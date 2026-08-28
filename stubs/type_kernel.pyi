@@ -180,6 +180,7 @@ __all__ = [
     "rust_classify_reveal_imported",
     "rust_refers_to_typeddict",
     "rust_classify_super_arg_types",
+    "rust_compute_arg_context_indices",
     "rust_classify_visit_op_expr",
     "rust_classify_check_arg",
     "rust_classify_check_boolean_op",
@@ -1028,6 +1029,15 @@ def rust_classify_reveal_imported(
 ) -> str | None: ...
 def rust_refers_to_typeddict(base: Any, target_bytes: bytes | None = None) -> bool: ...
 def rust_classify_super_arg_types(chk: Any, super_expr: Any) -> int | None: ...
+# Issue #1064: infer_arg_types_in_context index decision. Returns the
+# formal index per actual arg (-1 = no context, star args skipped), or
+# None on malformed input (length mismatch / out-of-bounds indices).
+def rust_compute_arg_context_indices(
+    arg_kinds: list[int],
+    formal_to_actual: list[list[int]],
+    args_len: int,
+    callee_arg_types_len: int,
+) -> list[int] | None: ...
 def rust_classify_visit_op_expr(expr: Any) -> int | None: ...
 def rust_classify_check_arg(
     caller_type_bytes: bytes, is_subtype: bool, has_abstract_type_part: bool

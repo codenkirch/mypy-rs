@@ -258,6 +258,7 @@ try:
         rust_classify_typeddict_call as _rust_classify_typeddict_call,
         rust_refers_to_typeddict as _rust_refers_to_typeddict,
         rust_combine_function_signatures as _rust_combine_function_signatures,
+        rust_compute_arg_context_indices as _rust_compute_arg_context_indices,
         rust_conditional_expr_join as _rust_conditional_expr_join,
         rust_container_type as _rust_container_type,
         rust_dangerous_comparison as _rust_dangerous_comparison,
@@ -347,6 +348,7 @@ except ImportError:
     _rust_real_union = None  # type: ignore[assignment]
     _rust_possible_none_type_var_overlap = None  # type: ignore[assignment]
     _rust_combine_function_signatures = None  # type: ignore[assignment]
+    _rust_compute_arg_context_indices = None  # type: ignore[assignment]
     _rust_solve_generic_call = None  # type: ignore[assignment]
     _rust_container_type = None  # type: ignore[assignment]
     _rust_tuple_context_matches = None  # type: ignore[assignment]
@@ -3276,13 +3278,33 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
 
         Returns the inferred types of *actual arguments*.
         """
-        # Precompute arg_context so that we type check argument expressions in evaluation order
-        arg_context: list[Type | None] = [None] * len(args)
-        for fi, actuals in enumerate(formal_to_actual):
-            for ai in actuals:
-                if arg_kinds[ai].is_star():
-                    continue
-                arg_context[ai] = callee.arg_types[fi]
+        # Native type_kernel seam (issue #1064): Rust computes the pure
+        # arg_context index map (formal index per actual, -1 = no context);
+        # accept + infer_unions toggle stay in Python. None defers below.
+        indices: list[int] | None = None
+        if _CHECKEXPR_HAS_TYPE_KERNEL and _native_checkexpr_active:
+            try:
+                indices = _rust_compute_arg_context_indices(
+                    [ak.value for ak in arg_kinds],
+                    formal_to_actual,
+                    len(args),
+                    len(callee.arg_types),
+                )
+            except (AssertionError, NotImplementedError, ValueError, TypeError):
+                indices = None
+
+        if indices is None:
+            # Precompute arg_context so that we type check argument expressions in evaluation order
+            arg_context: list[Type | None] = [None] * len(args)
+            for fi, actuals in enumerate(formal_to_actual):
+                for ai in actuals:
+                    if arg_kinds[ai].is_star():
+                        continue
+                    arg_context[ai] = callee.arg_types[fi]
+        else:
+            arg_context = [
+                callee.arg_types[fi] if fi >= 0 else None for fi in indices
+            ]
 
         res = []
         for arg, ctx in zip(args, arg_context):

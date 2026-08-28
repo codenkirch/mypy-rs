@@ -6459,6 +6459,152 @@ class NativeSuperArgTypesSuite(Suite):
 
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeInferArgContextSuite(Suite):
+    """Parity for `rust_compute_arg_context_indices` (issue #1064).
+
+    `infer_arg_types_in_context` (checkexpr.py:3265) first precomputes the
+    pure arg_context index map (formal index per actual, star args
+    skipped); the per-arg accept recursion and the infer_unions toggle
+    stay in Python. The Rust seam decides from scalars only. Direct seam
+    calls assert the mapping (star-skip, empty formal_to_actual,
+    no-context tail, malformed deferral); gate off vs on must produce
+    identical accept traces across the 3 call-site shapes
+    (checkexpr.py:3004, 3424, 3627).
+    """
+
+    def setUp(self) -> None:
+        from mypy.checkexpr import _set_native_checkexpr_active
+
+        self._set_active = _set_native_checkexpr_active
+        self._set_active(True)
+        self.fx = TypeFixture()
+
+    def tearDown(self) -> None:
+        self._set_active(False)
+
+    def _with_gate(self, active: bool, fn: Callable[[], T]) -> T:
+        self._set_active(active)
+        try:
+            return fn()
+        finally:
+            self._set_active(True)
+
+    def _make_callee(self, n_args: int) -> CallableType:
+        return CallableType(
+            [AnyType(TypeOfAny.special_form)] * n_args,
+            [ARG_POS] * n_args,
+            [None] * n_args,
+            AnyType(TypeOfAny.special_form),
+            self.fx.function,
+        )
+
+    # -- direct seam tests --
+
+    def test_seam_star_skip(self) -> None:
+        out = _type_kernel.rust_compute_arg_context_indices(
+            [ARG_POS.value, ARG_STAR.value, ARG_STAR2.value, ARG_POS.value],
+            [[0, 1, 2, 3]],
+            4,
+            1,
+        )
+        assert out == [0, -1, -1, 0], f"{out}"
+
+    def test_seam_empty_formal_to_actual(self) -> None:
+        out = _type_kernel.rust_compute_arg_context_indices([ARG_POS.value] * 2, [], 2, 1)
+        assert out == [-1, -1], f"{out}"
+
+    def test_seam_no_context_tail(self) -> None:
+        out = _type_kernel.rust_compute_arg_context_indices(
+            [ARG_POS.value] * 3, [[1]], 3, 1
+        )
+        assert out == [-1, 0, -1], f"{out}"
+
+    def test_seam_malformed_defers(self) -> None:
+        # Actual index out of bounds of args_len.
+        out = _type_kernel.rust_compute_arg_context_indices([0, 0], [[2]], 2, 1)
+        assert out is None, f"{out}"
+        # Formal index out of bounds of callee.arg_types.
+        out = _type_kernel.rust_compute_arg_context_indices([0, 0], [[0], [1]], 2, 1)
+        assert out is None, f"{out}"
+        # arg_kinds / args_len mismatch.
+        out = _type_kernel.rust_compute_arg_context_indices([0], [[0]], 2, 1)
+        assert out is None, f"{out}"
+
+    # -- gate off/on differential across the 3 call sites --
+
+    def _run_infer(
+        self,
+        callee: CallableType,
+        args: list[Expression],
+        arg_kinds: list[ArgKind],
+        formal_to_actual: list[list[int]],
+        active: bool,
+    ) -> list[str]:
+        from mypy.checkexpr import ExpressionChecker
+
+        captured: list[str] = []
+        ec = ExpressionChecker.__new__(ExpressionChecker)
+
+        def accept(arg: Expression, ctx: Type | None = None) -> Any:
+            captured.append(f"{arg!r}|ctx={ctx!r}")
+            return arg
+
+        ec.accept = accept  # type: ignore[assignment]
+        result = self._with_gate(
+            active,
+            lambda: ec.infer_arg_types_in_context(
+                callee, args, arg_kinds, formal_to_actual
+            ),
+        )
+        return [str(r) for r in result] + captured
+
+    def _make_args(self, n: int) -> list[Expression]:
+        return [NameExpr(f"a{i}") for i in range(n)]
+
+    def test_par_lambda_body_site(self) -> None:
+        # checkexpr.py:3004 shape: positional args, 1:1 formal mapping.
+        callee = self._make_callee(2)
+        args = self._make_args(2)
+        kinds = [ARG_POS, ARG_POS]
+        f2a = [[0], [1]]
+        off = self._run_infer(callee, args, kinds, f2a, False)
+        on = self._run_infer(callee, args, kinds, f2a, True)
+        assert off == on, f"lambda_body: off={off} on={on}"
+        assert all("ctx=Any" in s for s in on[len(args):]), f"expected contexts: {on}"
+
+    def test_par_first_pass_site(self) -> None:
+        # checkexpr.py:3424 shape: optional + named formals, error-filtered.
+        callee = self._make_callee(3)
+        args = self._make_args(3)
+        kinds = [ARG_POS, ARG_OPT, ARG_NAMED]
+        f2a = [[0], [1], [2]]
+        off = self._run_infer(callee, args, kinds, f2a, False)
+        on = self._run_infer(callee, args, kinds, f2a, True)
+        assert off == on, f"first_pass: off={off} on={on}"
+
+    def test_par_second_pass_site(self) -> None:
+        # checkexpr.py:3627 shape: star args skipped, kwargs shares a formal.
+        callee = self._make_callee(2)
+        args = self._make_args(3)
+        kinds = [ARG_POS, ARG_STAR, ARG_STAR2]
+        f2a = [[0, 1, 2], [2]]
+        off = self._run_infer(callee, args, kinds, f2a, False)
+        on = self._run_infer(callee, args, kinds, f2a, True)
+        assert off == on, f"second_pass: off={off} on={on}"
+        assert "ctx=None" in on[len(args) + 1], f"star arg must have no context: {on}"
+
+    def test_par_no_context_all(self) -> None:
+        # Empty formal_to_actual: every actual accepted without context.
+        callee = self._make_callee(2)
+        args = self._make_args(2)
+        kinds = [ARG_POS, ARG_POS]
+        off = self._run_infer(callee, args, kinds, [], False)
+        on = self._run_infer(callee, args, kinds, [], True)
+        assert off == on, f"no_context: off={off} on={on}"
+        assert all("ctx=None" in s for s in on[len(args):]), f"{on}"
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeVisitOpExprSuite(Suite):
     """Parity for `rust_classify_visit_op_expr` (issue #959).
 

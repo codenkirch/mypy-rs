@@ -1724,3 +1724,21 @@ directly to `main`.
   and covered by `NativeTypeCheckRaiseSuite` in `mypy/test/testtypes.py`
   (gate-off vs gate-on differential plus direct seam calls), plus pure
   decision unit tests in `checker_functions.rs`.
+- `rust_compute_arg_context_indices` (issue #1064, mypy.checkexpr) —
+  ports the pure index-decision core of
+  `ExpressionChecker.infer_arg_types_in_context` (checkexpr.py:3280-3285):
+  the `arg_context` precompute loop mapping each actual-arg index to its
+  formal index (source of the `callee.arg_types[fi]` context) or `-1`,
+  skipping star args via the `ArgKind.is_star()` values (ARG_STAR = 2,
+  ARG_STAR2 = 4). Args arrive as plain scalars (`arg_kinds` as integer
+  `ArgKind.value`s, `formal_to_actual`, `len(args)`,
+  `len(callee.arg_types)`), so no wire serializer is involved; later
+  formals overwrite earlier ones, matching the Python loop order.
+  Returns `None` (defer) only on malformed input (length mismatch,
+  out-of-bounds actual/formal index); the per-arg `self.accept`
+  recursion and the `infer_more_unions_for_recursive_type`
+  `type_state.infer_unions` toggle stay in Python. Gated by
+  `_native_checkexpr_active` and covered by `NativeInferArgContextSuite`
+  in `mypy/test/testtypes.py` (direct seam calls plus gate-off vs
+  gate-on differential across the 3 call sites), plus 9 pure index
+  unit tests in `checkexpr_functions.rs`.
