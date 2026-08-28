@@ -189,24 +189,38 @@ pub(crate) fn is_subtype(
     if let Type::UnionType { items, .. } = right {
         if !matches!(left, Type::UnionType { .. }) {
             if matches!(left, Type::TypeVarType { .. }) {
-                // TypeVarType left: Python falls through to the visitor
-                // (may match via upper_bound). Defer to preserve that.
+                // subtypes.py:829-833: tvar-left union-right only
+                // short-circuits True per item; no-match falls to the
+                // visitor (upper bound may itself be a union, #2314).
+                let mut saw_defer = false;
+                for item in items {
+                    match is_subtype(left, item, ctx, resolver) {
+                        Some(true) => return Some(true),
+                        Some(false) => {}
+                        None => {
+                            saw_defer = true;
+                        }
+                    }
+                }
+                if saw_defer {
+                    return None;
+                }
+            } else {
+                let mut all_decided_false = true;
+                for item in items {
+                    match is_subtype(left, item, ctx, resolver) {
+                        Some(true) => return Some(true),
+                        None => {
+                            all_decided_false = false;
+                        }
+                        Some(false) => {}
+                    }
+                }
+                if all_decided_false {
+                    return Some(false);
+                }
                 return None;
             }
-            let mut all_decided_false = true;
-            for item in items {
-                match is_subtype(left, item, ctx, resolver) {
-                    Some(true) => return Some(true),
-                    None => {
-                        all_decided_false = false;
-                    }
-                    Some(false) => {}
-                }
-            }
-            if all_decided_false {
-                return Some(false);
-            }
-            return None;
         }
     }
     // visit_uninhabited_type (subtypes.py:555-556): UninhabitedType is
@@ -635,7 +649,7 @@ pub(crate) fn is_subtype(
             // the complex callable matching.
             return None;
         }
-        // right is Instance.
+        // right is Instance (subtypes.py:1244-1256).
         if let Type::Instance {
             type_ref: right_ref,
             ..
@@ -645,26 +659,86 @@ pub(crate) fn is_subtype(
             if right_ref == "builtins.object" || right_ref == "builtins.type" {
                 return Some(true);
             }
-            // For other instances: check metaclass of left.item.
-            // Simplified: if left_item is Instance, check if it has a metaclass
-            // that is a subtype of right. Defer to Python for full accuracy.
-            return None;
+            // A protocol right needs the class_obj
+            // `is_protocol_implementation` check; defer.
+            if resolver.get(right_ref).is_some_and(|s| s.is_protocol) {
+                return None;
+            }
+            // item unwrap (subtypes.py:1248-1249): a TypeVarType item
+            // unwraps to its upper bound; a non-Instance item returns
+            // False.
+            let item = match left_item.as_ref() {
+                Type::TypeVarType { upper_bound, .. } => {
+                    get_proper_type_or_defer(upper_bound.as_ref(), resolver)?
+                }
+                t => t,
+            };
+            let Type::Instance {
+                type_ref: item_ref, ..
+            } = item
+            else {
+                return Some(false);
+            };
+            // metaclass check (subtypes.py:1253-1254): the item's metaclass
+            // must be a subtype of right; the snapshot carries it only
+            // for classes with an explicit or inherited metaclass.
+
+            // An absent one defers: Python's live `metaclass_type` is
+            // context-sensitive (the overlap path falls back to
+            // `right.has_base("builtins.type")`).
+
+            // A decided False here broke `issubclass(x, cls)` on plain
+            // classes (issue #1121).
+            let item_snap = resolver.get(item_ref)?;
+            let Some(meta_fullname) = &item_snap.metaclass_fullname else {
+                return None;
+            };
+            let meta_snap = resolver.get(meta_fullname);
+            if meta_snap.is_some_and(|s| !s.type_vars_with_variance.is_empty()) {
+                return None;
+            }
+            let metaclass = Type::Instance {
+                type_ref: meta_fullname.clone(),
+                args: Vec::new(),
+                last_known_value: None,
+                extra_attrs: None,
+            };
+            return is_subtype(&metaclass, right, ctx, resolver);
         }
         return Some(false);
     }
     // visit_overloaded (subtypes.py:1104-1169): Overloaded left.
     if let Type::Overloaded { items: left_items } = left {
-        // right is Instance (subtypes.py:1105-1119): for a protocol Instance
-        // the check is `find_member("__call__", right, right)` then a
-        // subtyping check plus `is_protocol_implementation`; for a plain
+        // right is Instance (subtypes.py:1105-1119).
+        if let Type::Instance {
+            type_ref: right_ref,
+            ..
+        } = right
+        {
+            // A protocol with an explicit `__call__` member needs
+            // find_member + the live member loop
+            // (is_protocol_implementation, skip=["__call__"]).
 
-        // Instance it recurses on `left.fallback`. Neither is ported
-        // (find_member / is_protocol_implementation stay on the Python
-        // side), so defer — deciding here produced a false "incompatible
-
-        // type" for an Overloaded passed to a __call__-Protocol.
-        if matches!(right, Type::Instance { .. }) {
-            return None;
+            // Both need live machinery; defer so Python decides.
+            if resolver
+                .get(right_ref)
+                .is_some_and(|s| s.is_protocol && s.protocol_members.iter().any(|m| m == "__call__"))
+            {
+                return None;
+            }
+            // subtypes.py:1118: a plain Instance right recurses on the
+            // overload's fallback (`Overloaded.fallback` is the first
+            // item's fallback).
+            let fallback = match left_items.first().map(|i| match i {
+                Type::CallableType { fallback, .. } => Some(fallback.as_ref()),
+                _ => None,
+            }) {
+                Some(Some(f)) => f,
+                _ => {
+                    return None;
+                }
+            };
+            return is_subtype(fallback, right, ctx, resolver);
         }
         // right is CallableType: at least one overload item must match.
         if let Type::CallableType { .. } = right {
@@ -1756,9 +1830,8 @@ fn map_derivation_path(
 ) -> Option<Vec<Type>> {
     let left_snap = resolver.get(left_ref)?;
     // Variadic left: expand_type_by_instance_core handles the env
-    // binding but the subset walker doesn't fully handle all
-    // prefix/suffix splicing cases, producing wrong results. Defer
-    // to Python until the full split_with_prefix_and_suffix is ported.
+    // binding but not all prefix/suffix splicing cases, so defer to
+    // Python until split_with_prefix_and_suffix is fully ported.
     if left_snap.has_type_var_tuple_type {
         return None;
     }
@@ -1858,10 +1931,9 @@ fn protocol_right_decision(
     if !resolver.has_live_info_map() {
         return None;
     }
-    // Recursion guard (subtypes.py:1972-1976): a pair already being checked
-    // is assumed True. Structural equality on the wire Type mirrors the
-    // identity check on live Instances — the recursion re-serializes the
-    // same pair.
+    // Recursion guard (subtypes.py:1972-1976): a pair already being
+    // checked is assumed True; wire structural equality mirrors Python's
+    // identity check on the re-encountered live pair.
     if assuming_contains(left, right, ctx.proper_subtype) {
         return Some(true);
     }
@@ -2000,11 +2072,12 @@ fn visit_instance_nominal(
         (has_base || is_object || is_named_tuple_right) && !ctx.ignore_declared_variance;
     if !nominal_applies {
         // Nominal branch skipped. If right is a protocol, run the
-        // protocol-implementation port — Python reaches
-        // is_protocol_implementation (subtypes.py:1287-1291) exactly when
-        // the nominal branch did not apply; when it did apply, Python
-        // returns the nominal verdict without a protocol check. Otherwise
-        // Python records a negative cache entry and returns False.
+        // protocol-implementation port: Python reaches it exactly when
+        // the nominal branch did not apply.
+
+        // When it did apply, Python returns the nominal verdict without
+        // a protocol check; otherwise it records a negative cache entry
+        // and returns False.
         if right_is_protocol {
             return protocol_right_decision(left, right, left_ref, right_ref, ctx, resolver);
         }
@@ -4813,13 +4886,28 @@ mod tests {
     }
 
     #[test]
-    fn overloaded_defers_instance_right() {
-        // right is Instance: needs find_member/is_protocol_implementation
-        // (Python-only). Defer (subtypes.py:1115-1125).
+    fn overloaded_instance_right_recurses_on_fallback() {
+        // right is a plain Instance: is_subtype(left.fallback, right)
+        // (subtypes.py:1118). builtins.function <: builtins.function.
         let r = make_resolver(vec![snap("builtins.function", "function")]);
         let item = callable_type(vec![], Type::NoneType, None);
         let left = Type::Overloaded { items: vec![item] };
         let right = instance("builtins.function", vec![]);
+        assert_eq!(is_subtype(&left, &right, &ctx_nominal(), &r), Some(true));
+    }
+
+    #[test]
+    fn overloaded_protocol_call_right_still_defers() {
+        // right is a protocol whose members include __call__: needs
+        // find_member + is_protocol_implementation (Python-only). Defer
+        // (subtypes.py:1115-1125).
+        let mut proto = snap("mod.CallProto", "CallProto");
+        proto.is_protocol = true;
+        proto.protocol_members = vec!["__call__".to_string()];
+        let r = make_resolver(vec![snap("builtins.function", "function"), proto]);
+        let item = callable_type(vec![], Type::NoneType, None);
+        let left = Type::Overloaded { items: vec![item] };
+        let right = instance("mod.CallProto", vec![]);
         assert_eq!(is_subtype(&left, &right, &ctx_nominal(), &r), None);
     }
 
@@ -5786,9 +5874,8 @@ mod tests {
     #[test]
     fn assuming_guard_push_pop_and_flag_keying() {
         // The assuming guard (subtypes.py:1972-1976): a pair being checked
-        // under one proper flag is invisible to the other stack (Python
-        // keeps assuming / assuming_proper separate), and pop-on-drop
-        // clears it on every exit path.
+        // under one proper flag is invisible to the other stack, and
+        // pop-on-drop clears it on every exit path.
         let left = instance("a.A", vec![]);
         let right = instance("a.P", vec![]);
         let other = instance("a.B", vec![]);

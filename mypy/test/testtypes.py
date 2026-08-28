@@ -6976,6 +6976,247 @@ class NativeProtocolImplementationSuite(Suite):
 
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeProtocolMemberDeferSuite(Suite):
+    """Engagement for the `get_protocol_member_inner` defer closures
+    ported in issue #1121.
+
+    The protocol-right member loop (is_protocol_implementation_inner)
+    previously went back to Python whenever the looked-up member was a
+    Decorator node (typeshed `@property` protocol members like
+    ``SupportsIndex.__index__`` / ``Sized.__len__``) or was defined on a
+    base class of the receiver (the same-class guard of
+    member_method_inner). Both shapes are now decided natively:
+
+    * Decorator nodes unwrap to ``.var``; the var's callable type runs
+      the same bind + map + expand tail as a plain method, and a property
+      member yields the getter's return type (checkmember.py:1966-1982).
+      Static methods still defer (analyze_var skips the self bind for
+      them, which member_method_inner's strip would get wrong).
+    * Base-class-defined members run the same tail with the
+      allow_subclass_receiver flag; `map_instance_to_supertype` re-maps
+      the receiver to the defining class (the pure-Python
+      `analyze_instance_member_access` maps via `method.info`).
+
+    Each test calls the `rust_is_protocol_implementation` seam directly
+    (the deferred path needs a live checker_state, mirroring
+    NativeProtocolImplementationSuite) and asserts the decided answer.
+    """
+
+    def setUp(self) -> None:
+        from mypy.checkexpr import _set_native_plugin_hook_registry
+        from mypy.options import Options
+        from mypy.plugins.default import DEFAULT_HOOK_FULLNAMES_BY_KIND, DefaultPlugin
+
+        self.fx = TypeFixture()
+        self._live_info: dict[str, Any] = {}
+        self.resolver: Any = None
+        # The decorator arm resolves attribute hooks through the live
+        # ChainedPlugin snapshot; install a defaults-only chain so the
+        # synthetic member fullnames are provably unhooked.
+        import type_kernel as _type_kernel
+
+        registry = _type_kernel.PluginHookRegistry(
+            {kind: list(names) for kind, names in DEFAULT_HOOK_FULLNAMES_BY_KIND.items()}
+        )
+        _set_native_plugin_hook_registry(registry, False, [DefaultPlugin(Options())])
+
+    def tearDown(self) -> None:
+        from mypy.checkexpr import _set_native_plugin_hook_registry
+
+        _set_native_plugin_hook_registry(None, False)
+
+    def _protocol_info(self, fullname: str) -> Any:
+        """Build and register a protocol TypeInfo (plain MRO)."""
+        info = self.fx.make_type_info(fullname)
+        info.mro = [info, self.fx.oi]
+        info.is_protocol = True
+        self._live_info[fullname] = info
+        return info
+
+    def _impl_info(self, fullname: str) -> Any:
+        """Build and register a non-protocol TypeInfo (plain MRO)."""
+        info = self.fx.make_type_info(fullname)
+        info.mro = [info, self.fx.oi]
+        self._live_info[fullname] = info
+        return info
+
+    def _property_decorator(self, name: str, ret_type: Any, owner: Any) -> Any:
+        """A ``@property def name(self) -> ret`` Decorator node owned by
+        `owner`, with the getter bound against the owner's instance."""
+        from mypy.nodes import Block, Decorator, FuncDef, Var
+        from mypy.types import CallableType, Instance
+
+        fd = FuncDef(name, [], Block([]))
+        fd.info = owner
+        v = Var(name)
+        v.info = owner
+        v.is_property = True
+        v.is_initialized_in_class = True
+        v.is_ready = True
+        v.is_inferred = False
+        v.type = CallableType(
+            [Instance(owner, [])],
+            [ARG_POS],
+            [None],
+            ret_type,
+            self.fx.function,
+        )
+        return Decorator(fd, [], v)
+
+    def _staticmethod_decorator(self, name: str, ret_type: Any, owner: Any) -> Any:
+        """A ``@staticmethod def name(...) -> ret`` Decorator node."""
+        from mypy.nodes import Block, Decorator, FuncDef, Var
+        from mypy.types import CallableType
+
+        fd = FuncDef(name, [], Block([]))
+        fd.info = owner
+        v = Var(name)
+        v.info = owner
+        v.is_staticmethod = True
+        v.is_initialized_in_class = True
+        v.is_ready = True
+        v.is_inferred = False
+        v.type = CallableType(
+            [self.fx.a],
+            [ARG_POS],
+            [None],
+            ret_type,
+            self.fx.function,
+        )
+        return Decorator(fd, [], v)
+
+    def _method_callable(self, ret: Any, self_type: Any) -> Any:
+        from mypy.types import CallableType
+
+        return CallableType(
+            [self_type],
+            [ARG_POS],
+            [None],
+            ret,
+            self.fx.function,
+        )
+
+    def _base_impl(self, fullname: str, base: Any, member: str, func_types: dict[str, Any]) -> Any:
+        """An implementing Info that inherits `member` from `base`."""
+        from mypy.types import Instance
+
+        info = self.fx.make_type_info(fullname)
+        base.mro = [base, info, self.fx.oi]
+        info.mro = [info, base, self.fx.oi]
+        info.bases = [Instance(base, [])]
+        node = FuncDef(member, [], None)
+        node.info = base
+        node.type = func_types[member]
+        node.line = 1
+        node.column = 1
+        base.names[member] = SymbolTableNode(MDEF, node)
+        self._live_info[fullname] = info
+        self._live_info[base.fullname] = base
+        return info
+
+    def _build_resolver(self) -> None:
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        type_infos = []
+        for name in dir(self.fx):
+            if not name.endswith("i"):
+                continue
+            value = getattr(self.fx, name)
+            if _is_type_info(value):
+                type_infos.append(value)
+        type_infos.extend(list(self._live_info.values()))
+        self.resolver = _type_kernel.build_native_resolver(type_infos, [])
+        self.resolver.set_live_typeinfo_map(dict(self._live_info))
+        set_wire_typeinfo_map(dict(self._live_info))
+
+    def _seam_call(self, left: Any, right: Any) -> bool | None:
+        from mypy.subtypes import _serialize_type
+
+        return _type_kernel.rust_is_protocol_implementation(
+            _serialize_type(left),
+            _serialize_type(right),
+            [],
+            False,
+            False,
+            False,
+            False,
+            False,  # proper_subtype
+            True,   # strict_optional
+            False,
+            False,
+            self.resolver,
+        )
+
+    def test_property_protocol_member_engages(self) -> None:
+        """A protocol whose member is a `@property` Decorator (the
+        ``Sized.__len__`` shape) must be decided natively: the sup lookup
+        unwraps to the getter and compares its return type against the
+        implementation's property value."""
+        from mypy.types import Instance
+
+        self._live_info = {}
+        p_info = self._protocol_info("mod.P")
+        i_info = self._impl_info("mod.I")
+        p_info.names["attr"] = SymbolTableNode(MDEF, self._property_decorator("attr", self.fx.a, p_info))
+        i_info.names["attr"] = SymbolTableNode(MDEF, self._property_decorator("attr", self.fx.a, i_info))
+        self._build_resolver()
+        result = self._seam_call(Instance(i_info, []), Instance(p_info, []))
+        assert result is True, f"property-protocol must be decided True, got {result!r}"
+
+    def test_property_protocol_ret_mismatch_false(self) -> None:
+        """A property whose getter returns a different type is not an
+        implementation: the member VALUE (ret type) is compared, not the
+        bound getter callable."""
+        from mypy.types import Instance
+
+        self._live_info = {}
+        p_info = self._protocol_info("mod.P")
+        i_info = self._impl_info("mod.I")
+        p_info.names["attr"] = SymbolTableNode(MDEF, self._property_decorator("attr", self.fx.a, p_info))
+        i_info.names["attr"] = SymbolTableNode(MDEF, self._property_decorator("attr", self.fx.o, i_info))
+        self._build_resolver()
+        result = self._seam_call(Instance(i_info, []), Instance(p_info, []))
+        assert result is False, f"wrong-return property must not implement, got {result!r}"
+
+    def test_staticmethod_member_still_defers(self) -> None:
+        """A `@staticmethod` member still defers: analyze_var skips the
+        self bind for static methods, which the bind tail would get wrong."""
+        from mypy.types import Instance
+
+        self._live_info = {}
+        p_info = self._protocol_info("mod.P")
+        i_info = self._impl_info("mod.I")
+        p_info.names["f"] = SymbolTableNode(MDEF, self._staticmethod_decorator("f", self.fx.a, p_info))
+        i_info.names["f"] = SymbolTableNode(MDEF, self._staticmethod_decorator("f", self.fx.a, i_info))
+        self._build_resolver()
+        result = self._seam_call(Instance(i_info, []), Instance(p_info, []))
+        assert result is None, f"staticmethod member must defer, got {result!r}"
+
+    def test_base_class_member_engages(self) -> None:
+        """An inherited member (defining class is a base of the receiver)
+        must be decided natively: map_instance_to_supertype re-maps the
+        receiver to the defining class before the bind."""
+        from mypy.types import Instance
+
+        self._live_info = {}
+        base = self._impl_info("mod.Base")
+        p_info = self._protocol_info("mod.P")
+        i = self._base_impl(
+            "mod.Sub",
+            base,
+            "f",
+            {"f": self._method_callable(self.fx.a, Instance(base, []))},
+        )
+        fnode = FuncDef("f", [], None)
+        fnode.info = p_info
+        fnode.type = self._method_callable(self.fx.a, Instance(p_info, []))
+        p_info.names["f"] = SymbolTableNode(MDEF, fnode)
+        self._build_resolver()
+        result = self._seam_call(Instance(i, []), Instance(p_info, []))
+        assert result is True, f"inherited member must be decided True, got {result!r}"
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeAliasExpansionSuite(Suite):
     """Parity suite for TypeAliasType expansion in kernel seams (alias slice).
 
