@@ -311,6 +311,14 @@ pub(crate) fn rust_classify_all_supers_gate(
         Some(k) => k == mdef,
     };
 
+    // Python reads `lvalue_node.info.bases` only after the Var/line/kind
+    // clauses of its `and` chain (checker.py:5053-5063). Mirror that: a Var
+    // whose info is the VAR_NO_INFO FakeInfo placeholder must SKIP above.
+    let line_ok = node_line == lvalue_line;
+    if !(line_ok || (is_inferred && !explicit_self_type)) || !kind_ok {
+        return Ok(Some((ALL_SUPERS_GATE_SKIP, Vec::new())));
+    }
+
     let info = match lvalue_node.getattr("info") {
         Ok(v) => v,
         Err(_) => return Ok(None),
@@ -325,7 +333,7 @@ pub(crate) fn rust_classify_all_supers_gate(
     };
     let gate = classify_all_supers_gate(
         is_var,
-        node_line == lvalue_line,
+        line_ok,
         is_inferred,
         explicit_self_type,
         kind_ok,
