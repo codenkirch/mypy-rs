@@ -780,6 +780,20 @@ fn find_self_type_inner(
         let arg_types = get_attr_or_defer(obj, "arg_types")?;
         return self_type_any_seq(py, arg_types, ctx);
     }
+    // TypeList: query_types(t.items), matching BoolTypeQuery's
+    // visit_type_list (syntactic list inside Callable arg position).
+    if class_name_is(obj, "TypeList") {
+        let items = get_attr_or_defer(obj, "items")?;
+        return self_type_any_seq(py, items, ctx);
+    }
+    // EllipsisType: strategy([]) -> False (bare Callable[..., T]).
+    if class_name_is(obj, "EllipsisType") {
+        return Ok(false);
+    }
+    // RawExpressionType: strategy([]) -> False (invalid type literals).
+    if class_name_is(obj, "RawExpressionType") {
+        return Ok(false);
+    }
     // Unknown type variant: defer.
     Err(DeferError)
 }

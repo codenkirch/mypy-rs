@@ -43249,3 +43249,163 @@ class NativeSetCallableNameSuite(Suite):
         assert isinstance(sig, Overloaded)
         result = self._assert_par(sig, fdef)
         assert result.get_name() == "m of C"
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeFindSelfTypeSuite(Suite):
+    """Parity for the Rust `find_self_type` port (mypy.typeanal, #1114).
+
+    `find_self_type` (typeanal.py:4231) walks a live type tree with the
+    `HasSelfType` BoolTypeQuery (ANY_STRATEGY) and returns True when any
+    unbound name resolves to `typing.Self` / `typing_extensions.Self`.
+    The Rust seam (`rust_find_self_type`) mirrors the visitor. Issue #1114
+    added the previously-deferred leaf shapes: TypeList items (query),
+    bare EllipsisType (False), and RawExpressionType (False); before the
+    port those fell through to the pure-Python body on every occurrence.
+
+    Gate-off vs gate-on runs must produce identical booleans, and the
+    direct seam call must decide each shape (never defer).
+    """
+
+    def setUp(self) -> None:
+        from mypy.typeanal import _set_native_typeanal_active
+
+        self.fx = TypeFixture()
+        self._set_active = _set_native_typeanal_active
+        self._set_active(True)
+
+    def tearDown(self) -> None:
+        self._set_active(False)
+
+    def _with_gate(self, active: bool, fn: Callable[[], T]) -> T:
+        self._set_active(active)
+        try:
+            return fn()
+        finally:
+            self._set_active(True)
+
+    def _lookup(self, names: dict[str, str]) -> Callable[[str], Any]:
+        class FakeSym:
+            def __init__(self, fullname: str | None) -> None:
+                self.fullname = fullname
+
+        def lookup(name: str) -> Any:
+            fullname = names.get(name)
+            if fullname is None:
+                return None
+            return FakeSym(fullname)
+
+        return lookup
+
+    def _assert_par(self, typ: Type, names: dict[str, str], expected: bool) -> None:
+        from mypy.typeanal import find_self_type
+
+        lookup = self._lookup(names)
+        off = self._with_gate(False, lambda: find_self_type(typ, lookup))
+        on = self._with_gate(True, lambda: find_self_type(typ, lookup))
+        assert off == expected, f"gate-off {typ!r}: {off} != {expected}"
+        assert on == expected, f"gate-on {typ!r}: {on} != {expected}"
+
+    def _assert_seam(self, typ: Type, names: dict[str, str], expected: bool) -> None:
+        lookup = self._lookup(names)
+        result = _type_kernel.rust_find_self_type(typ, lookup)
+        assert result is not None, f"Rust deferred on {typ!r}"
+        assert result == expected, f"Rust seam {typ!r}: {result} != {expected}"
+
+    def test_seam_unbound_self(self) -> None:
+        self._assert_seam(UnboundType("Self"), {"Self": "typing.Self"}, True)
+
+    def test_seam_unbound_plain(self) -> None:
+        self._assert_seam(UnboundType("int"), {}, False)
+
+    def test_seam_unbound_nested_self(self) -> None:
+        t = UnboundType("list", [UnboundType("Self")])
+        self._assert_seam(t, {"Self": "typing.Self"}, True)
+
+    def test_seam_raw_expression(self) -> None:
+        from mypy.typeanal import RawExpressionType
+
+        t = RawExpressionType("nope", "mod", line=1, column=1)
+        self._assert_seam(t, {}, False)
+
+    def test_seam_ellipsis(self) -> None:
+        from mypy.types import EllipsisType
+
+        self._assert_seam(EllipsisType(), {}, False)
+
+    def test_seam_type_list_with_self(self) -> None:
+        from mypy.types import TypeList
+
+        t = TypeList([UnboundType("Self")], line=1, column=1)
+        self._assert_seam(t, {"Self": "typing.Self"}, True)
+
+    def test_seam_type_list_plain(self) -> None:
+        from mypy.types import TypeList
+
+        t = TypeList([UnboundType("int")], line=1, column=1)
+        self._assert_seam(t, {}, False)
+
+    def test_seam_instance_arg_self(self) -> None:
+        t = Instance(self.fx.ai, [UnboundType("Self")])
+        self._assert_seam(t, {"Self": "typing.Self"}, True)
+
+    def test_seam_union_nested_self(self) -> None:
+        t = UnionType([self.fx.a, UnboundType("Self")])
+        self._assert_seam(t, {"Self": "typing.Self"}, True)
+
+    def test_seam_callable_ret_self(self) -> None:
+        t = CallableType([], [], [], UnboundType("Self"), self.fx.function)
+        self._assert_seam(t, {"Self": "typing.Self"}, True)
+
+    def test_seam_callable_ret_plain(self) -> None:
+        t = CallableType([], [], [], UnboundType("int"), self.fx.function)
+        self._assert_seam(t, {}, False)
+
+    def test_parity_unbound_self(self) -> None:
+        self._assert_par(UnboundType("Self"), {"Self": "typing.Self"}, True)
+
+    def test_parity_unbound_plain(self) -> None:
+        self._assert_par(UnboundType("int"), {}, False)
+
+    def test_parity_unbound_nested_self(self) -> None:
+        t = UnboundType("list", [UnboundType("Self")])
+        self._assert_par(t, {"Self": "typing.Self"}, True)
+
+    def test_parity_raw_expression(self) -> None:
+        from mypy.typeanal import RawExpressionType
+
+        t = RawExpressionType("nope", "mod", line=1, column=1)
+        self._assert_par(t, {}, False)
+
+    def test_parity_ellipsis(self) -> None:
+        from mypy.types import EllipsisType
+
+        self._assert_par(EllipsisType(), {}, False)
+
+    def test_parity_type_list_with_self(self) -> None:
+        from mypy.types import TypeList
+
+        t = TypeList([UnboundType("Self")], line=1, column=1)
+        self._assert_par(t, {"Self": "typing.Self"}, True)
+
+    def test_parity_type_list_plain(self) -> None:
+        from mypy.types import TypeList
+
+        t = TypeList([UnboundType("int")], line=1, column=1)
+        self._assert_par(t, {}, False)
+
+    def test_parity_instance_arg_self(self) -> None:
+        t = Instance(self.fx.ai, [UnboundType("Self")])
+        self._assert_par(t, {"Self": "typing.Self"}, True)
+
+    def test_parity_union_nested_self(self) -> None:
+        t = UnionType([self.fx.a, UnboundType("Self")])
+        self._assert_par(t, {"Self": "typing.Self"}, True)
+
+    def test_parity_callable_ret_self(self) -> None:
+        t = CallableType([], [], [], UnboundType("Self"), self.fx.function)
+        self._assert_par(t, {"Self": "typing.Self"}, True)
+
+    def test_parity_callable_ret_plain(self) -> None:
+        t = CallableType([], [], [], UnboundType("int"), self.fx.function)
+        self._assert_par(t, {}, False)

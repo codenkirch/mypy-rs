@@ -2034,3 +2034,16 @@ directly to `main`.
   `mypy/test/testtypes.py` (direct seam calls for method / TypedDict /
   FakeInfo / None-info / passthrough shapes plus gate-off vs gate-on
   parity through `set_callable_name`).
+
+- `rust_find_self_type` (issue #1114) — mirrors
+  `mypy.typeanal.find_self_type` (typeanal.py:4231, the `HasSelfType`
+  BoolTypeQuery over a live type tree with the `lookup` Python callback).
+  The audit (env-gated buckets over the cold self-check) found every
+  defer in three decidable leaf shapes, now ported: `TypeList` items
+  (query, matching `visit_type_list`), bare `EllipsisType` (`strategy([])`
+  -> False), and `RawExpressionType` (`strategy([])` -> False). The port
+  removed all 2,353 measured defers (35,204 calls @ 93% -> 35,210 calls
+  @ 100% native). Gated by `_native_typeanal_active` (existing wiring)
+  and covered by `NativeFindSelfTypeSuite` in `mypy/test/testtypes.py`
+  (direct seam calls plus gate-off vs gate-on differential through
+  `find_self_type`).
