@@ -1016,6 +1016,27 @@ including:
   `NativeVisitOpExprSuite` in `mypy/test/testtypes.py` (direct seam calls
   for all 5 branches plus edge cases), and 11 pure decision unit tests in
   `checkexpr_functions.rs`.
+- `rust_classify_check_boolean_op` (issue #1049) — mirrors the
+  map-arrangement + result-tail decision head of
+  `ExpressionChecker.check_boolean_op` (checkexpr.py:6062-6145): the
+  4-way map-tag dispatch (`right_always` / `right_unreachable` /
+  `and` / `or`), the two reachability gates (left/right map values
+  scanned for `UninhabitedType`), and the result arbitration
+  (return left / return right / `UninhabitedType` restricted type /
+  union). Rust classifies from the wire map values, one wire
+  serialization of the expanded-left operand, its live
+  `can_be_true`/`can_be_false` flags, and `strict_optional`; the tail
+  reuses the `false_only`/`true_only` truthiness kernels for the
+  restricted type. Python keeps `find_isinstance_check`,
+  `analyze_cond_branch`, the two `self.msg.*_operand` emissions, and
+  `make_simplified_union`. Defers (`None`) on `TypeAliasType` map
+  values, a `Union` expanded-left (the union recursion needs live
+  per-item flags), and `true_only` dunder lookups the resolver
+  snapshot cannot decide (e.g. an int Instance under `or`). Gated by
+  `_native_checkexpr_active` (wired from `mypy/build.py`) and covered
+  by `NativeCheckBooleanOpSuite` in `mypy/test/testtypes.py`
+  (gate-off vs gate-on differential plus direct seam calls), and 13
+  pure decision unit tests in `checkexpr_functions.rs`.
 - `rust_classify_type_type_member_access` (issue #957) — mirrors the
   9-way dispatch head of
   `mypy.checkmember.analyze_type_type_member_access`

@@ -233,10 +233,11 @@ pub(crate) fn can_be_false_default(t: &Type) -> Option<bool> {
 /// * `UnionNarrow(item_discs)` -> recurse on each union item (discs[i] is
 ///   the discriminator for items[i])
 #[derive(Clone, Debug, PartialEq)]
-#[allow(dead_code)]
-enum TruthinessResult {
+pub(crate) enum TruthinessResult {
     Uninhabited,
+    #[allow(dead_code)]
     NoneType,
+    #[allow(dead_code)]
     SameType,
     CopyTrueOnly,
     CopyFalseOnly,
@@ -390,7 +391,11 @@ fn step6_is_final_or_enum(py: Python<'_>, t: &Type, resolver: &NativeTypeResolve
 /// missing, the dunder ret_type truthiness cannot be decided, or the leaf
 /// is a LiteralType (only enum literals reach the leaf; the enum unwrap in
 /// `_get_type_method_ret_type` needs live TypeInfo).
-fn true_only(py: Python<'_>, t: &Type, resolver: &NativeTypeResolver) -> Option<TruthinessResult> {
+pub(crate) fn true_only(
+    py: Python<'_>,
+    t: &Type,
+    resolver: &NativeTypeResolver,
+) -> Option<TruthinessResult> {
     // Only enum literals reach the leaf (plain literals exit at the Python
     // live-flag steps); the enum unwrap needs live TypeInfo -> defer.
     if matches!(t, Type::LiteralType { .. }) {
@@ -423,7 +428,7 @@ fn true_only(py: Python<'_>, t: &Type, resolver: &NativeTypeResolver) -> Option<
 /// 4. A `@final` class or enum, or an enum literal, under `strict_optional`
 ///    -> Uninhabited (typeops.py:1369-1373). Defer when the live map cannot
 ///    decide.
-fn false_only(
+pub(crate) fn false_only(
     py: Python<'_>,
     t: &Type,
     strict_optional: bool,

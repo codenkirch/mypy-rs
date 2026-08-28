@@ -181,6 +181,7 @@ __all__ = [
     "rust_classify_super_arg_types",
     "rust_classify_visit_op_expr",
     "rust_classify_check_arg",
+    "rust_classify_check_boolean_op",
     "rust_classify_index_with_type",
     "rust_calibrate_type_obj_return",
     "rust_normalize_callable",
@@ -1016,6 +1017,20 @@ def rust_classify_visit_op_expr(expr: Any) -> int | None: ...
 def rust_classify_check_arg(
     caller_type_bytes: bytes, is_subtype: bool, has_abstract_type_part: bool
 ) -> int | None: ...
+# Issue #1049: check_boolean_op decision head. Returns
+# (map_tag, left_unreachable, right_unreachable, result_tag) or None.
+def rust_classify_check_boolean_op(
+    op_is_and: bool,
+    right_always: bool,
+    right_unreachable: bool,
+    left_map_values: list[bytes],
+    right_map_values: list[bytes],
+    expanded_left_bytes: bytes,
+    can_be_true: bool,
+    can_be_false: bool,
+    strict_optional: bool,
+    resolver: NativeTypeResolver,
+) -> tuple[int, bool, bool, int] | None: ...
 def rust_classify_index_with_type(left_type: Any, chk: Any, expand_variadic: bool) -> int | None: ...
 def rust_calibrate_type_obj_return(callee_bytes: bytes, arg_type_bytes: bytes) -> bytes | None: ...
 def rust_normalize_callable(callee_bytes: bytes) -> bytes | None: ...
