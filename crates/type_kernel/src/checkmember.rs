@@ -774,6 +774,7 @@ fn tuple_special_map(
 /// Python's `freeze_all_type_vars` is unported: the signature is already
 /// frozen by this seam (expand produces only bound class vars), so nothing
 /// remains to freeze when the Rust path fully succeeds.
+#[allow(clippy::too_many_arguments)]
 fn static_member_tail(
     instance: &Type,
     signature: &Type,
