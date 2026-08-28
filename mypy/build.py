@@ -1692,9 +1692,11 @@ class BuildManager:
         _clear_expand_decode_cache()
         from mypy.join import _set_native_join_resolver, _set_native_join_typeinfo_map
         from mypy.mro import _set_native_mro_resolver
+        from mypy.nodes import _clear_native_metaclass_memo
         from mypy.subtypes import _set_native_subtype_resolver
         from mypy.wirefixup import set_wire_alias_map
 
+        _clear_native_metaclass_memo()
         _set_native_subtype_resolver(None)
         _set_native_join_resolver(None)
         _set_native_join_typeinfo_map(None)

@@ -31574,6 +31574,187 @@ class NativeMetaclassCompatibilitySuite(Suite):
 
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeTypeinfoMetaclassMemoSuite(Suite):
+    """Parity + memo semantics for the Rust `is_metaclass` verdict memo (#1137).
+
+    `TypeInfo.is_metaclass` routes to `rust_typeinfo_is_metaclass`, a pure
+    zero-byte FFI fold measured at #1135 as the dominant remaining fixed
+    cost (957k cold-check calls). Instead of a batched wire interface the
+    fix memoizes the verdict per build, keyed by (MRO list identity,
+    precise); see `_clear_native_metaclass_memo` in mypy/nodes.py for the
+    invalidation contract.
+
+    These tests pin the memo directly: gate-off vs gate-on parity, one FFI
+    crossing per (MRO, precise) key, MRO rebound / in-place and build
+    boundary invalidation, and the empty-MRO never-memoized path.
+    """
+
+    def setUp(self) -> None:
+        from mypy.nodes import _set_native_nodes_active
+
+        self._set_active = _set_native_nodes_active
+        self._set_active(True)
+
+    def tearDown(self) -> None:
+        self._set_active(False)
+
+    def _clear_memo(self) -> None:
+        from mypy.nodes import _clear_native_metaclass_memo
+
+        _clear_native_metaclass_memo()
+
+    def _typeinfo(
+        self, *, fullname: str = "mod.A", fallback_to_any: bool = False
+    ) -> TypeInfo:
+        from mypy.nodes import Block, ClassDef, SymbolTable, TypeInfo
+
+        defn = ClassDef(fullname.rsplit(".", 1)[-1], Block([]), None, [])
+        defn.fullname = fullname
+        info = TypeInfo(SymbolTable(), defn, "mod")
+        defn.info = info
+        info.fallback_to_any = fallback_to_any
+        info.mro = [info]
+        return info
+
+    def _assert_parity(
+        self, info: TypeInfo, *, precise: bool = False, expected: bool
+    ) -> None:
+        # Phase 1: gate off, fresh verdict from the pure-Python body. The
+        # toggle also clears the memo, so phase 2 recomputes natively.
+        self._set_active(False)
+        try:
+            off = info.is_metaclass(precise=precise)
+        finally:
+            self._set_active(True)
+        on = info.is_metaclass(precise=precise)
+        assert_equal(on, off, f"parity for {info.fullname}, precise={precise}")
+        assert on == expected, f"gate-on {info.fullname}: got {on}, want {expected}"
+
+    def test_parity_plain_class(self) -> None:
+        self._clear_memo()
+        self._assert_parity(self._typeinfo(), expected=False)
+
+    def test_parity_abcmeta_fullname(self) -> None:
+        self._clear_memo()
+        self._assert_parity(
+            self._typeinfo(fullname="abc.ABCMeta"), expected=True
+        )
+
+    def test_parity_base_in_mro(self) -> None:
+        from types import SimpleNamespace
+
+        self._clear_memo()
+        info = self._typeinfo()
+        # Fake metaclass base entries are fine for both arms: the Python
+        # loop and the Rust walk both compare `fullname`.
+        info.mro = [info, SimpleNamespace(fullname="builtins.type")]  # type: ignore[list-item]
+        self._assert_parity(info, expected=True)
+
+    def test_parity_fallback_to_any(self) -> None:
+        self._clear_memo()
+        info = self._typeinfo(fallback_to_any=True)
+        self._assert_parity(info, expected=True)
+        self._clear_memo()
+        self._assert_parity(info, precise=True, expected=False)
+
+    def _with_counting_delegate(
+        self, fn: Callable[[list[bool]], None]
+    ) -> None:
+        """Run `fn` with a counting wrapper over the Rust metaclass seam."""
+        import mypy.nodes as nodes_module
+
+        orig = nodes_module._rust_typeinfo_is_metaclass  # type: ignore[attr-defined]
+        calls: list[bool] = []
+
+        def counting(info: TypeInfo, precise: bool) -> bool:
+            calls.append(precise)
+            return bool(orig(info, precise))
+
+        nodes_module._rust_typeinfo_is_metaclass = counting  # type: ignore[attr-defined]
+        try:
+            fn(calls)
+        finally:
+            nodes_module._rust_typeinfo_is_metaclass = orig  # type: ignore[attr-defined]
+
+    def test_memo_single_ffi_crossing(self) -> None:
+        self._clear_memo()
+        info = self._typeinfo()
+
+        def run(calls: list[bool]) -> None:
+            assert info.is_metaclass() is False
+            assert info.is_metaclass() is False
+            assert info.is_metaclass() is False
+            assert_equal(len(calls), 1, "3 queries must cross the seam once")
+
+        self._with_counting_delegate(run)
+
+    def test_memo_keyed_by_precise(self) -> None:
+        self._clear_memo()
+        info = self._typeinfo(fallback_to_any=True)
+
+        def run(calls: list[bool]) -> None:
+            assert info.is_metaclass() is True
+            assert info.is_metaclass() is True
+            assert info.is_metaclass(precise=True) is False
+            assert info.is_metaclass(precise=True) is False
+            assert_equal(len(calls), 2, "each precise key crosses once")
+
+        self._with_counting_delegate(run)
+
+    def test_mro_rebind_misses_memo(self) -> None:
+        self._clear_memo()
+        info = self._typeinfo()
+
+        def run(calls: list[bool]) -> None:
+            from types import SimpleNamespace
+
+            assert info.is_metaclass() is False
+            assert info.is_metaclass() is False
+            # A rebound MRO is a new list identity: the memo must miss.
+            info.mro = [info, SimpleNamespace(fullname="builtins.type")]  # type: ignore[list-item]
+            assert info.is_metaclass() is True
+            assert_equal(len(calls), 2, "rebind must recompute, not reuse")
+
+        self._with_counting_delegate(run)
+
+    def test_build_boundary_clears_in_place_mutation(self) -> None:
+        self._clear_memo()
+        info = self._typeinfo()
+
+        def run(calls: list[bool]) -> None:
+            from types import SimpleNamespace
+
+            assert info.is_metaclass() is False
+            # In-place mutation under the same key stays stale by design.
+            info.mro.append(SimpleNamespace(fullname="builtins.type"))  # type: ignore[arg-type]
+            assert info.is_metaclass() is False
+            # A build boundary (`_set_native_nodes_active`) clears the memo,
+            # so the same in-place state becomes visible.
+            self._set_active(True)
+            assert info.is_metaclass() is True
+            assert_equal(len(calls), 2, "boundary clear must force recompute")
+
+        self._with_counting_delegate(run)
+
+    def test_empty_mro_never_memoized(self) -> None:
+        self._clear_memo()
+        info = self._typeinfo()
+        info.mro = []
+
+        def run(calls: list[bool]) -> None:
+            from types import SimpleNamespace
+
+            assert info.is_metaclass() is False
+            # Empty-MRO placeholders must not be memoized: their MRO can
+            # still be bound later in the same build.
+            info.mro.append(SimpleNamespace(fullname="builtins.type"))  # type: ignore[arg-type]
+            assert info.is_metaclass() is True
+            assert_equal(len(calls), 2, "empty-MRO queries always recompute")
+
+        self._with_counting_delegate(run)
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeDecoratedFunctionIsMethodSuite(Suite):
     """Parity for the Rust `check_decorated_function_is_method` predicate port.
 
