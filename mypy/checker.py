@@ -392,6 +392,7 @@ try:
         rust_is_unsafe_overlapping_overload_signatures as _rust_is_unsafe_overlapping_overload_signatures,
         rust_is_untyped_decorator as _rust_is_untyped_decorator,
         rust_is_valid_inferred_type as _rust_is_valid_inferred_type,
+        rust_is_writable_attribute as _rust_is_writable_attribute,
         rust_narrow_type_by_identity_equality as _rust_narrow_type_by_identity_equality,
         rust_narrow_with_len as _rust_narrow_with_len,
         rust_or_conditional_maps as _rust_or_conditional_maps,
@@ -452,6 +453,7 @@ except ImportError:
     _rust_is_untyped_decorator = None  # type: ignore[assignment]
     _rust_is_typeddict_type_context = None  # type: ignore[assignment]
     _rust_is_valid_inferred_type = None  # type: ignore[assignment]
+    _rust_is_writable_attribute = None  # type: ignore[assignment]
     _rust_is_more_general_arg_prefix = None  # type: ignore[assignment]
     _rust_overload_can_never_match = None  # type: ignore[assignment]
     _rust_is_equality_ambiguous_for_narrowing = None  # type: ignore[assignment]
@@ -10166,6 +10168,19 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
 
     def is_writable_attribute(self, node: Node) -> bool:
         """Check if an attribute is writable"""
+        # Native type_kernel seam: the whole predicate is a pure bool over
+        # the live node; Rust reads it via PyO3 and returns the bool.
+        if (
+            _CHECKER_HAS_TYPE_KERNEL
+            and _native_checker_active
+            and _rust_is_writable_attribute is not None
+        ):
+            try:
+                result = _rust_is_writable_attribute(node)
+                if result is not None:
+                    return result
+            except (AssertionError, NotImplementedError, ValueError, TypeError):
+                pass
         if isinstance(node, Var):
             if node.is_property and not node.is_settable_property:
                 return False
