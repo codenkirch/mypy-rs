@@ -127,15 +127,17 @@ fn is_descriptor_wire(typ: &Type, resolver: &TypeResolver) -> Option<bool> {
     }
 }
 
-/// `TypeInfo.get(name)` (nodes.py:4063-4068) walking the live MRO: return
+/// `TypeInfo.get(name)` (nodes.py:4062-4066) walking the live MRO: return
 /// the first `(TypeInfo, SymbolTableNode)` whose own `names` dict contains
-/// `name`. `None` when absent or when any MRO class lacks `.names`.
+/// `name`. Python looks up with `names.get(name)` (None-safe, never
+/// raises), so a missing key on one base must continue the walk, not
+/// abort it. `None` when absent or when any MRO class lacks `.names`.
 fn mro_get(py: Python<'_>, info: &PyAny, name: &str) -> Option<(PyObject, PyObject)> {
     let mro = info.getattr("mro").ok()?;
     let mro_list = mro.downcast::<PyList>().ok()?;
     for base in mro_list.iter() {
         let names = base.getattr("names").ok()?;
-        let value = names.get_item(name).ok()?;
+        let value = names.getattr("get").ok()?.call1((name,)).ok()?;
         if !value.is_none() {
             return Some((base.to_object(py), value.to_object(py)));
         }
@@ -932,6 +934,11 @@ pub(crate) fn rust_join_type_list(
 ///        classvar, inferred var, no PartialType) -> expand `var.type` by
 ///        the receiver preserving type-var ids, matching
 ///        `find_node_type`'s non-callable tail.
+///   4. The find_member miss path (member absent from the MRO, or the
+///      found symbol's `node` still None): the `__getattribute__` /
+///      `__getattr__` accessor scan runs via `get_method_definer`; with no
+///      non-object accessor, `fallback_to_any` -> `AnyType(special_form)`,
+///      otherwise a plain miss -> `None` (`member_miss_decision`).
 ///
 /// Defers (returns `None`) whenever anything needs plugins, descriptors,
 /// class-attribute access, error emission, live checker state, or a
@@ -964,7 +971,12 @@ pub(crate) fn get_protocol_member_inner(
         // present extra_attrs cannot be decided here.
         return Some(GetProtocolMemberResult::Defer);
     }
-    let snap = resolver.resolver().get(type_ref)?;
+    let snap = match resolver.resolver().get(type_ref) {
+        Some(s) => s,
+        None => {
+            return None;
+        }
+    };
 
     if member == "__call__" && class_obj {
         // type_object_type(left.type): the constructor type. This needs
@@ -977,7 +989,6 @@ pub(crate) fn get_protocol_member_inner(
         // Avoid falling back to metaclass __call__; return None.
         return Some(GetProtocolMemberResult::NoneVal);
     }
-
     if member == "__init__" {
         // analyze_instance_member_access (checkmember.py:616-621) filters
         // `__init__` access to final methods / super; anything else issues
@@ -1009,7 +1020,10 @@ pub(crate) fn get_protocol_member_inner(
     let (sym_info, sym_node) = match mro_get(py, info, member) {
         Some(pair) => pair,
         None => {
-            return Some(GetProtocolMemberResult::Defer);
+            // find_member miss path: `info.get(name)` found nothing. The
+            // decidable arms (accessor scan + fallback_to_any -> AnyType,
+            // plain miss -> None) run in Rust; anything else defers.
+            return member_miss_decision(py, info, member, snap);
         }
     };
     let sym_info: &PyAny = sym_info.as_ref(py);
@@ -1021,10 +1035,9 @@ pub(crate) fn get_protocol_member_inner(
     };
     let node_ref: &PyAny = node.as_ref(py);
     if node_ref.is_none() {
-        // find_member falls to the missing-attribute path (getattr /
-        // fallback_to_any / extra_attrs / None). All need checker state
-        // or error emission -> defer.
-        return Some(GetProtocolMemberResult::Defer);
+        // A present symbol with an unfilled `node` takes the same miss
+        // path in Python (`if not node:` in find_member).
+        return member_miss_decision(py, info, member, snap);
     }
     let class_name = node_ref.get_type().name().unwrap_or("").to_string();
     match class_name.as_str() {
@@ -1146,9 +1159,103 @@ pub(crate) fn get_protocol_member_inner(
         _ => {
             // Decorator, MypyFile, TypeInfo, TypeAlias, TypeVarLikeExpr,
             // PlaceholderNode: defer.
+
             Some(GetProtocolMemberResult::Defer)
         }
     }
+}
+
+/// The find_member miss path (subtypes.py:2072-2089) for a protocol
+/// member absent from the receiver's MRO: the `__getattribute__` /
+/// `__getattr__` accessor scan, then the `fallback_to_any` AnyType arm,
+/// then the plain miss.
+///
+/// Python runs this when `info.get(name)` finds nothing or the found
+/// symbol's `node` is None. The `extra_attrs` attr-hit arm is unreachable
+/// here (the whole Instance-left path defers when `extra_attrs` is
+/// present) and the `meta_fallback_to_any` arm needs `class_obj` (also
+/// deferred upstream), so only the two decidable arms remain.
+///
+/// Returns `None` (defer) when any MRO accessor lookup is unreadable —
+/// a wrong "no accessor" answer would skip the getattr member type.
+fn member_miss_decision(
+    py: Python<'_>,
+    info: &PyAny,
+    member: &str,
+    snap: &crate::typeinfo::TypeInfoSnapshot,
+) -> Option<GetProtocolMemberResult> {
+    if !matches!(member, "__getattr__" | "__setattr__" | "__getattribute__") {
+        for method_name in ["__getattribute__", "__getattr__"] {
+            if let Some(definer) = get_method_definer(py, info, method_name)? {
+                if definer != "builtins.object" {
+                    // An accessor is defined on a non-object class: the
+                    // member type comes from find_node_type on the
+                    // accessor (its ret_type) -> defer.
+                    return Some(GetProtocolMemberResult::Defer);
+                }
+            }
+        }
+    }
+    if snap.fallback_to_any {
+        return Some(GetProtocolMemberResult::Found(Type::AnyType {
+            type_of_any: 6, // TypeOfAny.special_form
+            source_any: None,
+            missing_import_name: None,
+        }));
+    }
+    Some(GetProtocolMemberResult::NoneVal)
+}
+
+/// Mirror `TypeInfo.get_method` (nodes.py:4167) returning the defining
+/// class's fullname: `Some(Some(fullname))` when a FuncBase / Decorator
+/// method is found on class `fullname`, `Some(None)` when the walk found
+/// a non-function node (get_method stops and returns None) or nothing,
+/// `None` on any read failure (defer).
+fn get_method_definer(_py: Python<'_>, info: &PyAny, name: &str) -> Option<Option<String>> {
+    let mro = info.getattr("mro").ok()?;
+    let mro_list = mro.downcast::<PyList>().ok()?;
+    for cls in mro_list.iter() {
+        let names = cls.getattr("names").ok()?;
+        let sym = match names.get_item(name) {
+            Ok(s) if !s.is_none() => s,
+            _ => {
+                // No exact entry: check the `{name}-redefinition` entries,
+                // taking the last in sorted order (nodes.py:4170-4174).
+                let keys = names.call_method0("keys").ok()?;
+                let mut redef: Vec<String> = Vec::new();
+                for key in keys.iter().ok()? {
+                    let key: String = key.ok()?.extract().ok()?;
+                    if key.starts_with(&format!("{name}-redefinition")) {
+                        redef.push(key);
+                    }
+                }
+                redef.sort();
+                match redef.pop() {
+                    Some(k) => match names.get_item(k) {
+                        Ok(s) if !s.is_none() => s,
+                        _ => continue,
+                    },
+                    None => continue,
+                }
+            }
+        };
+        let node = match sym.getattr("node") {
+            Ok(n) => n,
+            Err(_) => return None,
+        };
+        let class_name = match node.get_type().name() {
+            Ok(n) => n.to_string(),
+            Err(_) => return None,
+        };
+        if class_name == "FuncDef" || class_name == "OverloadedFuncDef" || class_name == "Decorator"
+        {
+            let fullname = get_opt_str_attr(cls, "fullname")?;
+            return Some(Some(fullname));
+        }
+        // Found-but-non-function node stops the walk with None.
+        return Some(None);
+    }
+    Some(None)
 }
 
 /// The `live_strict_optional` read from `mypy.state` (checkmember.py uses

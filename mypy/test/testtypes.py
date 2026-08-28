@@ -42510,3 +42510,219 @@ class NativeArgVarianceWalkSuite(Suite):
         nr_obj = Instance(self.nr, [self.fx.o])
         assert self._direct_seam(nr_str, nr_obj) is None
         assert self._differential(nr_str, nr_obj) is True
+
+
+class NativeProtocolMemberMissSuite(Suite):
+    """Parity for the find_member miss path in `get_protocol_member_inner`
+    (issue #1099).
+
+    The mro-miss / node-None head (`member_miss_decision`) decides the
+    decidable arms of `find_member_simple`'s missing-attribute path: the
+    `__getattribute__` / `__getattr__` accessor scan (defer on a
+    non-object definer), `fallback_to_any` -> `AnyType(special_form)`,
+    and the plain miss -> None. The live `TypeInfo.get` MRO walk
+    (`mro_get`) and the implementation loop's `mro_has` pre-check must
+    look up with `names.get(name)` semantics: a missing key on one MRO
+    base continues the walk (a dict subscript raises `KeyError` on the
+    first base lacking the name and would silently truncate the walk).
+
+    Each member lookup is run through the public Python shim
+    `mypy.subtypes.get_protocol_member` twice (gate off = pure Python,
+    gate on = resolver-backed seam) and the results compared; direct
+    seam calls prove which verdict the Rust side reached (None = defer,
+    empty = decided miss, bytes = found).
+    """
+
+    def setUp(self) -> None:
+        self.fx = TypeFixture()
+        self._live_info: dict[str, TypeInfo] = {}
+
+    def _method(self, info: TypeInfo, ret: Type) -> CallableType:
+        """A plain method `def f(self: info) -> ret`."""
+        return CallableType(
+            [Instance(info, [])], [ARG_POS], [None], ret, self.fx.function
+        )
+
+    def _class(
+        self,
+        fullname: str,
+        mro_bases: list[TypeInfo],
+        methods: dict[str, Type] | None = None,
+        none_nodes: list[str] | None = None,
+        *,
+        protocol: bool = False,
+        fallback_to_any: bool = False,
+    ) -> TypeInfo:
+        info = self.fx.make_type_info(fullname)
+        info.mro = [info, *mro_bases, self.fx.oi]
+        if protocol:
+            info.is_protocol = True
+        if fallback_to_any:
+            info.fallback_to_any = True
+        for name, ret in (methods or {}).items():
+            node = FuncDef(name, [], None, None)
+            node.info = info
+            node.type = CallableType(
+                [Instance(info, [])], [ARG_POS], [None], ret, self.fx.function
+            )
+            node.line = 1
+            node.column = 1
+            info.names[name] = SymbolTableNode(MDEF, node)
+        for name in none_nodes or []:
+            info.names[name] = SymbolTableNode(MDEF, None)
+        self._live_info[fullname] = info
+        return info
+
+    def _build_resolver(self) -> None:
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        type_infos = []
+        for name in dir(self.fx):
+            if name.endswith("i"):
+                value = getattr(self.fx, name)
+                if _is_type_info(value):
+                    type_infos.append(value)
+        type_infos.extend(list(self._live_info.values()))
+        self.resolver = _type_kernel.build_native_resolver(type_infos, [])
+        self.resolver.set_live_typeinfo_map(dict(self._live_info))
+        set_wire_typeinfo_map(dict(self._live_info))
+
+    def _restore(self) -> None:
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        set_wire_typeinfo_map(None)
+
+    def _serialize(self, typ: Type) -> bytes:
+        from mypy.subtypes import _serialize_type
+
+        return _serialize_type(typ)
+
+    def _parity(self, itype: Instance, member: str) -> tuple[Type | None, Type | None]:
+        """`get_protocol_member` with the gate off, then on."""
+        from mypy import subtypes
+
+        subtypes._set_native_subtype_active(False)
+        off = subtypes.get_protocol_member(itype, itype, member, False)
+        subtypes._set_native_subtype_resolver(self.resolver)
+        subtypes._set_native_subtype_active(True)
+        try:
+            on = subtypes.get_protocol_member(itype, itype, member, False)
+        finally:
+            subtypes._set_native_subtype_active(False)
+            subtypes._set_native_subtype_resolver(None)
+        return off, on
+
+    def _raw(self, itype: Instance, member: str) -> Any:
+        """Direct seam call: None = defer, empty = decided miss, bytes = found."""
+        return _type_kernel.rust_get_protocol_member(
+            self._serialize(itype),
+            self._serialize(itype),
+            member,
+            False,
+            False,
+            self.resolver,
+        )
+
+    def test_plain_miss_decides_none_parity(self) -> None:
+        """A member absent from the whole MRO (no accessor, no fallback)
+        is a decided miss: Rust NoneVal, Python None."""
+        i = self._class("mod.PlainMiss", [], None)
+        self._build_resolver()
+        off, on = self._parity(Instance(i, []), "f")
+        assert off is None and on is None
+        raw = self._raw(Instance(i, []), "f")
+        assert raw is not None and len(raw) == 0, f"expected decided miss, got {raw!r}"
+        self._restore()
+
+    def test_fallback_to_any_parity(self) -> None:
+        """`fallback_to_any` miss -> `AnyType(special_form)` both ways."""
+        i = self._class("mod.AnyFallback", [], None, fallback_to_any=True)
+        self._build_resolver()
+        off, on = self._parity(Instance(i, []), "f")
+        assert off is not None and on is not None
+        assert str(off) == str(on) == str(AnyType(TypeOfAny.special_form)), (
+            f"fallback mismatch: off={off!r} on={on!r}"
+        )
+        raw = self._raw(Instance(i, []), "f")
+        assert raw is not None and len(raw) > 0, f"expected found bytes, got {raw!r}"
+        self._restore()
+
+    def test_getattr_accessor_defers_parity(self) -> None:
+        """`__getattr__` defined on a non-object class defers; the Python
+        tail (accessor ret type) answers identically both ways."""
+        i = self._class("mod.HasGetattr", [], {"__getattr__": self.fx.a})
+        self._build_resolver()
+        off, on = self._parity(Instance(i, []), "f")
+        assert str(off) == str(on), f"accessor mismatch: off={off!r} on={on!r}"
+        raw = self._raw(Instance(i, []), "f")
+        assert raw is None, f"accessor must defer, got {raw!r}"
+        self._restore()
+
+    def test_node_none_miss_parity(self) -> None:
+        """A present symbol with an unfilled node takes the same miss
+        path in Python (`if not node:`)."""
+        i = self._class("mod.NodeNone", [], None, none_nodes=["f"])
+        self._build_resolver()
+        off, on = self._parity(Instance(i, []), "f")
+        assert off is None and on is None, f"node-None mismatch: {off!r} vs {on!r}"
+        raw = self._raw(Instance(i, []), "f")
+        assert raw is not None and len(raw) == 0, f"expected decided miss, got {raw!r}"
+        self._restore()
+
+    def test_member_on_base_class_continues_walk(self) -> None:
+        """The member lives on a base class: the MRO walk must find it
+        (a `KeyError` on the first base must not truncate the walk);
+        the same-class guard then defers to Python."""
+        b = self._class("mod.BaseWithF", [], {"f": self.fx.a})
+        i = self._class("mod.DerivedNoF", [b], None)
+        self._build_resolver()
+        off, on = self._parity(Instance(i, []), "f")
+        assert str(off) == str(on), f"base-member mismatch: off={off!r} on={on!r}"
+        raw = self._raw(Instance(i, []), "f")
+        assert raw is None, f"base-defined member must defer, got {raw!r}"
+        self._restore()
+
+    def _loop_call(self, left: Instance, right: Instance) -> bool | None:
+        """`rust_is_protocol_implementation` with the subtype gate on."""
+        from mypy.subtypes import _set_native_subtype_active
+
+        _set_native_subtype_active(True)
+        try:
+            return _type_kernel.rust_is_protocol_implementation(
+                self._serialize(left),
+                self._serialize(right),
+                [],
+                False,
+                False,
+                False,
+                False,
+                False,
+                True,
+                False,
+                False,
+                self.resolver,
+            )
+        finally:
+            _set_native_subtype_active(False)
+
+    def test_impl_member_on_base_loop_defers_not_false(self) -> None:
+        """Implementation loop: an impl whose member lives on a base must
+        not be rejected by the `mro_has` pre-check (it defers instead)."""
+        b = self._class("mod.LoopBase", [], {"f": self.fx.a})
+        p = self._class("mod.LoopProto", [], {"f": self.fx.a}, protocol=True)
+        i = self._class("mod.LoopDerived", [b], None)
+        self._build_resolver()
+        # The member resolves on the base class, which the same-class
+        # guard defers: the loop must defer, never decide False.
+        result = self._loop_call(Instance(i, []), Instance(p, []))
+        assert result is None, f"expected deferral, got {result!r}"
+        self._restore()
+
+    def test_missing_member_loop_decides_false(self) -> None:
+        """A genuinely absent member is decided False by the loop."""
+        p = self._class("mod.MissProto", [], {"f": self.fx.a}, protocol=True)
+        i = self._class("mod.MissDerived", [], None)
+        self._build_resolver()
+        result = self._loop_call(Instance(i, []), Instance(p, []))
+        assert result is False, f"missing member must be False, got {result!r}"
+        self._restore()

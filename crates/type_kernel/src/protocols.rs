@@ -218,6 +218,10 @@ fn extra_attrs(_t: &Type) -> Option<&pyo3::PyAny> {
 /// True iff `name` resolves via a `names` walk of `info`'s MRO (the
 /// same walk `get_protocol_member_inner` uses; a missing name there is
 /// determinate "member absent" for the implementation loop).
+///
+/// Looks up with `names.get(name)` (mirroring `TypeInfo.get`): a missing
+/// key on one base must continue the walk, not abort it — a dict
+/// subscript raises `KeyError` on the first base that lacks the name.
 fn mro_has(info: &PyAny, name: &str) -> bool {
     let mro = match info.getattr("mro") {
         Ok(m) => m,
@@ -232,7 +236,11 @@ fn mro_has(info: &PyAny, name: &str) -> bool {
             Ok(n) => n,
             Err(_) => return false,
         };
-        match names.get_item(name) {
+        let get = match names.getattr("get") {
+            Ok(g) => g,
+            Err(_) => return false,
+        };
+        match get.call1((name,)) {
             Ok(v) => {
                 if !v.is_none() {
                     return true;
