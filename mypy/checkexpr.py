@@ -2927,18 +2927,23 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
             # in constraint generation (constraints.py:514, 633): recursive
             # templates are solved by special-casing. Defer those to Python.
             has_rec_ctx = has_recursive_types(callee)
+            # dict(...) with keyword args needs Python's dict special-case
+            # (the KEYWORD_ARGUMENT_REQUIRES_STR_KEY_TYPE fail and the str-key
+            # rewrite are checker side effects): defer those calls.
+            py_dict_kwargs = callee.special_sig == "dict" and (
+                ARG_NAMED in arg_kinds or ARG_STAR2 in arg_kinds
+            )
             if (
                 _CHECKEXPR_HAS_TYPE_KERNEL
                 and _native_checkcall_active
                 and _native_checkexpr_resolver is not None
                 and not need_refresh
                 and not has_rec_ctx
+                and not py_dict_kwargs
             ):
                 # Collect arg types and formal-to-actual mapping for Rust.
                 # Accept each arg with its formal type as context (mirroring
-                # infer_arg_types_in_context) so lambdas keep parameter/return
-
-                # narrowing; bare accept() degrades them to Any.
+                # infer_arg_types_in_context) so lambdas keep narrowing.
                 try:
                     # arg_context[ai] = callee.arg_types[fi] for non-star actuals.
                     arg_context: list[Any | None] = [None] * len(args)
@@ -2994,6 +2999,7 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
                                     callee = resolved_callee
                                     # Native solve succeeded; skip Python's infer pass.
                                     native_solved = True
+                            # Rust returned None: fall through to Python below.
                 except (AssertionError, NotImplementedError, ValueError, TypeError):
                     pass  # Defer to Python
 

@@ -1397,14 +1397,18 @@ fn solve_constraints_native(
             // No usable bounds: ambiguous Never (solve.py:470-474).
             Some(Type::UninhabitedType { ambiguous: true })
         } else {
-            let out = solve_one_inner(
+            let out = match solve_one_inner(
                 &lowers,
                 &filtered_uppers,
                 infer_unions,
                 strict_optional,
                 resolver,
-            )
-            .ok_or(())?;
+            ) {
+                Some(o) => o,
+                None => {
+                    return Err(());
+                }
+            };
             match out {
                 (0, Some(bytes)) | (1, Some(bytes)) | (3, Some(bytes)) => {
                     let typ = decode_type(&bytes).ok_or(())?;
