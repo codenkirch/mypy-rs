@@ -12,7 +12,7 @@
 //! flags       = (sub/super member-flags checks for settable/classvar)
 //! ```
 //!
-//! This port decides the pure member-compat loop only:
+//! This port decides the pure member-compat loop:
 //!   * both member lookups run through `get_protocol_member_inner`
 //!     (checker_helpers.rs), which mirrors `find_member`'s
 //!     plain-method / plain-Var path and defers on anything needing
@@ -22,20 +22,25 @@
 //!     `ignore_pos_arg_names` (Python: `is_subtype(subtype, supertype,
 //!     ignore_pos_arg_names=ignore_names, options=options)`) and the
 //!     caller's `proper_subtype`;
-//!   * the member-flag loop (IS_SETTABLE / IS_CLASSVAR /
-//!     IS_CLASS_OR_STATIC rejections) is mirrored only in the trivial
-//!     direction: when both flag sets are subsets of {IS_VAR} the flags
-//!     cannot reject, so Rust decides; any other flag combination
-//!     defers to the pure-Python body, which runs the full check.
+//!   * the member-flag loop (subtypes.py:2025-2055, IS_SETTABLE /
+//!     IS_CLASSVAR / IS_CLASS_OR_STATIC rejections) is mirrored from the
+//!     two flag sets and the already-extracted member types; members
+//!     carrying IS_EXPLICIT_SETTER need lvalue re-resolution and defer;
+//!   * the `assuming` recursion guard (subtypes.py:1972-1976) is mirrored
+//!     by the caller (`subtypes.rs:protocol_right_decision`) with a
+//!     thread-local stack keyed by the proper-subtype dimension.
 //!
-//! Deferral is the safe default: recursion through `assuming` is not
-//! mirrored (the snapshot omits the recursive-protocol matrices), so a
-//! protocol left (the recursion-prone case) defers wholesale.
+//! Deferral is the safe default: a protocol left (the recursion-prone
+//! `assuming` consumer itself) still defers wholesale, as does any member
+//! the lookups cannot decide (descriptors, extra_attrs/module instances,
+//! base-class-defined members behind the same-class guard).
 
 use crate::checker_helpers::{get_protocol_member_inner, GetProtocolMemberResult};
-use crate::member_flags::get_member_flags_inner_pub;
+use crate::member_flags::{
+    get_member_flags_inner_pub, IS_CLASSVAR, IS_CLASS_OR_STATIC, IS_EXPLICIT_SETTER, IS_SETTABLE,
+};
 use crate::subtypes::{is_subtype, SubtypeContext};
-use crate::typeinfo::NativeTypeResolver;
+use crate::typeinfo::{NativeTypeResolver, TypeResolver};
 use crate::wire::{read_type, ReadBuffer, Type};
 use pyo3::prelude::*;
 
@@ -47,18 +52,6 @@ fn decode_type(bytes: &[u8]) -> Option<Type> {
 /// Always-skipped members (subtypes.py:1801-1803).
 fn member_is_skipped(member: &str, skip: &[String]) -> bool {
     member == "__init__" || member == "__new__" || skip.iter().any(|m| m == member)
-}
-
-/// The member-flag loop (subtypes.py:1877-1907) can only reject on
-/// IS_SETTABLE / IS_CLASSVAR / IS_CLASS_OR_STATIC; when both sides
-/// carry only IS_VAR (or nothing) the loop cannot change the
-/// member-compat verdict, so Rust decides without it. `get_member_flags`
-/// returns `[]` for plain/decorated methods and `[IS_VAR]` for vars
-/// (member_flags.rs), so both are trivial.
-const IS_VAR: i64 = 4;
-
-fn flags_trivial(flags: &[i64]) -> bool {
-    flags.iter().all(|f| *f == IS_VAR)
 }
 
 /// `is_protocol_implementation` member loop, Rust common path.
@@ -73,16 +66,16 @@ pub(crate) fn is_protocol_implementation_inner(
     right: &Type,
     skip: &[String],
     ctx: &SubtypeContext,
-    resolver: &NativeTypeResolver,
+    resolver: &TypeResolver,
 ) -> Option<bool> {
-    let right_snap = resolver.resolver().get(right_ref(right)?)?;
+    let right_snap = resolver.get(right_ref(right)?)?;
     if !right_snap.is_protocol {
         // Non-protocol right must defer to SubtypeVisitor.
         return None;
     }
     // Protocol-left: recursion-prone (`assuming` guard not mirrored).
     // Defer to Python's guarded loop.
-    let left_snap = resolver.resolver().get(left_ref(left)?);
+    let left_snap = resolver.get(left_ref(left)?);
     if left_snap.is_some_and(|s| s.is_protocol) {
         return None;
     }
@@ -92,14 +85,6 @@ pub(crate) fn is_protocol_implementation_inner(
         .filter(|m| !member_is_skipped(m, skip))
         .collect();
     for member in members {
-        // Missing-member pre-check: if the member is absent from the
-        // impl's `names` MRO, Python returns False. Decide it here.
-        let left_ref_str = left_ref(left)?;
-        if let Some(live_info) = resolver.live_typeinfo(py, left_ref_str) {
-            if !mro_has(live_info, member) {
-                return Some(false);
-            }
-        }
         let sub = match get_protocol_member_inner(py, left, member, false, false, resolver) {
             Some(GetProtocolMemberResult::Found(t)) => Some(t),
             Some(GetProtocolMemberResult::NoneVal) => None,
@@ -139,7 +124,7 @@ pub(crate) fn is_protocol_implementation_inner(
             member != "__call__",
             ctx.strict_concatenate,
         );
-        match is_subtype(&sub, &sup, &member_ctx, resolver.resolver()) {
+        match is_subtype(&sub, &sup, &member_ctx, resolver) {
             Some(true) => {}
             Some(false) => {
                 return Some(false);
@@ -153,9 +138,9 @@ pub(crate) fn is_protocol_implementation_inner(
         if matches!(sub, Type::NoneType) && matches!(sup, Type::CallableType { .. }) {
             return Some(false);
         }
-        // Member-flag loop: only decided in the trivial direction. Both
-        // sides must be plain vars (flags == {IS_VAR}); any other flag
-        // combination can reject and defers to Python.
+        // Member-flag loop (subtypes.py:2025-2055): reads both flag sets
+        // off the live Var nodes; any flag set the kernel cannot compute
+        // defers to Python, which recomputes it exactly.
         let left_ref = left_ref(left)?;
         let right_ref = right_ref(right)?;
         let left_info = resolver.live_typeinfo(py, left_ref)?;
@@ -190,8 +175,50 @@ pub(crate) fn is_protocol_implementation_inner(
                 return None;
             }
         };
-        if !flags_trivial(&subflags) || !flags_trivial(&superflags) {
-            return None;
+        // Member-flag loop (subtypes.py:2025-2055), decided whenever the
+        // arbitration hangs only off the two flag sets and the already
+        // extracted member types. Explicit-setter members need lvalue
+        // re-resolution (find_member / get_protocol_member with
+        // is_lvalue=True) and defer.
+        let settable_sub = subflags.contains(&IS_SETTABLE);
+        let settable_super = superflags.contains(&IS_SETTABLE);
+        if settable_super {
+            if superflags.contains(&IS_EXPLICIT_SETTER) || subflags.contains(&IS_EXPLICIT_SETTER) {
+                return None;
+            }
+            // Reversed subtype check (subtypes.py:2035-2037): plain
+            // is_subtype(supertype, subtype) — fresh visitor, so
+            // proper_subtype=False, ignore_pos_arg_names=False; the
+            // strict flags derive from the same options, hence ctx's.
+            let rev_ctx = SubtypeContext::with_callable_flags(
+                false,
+                false,
+                false,
+                false,
+                false, // proper_subtype
+                ctx.strict_optional,
+                false, // ignore_pos_arg_names
+                ctx.strict_concatenate,
+            );
+            match is_subtype(&sup, &sub, &rev_ctx, resolver) {
+                Some(true) => {}
+                Some(false) => return Some(false),
+                None => return None,
+            }
+        }
+        if settable_super && !settable_sub {
+            return Some(false);
+        }
+        // class_obj is always false here (the inner defers on class_obj).
+        if !settable_super {
+            if superflags.contains(&IS_CLASSVAR) && !subflags.contains(&IS_CLASSVAR) {
+                return Some(false);
+            }
+        } else if subflags.contains(&IS_CLASSVAR) != superflags.contains(&IS_CLASSVAR) {
+            return Some(false);
+        }
+        if superflags.contains(&IS_CLASS_OR_STATIC) && !subflags.contains(&IS_CLASS_OR_STATIC) {
+            return Some(false);
         }
     }
     Some(true)
@@ -213,43 +240,6 @@ fn extra_attrs(_t: &Type) -> Option<&pyo3::PyAny> {
     // extra_attrs already defers in `get_protocol_member_inner`, and the
     // flag loop here only needs the common no-extra_attrs case (None).
     None
-}
-
-/// True iff `name` resolves via a `names` walk of `info`'s MRO (the
-/// same walk `get_protocol_member_inner` uses; a missing name there is
-/// determinate "member absent" for the implementation loop).
-///
-/// Looks up with `names.get(name)` (mirroring `TypeInfo.get`): a missing
-/// key on one base must continue the walk, not abort it — a dict
-/// subscript raises `KeyError` on the first base that lacks the name.
-fn mro_has(info: &PyAny, name: &str) -> bool {
-    let mro = match info.getattr("mro") {
-        Ok(m) => m,
-        Err(_) => return false,
-    };
-    let mro_list = match mro.downcast::<pyo3::types::PyList>() {
-        Ok(l) => l,
-        Err(_) => return false,
-    };
-    for base in mro_list.iter() {
-        let names = match base.getattr("names") {
-            Ok(n) => n,
-            Err(_) => return false,
-        };
-        let get = match names.getattr("get") {
-            Ok(g) => g,
-            Err(_) => return false,
-        };
-        match get.call1((name,)) {
-            Ok(v) => {
-                if !v.is_none() {
-                    return true;
-                }
-            }
-            Err(_) => return false,
-        }
-    }
-    false
 }
 
 /// `#[pyfunction]` entry for `is_protocol_implementation`.
@@ -286,5 +276,5 @@ pub(crate) fn rust_is_protocol_implementation(
         ignore_pos_arg_names,
         strict_concatenate,
     );
-    is_protocol_implementation_inner(py, &left, &right, &skip, &ctx, resolver)
+    is_protocol_implementation_inner(py, &left, &right, &skip, &ctx, resolver.resolver())
 }

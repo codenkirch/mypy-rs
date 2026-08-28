@@ -18,15 +18,15 @@
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PySet, PyType};
 
-use crate::typeinfo::{serialize_type_to_bytes, NativeTypeResolver};
+use crate::typeinfo::{serialize_type_to_bytes, NativeTypeResolver, TypeResolver};
 use crate::wire::{self, ReadBuffer, Type};
 
 /// Flag constants, mirroring `mypy.subtypes` (subtypes.py:178-182).
-const IS_SETTABLE: i64 = 1;
-const IS_CLASSVAR: i64 = 2;
-const IS_CLASS_OR_STATIC: i64 = 3;
+pub(crate) const IS_SETTABLE: i64 = 1;
+pub(crate) const IS_CLASSVAR: i64 = 2;
+pub(crate) const IS_CLASS_OR_STATIC: i64 = 3;
 const IS_VAR: i64 = 4;
-const IS_EXPLICIT_SETTER: i64 = 5;
+pub(crate) const IS_EXPLICIT_SETTER: i64 = 5;
 
 /// Fetch a class from a module.
 fn py_class<'py>(py: Python<'py>, module: &str, name: &str) -> Option<&'py PyType> {
@@ -63,17 +63,13 @@ fn read_bool_attr(obj: &PyAny, attr: &str) -> Option<bool> {
 /// expanded on the wire (`get_proper_type`) so it defers. `relevant_items`
 /// drops NoneType items when strict_optional is off; `strict_optional`
 /// lets Rust decide the same filtering.
-fn is_descriptor(
-    typ_bytes: &[u8],
-    strict_optional: bool,
-    resolver: &NativeTypeResolver,
-) -> Option<bool> {
+fn is_descriptor(typ_bytes: &[u8], strict_optional: bool, resolver: &TypeResolver) -> Option<bool> {
     let mut buf = ReadBuffer::new(typ_bytes);
     let typ = wire::read_type(&mut buf, None).ok()?;
     match typ {
         Type::TypeAliasType { .. } => None,
         Type::Instance { type_ref, .. } => {
-            let snap = resolver.resolver().get(&type_ref)?;
+            let snap = resolver.get(&type_ref)?;
             Some(snap.member_definers.contains_key("__get__"))
         }
         Type::UnionType { items, .. } => {
@@ -173,7 +169,7 @@ fn get_member_flags_inner(
     class_obj: bool,
     extra_attrs: Option<&PyAny>,
     strict_optional: bool,
-    resolver: &NativeTypeResolver,
+    resolver: &TypeResolver,
 ) -> Option<Vec<i64>> {
     get_member_flags_inner_impl(
         py,
@@ -196,7 +192,7 @@ pub(crate) fn get_member_flags_inner_pub(
     class_obj: bool,
     extra_attrs: Option<&PyAny>,
     strict_optional: bool,
-    resolver: &NativeTypeResolver,
+    resolver: &TypeResolver,
 ) -> Option<Vec<i64>> {
     get_member_flags_inner_impl(
         py,
@@ -216,7 +212,7 @@ fn get_member_flags_inner_impl(
     class_obj: bool,
     extra_attrs: Option<&PyAny>,
     strict_optional: bool,
-    resolver: &NativeTypeResolver,
+    resolver: &TypeResolver,
 ) -> Option<Vec<i64>> {
     let method = get_method_node(info, name);
     let setattr_meth = has_setattr(info)?.then_some(());
@@ -299,8 +295,14 @@ fn get_member_flags_inner_impl(
                 let type_obj = v.getattr("type").ok()?;
                 if !type_obj.is_none() {
                     let bytes = serialize_type_to_bytes(py, type_obj)?;
-                    if is_descriptor(&bytes, strict_optional, resolver) == Some(false) {
-                        flags.push(IS_CLASSVAR);
+                    match is_descriptor(&bytes, strict_optional, resolver) {
+                        Some(false) => flags.push(IS_CLASSVAR),
+                        // Python computes `not is_descriptor(v.type)` with
+                        // a total predicate; an undecidable wire answer
+                        // must defer the flag set so the shim recomputes
+                        // it with the exact IS_CLASSVAR membership.
+                        None => return None,
+                        Some(true) => {}
                     }
                 }
             }
@@ -333,6 +335,6 @@ pub(crate) fn rust_get_member_flags(
         class_obj,
         extra_attrs,
         strict_optional,
-        resolver,
+        resolver.resolver(),
     )
 }

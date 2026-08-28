@@ -202,6 +202,13 @@ pub(crate) struct TypeResolver {
     /// `fullname -> ModuleSnapshot` for loaded modules. Populated from
     /// `BuildManager.modules`; mirrors the `module.names` SymbolTable.
     modules: HashMap<String, ModuleSnapshot>,
+    /// Live `fullname -> TypeInfo` map, moved here from
+    /// `NativeTypeResolver` so the subtype engine (which only holds a
+    /// `&TypeResolver`) can reach live TypeInfos for the protocol-right
+    /// port (member flags, `record_protocol_subtype_check`). Populated
+    /// via `set_live_typeinfo_map` from `BuildManager._native_typeinfo_map`.
+    /// `None` until set (engine protocol-right defers without it).
+    live_info_map: Option<PyObject>,
 }
 
 #[allow(dead_code)]
@@ -210,7 +217,29 @@ impl TypeResolver {
         Self {
             snapshots: HashMap::new(),
             modules: HashMap::new(),
+            live_info_map: None,
         }
+    }
+
+    /// Whether a live TypeInfo map is installed (engine protocol-right
+    /// sites defer without one, keeping pure-Rust tests interpreter-free).
+    pub(crate) fn has_live_info_map(&self) -> bool {
+        self.live_info_map.is_some()
+    }
+
+    /// Look up a live `TypeInfo` (as `&PyAny`) by fullname from the
+    /// `live_info_map` installed by `set_live_typeinfo_map`. `None` when no
+    /// map is installed or the fullname is absent. Used by enum-member reads
+    /// that need current (non-snapshot) data, and by the protocol-right
+    /// subtype site.
+    pub(crate) fn live_typeinfo<'py>(
+        &'py self,
+        py: Python<'py>,
+        fullname: &str,
+    ) -> Option<&'py PyAny> {
+        let map = self.live_info_map.as_ref()?;
+        let dict = map.as_ref(py).downcast::<PyDict>().ok()?;
+        dict.get_item(fullname).ok()?
     }
 
     pub fn insert(&mut self, fullname: String, snap: TypeInfoSnapshot) {
@@ -960,7 +989,8 @@ pub(crate) struct NativeTypeResolver {
     /// helpers read `is_enum` / `enum_members` live from here instead.
     /// Populated from `BuildManager._native_typeinfo_map` (live TypeInfos)
     /// at each `_build_native_resolvers` call. `None` until set.
-    live_info_map: Option<PyObject>,
+    /// (Storage lives on the inner `TypeResolver` so the subtype engine can
+    /// reach it; this struct only forwards the setter.)
     /// Module fullnames snapshotted so far. `update` re-reads `self.modules`
     /// each call but only snapshots modules not seen (first seal wins, like
     /// the TypeInfo side; a module's symbol table is final once its own SCC
@@ -1099,7 +1129,7 @@ impl NativeTypeResolver {
     /// `_build_native_resolvers` call, so member lists read through it are
     /// always current (coerce_to_literal / singleton helpers).
     fn set_live_typeinfo_map(&mut self, py: Python<'_>, map: Option<PyObject>) -> PyResult<()> {
-        self.live_info_map = map;
+        self.resolver.live_info_map = map;
         let _ = py;
         Ok(())
     }
@@ -1299,7 +1329,6 @@ impl NativeTypeResolver {
             resolver,
             alias_resolver,
             cached_dict: None,
-            live_info_map: None,
             seen_modules: HashSet::new(),
         }
     }
@@ -1325,9 +1354,7 @@ impl NativeTypeResolver {
         py: Python<'py>,
         fullname: &str,
     ) -> Option<&'py PyAny> {
-        let map = self.live_info_map.as_ref()?;
-        let dict = map.as_ref(py).downcast::<PyDict>().ok()?;
-        dict.get_item(fullname).ok()?
+        self.resolver.live_typeinfo(py, fullname)
     }
 
     /// Borrow the `TypeAliasResolver` so checkexpr helpers can expand

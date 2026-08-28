@@ -23827,9 +23827,9 @@ class NativeConditionalTypesSuite(Suite):
         self._assert_engages(enum_inst, ranges, None)
 
     def test_structural_protocol(self) -> None:
-        # proposed is a protocol. The Rust `is_subtype` defers protocol
-        # implementation checks (subtypes.rs returns None for Instance-vs-
-        # protocol right), so structural-BTS falls back to Python.
+        # proposed is a protocol. The Rust `is_subtype` port now decides
+        # protocol-right Instance pairs natively (issue #1111), so
+        # structural-BTS goes through the Rust path end to end.
         from mypy.checker import (
             _serialize_type_for_checker,
             _serialize_type_ranges,
@@ -23849,8 +23849,9 @@ class NativeConditionalTypesSuite(Suite):
             state.strict_optional,
             self.resolver,
         )
-        # Protocol implementation is Python-only: the seam must defer.
-        assert result is None, f"expected deferral for {current} vs protocol, got {result}"
+        # Structural protocol checks decide natively now: the seam returns
+        # the narrowed pair, and the Python answer below must be unchanged.
+        assert result is not None, f"Rust conditional_types did not engage for {current} vs protocol"
         (yes, no) = self._with_gate(True, lambda: conditional_types(current, ranges, None))
         assert_equal((str(yes), str(no)), ("None", "Never"))
 
