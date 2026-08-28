@@ -64,14 +64,14 @@ from mypy.types import (
     UninhabitedType,
     UnionType,
     UnpackType,
+    _serialize_with_taint_check,
+    _type_wire_cache,
+    _wire_cache_enabled,
     flatten_nested_unions,
     get_proper_type,
     get_proper_types,
     instance_cache,
     remove_dups,
-    _serialize_with_taint_check,
-    _type_wire_cache,
-    _wire_cache_enabled,
 )
 from mypy.typetraverser import TypeTraverserVisitor
 from mypy.typevars import fill_typevars
@@ -95,6 +95,14 @@ except ImportError:
 
 _native_typeops_active: bool = False
 _native_typeops_resolver: Any = None
+
+# Decision tags returned by `_type_kernel.rust_classify_type_object_type`
+# (#1059); must match TYPE_OBJECT_* in crates/type_kernel/src/typeops.rs.
+NATIVE_TYPE_OBJECT_ERROR_INIT = 0
+NATIVE_TYPE_OBJECT_ERROR_NEW = 1
+NATIVE_TYPE_OBJECT_INIT = 2
+NATIVE_TYPE_OBJECT_NEW = 3
+NATIVE_TYPE_OBJECT_TIE_ANY = 4
 
 
 def _needs_python(typ: Type) -> bool:
@@ -382,6 +390,69 @@ def get_self_type(func: CallableType, def_info: TypeInfo) -> Type | None:
         return None
 
 
+def _type_object_type_rust_head(
+    info: TypeInfo, classified: tuple[Any, ...], allow_cache: bool
+) -> ProperType:
+    """Apply the arbitration tag returned by `rust_classify_type_object_type`.
+
+    `classified` is `(tag, is_new, special_sig, uncached, method)`; the
+    uncached bit is re-checked here so `allow_cache` can be passed
+    through unmodified. Python applies every side effect: the
+    invalid-class-definition Any, fallback construction, the
+    universal-callable tie arm, the already-native
+    `type_object_type_from_function` tail, the tuple `special_sig`
+    fixup, and the cache write.
+    """
+    tag, is_new, special_sig, uncached, method = classified
+    if uncached:
+        allow_cache = False
+    if tag in (NATIVE_TYPE_OBJECT_ERROR_INIT, NATIVE_TYPE_OBJECT_ERROR_NEW):
+        # Must be an invalid class definition.
+        return AnyType(TypeOfAny.from_error)
+    if info.metaclass_type is not None:
+        fallback = info.metaclass_type
+    else:
+        type_type = lookup_stdlib_typeinfo("builtins.type", modules_state.modules)
+        fallback = Instance(type_type, [])
+    if tag == NATIVE_TYPE_OBJECT_TIE_ANY:
+        # Both are defined by object with a bogus base class:
+        # construct a universal callable as the prototype.
+        any_type = AnyType(TypeOfAny.special_form)
+        if instance_cache.function_type is None:
+            function_typeinfo = lookup_stdlib_typeinfo(
+                "builtins.function", modules_state.modules
+            )
+            instance_cache.function_type = Instance(function_typeinfo, [])
+        sig = CallableType(
+            arg_types=[any_type, any_type],
+            arg_kinds=[ARG_STAR, ARG_STAR2],
+            arg_names=["_args", "_kwds"],
+            ret_type=any_type,
+            is_bound=True,
+            fallback=instance_cache.function_type,
+        )
+        result = class_callable(sig, info, None, fallback, None, is_new=False)
+        if allow_cache and state.strict_optional:
+            info.type_object_type = result
+        return result
+    # tag is NATIVE_TYPE_OBJECT_INIT or NATIVE_TYPE_OBJECT_NEW.
+    if isinstance(method, FuncBase):
+        t = function_type(method, fallback)
+    else:
+        assert isinstance(method.type, ProperType)
+        assert isinstance(method.type, FunctionLike)  # is_valid_constructor() ensures this
+        t = method.type
+    result = type_object_type_from_function(t, info, method.info, fallback, is_new)
+    if special_sig:
+        assert isinstance(result, CallableType)
+        result = result.copy_modified(special_sig="tuple")
+    # Only write cached result is strict_optional=True, otherwise we may get
+    # inconsistent behaviour because of union simplification.
+    if allow_cache and state.strict_optional:
+        info.type_object_type = result
+    return result
+
+
 def type_object_type(
     info: TypeInfo, named_type: Callable[[str], Instance] | None = None
 ) -> ProperType:
@@ -404,6 +475,20 @@ def type_object_type(
         if allow_cache:
             return info.type_object_type
         info.type_object_type = None
+
+    # Native type_kernel seam (#1059): Rust decides the init-vs-new-vs-tie
+    # arbitration (plus the tuple special_sig and cache-write policy) from
+    # the live TypeInfo; Python applies every side effect in the shim below.
+    if _HAS_TYPE_KERNEL and _native_typeops_active:
+        try:
+            classified = _type_kernel.rust_classify_type_object_type(info)
+        except (AssertionError, NotImplementedError, ValueError):
+            classified = None
+        if classified is not None:
+            if classified[3]:
+                # Uncached: do not cache if the method's type is not ready.
+                allow_cache = False
+            return _type_object_type_rust_head(info, classified, allow_cache)
 
     # We take the type from whichever of __init__ and __new__ is first
     # in the MRO, preferring __init__ if there is a tie.

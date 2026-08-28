@@ -2566,6 +2566,12 @@ pub(crate) fn rust_is_valid_constructor(py: Python<'_>, n: &PyAny) -> PyResult<b
     if n.is_none() {
         return Ok(false);
     }
+    is_valid_constructor_inner(py, n)
+}
+
+/// Shared body of `is_valid_constructor`, reused by the `type_object_type`
+/// arbitration head (issue #1059). The `None` fast path is the caller's.
+pub(crate) fn is_valid_constructor_inner(py: Python<'_>, n: &PyAny) -> PyResult<bool> {
     let nodes_mod = py.import("mypy.nodes")?;
     let ofd_cls: &PyType = nodes_mod.getattr("OverloadedFuncDef")?.downcast()?;
     let fd_cls: &PyType = nodes_mod.getattr("FuncDef")?.downcast()?;
@@ -2596,6 +2602,244 @@ pub(crate) fn rust_is_valid_constructor(py: Python<'_>, n: &PyAny) -> PyResult<b
     }
     let fl_cls: &PyType = types_mod.getattr("FunctionLike")?.downcast()?;
     proper.is_instance(fl_cls)
+}
+
+// ---------------------------------------------------------------------------
+// type_object_type arbitration head (#1059)
+// ---------------------------------------------------------------------------
+
+/// Decision tags for the `type_object_type` arbitration head; must match
+/// `NATIVE_TYPE_OBJECT_*` in mypy/typeops.py.
+const TYPE_OBJECT_ERROR_INIT: i64 = 0;
+const TYPE_OBJECT_ERROR_NEW: i64 = 1;
+const TYPE_OBJECT_INIT: i64 = 2;
+const TYPE_OBJECT_NEW: i64 = 3;
+const TYPE_OBJECT_TIE_ANY: i64 = 4;
+
+/// Scalar facts the arbitration head decides from, gathered from the live
+/// `TypeInfo` by `gather_type_object_facts`. Index positions are
+/// `info.mro.index(method.node.info)`; validity is the presence + native
+/// `is_valid_constructor` verdict for each candidate; the tuple / uncached
+/// flags are per-candidate so the classifier can pick the chosen one.
+struct TypeObjectFacts {
+    init_valid: bool,
+    new_valid: bool,
+    init_index: usize,
+    new_index: usize,
+    // Tie arm: the __init__ node is defined on `builtins.object`.
+    init_info_is_object: bool,
+    fallback_to_any: bool,
+    // Defining class of each candidate method is `builtins.tuple`.
+    init_is_tuple: bool,
+    new_is_tuple: bool,
+    // The constructed class itself is `builtins.tuple` (skips special_sig).
+    info_is_tuple: bool,
+    // Candidate is an `OverloadedFuncDef` whose `.type` is still None.
+    init_uncached: bool,
+    new_uncached: bool,
+}
+
+/// Pure init-vs-new-vs-tie arbitration of `typeops.type_object_type`
+/// (typeops.py:350-461 head). Returns `(tag, is_new, special_sig,
+/// uncached)`. Branch order mirrors the Python body: missing/invalid
+/// `__init__` or `__new__` is an invalid class definition (error tags),
+/// then prefer `__init__` on the lower MRO index and `__new__` on the
+/// higher; on a tie prefer `__init__` unless the method is object's and
+/// the class falls back to Any (the universal-callable arm). The tuple
+/// `special_sig` and cache-disabling overloaded flag follow the chosen
+/// method; the TIE_ANY arm returns before them (Python returns early).
+fn classify_type_object_head(f: &TypeObjectFacts) -> (i64, bool, bool, bool) {
+    if !f.init_valid {
+        return (TYPE_OBJECT_ERROR_INIT, false, false, false);
+    }
+    if !f.new_valid {
+        return (TYPE_OBJECT_ERROR_NEW, false, false, false);
+    }
+    let (tag, is_new) = if f.init_index < f.new_index {
+        (TYPE_OBJECT_INIT, false)
+    } else if f.init_index > f.new_index {
+        (TYPE_OBJECT_NEW, true)
+    } else if f.init_info_is_object && f.fallback_to_any {
+        return (TYPE_OBJECT_TIE_ANY, false, false, false);
+    } else {
+        (TYPE_OBJECT_INIT, false)
+    };
+    let (chosen_is_tuple, chosen_uncached) = if is_new {
+        (f.new_is_tuple, f.new_uncached)
+    } else {
+        (f.init_is_tuple, f.init_uncached)
+    };
+    let special_sig = chosen_is_tuple && !f.info_is_tuple;
+    (tag, is_new, special_sig, chosen_uncached)
+}
+
+/// The arbitrated method node plus the gathered facts, so the entry can
+/// hand the chosen node to the Python shim.
+struct TypeObjectGathered<'a> {
+    facts: TypeObjectFacts,
+    init_node: &'a PyAny,
+    new_node: &'a PyAny,
+}
+
+/// Return shape of `rust_classify_type_object_type`: `(tag, is_new,
+/// special_sig, uncached, method)`.
+type TypeObjectClassification = (i64, bool, bool, bool, Option<PyObject>);
+
+/// `#[pyfunction]` entry for the `type_object_type` arbitration head
+/// (typeops.py:350-461). Reads the live `TypeInfo` via PyO3 and returns
+/// `(tag, is_new, special_sig, uncached, method)`: the arbitration tag,
+/// the is_new bit for the `type_object_type_from_function` tail, the
+/// tuple `special_sig` decision, the cache-disabling overloaded flag,
+/// and the arbitrated method node (None for the error / universal
+/// callable tags, where Python builds the result without a method).
+/// Python keeps the fallback construction, the already-native tail, and
+/// all cache writes. Defers (`None`) on any unreadable attribute, a
+/// non-list `mro`, or a method whose `info` is missing from the MRO; the
+/// Python caller then re-runs the pure-Python body, which decides or
+/// raises exactly as before the seam.
+#[pyfunction]
+pub(crate) fn rust_classify_type_object_type(
+    py: Python<'_>,
+    info: &PyAny,
+) -> PyResult<Option<TypeObjectClassification>> {
+    let gathered = match gather_type_object_facts(py, info) {
+        Ok(Some(g)) => g,
+        _ => return Ok(None),
+    };
+    let (tag, is_new, special_sig, uncached) = classify_type_object_head(&gathered.facts);
+    let method = match tag {
+        TYPE_OBJECT_INIT => Some(gathered.init_node.into_py(py)),
+        TYPE_OBJECT_NEW => Some(gathered.new_node.into_py(py)),
+        _ => None,
+    };
+    Ok(Some((tag, is_new, special_sig, uncached, method)))
+}
+
+/// Gathers the arbitration facts from the live `TypeInfo`, mirroring the
+/// Python body's read order: init presence/validity, new presence/
+/// validity, MRO indices, then the scalar facts of both candidates.
+/// Any PyO3 read failure surfaces as `Err`, which the entry maps to a
+/// deferral (`None`).
+fn gather_type_object_facts<'a>(
+    py: Python<'_>,
+    info: &'a PyAny,
+) -> PyResult<Option<TypeObjectGathered<'a>>> {
+    let init_method = info.call_method1("get", ("__init__",))?;
+    if init_method.is_none() {
+        // Missing `__init__`: invalid class definition; decided before
+        // any other fact is read.
+        return Ok(Some(TypeObjectGathered {
+            facts: error_facts(),
+            init_node: info,
+            new_node: info,
+        }));
+    }
+    let init_node = init_method.getattr("node")?;
+    if !is_valid_constructor_inner(py, init_node)? {
+        return Ok(Some(TypeObjectGathered {
+            facts: error_facts(),
+            init_node: info,
+            new_node: info,
+        }));
+    }
+    // There *should* always be a `__new__` method except the test stubs
+    // lack it, so Python copies init_method in that situation.
+    let new_method = info.call_method1("get", ("__new__",))?;
+    let (new_node, new_valid) = if new_method.is_none() {
+        (init_node, true)
+    } else {
+        let node = new_method.getattr("node")?;
+        (node, is_valid_constructor_inner(py, node)?)
+    };
+    if !new_valid {
+        return Ok(Some(TypeObjectGathered {
+            facts: error_facts(),
+            init_node: info,
+            new_node: info,
+        }));
+    }
+
+    let mro = info.getattr("mro")?;
+    let mro_list: &PyList = match mro.downcast() {
+        Ok(l) => l,
+        Err(_) => return Ok(None),
+    };
+    let init_index = match mro_index(mro_list, init_node.getattr("info")?) {
+        Some(i) => i,
+        None => return Ok(None),
+    };
+    let new_index = match mro_index(mro_list, new_node.getattr("info")?) {
+        Some(i) => i,
+        None => return Ok(None),
+    };
+
+    let init_info = init_node.getattr("info")?;
+    if init_info.is_none() {
+        return Ok(None);
+    }
+    let init_fullname: String = init_info.getattr("fullname")?.extract()?;
+    let new_info = new_node.getattr("info")?;
+    if new_info.is_none() {
+        return Ok(None);
+    }
+    let new_fullname: String = new_info.getattr("fullname")?.extract()?;
+    let info_fullname: String = info.getattr("fullname")?.extract()?;
+    let fallback_to_any = match read_bool_attr(info, "fallback_to_any") {
+        Some(b) => b,
+        None => return Ok(None),
+    };
+    let nodes_mod = py.import("mypy.nodes")?;
+    let ofd_cls: &PyType = nodes_mod.getattr("OverloadedFuncDef")?.downcast()?;
+    let is_uncached = |node: &PyAny| -> PyResult<bool> {
+        Ok(node.is_instance(ofd_cls)? && node.getattr("type")?.is_none())
+    };
+
+    Ok(Some(TypeObjectGathered {
+        facts: TypeObjectFacts {
+            init_valid: true,
+            new_valid,
+            init_index,
+            new_index,
+            init_info_is_object: init_fullname == "builtins.object",
+            fallback_to_any,
+            init_is_tuple: init_fullname == "builtins.tuple",
+            new_is_tuple: new_fullname == "builtins.tuple",
+            info_is_tuple: info_fullname == "builtins.tuple",
+            init_uncached: is_uncached(init_node)?,
+            new_uncached: is_uncached(new_node)?,
+        },
+        init_node,
+        new_node,
+    }))
+}
+
+/// Facts for the invalid-class-definition early returns: Python returns
+/// `AnyType(TypeOfAny.from_error)` without touching the cache.
+fn error_facts() -> TypeObjectFacts {
+    TypeObjectFacts {
+        init_valid: false,
+        new_valid: false,
+        init_index: 0,
+        new_index: 0,
+        init_info_is_object: false,
+        fallback_to_any: false,
+        init_is_tuple: false,
+        new_is_tuple: false,
+        info_is_tuple: false,
+        init_uncached: false,
+        new_uncached: false,
+    }
+}
+
+/// Identity-based `list.index` over the MRO; TypeInfo does not define
+/// `__eq__`, so Python's `list.index` compares by identity too.
+fn mro_index(mro: &PyList, needle: &PyAny) -> Option<usize> {
+    for (i, entry) in mro.iter().enumerate() {
+        if entry.is(needle) {
+            return Some(i);
+        }
+    }
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -4298,5 +4542,149 @@ mod tests {
             &mut empty_resolver(),
         );
         assert_eq!(r, None);
+    }
+}
+
+/// Pure decision-table tests for the `type_object_type` arbitration head
+/// (issue #1059). Live-TypeInfo coverage (gate differential, deferral,
+/// seam engagement) lives in `NativeTypeObjectArbitrationSuite` in
+/// mypy/test/testtypes.py.
+#[cfg(test)]
+mod type_object_head_tests {
+    use super::*;
+
+    fn base_facts() -> TypeObjectFacts {
+        TypeObjectFacts {
+            init_valid: true,
+            new_valid: true,
+            init_index: 1,
+            new_index: 1,
+            init_info_is_object: false,
+            fallback_to_any: false,
+            init_is_tuple: false,
+            new_is_tuple: false,
+            info_is_tuple: false,
+            init_uncached: false,
+            new_uncached: false,
+        }
+    }
+
+    fn facts_with(f: impl FnOnce(&mut TypeObjectFacts)) -> TypeObjectFacts {
+        let mut f_ = base_facts();
+        f(&mut f_);
+        f_
+    }
+
+    #[test]
+    fn test_invalid_init_wins_over_everything() {
+        // Missing/invalid __init__ short-circuits before __new__ reads.
+        let f = facts_with(|f| {
+            f.init_valid = false;
+            f.new_valid = false;
+            f.fallback_to_any = true;
+        });
+        assert_eq!(classify_type_object_head(&f).0, TYPE_OBJECT_ERROR_INIT);
+    }
+
+    #[test]
+    fn test_invalid_new() {
+        let f = facts_with(|f| f.new_valid = false);
+        assert_eq!(
+            classify_type_object_head(&f),
+            (TYPE_OBJECT_ERROR_NEW, false, false, false)
+        );
+    }
+
+    #[test]
+    fn test_init_lower_mro_wins() {
+        let f = facts_with(|f| f.new_index = 2);
+        assert_eq!(
+            classify_type_object_head(&f),
+            (TYPE_OBJECT_INIT, false, false, false)
+        );
+    }
+
+    #[test]
+    fn test_new_higher_mro_wins() {
+        let f = facts_with(|f| {
+            f.init_index = 2;
+            f.new_is_tuple = true;
+            f.new_uncached = true;
+        });
+        assert_eq!(
+            classify_type_object_head(&f),
+            (TYPE_OBJECT_NEW, true, true, true)
+        );
+    }
+
+    #[test]
+    fn test_tie_prefers_init() {
+        let f = facts_with(|f| {
+            f.init_is_tuple = true;
+            f.init_uncached = true;
+        });
+        assert_eq!(
+            classify_type_object_head(&f),
+            (TYPE_OBJECT_INIT, false, true, true)
+        );
+    }
+
+    #[test]
+    fn test_tie_any_needs_object_and_fallback() {
+        let f = facts_with(|f| {
+            f.init_info_is_object = true;
+            f.fallback_to_any = true;
+            f.init_is_tuple = true;
+        });
+        // The universal-callable arm returns before special_sig / uncached.
+        assert_eq!(
+            classify_type_object_head(&f),
+            (TYPE_OBJECT_TIE_ANY, false, false, false)
+        );
+    }
+
+    #[test]
+    fn test_tie_object_without_fallback_prefers_init() {
+        let f = facts_with(|f| f.init_info_is_object = true);
+        assert_eq!(
+            classify_type_object_head(&f),
+            (TYPE_OBJECT_INIT, false, false, false)
+        );
+    }
+
+    #[test]
+    fn test_tie_fallback_without_object_prefers_init() {
+        let f = facts_with(|f| f.fallback_to_any = true);
+        assert_eq!(
+            classify_type_object_head(&f),
+            (TYPE_OBJECT_INIT, false, false, false)
+        );
+    }
+
+    #[test]
+    fn test_special_sig_skipped_for_tuple_itself() {
+        // tuple's own constructor: method is tuple's but info is tuple too.
+        let f = facts_with(|f| {
+            f.init_is_tuple = true;
+            f.info_is_tuple = true;
+        });
+        assert!(!classify_type_object_head(&f).2);
+    }
+
+    #[test]
+    fn test_special_sig_requires_chosen_method() {
+        // __new__ is chosen; only its own tuple-ness counts.
+        let f = facts_with(|f| {
+            f.init_index = 2;
+            f.init_is_tuple = true;
+            f.new_is_tuple = false;
+        });
+        assert!(!classify_type_object_head(&f).2);
+        let f = facts_with(|f| {
+            f.init_index = 2;
+            f.init_is_tuple = false;
+            f.new_is_tuple = true;
+        });
+        assert!(classify_type_object_head(&f).2);
     }
 }

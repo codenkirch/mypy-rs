@@ -1088,6 +1088,27 @@ including:
   `mypy/test/testtypes.py` (gate-off vs gate-on differential plus direct
   seam calls across all branches: FuncDef, OverloadedFuncDef, Decorator
   with CallableType/Overloaded/Instance/None type, Var, None node).
+- `rust_classify_type_object_type` (issue #1059) — mirrors the
+  init-vs-new arbitration head of `mypy.typeops.type_object_type`
+  (typeops.py:495-546): Rust walks the live `TypeInfo`'s MRO via PyO3
+  (same `is_valid_constructor_inner` classification as #967), picks the
+  first MRO entry defining `__init__` or `__new__`, resolves the
+  init-new tie in favor of the entry defining both or, when both come
+  from `object` with a bogus base, the TIE_ANY universal-callable arm,
+  and reads `special_sig` (tuple subclass), `is_new`, and the
+  method-is-uncached bit off the winner. Returns
+  `(tag, is_new, special_sig, uncached, method)`; the Python shim
+  (`_type_object_type_rust_head`) applies all side effects: the
+  invalid-class-definition Any, metaclass/`builtins.type` fallback
+  construction, the universal-callable tie arm, the already-native
+  `type_object_type_from_function` tail, the `special_sig="tuple"`
+  fixup, and the `strict_optional`-gated cache write. Defers (`None`)
+  when `type_object_type_from_function`'s pure decision is not
+  reachable (unreadable MRO/method facts). Gated by
+  `_native_typeops_active` (wired from `mypy/build.py`) and covered by
+  `NativeTypeObjectArbitrationSuite` in `mypy/test/testtypes.py`
+  (gate-off vs gate-on differential plus direct seam calls for all 5
+  tags), plus 10 pure decision unit tests in `typeops.rs`.
 - `rust_is_instance_var` (issue #965) — mirrors the pure bool predicate
   `is_instance_var` (checkmember.py:1502-1511): the PEP 526
   instance-variable conjunction `var.name in var.info.names and
