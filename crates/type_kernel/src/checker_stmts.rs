@@ -30,12 +30,10 @@ use pyo3::types::{PyBytes, PyList, PyTuple};
 use crate::astwire::{decode_node, AstNode};
 use crate::callable_compat::is_type_obj;
 use crate::checkexpr_functions::expanded_alias_target;
+use crate::cond_types::conditional_types_inner;
 use crate::erase_typevars::{erase_typevars_inner, make_any};
-use crate::meet::overlap;
-use crate::setops::{make_simplified_union, union_make_union};
-use crate::subtypes::{is_subtype, SubtypeContext};
-use crate::typeinfo::{NativeTypeResolver, TypeResolver};
-use crate::typeops::try_expanding_sum_type_to_union_inner;
+use crate::setops::union_make_union;
+use crate::typeinfo::{read_bool_attr, read_str_list_attr, NativeTypeResolver, TypeResolver};
 use crate::wire::{read_type, write_type, LiteralValue, ReadBuffer, Type, WriteBuffer};
 
 // ---------------------------------------------------------------------------
@@ -647,16 +645,17 @@ pub(crate) fn rust_partial_type_inference(py: Python<'_>) -> PyResult<PyObject> 
 }
 
 // ---------------------------------------------------------------------------
-// narrow_type_by_identity_equality (issue #387), identity-only branch
+// narrow_type_by_identity_equality (issue #387), identity + equality branch
 // ---------------------------------------------------------------------------
 
-// Ports the identity (`is` / `is not`) path of
-// `mypy.checker.narrow_type_by_identity_equality` (checker.py:7127). The
-// caller serializes the raw expr_type and the already-coerced target_type.
+// Ports the identity (`is` / `is not`) and equality (`==` / `!=`)
+// branches of `mypy.checker.narrow_type_by_identity_equality`
+// (checker.py:8963) behind the #387 seam, extended to equality in #1126.
 
-// Rust mirrors the caller's else-branch (checker.py:7227-7237):
+// The caller serializes the raw expr_type and the target_type (already
+// coerced when `should_coerce_literals` is set). Rust mirrors the
+// caller's fallback else-branch (checker.py:9095-9098):
 
-// ```text
 // narrowable = try_expanding_sum_type_to_union(
 //     coerce_to_literal(narrowable_expr_type), None)
 
@@ -664,44 +663,47 @@ pub(crate) fn rust_partial_type_inference(py: Python<'_>) -> PyResult<PyObject> 
 //     narrowable, [TypeRange(target_type, is_upper_bound=False)],
 //     from_equality=True)
 
-// ```
+// For `is`/`is not` the partition is a no-op (`is_identity=True` returns
+// `(current_type, None)`), so there is no ambiguous side to re-merge; for
+// `==`/`!=` the Python caller already partitioned ambiguous union items
 
-// For identity the partition is a no-op (`is_identity=True` returns
-// `(current_type, None)`), so narrowable_expr_type == expr_type and there is
-// no ambiguous side to re-merge. Equality operators (==/!=) defer: they need
+// off (`rust_partition_equality_ambiguous_types`) and re-merges them
+// after the seam returns, so both operator families hand the seam the
+// same single-range question. The conditional_types computation itself
 
-// the partition machinery and the ambiguous union-merge.
+// delegates to cond_types::conditional_types_inner (the fuller port with
+// NewType unwrap, live enum expansion, and the restrict_subtype_away
+// tail).
 
 // Deferred (return None) cases, all structurally safe:
-//   * `coerce_to_literal` on a single-member enum (stale enum_members) or a
-//     TypeAliasType (no alias target on the wire).
+// `coerce_to_literal` on a TypeAliasType (no alias target on the wire),
+// a single-member enum, or a recursive alias inside a union rebuild.
 
-//   * `try_expanding_sum_type_to_union` or an alias on either side.
-//   * `is_subtype` returning None (LiteralType/NoneType/other non-Instance
-//     current); proper-subtype True then proceeds natively.
+// `try_expanding_sum_type_to_union` on an alias. Any sub-step of the
+// conditional_types port that cannot decide: `is_subtype` returning
+// None, a generic Instance target whose args would erase to Any, an
 
-//   * A Callable / protocol target needing `restrict_subtype_away`
-//     (structural guards need live TypeInfo).
-//   * Overlap True but not proper-subtype (also `restrict_subtype_away`).
+// undecidable `restrict_subtype_away`, a `make_simplified_union` on an
+// alias, or an overlap the meet kernel cannot decide.
 
-//   * A generic Instance target (Instance with args) that
-//     `shallow_erase_type_for_equality` would erase vars off.
-//   * `make_simplified_union` deferring (alias or a non-Instance subset).
-
-/// `mypy.typeops.coerce_to_literal` (typeops.py:1439-1455).
-///
-/// `get_proper_type` comes first: a TypeAliasType cannot be resolved on the
-/// wire, so it defers. A Union is mapped item-wise and rebuilt with
-/// `make_union`. An Instance carries its last-known value on the wire and
-/// returns it (the whole point of the coercion); a single-member enum defers
-/// (stale snapshot, same principle as `try_expanding_sum_type_to_union`).
-fn coerce_to_literal_inner(t: &Type, resolver: &TypeResolver) -> Option<Type> {
+/// `mypy.typeops.coerce_to_literal` (typeops.py:2000-2024): resolves aliases
+/// (a recursive alias defers), maps unions item-wise, returns the Instance
+/// last-known value; single-member enum members are read live, never stale.
+fn coerce_to_literal_inner(
+    t: &Type,
+    aliases: &crate::aliases::TypeAliasResolver,
+    native: &NativeTypeResolver,
+    py: Python<'_>,
+) -> Option<Type> {
     match t {
-        Type::TypeAliasType { .. } => None,
+        Type::TypeAliasType { .. } => {
+            let (target, _, _) = crate::checkexpr_functions::expanded_alias_target(t, aliases)?;
+            coerce_to_literal_inner(&target, aliases, native, py)
+        }
         Type::UnionType { items, .. } => {
             let mut out = Vec::with_capacity(items.len());
             for item in items {
-                out.push(coerce_to_literal_inner(item, resolver)?);
+                out.push(coerce_to_literal_inner(item, aliases, native, py)?);
             }
             Some(union_make_union(out))
         }
@@ -710,9 +712,15 @@ fn coerce_to_literal_inner(t: &Type, resolver: &TypeResolver) -> Option<Type> {
             ..
         } => Some((**lkv).clone()),
         Type::Instance { type_ref, .. } => {
-            let snap = resolver.get(type_ref)?;
-            if snap.is_enum && snap.enum_members.len() == 1 {
-                return None;
+            let info = native.live_typeinfo(py, type_ref)?;
+            if read_bool_attr(info, "is_enum").unwrap_or(false) {
+                let members = read_str_list_attr(info, "enum_members").unwrap_or_default();
+                if members.len() == 1 {
+                    return Some(Type::LiteralType {
+                        fallback: Box::new(t.clone()),
+                        value: LiteralValue::Str(members[0].clone()),
+                    });
+                }
             }
             Some(t.clone())
         }
@@ -720,199 +728,60 @@ fn coerce_to_literal_inner(t: &Type, resolver: &TypeResolver) -> Option<Type> {
     }
 }
 
-/// `mypy.erasetype.shallow_erase_type_for_equality` (erasetype.py:418-429),
-/// partial port.
-///
-/// Unions are mapped item-wise and rebuilt with `make_union`. An Instance
-/// with args defers: erasing type vars to `Any` would need to build the right
-/// `AnyType`, which is not portable here. Everything else is identity.
-/// Because the Union branch defers if ANY item has args, a generic container
-/// in the target can over-defer, which is safe (falls back to Python).
-fn shallow_erase_for_equality(t: &Type) -> Option<Type> {
-    match t {
-        Type::UnionType { items, .. } => {
-            let mut out = Vec::with_capacity(items.len());
-            for item in items {
-                out.push(shallow_erase_for_equality(item)?);
-            }
-            Some(union_make_union(out))
-        }
-        Type::Instance { args, .. } if !args.is_empty() => None,
-        _ => Some(t.clone()),
-    }
-}
-
-/// `mypy.checker.conditional_types` (checker.py:8854-8995) for the
-/// equality/identity subset.
-///
-/// Proposed is the single `TypeRange(target, is_upper_bound=False)` with
-/// `from_equality=True`. current/proposed are already proper (aliases defer
-/// at the top of the pyfunction). Nested union recursion passes
-/// `default=Some(union_item)`; the top-level call passes `None`.
-fn conditional_types_identity_subset(
-    current: &Type,
-    proposed: &Type,
-    default: Option<&Type>,
-    strict_optional: bool,
-    resolver: &TypeResolver,
-) -> Option<(Option<Type>, Option<Type>)> {
-    // Pre-expand for a len()==1 proposed range (checker.py:8902-8910): only
-    // bool literals expand natively (via builtins.bool); a str-literal enum
-    // target defers (enum expansion not portable); plain literals don't.
-    let enum_name = match proposed {
-        // bool literal: expand current by builtins.bool, matching
-        // checker.py's try_expanding_sum_type_to_union(current_type,
-        // "builtins.bool") for the value-bool target.
-        Type::LiteralType {
-            value: LiteralValue::Bool(_),
-            ..
-        } => Some("builtins.bool".to_string()),
-        Type::LiteralType {
-            fallback,
-            value: LiteralValue::Str(_),
-            ..
-        } => {
-            let snap = match &**fallback {
-                Type::Instance { type_ref, .. } => resolver.get(type_ref)?,
-                _ => return None,
-            };
-            if snap.is_enum {
-                return None;
-            }
-            None
-        }
-        _ => None,
-    };
-    let current = match enum_name {
-        Some(name) => {
-            try_expanding_sum_type_to_union_inner(current, Some(&name), strict_optional, resolver)?
-        }
-        None => current.clone(),
-    };
-    let current = &current;
-
-    // Factorize over union types (checker.py:8917-8931): each item is
-    // narrowed against the whole proposed range, with itself as the default.
-
-    // With a non-None default the recursive results are always concrete, so
-    // an inner None pair or a sub-defer propagates a defer out of the whole
-    // union call (Python would have computed a definite result).
-    if let Type::UnionType { items, .. } = current {
-        let mut yes_items = Vec::with_capacity(items.len());
-        let mut no_items = Vec::with_capacity(items.len());
-        for item in items {
-            let (yes_type, no_type) = conditional_types_identity_subset(
-                item,
-                proposed,
-                Some(item),
-                strict_optional,
-                resolver,
-            )?;
-            let (yes_type, no_type) = match (yes_type, no_type) {
-                (Some(y), Some(n)) => (y, n),
-                _ => return None,
-            };
-            yes_items.push(yes_type);
-            no_items.push(no_type);
-        }
-        let union_ctx = SubtypeContext::new(false, false, false, true, true, true);
-        let yes = make_simplified_union(&yes_items, &union_ctx, resolver, true)?;
-        let no = make_simplified_union(&no_items, &union_ctx, resolver, true)?;
-        return Some((Some(yes), Some(no)));
-    }
-
-    let default_owned = default.cloned();
-
-    // Any lhs (checker.py:8926): Any is subtyped by everything and subsumes
-    // the rhs, so the branch keeps the proposed type, the else keeps current.
-    if let Type::AnyType { .. } = current {
-        return Some((Some(proposed.clone()), Some(current.clone())));
-    }
-    // Any rhs (checker.py:8928): no info, else-keeps-default.
-    if let Type::AnyType { .. } = proposed {
-        return Some((Some(proposed.clone()), default_owned));
-    }
-
-    // Concrete proper subtype (checker.py:8933-8936): rhs covers lhs, add
-    // nothing in the if-branch and mark the else unreachable.
-    let proper_ctx = SubtypeContext::new(false, false, false, true, true, strict_optional);
-    match is_subtype(current, proposed, &proper_ctx, resolver) {
-        Some(true) => {
-            return Some((
-                default_owned,
-                Some(Type::UninhabitedType { ambiguous: false }),
-            ));
-        }
-        None => return None,
-        Some(false) => {}
-    }
-
-    // Structural guard (checker.py:8937-8944): a Callable or protocol target
-    // needs `restrict_subtype_away` to rule out an unequal-but-overlapping
-    // value, which needs live TypeInfo -> DEFER.
-    let structural = match proposed {
-        Type::CallableType { .. } => true,
-        Type::Instance { type_ref, .. } => resolver.get(type_ref)?.is_protocol,
-        _ => false,
-    };
-    if structural {
-        return None;
-    }
-
-    // Equality-aware erasure (checker.py:8946-8949), then overlap
-    // (checker.py:8951-8953) with ignore_promotions=True.
-    let erased = shallow_erase_for_equality(proposed)?;
-    match overlap(current, &erased, strict_optional, true, false, resolver, 0) {
-        // Overlap False: expression is never of any type in the proposed
-        // range -> if-branch unreachable, else keeps the default.
-        Some(false) => Some((
-            Some(Type::UninhabitedType { ambiguous: false }),
-            default_owned,
-        )),
-        // Overlap True but not a proper subtype: restrict_subtype_away would
-        // need live TypeInfo -> defer to Python.
-        Some(true) => None,
-        None => None,
-    }
-}
-
 /// Inner (non-pyfunction) driver so `?` on `Option` works: returns
 /// `Some((if_type, else_type))` on a successful native narrowing, `None` to
 /// defer to the pure-Python path.
 fn narrow_type_by_identity_equality_inner(
+    py: Python<'_>,
     current: Type,
     target: Type,
-    comparison: &str,
     strict_optional: bool,
-    res: &TypeResolver,
+    native: &NativeTypeResolver,
 ) -> Option<(Option<Type>, Option<Type>)> {
-    if !(comparison == "is" || comparison == "is not") {
-        return None;
-    }
-    let coerced = coerce_to_literal_inner(&current, res)?;
-    let expanded = try_expanding_sum_type_to_union_inner(&coerced, None, strict_optional, res)?;
-    let (if_type, else_type) =
-        conditional_types_identity_subset(&expanded, &target, None, strict_optional, res)?;
-    Some((if_type, else_type))
+    let res = native.resolver();
+    // Caller's fallback pre-step:
+    // `narrowable = try_expanding_sum_type_to_union(coerce_to_literal(narrowable), None)`.
+    let coerced = coerce_to_literal_inner(&current, native.alias_resolver(), native, py)?;
+    let expanded =
+        crate::cond_types::expand_for_target(&coerced, None, strict_optional, native, py)?;
+    let range = crate::cond_types::WireRange {
+        item: target,
+        is_upper_bound: false,
+    };
+    conditional_types_inner(
+        &expanded,
+        Some(&[range]),
+        None,
+        true,
+        true,
+        strict_optional,
+        res,
+        native,
+        py,
+    )
 }
 
-/// `mypy.checker.narrow_type_by_identity_equality` (checker.py:7127), the
-/// identity-only branch ported behind the #387 seam.
+/// `mypy.checker.narrow_type_by_identity_equality` (checker.py:8963), the
+/// identity + equality branch ported behind the #387 seam.
 ///
 /// Returns `Some((if_type, else_type))` encoded, where a branch's `None`
 /// means Python's `None` ("no new information"), or `None` to defer to the
-/// pure-Python path. `target_type` is already coerced by the caller (identity
-/// sets `should_coerce_literals=True`), so only `expr_type` is coerced here.
+/// pure-Python path. Handles all four comparison operators; anything else
+/// defers (callers never pass them).
 #[pyfunction]
 #[allow(clippy::needless_pass_by_value)]
 #[allow(clippy::type_complexity)]
 pub(crate) fn rust_narrow_type_by_identity_equality(
+    py: Python<'_>,
     a_bytes: &[u8],
     b_bytes: &[u8],
     comparison: &str,
     strict_optional: bool,
     resolver: &mut NativeTypeResolver,
 ) -> PyResult<Option<(Option<Vec<u8>>, Option<Vec<u8>>)>> {
+    if !(comparison == "is" || comparison == "is not" || comparison == "==" || comparison == "!=") {
+        return Ok(None);
+    }
     let current = match decode_type(a_bytes) {
         Some(t) => t,
         None => return Ok(None),
@@ -922,11 +791,11 @@ pub(crate) fn rust_narrow_type_by_identity_equality(
         None => return Ok(None),
     };
     let (if_type, else_type) = match narrow_type_by_identity_equality_inner(
+        py,
         current,
         target,
-        comparison,
         strict_optional,
-        resolver.resolver(),
+        resolver,
     ) {
         Some(pair) => pair,
         None => return Ok(None),
@@ -947,7 +816,6 @@ pub(crate) fn rust_narrow_type_by_identity_equality(
     };
     Ok(Some((if_blob, else_blob)))
 }
-
 // ---------------------------------------------------------------------------
 // rust_classify_except_handler_tests (Phase C2, issue #609)
 // ---------------------------------------------------------------------------

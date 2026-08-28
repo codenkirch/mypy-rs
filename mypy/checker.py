@@ -701,13 +701,14 @@ def _set_native_checker_resolver(resolver: Any) -> None:
 def _try_native_narrow_type_by_identity_equality(
     a: Type, b: Type, operator: str
 ) -> tuple[Type | None, Type | None] | None:
-    """Native fast path for identity equality narrowing (#387, parity-only).
+    """Native fast path for identity/equality narrowing (#387, #1126).
 
-    Ports the identity (`is` / `is not`) branch of
-    narrow_type_by_identity_equality. `b` is assumed already coerced by the
-    caller (identity sets should_coerce_literals=True). Returns
-    (if_type, else_type) with None meaning "no new information", or None to
-    defer to the pure-Python path.
+    Ports the `is` / `is not` / `==` / `!=` branch of
+    narrow_type_by_identity_equality: the caller's fallback
+    conditional_types(narrowable, [TypeRange(target, is_upper_bound=False)],
+    from_equality=True) call, with b already coerced when the caller sets
+    should_coerce_literals. Returns (if_type, else_type) with None meaning
+    "no new information", or None to defer to the pure-Python path.
     """
     if not (
         _CHECKER_HAS_TYPE_KERNEL
