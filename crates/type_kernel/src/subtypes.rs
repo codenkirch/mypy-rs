@@ -18,6 +18,7 @@
 
 use pyo3::basic::CompareOp;
 use pyo3::prelude::*;
+use std::cell::RefCell;
 use std::collections::HashSet;
 
 use crate::typeinfo::{NativeTypeResolver, TypeResolver};
@@ -841,7 +842,7 @@ pub(crate) fn is_subtype(
         }
     };
     visit_instance_nominal(
-        left_ref, left_args, right, right_ref, right_args, ctx, resolver,
+        left, left_ref, left_args, right, right_ref, right_args, ctx, resolver,
     )
 }
 
@@ -1797,7 +1798,95 @@ fn map_derivation_path(
     None
 }
 
+// --- Protocol-right port (subtypes.py:1287-1291 -> is_protocol_implementation) ---
+
+thread_local! {
+    /// Mirrors Python's `assuming` / `assuming_proper` recursion stacks
+    /// (subtypes.py:1972), flattened into one list keyed by the
+    /// proper-subtype dimension (Python picks one of the two stacks by
+    /// `proper_subtype`; a single list with the flag is equivalent).
+    /// Entries live only for the duration of a protocol-right member loop.
+    static ASSUMING: RefCell<Vec<(Type, Type, bool)>> = const { RefCell::new(Vec::new()) };
+}
+
+fn assuming_contains(left: &Type, right: &Type, proper: bool) -> bool {
+    ASSUMING.with(|s| {
+        s.borrow()
+            .iter()
+            .any(|(l, r, p)| *p == proper && l == left && r == right)
+    })
+}
+
+/// Pushes `(left, right, proper)` onto the assuming stack; pops on drop,
+/// covering every exit path including deferral (Python's `pop_on_exit`
+/// context manager, subtypes.py:1922).
+struct AssumingPush;
+
+impl AssumingPush {
+    fn new(left: Type, right: Type, proper: bool) -> Self {
+        ASSUMING.with(|s| s.borrow_mut().push((left, right, proper)));
+        AssumingPush
+    }
+}
+
+impl Drop for AssumingPush {
+    fn drop(&mut self) {
+        ASSUMING.with(|s| {
+            s.borrow_mut().pop();
+        });
+    }
+}
+
+/// Protocol-right decision site: Python's
+/// `if right.type.is_protocol and is_protocol_implementation(...)` tail of
+/// `SubtypeVisitor.visit_instance` (subtypes.py:1287-1291), reached when the
+/// nominal branch did not apply.
+///
+/// Returns `Some(bool)` when Rust decided; `None` defers to the pure-Python
+/// body (which runs its own assuming stack — safe, just re-work).
+fn protocol_right_decision(
+    left: &Type,
+    right: &Type,
+    left_ref: &str,
+    right_ref: &str,
+    ctx: &SubtypeContext,
+    resolver: &TypeResolver,
+) -> Option<bool> {
+    // Without a live TypeInfo map the dependency record and the member-flag
+    // loop cannot run; defer. This also keeps pure-Rust cargo tests
+    // interpreter-free (their resolvers never install the map).
+    if !resolver.has_live_info_map() {
+        return None;
+    }
+    // Recursion guard (subtypes.py:1972-1976): a pair already being checked
+    // is assumed True. Structural equality on the wire Type mirrors the
+    // identity check on live Instances — the recursion re-serializes the
+    // same pair.
+    if assuming_contains(left, right, ctx.proper_subtype) {
+        return Some(true);
+    }
+    let _guard = AssumingPush::new(left.clone(), right.clone(), ctx.proper_subtype);
+    pyo3::Python::with_gil(|py| {
+        let left_info = resolver.live_typeinfo(py, left_ref)?;
+        let right_info = resolver.live_typeinfo(py, right_ref)?;
+        // Fine-grained dependency record (subtypes.py:1962); idempotent
+        // set-add on the Python side. Defer on any failure so Python
+        // performs the record itself.
+        let type_state = py
+            .import("mypy.typestate")
+            .ok()?
+            .getattr("type_state")
+            .ok()?;
+        type_state
+            .call_method1("record_protocol_subtype_check", (left_info, right_info))
+            .ok()?;
+        crate::protocols::is_protocol_implementation_inner(py, left, right, &[], ctx, resolver)
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
 fn visit_instance_nominal(
+    left: &Type,
     left_ref: &str,
     left_args: &[Type],
     right: &Type,
@@ -1910,11 +1999,14 @@ fn visit_instance_nominal(
     let nominal_applies =
         (has_base || is_object || is_named_tuple_right) && !ctx.ignore_declared_variance;
     if !nominal_applies {
-        // Nominal branch skipped. If right is a protocol, defer to the
-        // Python protocol-implementation path (M8c). Otherwise Python
-        // records a negative cache entry and returns False.
+        // Nominal branch skipped. If right is a protocol, run the
+        // protocol-implementation port — Python reaches
+        // is_protocol_implementation (subtypes.py:1287-1291) exactly when
+        // the nominal branch did not apply; when it did apply, Python
+        // returns the nominal verdict without a protocol check. Otherwise
+        // Python records a negative cache entry and returns False.
         if right_is_protocol {
-            return None;
+            return protocol_right_decision(left, right, left_ref, right_ref, ctx, resolver);
         }
         return Some(false);
     }
@@ -5688,6 +5780,51 @@ mod tests {
         assert_eq!(
             classify_type_parameter_dispatch(7, false),
             KIND_TYPEPARAM_EQUIVALENT
+        );
+    }
+
+    #[test]
+    fn assuming_guard_push_pop_and_flag_keying() {
+        // The assuming guard (subtypes.py:1972-1976): a pair being checked
+        // under one proper flag is invisible to the other stack (Python
+        // keeps assuming / assuming_proper separate), and pop-on-drop
+        // clears it on every exit path.
+        let left = instance("a.A", vec![]);
+        let right = instance("a.P", vec![]);
+        let other = instance("a.B", vec![]);
+        assert!(!assuming_contains(&left, &right, false));
+        let guard = AssumingPush::new(left.clone(), right.clone(), false);
+        assert!(assuming_contains(&left, &right, false));
+        // Proper flag is part of the key.
+        assert!(!assuming_contains(&left, &right, true));
+        assert!(!assuming_contains(&other, &right, false));
+        assert!(!assuming_contains(&right, &left, false));
+        // Structural equality on wire Types: a separately built, equal
+        // pair matches (mirrors Python's identity check on live objects
+        // the recursion re-encounters).
+        assert!(assuming_contains(&instance("a.A", vec![]), &right, false));
+        drop(guard);
+        assert!(!assuming_contains(&left, &right, false));
+    }
+
+    #[test]
+    fn protocol_right_defers_without_live_map() {
+        // The protocol-right port needs the live TypeInfo map for the
+        // dependency record and member-flag loop; without it (pure-Rust
+        // cargo tests) it defers rather than guessing.
+        let mut proto = snap("a.P", "P");
+        proto.is_protocol = true;
+        proto.protocol_members.push("read".to_string());
+        let r = make_resolver(vec![
+            snap("a.A", "A"),
+            proto,
+            snap("builtins.object", "object"),
+        ]);
+        let left = instance("a.A", vec![]);
+        let right = instance("a.P", vec![]);
+        assert_eq!(
+            protocol_right_decision(&left, &right, "a.A", "a.P", &ctx_nominal(), &r),
+            None
         );
     }
 }

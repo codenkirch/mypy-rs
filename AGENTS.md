@@ -826,20 +826,28 @@ including:
   matching `anal_star_arg_type`'s fallback `anal_type(t, nested,
   allow_unpack=True)` instead of deferring. Covered by
   `NativeTypeAnalSuite` in `mypy/test/testtypes.py`.
-- `rust_is_protocol_implementation` (subtypes.py:1766-1895) — ported
-  behind the `_is_subtype` fallback: when `rust_is_subtype` defers on a
-  protocol-right Instance pair, the seam drives the full member-compat
-  loop natively (member lookup via `get_protocol_member_inner`,
-  per-member `is_subtype` with a fresh default context, trivial flag
-  gate). Decorator nodes on the protocol (right) side unwrap to `.var`
-  and route through `member_method_inner` (bind_self + expand),
+- `rust_is_protocol_implementation` (subtypes.py:1766-1895, issue #1111)
+  — the protocol-right Instance arm of `rust_is_subtype`. Wired from
+  `visit_instance_nominal` via `protocol_right_decision` (subtypes.rs):
+  Rust mirrors Python's `assuming` recursion guard with a thread-local
+  stack keyed by the proper-subtype dimension, records the fine-grained
+  dependency (`record_protocol_subtype_check`) through the live map
+  (now on `TypeResolver`, not `NativeTypeResolver`), then drives the full
+  member-compat loop natively (member lookup via `get_protocol_member_inner`,
+  per-member `is_subtype` with a fresh default context, and the full
+  subtypes.py:2025-2055 member-flag arbitration incl. the reversed
+  settable check). Decorator nodes on the protocol (right) side unwrap to
+  `.var` and route through `member_method_inner` (bind_self + expand),
   matching `find_node_type`'s callable path for decorated protocol
   members. Defers on: protocol-left (recursion-prone `assuming` guard),
-  generic Callable-Callable member pairs (needs type inference),
-  non-trivial flag combinations (settable/classvar), MRO misses.
-  Measured (self-check): 18623 calls, 13049 decided (70% native).
+  generic Callable-Callable member pairs (needs type inference), explicit
+  -setter members (needs is_lvalue re-resolution), module instances and
+  other extra_attrs carriers, base-class-defined members behind the
+  same-class guard, MRO/resolver misses, and any call without a live
+  TypeInfo map. Measured (self-check): protoR defers 14,794 -> 13,149.
   Covered by `NativeProtocolImplementationSuite` in
-  `mypy/test/testtypes.py`.
+  `mypy/test/testtypes.py` plus pure unit tests for the assuming guard
+  in `subtypes.rs`.
 - `rust_has_abstract_type` (mypy.checkexpr) — mirrors
   `TypeChecker.has_abstract_type` (checkexpr.py:8134-8143): a pure
   boolean conjunction over live types. The seam reads live Python
