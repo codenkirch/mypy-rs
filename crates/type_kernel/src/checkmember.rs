@@ -765,7 +765,13 @@ fn collect_freeze_ids(typ: &mut Type, ids: &mut Vec<(i64, i64, String)>) {
     match typ {
         Type::CallableType { variables, .. } => {
             for v in variables.iter_mut() {
-                if let Type::TypeVarType { raw_id, namespace, meta_level, .. } = v {
+                if let Type::TypeVarType {
+                    raw_id,
+                    namespace,
+                    meta_level,
+                    ..
+                } = v
+                {
                     let key = (*raw_id, *meta_level, namespace.clone());
                     if !ids.contains(&key) {
                         ids.push(key);
@@ -799,7 +805,12 @@ fn survivors_freezable(typ: &mut Type, ids: &[(i64, i64, String)]) -> bool {
 
 fn typevar_freezable(typ: &Type, ids: &[(i64, i64, String)]) -> bool {
     match typ {
-        Type::TypeVarType { raw_id, namespace, meta_level, .. } => ids
+        Type::TypeVarType {
+            raw_id,
+            namespace,
+            meta_level,
+            ..
+        } => ids
             .iter()
             .any(|(r, m, ns)| *r == *raw_id && *m == *meta_level && ns == namespace),
         Type::ParamSpecType { .. } | Type::TypeVarTupleType { .. } => false,
@@ -808,7 +819,13 @@ fn typevar_freezable(typ: &Type, ids: &[(i64, i64, String)]) -> bool {
 }
 
 fn apply_freeze(typ: &mut Type, ids: &[(i64, i64, String)]) {
-    if let Type::TypeVarType { raw_id, namespace, meta_level, .. } = typ {
+    if let Type::TypeVarType {
+        raw_id,
+        namespace,
+        meta_level,
+        ..
+    } = typ
+    {
         if ids
             .iter()
             .any(|(r, m, ns)| *r == *raw_id && *m == *meta_level && ns == namespace)
@@ -821,14 +838,21 @@ fn apply_freeze(typ: &mut Type, ids: &[(i64, i64, String)]) {
 
 fn freeze_children<F: FnMut(&mut Type)>(typ: &mut Type, f: &mut F) {
     match typ {
-        Type::TypeVarType { values, upper_bound, default, .. } => {
+        Type::TypeVarType {
+            values,
+            upper_bound,
+            default,
+            ..
+        } => {
             for v in values.iter_mut() {
                 f(v);
             }
             f(upper_bound);
             f(default);
         }
-        Type::Instance { args, .. } | Type::TypeAliasType { args, .. } | Type::UnboundType { args, .. } => {
+        Type::Instance { args, .. }
+        | Type::TypeAliasType { args, .. }
+        | Type::UnboundType { args, .. } => {
             for a in args.iter_mut() {
                 f(a);
             }
@@ -838,9 +862,16 @@ fn freeze_children<F: FnMut(&mut Type)>(typ: &mut Type, f: &mut F) {
                 f(src);
             }
         }
-        Type::ParamSpecType { prefix, upper_bound, default, .. } => {
+        Type::ParamSpecType {
+            prefix,
+            upper_bound,
+            default,
+            ..
+        } => {
             let Parameters {
-                arg_types, variables, ..
+                arg_types,
+                variables,
+                ..
             } = prefix.as_mut();
             for a in arg_types.iter_mut() {
                 f(a);
@@ -851,7 +882,12 @@ fn freeze_children<F: FnMut(&mut Type)>(typ: &mut Type, f: &mut F) {
             f(upper_bound);
             f(default);
         }
-        Type::TypeVarTupleType { tuple_fallback, upper_bound, default, .. } => {
+        Type::TypeVarTupleType {
+            tuple_fallback,
+            upper_bound,
+            default,
+            ..
+        } => {
             f(tuple_fallback);
             f(upper_bound);
             f(default);
@@ -900,7 +936,9 @@ fn freeze_children<F: FnMut(&mut Type)>(typ: &mut Type, f: &mut F) {
                 f(it);
             }
         }
-        Type::TypedDictType { fallback, items, .. } => {
+        Type::TypedDictType {
+            fallback, items, ..
+        } => {
             f(fallback);
             for (_, it) in items.iter_mut() {
                 f(it);
@@ -921,7 +959,10 @@ fn freeze_children<F: FnMut(&mut Type)>(typ: &mut Type, f: &mut F) {
                 f(v);
             }
         }
-        Type::NoneType | Type::ErasedType | Type::UninhabitedType { .. } | Type::DeletedType { .. } => {}
+        Type::NoneType
+        | Type::ErasedType
+        | Type::UninhabitedType { .. }
+        | Type::DeletedType { .. } => {}
     }
 }
 
@@ -4032,7 +4073,9 @@ mod tests {
         let tvar = make_meta_tvar(50, "", 1);
         let mut sig = make_callable(vec![], false);
         if let Type::CallableType {
-            ret_type, variables, ..
+            ret_type,
+            variables,
+            ..
         } = &mut sig
         {
             *ret_type = Box::new(tvar.clone());
@@ -4040,13 +4083,26 @@ mod tests {
         }
         let inst = make_instance("builtins.int");
         let result = static_member_tail(
-            &inst, &sig, "builtins.int", false, &resolver, false, false, None,
+            &inst,
+            &sig,
+            "builtins.int",
+            false,
+            &resolver,
+            false,
+            false,
+            None,
         )
         .expect("expected Some result");
         match result {
-            Type::CallableType { ret_type, variables, .. } => {
+            Type::CallableType {
+                ret_type,
+                variables,
+                ..
+            } => {
                 match *ret_type {
-                    Type::TypeVarType { raw_id, meta_level, .. } => {
+                    Type::TypeVarType {
+                        raw_id, meta_level, ..
+                    } => {
                         assert_eq!(raw_id, 50);
                         assert_eq!(meta_level, 0);
                     }
@@ -4054,7 +4110,9 @@ mod tests {
                 }
                 assert_eq!(variables.len(), 1);
                 match &variables[0] {
-                    Type::TypeVarType { raw_id, meta_level, .. } => {
+                    Type::TypeVarType {
+                        raw_id, meta_level, ..
+                    } => {
                         assert_eq!(*raw_id, 50);
                         assert_eq!(*meta_level, 0);
                     }
@@ -4082,7 +4140,14 @@ mod tests {
             extra_attrs: None,
         };
         assert!(static_member_tail(
-            &inst, &sig, "builtins.int", false, &resolver, false, false, None
+            &inst,
+            &sig,
+            "builtins.int",
+            false,
+            &resolver,
+            false,
+            false,
+            None
         )
         .is_none());
     }
