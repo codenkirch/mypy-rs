@@ -1847,4 +1847,17 @@ directly to `main`.
   `mypy/test/testtypes.py` (gate-off vs gate-on differential plus
   direct seam calls), plus pure decision unit tests in
   `checker_functions.rs`.
+- `rust_check_final_member` (issue #1078) — mirrors the MRO fold of
+  `mypy.checkmember.check_final_member` (checkmember.py:1360): Rust
+  walks the live `info.mro` via PyO3 (zero wire bytes), looks up
+  `base.names.get(name)` per entry, classifies the node kind
+  (Var / FuncBase / Decorator via `is_instance`, covering the
+  `is_final_node` tuple exactly), and reads `is_final`, folding the
+  MRO into one bool (True = some entry is final). The Python shim
+  keeps the `cant_assign_to_final` emission; a `None` defers on any
+  unreadable fact so the pure-Python loop re-runs unchanged. Gated by
+  `_native_checkmember_active` (existing wiring, no build.py change)
+  and covered by `NativeCheckFinalMemberSuite` in
+  `mypy/test/testtypes.py` (gate-off vs gate-on differential plus
+  direct seam calls), plus pure fold unit tests in `checkmember.rs`.
 

@@ -126,6 +126,7 @@ try:
         rust_analyze_typeddict_access as _rust_analyze_typeddict_access,
         rust_analyze_union_member_access as _rust_analyze_union_member_access,
         rust_bind_self_fast as _rust_bind_self_fast,
+        rust_check_final_member as _rust_check_final_member,
         rust_classify_analyze_var as _rust_classify_analyze_var,
         rust_classify_type_type_member_access as _rust_classify_type_type_member_access,
         rust_defined_in_superclass as _rust_defined_in_superclass,
@@ -144,6 +145,7 @@ except ImportError:
     _rust_has_operator = None  # type: ignore[assignment]
     _rust_meta_has_operator = None  # type: ignore[assignment]
     _rust_is_instance_var = None  # type: ignore[assignment]
+    _rust_check_final_member = None  # type: ignore[assignment]
     _rust_defined_in_superclass = None  # type: ignore[assignment]
     _rust_classify_analyze_var = None  # type: ignore[assignment]
     _rust_classify_type_type_member_access = None  # type: ignore[assignment]
@@ -1357,6 +1359,14 @@ def analyze_member_var_access(
 
 def check_final_member(name: str, info: TypeInfo, msg: MessageBuilder, ctx: Context) -> None:
     """Give an error if the name being assigned was declared as final."""
+    # M20 kernel dispatch (#1078): the MRO walk is one Rust call over the
+    # live TypeInfo; the `cant_assign_to_final` emission stays here.
+    if _HAS_TYPE_KERNEL and _native_checkmember_active and _rust_check_final_member is not None:
+        result = _rust_check_final_member(info, name)
+        if result is not None:
+            if result:
+                msg.cant_assign_to_final(name, attr_assign=True, ctx=ctx)
+            return
     for base in info.mro:
         sym = base.names.get(name)
         if sym and is_final_node(sym.node):

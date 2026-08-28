@@ -2962,6 +2962,95 @@ pub(crate) fn rust_classify_analyze_var(
     )))
 }
 
+// ---------------------------------------------------------------------------
+// check_final_member
+// ---------------------------------------------------------------------------
+
+/// The fold over per-MRO-entry facts, kept separate from the PyO3 entry so
+/// the MRO ordering is unit-testable without a Python runtime. Each entry
+/// is whether that base declares `name` final (`false` includes "name not
+/// present" and "present but not a final-capable node kind"); `None` is an
+/// unreadable entry, which defers the whole walk (Python would have raised
+/// mid-loop, so the shim falls back to the pure body). Python scans the
+/// full MRO without breaking, so the fold answers "any entry final".
+fn check_final_member_fold(entries: impl Iterator<Item = Option<bool>>) -> Option<bool> {
+    for entry in entries {
+        match entry {
+            None => return None,
+            Some(true) => return Some(true),
+            Some(false) => {}
+        }
+    }
+    Some(false)
+}
+
+/// `mypy.checkmember.check_final_member` (checkmember.py:1358-1363): the
+/// pure MRO fold deciding whether any base of `info` declares `name`
+/// final. Live-PyO3-object seam, zero wire bytes: for each `TypeInfo` in
+/// `info.mro`, read `names.get(name)` and decide finality from the node
+/// kind (`is_final_node`: `Var`/`FuncBase`/`Decorator` with `is_final`;
+/// `FuncDef`/`OverloadedFuncDef` are `FuncBase` subclasses). Returns
+/// `Some(bool)`; any unreadable attribute defers (`None`) so the shim
+/// re-runs the untouched pure-Python body.
+#[pyfunction]
+pub(crate) fn rust_check_final_member(info: &PyAny, name: &str) -> Option<bool> {
+    let py = info.py();
+    let mro = info.getattr("mro").ok()?;
+    let nodes_mod = py.import("mypy.nodes").ok()?;
+    let var_cls = nodes_mod.getattr("Var").ok()?.downcast::<PyType>().ok()?;
+    let func_base_cls = nodes_mod
+        .getattr("FuncBase")
+        .ok()?
+        .downcast::<PyType>()
+        .ok()?;
+    let decorator_cls = nodes_mod
+        .getattr("Decorator")
+        .ok()?
+        .downcast::<PyType>()
+        .ok()?;
+    let entries = mro.iter().ok()?.map(|base| {
+        let base = match base {
+            Ok(b) => b,
+            Err(_) => return None,
+        };
+        let names = match base.getattr("names") {
+            Ok(n) => n,
+            Err(_) => return None,
+        };
+        let sym = match names.call_method1("get", (name,)) {
+            Ok(s) => s,
+            Err(_) => return None,
+        };
+        if sym.is_none() {
+            return Some(false);
+        }
+        let node = match sym.getattr("node") {
+            Ok(n) => n,
+            Err(_) => return None,
+        };
+        // is_final_node(None) is False; a non-matching kind (TypeInfo,
+        // TypeAlias, ...) can never be final, so keep walking.
+        if node.is_none() {
+            return Some(false);
+        }
+        let is_kind = match node.is_instance(var_cls) {
+            Ok(v) => v,
+            Err(_) => return None,
+        } || match node.is_instance(func_base_cls) {
+            Ok(v) => v,
+            Err(_) => return None,
+        } || match node.is_instance(decorator_cls) {
+            Ok(v) => v,
+            Err(_) => return None,
+        };
+        if !is_kind {
+            return Some(false);
+        }
+        node.getattr("is_final").ok()?.extract::<bool>().ok()
+    });
+    check_final_member_fold(entries)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4669,5 +4758,60 @@ mod classify_analyze_var_tests {
             classify_analyze_var_inner("RED", &facts, false, false, false),
             ANALYZE_VAR_ENUM_LITERAL
         );
+    }
+}
+
+/// Pure fold tests for `check_final_member_fold` (issue #1078). Live
+/// MRO-walk coverage (gate differential, deferral) lives in
+/// `NativeCheckFinalMemberSuite` in mypy/test/testtypes.py.
+#[cfg(test)]
+mod check_final_member_tests {
+    use super::check_final_member_fold;
+
+    #[test]
+    fn test_fold_empty_mro_is_not_final() {
+        assert_eq!(check_final_member_fold(std::iter::empty()), Some(false));
+    }
+
+    #[test]
+    fn test_fold_name_not_in_mro() {
+        // `names.get(name)` misses on every base: not final.
+        let entries = vec![Some(false), Some(false)];
+        assert_eq!(check_final_member_fold(entries.into_iter()), Some(false));
+    }
+
+    #[test]
+    fn test_fold_final_var_in_first_base() {
+        let entries = vec![Some(true)];
+        assert_eq!(check_final_member_fold(entries.into_iter()), Some(true));
+    }
+
+    #[test]
+    fn test_fold_final_in_later_base() {
+        // Only a base deeper in the MRO declares the name final.
+        let entries = vec![Some(false), Some(false), Some(true)];
+        assert_eq!(check_final_member_fold(entries.into_iter()), Some(true));
+    }
+
+    #[test]
+    fn test_fold_any_entry_final_wins() {
+        // Python scans the full MRO without breaking on non-final hits,
+        // so an overridden name is still final when a base declares it.
+        let entries = vec![Some(false), Some(false), Some(true), Some(false)];
+        assert_eq!(check_final_member_fold(entries.into_iter()), Some(true));
+    }
+
+    #[test]
+    fn test_fold_unreadable_entry_defers() {
+        let entries = vec![Some(false), None];
+        assert_eq!(check_final_member_fold(entries.into_iter()), None);
+    }
+
+    #[test]
+    fn test_fold_unreadable_after_final_still_answers() {
+        // The early-true short-circuit answers before the defer is seen;
+        // the shim's fallback reproduces the same output either way.
+        let entries = vec![Some(true), None];
+        assert_eq!(check_final_member_fold(entries.into_iter()), Some(true));
     }
 }
