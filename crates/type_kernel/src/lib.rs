@@ -95,6 +95,7 @@ mod infer_variance;
 mod joinfns;
 mod lennarrow;
 mod lkv;
+mod lookup_definer;
 mod maptype;
 mod meet;
 mod member_flags;
@@ -3280,6 +3281,13 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
     // pre-resolves the MemberExpr owner type, and any unreadable fact defers.
     module.add_function(wrap_pyfunction!(
         returns_none::rust_always_returns_none,
+        module
+    )?)?;
+
+    // Issue #1075: lookup_definer live-object MRO walk. Rust reads
+    // typ.type.mro via PyO3 (zero wire bytes); any unreadable fact defers.
+    module.add_function(wrap_pyfunction!(
+        lookup_definer::rust_lookup_definer,
         module
     )?)?;
 

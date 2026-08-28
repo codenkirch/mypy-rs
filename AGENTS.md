@@ -1795,4 +1795,18 @@ directly to `main`.
   `mypy/test/testtypes.py` (gate-off vs gate-on differential plus
   direct seam calls), plus pure decision unit tests in
   `returns_none.rs`.
+- `rust_lookup_definer` (issue #1075) — mirrors
+  `ExpressionChecker.lookup_definer` (checkexpr.py:5862-5876), the
+  pure MRO walk behind both `check_op_reversible` call sites
+  (checkexpr.py:5947-5948): Rust reads the live `Instance`'s
+  `typ.type.mro` via PyO3 (zero wire bytes) and returns the first
+  `cls` whose `names.get(attr_name)` is present, in MRO order. A found
+  verdict is `Some(Some(fullname))`, not found is `Some(None)`; any
+  unreadable fact (`typ.type`, an MRO entry, its `names` or
+  `fullname`) defers (`None`) to the untouched pure-Python body.
+  Gated by `_native_checkexpr_active` (existing wiring, no build.py
+  change) and covered by `NativeLookupDefinerSuite` in
+  `mypy/test/testtypes.py` (gate-off vs gate-on differential plus
+  direct seam calls), plus pure fold unit tests in
+  `lookup_definer.rs`.
 
