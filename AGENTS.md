@@ -1832,4 +1832,19 @@ directly to `main`.
   `mypy/test/testtypes.py` (gate-off vs gate-on differential plus
   direct seam calls), plus pure fold unit tests in
   `lookup_definer.rs`.
+- `rust_infer_operator_assignment_method` (issue #1079) — mirrors
+  `infer_operator_assignment_method` + `_find_inplace_method`
+  (checker.py:11498-11520), the pure `(True, "__i<rest>")` vs
+  `(False, method)` decision for augmented assignments. Rust reads the
+  live proper type via PyO3 (isinstance Instance / TypedDictType +
+  `typ.fallback`, `typ.type.has_readable_member(...)`) plus the
+  `method` string and the `in_ops` membership bool the shim computes
+  from `operators.ops_with_inplace_method`, and returns the 2-tuple;
+  never defers for well-formed input (`None` only on an unreadable
+  attribute). `get_proper_type` stays shim-side. Gated by
+  `_native_checker_active` (existing wiring, no build.py change) and
+  covered by `NativeInferOperatorAssignmentSuite` in
+  `mypy/test/testtypes.py` (gate-off vs gate-on differential plus
+  direct seam calls), plus pure decision unit tests in
+  `checker_functions.rs`.
 

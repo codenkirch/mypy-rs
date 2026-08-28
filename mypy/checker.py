@@ -367,6 +367,7 @@ try:
         rust_group_comparison_operands as _rust_group_comparison_operands,
         rust_has_bool_item as _rust_has_bool_item,
         rust_has_custom_eq_checks as _rust_has_custom_eq_checks,
+        rust_infer_operator_assignment_method as _rust_infer_operator_assignment_method,
         rust_is_async_generator_return_type as _rust_is_async_generator_return_type,
         rust_is_classmethod_node as _rust_is_classmethod_node,
         rust_is_custom_settable_property as _rust_is_custom_settable_property,
@@ -413,6 +414,7 @@ except ImportError:
     _rust_and_conditional_maps = None  # type: ignore[assignment]
     _rust_has_bool_item = None  # type: ignore[assignment]
     _rust_has_custom_eq_checks = None  # type: ignore[assignment]
+    _rust_infer_operator_assignment_method = None  # type: ignore[assignment]
     _rust_narrow_type_by_identity_equality = None  # type: ignore[assignment]
     _rust_narrow_with_len = None  # type: ignore[assignment]
     _rust_or_conditional_maps = None  # type: ignore[assignment]
@@ -11503,6 +11505,22 @@ def infer_operator_assignment_method(typ: Type, operator: str) -> tuple[bool, st
     """
     typ = get_proper_type(typ)
     method = operators.op_methods[operator]
+    # Native type_kernel seam: the pure (is_inplace, method) decision in
+    # Rust (checker_functions.rs); None or a gate-off build falls through
+    # to the pure-Python body below.
+    if (
+        _CHECKER_HAS_TYPE_KERNEL
+        and _native_checker_active
+        and _rust_infer_operator_assignment_method is not None
+    ):
+        try:
+            result = _rust_infer_operator_assignment_method(
+                typ, method, operator in operators.ops_with_inplace_method
+            )
+        except (AssertionError, NotImplementedError, ValueError, TypeError):
+            result = None
+        if result is not None:
+            return result
     existing_method = None
     if isinstance(typ, Instance):
         existing_method = _find_inplace_method(typ, method, operator)
