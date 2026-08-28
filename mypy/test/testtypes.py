@@ -42357,3 +42357,156 @@ class NativeCheckAssignmentHeadSuite(Suite):
 
     def test_parity_tuple(self) -> None:
         self._assert_par(TupleExpr([NameExpr("a")]), None, None, None)
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeArgVarianceWalkSuite(Suite):
+    """Differential suite for the per-arg variance walk in
+    `visit_instance_nominal` (issue #1098).
+
+    Covers the two defer removals in the walk: non-TypeVarType type
+    params (ParamSpec, kind=1) now dispatch like Python's else branch
+    (COVARIANT pass-through), and wire-equal args short-circuit via the
+    reflexive fast path in `check_type_parameter`. VARIANCE_NOT_READY
+    still defers; the snapshot variance is populated at build time by
+    `infer_class_variances` (mypy/build.py).
+    """
+
+    def setUp(self) -> None:
+        from mypy.subtypes import _set_native_subtype_active, _set_native_subtype_resolver
+
+        self.fx = TypeFixture(INVARIANT)
+        type_infos = self._collect_type_infos() + self._custom_infos()
+        self.resolver = _type_kernel.build_native_resolver(type_infos, [])
+        _set_native_subtype_active(True)
+        _set_native_subtype_resolver(self.resolver)
+
+    def tearDown(self) -> None:
+        from mypy.subtypes import _set_native_subtype_active, _set_native_subtype_resolver
+
+        _set_native_subtype_active(False)
+        _set_native_subtype_resolver(None)
+
+    def _collect_type_infos(self) -> list[TypeInfo]:
+        infos = []
+        for name in dir(self.fx):
+            if not name.endswith("i"):
+                continue
+            value = getattr(self.fx, name)
+            if isinstance(value, TypeInfo):
+                infos.append(value)
+        return infos
+
+    def _custom_infos(self) -> list[TypeInfo]:
+        from mypy.nodes import VARIANCE_NOT_READY
+
+        fx = self.fx
+        self.co = fx.make_type_info(
+            "Co", mro=[fx.oi], typevars=["T"], variances=[COVARIANT]
+        )
+        self.contra = fx.make_type_info(
+            "Contra", mro=[fx.oi], typevars=["T"], variances=[CONTRAVARIANT]
+        )
+        inv = fx.make_type_info(
+            "Inv", mro=[fx.oi], typevars=["T"], variances=[INVARIANT]
+        )
+        self.inv = inv
+        # A class whose only type param is a bare ParamSpec (snapshot kind=1).
+        gp = fx.make_type_info("GP", mro=[fx.oi])
+        self.pspec = ParamSpecType(
+            "P",
+            "P",
+            TypeVarId(1),
+            ParamSpecFlavor.BARE,
+            Instance(fx.oi, [], -1),
+            NoneType(),
+        )
+        gp.defn.type_vars = [self.pspec]
+        self.gp = gp
+        # A class whose type param is stuck at VARIANCE_NOT_READY.
+        self.nr = fx.make_type_info(
+            "Nr", mro=[fx.oi], typevars=["T"], variances=[VARIANCE_NOT_READY]
+        )
+        return [self.co, self.contra, inv, gp, self.nr]
+
+    def _differential(self, left: Type, right: Type) -> bool:
+        """Assert the gate-off (pure Python) and gate-on answers agree."""
+        from mypy.subtypes import _set_native_subtype_active, is_subtype
+
+        _set_native_subtype_active(False)
+        try:
+            with state.strict_optional_set(True):
+                expected = is_subtype(left, right)
+        finally:
+            _set_native_subtype_active(True)
+        with state.strict_optional_set(True):
+            actual = is_subtype(left, right)
+        assert_equal(actual, expected)
+        return actual
+
+    def _direct_seam(
+        self, left: Type, right: Type
+    ) -> bool | None:
+        """Call the single-pair seam directly; None means Rust deferred."""
+        from mypy.subtypes import _serialize_type
+
+        return _type_kernel.rust_is_subtype(
+            _serialize_type(left),
+            _serialize_type(right),
+            False,  # ignore_type_params
+            False,  # ignore_declared_variance
+            False,  # always_covariant
+            False,  # ignore_promotions
+            False,  # proper_subtype
+            True,  # strict_optional
+            False,  # ignore_pos_arg_names
+            False,  # strict_concatenate
+            self.resolver,
+        )
+
+    def test_covariant_arg(self) -> None:
+        # Co[int] <: Co[object] holds; the reverse does not.
+        co_int = Instance(self.co, [self.fx.str_type])
+        co_obj = Instance(self.co, [self.fx.o])
+        assert self._differential(co_int, co_obj) is True
+        assert self._differential(co_obj, co_int) is False
+
+    def test_contravariant_arg(self) -> None:
+        # Contra[object] <: Contra[str] holds; the reverse does not.
+        contra_str = Instance(self.contra, [self.fx.str_type])
+        contra_obj = Instance(self.contra, [self.fx.o])
+        assert self._differential(contra_obj, contra_str) is True
+        assert self._differential(contra_str, contra_obj) is False
+
+    def test_invariant_arg(self) -> None:
+        # Inv[str] <: Inv[str] holds; Inv[str] <: Inv[object] does not.
+        inv_str = Instance(self.inv, [self.fx.str_type])
+        inv_obj = Instance(self.inv, [self.fx.o])
+        assert self._differential(inv_str, inv_str) is True
+        assert self._differential(inv_str, inv_obj) is False
+
+    def test_paramspec_same_ref_decides_natively(self) -> None:
+        # GP[P] <: GP[P]: identical ParamSpec args hit the reflexive fast
+        # path in check_type_parameter instead of deferring in the
+        # recursive is_subtype (the pre-#1098 behavior).
+        gp_p = Instance(self.gp, [self.pspec])
+        assert self._differential(gp_p, gp_p) is True
+        assert self._direct_seam(gp_p, gp_p) is True
+
+    def test_paramspec_differing_args_parity(self) -> None:
+        # GP[P] <: GP[P.args-shape]: differing ParamSpec args dispatch
+        # through the kind=1 COVARIANT pass-through; gate on/off agree.
+        gp_p = Instance(self.gp, [self.pspec])
+        other = self.pspec.with_flavor(ParamSpecFlavor.KWARGS)
+        gp_other = Instance(self.gp, [other])
+        self._differential(gp_p, gp_other)
+        self._differential(gp_other, gp_p)
+
+    def test_variance_not_ready_still_defers(self) -> None:
+        # The snapshot cannot mirror infer_class_variances' live mutation;
+        # NOT_READY keeps deferring to the Python fallback, which infers
+        # the variance lazily (covariant here) on first encounter.
+        nr_str = Instance(self.nr, [self.fx.str_type])
+        nr_obj = Instance(self.nr, [self.fx.o])
+        assert self._direct_seam(nr_str, nr_obj) is None
+        assert self._differential(nr_str, nr_obj) is True

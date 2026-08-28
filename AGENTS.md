@@ -1942,3 +1942,17 @@ directly to `main`.
   `NativeCheckAssignmentHeadSuite` in `mypy/test/testtypes.py` (direct
   seam calls per arm tag plus gate-off vs gate-on differential), plus
   pure decision unit tests in `checker_functions.rs`.
+- `visit_instance_nominal` per-arg variance walk (issue #1098,
+  crates/type_kernel/src/subtypes.rs) — ports the args-differ dispatch of
+  `SubtypeContext.visit_instance` (subtypes.py:1195-1203): a non-
+  `TypeVarType` tvar gets `effective_variance = COVARIANT` (Python's
+  else-branch) instead of deferring, and `check_type_parameter` gains a
+  reflexive `left == right` fast path at the top. `VARIANCE_NOT_READY`
+  still defers, but `mypy/build.py` (`_build_native_resolvers`, right
+  after `_collect_incremental`) now pre-infers snapshot variance via
+  `infer_class_variances` for infos carrying a NOT_READY TypeVarType;
+  known limitation: classes with unannotated attribute Vars fail
+  build-time inference (Var.type is None at semanal) and keep deferring.
+  Covered by `NativeArgVarianceWalkSuite` in `mypy/test/testtypes.py`
+  (gate-off vs gate-on differentials for covariant/contravariant/
+  invariant, ParamSpec same-ref/differing-args, NOT_READY defer proof).
