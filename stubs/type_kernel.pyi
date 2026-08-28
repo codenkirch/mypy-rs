@@ -78,6 +78,7 @@ __all__ = [
     "rust_object_from_instance",
     "rust_narrow_declared_type",
     "rust_narrow_with_len",
+    "rust_can_be_narrowed_with_len",
     "rust_map_actuals_to_formals",
     "rust_narrow_type_by_identity_equality",
     "rust_map_formals_to_actuals",
@@ -593,6 +594,9 @@ def rust_narrow_with_len(
     precise_tuple: bool,
     resolver: NativeTypeResolver,
 ) -> tuple[bytes, bytes] | None: ...
+def rust_can_be_narrowed_with_len(
+    typ: bytes, resolver: NativeTypeResolver
+) -> bool | None: ...
 def rust_map_actuals_to_formals(
     actual_kinds: list[int],
     actual_names: list[str | None],

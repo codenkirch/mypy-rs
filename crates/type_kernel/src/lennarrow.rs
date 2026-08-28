@@ -93,7 +93,7 @@ fn neg_op(op: &str) -> Option<&'static str> {
 /// `Instance` with `builtins.tuple` base, and unions of those. Returns `None`
 /// to defer when a `custom_special_method` or `has_base` check needs a
 /// snapshot that is missing from the resolver.
-fn can_be_narrowed_with_len(typ: &Type, resolver: &TypeResolver) -> Option<bool> {
+pub(crate) fn can_be_narrowed_with_len(typ: &Type, resolver: &TypeResolver) -> Option<bool> {
     // If user overrides builtin behavior, we can't do anything.
     if custom_special_method_inner(typ, "__len__", false, resolver)? {
         return Some(false);
@@ -493,5 +493,217 @@ fn narrow_with_len_inner(
             Some((yes_type, no_type))
         }
         _ => None,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// rust_can_be_narrowed_with_len — exported gate predicate (#1065)
+// ---------------------------------------------------------------------------
+
+/// `TypeChecker.can_be_narrowed_with_len` (checker.py:9267).
+///
+/// Returns the bool decision, or `None` to defer to the pure-Python path
+/// (undecodable wire bytes, an unresolved resolver snapshot, or an alias
+/// target that has no proper form on the wire).
+#[pyfunction]
+pub(crate) fn rust_can_be_narrowed_with_len(
+    typ_bytes: &[u8],
+    resolver: &mut NativeTypeResolver,
+) -> PyResult<Option<bool>> {
+    let typ = match decode_type(typ_bytes) {
+        Some(t) => t,
+        None => return Ok(None),
+    };
+    Ok(can_be_narrowed_with_len(&typ, resolver.resolver()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::typeinfo::TypeInfoSnapshot;
+    use std::collections::HashSet;
+
+    fn make_instance(type_ref: &str, args: Vec<Type>) -> Type {
+        Type::Instance {
+            type_ref: type_ref.to_string(),
+            args,
+            last_known_value: None,
+            extra_attrs: None,
+        }
+    }
+
+    fn make_snapshot(fullname: &str) -> TypeInfoSnapshot {
+        TypeInfoSnapshot {
+            fullname: fullname.to_string(),
+            name: fullname.rsplit('.').next().unwrap_or(fullname).to_string(),
+            mro: vec![fullname.to_string()],
+            has_base: HashSet::from([fullname.to_string()]),
+            ..Default::default()
+        }
+    }
+
+    fn make_tuple(fallback_ref: &str, items: Vec<Type>) -> Type {
+        Type::TupleType {
+            partial_fallback: Box::new(make_instance(fallback_ref, vec![])),
+            items,
+            implicit: false,
+        }
+    }
+
+    #[test]
+    fn test_fixed_tuple_true() {
+        let mut r = TypeResolver::new();
+        r.insert(
+            "builtins.tuple".to_string(),
+            make_snapshot("builtins.tuple"),
+        );
+        let t = make_tuple("builtins.tuple", vec![]);
+        assert_eq!(can_be_narrowed_with_len(&t, &r), Some(true));
+    }
+
+    #[test]
+    fn test_unpack_tuple_builtins_fallback_true() {
+        let mut r = TypeResolver::new();
+        r.insert(
+            "builtins.tuple".to_string(),
+            make_snapshot("builtins.tuple"),
+        );
+        // Mirrors tuple[int, ...]: the unpack wraps tuple[int].
+        let unpack = Type::UnpackType {
+            typ: Box::new(make_instance(
+                "builtins.tuple",
+                vec![Type::AnyType {
+                    type_of_any: 0,
+                    source_any: None,
+                    missing_import_name: None,
+                }],
+            )),
+        };
+        let t = make_tuple("builtins.tuple", vec![unpack]);
+        assert_eq!(can_be_narrowed_with_len(&t, &r), Some(true));
+    }
+
+    #[test]
+    fn test_unpack_tuple_other_fallback_false() {
+        let mut r = TypeResolver::new();
+        r.insert(
+            "builtins.tuple".to_string(),
+            make_snapshot("builtins.tuple"),
+        );
+        r.insert("mymod.Fake".to_string(), make_snapshot("mymod.Fake"));
+        let unpack = Type::UnpackType {
+            typ: Box::new(make_instance(
+                "builtins.tuple",
+                vec![Type::AnyType {
+                    type_of_any: 0,
+                    source_any: None,
+                    missing_import_name: None,
+                }],
+            )),
+        };
+        let t = make_tuple("mymod.Fake", vec![unpack]);
+        assert_eq!(can_be_narrowed_with_len(&t, &r), Some(false));
+    }
+
+    #[test]
+    fn test_tuple_instance_true() {
+        let mut r = TypeResolver::new();
+        r.insert(
+            "builtins.tuple".to_string(),
+            make_snapshot("builtins.tuple"),
+        );
+        let t = make_instance("builtins.tuple", vec![]);
+        assert_eq!(can_be_narrowed_with_len(&t, &r), Some(true));
+    }
+
+    #[test]
+    fn test_non_tuple_instance_false() {
+        let mut r = TypeResolver::new();
+        r.insert("builtins.int".to_string(), make_snapshot("builtins.int"));
+        let t = make_instance("builtins.int", vec![]);
+        assert_eq!(can_be_narrowed_with_len(&t, &r), Some(false));
+    }
+
+    #[test]
+    fn test_custom_len_false() {
+        let mut r = TypeResolver::new();
+        let mut snap = make_snapshot("mymod.Len");
+        snap.member_definers
+            .insert("__len__".to_string(), (0, "mymod.Len".to_string()));
+        r.insert("mymod.Len".to_string(), snap);
+        let t = make_instance("mymod.Len", vec![]);
+        assert_eq!(can_be_narrowed_with_len(&t, &r), Some(false));
+    }
+
+    #[test]
+    fn test_missing_snapshot_defers() {
+        let r = TypeResolver::new();
+        let t = make_instance("mymod.Unknown", vec![]);
+        assert_eq!(can_be_narrowed_with_len(&t, &r), None);
+    }
+
+    #[test]
+    fn test_union_with_tuple_true() {
+        let mut r = TypeResolver::new();
+        r.insert(
+            "builtins.tuple".to_string(),
+            make_snapshot("builtins.tuple"),
+        );
+        r.insert("builtins.int".to_string(), make_snapshot("builtins.int"));
+        let t = Type::UnionType {
+            items: vec![
+                make_instance("builtins.tuple", vec![]),
+                make_instance("builtins.int", vec![]),
+            ],
+            uses_pep604_syntax: false,
+            can_be_true: false,
+            can_be_false: false,
+        };
+        assert_eq!(can_be_narrowed_with_len(&t, &r), Some(true));
+    }
+
+    #[test]
+    fn test_union_without_tuple_false() {
+        let mut r = TypeResolver::new();
+        r.insert("builtins.int".to_string(), make_snapshot("builtins.int"));
+        let t = Type::UnionType {
+            items: vec![
+                make_instance("builtins.int", vec![]),
+                Type::AnyType {
+                    type_of_any: 0,
+                    source_any: None,
+                    missing_import_name: None,
+                },
+            ],
+            uses_pep604_syntax: false,
+            can_be_true: false,
+            can_be_false: false,
+        };
+        // AnyType is treated as custom-__len__ (uncertain) -> False.
+        assert_eq!(can_be_narrowed_with_len(&t, &r), Some(false));
+    }
+
+    #[test]
+    fn test_wire_round_trip_through_export() {
+        let make_native = || {
+            let mut r = TypeResolver::new();
+            r.insert(
+                "builtins.tuple".to_string(),
+                make_snapshot("builtins.tuple"),
+            );
+            NativeTypeResolver::from_resolver(r)
+        };
+        let bytes = encode_type(&make_tuple("builtins.tuple", vec![])).unwrap();
+        let mut native = make_native();
+        assert_eq!(
+            rust_can_be_narrowed_with_len(&bytes, &mut native).unwrap(),
+            Some(true)
+        );
+        // Undecodable wire bytes defer (shim falls back to pure Python).
+        let mut native = make_native();
+        assert_eq!(
+            rust_can_be_narrowed_with_len(&[0xff, 0xff], &mut native).unwrap(),
+            None
+        );
     }
 }

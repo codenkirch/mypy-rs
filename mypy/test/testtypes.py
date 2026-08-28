@@ -26164,6 +26164,180 @@ class NativeIsFinalEnumValueSuite(Suite):
 
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeCanBeNarrowedWithLenSuite(Suite):
+    """Parity for the Rust len-narrowing gate predicate (#1065).
+
+    `TypeChecker.can_be_narrowed_with_len` (checker.py:9267) is consulted
+    at the leaf of every `find_isinstance_check` conditional. The Rust
+    port (`lennarrow.rs`) decides from the wire type + resolver snapshot
+    and defers (None) on an unresolved MRO/alias; the shim falls through
+    to the pure-Python body then. Direct seam calls assert the exact
+    bool; the gate-off vs gate-on differential drives the real
+    TypeChecker method.
+    """
+
+    def setUp(self) -> None:
+        from mypy.checker import _set_native_checker_active, _set_native_checker_resolver
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        self.fx = TypeFixture()
+        self._typeinfos: list[TypeInfo] = []
+        self._rebuild_resolver()
+        _set_native_checker_active(True)
+        _set_native_checker_resolver(self._resolver)
+        set_wire_typeinfo_map(
+            {info.fullname: info for info in self._typeinfos + _base_infos(self.fx)}
+        )
+
+    def tearDown(self) -> None:
+        from mypy.checker import _set_native_checker_active, _set_native_checker_resolver
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        _set_native_checker_active(False)
+        _set_native_checker_resolver(None)
+        set_wire_typeinfo_map(None)
+
+    def _rebuild_resolver(self) -> None:
+        import type_kernel as _tk
+
+        from mypy.checker import _set_native_checker_resolver
+
+        infos = self._typeinfos + _base_infos(self.fx)
+        self._resolver = _tk.build_native_resolver(infos, [])
+        _set_native_checker_resolver(self._resolver)
+
+    def _with_gate(self, active: bool, fn: Callable[[], T]) -> T:
+        from mypy.checker import _set_native_checker_active
+
+        _set_native_checker_active(active)
+        try:
+            return fn()
+        finally:
+            _set_native_checker_active(True)
+
+    def _run(self, typ: Type) -> tuple[bool, bool]:
+        from mypy.checker import TypeChecker
+
+        def check_one() -> bool:
+            chk = TypeChecker.__new__(TypeChecker)
+            return chk.can_be_narrowed_with_len(typ)
+
+        off = self._with_gate(False, check_one)
+        on = self._with_gate(True, check_one)
+        return off, on
+
+    def _assert_par(self, typ: Type, expected: bool | None = None, defers: bool = False) -> None:
+        from mypy.checker import _serialize_type_for_checker
+
+        off, on = self._run(typ)
+        assert on == off, f"can_be_narrowed_with_len parity {typ!r}: off={off} on={on}"
+        if expected is not None:
+            assert on == expected, f"can_be_narrowed_with_len {typ!r}: {on} != {expected}"
+        # The seam must engage (not defer) for the differential to mean
+        # anything; alias/missing-snapshot cases assert deferral directly.
+        result = _type_kernel.rust_can_be_narrowed_with_len(
+            _serialize_type_for_checker(typ), self._resolver
+        )
+        if defers:
+            assert result is None, f"Rust len gate expected defer for {typ!r}"
+        else:
+            assert result is not None, f"Rust len gate did not engage for {typ!r}"
+
+    def _seam(self, typ: Type, resolver: Any) -> bool | None:
+        from mypy.checker import _serialize_type_for_checker
+
+        return _type_kernel.rust_can_be_narrowed_with_len(
+            _serialize_type_for_checker(typ), resolver
+        )
+
+    def _info(self, fullname: str) -> TypeInfo:
+
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        info = self.fx.make_type_info(fullname)
+        self._typeinfos.append(info)
+        self._rebuild_resolver()
+        set_wire_typeinfo_map(
+            {i.fullname: i for i in self._typeinfos + _base_infos(self.fx)}
+        )
+        return info
+
+    def test_seam_fixed_tuple(self) -> None:
+        t = TupleType([self.fx.a, self.fx.b], self.fx.std_tuple)
+        assert self._seam(t, self._resolver) is True
+
+    def test_seam_tuple_instance(self) -> None:
+        assert self._seam(self.fx.std_tuple, self._resolver) is True
+
+    def test_seam_non_tuple_instance(self) -> None:
+        assert self._seam(self.fx.a, self._resolver) is False
+
+    def test_seam_custom_len_false(self) -> None:
+        info = self._info("mod.Len")
+        node = FuncDef("__len__", [], None, None)
+        node.info = info
+        info.names["__len__"] = SymbolTableNode(MDEF, node)
+        self._rebuild_resolver()
+        assert self._seam(Instance(info, []), self._resolver) is False
+
+    def test_seam_missing_snapshot_defers(self) -> None:
+        import type_kernel as _tk
+
+        empty = _tk.build_native_resolver([], [])
+        assert self._seam(self.fx.std_tuple, empty) is None
+
+    def test_seam_alias_defers(self) -> None:
+        from mypy.nodes import TypeAlias
+
+        alias = TypeAlias(self.fx.std_tuple, "mod.Alias", "mod", -1, -1)
+        assert self._seam(TypeAliasType(alias, []), self._resolver) is None
+
+    def test_parity_fixed_tuple(self) -> None:
+        self._assert_par(TupleType([self.fx.a, self.fx.b], self.fx.std_tuple), True)
+
+    def test_parity_tuple_instance(self) -> None:
+        self._assert_par(self.fx.std_tuple, True)
+
+    def test_parity_non_tuple(self) -> None:
+        self._assert_par(self.fx.a, False)
+        self._assert_par(AnyType(TypeOfAny.special_form), False)
+
+    def test_parity_custom_len(self) -> None:
+        info = self._info("mod.Len")
+        node = FuncDef("__len__", [], None, None)
+        node.info = info
+        info.names["__len__"] = SymbolTableNode(MDEF, node)
+        self._rebuild_resolver()
+        self._assert_par(Instance(info, []), False)
+
+    def test_parity_union_of_tuples(self) -> None:
+        u = UnionType([TupleType([self.fx.a], self.fx.std_tuple), self.fx.std_tuple])
+        self._assert_par(u, True)
+
+    def test_parity_union_without_tuple(self) -> None:
+        u = UnionType([self.fx.a, self.fx.b])
+        self._assert_par(u, False)
+
+    def test_parity_union_with_custom_len_item(self) -> None:
+        # A custom-__len__ item poisons the whole union -> False.
+        info = self._info("mod.Len")
+        node = FuncDef("__len__", [], None, None)
+        node.info = info
+        info.names["__len__"] = SymbolTableNode(MDEF, node)
+        self._rebuild_resolver()
+        u = UnionType([Instance(info, []), self.fx.std_tuple])
+        self._assert_par(u, False)
+
+    def test_parity_alias_falls_back(self) -> None:
+        # The seam defers on a TypeAliasType; the shim must fall through
+        # to the pure-Python body, which expands the alias to tuple.
+        from mypy.nodes import TypeAlias
+
+        alias = TypeAlias(self.fx.std_tuple, "mod.Alias", "mod", -1, -1)
+        self._assert_par(TypeAliasType(alias, []), True, defers=True)
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeFixedArgsSuite(Suite):
     """Parity for the Rust `check_fixed_args` arbitration port.
 
