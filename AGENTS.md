@@ -1990,3 +1990,16 @@ directly to `main`.
   constant_fold keeps propagating). Covered by `NativeDecidedNoneSuite`
   in `mypy/test/testtypes.py` (direct seam decided-None calls plus
   gate-off vs gate-on parity).
+
+- `rust_set_callable_name` (issue #1100) — mirrors
+  `mypy.semanal_shared.set_callable_name` (semanal_shared.py:290-310). The
+  class-context test mirrors Python's `if fdef.info:` truthiness via
+  PyO3 `is_true` (`TypeInfo.__bool__` returns False for the FakeInfo
+  placeholder `FUNC_NO_INFO` that non-method `FuncDef`s carry), not an
+  `is None` check; the old check deferred every non-method call (~6,525
+  measured on the cold self-check, 100% of the seam's defers) to the
+  pure-Python body. Gated by `_native_semanal_shared_active` (existing
+  wiring) and covered by `NativeSetCallableNameSuite` in
+  `mypy/test/testtypes.py` (direct seam calls for method / TypedDict /
+  FakeInfo / None-info / passthrough shapes plus gate-off vs gate-on
+  parity through `set_callable_name`).

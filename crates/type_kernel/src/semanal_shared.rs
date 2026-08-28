@@ -201,11 +201,16 @@ fn argument_elide_name_inner(name: Option<&str>) -> bool {
 ///
 /// Mirrors semanal_shared.py:266-279. Resolves `sig` via
 /// `get_proper_type`; if the result is a `FunctionLike` and `fdef.info`
-/// is set, uses `fdef.info.fullname` (replaced with "TypedDict" if it's an
-/// internal `_TypedDict` name) or `fdef.info.name` to build
-/// `"{fdef.name} of {class_name}"`. If `fdef.info` is `None`, uses just
-/// `fdef.name`. For non-`FunctionLike` types, returns the proper type
-/// unchanged.
+/// is truthy, uses `fdef.info.fullname` (replaced with "TypedDict" if it's
+/// an internal `_TypedDict` name) or `fdef.info.name` to build
+/// `"{fdef.name} of {class_name}"`. Otherwise uses just `fdef.name`. For
+/// non-`FunctionLike` types, returns the proper type unchanged.
+///
+/// The class-context test mirrors Python's `if fdef.info:` truthiness, not
+/// an `is None` check: non-method `FuncDef`s carry a `FakeInfo` placeholder
+/// (`FUNC_NO_INFO`) whose `__getattribute__` raises `AssertionError`, and
+/// `TypeInfo.__bool__` returns `False` for it. Testing `is None` alone
+/// deferred every such call to the pure-Python body.
 ///
 /// Returns `None` when any attribute access fails (conservative fallback:
 /// Python would never raise here on a well-formed input).
@@ -233,7 +238,14 @@ pub(crate) fn rust_set_callable_name(
         Ok(i) => i,
         Err(_) => return Ok(None),
     };
-    if info.is_none() {
+    // Mirror Python's `if fdef.info:` truthiness: `TypeInfo.__bool__`
+    // returns False for the FakeInfo placeholder (FUNC_NO_INFO), and None
+    // (no class context) is falsy too.
+    let has_info = match info.is_true() {
+        Ok(t) => t,
+        Err(_) => return Ok(None),
+    };
+    if !has_info {
         // No class context: sig.with_name(fdef.name).
         let fdef_name = match fdef.getattr("name") {
             Ok(n) => n,
@@ -279,7 +291,14 @@ pub(crate) fn rust_set_callable_name(
         Ok(n) => n,
         Err(_) => return Ok(None),
     };
-    let display_name = format!("{} of {}", fdef_name.str()?.to_str()?, class_name);
+    let fdef_name_str = match fdef_name.str() {
+        Ok(s) => match s.to_str() {
+            Ok(st) => st.to_string(),
+            Err(_) => return Ok(None),
+        },
+        Err(_) => return Ok(None),
+    };
+    let display_name = format!("{} of {}", fdef_name_str, class_name);
     let result = match proper.call_method1("with_name", (display_name,)) {
         Ok(r) => r,
         Err(_) => return Ok(None),
