@@ -111,6 +111,7 @@ mod overload_never;
 mod overload_override;
 mod protocols;
 
+mod findmember;
 mod partially_defined;
 mod plugin_helpers;
 mod plugin_hooks;
@@ -3288,6 +3289,13 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
     // typ.type.mro via PyO3 (zero wire bytes); any unreadable fact defers.
     module.add_function(wrap_pyfunction!(
         lookup_definer::rust_lookup_definer,
+        module
+    )?)?;
+    // Issue #1074: find_member prelude live-object port. Rust classifies
+    // the miss path into PROCEED / ANY_SPECIAL_FORM / EXTRA_ATTR /
+    // NOT_FOUND; Python applies the verdicts, unreadable facts defer.
+    module.add_function(wrap_pyfunction!(
+        findmember::rust_classify_find_member,
         module
     )?)?;
 

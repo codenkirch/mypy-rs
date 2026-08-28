@@ -91,6 +91,7 @@ try:
 
     from type_kernel import (
         rust_are_args_compatible as _rust_are_args_compatible,
+        rust_classify_find_member as _rust_classify_find_member,
         rust_classify_type_parameter as _rust_classify_type_parameter,
         rust_infer_variance_member as _rust_infer_variance_member,
     )
@@ -104,6 +105,7 @@ except ImportError:
     _read_type = None  # type: ignore[assignment]
     _rust_infer_variance_member = None  # type: ignore[assignment]
     _rust_are_args_compatible = None  # type: ignore[assignment]
+    _rust_classify_find_member = None  # type: ignore[assignment]
     _rust_classify_type_parameter = None  # type: ignore[assignment]
     _HAS_TYPE_KERNEL = False
 
@@ -160,6 +162,23 @@ def _native_erase_return_self_types_active() -> bool:
 NATIVE_ARE_ARGS_FALSE = 0
 NATIVE_ARE_ARGS_TRUE = 1
 NATIVE_ARE_ARGS_CALL_IS_COMPAT = 2
+
+# Decision tags returned by `_rust_classify_find_member` (#1074); must
+# match the TAG_* constants in crates/type_kernel/src/findmember.rs.
+NATIVE_FIND_MEMBER_PROCEED = 0
+NATIVE_FIND_MEMBER_ANY_SPECIAL_FORM = 1
+NATIVE_FIND_MEMBER_EXTRA_ATTR = 2
+NATIVE_FIND_MEMBER_NOT_FOUND = 3
+
+
+def _native_find_member_prelude_active() -> bool:
+    """Guard for the `find_member` name-resolution prelude seam."""
+    return (
+        _HAS_TYPE_KERNEL
+        and _native_subtype_active
+        and _native_subtype_resolver is not None
+        and _rust_classify_find_member is not None
+    )
 
 
 def _native_are_args_compatible_active() -> bool:
@@ -2020,6 +2039,26 @@ def find_member(
         return find_member_simple(
             name, itype, subtype, is_operator=is_operator, class_obj=class_obj, is_lvalue=is_lvalue
         )
+
+    if _native_find_member_prelude_active():
+        # Issue #1074: Rust classifies the name-resolution prelude (the
+        # info.get miss path, the dunder-accessor scan, and the miss
+        # verdicts); the checkmember tail below stays Python.
+        try:
+            tag = _rust_classify_find_member(name, itype, is_operator, class_obj)
+        except (AssertionError, NotImplementedError, ValueError, AttributeError):
+            tag = None
+        if tag == NATIVE_FIND_MEMBER_PROCEED:
+            pass
+        elif tag == NATIVE_FIND_MEMBER_ANY_SPECIAL_FORM:
+            return AnyType(TypeOfAny.special_form)
+        elif tag == NATIVE_FIND_MEMBER_EXTRA_ATTR:
+            # Rust decided the hit; fetch the live Type here so it never
+            # crosses the seam.
+            assert itype.extra_attrs is not None
+            return itype.extra_attrs.attrs[name]
+        elif tag == NATIVE_FIND_MEMBER_NOT_FOUND:
+            return None
 
     # We don't use ATTR_DEFINED error code below (since missing attributes can cause various
     # other error codes), instead we perform quick node lookup with all the fallbacks.

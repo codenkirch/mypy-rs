@@ -5,7 +5,8 @@ from __future__ import annotations
 import os
 import re
 import sys
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
+from contextlib import contextmanager
 from types import SimpleNamespace
 from typing import Any, TypeVar, cast
 from unittest import TestCase, skipIf, skipUnless
@@ -90,6 +91,7 @@ from mypy.subtypes import (
     is_subtype,
 )
 from mypy.test.helpers import Suite, assert_equal, assert_type, skip
+from contextlib import contextmanager
 from mypy.test.typefixture import InterfaceTypeFixture, TypeFixture
 from mypy.traverser import (
     all_name_and_member_expressions,
@@ -40764,3 +40766,227 @@ class NativeLookupDefinerSuite(Suite):
         # An MRO listing nothing but the class itself, no defs: None.
         b = self._subclass("mod.B", [])
         self._assert_par(Instance(b, []), "foo", None)
+
+
+class _FindMemberTailReached(Exception):
+    """Raised by the fake checker msg when find_member reaches its tail."""
+
+
+class _FindMemberTailMsg:
+    """Fake checker msg: entering filter_errors marks the tail handoff."""
+
+    def filter_errors(self, *args: Any, **kwargs: Any) -> Any:
+        raise _FindMemberTailReached
+
+
+_FIND_MEMBER_TAIL = "<find_member_tail_reached>"
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeFindMemberPreludeSuite(Suite):
+    """Parity for the Rust `find_member` prelude port (issue #1074).
+
+    `mypy.subtypes.find_member` (subtypes.py:2006) resolves a protocol
+    member by name before the heavy checkmember tail. The Rust port
+    (`findmember.rs`) reads the live Instance and its TypeInfo via PyO3
+    and returns a tag: PROCEED (fall through to the Python tail),
+    ANY_SPECIAL_FORM, EXTRA_ATTR (Python fetches extra_attrs.attrs[name]
+    so the Type never crosses the seam), or NOT_FOUND. Direct seam calls
+    assert the exact tag; the gate-off vs gate-on differential drives the
+    real find_member and asserts identical results, with a raising
+    msg.filter_errors marking the PROCEED tail handoff.
+    """
+
+    def setUp(self) -> None:
+        from mypy.checker_state import checker_state
+        from mypy.subtypes import _set_native_subtype_active, _set_native_subtype_resolver
+
+        self.fx = TypeFixture()
+        self._checker_state = checker_state
+        self._saved_checker = checker_state.type_checker
+        self._set_active = _set_native_subtype_active
+        self._set_resolver = _set_native_subtype_resolver
+        # The gate requires a non-None resolver (the seam itself never
+        # consults it, matching the get_protocol_member gate conditions).
+        type_infos = [v for v in (getattr(self.fx, n) for n in dir(self.fx)) if _is_type_info(v)]
+        self._set_active(True)
+        self._set_resolver(_type_kernel.build_native_resolver(type_infos, []))
+
+    def tearDown(self) -> None:
+        self._set_resolver(None)
+        self._set_active(False)
+        self._checker_state.type_checker = self._saved_checker
+
+    def _with_gate(self, active: bool, fn: Callable[[], T]) -> T:
+        self._set_active(active)
+        try:
+            return fn()
+        finally:
+            self._set_active(True)
+
+    def _info(self, name: str, mro: list[TypeInfo] | None = None) -> TypeInfo:
+        return self.fx.make_type_info(name, mro=mro or [self.fx.oi])
+
+    def _add_method(self, info: TypeInfo, name: str) -> None:
+        fn = FuncDef(name, [], None, CallableType([], [], [], self.fx.anyt, self.fx.function))
+        fn.info = info
+        info.names[name] = SymbolTableNode(MDEF, fn)
+
+    def _instance(self, info: TypeInfo, attrs: dict[str, Type] | None = None) -> Instance:
+        itype = Instance(info, [])
+        if attrs is not None:
+            from mypy.types import ExtraAttrs
+
+            itype.extra_attrs = ExtraAttrs(attrs)
+        return itype
+
+    def _seam(
+        self, name: str, itype: Any, *, is_operator: bool = False, class_obj: bool = False
+    ) -> int | None:
+        return _type_kernel.rust_classify_find_member(name, itype, is_operator, class_obj)
+
+    @contextmanager
+    def _checker(self) -> Iterator[None]:
+        # find_member needs a non-None type_checker to reach the prelude;
+        # a PROCEED verdict runs into msg.filter_errors and raises.
+        self._checker_state.type_checker = SimpleNamespace(msg=_FindMemberTailMsg())  # type: ignore[assignment]
+        try:
+            yield
+        finally:
+            self._checker_state.type_checker = self._saved_checker
+
+    def _run(self, name: str, itype: Instance, **kwargs: bool) -> Any:
+        from mypy.subtypes import find_member
+
+        def check_one() -> Any:
+            with self._checker():
+                try:
+                    return find_member(name, itype, itype, **kwargs)
+                except _FindMemberTailReached:
+                    return _FIND_MEMBER_TAIL
+
+        off = self._with_gate(False, check_one)
+        on = self._with_gate(True, check_one)
+        return off, on
+
+    def _assert_par(self, name: str, itype: Instance, **kwargs: bool) -> None:
+        off, on = self._run(name, itype, **kwargs)
+        assert_equal(on, off, f"find_member parity for {name!r} on {itype!r}, kwargs={kwargs}")
+
+    # Direct seam calls.
+
+    def test_seam_direct_hit(self) -> None:
+        info = self._info("mod.C")
+        info.names["attr"] = SymbolTableNode(MDEF, Var("attr"))
+        assert self._seam("attr", self._instance(info)) == 0
+
+    def test_seam_plain_miss(self) -> None:
+        assert self._seam("attr", self._instance(self._info("mod.C"))) == 3
+
+    def test_seam_custom_getattribute(self) -> None:
+        info = self._info("mod.C")
+        self._add_method(info, "__getattribute__")
+        assert self._seam("attr", self._instance(info)) == 0
+
+    def test_seam_custom_getattr(self) -> None:
+        info = self._info("mod.C")
+        self._add_method(info, "__getattr__")
+        assert self._seam("attr", self._instance(info)) == 0
+
+    def test_seam_object_getattribute_not_custom(self) -> None:
+        # A __getattribute__ that resolves to builtins.object does not
+        # count as a custom accessor.
+        self._add_method(self.fx.oi, "__getattribute__")
+        try:
+            assert self._seam("attr", self._instance(self._info("mod.C"))) == 3
+        finally:
+            del self.fx.oi.names["__getattribute__"]
+
+    def test_seam_fallback_to_any(self) -> None:
+        info = self._info("mod.C")
+        info.fallback_to_any = True
+        assert self._seam("attr", self._instance(info)) == 1
+
+    def test_seam_meta_fallback_needs_class_obj(self) -> None:
+        info = self._info("mod.C")
+        info.meta_fallback_to_any = True
+        itype = self._instance(info)
+        assert self._seam("attr", itype, class_obj=True) == 1
+        assert self._seam("attr", itype) == 3
+
+    def test_seam_extra_attrs_hit(self) -> None:
+        itype = self._instance(self._info("mod.C"), {"x": self.fx.a})
+        assert self._seam("x", itype) == 2
+
+    def test_seam_extra_attrs_miss(self) -> None:
+        itype = self._instance(self._info("mod.C"), {"y": self.fx.a})
+        assert self._seam("x", itype) == 3
+
+    def test_seam_operator_skips_dunder_scan(self) -> None:
+        info = self._info("mod.C")
+        self._add_method(info, "__getattr__")
+        itype = self._instance(info)
+        assert self._seam("attr", itype, is_operator=True) == 3
+        assert self._seam("attr", itype) == 0
+
+    def test_seam_dunder_name_skips_scan(self) -> None:
+        info = self._info("mod.C")
+        self._add_method(info, "__getattr__")
+        assert self._seam("__setattr__", self._instance(info)) == 3
+
+    def test_seam_unreadable_defers(self) -> None:
+        # Not an Instance: every attribute read fails, Rust defers.
+        assert self._seam("attr", object()) is None
+
+    # Gate-off vs gate-on differential through the real find_member.
+
+    def test_parity_direct_hit(self) -> None:
+        info = self._info("mod.C")
+        info.names["attr"] = SymbolTableNode(MDEF, Var("attr"))
+        self._assert_par("attr", self._instance(info))
+
+    def test_parity_plain_miss(self) -> None:
+        self._assert_par("attr", self._instance(self._info("mod.C")))
+
+    def test_parity_custom_getattribute(self) -> None:
+        info = self._info("mod.C")
+        self._add_method(info, "__getattribute__")
+        self._assert_par("attr", self._instance(info))
+
+    def test_parity_custom_getattr(self) -> None:
+        info = self._info("mod.C")
+        self._add_method(info, "__getattr__")
+        self._assert_par("attr", self._instance(info))
+
+    def test_parity_object_getattribute(self) -> None:
+        self._add_method(self.fx.oi, "__getattribute__")
+        try:
+            self._assert_par("attr", self._instance(self._info("mod.C")))
+        finally:
+            del self.fx.oi.names["__getattribute__"]
+
+    def test_parity_fallback_to_any(self) -> None:
+        info = self._info("mod.C")
+        info.fallback_to_any = True
+        self._assert_par("attr", self._instance(info))
+
+    def test_parity_meta_fallback_class_obj(self) -> None:
+        info = self._info("mod.C")
+        info.meta_fallback_to_any = True
+        self._assert_par("attr", self._instance(info), class_obj=True)
+
+    def test_parity_extra_attrs_hit(self) -> None:
+        self._assert_par("x", self._instance(self._info("mod.C"), {"x": self.fx.a}))
+
+    def test_parity_extra_attrs_miss(self) -> None:
+        self._assert_par("x", self._instance(self._info("mod.C"), {"y": self.fx.a}))
+
+    def test_parity_operator_skips_dunder_scan(self) -> None:
+        info = self._info("mod.C")
+        self._add_method(info, "__getattr__")
+        self._assert_par("attr", self._instance(info), is_operator=True)
+
+    def test_parity_dunder_name(self) -> None:
+        info = self._info("mod.C")
+        self._add_method(info, "__getattr__")
+        self._assert_par("__setattr__", self._instance(info))
