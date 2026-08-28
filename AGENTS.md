@@ -1599,6 +1599,31 @@ including:
   direct seam calls), plus 9 pure decision unit tests in
   `findmember.rs`.
 
+- `rust_check_argument_count` (issue #1136) — reworked the wire-fact
+  seam into a pure scalar-fact interface: no wire bytes cross the
+  boundary. The seam folds `check_for_extra_actual_arguments` and the
+  formal loop of `ExpressionChecker.check_argument_count`
+  (checkexpr.py:3855) into one decision graph over scalar facts only:
+  formal/actual `ArgKind` ints, per-actual shape tags
+  (`NATIVE_ARG_SHAPE_PLAIN/TUPLE/TYPEDDICT/PARAM_SPEC/ALIAS` in
+  `mypy/checkexpr.py` ~line 404, matching the Rust `ACTUAL_*`
+  constants), per-actual item counts (tuple/TypedDict only), the live
+  `formal_to_actual` pairs, and three scalars computed shim-side:
+  `has_param_spec` (raw `arg_types[-2]` is `ParamSpecType` with the
+  last two kind slots `ARG_STAR`/`ARG_STAR2`), `special_sig`, and
+  `in_checked_function`. Rust returns
+  `(ok, errors, is_unexpected_arg_error)` where each error is an
+  `(ERR_*, index, 0)` record translated to a message by the Python
+  shim. A `TypeAliasType` actual defers (`None`) via
+  `ACTUAL_ALIAS` (proper-expanded aliases classify PLAIN). The
+  `is_duplicate_mapping_inner` shape lookup reads shapes by mapping
+  POSITION rather than the mapped actual index (the wire-era
+  behaviour), preserving a pre-existing decision bug verbatim; tracked
+  in #1152. Covered by `NativeCheckArgCountSuite` in
+  `mypy/test/testtypes.py` (direct seam calls over every `ERR_*` record
+  shape plus gate-off vs gate-on parity through the real method), and
+  pure decision unit tests in `checkexpr_argcount.rs`.
+
 Stages 1/2 return `None` for any type class Rust does not handle, and
 the Python caller falls back to the pure-Python visitor. This is the
 strangler-fig per-call gate. See "Milestone 3/4/5 (Phase 4)" in

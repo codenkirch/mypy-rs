@@ -401,6 +401,14 @@ NATIVE_CHECK_ARG_ABSTRACT_ONLY = 1
 NATIVE_CHECK_ARG_INCOMPATIBLE = 2
 NATIVE_CHECK_ARG_PASS = 3
 
+# Per-actual shape tags passed to `_rust_check_argument_count`; must match
+# `ACTUAL_*` in crates/type_kernel/src/checkexpr_argcount.rs.
+NATIVE_ARG_SHAPE_PLAIN = 0
+NATIVE_ARG_SHAPE_TUPLE = 1
+NATIVE_ARG_SHAPE_TYPEDDICT = 2
+NATIVE_ARG_SHAPE_PARAM_SPEC = 3
+NATIVE_ARG_SHAPE_ALIAS = 4
+
 # Decision tags returned by `_rust_classify_index_with_type`; must match
 # the `INDEX_*` constants in crates/type_kernel/src/checkexpr_functions.rs.
 NATIVE_INDEX_NORMALIZE = 0
@@ -3874,14 +3882,47 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
             and _native_checkexpr_active
             and _rust_check_argument_count is not None
         ):
+            # Scalar-fact interface (issue #1136): the shim classifies each
+            # actual's proper type to a shape tag; a TypeAliasType actual
+            # defers via ACTUAL_ALIAS, mirroring the wire-era seam.
             try:
+                actual_shapes = []
+                actual_item_counts = []
+                for t in actual_types:
+                    p = get_proper_type(t)
+                    if isinstance(p, TypeAliasType):
+                        actual_shapes.append(NATIVE_ARG_SHAPE_ALIAS)
+                        actual_item_counts.append(0)
+                    elif isinstance(p, TupleType):
+                        actual_shapes.append(NATIVE_ARG_SHAPE_TUPLE)
+                        actual_item_counts.append(len(p.items))
+                    elif isinstance(p, TypedDictType):
+                        actual_shapes.append(NATIVE_ARG_SHAPE_TYPEDDICT)
+                        actual_item_counts.append(len(p.items))
+                    elif isinstance(p, ParamSpecType):
+                        actual_shapes.append(NATIVE_ARG_SHAPE_PARAM_SPEC)
+                        actual_item_counts.append(0)
+                    else:
+                        actual_shapes.append(NATIVE_ARG_SHAPE_PLAIN)
+                        actual_item_counts.append(0)
+                # Shim-side mirror of CallableType.param_spec()'s head: the raw
+                # arg_types[-2] must be a ParamSpecType with *args/**kwargs as the
+                # last two kind slots. Rust gets a plain bool.
+                has_param_spec = (
+                    len(callee.arg_types) >= 2
+                    and callee.arg_kinds[-2] == nodes.ARG_STAR
+                    and callee.arg_kinds[-1] == nodes.ARG_STAR2
+                    and isinstance(callee.arg_types[-2], ParamSpecType)
+                )
                 result = _rust_check_argument_count(
-                    _serialize_type_for_checkexpr(callee),
-                    [_serialize_type_for_checkexpr(get_proper_type(t)) for t in actual_types],
+                    [int(k.value) for k in callee.arg_kinds],
+                    has_param_spec,
+                    callee.special_sig,
                     [int(k.value) for k in actual_kinds],
                     list(actual_names) if actual_names is not None else [],
+                    actual_shapes,
+                    actual_item_counts,
                     formal_to_actual,
-                    callee.special_sig,
                     object_type is not None,
                     callable_name,
                     self.chk.in_checked_function(),

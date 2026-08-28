@@ -40089,6 +40089,627 @@ class NativeCheckArgSuite(Suite):
         assert off == on, f"pass: off={off} on={on}"
         assert off == [], f"expected no messages: {off}"
 
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeCheckArgCountSuite(Suite):
+    """Parity for `rust_check_argument_count` (issue #1136).
+
+    `ExpressionChecker.check_argument_count` (checkexpr.py:3855) folds
+    check_for_extra_actual_arguments and the formal loop into one Rust
+    seam with the scalar-fact interface: no wire bytes cross the
+    boundary. The shim classifies each actual's proper type to a shape
+    tag (NATIVE_ARG_SHAPE_*), mirrors the CallableType.param_spec() head
+    into a bool, and the kernel returns (ok, errors,
+    is_unexpected_arg_error) records that the shim translates to
+    messages. Direct seam calls assert the exact decision records for
+    every arm; toggling the checkexpr gate off vs on must produce
+    identical captured messages through the real method.
+    """
+
+    def setUp(self) -> None:
+        from mypy.checkexpr import _set_native_checkexpr_active
+
+        self._set_active = _set_native_checkexpr_active
+        self._set_active(True)
+
+    def tearDown(self) -> None:
+        self._set_active(False)
+
+    def _with_gate(self, active: bool, fn: Callable[[], T]) -> T:
+        self._set_active(active)
+        try:
+            return fn()
+        finally:
+            self._set_active(True)
+
+    # ---- direct seam tests (scalar interface) ----
+
+    def _seam(
+        self,
+        formal_kinds: list[int],
+        actual_kinds: list[int],
+        actual_names: list[str | None],
+        actual_shapes: list[int],
+        actual_item_counts: list[int],
+        formal_to_actual: list[list[int]],
+        *,
+        has_param_spec: bool = False,
+        special_sig: str | None = None,
+        object_type_present: bool = False,
+        callable_name: str | None = None,
+        in_checked_function: bool = True,
+    ) -> tuple[bool, list[tuple[int, int, int]], bool] | None:
+        from mypy.checkexpr import (
+            NATIVE_ARG_SHAPE_ALIAS,
+            NATIVE_ARG_SHAPE_PLAIN,
+            NATIVE_ARG_SHAPE_PARAM_SPEC,
+            NATIVE_ARG_SHAPE_TUPLE,
+            NATIVE_ARG_SHAPE_TYPEDDICT,
+        )
+
+        # Tag vocabulary stays in lockstep with the Rust ACTUAL_* constants.
+        assert (NATIVE_ARG_SHAPE_PLAIN, NATIVE_ARG_SHAPE_TUPLE) == (0, 1)
+        assert (NATIVE_ARG_SHAPE_TYPEDDICT, NATIVE_ARG_SHAPE_PARAM_SPEC) == (2, 3)
+        assert NATIVE_ARG_SHAPE_ALIAS == 4
+        return _type_kernel.rust_check_argument_count(
+            formal_kinds,
+            has_param_spec,
+            special_sig,
+            actual_kinds,
+            actual_names,
+            actual_shapes,
+            actual_item_counts,
+            formal_to_actual,
+            object_type_present,
+            callable_name,
+            in_checked_function,
+        )
+
+    def test_seam_ok(self) -> None:
+        result = self._seam(
+            [int(ARG_POS.value)],
+            [int(ARG_POS.value)],
+            [None],
+            [0],
+            [0],
+            [[0]],
+        )
+        assert result == (True, [], False), result
+
+    def test_seam_too_few_with_classvar_note(self) -> None:
+        # Formal 1 unmatched and object_type/callable_name present.
+        result = self._seam(
+            [int(ARG_POS.value)] * 2,
+            [int(ARG_POS.value)],
+            [None],
+            [0],
+            [0],
+            [[0], []],
+            object_type_present=True,
+            callable_name="mod.A.attr",
+        )
+        assert result is not None
+        ok, errors, unexpected = result
+        assert not ok and not unexpected
+        assert errors == [(4, 1, 0), (11, 1, 0)], errors
+
+    def test_seam_too_few_note_suppressed(self) -> None:
+        # callable_name without a dot: no note record.
+        result = self._seam(
+            [int(ARG_POS.value)] * 2,
+            [int(ARG_POS.value)],
+            [None],
+            [0],
+            [0],
+            [[0], []],
+            object_type_present=True,
+            callable_name="func",
+        )
+        assert result is not None
+        _, errors, _ = result
+        assert errors == [(4, 1, 0)], errors
+
+    def test_seam_missing_named_plus_extra(self) -> None:
+        # A positional actual unmapped against a named-only formal counts
+        # as one too-many and one too-few error, mirroring the Python body.
+        result = self._seam(
+            [int(ARG_NAMED.value)],
+            [int(ARG_POS.value)],
+            [None],
+            [0],
+            [0],
+            [[]],
+        )
+        assert result is not None
+        ok, errors, unexpected = result
+        assert not ok and not unexpected
+        assert errors == [(0, 0, 0), (5, 0, 0)], errors
+
+    def test_seam_extra_unnamed(self) -> None:
+        result = self._seam(
+            [int(ARG_POS.value)],
+            [int(ARG_POS.value)] * 2,
+            [None, None],
+            [0, 0],
+            [0, 0],
+            [[0], []],
+        )
+        assert result is not None
+        ok, errors, unexpected = result
+        assert not ok and not unexpected
+        assert errors == [(0, 1, 0)], errors
+
+    def test_seam_extra_named(self) -> None:
+        result = self._seam(
+            [int(ARG_POS.value)],
+            [int(ARG_POS.value), int(ARG_NAMED.value)],
+            [None, "x"],
+            [0, 0],
+            [0, 0],
+            [[0], []],
+        )
+        assert result is not None
+        ok, errors, unexpected = result
+        assert not ok and unexpected
+        assert errors == [(1, 1, 0)], errors
+
+    def test_seam_defers_on_alias_actual(self) -> None:
+        assert (
+            self._seam(
+                [int(ARG_POS.value)],
+                [int(ARG_POS.value)],
+                [None],
+                [4],
+                [0],
+                [[0]],
+            )
+            is None
+        )
+
+    def test_seam_defers_on_unnamed_named_extra(self) -> None:
+        # An unmatched named-kind actual without a name defers.
+        assert (
+            self._seam(
+                [int(ARG_POS.value)],
+                [int(ARG_POS.value), int(ARG_NAMED.value)],
+                [None, None],
+                [0, 0],
+                [0, 0],
+                [[0], []],
+            )
+            is None
+        )
+
+    def test_seam_star_tuple_leftover_items(self) -> None:
+        result = self._seam(
+            [int(ARG_POS.value)],
+            [int(ARG_STAR.value)],
+            [None],
+            [1],
+            [2],
+            [[0]],
+        )
+        assert result is not None
+        ok, errors, unexpected = result
+        assert not ok and not unexpected
+        assert errors == [(2, 0, 0)], errors
+
+    def test_seam_star_empty_tuple_ok(self) -> None:
+        result = self._seam(
+            [],
+            [int(ARG_STAR.value)],
+            [None],
+            [1],
+            [0],
+            [],
+        )
+        assert result == (True, [], False), result
+
+    def test_seam_star2_typeddict_leftover_items(self) -> None:
+        result = self._seam(
+            [int(ARG_POS.value)],
+            [int(ARG_STAR2.value)],
+            [None],
+            [2],
+            [2],
+            [[0]],
+        )
+        assert result is not None
+        ok, errors, unexpected = result
+        assert not ok and unexpected
+        assert errors == [(3, 0, 0)], errors
+
+    def test_seam_star2_non_typeddict_ok(self) -> None:
+        result = self._seam(
+            [int(ARG_POS.value)],
+            [int(ARG_STAR2.value)],
+            [None],
+            [0],
+            [0],
+            [[0]],
+        )
+        assert result == (True, [], False), result
+
+    def test_seam_duplicate_mapping(self) -> None:
+        result = self._seam(
+            [int(ARG_POS.value)],
+            [int(ARG_STAR2.value)] * 2,
+            [None, None],
+            [0, 2],
+            [0, 1],
+            [[0, 1]],
+        )
+        assert result is not None
+        ok, errors, unexpected = result
+        assert not ok and not unexpected
+        assert errors == [(6, 0, 0)], errors
+
+    def test_seam_duplicate_shape_lookup_is_by_position(self) -> None:
+        # Preserved verbatim (issue #1152): is_duplicate_mapping_inner reads
+        # shapes[i] by mapping POSITION, not by the actual index mapping[i]
+        # holds; the unmapped TD actual also fires the too-many record first.
+        result = self._seam(
+            [int(ARG_POS.value)],
+            [int(ARG_STAR2.value)] * 4,
+            [None] * 4,
+            [2, 0, 0, 0],
+            [1, 0, 0, 0],
+            [[2, 3]],
+        )
+        assert result is not None
+        ok, errors, unexpected = result
+        assert not ok and unexpected
+        assert errors == [(3, 0, 0), (6, 0, 0)], errors
+
+    def test_seam_star_plus_kwargs_mapping_ok(self) -> None:
+        # f(..., *args, **kwargs): two actuals may share one formal.
+        result = self._seam(
+            [int(ARG_POS.value)],
+            [int(ARG_STAR.value), int(ARG_STAR2.value)],
+            [None, None],
+            [0, 0],
+            [0, 0],
+            [[0, 1]],
+        )
+        assert result == (True, [], False), result
+
+    def test_seam_too_many_positional_for_named_formal(self) -> None:
+        result = self._seam(
+            [int(ARG_NAMED.value)],
+            [int(ARG_POS.value)],
+            [None],
+            [0],
+            [0],
+            [[0]],
+        )
+        assert result is not None
+        ok, errors, _ = result
+        assert not ok and errors == [(7, 0, 0)], errors
+
+    def test_seam_param_spec_star_too_few(self) -> None:
+        # Under a param_spec callee the required unmapped formal is reported by
+        # the main table arm (ERR_TOO_FEW_POSITIONAL), which runs before the CPS
+        # elif; the mapped *args/**kwargs formals with one actual each are fine.
+        result = self._seam(
+            [
+                int(ARG_POS.value),
+                int(ARG_STAR.value),
+                int(ARG_STAR2.value),
+            ],
+            [int(ARG_STAR.value), int(ARG_STAR2.value)],
+            [None, None],
+            [0, 0],
+            [0, 0],
+            [[], [0], [1]],
+            has_param_spec=True,
+        )
+        assert result is not None
+        ok, errors, _ = result
+        assert not ok
+        assert errors == [(4, 0, 0)], errors
+
+    def test_seam_param_spec_unmapped_star_too_few(self) -> None:
+        # The CPS arm's own too-few tag (ERR_PARAMSPEC_TOO_FEW) only
+        # reaches a formal the earlier arms did not already claim: here a
+        # non-required *args formal left unmapped with special_sig unset.
+        result = self._seam(
+            [int(ARG_STAR.value)],
+            [],
+            [],
+            [],
+            [],
+            [[]],
+            has_param_spec=True,
+        )
+        assert result is not None
+        ok, errors, _ = result
+        assert not ok and errors == [(8, 0, 0)], errors
+
+    def test_seam_param_spec_partial_special_sig_ok(self) -> None:
+        # functools.partial callees may leave *args/**kwargs unmapped.
+        result = self._seam(
+            [int(ARG_STAR.value), int(ARG_STAR2.value)],
+            [int(ARG_STAR.value), int(ARG_STAR2.value)],
+            [None, None],
+            [0, 0],
+            [0, 0],
+            [[0], [1]],
+            has_param_spec=True,
+            special_sig="partial",
+        )
+        assert result == (True, [], False), result
+
+    def test_seam_param_spec_args_once(self) -> None:
+        result = self._seam(
+            [int(ARG_STAR.value)],
+            [int(ARG_STAR.value)] * 2,
+            [None, None],
+            [3, 3],
+            [0, 0],
+            [[0, 1]],
+            has_param_spec=True,
+        )
+        assert result is not None
+        ok, errors, _ = result
+        assert not ok and errors == [(9, 0, 0)], errors
+
+    def test_seam_param_spec_kwargs_once(self) -> None:
+        result = self._seam(
+            [int(ARG_STAR2.value)],
+            [int(ARG_STAR2.value)] * 2,
+            [None, None],
+            [3, 3],
+            [0, 0],
+            [[0, 1]],
+            has_param_spec=True,
+        )
+        assert result is not None
+        ok, errors, _ = result
+        assert not ok and errors == [(10, 0, 0)], errors
+
+    def test_seam_param_spec_needs_two_tail_formals(self) -> None:
+        # has_param_spec requires ARG_STAR/ARG_STAR2 as the last two formals;
+        # with the flag off (the shim's verdict for an invalid tail) the plain
+        # decisions apply, so an optional unmapped *args formal is not an error.
+        result = self._seam(
+            [int(ARG_POS.value), int(ARG_STAR.value)],
+            [int(ARG_POS.value)],
+            [None],
+            [0],
+            [0],
+            [[0], []],
+        )
+        assert result == (True, [], False), result
+
+    # ---- gate-off vs gate-on differential tests ----
+
+    def _make_ec(
+        self, in_checked_function: bool
+    ) -> tuple[ExpressionChecker, list[tuple[str, ...]]]:
+        captured: list[tuple[str, ...]] = []
+        msg = SimpleNamespace(
+            too_many_arguments=lambda c, ctx: captured.append(("too_many",)),
+            unexpected_keyword_argument=lambda c, n, t, ctx: captured.append(
+                ("unexpected_kw", n)
+            ),
+            too_many_arguments_from_typed_dict=lambda c, t, ctx: captured.append(
+                ("too_many_td",)
+            ),
+            too_few_arguments=lambda c, ctx, ns: captured.append(("too_few",)),
+            missing_named_argument=lambda c, ctx, n: captured.append(
+                ("missing_named", n)
+            ),
+            duplicate_argument_value=lambda c, i, ctx: captured.append(
+                ("dup", str(i))
+            ),
+            too_many_positional_arguments=lambda c, ctx: captured.append(
+                ("too_many_pos",)
+            ),
+            fail=lambda m, ctx: captured.append(("fail", str(m))),
+            note=lambda m, ctx: captured.append(("note", str(m))),
+        )
+        chk = SimpleNamespace(in_checked_function=lambda: in_checked_function)
+        ec = ExpressionChecker.__new__(ExpressionChecker)
+        ec.chk = chk  # type: ignore[assignment]
+        ec.msg = msg  # type: ignore[assignment]
+        return ec, captured
+
+    def _run(
+        self,
+        callee: CallableType,
+        actual_types: list[Type],
+        actual_kinds: list[ArgKind],
+        actual_names: list[str | None] | None,
+        formal_to_actual: list[list[int]],
+        *,
+        object_type: Type | None = None,
+        callable_name: str | None = None,
+        in_checked_function: bool = True,
+    ) -> tuple[tuple[tuple[str, ...], ...], tuple[tuple[str, ...], ...]]:
+        from mypy.nodes import TempNode
+
+        context = TempNode(AnyType(TypeOfAny.special_form))
+
+        def check_one(active: bool) -> tuple[tuple[str, ...], ...]:
+            ec, captured = self._make_ec(in_checked_function)
+            ret = self._with_gate(
+                active,
+                lambda: ec.check_argument_count(
+                    callee,
+                    actual_types,
+                    actual_kinds,
+                    actual_names,
+                    formal_to_actual,
+                    context,
+                    object_type,
+                    callable_name,
+                ),
+            )
+            return tuple(captured) + (("ret", str(ret)),)
+
+        off = check_one(False)
+        on = check_one(True)
+        return off, on
+
+    def _parity(
+        self, *args: Any, **kwargs: Any
+    ) -> tuple[tuple[str, ...], ...]:
+        off, on = self._run(*args, **kwargs)
+        assert off == on, f"off={off} on={on}"
+        return off
+
+    def test_par_ok(self) -> None:
+        fx = TypeFixture()
+        callee = fx.callable(fx.a, fx.a)
+        off = self._parity(
+            callee,
+            [fx.a, fx.a],
+            [ARG_POS, ARG_POS],
+            [None, None],
+            [[0], [1]],
+        )
+        assert off == (("ret", "True"),), off
+
+    def test_par_too_few(self) -> None:
+        fx = TypeFixture()
+        # fx.callable(*a) treats the last arg as the return type; pass one
+        # explicit return to get a two-formal callee.
+        callee = fx.callable(fx.a, fx.a, fx.anyt)
+        off = self._parity(
+            callee,
+            [fx.a],
+            [ARG_POS],
+            [None],
+            [[0], []],
+            callable_name="mod.A.attr",
+        )
+        assert ("too_few",) in off, off
+        # object_type is None, so the note stays silent on both gates.
+
+    def test_par_extra_named(self) -> None:
+        fx = TypeFixture()
+        callee = fx.callable(fx.a)
+        off = self._parity(
+            callee,
+            [fx.a, fx.a],
+            [ARG_POS, ARG_NAMED],
+            [None, "x"],
+            [[0], []],
+        )
+        assert ("unexpected_kw", "x") in off, off
+
+    def test_par_missing_named(self) -> None:
+        fx = TypeFixture()
+        callee = CallableType(
+            [fx.anyt], [ARG_NAMED], ["a"], fx.anyt, fx.function, name="f"
+        )
+        off = self._parity(callee, [fx.a], [ARG_POS], [None], [[]])
+        assert ("missing_named", "a") in off, off
+        assert ("too_many",) in off, off
+
+    def test_par_dup_with_typeddict_kwargs(self) -> None:
+        fx = TypeFixture()
+        callee = CallableType(
+            [fx.anyt], [ARG_POS], [None], fx.anyt, fx.function, name="f"
+        )
+        # One plain **kwargs and one TypedDict **kwargs matching the same
+        # formal: duplicates are not automatically allowed (the TypedDict
+        # mapping is precise), so the duplicate error fires.
+        td = TypedDictType({"a": fx.a}, set(), set(), fx.function)
+        off = self._parity(
+            callee,
+            [fx.function, td],
+            [ARG_STAR2, ARG_STAR2],
+            [None, None],
+            [[0, 1]],
+        )
+        assert ("dup", "0") in off, off
+
+    def test_par_star_plus_kwargs_ok(self) -> None:
+        fx = TypeFixture()
+        callee = CallableType(
+            [fx.anyt], [ARG_POS], [None], fx.anyt, fx.function, name="f"
+        )
+        off = self._parity(
+            callee,
+            [TupleType([], fx.std_tuple), TypedDictType({}, set(), set(), fx.function)],
+            [ARG_STAR, ARG_STAR2],
+            [None, None],
+            [[0, 1]],
+        )
+        assert off == (("ret", "True"),), off
+
+    def test_par_param_spec_args_once(self) -> None:
+        fx = TypeFixture()
+        ps = ParamSpecType(
+            name="P",
+            fullname="P",
+            id=TypeVarId(-1),
+            flavor=ParamSpecFlavor.BARE,
+            upper_bound=fx.o,
+            default=AnyType(TypeOfAny.from_omitted_generics),
+        )
+        callee = CallableType(
+            [ps, ps],
+            [ARG_STAR, ARG_STAR2],
+            [None, None],
+            fx.anyt,
+            fx.function,
+            name="f",
+        )
+        assert callee.param_spec() is not None
+        off = self._parity(
+            callee,
+            [ps, ps],
+            [ARG_STAR, ARG_STAR],
+            [None, None],
+            [[0, 1], [0, 1]],
+        )
+        assert ("fail", "ParamSpec.args should only be passed once") in off, off
+
+    def test_par_classvar_note_fires(self) -> None:
+        fx = TypeFixture()
+        callee = CallableType(
+            [fx.anyt, fx.anyt],
+            [ARG_POS, ARG_POS],
+            ["x", "y"],
+            fx.anyt,
+            fx.function,
+            name="f",
+        )
+        var = Var("attr")
+        var.is_inferred = False
+        var.is_classvar = False
+        fx.a.type.names["attr"] = SymbolTableNode(GDEF, var)
+        off = self._parity(
+            callee,
+            [fx.a],
+            [ARG_POS],
+            [None],
+            [[0], []],
+            object_type=fx.a,
+            callable_name="mod.A.attr",
+        )
+        assert any(o[0] == "note" for o in off), off
+
+    def test_par_alias_actual_parity(self) -> None:
+        # A (proper-expanded) alias actual classifies PLAIN on both gates;
+        # the wire-era deferral condition is moot for the scalar seam.
+        fx = TypeFixture()
+        alias = TypeAlias(fx.a, "mod.A", "mod", -1, -1)
+        t = TypeAliasType(alias, [])
+        # One formal, no formals-to-actuals mapping: too_few fires.
+        callee = fx.callable(fx.a, fx.a)
+        off = self._parity(
+            callee,
+            [t],
+            [ARG_POS],
+            [None],
+            [[]],
+        )
+        assert any(o[0] == "too_few" for o in off), off
+
+
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeTypeCheckRaiseSuite(Suite):
     """Parity for the Rust `type_check_raise` decision-head port (#1050).
