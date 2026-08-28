@@ -282,6 +282,7 @@ try:
         rust_is_type_type_context as _rust_is_type_type_context,
         rust_is_valid_keyword_var_arg as _rust_is_valid_keyword_var_arg,
         rust_is_valid_var_arg as _rust_is_valid_var_arg,
+        rust_lookup_definer as _rust_lookup_definer,
         rust_merge_typevars_in_callables_by_name as _rust_merge_typevars_in_callables_by_name,
         rust_method_fullname as _rust_method_fullname,
         rust_normalize_callable as _rust_normalize_callable,
@@ -332,6 +333,7 @@ except ImportError:
     _rust_is_type_type_context = None  # type: ignore[assignment]
     _rust_is_valid_keyword_var_arg = None  # type: ignore[assignment]
     _rust_is_valid_var_arg = None  # type: ignore[assignment]
+    _rust_lookup_definer = None  # type: ignore[assignment]
     _rust_merge_typevars_in_callables_by_name = None  # type: ignore[assignment]
     _rust_method_fullname = None  # type: ignore[assignment]
     _rust_try_getting_literal = None  # type: ignore[assignment]
@@ -5870,6 +5872,15 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
 
         If the attr name is not present in the given class or its MRO, returns None.
         """
+        # Native type_kernel seam (#1075): the MRO walk is a pure read of
+        # the live Instance; deferral falls back to the walk below.
+        if _CHECKEXPR_HAS_TYPE_KERNEL and _native_checkexpr_active:
+            try:
+                result = _rust_lookup_definer(typ, attr_name)
+                if result is not None:
+                    return result
+            except (AssertionError, NotImplementedError, ValueError):
+                pass
         for cls in typ.type.mro:
             if cls.names.get(attr_name):
                 return cls.fullname

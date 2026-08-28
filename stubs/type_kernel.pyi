@@ -44,7 +44,14 @@ from mypy.nodes import (
     TypeInfo,
     Var,
 )
-from mypy.types import CallableType, ProperType, TupleType, Type, TypeVarLikeType
+from mypy.types import (
+    CallableType,
+    Instance,
+    ProperType,
+    TupleType,
+    Type,
+    TypeVarLikeType,
+)
 
 T = TypeVar("T")
 
@@ -138,6 +145,7 @@ __all__ = [
     "rust_has_erased_component",
     "rust_allow_fast_container_literal",
     "rust_always_returns_none",
+    "rust_lookup_definer",
     "rust_analyze_cond_branch",
     "rust_has_bytes_component",
     "rust_has_bool_item",
@@ -2698,3 +2706,4 @@ def rust_classify_enum(
     info: Any, is_stub: bool, tree_fullname: str, enum_bases: list[str]
 ) -> tuple[int, list[str]] | None: ...
 def rust_always_returns_none(node: Expression, info: TypeInfo | None) -> bool | None: ...
+def rust_lookup_definer(typ: Instance, attr_name: str) -> str | None: ...

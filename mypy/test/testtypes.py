@@ -40629,3 +40629,138 @@ class NativeAlwaysReturnsNoneSuite(Suite):
         expr = MemberExpr(NameExpr("obj"), "attr")
         result = _type_kernel.rust_always_returns_none(expr, None)
         assert result is None, f"seam: {result} is not None"
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeLookupDefinerSuite(Suite):
+    """Parity for `rust_lookup_definer` (issue #1075).
+
+    `ExpressionChecker.lookup_definer` (checkexpr.py:5862-5876) walks
+    `typ.type.mro` and returns the fullname of the first class that
+    defines `attr_name`. The Rust seam is a live-PyO3-object port (zero
+    wire bytes) that defers on any unreadable fact. Direct seam calls
+    assert the expected fullname (and the deferral); toggling the
+    checkexpr gate off vs on drives the real ExpressionChecker method
+    and must agree on both.
+    """
+
+    def setUp(self) -> None:
+        from mypy.checkexpr import _set_native_checkexpr_active
+
+        self.fx = TypeFixture()
+        self._set_active = _set_native_checkexpr_active
+        self._set_active(True)
+
+    def tearDown(self) -> None:
+        self._set_active(False)
+
+    def _with_gate(self, active: bool, fn: Callable[[], T]) -> T:
+        self._set_active(active)
+        try:
+            return fn()
+        finally:
+            self._set_active(True)
+
+    def _info(self, fullname: str, mro: list[TypeInfo] | None = None) -> TypeInfo:
+        from mypy.nodes import Block, ClassDef
+
+        defn = ClassDef(fullname.rsplit(".", 1)[-1], Block([]), None, [])
+        defn.fullname = fullname
+        info = TypeInfo(SymbolTable(), defn, "mod")
+        defn.info = info
+        info.mro = mro if mro is not None else [info]
+        return info
+
+    def _definer(self, fullname: str, attr: str = "foo") -> TypeInfo:
+        info = self._info(fullname)
+        info.names[attr] = SymbolTableNode(GDEF, Var(attr))
+        return info
+
+    def _subclass(self, fullname: str, bases: list[TypeInfo]) -> TypeInfo:
+        info = self._info(fullname)
+        info.mro = [info, *bases]
+        return info
+
+    def _checker(self) -> Any:
+        from mypy.checker import TypeChecker
+        from mypy.errors import Errors
+        from mypy.nodes import MypyFile
+        from mypy.plugin import Plugin
+
+        options = Options()
+        errors = Errors(options)
+        tree = MypyFile([], [])
+        tree.is_stub = True
+        tree.names = SymbolTable()
+        modules: dict[str, MypyFile] = {}
+        return TypeChecker(errors, modules, options, tree, "", Plugin(options), {})
+
+    def _ec(self) -> Any:
+        from mypy.checkexpr import ExpressionChecker
+
+        return ExpressionChecker(self._checker(), None, None, None)  # type: ignore[arg-type]
+
+    def _assert_seam(self, typ: Instance, attr: str, expected: str | None) -> None:
+        result = _type_kernel.rust_lookup_definer(typ, attr)
+        assert result == expected, f"seam: {result} != {expected}"
+
+    def _assert_par(self, typ: Instance, attr: str, expected: str | None) -> None:
+        ec = self._ec()
+        off = self._with_gate(False, lambda: ec.lookup_definer(typ, attr))
+        on = self._with_gate(True, lambda: ec.lookup_definer(typ, attr))
+        assert off == expected, f"gate-off: {off} != {expected}"
+        assert on == expected, f"gate-on: {on} != {expected}"
+
+    def test_seam_defined_in_base(self) -> None:
+        a = self._definer("mod.A")
+        b = self._subclass("mod.B", [a])
+        self._assert_seam(Instance(b, []), "foo", "mod.A")
+
+    def test_seam_overridden_in_subclass(self) -> None:
+        a = self._definer("mod.A")
+        b = self._subclass("mod.B", [a])
+        b.names["foo"] = SymbolTableNode(GDEF, Var("foo"))
+        self._assert_seam(Instance(b, []), "foo", "mod.B")
+
+    def test_seam_not_in_mro(self) -> None:
+        a = self._info("mod.A")
+        b = self._subclass("mod.B", [a])
+        self._assert_seam(Instance(b, []), "foo", None)
+
+    def test_seam_multiple_bases_first_mro_wins(self) -> None:
+        a = self._definer("mod.A")
+        b = self._definer("mod.B")
+        c = self._subclass("mod.C", [b, a])
+        self._assert_seam(Instance(c, []), "foo", "mod.B")
+
+    def test_seam_unreadable_type_defers(self) -> None:
+        # A non-Instance has no readable .type: the seam defers (None).
+        result = _type_kernel.rust_lookup_definer(cast(Any, IntExpr(3)), "foo")
+        assert result is None
+
+    def test_parity_defined_in_base(self) -> None:
+        a = self._definer("mod.A")
+        b = self._subclass("mod.B", [a])
+        self._assert_par(Instance(b, []), "foo", "mod.A")
+
+    def test_parity_overridden_in_subclass(self) -> None:
+        a = self._definer("mod.A")
+        b = self._subclass("mod.B", [a])
+        b.names["foo"] = SymbolTableNode(GDEF, Var("foo"))
+        self._assert_par(Instance(b, []), "foo", "mod.B")
+
+    def test_parity_not_in_mro(self) -> None:
+        a = self._info("mod.A")
+        b = self._subclass("mod.B", [a])
+        self._assert_par(Instance(b, []), "foo", None)
+
+    def test_parity_multiple_bases_first_mro_wins(self) -> None:
+        a = self._definer("mod.A")
+        b = self._definer("mod.B")
+        c = self._subclass("mod.C", [b, a])
+        self._assert_par(Instance(c, []), "foo", "mod.B")
+
+    def test_parity_empty_mro(self) -> None:
+        # An MRO listing nothing but the class itself, no defs: None.
+        b = self._subclass("mod.B", [])
+        self._assert_par(Instance(b, []), "foo", None)
