@@ -40423,3 +40423,209 @@ class NativeIsWritableAttributeSuite(Suite):
 
     def test_parity_non_node(self) -> None:
         self._assert_par(self.fx.oi)
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeAlwaysReturnsNoneSuite(Suite):
+    """Parity for `rust_always_returns_none` (issue #1070).
+
+    `ExpressionChecker.always_returns_none` / `defn_returns_none`
+    (checkexpr.py:1714-1779) decide whether a callee is explicitly
+    annotated as only returning None. The Rust seam is a live-PyO3-object
+    port (isinstance + attribute reads, zero wire bytes) that recurses
+    over FuncDef / OverloadedFuncDef / Var and calls the real Python
+    `get_proper_type` for ret None-ness. The MemberExpr owner type is
+    checker state, so the shim pre-resolves `lookup_type(node.expr)` and
+    passes the resulting TypeInfo. Direct seam calls assert the expected
+    bool (and deferrals); toggling the checkexpr gate off vs on drives
+    the real ExpressionChecker method and must agree on both.
+    """
+
+    def setUp(self) -> None:
+        from mypy.checkexpr import _set_native_checkexpr_active
+
+        self.fx = TypeFixture()
+        self._set_active = _set_native_checkexpr_active
+        self._set_active(True)
+
+    def tearDown(self) -> None:
+        self._set_active(False)
+
+    def _with_gate(self, active: bool, fn: Callable[[], T]) -> T:
+        self._set_active(active)
+        try:
+            return fn()
+        finally:
+            self._set_active(True)
+
+    def _info(self, fullname: str = "mod.C") -> TypeInfo:
+        from mypy.nodes import Block, ClassDef
+
+        defn = ClassDef(fullname.rsplit(".", 1)[-1], Block([]), None, [])
+        defn.fullname = fullname
+        info = TypeInfo(SymbolTable(), defn, "mod")
+        defn.info = info
+        info.mro = [info]
+        return info
+
+    def _funcdef(self, ret_none: bool, name: str = "f") -> FuncDef:
+        from mypy.nodes import Block
+
+        ret: Type = NoneType() if ret_none else self.fx.o
+        fd = FuncDef(name, [], Block([]), None)
+        fd.type = CallableType([], [], [], ret, self.fx.function)
+        return fd
+
+    def _none_ret_callable(self) -> CallableType:
+        return CallableType([], [], [], NoneType(), self.fx.function)
+
+    def _overload(self, rets: list[bool]) -> OverloadedFuncDef:
+        return OverloadedFuncDef([self._funcdef(r) for r in rets])
+
+    def _var(self, typ: Type, is_inferred: bool = False) -> Var:
+        v = Var("x")
+        v.type = typ
+        v.is_inferred = is_inferred
+        return v
+
+    def _call_var(self, call_ret_none: bool) -> Var:
+        # Var of an instance-like type whose __call__ is a method with the
+        # given return annotation; exercises the defn_returns_none
+        # `__call__` recursion.
+        info = self._info("mod.Callable0")
+        info.names["__call__"] = SymbolTableNode(GDEF, self._funcdef(call_ret_none, "__call__"))
+        return self._var(Instance(info, []))
+
+    def _ref(self, node: object) -> NameExpr:
+        expr = NameExpr("f")
+        expr.node = node  # type: ignore[assignment]
+        return expr
+
+    def _checker(self) -> Any:
+        from mypy.checker import TypeChecker
+        from mypy.errors import Errors
+        from mypy.nodes import MypyFile
+        from mypy.plugin import Plugin
+
+        options = Options()
+        errors = Errors(options)
+        tree = MypyFile([], [])
+        tree.is_stub = True
+        tree.names = SymbolTable()
+        modules: dict[str, MypyFile] = {}
+        return TypeChecker(errors, modules, options, tree, "", Plugin(options), {})
+
+    def _ec(self) -> Any:
+        from mypy.checkexpr import ExpressionChecker
+
+        return ExpressionChecker(self._checker(), None, None, None)  # type: ignore[arg-type]
+
+    def _member(self, owner: Type, name: str = "attr") -> tuple[MemberExpr, Any]:
+        from mypy.checkexpr import ExpressionChecker
+
+        base = NameExpr("obj")
+        expr = MemberExpr(base, name)
+        ec = ExpressionChecker(self._checker(), None, None, None)  # type: ignore[arg-type]
+        ec.chk._type_maps[0][base] = owner
+        return expr, ec
+
+    def _assert_seam(self, node: Expression, expected: bool) -> None:
+        result = _type_kernel.rust_always_returns_none(node, None)
+        assert result == expected, f"seam: {result} != {expected}"
+
+    def _assert_par(self, node: Expression, ec: Any, expected: bool) -> None:
+        off = self._with_gate(False, lambda: ec.always_returns_none(node))
+        on = self._with_gate(True, lambda: ec.always_returns_none(node))
+        assert off == expected, f"gate-off: {off} != {expected}"
+        assert on == expected, f"gate-on: {on} != {expected}"
+
+    def test_seam_funcdef_none(self) -> None:
+        self._assert_seam(self._ref(self._funcdef(True)), True)
+
+    def test_seam_funcdef_not_none(self) -> None:
+        self._assert_seam(self._ref(self._funcdef(False)), False)
+
+    def test_seam_untyped_funcdef(self) -> None:
+        # A dynamic function (type None) is not annotated as None-only.
+        from mypy.nodes import Block
+
+        fd = FuncDef("f", [], Block([]), None)
+        self._assert_seam(self._ref(fd), False)
+
+    def test_seam_overload_all_none(self) -> None:
+        self._assert_seam(self._ref(self._overload([True, True])), True)
+
+    def test_seam_overload_mixed(self) -> None:
+        self._assert_seam(self._ref(self._overload([True, False])), False)
+
+    def test_seam_var_annotated_none(self) -> None:
+        self._assert_seam(self._ref(self._var(self._none_ret_callable())), True)
+
+    def test_seam_var_inferred(self) -> None:
+        self._assert_seam(
+            self._ref(self._var(self._none_ret_callable(), is_inferred=True)), False
+        )
+
+    def test_seam_var_call_recursion(self) -> None:
+        self._assert_seam(self._ref(self._call_var(True)), True)
+
+    def test_seam_var_call_not_none(self) -> None:
+        self._assert_seam(self._ref(self._call_var(False)), False)
+
+    def test_seam_refexpr_unresolved(self) -> None:
+        self._assert_seam(self._ref(None), False)
+
+    def test_seam_var_plain_instance_no_call(self) -> None:
+        # Instance type without __call__ in the MRO: False.
+        self._assert_seam(self._ref(self._var(Instance(self._info(), []))), False)
+
+    def test_seam_member_sym_none_returning(self) -> None:
+        info = self._info()
+        info.names["attr"] = SymbolTableNode(GDEF, self._funcdef(True))
+        expr, ec = self._member(Instance(info, []))
+        self._assert_par(expr, ec, True)
+
+    def test_seam_member_sym_not_none(self) -> None:
+        info = self._info()
+        info.names["attr"] = SymbolTableNode(GDEF, self._funcdef(False))
+        expr, ec = self._member(Instance(info, []))
+        self._assert_par(expr, ec, False)
+
+    def test_seam_member_sym_missing(self) -> None:
+        info = self._info()
+        expr, ec = self._member(Instance(info, []))
+        self._assert_par(expr, ec, False)
+
+    def test_seam_member_type_object(self) -> None:
+        # Type-object callee: the owner is the class behind the callable.
+        info = self._info()
+        type_obj = CallableType([], [], [], Instance(info, []), self.fx.type_type)
+        info.names["attr"] = SymbolTableNode(GDEF, self._funcdef(True))
+        expr, ec = self._member(type_obj)
+        self._assert_par(expr, ec, True)
+
+    def test_seam_member_non_instance(self) -> None:
+        # A non-Instance, non-type-object owner kind: both gates False.
+        expr, ec = self._member(NoneType())
+        self._assert_par(expr, ec, False)
+
+    def test_seam_member_analyzed(self) -> None:
+        # An analyzed MemberExpr (node set) never consults the owner type.
+        info = self._info()
+        info.names["attr"] = SymbolTableNode(GDEF, self._funcdef(True))
+        base = NameExpr("obj")
+        expr = MemberExpr(base, "attr")
+        expr.node = Var("attr")
+        ec = self._ec()
+        ec.chk._type_maps[0][base] = Instance(info, [])
+        self._assert_par(expr, ec, False)
+
+    def test_seam_non_expression_kind(self) -> None:
+        # Neither RefExpr nor MemberExpr: the seam answers False.
+        self._assert_seam(IntExpr(3), False)
+
+    def test_seam_member_missing_info_defers(self) -> None:
+        # A MemberExpr arm without a pre-resolved owner defers (None);
+        # the shim then re-runs the pure-Python body.
+        expr = MemberExpr(NameExpr("obj"), "attr")
+        result = _type_kernel.rust_always_returns_none(expr, None)
+        assert result is None, f"seam: {result} is not None"

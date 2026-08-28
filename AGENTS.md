@@ -1779,3 +1779,20 @@ directly to `main`.
   in `mypy/test/testtypes.py` (direct seam calls plus gate-off vs
   gate-on differential across the 3 call sites), plus 9 pure index
   unit tests in `checkexpr_functions.rs`.
+- `rust_always_returns_none` (issue #1070) — mirrors
+  `ExpressionChecker.always_returns_none` /
+  `defn_returns_none` (checkexpr.py:1714-1779) as a live-PyO3-object
+  seam (`rust_is_final_enum_value` shape, zero wire bytes): Rust walks
+  the recursive node kinds (FuncDef / OverloadedFuncDef / Var, the
+  `OverloadedFuncDef.items` fold, and the `Var.__call__` recursion) and
+  reads ret None-ness via the real Python `get_proper_type`, never bare
+  attribute reads, so a partially-fixed wire object defers. The
+  MemberExpr owner type is checker state (`chk.lookup_type`), so the
+  shim pre-resolves it and passes the resulting `TypeInfo`. Any
+  unreadable fact defers (`None`) to the untouched pure-Python body.
+  Gated by `_native_checkexpr_active` (existing wiring, no build.py
+  change) and covered by `NativeAlwaysReturnsNoneSuite` in
+  `mypy/test/testtypes.py` (gate-off vs gate-on differential plus
+  direct seam calls), plus pure decision unit tests in
+  `returns_none.rs`.
+

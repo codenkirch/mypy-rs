@@ -236,6 +236,7 @@ try:
     from type_kernel import (
         rust_all_same_types as _rust_all_same_types,
         rust_allow_fast_container_literal as _rust_allow_fast_container_literal,
+        rust_always_returns_none as _rust_always_returns_none,
         rust_analyze_cond_branch as _rust_analyze_cond_branch,
         rust_any_causes_overload_ambiguity as _rust_any_causes_overload_ambiguity,
         rust_arg_approximate_similarity as _rust_arg_approximate_similarity,
@@ -310,6 +311,7 @@ except ImportError:
     _rust_any_causes_overload_ambiguity = None  # type: ignore[assignment]
     _rust_arg_approximate_similarity = None  # type: ignore[assignment]
     _rust_all_same_types = None  # type: ignore[assignment]
+    _rust_always_returns_none = None  # type: ignore[assignment]
     _rust_has_abstract_type = None  # type: ignore[assignment]
     _rust_has_uninhabited_component = None  # type: ignore[assignment]
     _rust_has_ambiguous_uninhabited_component = None  # type: ignore[assignment]
@@ -1711,6 +1713,29 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
 
     def always_returns_none(self, node: Expression) -> bool:
         """Check if `node` refers to something explicitly annotated as only returning None."""
+        # Native type_kernel seam (#1070): the recursive defn walk runs in
+        # Rust over live nodes; the MemberExpr owner type is checker state,
+        # so it is pre-resolved here and passed as a TypeInfo object ref.
+        if _CHECKEXPR_HAS_TYPE_KERNEL and _native_checkexpr_active:
+            info: TypeInfo | None = None
+            try:
+                if isinstance(node, MemberExpr) and node.node is None:
+                    typ = get_proper_type(self.chk.lookup_type(node.expr))
+                    if isinstance(typ, Instance):
+                        info = typ.type
+                    elif isinstance(typ, CallableType) and typ.is_type_obj():
+                        instance_type = typ.get_instance_type(force_fallback=True)
+                        if isinstance(instance_type, Instance):
+                            info = instance_type.type
+                        else:
+                            return False
+                    else:
+                        return False
+                result = _rust_always_returns_none(node, info)
+                if result is not None:
+                    return result
+            except (AssertionError, NotImplementedError, ValueError):
+                pass
         if isinstance(node, RefExpr):
             if self.defn_returns_none(node.node):
                 return True

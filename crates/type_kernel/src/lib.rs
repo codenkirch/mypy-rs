@@ -116,6 +116,7 @@ mod plugin_hooks;
 mod reachability;
 mod refs;
 mod remove_redundant;
+mod returns_none;
 mod semanal_algebra;
 mod semanal_bases;
 mod semanal_checks;
@@ -3271,6 +3272,14 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
     // typeops._remove_redundant_union_items (two-pass union dedup).
     module.add_function(wrap_pyfunction!(
         remove_redundant::rust_remove_redundant_union_items,
+        module
+    )?)?;
+
+    // Issue #1070: always_returns_none / defn_returns_none live-object port.
+    // Rust walks the recursive node kinds via PyO3 (zero wire bytes); the shim
+    // pre-resolves the MemberExpr owner type, and any unreadable fact defers.
+    module.add_function(wrap_pyfunction!(
+        returns_none::rust_always_returns_none,
         module
     )?)?;
 

@@ -137,6 +137,7 @@ __all__ = [
     "rust_has_ambiguous_uninhabited_component",
     "rust_has_erased_component",
     "rust_allow_fast_container_literal",
+    "rust_always_returns_none",
     "rust_analyze_cond_branch",
     "rust_has_bytes_component",
     "rust_has_bool_item",
@@ -2696,3 +2697,4 @@ def rust_match_generic_callables(
 def rust_classify_enum(
     info: Any, is_stub: bool, tree_fullname: str, enum_bases: list[str]
 ) -> tuple[int, list[str]] | None: ...
+def rust_always_returns_none(node: Expression, info: TypeInfo | None) -> bool | None: ...
