@@ -635,6 +635,117 @@ pub(crate) fn rust_defined_in_superclass(
 // analyze_instance_member_access (method path)
 // ---------------------------------------------------------------------------
 
+/// The `maptype.py:326-345` `builtins.tuple` special case inside
+/// `map_instance_to_direct_supertypes`, decided from the live receiver
+/// `TypeInfo`. Returns `Some(Some(inst))` when the special case produces
+/// the mapped supertype instance, `Some(None)` when it does not apply and
+/// the generic `map_instance_to_supertype` walk is parity-correct, and
+/// `None` (defer) when a live fact is unreadable or the expand defers.
+///
+/// `tuple_type` and `special_alias._is_recursive` are read LIVE (not from
+/// the snapshot): `_is_recursive` is a mutable raw cache (types.py:488)
+/// that Python reads raw at maptype time, so a snapshot could go stale.
+fn tuple_special_map(
+    py: Python<'_>,
+    resolver: &NativeTypeResolver,
+    instance: &Type,
+    strict_optional: bool,
+) -> Option<Option<Type>> {
+    let left_ref = match instance {
+        Type::Instance { type_ref, .. } => type_ref.as_str(),
+        _ => return None,
+    };
+    if left_ref == "builtins.tuple" {
+        // maptype.py:178 `if instance.type == superclass: return instance`.
+        return Some(Some(instance.clone()));
+    }
+    // The special case needs a DIRECT `builtins.tuple` base in the
+    // receiver's `bases` (the NamedTuple shape); a generic NamedTuple
+    // reached via an intermediate class defers to Python.
+    let info = resolver.live_typeinfo(py, left_ref)?;
+    if info.is_none() {
+        return None;
+    }
+    let has_tuple_base = {
+        let bases = info.getattr("bases").ok()?;
+        let mut found = false;
+        for b in bases.iter().ok()? {
+            let full = b
+                .ok()?
+                .getattr("type")
+                .ok()?
+                .getattr("fullname")
+                .ok()?
+                .extract::<String>()
+                .ok()?;
+            if full == "builtins.tuple" {
+                found = true;
+                break;
+            }
+        }
+        found
+    };
+    if !has_tuple_base {
+        return None;
+    }
+    // maptype.py:327 `and instance.type.tuple_type`: falsy tuple_type
+    // skips the special case.
+    let tt = match info.getattr("tuple_type") {
+        Ok(t) if !t.is_none() => t,
+        _ => return Some(None),
+    };
+    let tt_bytes = serialize_type_to_bytes(py, tt)?;
+    let tt_wire = decode_type(&tt_bytes)?;
+    if !crate::expandtype::result_has_typevar(&tt_wire) {
+        // maptype.py:328 `if has_type_vars(...)`: false means the generic
+        // expand of the direct tuple base is parity-correct.
+        return Some(None);
+    }
+    // maptype.py:330-332 `alias = instance.type.special_alias; assert
+    // alias is not None`. A missing alias asserts in Python, so defer.
+    let alias = match info.getattr("special_alias") {
+        Ok(a) if !a.is_none() => a,
+        _ => return None,
+    };
+    // maptype.py:334 `if not alias._is_recursive` reads the RAW cached
+    // value: `None` (not yet computed) is falsy and proceeds.
+    let is_recursive = match alias.getattr("_is_recursive") {
+        Ok(v) if v.is_none() => false,
+        Ok(v) => match v.extract::<bool>() {
+            Ok(b) => b,
+            Err(_) => return None,
+        },
+        Err(_) => return None,
+    };
+    if is_recursive {
+        // "Unfortunately we can't support this for generic recursive
+        // tuples": Python skips the special casing and falls back to the
+        // generic walk of the direct tuple base.
+        return Some(None);
+    }
+    // maptype.py:335-336 `tuple_type = expand_type_by_instance(
+    // instance.type.tuple_type, instance)`.
+    let expanded = crate::expandtype::expand_type_by_instance_core(
+        &tt_wire,
+        instance,
+        resolver.resolver(),
+        strict_optional,
+    )?;
+    match expanded {
+        Type::TupleType { .. } => {
+            // maptype.py:338-342 `tuple_fallback(tuple_type)`.
+            let fb = crate::typeops::tuple_fallback(&expanded, resolver.resolver())?;
+            Some(Some(fb))
+        }
+        // maptype.py:343-345 "This can happen after normalizing variadic
+        // tuples."
+        Type::Instance { .. } => Some(Some(expanded)),
+        // Any other shape falls through to the generic expand of the
+        // direct tuple base.
+        _ => Some(None),
+    }
+}
+
 /// Shared map-then-expand tail of `analyze_instance_member_access`
 /// (checkmember.py:773-775) for static and trivial-self methods, and the
 /// member-access dispatch: `map_instance_to_supertype` +
@@ -663,6 +774,7 @@ pub(crate) fn rust_defined_in_superclass(
 /// Python's `freeze_all_type_vars` is unported: the signature is already
 /// frozen by this seam (expand produces only bound class vars), so nothing
 /// remains to freeze when the Rust path fully succeeds.
+#[allow(clippy::too_many_arguments)]
 fn static_member_tail(
     instance: &Type,
     signature: &Type,
@@ -671,10 +783,13 @@ fn static_member_tail(
     resolver: &TypeResolver,
     is_trivial: bool,
     allow_overloaded: bool,
+    tuple_special: Option<Option<&Type>>,
 ) -> Option<Type> {
     let (left_ref, left_args) = match instance {
         Type::Instance { type_ref, args, .. } => (type_ref.as_str(), args.as_slice()),
-        _ => return None,
+        _ => {
+            return None;
+        }
     };
     // `map_instance_to_supertype` walks map_derivation_path and returns
     // None for a non-base receiver, deferring to Python exactly as the
@@ -687,20 +802,34 @@ fn static_member_tail(
     if !ok {
         return None;
     }
-    // Defer `builtins.tuple` methods: a NamedTuple subclass mapped there
-    // needs the `tuple_fallback` special case (maptype.py:316-339) Rust
-    // does not implement; mirrors maptype.py:130's `!= "builtins.tuple"`.
-    if method_fullname == "builtins.tuple" {
+    // Defer `builtins.tuple` methods unless the dispatch head already
+    // decided the maptype.py:326-345 special case. A `None` here is the
+    // legacy seam path, which maps overloads in Python anyway.
+    if method_fullname == "builtins.tuple" && tuple_special.is_none() {
         return None;
     }
     // checkmember.py:450 `typ = map_instance_to_supertype(typ, method.info)`.
-    let mapped_args =
-        crate::subtypes::map_instance_to_supertype(left_ref, left_args, method_fullname, resolver)?;
-    let mapped_instance = Type::Instance {
-        type_ref: method_fullname.to_string(),
-        args: mapped_args,
-        last_known_value: None,
-        extra_attrs: None,
+    let mapped_instance = match tuple_special {
+        Some(Some(pre)) => pre.clone(),
+        _ => {
+            let mapped_args = match crate::subtypes::map_instance_to_supertype(
+                left_ref,
+                left_args,
+                method_fullname,
+                resolver,
+            ) {
+                Some(a) => a,
+                None => {
+                    return None;
+                }
+            };
+            Type::Instance {
+                type_ref: method_fullname.to_string(),
+                args: mapped_args,
+                last_known_value: None,
+                extra_attrs: None,
+            }
+        }
     };
     // checkmember.py:451 `expand_type_by_instance(signature, typ)`. Expand
     // the unbound callable first (binding would defer the expand).
@@ -710,7 +839,12 @@ fn static_member_tail(
         resolver,
         strict_optional,
     );
-    let expanded = expanded?;
+    let expanded = match expanded {
+        Some(e) => e,
+        None => {
+            return None;
+        }
+    };
     if is_trivial {
         if crate::expandtype::result_has_typevar(&expanded) {
             return None;
@@ -744,6 +878,7 @@ pub(crate) fn rust_analyze_instance_member_access(
         resolver.resolver(),
         is_trivial_self,
         false,
+        None,
     )?;
     encode_type(&result)
 }
@@ -781,14 +916,18 @@ pub(crate) fn member_method_inner(
     }
     let (left_ref, left_args) = match instance {
         Type::Instance { type_ref, args, .. } => (type_ref.as_str(), args.as_slice()),
-        _ => return None,
+        _ => {
+            return None;
+        }
     };
     // The seam fires only when the receiver is the exact class the method
     // is defined on (the same-class guard). A subclass / union receiver
     // defers so Python's `check_self_arg` + generic `bind_self` handle it.
     let self_ref = match self_type {
         Type::Instance { type_ref, .. } => type_ref.as_str(),
-        _ => return None,
+        _ => {
+            return None;
+        }
     };
     if self_ref != method_fullname {
         return None;
@@ -796,17 +935,31 @@ pub(crate) fn member_method_inner(
     // checkmember.py:769 `check_self_arg(signature, mx.self_type, ...)`:
     // Rust mirrors the overload-item self filter; a zero-match defers so
     // Python emits `incompatible_self_argument` on the unfiltered signature.
-    let filtered = check_self_arg_inner(
+    let filtered = match check_self_arg_inner(
         signature,
         self_type,
         is_class,
         name,
         strict_optional,
         resolver,
-    )?;
+    ) {
+        Some(f) => f,
+        None => {
+            return None;
+        }
+    };
     // checkmember.py:728 `typ = map_instance_to_supertype(typ, method.info)`.
-    let mapped_args =
-        crate::subtypes::map_instance_to_supertype(left_ref, left_args, method_fullname, resolver)?;
+    let mapped_args = match crate::subtypes::map_instance_to_supertype(
+        left_ref,
+        left_args,
+        method_fullname,
+        resolver,
+    ) {
+        Some(a) => a,
+        None => {
+            return None;
+        }
+    };
     let mapped_instance = Type::Instance {
         type_ref: method_fullname.to_string(),
         args: mapped_args,
@@ -822,7 +975,12 @@ pub(crate) fn member_method_inner(
         resolver,
         strict_optional,
     );
-    let expanded = expanded?;
+    let expanded = match expanded {
+        Some(e) => e,
+        None => {
+            return None;
+        }
+    };
     if crate::expandtype::result_has_typevar(&expanded) {
         return None; // free type vars need object-preserving Python path.
     }
@@ -836,13 +994,25 @@ pub(crate) fn member_method_inner(
             }
             let mut new_items = Vec::with_capacity(items.len());
             for item in items {
-                let item = bind_self_fast_inner(&item)?;
+                let item = match bind_self_fast_inner(&item) {
+                    Some(i) => i,
+                    None => {
+                        return None;
+                    }
+                };
                 new_items.push(item);
             }
             Type::Overloaded { items: new_items }
         }
-        Type::CallableType { .. } => bind_self_fast_inner(&expanded)?,
-        _ => return None,
+        Type::CallableType { .. } => match bind_self_fast_inner(&expanded) {
+            Some(b) => b,
+            None => {
+                return None;
+            }
+        },
+        _ => {
+            return None;
+        }
     };
     Some(bound)
 }
@@ -978,7 +1148,13 @@ fn freshen_signature(
         Type::Overloaded { items } => {
             let mut new_items = Vec::with_capacity(items.len());
             for item in items {
-                new_items.push(freshen_type(item, next_raw_id, changed, strict_optional)?);
+                let it = match freshen_type(item, next_raw_id, changed, strict_optional) {
+                    Some(t) => t,
+                    None => {
+                        return None;
+                    }
+                };
+                new_items.push(it);
             }
             Some(Type::Overloaded { items: new_items })
         }
@@ -1007,52 +1183,115 @@ fn dispatch_instance_member_inner(
 ) -> Option<Type> {
     let type_ref = match instance {
         Type::Instance { type_ref, .. } => type_ref.as_str(),
-        _ => return None,
+        _ => {
+            return None;
+        }
     };
     // checkmember.py:610-612 `info = typ.type; if override_info: info = ...`
     let lookup_fullname = override_info.unwrap_or(type_ref);
-    let info = resolver.live_typeinfo(py, lookup_fullname)?;
+    let info = match resolver.live_typeinfo(py, lookup_fullname) {
+        Some(i) => i,
+        None => {
+            return None;
+        }
+    };
     if info.is_none() {
         return None; // present-but-None map entry
     }
-    let method = match get_method_live(py, info, name)? {
-        LiveMethod::FuncBase(node) => node,
-        // The Python shim pre-gates Decorator / property / lvalue / super
-        // for the instance path; the union path bypasses it, so Rust
-        // re-checks here.
-        LiveMethod::Decorator => return None,
+    let method = match get_method_live(py, info, name) {
+        Some(LiveMethod::FuncBase(node)) => node,
+        Some(LiveMethod::Decorator) => {
+            // The Python shim pre-gates Decorator / property / lvalue /
+            // super for the instance path; the union path bypasses it, so
+            // Rust re-checks here.
+            return None;
+        }
+        None => {
+            return None;
+        }
     };
     let method = method.as_ref(py);
-    if get_bool_flag(py, method, "is_property")? {
-        return None;
+    match get_bool_flag(py, method, "is_property") {
+        Some(true) => {
+            return None;
+        }
+        Some(false) => {}
+        None => {
+            return None;
+        }
     }
-    let is_static = get_bool_flag(py, method, "is_static")?;
-    let is_trivial_self = get_bool_flag(py, method, "is_trivial_self")?;
-    let is_class = get_bool_flag(py, method, "is_class")?;
+    let is_static = match get_bool_flag(py, method, "is_static") {
+        Some(b) => b,
+        None => {
+            return None;
+        }
+    };
+    let is_trivial_self = match get_bool_flag(py, method, "is_trivial_self") {
+        Some(b) => b,
+        None => {
+            return None;
+        }
+    };
+    let is_class = match get_bool_flag(py, method, "is_class") {
+        Some(b) => b,
+        None => {
+            return None;
+        }
+    };
     // checkmember.py:616-621 `__init__` guard: non-final class and method
     // (and not via super, already gated) defers so Python emits the error.
-    if name == "__init__"
-        && !get_bool_flag(py, info, "is_final")?
-        && !get_bool_flag(py, method, "is_final")?
-    {
-        return None;
+    if name == "__init__" {
+        let info_final = match get_bool_flag(py, info, "is_final") {
+            Some(b) => b,
+            None => {
+                return None;
+            }
+        };
+        let method_final = match get_bool_flag(py, method, "is_final") {
+            Some(b) => b,
+            None => {
+                return None;
+            }
+        };
+        if !info_final && !method_final {
+            return None;
+        }
     }
     // checkmember.py:648-658 `method.info.fullname` + `function_type`
     // typed passthrough (`method.type`). A None type is a not-ready
     // overload or an unanalyzed function — defer to Python.
-    let method_fullname: String = method
+    let method_fullname: String = match method
         .getattr("info")
-        .ok()?
-        .getattr("fullname")
-        .ok()?
-        .extract()
-        .ok()?;
-    let type_attr = method.getattr("type").ok()?;
+        .ok()
+        .and_then(|i| i.getattr("fullname").ok())
+        .and_then(|f| f.extract().ok())
+    {
+        Some(f) => f,
+        None => {
+            return None;
+        }
+    };
+    let type_attr = match method.getattr("type") {
+        Ok(t) => t,
+        Err(_) => {
+            return None;
+        }
+    };
     if type_attr.is_none() {
         return None;
     }
-    let sig_bytes = serialize_type_to_bytes(py, type_attr)?;
-    let mut signature = decode_type(&sig_bytes)?;
+    let sig_bytes = match serialize_type_to_bytes(py, type_attr) {
+        Some(b) => b,
+        None => {
+            return None;
+        }
+    };
+    let mut signature = match decode_type(&sig_bytes) {
+        Some(s) => s,
+        None => {
+            return None;
+        }
+    };
     if !matches!(
         signature,
         Type::CallableType { .. } | Type::Overloaded { .. }
@@ -1065,7 +1304,18 @@ fn dispatch_instance_member_inner(
         signature = freshen_signature(&signature, next_raw_id, changed, strict_optional)?;
     }
     // checkmember.py:722-775 tail: static never binds, trivial-self binds
-    // via bind_self_fast, otherwise the validated member_method_inner.
+    // via bind_self_fast, otherwise the validated member_method_inner. A
+    // `builtins.tuple` method defers if the map special case was undecided.
+    let tuple_special = if method_fullname == "builtins.tuple" && (is_static || is_trivial_self) {
+        match tuple_special_map(py, resolver, instance, strict_optional) {
+            Some(r) => Some(r),
+            None => {
+                return None;
+            }
+        }
+    } else {
+        None
+    };
     if is_static {
         static_member_tail(
             instance,
@@ -1075,6 +1325,7 @@ fn dispatch_instance_member_inner(
             resolver.resolver(),
             false,
             true,
+            tuple_special.as_ref().map(|r| r.as_ref()),
         )
     } else if is_trivial_self {
         static_member_tail(
@@ -1085,6 +1336,7 @@ fn dispatch_instance_member_inner(
             resolver.resolver(),
             true,
             true,
+            tuple_special.as_ref().map(|r| r.as_ref()),
         )
     } else {
         member_method_inner(
@@ -1117,8 +1369,18 @@ pub(crate) fn rust_analyze_instance_member_dispatch(
     start_raw_id: i64,
     strict_optional: bool,
 ) -> Option<(i64, bool, Vec<u8>)> {
-    let instance = decode_type(instance_bytes)?;
-    let self_type = decode_type(self_type_bytes)?;
+    let instance = match decode_type(instance_bytes) {
+        Some(t) => t,
+        None => {
+            return None;
+        }
+    };
+    let self_type = match decode_type(self_type_bytes) {
+        Some(t) => t,
+        None => {
+            return None;
+        }
+    };
     let mut next_raw_id = start_raw_id;
     let mut changed = false;
     let result = dispatch_instance_member_inner(
@@ -1297,9 +1559,9 @@ struct MemberAccessCtx<'a> {
 }
 
 fn analyze_member_access_inner<'a>(
-    typ: &'a Type,
+    typ: &Type,
     mut ctx: Option<&mut MemberAccessCtx<'a>>,
-    resolver: &'a TypeResolver,
+    resolver: &TypeResolver,
 ) -> Option<Type> {
     match typ {
         // --- Instance ---
@@ -1352,14 +1614,15 @@ fn analyze_member_access_inner<'a>(
             None
         }
         // --- TupleType ---
-        Type::TupleType {
-            partial_fallback, ..
-        } => {
+        Type::TupleType { .. } => {
             // Python: _analyze_member_access(name, tuple_fallback(typ), mx).
-            // Recurse on the partial fallback; an Instance target routes
-            // through the native method branch (or defers when there is no
-            // dispatch context / it is an lvalue/super access).
-            analyze_member_access_inner(partial_fallback, ctx.as_deref_mut(), resolver)
+            // tuple_fallback recomputes args from the items when the partial
+            // fallback is builtins.tuple; the wire's `tuple[Any, ...]` erased it.
+            let target = match crate::typeops::tuple_fallback(typ, resolver) {
+                Some(t @ Type::Instance { .. }) => t,
+                _ => return None,
+            };
+            analyze_member_access_inner(&target, ctx.as_deref_mut(), resolver)
         }
         // --- TypedDictType ---
         Type::TypedDictType { .. } => {
@@ -2979,8 +3242,7 @@ pub(crate) fn rust_classify_analyze_var(
     };
     // checkmember.py:1621 `itype = map_instance_to_supertype(itype,
     // var.info)`: the mapped instance feeds every non-partial tail. Rust
-    // mirrors it to gate the seam on resolver coverage; the shim still
-    // maps its own live instance.
+    // gates on resolver coverage; the shim still maps its own instance.
     if crate::subtypes::map_instance_to_supertype(
         type_ref,
         args,
@@ -3139,6 +3401,33 @@ mod tests {
             last_known_value: None,
             extra_attrs: None,
         }
+    }
+
+    /// A resolver with self-only MRO snapshots for the builtin classes the
+    /// tuple tests consult (mirrors checkcall.rs's test_resolver).
+    fn snap_resolver() -> TypeResolver {
+        let mut r = TypeResolver::new();
+        for fullname in [
+            "builtins.int",
+            "builtins.str",
+            "builtins.object",
+            "builtins.tuple",
+            "builtins.function",
+        ] {
+            let mut s = crate::typeinfo::TypeInfoSnapshot {
+                fullname: fullname.to_string(),
+                name: fullname.to_string(),
+                ..Default::default()
+            };
+            s.mro.push(fullname.to_string());
+            s.has_base.insert(fullname.to_string());
+            if fullname != "builtins.object" {
+                s.mro.push("builtins.object".to_string());
+                s.has_base.insert("builtins.object".to_string());
+            }
+            r.insert(s.fullname.clone(), s);
+        }
+        r
     }
 
     fn make_overloaded(items: Vec<Type>) -> Type {
@@ -3475,10 +3764,17 @@ mod tests {
         let sig = Type::Overloaded {
             items: vec![make_callable(vec![ARG_POS], false)],
         };
-        assert!(
-            static_member_tail(&inst, &sig, "builtins.int", false, &resolver, false, false)
-                .is_none()
-        );
+        assert!(static_member_tail(
+            &inst,
+            &sig,
+            "builtins.int",
+            false,
+            &resolver,
+            false,
+            false,
+            None
+        )
+        .is_none());
     }
 
     #[test]
@@ -3492,7 +3788,8 @@ mod tests {
             false,
             &resolver,
             false,
-            false
+            false,
+            None
         )
         .is_none());
     }
@@ -4607,6 +4904,128 @@ mod tests {
             let result = rust_is_instance_var(obj).unwrap();
             assert_eq!(result, None);
         });
+    }
+
+    #[test]
+    fn test_tuple_fallback_recomputes_args_from_items() {
+        // issue #1112: a tuple literal's partial fallback is `tuple[Any, ...]`;
+        // tuple_fallback (typeops.py:339-375) must recompute the element from
+        // the items, which the TupleType arm now feeds the method branch.
+        let tt = Type::TupleType {
+            items: vec![make_instance("builtins.int"), make_instance("builtins.str")],
+            partial_fallback: Box::new(Type::Instance {
+                type_ref: "builtins.tuple".to_string(),
+                args: vec![Type::AnyType {
+                    type_of_any: 6, // TypeOfAny.special_form
+                    source_any: None,
+                    missing_import_name: None,
+                }],
+                last_known_value: None,
+                extra_attrs: None,
+            }),
+            implicit: false,
+        };
+        let resolver = snap_resolver();
+        let fb = crate::typeops::tuple_fallback(&tt, &resolver).expect("fallback computed");
+        match fb {
+            Type::Instance { type_ref, args, .. } => {
+                assert_eq!(type_ref, "builtins.tuple");
+                assert_eq!(args.len(), 1);
+                match &args[0] {
+                    Type::UnionType { items, .. } => assert_eq!(items.len(), 2),
+                    other => panic!("expected union of items, got {other:?}"),
+                }
+            }
+            other => panic!("expected Instance, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_tuple_fallback_keeps_non_tuple_partial_fallback() {
+        // typeops.py:342-343: a named-tuple fallback is returned verbatim.
+        let tt = Type::TupleType {
+            items: vec![make_instance("builtins.int")],
+            partial_fallback: Box::new(make_instance("collections.OrderedDict")),
+            implicit: false,
+        };
+        let resolver = TypeResolver::new();
+        let fb = crate::typeops::tuple_fallback(&tt, &resolver).expect("fallback computed");
+        assert_eq!(fb, make_instance("collections.OrderedDict"));
+    }
+
+    #[test]
+    fn test_member_access_tuple_arm_defers_without_ctx() {
+        // The TupleType arm routes through the computed fallback and then
+        // the method branch; without a dispatch context the Instance arm
+        // defers to Python (no panics, no partial results).
+        let tt = Type::TupleType {
+            items: vec![make_instance("builtins.int")],
+            partial_fallback: Box::new(Type::Instance {
+                type_ref: "builtins.tuple".to_string(),
+                args: vec![Type::AnyType {
+                    type_of_any: 6,
+                    source_any: None,
+                    missing_import_name: None,
+                }],
+                last_known_value: None,
+                extra_attrs: None,
+            }),
+            implicit: false,
+        };
+        let resolver = TypeResolver::new();
+        assert!(analyze_member_access_inner(&tt, None, &resolver).is_none());
+    }
+
+    #[test]
+    fn test_static_member_tail_tuple_guard_legacy_seam() {
+        // The legacy seam passes tuple_special=None: builtins.tuple
+        // methods defer to Python (the maptype.py:326-345 special case
+        // is not mirrored on that path).
+        let resolver = TypeResolver::new();
+        let inst = make_instance("builtins.tuple");
+        let sig = make_callable(vec![ARG_POS], false);
+        assert!(static_member_tail(
+            &inst,
+            &sig,
+            "builtins.tuple",
+            true,
+            &resolver,
+            false,
+            true,
+            None
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn test_static_member_tail_tuple_special_uses_decided_map() {
+        // With a decided tuple_special (Some(Some(mapped))) the tail uses
+        // it directly, skipping map_instance_to_supertype.
+        let inst = Type::Instance {
+            type_ref: "builtins.tuple".to_string(),
+            args: vec![Type::AnyType {
+                type_of_any: 6,
+                source_any: None,
+                missing_import_name: None,
+            }],
+            last_known_value: None,
+            extra_attrs: None,
+        };
+        let sig = make_callable(vec![ARG_POS], false);
+        let result = static_member_tail(
+            &inst,
+            &sig,
+            "builtins.tuple",
+            true,
+            &snap_resolver(),
+            false,
+            true,
+            Some(Some(&inst)),
+        );
+        // The decided map engages: the expand of a var-less callable is
+        // identity, so the signature comes back unchanged (vs the legacy
+        // guard's deferral above).
+        assert!(result.is_some());
     }
 }
 

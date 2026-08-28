@@ -2,10 +2,9 @@
 
 from __future__ import annotations
 
+import copy
 from collections.abc import Callable, Sequence
 from typing import Any, Final, TypeVar, cast
-
-import copy
 
 from mypy import message_registry, state
 from mypy.checker_shared import TypeCheckerSharedApi
@@ -58,15 +57,9 @@ from mypy.typeops import (
 from mypy.types import (
     AnyType,
     CallableType,
-    _encode_no_arg_instance,
-    _serialize_stats,
-    _serialize_stats_on,
     DeletedType,
     FunctionLike,
     Instance,
-    _serialize_with_taint_check,
-    _type_wire_cache,
-    _wire_cache_enabled,
     LiteralType,
     NoneType,
     Overloaded,
@@ -85,6 +78,12 @@ from mypy.types import (
     TypeVarType,
     UninhabitedType,
     UnionType,
+    _encode_no_arg_instance,
+    _serialize_stats,
+    _serialize_stats_on,
+    _serialize_with_taint_check,
+    _type_wire_cache,
+    _wire_cache_enabled,
     get_proper_type,
     instance_cache,
 )
@@ -132,8 +131,8 @@ try:
         rust_defined_in_superclass as _rust_defined_in_superclass,
         rust_has_operator as _rust_has_operator,
         rust_instance_fallback as _rust_instance_fallback,
-        rust_meta_has_operator as _rust_meta_has_operator,
         rust_is_instance_var as _rust_is_instance_var,
+        rust_meta_has_operator as _rust_meta_has_operator,
     )
 
     from mypy.types import read_type as _checkmember_read_type
@@ -176,17 +175,15 @@ _rust_add_class_tvars: Any = None
 _rust_descriptor_has_get_set: Any = None
 if _HAS_TYPE_KERNEL:
     try:
-        from type_kernel import (
-            rust_descriptor_has_get_set as _rust_descriptor_has_get_set,
-        )
+        from type_kernel import rust_descriptor_has_get_set as _rust_descriptor_has_get_set
     except ImportError:
         pass
     try:
         from type_kernel import (
-            rust_check_self_arg as _rust_check_self_arg,
-            rust_expand_without_binding as _rust_expand_without_binding,
-            rust_expand_and_bind_callable as _rust_expand_and_bind_callable,
             rust_add_class_tvars as _rust_add_class_tvars,
+            rust_check_self_arg as _rust_check_self_arg,
+            rust_expand_and_bind_callable as _rust_expand_and_bind_callable,
+            rust_expand_without_binding as _rust_expand_without_binding,
         )
     except ImportError:
         pass
@@ -303,9 +300,7 @@ def _serialize_type_for_checkmember(t: Type) -> bytes:
     return result
 
 
-def _deserialize_type_for_checkmember(
-    data: bytes, freeze: bool = False
-) -> ProperType | None:
+def _deserialize_type_for_checkmember(data: bytes, freeze: bool = False) -> ProperType | None:
     """Decode wire bytes, resolving type_ref to live TypeInfo via wirefixup.
 
     Returns None when a type_ref is unresolvable so callers defer to Python.
@@ -387,17 +382,12 @@ def _restore_definition(original: Type, decoded: ProperType) -> ProperType:
         # find the matching item by arg-type signature to restore its
         # definition link.
         for orig in original.items:
-            if (
-                orig.definition is not None
-                and len(orig.arg_types) == len(decoded.arg_types)
-            ):
+            if orig.definition is not None and len(orig.arg_types) == len(decoded.arg_types):
                 return decoded.copy_modified(definition=orig.definition)
     return decoded
 
 
-def _restore_native_method_definition(
-    name: str, typ: Type, decoded: ProperType
-) -> ProperType:
+def _restore_native_method_definition(name: str, typ: Type, decoded: ProperType) -> ProperType:
     """Best-effort relink of ``definition`` for a native-decoded method type.
 
     The general member-access seam resolves a fallback to an Instance and
@@ -427,11 +417,7 @@ def _restore_native_method_definition(
     if info is None:
         return decoded
     method = info.get_method(name) if name else None
-    if (
-        method is not None
-        and not isinstance(method, Decorator)
-        and method.type is not None
-    ):
+    if method is not None and not isinstance(method, Decorator) and method.type is not None:
         return _restore_definition(method.type, decoded)
     return decoded
 
@@ -866,10 +852,12 @@ def analyze_instance_member_access(
                         decoded.column = typ.column
                         if isinstance(decoded, CallableType):
                             decoded.fallback.line = decoded.line
-        # The wire round-trip drops `.name` and `.definition`; both drive
-        # error-message formatting, so restore them from the pre-seam
-        # signature for identical bound-method notes.
-                        if isinstance(decoded, CallableType) and isinstance(signature, CallableType):
+                        # The wire round-trip drops `.name` and `.definition`; both drive
+                        # error-message formatting, so restore them from the pre-seam
+                        # signature for identical bound-method notes.
+                        if isinstance(decoded, CallableType) and isinstance(
+                            signature, CallableType
+                        ):
                             decoded.name = signature.name
                             decoded.definition = signature.definition
                     # Clear the process-global primitive decode singletons
@@ -1030,16 +1018,12 @@ def analyze_type_type_member_access(
                 with mx.msg.filter_errors():
                     return _analyze_member_access(name, fallback, mx, override_info)
             elif tag == NATIVE_TT_TV_UB_INSTANCE:
-                item = cast(
-                    Instance, get_proper_type(cast(TypeVarType, typ.item).upper_bound)
-                )
+                item = cast(Instance, get_proper_type(cast(TypeVarType, typ.item).upper_bound))
             elif tag == NATIVE_TT_TV_UB_UNION:
                 upper_bound = get_proper_type(cast(TypeVarType, typ.item).upper_bound)
                 return _analyze_member_access(
                     name,
-                    TypeType.make_normalized(
-                        upper_bound, line=typ.line, column=typ.column
-                    ),
+                    TypeType.make_normalized(upper_bound, line=typ.line, column=typ.column),
                     mx,
                     override_info,
                 )
@@ -1071,9 +1055,7 @@ def analyze_type_type_member_access(
             elif isinstance(upper_bound, UnionType):
                 return _analyze_member_access(
                     name,
-                    TypeType.make_normalized(
-                        upper_bound, line=typ.line, column=typ.column
-                    ),
+                    TypeType.make_normalized(upper_bound, line=typ.line, column=typ.column),
                     mx,
                     override_info,
                 )
@@ -1440,8 +1422,7 @@ def analyze_descriptor_access(descriptor_type: Type, mx: MemberContext) -> Type:
         ):
             try:
                 result = _rust_descriptor_has_get_set(
-                    _native_checkmember_resolver,
-                    _serialize_type_for_checkmember(descriptor_type),
+                    _native_checkmember_resolver, _serialize_type_for_checkmember(descriptor_type)
                 )
                 if result is not None:
                     rust_decided = True
@@ -2084,6 +2065,7 @@ def check_self_arg(
                 next_raw_id, changed, wire_bytes = result
                 if changed:
                     from mypy.types import TypeVarId
+
                     TypeVarId.next_raw_id = next_raw_id
                 decoded = _deserialize_type_for_checkmember(bytes(wire_bytes), freeze=True)
                 if decoded is not None:
@@ -2410,9 +2392,7 @@ def analyze_enum_class_attribute_access(
     ):
         try:
             result = _rust_analyze_enum_class_attribute_access(
-                _native_checkmember_resolver,
-                _serialize_type_for_checkmember(itype),
-                name,
+                _native_checkmember_resolver, _serialize_type_for_checkmember(itype), name
             )
             if result is not None:
                 decoded = _deserialize_type_for_checkmember(bytes(result))
@@ -2564,11 +2544,10 @@ def add_class_tvars(
             # Serialize original_vars as a wire-format type list.
             orig_vars_buf = _CheckMemberWriteBuffer()
             from mypy.types import write_type_list
+
             write_type_list(orig_vars_buf, list(tvars))
             orig_vars_bytes = orig_vars_buf.getvalue()
-            isuper_bytes = (
-                _serialize_type_for_checkmember(isuper) if isuper is not None else b""
-            )
+            isuper_bytes = _serialize_type_for_checkmember(isuper) if isuper is not None else b""
             result = _rust_add_class_tvars(
                 _native_checkmember_resolver,
                 _serialize_type_for_checkmember(t),
@@ -2720,7 +2699,12 @@ def has_operator(typ: Type, op_method: str) -> bool:
     # e.g. for __OP__ vs __rOP__.
     typ = get_proper_type(typ)
 
-    if _HAS_TYPE_KERNEL and _native_checkmember_active and _native_checkmember_resolver is not None and _rust_has_operator is not None:
+    if (
+        _HAS_TYPE_KERNEL
+        and _native_checkmember_active
+        and _native_checkmember_resolver is not None
+        and _rust_has_operator is not None
+    ):
         try:
             # The Rust path expands TypeVarLikeType internally (values_or_bound)
             # and defers (None) for any case it cannot decide, e.g. a
@@ -2784,12 +2768,15 @@ def instance_fallback(typ: ProperType) -> Instance:
 
 def meta_has_operator(item: Type, op_method: str) -> bool:
     item = get_proper_type(item)
-    if _HAS_TYPE_KERNEL and _native_checkmember_active and _native_checkmember_resolver is not None and _rust_meta_has_operator is not None:
+    if (
+        _HAS_TYPE_KERNEL
+        and _native_checkmember_active
+        and _native_checkmember_resolver is not None
+        and _rust_meta_has_operator is not None
+    ):
         try:
             result = _rust_meta_has_operator(
-                _native_checkmember_resolver,
-                _serialize_type_for_checkmember(item),
-                op_method,
+                _native_checkmember_resolver, _serialize_type_for_checkmember(item), op_method
             )
             if result is not None:
                 return result
@@ -2807,11 +2794,14 @@ def meta_has_operator(item: Type, op_method: str) -> bool:
 
 def defined_in_superclass(info: TypeInfo, name: str) -> bool:
     """Check if a variable has an explicit value at class level in any of superclasses."""
-    if _HAS_TYPE_KERNEL and _native_checkmember_active and _native_checkmember_resolver is not None and _rust_defined_in_superclass is not None:
+    if (
+        _HAS_TYPE_KERNEL
+        and _native_checkmember_active
+        and _native_checkmember_resolver is not None
+        and _rust_defined_in_superclass is not None
+    ):
         try:
-            result = _rust_defined_in_superclass(
-                _native_checkmember_resolver, info.fullname, name
-            )
+            result = _rust_defined_in_superclass(_native_checkmember_resolver, info.fullname, name)
             if result is not None:
                 return result
         except (AssertionError, NotImplementedError):

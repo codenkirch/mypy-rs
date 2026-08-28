@@ -800,6 +800,22 @@ including:
   empty-args or TVT-class mapped instances, ParamSpec/Unpack signatures, and
   un-frozen TypeVar-carrying results still defer to Python. Exercised by the
   native checkmember suites and Rust unit tests in `checkmember.rs`.
+- `rust_analyze_instance_member_dispatch` defer closures (issue #1112) —
+  ports two IAMA dispatch defers into the kernel: (a) the
+  `rust_freshen_function_type_vars` `TypeAliasType` arm (freshen walks alias
+  args only, TypeVars pass through unchanged per `type_visitor.py:239-240`;
+  a `Parameters` arg defers), and (b) the `builtins.tuple` special case of
+  `maptype.map_instance_to_supertype` (tuple_map: `Some(Some(mapped))`
+  decided tuples ride `tuple_special`, undecided ones defer). Also fixes a
+  latent bug in the TupleType arm of `analyze_member_access_inner`: it
+  recursed on the wire's `partial_fallback`, which for a plain tuple literal
+  is `tuple[Any, ...]`; it now computes `tuple_fallback(typ)` like Python
+  (`typeops.py:339-375`) and defers when that does not yield an Instance.
+  Measured (self-check): IAMA dispatch 99,535 calls / 12,126 fallbacks
+  (88% native) → 96,025 / 7,919 (92% native);
+  `rust_freshen_function_type_vars` 100% native. No new Python-side suites:
+  exercised by the existing gate-on/off parity differential plus Rust unit
+  tests in `checkmember.rs` and `freshen.rs`.
 - `expand_type_inner` Callable arm `is_bound` (issue #833) — removed the
   `is_bound` defer in the wire Callable expansion: Python's
   `visit_callable_type` never branches on the flag (it survives

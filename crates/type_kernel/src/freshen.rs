@@ -401,9 +401,22 @@ pub(crate) fn freshen_type(
             })
         }
 
-        // Deferred: Overloaded (unwritable), TypeAliasType (recursive),
-        // Parameters (unwritable).
-        Type::Overloaded { .. } | Type::TypeAliasType { .. } | Type::Parameters(_) => None,
+        // Deferred: Overloaded handled above; Parameters (unwritable).
+        Type::Overloaded { .. } | Type::Parameters(_) => None,
+
+        // visit_type_alias_type (expandtype.py:640-642): only the alias's
+        // args are translated; the alias node itself is kept, so the wire
+        // format's missing alias target is harmless (no recursion).
+        Type::TypeAliasType { args, type_ref } => {
+            let mut new_args = Vec::with_capacity(args.len());
+            for arg in args {
+                new_args.push(freshen_type(arg, next_raw_id, changed, strict_optional)?);
+            }
+            Some(Type::TypeAliasType {
+                args: new_args,
+                type_ref: type_ref.clone(),
+            })
+        }
 
         // visit_tuple_type (type_visitor.py:269-276): `implicit` resets to
         // False in the Python rebuild.
@@ -912,5 +925,59 @@ mod tests {
         // seam still defers instead of mis-behaving.
         let result = rust_match_generic_callables(0, 0, b"", b"").unwrap();
         assert!(result.is_none(), "num_vars == 0 defers");
+    }
+
+    #[test]
+    fn type_alias_type_visits_args_only() {
+        // FreshenCallableVisitor.visit_type_alias_type (expandtype.py:640-642):
+        // the alias node is kept (copy_modified(args=...)) and only its
+        // args are translated; a bare TypeVar arg passes through unchanged.
+        let alias = Type::TypeAliasType {
+            args: vec![Type::Instance {
+                type_ref: "builtins.tuple".to_string(),
+                args: vec![tvar("T", 1, 0)],
+                last_known_value: None,
+                extra_attrs: None,
+            }],
+            type_ref: "m.Alias".to_string(),
+        };
+        let mut next_raw_id = 100;
+        let mut changed = false;
+        let out = freshen_type(&alias, &mut next_raw_id, &mut changed, true)
+            .expect("TypeAliasType engages");
+        match out {
+            Type::TypeAliasType { args, type_ref } => {
+                assert_eq!(type_ref, "m.Alias");
+                assert_eq!(args.len(), 1);
+                match &args[0] {
+                    Type::Instance { type_ref, args, .. } => {
+                        assert_eq!(type_ref, "builtins.tuple");
+                        assert_eq!(args.len(), 1);
+                        assert_eq!(args[0], tvar("T", 1, 0));
+                    }
+                    other => panic!("expected Instance arg, got {other:?}"),
+                }
+            }
+            other => panic!("expected TypeAliasType, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn type_alias_type_bad_arg_defers() {
+        // An arg freshen_type cannot decide (Parameters) defers the alias.
+        let alias = Type::TypeAliasType {
+            args: vec![Type::Parameters(crate::wire::Parameters {
+                arg_types: Vec::new(),
+                arg_kinds: Vec::new(),
+                arg_names: Vec::new(),
+                variables: Vec::new(),
+                imprecise_arg_kinds: false,
+            })],
+            type_ref: "m.Alias".to_string(),
+        };
+        let mut next_raw_id = 7;
+        let mut changed = false;
+        assert!(freshen_type(&alias, &mut next_raw_id, &mut changed, true).is_none());
+        assert_eq!(next_raw_id, 7);
     }
 }
