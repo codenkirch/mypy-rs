@@ -603,6 +603,8 @@ def _analyze_member_access(
             typ,
             (Instance, UnionType, TypeType, TypedDictType, NoneType, DeletedType, TypeAliasType),
         )
+        and not isinstance(typ, PartialType)
+        and not (isinstance(typ, FunctionLike) and typ.is_type_obj())
     ):
         try:
             result = _rust_analyze_member_access(
