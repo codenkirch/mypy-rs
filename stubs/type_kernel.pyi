@@ -138,6 +138,7 @@ __all__ = [
     "rust_copy_type",
     "rust_apply_generic_arguments",
     "rust_has_no_typevars",
+    "rust_get_target_type",
     "rust_has_abstract_type",
     "rust_has_any_type",
     "rust_has_uninhabited_component",
@@ -773,6 +774,15 @@ def rust_apply_generic_arguments(
     strict_optional: bool,
 ) -> bytes | None: ...
 def rust_has_no_typevars(type_bytes: bytes) -> bool | None: ...
+def rust_get_target_type(
+    tvar_wire: bytes,
+    type_wire: bytes,
+    skip_unsatisfied: bool,
+    same_type_ok: bool | None,
+    bound_ok: bool | None,
+    value_subtypes: list[bool] | None,
+    narrow_matrix: list[bool] | None,
+) -> tuple[int, int] | None: ...
 def rust_has_any_type(
     resolver: NativeTypeResolver, type_bytes: bytes, ignore_in_type_obj: bool
 ) -> bool | None: ...

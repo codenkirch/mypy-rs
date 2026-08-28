@@ -521,6 +521,163 @@ fn make_any() -> Type {
 }
 
 // ---------------------------------------------------------------------------
+// get_target_type decision head (standalone seam)
+// ---------------------------------------------------------------------------
+
+// Tags returned by `rust_get_target_type`. The Python shim maps each tag
+// onto the side effects / results of the pure-Python body
+// (applytype.py:244-296).
+const TAG_EXPAND_DEFAULT: i64 = 0;
+const TAG_PASSTHROUGH: i64 = 1;
+const TAG_MATCH: i64 = 2;
+const TAG_SKIP: i64 = 3;
+const TAG_REPORT: i64 = 4;
+
+/// `#[pyfunction]` entry for the `get_target_type` decision head
+/// (applytype.py:244-296). Rust owns the branch selection; the Python shim
+/// computes the resolver-backed subtype/same-type booleans (already native)
+/// and passes them in, then applies the side effects the chosen tag
+/// implies (expand_type, report_incompatible_typevar_value, erase_typevars
+/// for the Self upper bound). The result Type never crosses the seam.
+///
+/// Returns `(tag, match_index)` or `None` (defer to the pure-Python body).
+/// `same_type_ok` is the cross-product conjunction for a TypeVarType
+/// argument carrying values; `bound_ok` is `is_subtype(type, upper_bound)`
+/// after the shim applied the Self erase; `value_subtypes` is
+/// `is_subtype(type, value)` per tvar value; `narrow_matrix` is the
+/// flattened `value_i <: value_j` matrix consulted only when more than
+/// one value matches.
+#[pyfunction]
+#[allow(clippy::too_many_arguments)]
+#[pyo3(signature = (tvar_wire, type_wire, skip_unsatisfied, same_type_ok, bound_ok, value_subtypes, narrow_matrix))]
+pub(crate) fn rust_get_target_type(
+    tvar_wire: &[u8],
+    type_wire: &[u8],
+    skip_unsatisfied: bool,
+    same_type_ok: Option<bool>,
+    bound_ok: Option<bool>,
+    value_subtypes: Option<Vec<bool>>,
+    narrow_matrix: Option<Vec<bool>>,
+) -> Option<(i64, i64)> {
+    let tvar = decode_type(tvar_wire)?;
+    let type_arg = decode_type(type_wire)?;
+    get_target_type_tag(
+        &tvar,
+        &type_arg,
+        skip_unsatisfied,
+        same_type_ok,
+        bound_ok,
+        value_subtypes.as_deref(),
+        narrow_matrix.as_deref(),
+    )
+}
+
+/// Branch selection for `get_target_type`. Mirrors applytype.py:253-296.
+fn get_target_type_tag(
+    tvar: &Type,
+    type_arg: &Type,
+    skip_unsatisfied: bool,
+    same_type_ok: Option<bool>,
+    bound_ok: Option<bool>,
+    value_subtypes: Option<&[bool]>,
+    narrow_matrix: Option<&[bool]>,
+) -> Option<(i64, i64)> {
+    // Defer on TypeAliasType: Python's get_proper_type would expand the
+    // alias, which the wire format cannot carry.
+    if matches!(type_arg, Type::TypeAliasType { .. }) {
+        return None;
+    }
+    // applytype.py:254-256: an ambiguous UninhabitedType with a real tvar
+    // default expands the default (Python runs expand_type(tvar.default)).
+    if let Type::UninhabitedType { ambiguous: true } = type_arg {
+        if default_of(tvar).is_some() {
+            return Some((TAG_EXPAND_DEFAULT, -1));
+        }
+    }
+    match tvar {
+        // applytype.py:257-260: ParamSpec / TypeVarTuple pass through.
+        Type::ParamSpecType { .. } | Type::TypeVarTupleType { .. } => Some((TAG_PASSTHROUGH, -1)),
+        Type::TypeVarType { values, .. } => {
+            if values.is_empty() {
+                // applytype.py:285-295: bound check. The shim already
+                // applied the Self upper-bound erase and computed
+                // is_subtype(type, bound); Rust only arbitrates.
+                let ok = bound_ok?;
+                if ok {
+                    Some((TAG_PASSTHROUGH, -1))
+                } else if skip_unsatisfied {
+                    Some((TAG_SKIP, -1))
+                } else {
+                    Some((TAG_REPORT, -1))
+                }
+            } else {
+                // applytype.py:262-284: value-constraint check.
+                get_target_type_values_tag(
+                    type_arg,
+                    values,
+                    skip_unsatisfied,
+                    same_type_ok,
+                    value_subtypes,
+                    narrow_matrix,
+                )
+            }
+        }
+        _ => None, // Not a TypeVarLike: defer (Python asserts otherwise).
+    }
+}
+
+/// Value-constraint branch of the `get_target_type` decision
+/// (applytype.py:262-284).
+fn get_target_type_values_tag(
+    type_arg: &Type,
+    values: &[Type],
+    skip_unsatisfied: bool,
+    same_type_ok: Option<bool>,
+    value_subtypes: Option<&[bool]>,
+    narrow_matrix: Option<&[bool]>,
+) -> Option<(i64, i64)> {
+    // applytype.py:264-265: AnyType passes through.
+    if matches!(type_arg, Type::AnyType { .. }) {
+        return Some((TAG_PASSTHROUGH, -1));
+    }
+    // applytype.py:266-270: a TypeVarType argument whose every value is a
+    // legal value of the tvar passes through (shim-computed conjunction).
+    if let Type::TypeVarType {
+        values: p_values, ..
+    } = type_arg
+    {
+        if !p_values.is_empty() && same_type_ok? {
+            return Some((TAG_PASSTHROUGH, -1));
+        }
+    }
+    // applytype.py:271-281: value matching + narrowest-match selection.
+    let subs = value_subtypes?;
+    let matching: Vec<usize> = (0..values.len())
+        .filter(|&i| subs.get(i) == Some(&true))
+        .collect();
+    if matching.is_empty() {
+        // applytype.py:282-284: no match.
+        if skip_unsatisfied {
+            return Some((TAG_SKIP, -1));
+        }
+        return Some((TAG_REPORT, -1));
+    }
+    let mut best = matching[0];
+    if matching.len() > 1 {
+        let matrix = narrow_matrix?;
+        let n = values.len();
+        for &m in &matching[1..] {
+            // Python: `if is_subtype(match, best): best = match` — the
+            // matrix is row-major with the left operand as the row index.
+            if matrix.get(m * n + best) == Some(&true) {
+                best = m;
+            }
+        }
+    }
+    Some((TAG_MATCH, best as i64))
+}
+
+// ---------------------------------------------------------------------------
 // has_no_typevars
 // ---------------------------------------------------------------------------
 
@@ -814,6 +971,377 @@ mod tests {
             }
             _ => panic!("expected Instance"),
         }
+    }
+
+    // --- get_target_type standalone decision head (issue #1081) ---
+
+    fn make_constrained_typevar(values: Vec<Type>) -> Type {
+        Type::TypeVarType {
+            name: "T".to_string(),
+            fullname: "mod.T".to_string(),
+            raw_id: 1,
+            namespace: "ns".to_string(),
+            values,
+            upper_bound: Box::new(make_instance("builtins.object", vec![])),
+            default: Box::new(make_omitted_any()),
+            variance: 0,
+            meta_level: 0,
+        }
+    }
+
+    fn make_self_typevar() -> Type {
+        Type::TypeVarType {
+            name: "Self".to_string(),
+            fullname: "mod.Self".to_string(),
+            raw_id: 1,
+            namespace: "ns".to_string(),
+            values: vec![],
+            upper_bound: Box::new(make_instance("builtins.object", vec![])),
+            default: Box::new(make_omitted_any()),
+            variance: 0,
+            meta_level: 0,
+        }
+    }
+
+    fn tags(
+        tvar: &Type,
+        type_arg: &Type,
+        skip: bool,
+        same_type_ok: Option<bool>,
+        bound_ok: Option<bool>,
+        subs: Option<Vec<bool>>,
+        matrix: Option<Vec<bool>>,
+    ) -> Option<(i64, i64)> {
+        get_target_type_tag(
+            tvar,
+            type_arg,
+            skip,
+            same_type_ok,
+            bound_ok,
+            subs.as_deref(),
+            matrix.as_deref(),
+        )
+    }
+
+    #[test]
+    fn test_tag_ambiguous_default_expands() {
+        let tvar = make_typevar_with_default(1, "ns", make_instance("builtins.int", vec![]));
+        assert_eq!(
+            tags(&tvar, &make_amb_uninhabited(), true, None, None, None, None),
+            Some((TAG_EXPAND_DEFAULT, -1))
+        );
+    }
+
+    #[test]
+    fn test_tag_ambiguous_no_default_falls_through() {
+        let tvar = make_typevar_with_default(1, "ns", make_omitted_any());
+        // Falls through to the unconstrained bound check; bound decided.
+        assert_eq!(
+            tags(
+                &tvar,
+                &make_amb_uninhabited(),
+                true,
+                None,
+                Some(true),
+                None,
+                None
+            ),
+            Some((TAG_PASSTHROUGH, -1))
+        );
+    }
+
+    #[test]
+    fn test_tag_param_spec_passthrough() {
+        let ps = Type::ParamSpecType {
+            prefix: Box::new(crate::wire::Parameters {
+                arg_types: vec![],
+                arg_kinds: vec![],
+                arg_names: vec![],
+                variables: vec![],
+                imprecise_arg_kinds: false,
+            }),
+            name: "P".to_string(),
+            fullname: "mod.P".to_string(),
+            raw_id: 2,
+            namespace: "ns".to_string(),
+            flavor: PARAM_SPEC_FLAVOR_BARE,
+            upper_bound: Box::new(make_instance("builtins.object", vec![])),
+            default: Box::new(make_omitted_any()),
+        };
+        assert_eq!(
+            tags(
+                &ps,
+                &make_instance("builtins.int", vec![]),
+                true,
+                None,
+                None,
+                None,
+                None
+            ),
+            Some((TAG_PASSTHROUGH, -1))
+        );
+    }
+
+    #[test]
+    fn test_tag_tvt_passthrough() {
+        let tvt = Type::TypeVarTupleType {
+            tuple_fallback: Box::new(make_instance("builtins.tuple", vec![])),
+            name: "Ts".to_string(),
+            fullname: "mod.Ts".to_string(),
+            raw_id: 3,
+            namespace: "ns".to_string(),
+            upper_bound: Box::new(make_instance("builtins.object", vec![])),
+            default: Box::new(make_omitted_any()),
+            min_len: 0,
+        };
+        assert_eq!(
+            tags(
+                &tvt,
+                &make_instance("builtins.int", vec![]),
+                true,
+                None,
+                None,
+                None,
+                None
+            ),
+            Some((TAG_PASSTHROUGH, -1))
+        );
+    }
+
+    #[test]
+    fn test_tag_constrained_any_passthrough() {
+        let tvar = make_constrained_typevar(vec![
+            make_instance("builtins.int", vec![]),
+            make_instance("builtins.str", vec![]),
+        ]);
+        assert_eq!(
+            tags(&tvar, &make_any(), true, None, None, None, None),
+            Some((TAG_PASSTHROUGH, -1))
+        );
+    }
+
+    #[test]
+    fn test_tag_constrained_same_type_ok() {
+        let tv_arg = Type::TypeVarType {
+            name: "T1".to_string(),
+            fullname: "mod.T1".to_string(),
+            raw_id: 2,
+            namespace: "ns".to_string(),
+            values: vec![make_instance("builtins.int", vec![])],
+            upper_bound: Box::new(make_instance("builtins.object", vec![])),
+            default: Box::new(make_omitted_any()),
+            variance: 0,
+            meta_level: 0,
+        };
+        let tvar = make_constrained_typevar(vec![make_instance("builtins.int", vec![])]);
+        assert_eq!(
+            tags(&tvar, &tv_arg, true, Some(true), None, None, None),
+            Some((TAG_PASSTHROUGH, -1))
+        );
+    }
+
+    #[test]
+    fn test_tag_constrained_same_type_false_falls_to_matching() {
+        let tv_arg = Type::TypeVarType {
+            name: "T1".to_string(),
+            fullname: "mod.T1".to_string(),
+            raw_id: 2,
+            namespace: "ns".to_string(),
+            values: vec![make_instance("builtins.str", vec![])],
+            upper_bound: Box::new(make_instance("builtins.object", vec![])),
+            default: Box::new(make_omitted_any()),
+            variance: 0,
+            meta_level: 0,
+        };
+        let tvar = make_constrained_typevar(vec![make_instance("builtins.int", vec![])]);
+        assert_eq!(
+            tags(
+                &tvar,
+                &tv_arg,
+                true,
+                Some(false),
+                None,
+                Some(vec![true]),
+                None
+            ),
+            Some((TAG_MATCH, 0))
+        );
+    }
+
+    #[test]
+    fn test_tag_single_match() {
+        let tvar = make_constrained_typevar(vec![
+            make_instance("builtins.int", vec![]),
+            make_instance("builtins.str", vec![]),
+        ]);
+        assert_eq!(
+            tags(
+                &tvar,
+                &make_instance("builtins.str", vec![]),
+                true,
+                None,
+                None,
+                Some(vec![false, true]),
+                None
+            ),
+            Some((TAG_MATCH, 1))
+        );
+    }
+
+    #[test]
+    fn test_tag_narrowest_match_selection() {
+        // Both values match; value 1 (str) is narrower than value 0
+        // (object), so the narrowing matrix picks index 1.
+        let tvar = make_constrained_typevar(vec![
+            make_instance("builtins.object", vec![]),
+            make_instance("builtins.str", vec![]),
+        ]);
+        assert_eq!(
+            tags(
+                &tvar,
+                &make_instance("builtins.str", vec![]),
+                true,
+                None,
+                None,
+                Some(vec![true, true]),
+                Some(vec![false, false, true, false])
+            ),
+            Some((TAG_MATCH, 1))
+        );
+    }
+
+    #[test]
+    fn test_tag_no_match_skip_vs_report() {
+        let tvar = make_constrained_typevar(vec![make_instance("builtins.str", vec![])]);
+        assert_eq!(
+            tags(
+                &tvar,
+                &make_instance("builtins.int", vec![]),
+                true,
+                None,
+                None,
+                Some(vec![false]),
+                None
+            ),
+            Some((TAG_SKIP, -1))
+        );
+        assert_eq!(
+            tags(
+                &tvar,
+                &make_instance("builtins.int", vec![]),
+                false,
+                None,
+                None,
+                Some(vec![false]),
+                None
+            ),
+            Some((TAG_REPORT, -1))
+        );
+    }
+
+    #[test]
+    fn test_tag_unconstrained_bound_outcomes() {
+        let tvar = make_typevar(1, "ns");
+        assert_eq!(
+            tags(
+                &tvar,
+                &make_instance("builtins.int", vec![]),
+                true,
+                None,
+                Some(true),
+                None,
+                None
+            ),
+            Some((TAG_PASSTHROUGH, -1))
+        );
+        assert_eq!(
+            tags(
+                &tvar,
+                &make_instance("builtins.int", vec![]),
+                true,
+                None,
+                Some(false),
+                None,
+                None
+            ),
+            Some((TAG_SKIP, -1))
+        );
+        assert_eq!(
+            tags(
+                &tvar,
+                &make_instance("builtins.int", vec![]),
+                false,
+                None,
+                Some(false),
+                None,
+                None
+            ),
+            Some((TAG_REPORT, -1))
+        );
+    }
+
+    #[test]
+    fn test_tag_unconstrained_missing_bound_defers() {
+        let tvar = make_typevar(1, "ns");
+        assert_eq!(
+            tags(
+                &tvar,
+                &make_instance("builtins.int", vec![]),
+                true,
+                None,
+                None,
+                None,
+                None
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn test_tag_alias_defers() {
+        let tvar = make_typevar(1, "ns");
+        let alias = Type::TypeAliasType {
+            args: vec![],
+            type_ref: "mod.Alias".to_string(),
+        };
+        assert_eq!(
+            tags(&tvar, &alias, true, None, Some(true), None, None),
+            None
+        );
+    }
+
+    #[test]
+    fn test_tag_non_typevar_defers() {
+        let inst = make_instance("builtins.int", vec![]);
+        assert_eq!(
+            tags(
+                &inst,
+                &make_instance("builtins.int", vec![]),
+                true,
+                None,
+                Some(true),
+                None,
+                None
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn test_tag_matching_missing_facts_defer() {
+        let tvar = make_constrained_typevar(vec![make_instance("builtins.int", vec![])]);
+        assert_eq!(
+            tags(
+                &tvar,
+                &make_instance("builtins.int", vec![]),
+                true,
+                None,
+                None,
+                None,
+                None
+            ),
+            None
+        );
     }
 
     // --- get_target_type ambiguous-UninhabitedType (issue #913) ---

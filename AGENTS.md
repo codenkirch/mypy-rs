@@ -1861,3 +1861,21 @@ directly to `main`.
   `mypy/test/testtypes.py` (gate-off vs gate-on differential plus
   direct seam calls), plus pure fold unit tests in `checkmember.rs`.
 
+- `rust_get_target_type` (issue #1081) — mirrors the branch-selection head
+  of `mypy.applytype.get_target_type` (applytype.py:244-296): Rust owns the
+  tag arbitration (EXPAND_DEFAULT for an ambiguous UninhabitedType with a
+  real tvar default, PASSTHROUGH for ParamSpec/TypeVarTuple/Any/cross-product
+  /bound-ok, MATCH with the narrowest-match index over the value list, SKIP,
+  REPORT) from wire `tvar` + `type` bytes; the Python shim computes the
+  resolver-backed booleans (the is_same_type cross-product conjunction, the
+  per-value is_subtype fold, the lazy narrowest-match matrix, and the bound
+  check after applying the Self erase_typevars) and passes them in, then
+  applies the side effects (`expand_type`, `report_incompatible_typevar_value`)
+  and returns live types, so the result Type never crosses the seam. Defers
+  (`None`) on undecodable wire bytes, a TypeAliasType argument (the proper
+  -type expansion needs the live alias), or a missing fact for the branch
+  Rust reaches. Gated by `_native_applytype_active` (existing wiring, no
+  build.py change) and covered by `NativeGetTargetTypeSuite` in
+  `mypy/test/testtypes.py` (gate-off vs gate-on differential plus direct
+  seam calls for every tag), plus pure decision unit tests in
+  `applytype.rs`.
