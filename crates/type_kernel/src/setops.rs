@@ -1476,6 +1476,7 @@ fn meet_parameters_pair(
         arg_names: t_p.arg_names.clone(),
         variables: t_p.variables.clone(),
         imprecise_arg_kinds: t_p.imprecise_arg_kinds,
+        is_ellipsis_args: t_p.is_ellipsis_args,
     });
     let mut wbuf = WriteBuffer::new();
     wire::write_type(&mut wbuf, &result).ok()?;
@@ -3009,6 +3010,7 @@ fn visit_join(
                     arg_names: new_names,
                     variables: t_p.variables.clone(),
                     imprecise_arg_kinds: t_p.imprecise_arg_kinds,
+                    is_ellipsis_args: t_p.is_ellipsis_args,
                 });
                 let mut wbuf = WriteBuffer::new();
                 wire::write_type(&mut wbuf, &result).ok()?;
@@ -7042,6 +7044,7 @@ mod tests {
                 arg_names: vec![],
                 variables: vec![],
                 imprecise_arg_kinds: false,
+                is_ellipsis_args: false,
             }),
             name: "P".to_string(),
             fullname: "P".to_string(),
@@ -7060,6 +7063,7 @@ mod tests {
             arg_names: vec![None; arg_types.len()],
             variables: vec![],
             imprecise_arg_kinds: false,
+            is_ellipsis_args: false,
             arg_types,
             arg_kinds,
         })

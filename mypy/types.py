@@ -69,11 +69,11 @@ from mypy.cache import (
 )
 from mypy.nodes import (
     ARG_KINDS,
+    ARG_NAMED,
+    ARG_NAMED_OPT,
     ARG_POS,
     ARG_STAR,
     ARG_STAR2,
-    ARG_NAMED,
-    ARG_NAMED_OPT,
     INVARIANT,
     ArgKind,
     SymbolNode,
@@ -2279,6 +2279,9 @@ class Parameters(ProperType):
         write_str_opt_list(data, self.arg_names)
         write_type_list(data, self.variables)
         write_bool(data, self.imprecise_arg_kinds)
+        # Written last so the Rust wire reader stays in lockstep; a stale
+        # extension fails the END_TAG assert and defers to Python.
+        write_bool(data, self.is_ellipsis_args)
         write_tag(data, END_TAG)
 
     @classmethod
@@ -2291,6 +2294,7 @@ class Parameters(ProperType):
             read_str_opt_list(data),
             variables=read_type_var_likes(data),
             imprecise_arg_kinds=read_bool(data),
+            is_ellipsis_args=read_bool(data),
         )
         assert read_tag(data) == END_TAG
         return ret
@@ -4520,19 +4524,20 @@ class HasTypeVars(BoolTypeQuery):
 try:
     from librt.internal import ReadBuffer as _ReadBuffer, WriteBuffer as _VisitorWriteBuffer
     from type_kernel import (
-        rust_callable_with_ellipsis as _rust_callable_with_ellipsis,
-        rust_can_be_false_default as _rust_can_be_false_default,
-        rust_can_be_false_default_live as _rust_can_be_false_default_live,
-        rust_can_be_true_default as _rust_can_be_true_default,
-        rust_can_be_true_default_live as _rust_can_be_true_default_live,
+        rust_callable_argument_by_name as _rust_callable_argument_by_name,
+        rust_callable_argument_by_position as _rust_callable_argument_by_position,
+        rust_callable_formal_arguments as _rust_callable_formal_arguments,
         rust_callable_is_generic as _rust_callable_is_generic,
         rust_callable_is_kw_arg as _rust_callable_is_kw_arg,
         rust_callable_is_var_arg as _rust_callable_is_var_arg,
         rust_callable_max_possible_positional_args as _rust_callable_max_possible_positional_args,
         rust_callable_min_args as _rust_callable_min_args,
-        rust_callable_formal_arguments as _rust_callable_formal_arguments,
-        rust_callable_argument_by_name as _rust_callable_argument_by_name,
-        rust_callable_argument_by_position as _rust_callable_argument_by_position,
+        rust_callable_with_ellipsis as _rust_callable_with_ellipsis,
+        rust_can_be_false_default as _rust_can_be_false_default,
+        rust_can_be_false_default_live as _rust_can_be_false_default_live,
+        rust_can_be_true_default as _rust_can_be_true_default,
+        rust_can_be_true_default_live as _rust_can_be_true_default_live,
+        rust_copy_modified as _rust_copy_modified,
         rust_copy_type as _rust_copy_type,
         rust_find_unpack_in_list as _rust_find_unpack_in_list,
         rust_flatten_nested_tuples as _rust_flatten_nested_tuples,
@@ -4541,7 +4546,6 @@ try:
         rust_has_type_vars as _rust_has_type_vars,
         rust_is_literal_type as _rust_is_literal_type,
         rust_is_unannotated_any as _rust_is_unannotated_any,
-        rust_copy_modified as _rust_copy_modified,
         rust_remove_dups as _rust_remove_dups,
         rust_split_with_prefix_and_suffix as _rust_split_with_prefix_and_suffix,
         rust_tuple_length as _rust_tuple_length,

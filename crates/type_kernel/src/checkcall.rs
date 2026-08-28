@@ -2326,6 +2326,7 @@ mod tests {
                 arg_names: Vec::new(),
                 variables: Vec::new(),
                 imprecise_arg_kinds: false,
+                is_ellipsis_args: false,
             }),
         }
     }

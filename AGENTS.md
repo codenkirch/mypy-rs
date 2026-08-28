@@ -246,6 +246,17 @@ including:
   `str(t)`. Not wired into any production path; used by
   `NativeTypeWireSuite` to prove the Rust `Type` enum + reader
   reconstructs the same type. Foundation for Stage 3c (`is_subtype`).
+- Wire-format invariants (keep Python `read_type`/`*.write` and
+  `crates/type_kernel/src/wire.rs` in lockstep; a stale `.so` fails the
+  END_TAG assert and defers to Python):
+  - `Parameters` carries `is_ellipsis_args` (written last before
+    END_TAG on both sides, issue #1115). Because `Parameters.write`/
+    `read` are shared with the persistent meta-cache format, this
+    change bumped `CACHE_VERSION` in `mypy/cache.py`.
+  - The wire `Type` carries NO line/column. Wire-decoded nodes come
+    back with `line == -1`; seams whose consumers key on positions
+    re-stamp from the live input (the typeanal seam does this via
+    `_WirePositionStamper` in `mypy/typeanal.py`, issue #1115).
 - `get_type_triggers` (M28) — mirrors
   `mypy.server.deps.TypeTriggersVisitor` in `crates/type_kernel/src/
   serverdeps.rs`; the `DependencyVisitor` AST walk stays in Python.

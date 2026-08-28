@@ -5,7 +5,7 @@ from __future__ import annotations
 import itertools
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from contextlib import contextmanager
-from typing import Any, Final, Protocol, TypeVar
+from typing import Any, Final, Protocol, TypeVar, cast
 
 from mypy import errorcodes as codes, message_registry, nodes
 from mypy.errorcodes import ErrorCode
@@ -3977,7 +3977,14 @@ def native_analyze_type(
         payload = _serialize_typeanal_type(t)
         result = _rust_type_analyze(payload, allow_tuple_literal, allow_param_spec_literals, allow_unpack)
         if result is not None:
-            return _typeanal_decode(result)
+            decoded = _typeanal_decode(result)
+            if decoded is not None:
+                # The wire format drops line/column; decoded nodes would
+                # report no location in semanal-time errors. Stamp the
+                # live input's position onto every decoded node.
+                if t.line >= 0:
+                    decoded = decoded.accept(_WirePositionStamper(t.line, t.column))
+                return decoded
     except (AssertionError, NotImplementedError):
         pass
     return None
@@ -3990,6 +3997,118 @@ def _serialize_typeanal_type(t: Type) -> bytes:
     buf = _TypeanalWriteBuffer()
     t.write(buf)
     return buf.getvalue()
+
+
+class _WirePositionStamper(TrivialSyntheticTypeTranslator):
+    """Re-stamp source positions onto a wire-decoded type tree.
+
+    The wire Type format carries no line/column, so every decoded node
+    comes back with line == -1, and error reporting that keys on
+    ``node.line < 0`` (e.g. semanal_typeargs context selection) would
+    drop the location. Nodes whose line is already set are live objects
+    re-linked during fixup and are left untouched.
+    """
+
+    def __init__(self, line: int, column: int) -> None:
+        super().__init__()
+        self._line = line
+        self._column = column
+
+    def _fix(self, new: Type) -> Type:
+        if new.line < 0:
+            new.line = self._line
+            new.column = self._column
+        return new
+
+    def visit_any(self, t: AnyType, /) -> Type:
+        return self._fix(t)
+
+    def visit_none_type(self, t: NoneType, /) -> Type:
+        return self._fix(t)
+
+    def visit_uninhabited_type(self, t: UninhabitedType, /) -> Type:
+        return self._fix(t)
+
+    def visit_erased_type(self, t: ErasedType, /) -> Type:
+        return self._fix(t)
+
+    def visit_deleted_type(self, t: DeletedType, /) -> Type:
+        return self._fix(t)
+
+    def visit_instance(self, t: Instance, /) -> Type:
+        result = get_proper_type(super().visit_instance(t))
+        if isinstance(result, Instance) and result.extra_attrs is not None:
+            extra = result.extra_attrs.copy()
+            extra.attrs = {k: v.accept(self) for k, v in extra.attrs.items()}
+            result.extra_attrs = extra
+        return self._fix(result)
+
+    def visit_type_var(self, t: TypeVarType, /) -> Type:
+        t.upper_bound = t.upper_bound.accept(self)
+        t.values = [v.accept(self) for v in t.values]
+        t.default = t.default.accept(self)
+        return self._fix(t)
+
+    def visit_param_spec(self, t: ParamSpecType, /) -> Type:
+        t.upper_bound = t.upper_bound.accept(self)
+        t.default = t.default.accept(self)
+        prefix = t.prefix.accept(self)
+        assert isinstance(prefix, Parameters)
+        t.prefix = prefix
+        return self._fix(t)
+
+    def visit_type_var_tuple(self, t: TypeVarTupleType, /) -> Type:
+        t.tuple_fallback = t.tuple_fallback.accept(self)  # type: ignore[assignment]
+        t.upper_bound = t.upper_bound.accept(self)
+        t.default = t.default.accept(self)
+        return self._fix(t)
+
+    def visit_partial_type(self, t: PartialType, /) -> Type:
+        return self._fix(t)
+
+    def visit_unbound_type(self, t: UnboundType, /) -> Type:
+        return self._fix(t)
+
+    def visit_unpack_type(self, t: UnpackType, /) -> Type:
+        return self._fix(super().visit_unpack_type(t))
+
+    def visit_callable_type(self, t: CallableType, /) -> Type:
+        result = get_proper_type(super().visit_callable_type(t))
+        if not isinstance(result, CallableType):
+            return self._fix(result)
+        result.variables = tuple(
+            cast(TypeVarLikeType, v.accept(self)) for v in result.variables
+        )
+        if result.type_guard is not None:
+            result.type_guard = result.type_guard.accept(self)
+        if result.type_is is not None:
+            result.type_is = result.type_is.accept(self)
+        return self._fix(result)
+
+    def visit_tuple_type(self, t: TupleType, /) -> Type:
+        return self._fix(super().visit_tuple_type(t))
+
+    def visit_typeddict_type(self, t: TypedDictType, /) -> Type:
+        return self._fix(super().visit_typeddict_type(t))
+
+    def visit_literal_type(self, t: LiteralType, /) -> Type:
+        return self._fix(super().visit_literal_type(t))
+
+    def visit_union_type(self, t: UnionType, /) -> Type:
+        return self._fix(super().visit_union_type(t))
+
+    def visit_overloaded(self, t: Overloaded, /) -> Type:
+        return self._fix(super().visit_overloaded(t))
+
+    def visit_type_type(self, t: TypeType, /) -> Type:
+        return self._fix(super().visit_type_type(t))
+
+    def visit_parameters(self, t: Parameters, /) -> Type:
+        return self._fix(super().visit_parameters(t))
+
+    def visit_type_alias_type(self, t: TypeAliasType, /) -> Type:
+        t.args = [arg.accept(self) for arg in t.args]
+        return self._fix(t)
 
 
 def _typeanal_decode(result: bytes) -> Type | None:

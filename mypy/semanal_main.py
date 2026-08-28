@@ -216,6 +216,10 @@ def process_top_levels(graph: Graph, scc: list[str], patches: Patches) -> None:
             any_progress = any_progress or progress
             if not incomplete:
                 state.manager.incomplete_namespaces.discard(next_id)
+                # Top-level done: publish this module's TypeInfos and
+                # aliases to the wirefixup maps so remaining semanal of
+                # the SCC can resolve cross-module decodes (issue #1115).
+                state.manager._install_semal_wirefixup(next_id)
         if final_iteration:
             assert not all_deferred, "Must not defer during final iteration"
         # Reverse to process the targets in the same order on every iteration. This avoids
