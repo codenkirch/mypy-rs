@@ -886,6 +886,14 @@ pub(crate) fn rust_analyze_instance_member_access(
 /// Non-trivial-instance-method tail of `analyze_instance_member_access`
 /// (checkmember.py:717-731): receiver-validated bind + map + expand in one
 /// wire call. Defers (None) when any step needs Python's object semantics.
+///
+/// `allow_subclass_receiver`: the `find_member` protocol path (issue #1121)
+/// looks members up on subclass receivers; `map_instance_to_supertype`
+/// already maps the receiver to the defining class and `bind_self`'s
+/// non-generic strip is receiver-independent, so the equality guard can
+/// be dropped there. The `analyze_instance_member_access` dispatch keeps
+/// the exact-class guard (Python's `check_self_arg` + generic `bind_self`
+/// handle subclass receivers with error emission).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn member_method_inner(
     instance: &Type,
@@ -896,6 +904,7 @@ pub(crate) fn member_method_inner(
     resolver: &TypeResolver,
     strict_optional: bool,
     is_class: bool,
+    allow_subclass_receiver: bool,
 ) -> Option<Type> {
     // Class methods: bind_self's non-generic strip path is
     // is_classmethod-agnostic, so the same strip is valid here; the
@@ -920,16 +929,16 @@ pub(crate) fn member_method_inner(
             return None;
         }
     };
-    // The seam fires only when the receiver is the exact class the method
-    // is defined on (the same-class guard). A subclass / union receiver
-    // defers so Python's `check_self_arg` + generic `bind_self` handle it.
+    // Same-class guard, unless the caller handles subclass receivers
+    // (protocol lookup re-maps the receiver to `method_fullname`; the
+    // non-generic bind strip ignores it). Union receivers defer.
     let self_ref = match self_type {
         Type::Instance { type_ref, .. } => type_ref.as_str(),
         _ => {
             return None;
         }
     };
-    if self_ref != method_fullname {
+    if !allow_subclass_receiver && self_ref != method_fullname {
         return None;
     }
     // checkmember.py:769 `check_self_arg(signature, mx.self_type, ...)`:
@@ -1042,6 +1051,7 @@ pub(crate) fn rust_analyze_member_method(
         resolver.resolver(),
         strict_optional,
         is_class,
+        false,
     )?;
     encode_type(&result)
 }
@@ -1348,6 +1358,7 @@ fn dispatch_instance_member_inner(
             resolver.resolver(),
             strict_optional,
             is_class,
+            false,
         )
     }
 }
@@ -4696,6 +4707,7 @@ mod tests {
             &resolver,
             true,
             false, // is_class
+            false, // allow_subclass_receiver (unit tests)
         );
         match result {
             Some(Type::CallableType { is_bound, .. }) => assert!(is_bound),
@@ -4731,6 +4743,7 @@ mod tests {
             &resolver,
             true,
             false, // is_class
+            false, // allow_subclass_receiver (unit tests)
         );
         assert!(result.is_none(), "incompatible self must defer");
     }
@@ -4747,7 +4760,8 @@ mod tests {
             "foo",
             &resolver,
             true,
-            true, // is_class
+            true,  // is_class
+            false, // allow_subclass_receiver (unit tests)
         );
         assert!(result.is_none(), "classmethod must defer");
     }

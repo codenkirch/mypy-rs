@@ -162,6 +162,29 @@ fn live_plugin_registry_absent(py: Python<'_>) -> bool {
         .unwrap_or(false)
 }
 
+/// Does a live plugin hook `fullname`? Mirrors `ChainedPlugin._find_hook`
+/// over `_native_plugin_hook_plugins`; a hit defers to Python, an
+/// all-None miss is the parity answer (None when the snapshot is missing).
+fn plugin_get_attribute_hook_hits(py: Python<'_>, fullname: &str) -> Option<bool> {
+    let plugins = py
+        .import("mypy.checkexpr")
+        .ok()?
+        .getattr("_native_plugin_hook_plugins")
+        .ok()?;
+    if plugins.is_none() {
+        return None;
+    }
+    for item in plugins.iter().ok()? {
+        let plugin = item.ok()?;
+        let hook_fn = plugin.getattr("get_attribute_hook").ok()?;
+        let hook = hook_fn.call1((fullname,)).ok()?;
+        if !hook.is_none() {
+            return Some(true);
+        }
+    }
+    Some(false)
+}
+
 /// `get_proper_type` for the wire format. Expands `TypeAliasType` by
 /// returning `None` (defer) since the wire format has no alias target.
 /// For all other types, returns the type as-is (they are already proper).
@@ -1074,16 +1097,15 @@ pub(crate) fn get_protocol_member_inner(
                     return Some(GetProtocolMemberResult::Defer);
                 }
             };
-            // method_fullname must be the receiver's type_ref.
+            // Member may be inherited (subclass receiver); Python maps the
+            // receiver to `method.info` before expanding, so pass
+            // allow_subclass_receiver (issue #1121).
             let method_fullname = match get_opt_str_attr(sym_info, "fullname") {
                 Some(f) => f,
                 None => {
                     return Some(GetProtocolMemberResult::Defer);
                 }
             };
-            if method_fullname != *type_ref {
-                return Some(GetProtocolMemberResult::Defer);
-            }
             let strict_optional = live_strict_optional(py);
             let result = crate::checkmember::member_method_inner(
                 left,
@@ -1094,6 +1116,7 @@ pub(crate) fn get_protocol_member_inner(
                 resolver,
                 strict_optional,
                 false, // is_class
+                true,  // allow_subclass_receiver
             );
             match result {
                 Some(t) => Some(GetProtocolMemberResult::Found(t)),
@@ -1101,9 +1124,128 @@ pub(crate) fn get_protocol_member_inner(
             }
         }
         "Decorator" => {
-            // Decorator member access needs the full find_node_type path
-            // (property unwrapping, decorator chain). Defer to Python.
-            Some(GetProtocolMemberResult::Defer)
+            // Decorators unwrap to `.var` (checkmember.py:1204-1211) and
+            // the callable binds/maps/expands like a method; properties
+            // bind too, static methods defer (no self bind, issue #1121).
+            let var = match node_ref.getattr("var") {
+                Ok(v) => v,
+                Err(_) => {
+                    return Some(GetProtocolMemberResult::Defer);
+                }
+            };
+            // is_staticmethod: analyze_var binds only when
+            // `not var.is_staticmethod`; member_method_inner's strip
+            // would wrongly drop a static signature's first real arg.
+            if get_bool_flag(py, var, "is_staticmethod") == Some(true) {
+                return Some(GetProtocolMemberResult::Defer);
+            }
+            // is_ready: a not-ready var type defers (Python's
+            // not_ready_callback).
+            if get_bool_flag(py, var, "is_ready") != Some(true) {
+                return Some(GetProtocolMemberResult::Defer);
+            }
+            // is_initialized_in_class: analyze_var computes call_type (and
+            // binds) only when the var is initialized in class scope; a
+            // False defers to the pure-Python no-bind path.
+            if get_bool_flag(py, var, "is_initialized_in_class") != Some(true) {
+                return Some(GetProtocolMemberResult::Defer);
+            }
+            // var.info.self_type: expand_self_type (checkmember.py:1737)
+            // needs the Var; defer on a Self-typed member (same guard as
+            // live_var_plain).
+            let var_info = match var.getattr("info") {
+                Ok(i) => i,
+                Err(_) => {
+                    return Some(GetProtocolMemberResult::Defer);
+                }
+            };
+            let self_type_none = match var_info.getattr("self_type") {
+                Ok(s) => s.is_none(),
+                Err(_) => false,
+            };
+            if !self_type_none {
+                return Some(GetProtocolMemberResult::Defer);
+            }
+            let var_type_obj = match var.getattr("type") {
+                Ok(t) => t,
+                Err(_) => {
+                    return Some(GetProtocolMemberResult::Defer);
+                }
+            };
+            if var_type_obj.is_none() {
+                return Some(GetProtocolMemberResult::Defer);
+            }
+            let signature = match serialize_type_to_bytes(py, var_type_obj) {
+                Some(bytes) => match decode_type(&bytes) {
+                    Some(t) => t,
+                    None => {
+                        return Some(GetProtocolMemberResult::Defer);
+                    }
+                },
+                None => {
+                    return Some(GetProtocolMemberResult::Defer);
+                }
+            };
+            let method_fullname = match get_opt_str_attr(var_info, "fullname") {
+                Some(f) => f,
+                None => {
+                    return Some(GetProtocolMemberResult::Defer);
+                }
+            };
+            // Attribute-hook resolution (checkmember.py:1821-1830 +
+            // ChainedPlugin._find_hook): a hit would transform the
+            // member result, so Rust defers; all-None is the answer.
+
+            // `_native_plugin_hook_plugins` is None when not installed.
+            let hook_fullname = format!("{method_fullname}.{member}");
+            match plugin_get_attribute_hook_hits(py, &hook_fullname) {
+                Some(true) => {
+                    return Some(GetProtocolMemberResult::Defer);
+                }
+                Some(false) => {}
+                None => {
+                    return Some(GetProtocolMemberResult::Defer);
+                }
+            }
+            let is_classmethod = get_bool_flag(py, var, "is_classmethod") == Some(true);
+            let is_property = get_bool_flag(py, var, "is_property") == Some(true);
+            let strict_optional = live_strict_optional(py);
+            match crate::checkmember::member_method_inner(
+                left,
+                &signature,
+                &method_fullname,
+                left,
+                member,
+                resolver,
+                strict_optional,
+                is_classmethod,
+                true, // allow_subclass_receiver
+            ) {
+                Some(t) => {
+                    // A property getter yields the getter return type,
+                    // not the bound callable (checkmember.py:1966-1982);
+                    // callable member types stay as-is.
+                    let result = if is_property {
+                        let item = match t {
+                            Type::Overloaded { items } => match items.first() {
+                                Some(i) => (*i).clone(),
+                                None => {
+                                    return Some(GetProtocolMemberResult::Defer);
+                                }
+                            },
+                            t => t,
+                        };
+                        let Type::CallableType { ret_type, .. } = item else {
+                            return Some(GetProtocolMemberResult::Defer);
+                        };
+                        (*ret_type).clone()
+                    } else {
+                        t
+                    };
+                    Some(GetProtocolMemberResult::Found(result))
+                }
+                None => Some(GetProtocolMemberResult::Defer),
+            }
         }
         "Var" => {
             // find_node_type (subtypes.py:2117-2160) Var path ->
@@ -1530,6 +1672,7 @@ pub(crate) fn find_member_call_is_plain_callable(
                 resolver.resolver(),
                 live_strict_optional(py),
                 false, // is_class
+                false, // allow_subclass_receiver
             )?;
             Some(matches!(
                 result,
