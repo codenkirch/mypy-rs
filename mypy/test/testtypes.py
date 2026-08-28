@@ -5074,6 +5074,356 @@ class NativeTypeObjectTypeSuite(Suite):
 
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeTypeObjectArbitrationSuite(Suite):
+    """Parity for the Rust `type_object_type` arbitration head (#1059).
+
+    `typeops.type_object_type` (typeops.py:350-461) takes its type from
+    whichever of `__init__`/`__new__` is first in the MRO (preferring
+    `__init__` on a tie, with a universal-callable arm for object +
+    fallback_to_any), applies the tuple `special_sig` fixup, and writes
+    the cache only when allowed and strict_optional is on. The Rust seam
+    reads the live `TypeInfo` and returns
+    `(tag, is_new, special_sig, uncached, method)`; Python keeps the
+    error Any, the universal-callable construction, fallback
+    construction, and the already-native
+    `type_object_type_from_function` tail. Direct seam calls assert the
+    exact tag for every branch; gate-off vs gate-on runs must produce
+    identical results and identical cache writes.
+    """
+
+    def setUp(self) -> None:
+        from mypy.typeops import _set_native_typeops_active, _set_native_typeops_resolver
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        self.fx = TypeFixture()
+        self._type_infos = []
+        for name in dir(self.fx):
+            if not name.endswith("i"):
+                continue
+            value = getattr(self.fx, name)
+            if _is_type_info(value):
+                self._type_infos.append(value)
+        self._resolver = _type_kernel.build_native_resolver(self._type_infos, [])
+        set_wire_typeinfo_map({info.fullname: info for info in self._type_infos})
+        self._set_active = _set_native_typeops_active
+        self._set_resolver = _set_native_typeops_resolver
+        self._set_active(True)
+        self._set_resolver(self._resolver)
+
+    def tearDown(self) -> None:
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        self._set_active(False)
+        self._set_resolver(None)
+        set_wire_typeinfo_map(None)
+
+    def _with_gate(self, active: bool, fn: Callable[[], T]) -> T:
+        self._set_active(active)
+        try:
+            return fn()
+        finally:
+            self._set_active(True)
+
+    def _func_def(self, name: str, defining: TypeInfo) -> FuncDef:
+        from mypy.nodes import Block
+
+        fd = FuncDef(name, [], Block([]))
+        fd.info = defining
+        return fd
+
+    def _add_method(
+        self, owner: TypeInfo, name: str, defining: TypeInfo | None = None
+    ) -> FuncDef:
+        # A bare `def name(self)` owned by `defining` (defaults to owner),
+        # installed in owner's symbol table.
+        fd = self._func_def(name, defining or owner)
+        owner.names[name] = SymbolTableNode(MDEF, fd)
+        return fd
+
+    def _cls(self, name: str, mro: list[TypeInfo] | None = None) -> TypeInfo:
+        info = self.fx.make_type_info(name, mro=mro)
+        # A metaclass fallback avoids the stdlib typeinfo lookup, which
+        # needs modules_state content unit tests do not populate.
+        info.metaclass_type = Instance(self.fx.type_typei, [])
+        return info
+
+    def _with_cache_allowed(self, fn: Callable[[], T]) -> T:
+        # type_object_type reads checker_state.type_checker to decide
+        # whether the constructor cache may be used.
+        from mypy.checker_state import checker_state
+
+        saved = checker_state.type_checker
+        checker_state.type_checker = SimpleNamespace(allow_constructor_cache=True)  # type: ignore[assignment]
+        try:
+            return fn()
+        finally:
+            checker_state.type_checker = saved
+
+    def _type_object(self, info: TypeInfo) -> ProperType:
+        from mypy.typeops import type_object_type
+
+        return type_object_type(info)
+
+    def _assert_par(self, info: TypeInfo, cache: bool = False) -> ProperType:
+        def run() -> ProperType:
+            info.type_object_type = None
+            return self._with_cache_allowed(lambda: self._type_object(info))
+
+        off = self._with_gate(False, run)
+        on = self._with_gate(True, run)
+        assert_equal(str(on), str(off), f"type_object_type parity {info.fullname}")
+        if cache:
+            cached_off = info.type_object_type
+            off2 = self._with_gate(False, run)
+            on2 = self._with_gate(True, run)
+            assert_equal(str(on2), str(off2), f"cached parity {info.fullname}")
+            assert_equal(str(on2), str(cached_off), f"cache stable {info.fullname}")
+        return on
+
+    # -- direct seam tests (all 5 tags + deferral) --
+
+    def test_seam_own_init_tie(self) -> None:
+        from mypy.typeops import NATIVE_TYPE_OBJECT_INIT
+
+        a = self._cls("mod.A", mro=[self.fx.oi])
+        fd = self._add_method(a, "__init__")
+        self._add_method(a, "__new__")
+        result = _type_kernel.rust_classify_type_object_type(a)
+        assert result is not None, "Rust arbitration did not engage"
+        tag, is_new, special_sig, uncached, method = result
+        assert tag == NATIVE_TYPE_OBJECT_INIT, f"{tag}"
+        assert is_new is False
+        assert special_sig is False
+        assert uncached is False
+        assert method is fd
+
+    def test_seam_new_wins_by_mro(self) -> None:
+        from mypy.typeops import NATIVE_TYPE_OBJECT_NEW
+
+        # class B(A): __new__ defined here, __init__ inherited from A.
+        a = self._cls("mod.A", mro=[self.fx.oi])
+        b = self._cls("mod.B", mro=[a, self.fx.oi])
+        self._add_method(a, "__init__")
+        fd_new = self._add_method(b, "__new__")
+        result = _type_kernel.rust_classify_type_object_type(b)
+        assert result is not None
+        tag, is_new, _, _, method = result
+        assert tag == NATIVE_TYPE_OBJECT_NEW, f"{tag}"
+        assert is_new is True
+        assert method is fd_new
+
+    def test_seam_init_wins_by_mro(self) -> None:
+        from mypy.typeops import NATIVE_TYPE_OBJECT_INIT
+
+        # class B(A): __init__ defined here, __new__ inherited from A.
+        a = self._cls("mod.A", mro=[self.fx.oi])
+        b = self._cls("mod.B", mro=[a, self.fx.oi])
+        fd_init = self._add_method(b, "__init__")
+        self._add_method(a, "__new__")
+        result = _type_kernel.rust_classify_type_object_type(b)
+        assert result is not None
+        tag, is_new, _, _, method = result
+        assert tag == NATIVE_TYPE_OBJECT_INIT, f"{tag}"
+        assert is_new is False
+        assert method is fd_init
+
+    def test_seam_missing_init(self) -> None:
+        from mypy.typeops import NATIVE_TYPE_OBJECT_ERROR_INIT
+
+        a = self._cls("mod.NoInit", mro=[self.fx.oi])
+        result = _type_kernel.rust_classify_type_object_type(a)
+        assert result is not None
+        tag, _, _, _, method = result
+        assert tag == NATIVE_TYPE_OBJECT_ERROR_INIT, f"{tag}"
+        assert method is None
+
+    def test_seam_invalid_init(self) -> None:
+        from mypy.typeops import NATIVE_TYPE_OBJECT_ERROR_INIT
+
+        a = self._cls("mod.BadInit", mro=[self.fx.oi])
+        a.names["__init__"] = SymbolTableNode(MDEF, Var("__init__"))
+        result = _type_kernel.rust_classify_type_object_type(a)
+        assert result is not None
+        assert result[0] == NATIVE_TYPE_OBJECT_ERROR_INIT
+
+    def test_seam_missing_new_copies_init(self) -> None:
+        from mypy.typeops import NATIVE_TYPE_OBJECT_INIT
+
+        # Test-stub case: no `__new__` anywhere in the MRO; init is used.
+        a = self._cls("mod.NoNew", mro=[self.fx.oi])
+        fd = self._add_method(a, "__init__")
+        result = _type_kernel.rust_classify_type_object_type(a)
+        assert result is not None
+        tag, is_new, _, _, method = result
+        assert tag == NATIVE_TYPE_OBJECT_INIT, f"{tag}"
+        assert is_new is False
+        assert method is fd
+
+    def test_seam_tie_any(self) -> None:
+        from mypy.typeops import NATIVE_TYPE_OBJECT_TIE_ANY
+
+        # Both __init__ and __new__ resolve to object's own methods and
+        # the class falls back to Any: the universal-callable arm.
+        self._add_method(self.fx.oi, "__init__", self.fx.oi)
+        try:
+            a = self._cls("mod.AnyBase", mro=[self.fx.oi])
+            a.fallback_to_any = True
+            result = _type_kernel.rust_classify_type_object_type(a)
+            assert result is not None
+            tag, is_new, _, _, method = result
+            assert tag == NATIVE_TYPE_OBJECT_TIE_ANY, f"{tag}"
+            assert is_new is False
+            assert method is None
+        finally:
+            del self.fx.oi.names["__init__"]
+
+    def test_seam_special_sig(self) -> None:
+        from mypy.typeops import NATIVE_TYPE_OBJECT_INIT
+
+        # A class inheriting tuple's constructor gets special_sig="tuple".
+        self._add_method(self.fx.std_tuplei, "__init__")
+        try:
+            sub = self._cls("mod.SubTuple", mro=[self.fx.std_tuplei, self.fx.oi])
+            result = _type_kernel.rust_classify_type_object_type(sub)
+            assert result is not None
+            tag, _, special_sig, _, _ = result
+            assert tag == NATIVE_TYPE_OBJECT_INIT
+            assert special_sig is True
+            # tuple itself skips the fixup (micro-optimization parity).
+            result = _type_kernel.rust_classify_type_object_type(self.fx.std_tuplei)
+            assert result is not None
+            assert result[2] is False
+        finally:
+            del self.fx.std_tuplei.names["__init__"]
+
+    def test_seam_uncached_overloaded(self) -> None:
+        # An untyped OverloadedFuncDef __init__ disables the cache write.
+        from mypy.nodes import OverloadedFuncDef
+
+        a = self._cls("mod.Over", mro=[self.fx.oi])
+        ofd = OverloadedFuncDef([self._func_def("__init__", a)])
+        ofd.info = a  # semanal sets this; the FakeInfo default defers
+        a.names["__init__"] = SymbolTableNode(MDEF, ofd)
+        a.names["__new__"] = SymbolTableNode(MDEF, self._func_def("__new__", a))
+        result = _type_kernel.rust_classify_type_object_type(a)
+        assert result is not None
+        assert result[3] is True, f"expected uncached: {result}"
+
+    def test_seam_defers_on_plain_object(self) -> None:
+        assert _type_kernel.rust_classify_type_object_type(object()) is None
+
+    # -- gate off/on differential tests --
+
+    def test_par_own_init(self) -> None:
+        a = self._cls("mod.A", mro=[self.fx.oi])
+        self._add_method(a, "__init__")
+        self._add_method(a, "__new__")
+        result = self._assert_par(a, cache=True)
+        result = cast(CallableType, result)
+        assert result.ret_type == Instance(a, [])
+        assert result.special_sig is None
+
+    def test_par_new_by_mro(self) -> None:
+        a = self._cls("mod.A", mro=[self.fx.oi])
+        b = self._cls("mod.B", mro=[a, self.fx.oi])
+        self._add_method(a, "__init__")
+        self._add_method(b, "__new__")
+        result = self._assert_par(b, cache=True)
+        result = cast(CallableType, result)
+        assert result.ret_type == Instance(b, [])
+
+    def test_par_error_init(self) -> None:
+        a = self._cls("mod.BadInit", mro=[self.fx.oi])
+        a.names["__init__"] = SymbolTableNode(MDEF, Var("__init__"))
+        result = self._assert_par(a)
+        assert isinstance(result, AnyType)
+        assert result.type_of_any == TypeOfAny.from_error
+
+    def test_par_missing_new(self) -> None:
+        a = self._cls("mod.NoNew", mro=[self.fx.oi])
+        self._add_method(a, "__init__")
+        result = self._assert_par(a, cache=True)
+        result = cast(CallableType, result)
+        assert result.ret_type == Instance(a, [])
+
+    def test_par_tie_any(self) -> None:
+        from mypy.types import instance_cache
+
+        self._add_method(self.fx.oi, "__init__", self.fx.oi)
+        saved_function = instance_cache.function_type
+        instance_cache.function_type = Instance(self.fx.functioni, [])
+        try:
+            a = self._cls("mod.AnyBase", mro=[self.fx.oi])
+            a.fallback_to_any = True
+            # metaclass fallback avoids the stdlib typeinfo lookup, which
+            # needs modules_state content unit tests do not populate.
+            a.metaclass_type = Instance(self.fx.type_typei, [])
+            result = self._assert_par(a)
+            result = cast(CallableType, result)
+            assert result.ret_type == Instance(a, [])
+            assert result.arg_kinds == [ARG_STAR, ARG_STAR2]
+        finally:
+            instance_cache.function_type = saved_function
+            del self.fx.oi.names["__init__"]
+
+    def test_par_special_sig(self) -> None:
+        self._add_method(self.fx.std_tuplei, "__init__")
+        self.fx.std_tuplei.metaclass_type = Instance(self.fx.type_typei, [])
+        try:
+            sub = self._cls("mod.SubTuple", mro=[self.fx.std_tuplei, self.fx.oi])
+            result = self._assert_par(sub, cache=True)
+            result = cast(CallableType, result)
+            assert result.special_sig == "tuple"
+            # tuple itself: same constructor, no special_sig.
+            result = self._assert_par(self.fx.std_tuplei, cache=True)
+            result = cast(CallableType, result)
+            assert result.special_sig is None
+        finally:
+            del self.fx.std_tuplei.names["__init__"]
+
+    def test_par_uncached_overload_not_cached(self) -> None:
+        from mypy.nodes import OverloadedFuncDef
+
+        a = self._cls("mod.Over", mro=[self.fx.oi])
+        ofd = OverloadedFuncDef([self._func_def("__init__", a)])
+        ofd.info = a  # semanal sets this; the FakeInfo default defers
+        a.names["__init__"] = SymbolTableNode(MDEF, ofd)
+        a.names["__new__"] = SymbolTableNode(MDEF, self._func_def("__new__", a))
+
+        def run() -> ProperType:
+            a.type_object_type = None
+            return self._with_cache_allowed(lambda: self._type_object(a))
+
+        off = self._with_gate(False, run)
+        on = self._with_gate(True, run)
+        assert_equal(str(on), str(off), f"uncached parity {a.fullname}")
+        # The overloaded result is computed but never written to the cache.
+        assert a.type_object_type is None, "uncached result must not be cached"
+
+        # A typed FuncDef __init__ under the same allowance is cached.
+        a2 = self._cls("mod.Cached", mro=[self.fx.oi])
+        self._add_method(a2, "__init__")
+        self._add_method(a2, "__new__")
+        self._with_gate(True, lambda: self._with_cache_allowed(lambda: self._type_object(a2)))
+        assert a2.type_object_type is not None, "typed result must be cached"
+
+    def test_par_cache_hit_roundtrip(self) -> None:
+        a = self._cls("mod.A", mro=[self.fx.oi])
+        self._add_method(a, "__init__")
+        self._add_method(a, "__new__")
+        cached = CallableType(
+            [], [], [], Instance(a, []), self.fx.type_type, name="cached"
+        )
+        a.type_object_type = cached
+
+        def run() -> ProperType:
+            return self._with_cache_allowed(lambda: self._type_object(a))
+
+        assert self._with_gate(False, run) is cached
+        assert self._with_gate(True, run) is cached
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeCoerceLiteralSingletonSuite(Suite):
     """Parity for the Rust `coerce_to_literal` + singleton pair
     (mypy.typeops.coerce_to_literal / is_singleton_identity_type /
