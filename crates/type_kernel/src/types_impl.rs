@@ -329,24 +329,49 @@ fn can_be_any_bool_for(
     Some((decided, instance))
 }
 
+/// Chain-resolve an alias target to the first non-alias type, mirroring
+/// `get_proper_type`'s while loop (types.py:4056). `expanded_alias_target`
+/// already walks snapshot chains internally; the one exit that can still
+/// yield a `TypeAliasType` is a `no_args` snapshot whose frozen target is
+/// itself an alias, so feed the result back in until it lands on a
+/// non-alias type. `None` defers: missing snapshot, alias cycle, or a
+/// substitution the kernel cannot perform exactly.
+fn chain_resolve_alias_target(
+    typ: &Type,
+    aliases: &crate::aliases::TypeAliasResolver,
+) -> Option<Type> {
+    let mut current = typ.clone();
+    // Guards mutual recursion across no_args aliases (A -> B, B -> A):
+    // the per-call `seen` inside expanded_alias_target cannot see it.
+    let mut seen: Vec<String> = Vec::new();
+    loop {
+        let (target, _, _) = expanded_alias_target(&current, aliases)?;
+        if !matches!(target, Type::TypeAliasType { .. }) {
+            return Some(target);
+        }
+        let type_ref = match &target {
+            Type::TypeAliasType { type_ref, .. } => type_ref.clone(),
+            _ => return Some(target),
+        };
+        if seen.contains(&type_ref) {
+            return None;
+        }
+        seen.push(type_ref);
+        current = target;
+    }
+}
+
 /// Resolve a fallback blob: a `TypeAliasType` is expanded through the
 /// frozen alias snapshots; everything else must decode to an `Instance`.
 /// Returns `None` to defer (missing alias snapshot, unreadable target,
-/// nested alias, or non-instance fallback).
+/// unresolvable alias chain, or non-instance fallback).
 fn resolve_fallback(py: Python<'_>, bytes: &[u8], resolver: &NativeTypeResolver) -> Option<Type> {
     let decoded = decode_type(bytes)?;
-    if matches!(decoded, Type::TypeAliasType { .. }) {
-        let aliases = resolver.alias_resolver();
-        let (target, _, _) = expanded_alias_target(&decoded, aliases)?;
-        if matches!(target, Type::TypeAliasType { .. }) {
-            // Only a top-level TypeAliasType fallback is supported; a
-            // still-alias target needs validity checks -> defer.
-            return None;
-        }
-        let _ = py;
-        return Some(target);
+    if !matches!(decoded, Type::TypeAliasType { .. }) {
+        return decode_instance(bytes);
     }
-    decode_instance(bytes)
+    let _ = py;
+    chain_resolve_alias_target(&decoded, resolver.alias_resolver())
 }
 
 /// Resolver-backed `mypy.types.Type.can_be_true_default` (types.py:360-364).
@@ -424,18 +449,14 @@ fn can_be_true_live(py: Python<'_>, typ: &Type, resolver: &NativeTypeResolver) -
 /// `TypeAliasType.can_be_true/false_default`: delegate to
 /// `self.alias.target` (types.py:476-484), chain-resolving the frozen
 /// alias target. `None` (defer) on a missing alias snapshot, an unreadable
-/// target, or a target that is itself an unresolved TypeAliasType.
+/// target, or an unresolvable alias chain.
 fn alias_can_be(
     py: Python<'_>,
     typ: &Type,
     is_true: bool,
     resolver: &NativeTypeResolver,
 ) -> Option<bool> {
-    let aliases = resolver.alias_resolver();
-    let (target, _, _) = expanded_alias_target(typ, aliases)?;
-    if matches!(target, Type::TypeAliasType { .. }) {
-        return None;
-    }
+    let target = chain_resolve_alias_target(typ, resolver.alias_resolver())?;
     if is_true {
         can_be_true_live(py, &target, resolver)
     } else {
@@ -1475,5 +1496,128 @@ mod tests {
         let bytes = encode(&t);
         assert_eq!(tuple_length_inner(&decode_type(&bytes).unwrap()), None);
         assert_eq!(union_length_inner(&decode_type(&bytes).unwrap()), None);
+    }
+
+    // -------------------------------------------------------------------
+    // chain_resolve_alias_target (issue #1134)
+    // -------------------------------------------------------------------
+
+    fn make_instance(type_ref: &str) -> Type {
+        Type::Instance {
+            type_ref: type_ref.to_string(),
+            args: vec![],
+            last_known_value: None,
+            extra_attrs: None,
+        }
+    }
+
+    /// Serialized target bytes for an alias node pointing at `inner_ref`.
+    /// `write_type` refuses `TypeAliasType`, so chain edges are crafted
+    /// by hand (mirrors read_type_alias_type: tag, args, ref, END_TAG).
+    fn alias_target_bytes(inner_ref: &str) -> Vec<u8> {
+        let mut wbuf = WriteBuffer::new();
+        crate::wire::write_tag(&mut wbuf, crate::wire::TYPE_ALIAS_TYPE);
+        crate::wire::write_type_list(&mut wbuf, &[]).expect("empty args encode");
+        crate::wire::write_str(&mut wbuf, inner_ref).expect("ref encodes");
+        crate::wire::write_tag(&mut wbuf, crate::wire::END_TAG);
+        wbuf.into_bytes()
+    }
+
+    fn insert_edge(
+        aliases: &mut crate::aliases::TypeAliasResolver,
+        fullname: &str,
+        target: Vec<u8>,
+        no_args: bool,
+    ) {
+        aliases.insert(
+            fullname.to_string(),
+            crate::aliases::TypeAliasSnapshot {
+                fullname: fullname.to_string(),
+                target,
+                no_args,
+                ..Default::default()
+            },
+        );
+    }
+
+    #[test]
+    fn test_chain_resolve_a_b_int() {
+        // A = B, B = int: the snapshot chain must land on the Instance.
+        let mut aliases = crate::aliases::TypeAliasResolver::new();
+        insert_edge(&mut aliases, "mod.A", alias_target_bytes("mod.B"), false);
+        insert_edge(
+            &mut aliases,
+            "mod.B",
+            encode(&make_instance("builtins.int")),
+            false,
+        );
+        let a = Type::TypeAliasType {
+            type_ref: "mod.A".to_string(),
+            args: vec![],
+        };
+        assert_eq!(
+            chain_resolve_alias_target(&a, &aliases),
+            Some(make_instance("builtins.int"))
+        );
+    }
+
+    #[test]
+    fn test_chain_resolve_missing_mid_snapshot_defers() {
+        // A = B but B has no snapshot: defer, do not guess.
+        let mut aliases = crate::aliases::TypeAliasResolver::new();
+        insert_edge(&mut aliases, "mod.A", alias_target_bytes("mod.B"), false);
+        let a = Type::TypeAliasType {
+            type_ref: "mod.A".to_string(),
+            args: vec![],
+        };
+        assert_eq!(chain_resolve_alias_target(&a, &aliases), None);
+    }
+
+    #[test]
+    fn test_chain_resolve_recursive_alias_defers() {
+        // A = A: the cycle guard must defer, not loop.
+        let mut aliases = crate::aliases::TypeAliasResolver::new();
+        insert_edge(&mut aliases, "mod.A", alias_target_bytes("mod.A"), false);
+        let a = Type::TypeAliasType {
+            type_ref: "mod.A".to_string(),
+            args: vec![],
+        };
+        assert_eq!(chain_resolve_alias_target(&a, &aliases), None);
+    }
+
+    #[test]
+    fn test_chain_resolve_no_args_alias_chain() {
+        // A (no_args) -> B (no_args) -> int: previously the still-alias
+        // intermediate deferred; the chain loop must ride past it.
+        let mut aliases = crate::aliases::TypeAliasResolver::new();
+        insert_edge(&mut aliases, "mod.A", alias_target_bytes("mod.B"), true);
+        insert_edge(
+            &mut aliases,
+            "mod.B",
+            encode(&make_instance("builtins.int")),
+            true,
+        );
+        let a = Type::TypeAliasType {
+            type_ref: "mod.A".to_string(),
+            args: vec![],
+        };
+        assert_eq!(
+            chain_resolve_alias_target(&a, &aliases),
+            Some(make_instance("builtins.int"))
+        );
+    }
+
+    #[test]
+    fn test_chain_resolve_no_args_mutual_cycle_defers() {
+        // A (no_args) -> B, B (no_args) -> A: mutual recursion through
+        // no_args snapshots must defer, not loop forever.
+        let mut aliases = crate::aliases::TypeAliasResolver::new();
+        insert_edge(&mut aliases, "mod.A", alias_target_bytes("mod.B"), true);
+        insert_edge(&mut aliases, "mod.B", alias_target_bytes("mod.A"), true);
+        let a = Type::TypeAliasType {
+            type_ref: "mod.A".to_string(),
+            args: vec![],
+        };
+        assert_eq!(chain_resolve_alias_target(&a, &aliases), None);
     }
 }
