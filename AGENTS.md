@@ -1976,3 +1976,17 @@ directly to `main`.
   `mypy/test/testtypes.py` (gate-off vs gate-on differential plus
   direct seam calls for the miss / accessor / fallback arms and the
   loop-level pre-check regression).
+
+- `rust_get_declaration` / `rust_constant_fold_expr` decided-None protocol
+  (issue #1101) — both seams now return a `(decided, value)` tuple instead
+  of a bare value or None. Rust owns the whole walk, so every call is
+  decided: a foldable/declared answer yields `(true, scalar)`, a genuine
+  no-result (un-foldable expression; non-`RefExpr`, Var without type,
+  `PartialType`, non-Var/TypeInfo node) yields `(true, None)`, and the
+  Python shims return early on `decided` — previously a decided-None
+  re-ran the full pure-Python walk on every call. `(false, None)` is
+  reserved for a future deferral and currently unreachable; exceptions
+  still propagate (binder keeps its `except Exception` fall-through,
+  constant_fold keeps propagating). Covered by `NativeDecidedNoneSuite`
+  in `mypy/test/testtypes.py` (direct seam decided-None calls plus
+  gate-off vs gate-on parity).

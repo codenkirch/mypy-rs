@@ -44,11 +44,19 @@ use crate::refs::is_instance;
 ///     return None
 /// ```
 ///
-/// Returns the type as a Python object, or Python `None` when there is no
-/// declaration (non-`RefExpr`, `Var` without an inferred/declared type yet,
-/// a `PartialType`, or a non-`Var`/`TypeInfo` node).
+/// Returns a `(decided, value)` wire answer (Issue #1101): `decided` is
+/// true for every path this port handles, including the genuine
+/// no-declaration answers (non-`RefExpr`, `Var` without an inferred/declared
+/// type yet, a `PartialType`, or a non-`Var`/`TypeInfo` node) — those come
+/// back as `(true, None)` so the Python caller skips its walk. The port
+/// mirrors the whole Python walk, so `(false, None)` (defer) is currently
+/// unreachable; an exception still propagates and the caller falls back.
 #[pyfunction]
-pub fn rust_get_declaration(py: Python<'_>, expr: &PyAny) -> PyResult<PyObject> {
+pub fn rust_get_declaration(py: Python<'_>, expr: &PyAny) -> PyResult<(bool, PyObject)> {
+    Ok((true, get_declaration_inner(py, expr)?))
+}
+
+fn get_declaration_inner(py: Python<'_>, expr: &PyAny) -> PyResult<PyObject> {
     let nodes_mod = py.import("mypy.nodes")?;
     let ref_expr_cls: &PyType = nodes_mod.getattr("RefExpr")?.downcast()?;
     if !expr.is_instance(ref_expr_cls)? {
