@@ -42502,6 +42502,182 @@ class NativeComparisonNarrowingSuite(Suite):
 
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeNarrowIdentityEqualitySuite(Suite):
+    """Parity for the identity/equality narrowing seam (#387, #1126).
+
+    `TypeChecker.narrow_type_by_identity_equality` (checker.py:8963) hands
+    each non-custom-__eq__ operand pair to
+    `_try_native_narrow_type_by_identity_equality`, which calls
+    `rust_narrow_type_by_identity_equality` for `is` / `is not` / `==` /
+    `!=`. Rust runs the caller's fallback pre-step (coerce_to_literal +
+    try_expanding_sum_type_to_union) and the single-range
+    `conditional_types(..., from_equality=True)` call through the
+    cond_types::conditional_types_inner port, deferring (None) on anything
+    it cannot decide (aliases, generic erasure, structural subtypes); the
+    Python shim falls back to the pure-Python body then.
+
+    Direct seam calls assert engagement per operator and the deferral
+    shapes; the gate-off vs gate-on differential drives the real method on
+    a TypeChecker stub (options only: the method needs no other checker
+    state for NameExpr operands) and asserts identical typemaps.
+    """
+
+    def setUp(self) -> None:
+        from mypy.checker import _set_native_checker_resolver, _set_native_checker_stmts_active
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        self.fx = TypeFixture()
+        self._enum_info = self.fx.make_type_info("mod.Color")
+        self._enum_info.is_enum = True
+        # enum_members is computed from names: one Var member with an
+        # explicit value makes this a single-member enum.
+        from mypy.nodes import GDEF, SymbolTableNode, Var
+
+        var = Var("RED", Instance(self._enum_info, []))
+        var.has_explicit_value = True
+        self._enum_info.names["RED"] = SymbolTableNode(GDEF, var)
+        # _base_infos skips str_type_info (its attr name ends in "o");
+        # include it so builtins.str snapshots resolve.
+        self._infos = [self._enum_info, self.fx.str_type_info] + _base_infos(self.fx)
+        self._resolver = _type_kernel.build_native_resolver(self._infos, [])
+        # Enum/instance member reads go live through this map
+        # (coerce_to_literal, expand_for_target).
+        self._resolver.set_live_typeinfo_map({i.fullname: i for i in self._infos})
+        _set_native_checker_resolver(self._resolver)
+        self._set_active = _set_native_checker_stmts_active
+        self._set_active(True)
+        set_wire_typeinfo_map({i.fullname: i for i in self._infos})
+
+    def tearDown(self) -> None:
+        from mypy.checker import _set_native_checker_resolver, _set_native_checker_stmts_active
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        _set_native_checker_stmts_active(False)
+        _set_native_checker_resolver(None)
+        set_wire_typeinfo_map(None)
+
+    def _with_gate(self, active: bool, fn: Callable[[], T]) -> T:
+        self._set_active(active)
+        try:
+            return fn()
+        finally:
+            self._set_active(True)
+
+    def _operands(self) -> list[Any]:
+        from mypy.nodes import NameExpr
+
+        return [NameExpr("x"), NameExpr("y")]
+
+    def _run(self, operator: str, operand_types: list[Type]) -> Any:
+        from mypy.checker import TypeChecker
+
+        operands = self._operands()
+
+        def run_one() -> Any:
+            chk = TypeChecker.__new__(TypeChecker)
+            chk.options = Options()
+            return chk.narrow_type_by_identity_equality(
+                operator, operands, operand_types, [0, 1], {0, 1}
+            )
+
+        off = self._with_gate(False, run_one)
+        on = self._with_gate(True, run_one)
+        return off, on
+
+    def _seam(self, a: Type, b: Type, operator: str) -> Any:
+        from mypy.checker import _serialize_type_for_checker
+
+        return _type_kernel.rust_narrow_type_by_identity_equality(
+            _serialize_type_for_checker(a),
+            _serialize_type_for_checker(b),
+            operator,
+            True,
+            self._resolver,
+        )
+
+    def _assert_par(
+        self, operator: str, operand_types: list[Type], note: str, defers: bool = False
+    ) -> None:
+        off, on = self._run(operator, operand_types)
+        assert on == off, f"narrow parity {operator} {note}: off={off!r} on={on!r}"
+        # Engagement: the differential must not silently compare two
+        # identical pure-Python runs. Alias/unsupported-operator cases
+        # assert the deferral directly instead.
+        result = self._seam(operand_types[0], operand_types[1], operator)
+        if defers:
+            assert result is None, f"seam expected defer ({operator} {note}): {result!r}"
+        else:
+            assert result is not None, f"seam did not engage ({operator} {note})"
+
+    # --- direct seam calls ---
+
+    def test_seam_all_operators_engage(self) -> None:
+        fx = self.fx
+        union = UnionType.make_union([fx.a, fx.nonet])
+        for op in ("is", "is not", "==", "!="):
+            assert self._seam(union, fx.a, op) is not None, op
+
+    def test_seam_unsupported_operator_defers(self) -> None:
+        fx = self.fx
+        assert self._seam(fx.a, fx.a, "<") is None
+
+    def test_seam_alias_defers(self) -> None:
+        from mypy.nodes import TypeAlias
+
+        fx = self.fx
+        alias = TypeAliasType(TypeAlias(Instance(fx.ai, []), "mod.AAlias", "mod", -1, -1), [])
+        for op in ("is", "=="):
+            assert self._seam(alias, fx.a, op) is None, op
+
+    def test_seam_single_member_enum_coerces(self) -> None:
+        # The #1126 port: a single-member enum target coerces to
+        # Literal["RED"] live (enum_members read via PyO3), so `x is y`
+        # narrows x to the literal instead of the enum instance.
+        enum = Instance(self._enum_info, [])
+        for op in ("is", "is not", "==", "!="):
+            assert self._seam(enum, enum, op) is not None, op
+
+    # --- gate-off vs gate-on differentials ---
+
+    def test_parity_equality_optional_against_base(self) -> None:
+        fx = self.fx
+        self._assert_par("==", [UnionType.make_union([fx.a, fx.nonet]), fx.a], "A | None == A")
+
+    def test_parity_not_equality_optional_against_base(self) -> None:
+        fx = self.fx
+        self._assert_par("!=", [UnionType.make_union([fx.a, fx.nonet]), fx.a], "A | None != A")
+
+    def test_parity_identity_optional_against_base(self) -> None:
+        fx = self.fx
+        union = UnionType.make_union([fx.a, fx.nonet])
+        self._assert_par("is", [union, fx.a], "A | None is A")
+        self._assert_par("is not", [union, fx.a], "A | None is not A")
+
+    def test_parity_equality_wider_target(self) -> None:
+        fx = self.fx
+        self._assert_par("==", [fx.str_type, fx.o], "str == object")
+
+    def test_parity_equality_none_target(self) -> None:
+        fx = self.fx
+        self._assert_par("==", [fx.a, fx.nonet], "A == None")
+
+    def test_parity_identity_literal_target(self) -> None:
+        fx = self.fx
+        self._assert_par("is", [UnionType.make_union([fx.a, fx.nonet]), fx.lit1_inst], "literal")
+
+    def test_parity_identity_single_member_enum(self) -> None:
+        enum = Instance(self._enum_info, [])
+        self._assert_par("is", [enum, enum], "Color is Color")
+
+    def test_parity_equality_alias_defers(self) -> None:
+        from mypy.nodes import TypeAlias
+
+        fx = self.fx
+        alias = TypeAliasType(TypeAlias(Instance(fx.ai, []), "mod.AAlias", "mod", -1, -1), [])
+        self._assert_par("==", [alias, fx.a], "alias operand", defers=True)
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeCheckAssignmentHeadSuite(Suite):
     """Parity for `rust_classify_check_assignment` (issue #1090).
 

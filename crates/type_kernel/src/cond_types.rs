@@ -25,9 +25,12 @@ use crate::wire::{self, LiteralValue, ReadBuffer, Type, WriteBuffer};
 // Wire helpers
 // ---------------------------------------------------------------------------
 
-struct WireRange {
-    item: Type,
-    is_upper_bound: bool,
+/// One decoded `TypeRange`. Fields are read by
+/// checker_stmts::rust_narrow_type_by_identity_equality (#1126), which
+/// narrows against a single lower-bound range.
+pub(crate) struct WireRange {
+    pub(crate) item: Type,
+    pub(crate) is_upper_bound: bool,
 }
 
 fn decode_type(bytes: &[u8]) -> Option<Type> {
@@ -98,7 +101,9 @@ fn make_union(items: &[Type]) -> Type {
 /// snapshot's `enum_members` can go stale for nonmember members). Defers
 /// (`None`) when the live read fails, a recursive alias appears inside a
 /// union rebuild, or the target span needs a live read the map cannot give.
-fn expand_for_target<'py>(
+///
+/// Also used by checker_stmts::rust_narrow_type_by_identity_equality (#1126).
+pub(crate) fn expand_for_target<'py>(
     typ: &Type,
     target_fullname: Option<&str>,
     strict_optional: bool,
@@ -233,7 +238,7 @@ fn unwrap_newtype(t: &Type, resolver: &TypeResolver) -> Option<Type> {
 ///
 /// Returns `Some((yes, no))` on success, `None` to defer to Python.
 #[allow(clippy::too_many_arguments)]
-fn conditional_types_inner(
+pub(crate) fn conditional_types_inner(
     current: &Type,
     ranges: Option<&[WireRange]>,
     default: Option<&Type>,
