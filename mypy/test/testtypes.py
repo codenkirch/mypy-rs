@@ -43323,7 +43323,7 @@ class NativeFindSelfTypeSuite(Suite):
         self._assert_seam(t, {"Self": "typing.Self"}, True)
 
     def test_seam_raw_expression(self) -> None:
-        from mypy.typeanal import RawExpressionType
+        from mypy.types import RawExpressionType
 
         t = RawExpressionType("nope", "mod", line=1, column=1)
         self._assert_seam(t, {}, False)
@@ -43372,7 +43372,7 @@ class NativeFindSelfTypeSuite(Suite):
         self._assert_par(t, {"Self": "typing.Self"}, True)
 
     def test_parity_raw_expression(self) -> None:
-        from mypy.typeanal import RawExpressionType
+        from mypy.types import RawExpressionType
 
         t = RawExpressionType("nope", "mod", line=1, column=1)
         self._assert_par(t, {}, False)
