@@ -1523,6 +1523,29 @@ including:
   direct seam calls), plus pure decision unit tests in
   `checker_functions.rs`.
 
+- `rust_classify_find_member` (issue #1074) — mirrors the
+  name-resolution prelude of `mypy.subtypes.find_member`
+  (subtypes.py:2025-2047): the `info.get(name)` miss path, the
+  `__getattribute__` / `__getattr__` scan (skipping
+  `builtins.object`), and the `fallback_to_any` /
+  `meta_fallback_to_any` / `extra_attrs` verdicts. Rust reads the live
+  `Instance` and `TypeInfo` via PyO3 (zero wire bytes) and returns a
+  4-way tag (PROCEED / ANY_SPECIAL_FORM / EXTRA_ATTR / NOT_FOUND); the
+  Python shim applies the verdicts (constructing the `AnyType`,
+  fetching `itype.extra_attrs.attrs[name]` so the Type never crosses
+  the seam, or returning None), and PROCEED falls through to the
+  untouched checkmember tail (`MemberContext` +
+  `analyze_class_attribute_access` / `analyze_instance_member_access`).
+  The `type_checker is None` `find_member_simple` fallback stays
+  Python-side and precedes the seam. Defers (`None`) on any unreadable
+  attribute so the pure-Python body re-runs. Gated by
+  `_native_find_member_prelude_active` (`_native_subtype_active` +
+  `_native_subtype_resolver` + `_HAS_TYPE_KERNEL`, wired from
+  `mypy/build.py`) and covered by `NativeFindMemberPreludeSuite` in
+  `mypy/test/testtypes.py` (gate-off vs gate-on differential plus
+  direct seam calls), plus 9 pure decision unit tests in
+  `findmember.rs`.
+
 Stages 1/2 return `None` for any type class Rust does not handle, and
 the Python caller falls back to the pure-Python visitor. This is the
 strangler-fig per-call gate. See "Milestone 3/4/5 (Phase 4)" in
