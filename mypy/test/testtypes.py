@@ -40303,3 +40303,123 @@ class NativeAllSupersGateSuite(Suite):
 
     def test_parity_super_incompatible_breaks(self) -> None:
         self._assert_par(self._lvalue(), super_ok=False)
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeIsWritableAttributeSuite(Suite):
+    """Parity for the Rust `is_writable_attribute` pure-predicate port (#1071).
+
+    `TypeChecker.is_writable_attribute` (checker.py:10167) is a pure bool
+    over a live `Node`: a `Var` is writable unless it is a read-only
+    property; a property `OverloadedFuncDef` is writable when its first
+    item (kept a `Decorator`, mirroring the Python assert) has a settable
+    property var; everything else is not writable. The Rust port
+    (`checker_functions.rs`) reads the live node via PyO3 and returns the
+    bool directly, mirroring `rust_is_final_enum_value`. Direct seam calls
+    assert the exact bool; the gate-off vs gate-on differential drives the
+    real TypeChecker method.
+    """
+
+    def setUp(self) -> None:
+        from mypy.checker import _set_native_checker_active
+
+        self._set_active = _set_native_checker_active
+        self._set_active(True)
+        self.fx = TypeFixture()
+
+    def tearDown(self) -> None:
+        self._set_active(False)
+
+    def _with_gate(self, active: bool, fn: Callable[[], T]) -> T:
+        self._set_active(active)
+        try:
+            return fn()
+        finally:
+            self._set_active(True)
+
+    def _var(
+        self, name: str, is_property: bool = False, is_settable: bool = False
+    ) -> Var:
+        v = Var(name)
+        v.is_property = is_property
+        v.is_settable_property = is_settable
+        return v
+
+    def _decorator(self, name: str, is_settable: bool) -> Decorator:
+        v = Var(name)
+        v.is_property = True
+        v.is_settable_property = is_settable
+        return Decorator(FuncDef(name), [], v)
+
+    def _overloaded(self, is_settable: bool, is_property: bool = True) -> Any:
+        ofd = OverloadedFuncDef([self._decorator("prop", is_settable)])
+        ofd.is_property = is_property
+        return ofd
+
+    def _seam(self, node: Any) -> Any:
+        return _type_kernel.rust_is_writable_attribute(node)
+
+    def _run(self, node: Any) -> tuple[bool, bool]:
+
+        from mypy.checker import TypeChecker
+
+        def check_one() -> bool:
+            chk = TypeChecker.__new__(TypeChecker)
+            return chk.is_writable_attribute(node)
+
+        off = self._with_gate(False, check_one)
+        on = self._with_gate(True, check_one)
+        return off, on
+
+    def _assert_par(self, node: Any) -> None:
+        off, on = self._run(node)
+        assert_equal(on, off, f"is_writable_attribute parity for node={node!r}")
+
+    def test_seam_var_plain(self) -> None:
+        assert self._seam(self._var("attr")) is True
+
+    def test_seam_var_readonly_property(self) -> None:
+        assert self._seam(self._var("prop", is_property=True)) is False
+
+    def test_seam_var_settable_property(self) -> None:
+        assert self._seam(self._var("prop", is_property=True, is_settable=True)) is True
+
+    def test_seam_overloaded_settable(self) -> None:
+        assert self._seam(self._overloaded(is_settable=True)) is True
+
+    def test_seam_overloaded_non_settable(self) -> None:
+        assert self._seam(self._overloaded(is_settable=False)) is False
+
+    def test_seam_overloaded_not_property(self) -> None:
+        assert self._seam(self._overloaded(is_settable=False, is_property=False)) is False
+
+    def test_seam_funcdef(self) -> None:
+        assert self._seam(FuncDef("method")) is False
+
+    def test_seam_non_node(self) -> None:
+        # Anything that is not a Var / property OverloadedFuncDef: False.
+        assert self._seam(self.fx.oi) is False
+
+    def test_parity_var_plain(self) -> None:
+        self._assert_par(self._var("attr"))
+
+    def test_parity_var_readonly_property(self) -> None:
+        self._assert_par(self._var("prop", is_property=True))
+
+    def test_parity_var_settable_property(self) -> None:
+        self._assert_par(self._var("prop", is_property=True, is_settable=True))
+
+    def test_parity_overloaded_settable(self) -> None:
+        self._assert_par(self._overloaded(is_settable=True))
+
+    def test_parity_overloaded_non_settable(self) -> None:
+        self._assert_par(self._overloaded(is_settable=False))
+
+    def test_parity_overloaded_not_property(self) -> None:
+        self._assert_par(self._overloaded(is_settable=False, is_property=False))
+
+    def test_parity_funcdef(self) -> None:
+        self._assert_par(FuncDef("method"))
+
+    def test_parity_non_node(self) -> None:
+        self._assert_par(self.fx.oi)

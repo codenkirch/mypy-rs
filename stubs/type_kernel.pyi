@@ -219,6 +219,7 @@ __all__ = [
     "rust_classify_enum_new",
     "rust_classify_enum_bases",
     "rust_is_final_enum_value",
+    "rust_is_writable_attribute",
     "rust_check_for_untyped_decorator",
     "rust_check_explicit_override_decorator",
     "rust_check_match_args",
@@ -865,6 +866,7 @@ def rust_classify_func_def_override(
 def rust_classify_enum_new(bases: Any) -> list[int] | None: ...
 def rust_classify_enum_bases(bases: Any) -> tuple[int, int] | None: ...
 def rust_is_final_enum_value(sym: SymbolTableNode, is_stub: bool) -> bool: ...
+def rust_is_writable_attribute(node: Any) -> bool | None: ...
 def rust_check_for_untyped_decorator(
     disallow_untyped_decorators: bool,
     func_type_bytes: bytes | None,

@@ -3138,6 +3138,13 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         module
     )?)?;
 
+    // Issue #1071: is_writable_attribute pure bool predicate. Rust reads
+    // the live node via PyO3 and returns the bool directly.
+    module.add_function(wrap_pyfunction!(
+        checker_functions::rust_is_writable_attribute,
+        module
+    )?)?;
+
     // Issue #942: check_for_untyped_decorator conjunction port. Rust folds
     // the disallow/typed-callback/untyped-decorator/not-deferred bool gate on
     // the wire format; the message emission stays in Python.

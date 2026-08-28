@@ -1317,6 +1317,66 @@ pub(crate) fn rust_is_final_enum_value(
     Ok(is_stub || has_explicit_value)
 }
 
+/// Pure decision core of `TypeChecker.is_writable_attribute` (#1071). The
+/// overloaded arm fires only when `overloaded_property_settable` is `Some`
+/// (a property `OverloadedFuncDef` with a readable `Decorator` head).
+fn is_writable_attribute_inner(
+    is_var: bool,
+    is_property: bool,
+    is_settable_property: bool,
+    overloaded_property_settable: Option<bool>,
+) -> bool {
+    if is_var {
+        return !(is_property && !is_settable_property);
+    }
+    overloaded_property_settable.unwrap_or(false)
+}
+
+/// `TypeChecker.is_writable_attribute` (checker.py:10167): a pure bool
+/// predicate over a live `Node`, mirroring `rust_is_final_enum_value`.
+/// Defers (`None`) on a non-`Decorator` overload head (Python asserts) or
+/// an unreadable attribute.
+#[pyfunction]
+pub(crate) fn rust_is_writable_attribute(py: Python<'_>, node: &PyAny) -> PyResult<Option<bool>> {
+    let var_cls = nodes_class(py, "Var")?;
+    if node.is_instance(var_cls)? {
+        let is_property: bool = node.getattr("is_property")?.extract()?;
+        let is_settable_property: bool = node.getattr("is_settable_property")?.extract()?;
+        return Ok(Some(is_writable_attribute_inner(
+            true,
+            is_property,
+            is_settable_property,
+            None,
+        )));
+    }
+    let overloaded_cls = nodes_class(py, "OverloadedFuncDef")?;
+    if node.is_instance(overloaded_cls)? && node.getattr("is_property")?.extract::<bool>()? {
+        let items = node.getattr("items")?;
+        if items.len()? == 0 {
+            // Python would IndexError on items[0]; defer to the pure body.
+            return Ok(None);
+        }
+        let first_item = items.get_item(0)?;
+        let decorator_cls = nodes_class(py, "Decorator")?;
+        if !first_item.is_instance(decorator_cls)? {
+            // Python asserts isinstance(first_item, Decorator); defer so the
+            // assert surfaces through the pure-Python fallback.
+            return Ok(None);
+        }
+        let settable: bool = first_item
+            .getattr("var")?
+            .getattr("is_settable_property")?
+            .extract()?;
+        return Ok(Some(is_writable_attribute_inner(
+            false,
+            false,
+            false,
+            Some(settable),
+        )));
+    }
+    Ok(Some(is_writable_attribute_inner(false, false, false, None)))
+}
+
 /// `TypeChecker.check_for_untyped_decorator` (checker.py:6955-6964): the
 /// bool conjunction `disallow_untyped_decorators and is_typed_callable(func.type)
 /// and is_untyped_decorator(dec_type) and not current_node_deferred`, reduced to
@@ -4929,5 +4989,51 @@ mod all_supers_gate_tests {
             classify_all_supers_base(false, false, false, true),
             ALL_SUPERS_BASE_SKIP
         );
+    }
+
+    fn writable(
+        is_var: bool,
+        is_property: bool,
+        is_settable: bool,
+        overloaded_settable: Option<bool>,
+    ) -> bool {
+        is_writable_attribute_inner(is_var, is_property, is_settable, overloaded_settable)
+    }
+
+    #[test]
+    fn test_var_plain_writable() {
+        assert!(writable(true, false, false, None));
+    }
+
+    #[test]
+    fn test_var_readonly_property_not_writable() {
+        assert!(!writable(true, true, false, None));
+    }
+
+    #[test]
+    fn test_var_settable_property_writable() {
+        assert!(writable(true, true, true, None));
+    }
+
+    #[test]
+    fn test_overloaded_property_settable() {
+        assert!(writable(false, false, false, Some(true)));
+    }
+
+    #[test]
+    fn test_overloaded_property_not_settable() {
+        assert!(!writable(false, false, false, Some(false)));
+    }
+
+    #[test]
+    fn test_non_var_non_overloaded_not_writable() {
+        // FuncDef / any other node kind: all facts false -> not writable.
+        assert!(!writable(false, false, false, None));
+    }
+
+    #[test]
+    fn test_var_flags_ignored_for_non_var() {
+        // Non-var nodes never consult the property flags.
+        assert!(!writable(false, true, true, None));
     }
 }

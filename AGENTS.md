@@ -1508,6 +1508,20 @@ including:
   `NativeCanBeNarrowedWithLenSuite` in `mypy/test/testtypes.py`
   (gate-off vs gate-on differential plus direct seam calls), plus pure
   decision unit tests in `lennarrow.rs`.
+- `rust_is_writable_attribute` (issue #1071) — mirrors
+  `TypeChecker.is_writable_attribute` (checker.py:10167): a pure bool
+  predicate over a live `Node`. A `Var` is writable unless it is a
+  read-only property; a property `OverloadedFuncDef` is writable when
+  its first item (kept a `Decorator`, mirroring the Python assert) has
+  a settable property var; everything else is not writable. Rust reads
+  the live node via PyO3 `is_instance` plus bool attrs, mirroring
+  `rust_is_final_enum_value`; defers (`None`) on a non-`Decorator`
+  overload head (Python asserts through the fallback) or an unreadable
+  attribute. Gated by `_native_checker_active` (existing wiring, no
+  build.py change) and covered by `NativeIsWritableAttributeSuite` in
+  `mypy/test/testtypes.py` (gate-off vs gate-on differential plus
+  direct seam calls), plus pure decision unit tests in
+  `checker_functions.rs`.
 
 Stages 1/2 return `None` for any type class Rust does not handle, and
 the Python caller falls back to the pure-Python visitor. This is the
