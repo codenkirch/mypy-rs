@@ -1955,12 +1955,14 @@ def rust_add_class_tvars(
 # mypy/checkexpr.py — check_argument_count, overload merge, arg similarity,
 # tuple index/slice helpers, int-literal extraction.
 def rust_check_argument_count(
-    callee_bytes: bytes,
-    actual_types_bytes: list[bytes],
+    formal_kinds: list[int],
+    has_param_spec: bool,
+    special_sig: str | None,
     actual_kinds: list[int],
     actual_names: list[str | None],
+    actual_shapes: list[int],
+    actual_item_counts: list[int],
     formal_to_actual: list[list[int]],
-    special_sig: str | None,
     object_type_present: bool,
     callable_name: str | None,
     in_checked_function: bool,
