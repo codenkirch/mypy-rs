@@ -338,6 +338,7 @@ try:
         rust_classify_check_final as _rust_classify_check_final,
         rust_classify_check_lvalue as _rust_classify_check_lvalue,
         rust_classify_classvar_super as _rust_classify_classvar_super,
+        rust_classify_comparison_operands as _rust_classify_comparison_operands,
         rust_classify_enum as _rust_classify_enum,
         rust_classify_enum_bases as _rust_classify_enum_bases,
         rust_classify_enum_new as _rust_classify_enum_new,
@@ -426,6 +427,7 @@ except ImportError:
     _rust_can_be_narrowed_with_len = None  # type: ignore[assignment]
     _rust_check_for_untyped_decorator = None  # type: ignore[assignment]
     _rust_check_overlapping_overloads = None  # type: ignore[assignment]
+    _rust_classify_comparison_operands = None  # type: ignore[assignment]
     _rust_classify_except_handler_tests = None  # type: ignore[assignment]
     _rust_classify_final_super = None  # type: ignore[assignment]
     _rust_classify_classvar_super = None  # type: ignore[assignment]
@@ -8673,34 +8675,82 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
         # types of literal string or enum expressions).
 
         operands = [collapse_walrus(x) for x in node.operands]
-        operand_types = []
         narrowable_operand_index_to_hash = {}
         narrowable_operand_hash_to_index = {}
-        for i, expr in enumerate(operands):
+
+        for expr in operands:
             if not self.has_type(expr):
                 return {}, {}
-            expr_type = self.lookup_type(expr)
-            operand_types.append(expr_type)
+        operand_types = [self.lookup_type(expr) for expr in operands]
 
-            if (
-                literal(expr) == LITERAL_TYPE
-                and not is_literal_none(expr)
-                and not is_literal_not_implemented(expr)
-                and not is_false_literal(expr)
-                and not is_true_literal(expr)
-                and not self.is_literal_enum(expr)
-                # CallableType type objects are usually already maximally specific
-                and not (
-                    isinstance(p_expr := get_proper_type(expr_type), FunctionLike)
-                    and p_expr.is_type_obj()
+        # Native type-kernel seam (#1087): Rust classifies operand
+        # narrowability from wire types plus cheap literal facts; the
+        # literal-hash bookkeeping stays Python-side. None defers below.
+        classified = None
+        if (
+            _CHECKER_HAS_TYPE_KERNEL
+            and _native_checker_active
+            and _native_checker_resolver is not None
+            and _rust_classify_comparison_operands is not None
+        ):
+            try:
+                # Literal facts are computed shim-side; flags for operands
+                # whose kind is not LITERAL_TYPE are placeholders, matching
+                # the original short-circuit evaluation order.
+                kinds = [literal(expr) for expr in operands]
+                operand_flags = []
+                for expr, kind in zip(operands, kinds):
+                    if kind == LITERAL_TYPE:
+                        operand_flags.append(
+                            (
+                                bool(is_literal_none(expr)),
+                                bool(is_literal_not_implemented(expr)),
+                                bool(is_false_literal(expr)),
+                                bool(is_true_literal(expr)),
+                                bool(self.is_literal_enum(expr)),
+                            )
+                        )
+                    else:
+                        operand_flags.append((False,) * 5)
+                classified = _rust_classify_comparison_operands(
+                    kinds,
+                    operand_flags,
+                    [_serialize_type_for_checker(t) for t in operand_types],
+                    _native_checker_resolver,
                 )
-                # This is a little ad hoc, in the absence of intersection types
-                and not (isinstance(p_expr, TypeType) and isinstance(p_expr.item, TypeVarType))
-            ):
-                h = literal_hash(expr)
+            except (AssertionError, NotImplementedError, ValueError):
+                classified = None
+        if classified is not None:
+            for i, narrowable in enumerate(classified):
+                if not narrowable:
+                    continue
+                h = literal_hash(operands[i])
                 if h is not None:
                     narrowable_operand_index_to_hash[i] = h
                     narrowable_operand_hash_to_index[h] = i
+        else:
+            for i, expr in enumerate(operands):
+                expr_type = operand_types[i]
+
+                if (
+                    literal(expr) == LITERAL_TYPE
+                    and not is_literal_none(expr)
+                    and not is_literal_not_implemented(expr)
+                    and not is_false_literal(expr)
+                    and not is_true_literal(expr)
+                    and not self.is_literal_enum(expr)
+                    # CallableType type objects are usually already maximally specific
+                    and not (
+                        isinstance(p_expr := get_proper_type(expr_type), FunctionLike)
+                        and p_expr.is_type_obj()
+                    )
+                    # This is a little ad hoc, in the absence of intersection types
+                    and not (isinstance(p_expr, TypeType) and isinstance(p_expr.item, TypeVarType))
+                ):
+                    h = literal_hash(expr)
+                    if h is not None:
+                        narrowable_operand_index_to_hash[i] = h
+                        narrowable_operand_hash_to_index[h] = i
 
         # Step 2: Group operands chained by either the 'is' or '==' operands
         # together. For all other operands, we keep them in groups of size 2.
