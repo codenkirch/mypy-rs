@@ -5167,3 +5167,210 @@ mod opassign_tests {
         );
     }
 }
+
+/// Arm tags for the `find_isinstance_check_helper` dispatch head
+/// (checker.py:8418-8464); values must match `NATIVE_ISINSTANCE_HEAD_*`
+/// in mypy/checker.py. The Python shim applies the arm body:
+/// - `*_BAD_ARGS`: arity mismatch, the error is reported elsewhere,
+///   Python returns `{}, {}`.
+/// - `*_NARROW`: `literal(expr) == LITERAL_TYPE`, Python runs the
+///   narrowing machinery for that builtin.
+/// - `*_TAIL`: literal gate failed, Python falls through to the
+///   boolean-context tail.
+/// - `HASATTR`: arity ok; the attr gate (`try_getting_str_literals`) is
+///   decided shim-side, NARROW-like body or the tail.
+/// - `TYPEGUARD`: callee is not a handled builtin; Python runs the
+///   TypeGuard/TypeIs extraction + narrowing block.
+pub(crate) const ISINSTANCE_HEAD_ISINSTANCE_BAD_ARGS: i64 = 1;
+pub(crate) const ISINSTANCE_HEAD_ISINSTANCE_NARROW: i64 = 2;
+pub(crate) const ISINSTANCE_HEAD_ISINSTANCE_TAIL: i64 = 3;
+pub(crate) const ISINSTANCE_HEAD_ISSUBCLASS_BAD_ARGS: i64 = 4;
+pub(crate) const ISINSTANCE_HEAD_ISSUBCLASS_NARROW: i64 = 5;
+pub(crate) const ISINSTANCE_HEAD_ISSUBCLASS_TAIL: i64 = 6;
+pub(crate) const ISINSTANCE_HEAD_CALLABLE_BAD_ARGS: i64 = 7;
+pub(crate) const ISINSTANCE_HEAD_CALLABLE_NARROW: i64 = 8;
+pub(crate) const ISINSTANCE_HEAD_CALLABLE_TAIL: i64 = 9;
+pub(crate) const ISINSTANCE_HEAD_HASATTR_BAD_ARGS: i64 = 10;
+pub(crate) const ISINSTANCE_HEAD_HASATTR: i64 = 11;
+pub(crate) const ISINSTANCE_HEAD_TYPEGUARD: i64 = 12;
+
+/// Pure decision core, PyO3-free so the arm table is unit-tested directly.
+/// `callee_name` is the RefExpr fullname (None for a non-RefExpr callee or
+/// a fullname outside the four builtins).
+pub(crate) fn classify_isinstance_head_inner(
+    callee_name: Option<&str>,
+    args_len: usize,
+    literal_ok: bool,
+) -> i64 {
+    match callee_name {
+        Some("builtins.isinstance") => {
+            if args_len != 2 {
+                ISINSTANCE_HEAD_ISINSTANCE_BAD_ARGS
+            } else if literal_ok {
+                ISINSTANCE_HEAD_ISINSTANCE_NARROW
+            } else {
+                ISINSTANCE_HEAD_ISINSTANCE_TAIL
+            }
+        }
+        Some("builtins.issubclass") => {
+            if args_len != 2 {
+                ISINSTANCE_HEAD_ISSUBCLASS_BAD_ARGS
+            } else if literal_ok {
+                ISINSTANCE_HEAD_ISSUBCLASS_NARROW
+            } else {
+                ISINSTANCE_HEAD_ISSUBCLASS_TAIL
+            }
+        }
+        Some("builtins.callable") => {
+            if args_len != 1 {
+                ISINSTANCE_HEAD_CALLABLE_BAD_ARGS
+            } else if literal_ok {
+                ISINSTANCE_HEAD_CALLABLE_NARROW
+            } else {
+                ISINSTANCE_HEAD_CALLABLE_TAIL
+            }
+        }
+        Some("builtins.hasattr") => {
+            if args_len != 2 {
+                ISINSTANCE_HEAD_HASATTR_BAD_ARGS
+            } else {
+                ISINSTANCE_HEAD_HASATTR
+            }
+        }
+        _ => ISINSTANCE_HEAD_TYPEGUARD,
+    }
+}
+
+/// `TypeChecker.find_isinstance_check_helper` dispatch-head port
+/// (checker.py:8418-8464). Rust reads the live callee via PyO3 (zero wire
+/// bytes) and classifies the builtin-callee arm; the Python shim applies
+/// the arm bodies. Mirrors `rust_classify_lvalue_validity`'s shape.
+///
+/// `refers_to_fullname` parity: a RefExpr whose fullname is one of the
+/// four builtins decides immediately (the fullname check precedes the
+/// TypeAlias unwrap in the Python helper). A RefExpr naming a TypeAlias
+/// defers to Python, which unwraps the alias target.
+#[pyfunction]
+#[pyo3(signature = (callee, args_len, literal_ok))]
+pub(crate) fn rust_classify_find_isinstance_head(
+    py: Python<'_>,
+    callee: &PyAny,
+    args_len: usize,
+    literal_ok: bool,
+) -> PyResult<Option<i64>> {
+    let ref_expr_cls = nodes_class(py, "RefExpr")?;
+    if !callee.is_instance(ref_expr_cls)? {
+        return Ok(Some(ISINSTANCE_HEAD_TYPEGUARD));
+    }
+    let fullname: String = match callee.getattr("fullname") {
+        Ok(f) => f.extract()?,
+        Err(_) => return Ok(None),
+    };
+    match fullname.as_str() {
+        "builtins.isinstance"
+        | "builtins.issubclass"
+        | "builtins.callable"
+        | "builtins.hasattr" => Ok(Some(classify_isinstance_head_inner(
+            Some(&fullname),
+            args_len,
+            literal_ok,
+        ))),
+        _ => {
+            let type_alias_cls = nodes_class(py, "TypeAlias")?;
+            let node = match callee.getattr("node") {
+                Ok(n) => n,
+                Err(_) => return Ok(None),
+            };
+            if node.is_instance(type_alias_cls)? {
+                return Ok(None);
+            }
+            Ok(Some(ISINSTANCE_HEAD_TYPEGUARD))
+        }
+    }
+}
+
+#[cfg(test)]
+mod isinstance_head_tests {
+    use super::*;
+
+    #[test]
+    fn test_isinstance_arms() {
+        assert_eq!(
+            classify_isinstance_head_inner(Some("builtins.isinstance"), 1, true),
+            ISINSTANCE_HEAD_ISINSTANCE_BAD_ARGS
+        );
+        assert_eq!(
+            classify_isinstance_head_inner(Some("builtins.isinstance"), 2, true),
+            ISINSTANCE_HEAD_ISINSTANCE_NARROW
+        );
+        assert_eq!(
+            classify_isinstance_head_inner(Some("builtins.isinstance"), 2, false),
+            ISINSTANCE_HEAD_ISINSTANCE_TAIL
+        );
+        assert_eq!(
+            classify_isinstance_head_inner(Some("builtins.isinstance"), 3, true),
+            ISINSTANCE_HEAD_ISINSTANCE_BAD_ARGS
+        );
+    }
+
+    #[test]
+    fn test_issubclass_arms() {
+        assert_eq!(
+            classify_isinstance_head_inner(Some("builtins.issubclass"), 1, true),
+            ISINSTANCE_HEAD_ISSUBCLASS_BAD_ARGS
+        );
+        assert_eq!(
+            classify_isinstance_head_inner(Some("builtins.issubclass"), 2, true),
+            ISINSTANCE_HEAD_ISSUBCLASS_NARROW
+        );
+        assert_eq!(
+            classify_isinstance_head_inner(Some("builtins.issubclass"), 2, false),
+            ISINSTANCE_HEAD_ISSUBCLASS_TAIL
+        );
+    }
+
+    #[test]
+    fn test_callable_arms() {
+        assert_eq!(
+            classify_isinstance_head_inner(Some("builtins.callable"), 2, true),
+            ISINSTANCE_HEAD_CALLABLE_BAD_ARGS
+        );
+        assert_eq!(
+            classify_isinstance_head_inner(Some("builtins.callable"), 1, true),
+            ISINSTANCE_HEAD_CALLABLE_NARROW
+        );
+        assert_eq!(
+            classify_isinstance_head_inner(Some("builtins.callable"), 1, false),
+            ISINSTANCE_HEAD_CALLABLE_TAIL
+        );
+    }
+
+    #[test]
+    fn test_hasattr_arms() {
+        assert_eq!(
+            classify_isinstance_head_inner(Some("builtins.hasattr"), 1, true),
+            ISINSTANCE_HEAD_HASATTR_BAD_ARGS
+        );
+        assert_eq!(
+            classify_isinstance_head_inner(Some("builtins.hasattr"), 2, true),
+            ISINSTANCE_HEAD_HASATTR
+        );
+        // The attr gate is shim-side; literal_ok is irrelevant for the tag.
+        assert_eq!(
+            classify_isinstance_head_inner(Some("builtins.hasattr"), 2, false),
+            ISINSTANCE_HEAD_HASATTR
+        );
+    }
+
+    #[test]
+    fn test_other_callee_is_typeguard() {
+        assert_eq!(
+            classify_isinstance_head_inner(Some("mod.func"), 1, true),
+            ISINSTANCE_HEAD_TYPEGUARD
+        );
+        assert_eq!(
+            classify_isinstance_head_inner(None, 0, false),
+            ISINSTANCE_HEAD_TYPEGUARD
+        );
+    }
+}

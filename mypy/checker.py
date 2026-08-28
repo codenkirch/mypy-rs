@@ -343,6 +343,7 @@ try:
         rust_classify_enum_new as _rust_classify_enum_new,
         rust_classify_except_handler_tests as _rust_classify_except_handler_tests,
         rust_classify_final_super as _rust_classify_final_super,
+        rust_classify_find_isinstance_head as _rust_classify_find_isinstance_head,
         rust_classify_func_def_override as _rust_classify_func_def_override,
         rust_classify_getattr_method as _rust_classify_getattr_method,
         rust_classify_metaclass_compat as _rust_classify_metaclass_compat,
@@ -444,6 +445,7 @@ except ImportError:
     _rust_classify_type_check_raise = None  # type: ignore[assignment]
     _rust_classify_missing_annotations = None  # type: ignore[assignment]
     _rust_classify_getattr_method = None  # type: ignore[assignment]
+    _rust_classify_find_isinstance_head = None  # type: ignore[assignment]
     _rust_classify_enum_new = None  # type: ignore[assignment]
     _rust_classify_enum_bases = None  # type: ignore[assignment]
     _rust_classify_enum = None  # type: ignore[assignment]
@@ -616,6 +618,21 @@ NATIVE_SA_STUB = 0
 NATIVE_SA_DIRECT = 1
 NATIVE_SA_FALLBACK_NO_PREFERRED = 2
 NATIVE_SA_FALLBACK_LVALUE_PREFERRED = 3
+
+# Decision tags returned by `_rust_classify_find_isinstance_head`; must
+# match `ISINSTANCE_HEAD_*` in crates/type_kernel/src/checker_functions.rs.
+NATIVE_ISINSTANCE_HEAD_ISINSTANCE_BAD_ARGS = 1
+NATIVE_ISINSTANCE_HEAD_ISINSTANCE_NARROW = 2
+NATIVE_ISINSTANCE_HEAD_ISINSTANCE_TAIL = 3
+NATIVE_ISINSTANCE_HEAD_ISSUBCLASS_BAD_ARGS = 4
+NATIVE_ISINSTANCE_HEAD_ISSUBCLASS_NARROW = 5
+NATIVE_ISINSTANCE_HEAD_ISSUBCLASS_TAIL = 6
+NATIVE_ISINSTANCE_HEAD_CALLABLE_BAD_ARGS = 7
+NATIVE_ISINSTANCE_HEAD_CALLABLE_NARROW = 8
+NATIVE_ISINSTANCE_HEAD_CALLABLE_TAIL = 9
+NATIVE_ISINSTANCE_HEAD_HASATTR_BAD_ARGS = 10
+NATIVE_ISINSTANCE_HEAD_HASATTR = 11
+NATIVE_ISINSTANCE_HEAD_TYPEGUARD = 12
 
 _native_checker_active: bool = False
 _native_checker_types_active: bool = False
@@ -8417,6 +8434,25 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
 
         if isinstance(node, CallExpr) and len(node.args) != 0:
             expr = collapse_walrus(node.args[0])
+            # Native type_kernel seam: the builtin-callee dispatch front is
+            # a pure tag decision over the live callee; the shim applies the
+            # arm bodies. None defers to the pure-Python head below.
+            if (
+                _CHECKER_HAS_TYPE_KERNEL
+                and _native_checker_active
+                and _rust_classify_find_isinstance_head is not None
+            ):
+                try:
+                    literal_ok = literal(expr) == LITERAL_TYPE
+                    tag = _rust_classify_find_isinstance_head(
+                        node.callee, len(node.args), literal_ok
+                    )
+                except (AssertionError, NotImplementedError, ValueError, TypeError):
+                    tag = None
+                if tag is not None:
+                    return self._apply_find_isinstance_head_tag(
+                        tag, node, expr, in_boolean_context, literal_ok
+                    )
             if refers_to_fullname(node.callee, "builtins.isinstance"):
                 if len(node.args) != 2:  # the error will be reported elsewhere
                     return {}, {}
@@ -8445,64 +8481,9 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
                 if literal(expr) == LITERAL_TYPE and attr and len(attr) == 1:
                     return self.hasattr_type_maps(expr, self.lookup_type(expr), attr[0])
             else:
-                type_is, type_guard = None, None
-                called_type = self.lookup_type_or_none(node.callee)
-                if called_type is not None:
-                    called_type = get_proper_type(called_type)
-                    # TODO: there are some more cases in check_call() to handle.
-                    # If the callee is an instance, try to extract TypeGuard/TypeIs from
-                    # its __call__ method.
-                    if isinstance(called_type, Instance):
-                        call = find_member("__call__", called_type, called_type, is_operator=True)
-                        if call is not None:
-                            called_type = get_proper_type(call)
-                    if isinstance(called_type, CallableType):
-                        type_is, type_guard = called_type.type_is, called_type.type_guard
-
-                # If the callee is a RefExpr, extract TypeGuard/TypeIs directly.
-                if isinstance(node.callee, RefExpr):
-                    type_is, type_guard = node.callee.type_is, node.callee.type_guard
-                if type_guard is not None or type_is is not None:
-                    # TODO: Follow *args, **kwargs
-                    if node.arg_kinds[0] != nodes.ARG_POS:
-                        # *assuming* the overloaded function is correct, there's a couple cases:
-                        #  1) The first argument has different names, but is pos-only. We don't
-                        #     care about this case, the argument must be passed positionally.
-
-                        #  2) The first argument allows keyword reference, therefore must be the
-                        #     same between overloads.
-                        if isinstance(called_type, (CallableType, Overloaded)):
-                            name = called_type.items[0].arg_names[0]
-                            if name in node.arg_names:
-                                idx = node.arg_names.index(name)
-                                # we want the idx-th variable to be narrowed
-                                expr = collapse_walrus(node.args[idx])
-                            else:
-                                kind = "guard" if type_guard is not None else "narrower"
-                                self.fail(
-                                    message_registry.TYPE_GUARD_POS_ARG_REQUIRED.format(kind), node
-                                )
-                                return {}, {}
-                    if literal(expr) == LITERAL_TYPE:
-                        # Note: we wrap the target type, so that we can special case later.
-                        # Namely, for isinstance() we use a normal meet, while TypeGuard is
-                        # considered "always right" (i.e. even if the types are not overlapping).
-
-                        # Also note that a care must be taken to unwrap this back at read places
-                        # where we use this to narrow down declared type.
-                        if type_guard is not None:
-                            return {expr: TypeGuardedType(type_guard)}, {}
-                        else:
-                            assert type_is is not None
-                            return conditional_types_to_typemaps(
-                                expr,
-                                *self.conditional_types_with_intersection(
-                                    self.lookup_type(expr),
-                                    [TypeRange(type_is, is_upper_bound=False)],
-                                    expr,
-                                    consider_runtime_isinstance=False,
-                                ),
-                            )
+                maps = self._typeguard_call_maps(node, expr)
+                if maps is not None:
+                    return maps
         elif isinstance(node, ComparisonExpr):
             return self.comparison_type_narrowing_helper(node)
         elif isinstance(node, AssignmentExpr):
@@ -8565,16 +8546,125 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
 
         # Restrict the type of the variable to True-ish/False-ish in the if and else branches
         # respectively
+        return self._boolean_context_type_maps(node, in_boolean_context)
+
+    def _boolean_context_type_maps(
+        self, node: Expression, in_boolean_context: bool
+    ) -> tuple[TypeMap, TypeMap]:
+        """Restrict the type of the variable to True-ish/False-ish in the if
+        and else branches respectively."""
         original_vartype = self.lookup_type(node)
         if in_boolean_context:
             # We don't check `:=` values in expressions like `(a := A())`,
             # because they produce two error messages.
             self.check_for_truthy_type(original_vartype, node)
         vartype = try_expanding_sum_type_to_union(original_vartype, "builtins.bool")
+        return {node: true_only(vartype)}, {node: false_only(vartype)}
 
-        if_map = {node: true_only(vartype)}
-        else_map = {node: false_only(vartype)}
-        return if_map, else_map
+    def _apply_find_isinstance_head_tag(
+        self,
+        tag: int,
+        node: CallExpr,
+        expr: Expression,
+        in_boolean_context: bool,
+        literal_ok: bool,
+    ) -> tuple[TypeMap, TypeMap]:
+        """Apply the arm body selected by `rust_classify_find_isinstance_head`."""
+        if tag in (
+            NATIVE_ISINSTANCE_HEAD_ISINSTANCE_BAD_ARGS,
+            NATIVE_ISINSTANCE_HEAD_ISSUBCLASS_BAD_ARGS,
+            NATIVE_ISINSTANCE_HEAD_CALLABLE_BAD_ARGS,
+            NATIVE_ISINSTANCE_HEAD_HASATTR_BAD_ARGS,
+        ):
+            # The arity error is reported elsewhere.
+            return {}, {}
+        if tag == NATIVE_ISINSTANCE_HEAD_ISINSTANCE_NARROW:
+            return conditional_types_to_typemaps(
+                expr,
+                *self.conditional_types_with_intersection(
+                    self.lookup_type(expr), self.get_isinstance_type(node.args[1]), expr
+                ),
+            )
+        if tag == NATIVE_ISINSTANCE_HEAD_ISSUBCLASS_NARROW:
+            return self.infer_issubclass_maps(node, expr)
+        if tag == NATIVE_ISINSTANCE_HEAD_CALLABLE_NARROW:
+            return self.conditional_callable_type_map(expr, self.lookup_type(expr))
+        if tag == NATIVE_ISINSTANCE_HEAD_HASATTR:
+            attr = try_getting_str_literals(node.args[1], self.lookup_type(node.args[1]))
+            if literal_ok and attr and len(attr) == 1:
+                return self.hasattr_type_maps(expr, self.lookup_type(expr), attr[0])
+            return self._boolean_context_type_maps(node, in_boolean_context)
+        if tag == NATIVE_ISINSTANCE_HEAD_TYPEGUARD:
+            maps = self._typeguard_call_maps(node, expr)
+            if maps is not None:
+                return maps
+        return self._boolean_context_type_maps(node, in_boolean_context)
+
+    def _typeguard_call_maps(
+        self, node: CallExpr, expr: Expression
+    ) -> tuple[TypeMap, TypeMap] | None:
+        """TypeGuard/TypeIs arm of `find_isinstance_check_helper`.
+
+        Returns the narrowing maps, or None to fall through to the
+        boolean-context tail.
+        """
+        type_is, type_guard = None, None
+        called_type = self.lookup_type_or_none(node.callee)
+        if called_type is not None:
+            called_type = get_proper_type(called_type)
+            # TODO: there are some more cases in check_call() to handle.
+            # If the callee is an instance, try to extract TypeGuard/TypeIs from
+            # its __call__ method.
+            if isinstance(called_type, Instance):
+                call = find_member("__call__", called_type, called_type, is_operator=True)
+                if call is not None:
+                    called_type = get_proper_type(call)
+            if isinstance(called_type, CallableType):
+                type_is, type_guard = called_type.type_is, called_type.type_guard
+
+        # If the callee is a RefExpr, extract TypeGuard/TypeIs directly.
+        if isinstance(node.callee, RefExpr):
+            type_is, type_guard = node.callee.type_is, node.callee.type_guard
+        if type_guard is not None or type_is is not None:
+            # TODO: Follow *args, **kwargs
+            if node.arg_kinds[0] != nodes.ARG_POS:
+                # *assuming* the overloaded function is correct, there's a couple cases:
+                #  1) The first argument has different names, but is pos-only. We don't
+                #     care about this case, the argument must be passed positionally.
+
+                #  2) The first argument allows keyword reference, therefore must be the
+                #     same between overloads.
+                if isinstance(called_type, (CallableType, Overloaded)):
+                    name = called_type.items[0].arg_names[0]
+                    if name in node.arg_names:
+                        idx = node.arg_names.index(name)
+                        # we want the idx-th variable to be narrowed
+                        expr = collapse_walrus(node.args[idx])
+                    else:
+                        kind = "guard" if type_guard is not None else "narrower"
+                        self.fail(message_registry.TYPE_GUARD_POS_ARG_REQUIRED.format(kind), node)
+                        return {}, {}
+            if literal(expr) == LITERAL_TYPE:
+                # Note: we wrap the target type, so that we can special case later.
+                # Namely, for isinstance() we use a normal meet, while TypeGuard is
+                # considered "always right" (i.e. even if the types are not overlapping).
+
+                # Also note that a care must be taken to unwrap this back at read places
+                # where we use this to narrow down declared type.
+                if type_guard is not None:
+                    return {expr: TypeGuardedType(type_guard)}, {}
+                else:
+                    assert type_is is not None
+                    return conditional_types_to_typemaps(
+                        expr,
+                        *self.conditional_types_with_intersection(
+                            self.lookup_type(expr),
+                            [TypeRange(type_is, is_upper_bound=False)],
+                            expr,
+                            consider_runtime_isinstance=False,
+                        ),
+                    )
+        return None
 
     def comparison_type_narrowing_helper(self, node: ComparisonExpr) -> tuple[TypeMap, TypeMap]:
         """Infer type narrowing from a comparison expression."""

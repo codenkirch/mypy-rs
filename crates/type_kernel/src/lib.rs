@@ -3316,5 +3316,13 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         module
     )?)?;
 
+    // Issue #1086: find_isinstance_check_helper dispatch head. Rust reads
+    // the live callee via PyO3 (zero wire bytes) and classifies the
+    // builtin-callee arm; arm bodies stay in Python, unreadable facts defer.
+    module.add_function(wrap_pyfunction!(
+        checker_functions::rust_classify_find_isinstance_head,
+        module
+    )?)?;
+
     Ok(())
 }

@@ -31904,6 +31904,221 @@ class NativeMatchArgsSuite(Suite):
         tup = TupleType([TypeAliasType(alias, [])], fx.std_tuple)
         self._assert_par(self._class_scope(), tup)
 
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeFindIsinstanceHeadSuite(Suite):
+    """Parity for the Rust `find_isinstance_check` dispatch head port (#1086).
+
+    `TypeChecker.find_isinstance_check_helper` (checker.py:8418) dispatches
+    on the builtin callee (isinstance / issubclass / callable / hasattr)
+    before falling into the TypeGuard/TypeIs extraction block. The Rust seam
+    (`checker_functions.rs`) reads the live callee via PyO3 (zero wire
+    bytes) and returns the arm tag; the shim applies the arm bodies. Defers
+    (None) on a RefExpr naming a TypeAlias (refers_to_fullname unwraps the
+    alias target) or any unreadable fact.
+
+    Direct seam calls assert the tag per arm; the gate-off vs gate-on
+    differential drives the real `find_isinstance_check_helper` through a
+    stub TypeChecker (a `_type_maps` list is all the machinery the covered
+    arms need) and asserts identical (if_map, else_map) results.
+    """
+
+    def setUp(self) -> None:
+        from mypy.checker import _set_native_checker_active
+
+        self.fx = TypeFixture()
+        self._set_active = _set_native_checker_active
+        self._set_active(True)
+
+    def tearDown(self) -> None:
+        self._set_active(False)
+
+    def _with_gate(self, active: bool, fn: Callable[[], T]) -> T:
+        self._set_active(active)
+        try:
+            return fn()
+        finally:
+            self._set_active(True)
+
+    def _seam(self, callee: Any, args_len: int, literal_ok: bool) -> Any:
+        return _type_kernel.rust_classify_find_isinstance_head(callee, args_len, literal_ok)
+
+    def _builtin_ref(self, fullname: str) -> Any:
+        ref = NameExpr(fullname.rsplit(".", 1)[-1])
+        ref.fullname = fullname
+        return ref
+
+    def _var_expr(self) -> NameExpr:
+        # A NameExpr bound to a Var classifies as LITERAL_TYPE via literal().
+        expr = NameExpr("x")
+        expr.node = Var("x")
+        return expr
+
+    def _call(self, callee: Any, args: list[Expression]) -> CallExpr:
+        return CallExpr(callee, args, [ARG_POS] * len(args), [None] * len(args))
+
+    def _checker(self) -> Any:
+        from mypy.checker import TypeChecker
+
+        return TypeChecker.__new__(TypeChecker)
+
+    def _run(self, node: CallExpr) -> Any:
+        from mypy.checker import TypeChecker
+
+        def check_one() -> Any:
+            chk = TypeChecker.__new__(TypeChecker)
+            chk._type_maps = [{node: AnyType(TypeOfAny.unannotated)}]
+            return TypeChecker.find_isinstance_check_helper(
+                chk, node, in_boolean_context=False
+            )
+
+        off = self._with_gate(False, check_one)
+        on = self._with_gate(True, check_one)
+        assert_equal(str(on), str(off), f"find_isinstance head parity for {node.callee}")
+        return on
+
+    # Direct seam calls: one per arm tag.
+
+    def test_seam_isinstance_arms(self) -> None:
+        from mypy.checker import (
+            NATIVE_ISINSTANCE_HEAD_ISINSTANCE_BAD_ARGS,
+            NATIVE_ISINSTANCE_HEAD_ISINSTANCE_NARROW,
+            NATIVE_ISINSTANCE_HEAD_ISINSTANCE_TAIL,
+        )
+
+        callee = self._builtin_ref("builtins.isinstance")
+        assert self._seam(callee, 2, True) == NATIVE_ISINSTANCE_HEAD_ISINSTANCE_NARROW
+        assert self._seam(callee, 1, True) == NATIVE_ISINSTANCE_HEAD_ISINSTANCE_BAD_ARGS
+        assert self._seam(callee, 2, False) == NATIVE_ISINSTANCE_HEAD_ISINSTANCE_TAIL
+
+    def test_seam_issubclass_arms(self) -> None:
+        from mypy.checker import (
+            NATIVE_ISINSTANCE_HEAD_ISSUBCLASS_BAD_ARGS,
+            NATIVE_ISINSTANCE_HEAD_ISSUBCLASS_NARROW,
+            NATIVE_ISINSTANCE_HEAD_ISSUBCLASS_TAIL,
+        )
+
+        callee = self._builtin_ref("builtins.issubclass")
+        assert self._seam(callee, 2, True) == NATIVE_ISINSTANCE_HEAD_ISSUBCLASS_NARROW
+        assert self._seam(callee, 1, True) == NATIVE_ISINSTANCE_HEAD_ISSUBCLASS_BAD_ARGS
+        assert self._seam(callee, 2, False) == NATIVE_ISINSTANCE_HEAD_ISSUBCLASS_TAIL
+
+    def test_seam_callable_arms(self) -> None:
+        from mypy.checker import (
+            NATIVE_ISINSTANCE_HEAD_CALLABLE_BAD_ARGS,
+            NATIVE_ISINSTANCE_HEAD_CALLABLE_NARROW,
+            NATIVE_ISINSTANCE_HEAD_CALLABLE_TAIL,
+        )
+
+        callee = self._builtin_ref("builtins.callable")
+        assert self._seam(callee, 1, True) == NATIVE_ISINSTANCE_HEAD_CALLABLE_NARROW
+        assert self._seam(callee, 2, True) == NATIVE_ISINSTANCE_HEAD_CALLABLE_BAD_ARGS
+        assert self._seam(callee, 1, False) == NATIVE_ISINSTANCE_HEAD_CALLABLE_TAIL
+
+    def test_seam_hasattr_arms(self) -> None:
+        from mypy.checker import (
+            NATIVE_ISINSTANCE_HEAD_HASATTR,
+            NATIVE_ISINSTANCE_HEAD_HASATTR_BAD_ARGS,
+        )
+
+        callee = self._builtin_ref("builtins.hasattr")
+        assert self._seam(callee, 2, True) == NATIVE_ISINSTANCE_HEAD_HASATTR
+        assert self._seam(callee, 1, True) == NATIVE_ISINSTANCE_HEAD_HASATTR_BAD_ARGS
+
+    def test_seam_typeguard_for_other_callees(self) -> None:
+        from mypy.checker import NATIVE_ISINSTANCE_HEAD_TYPEGUARD
+
+        assert self._seam(self._builtin_ref("mod.guard_fn"), 1, True) == (
+            NATIVE_ISINSTANCE_HEAD_TYPEGUARD
+        )
+        member = MemberExpr(self._var_expr(), "guard_fn")
+        assert self._seam(member, 1, True) == NATIVE_ISINSTANCE_HEAD_TYPEGUARD
+
+    def test_seam_defers_on_alias_callee(self) -> None:
+        from mypy.nodes import TypeAlias
+
+        alias = TypeAlias(self.fx.str_type, "mod.A", "mod", -1, -1)
+        ref = self._builtin_ref("mod.A")
+        ref.node = alias
+        assert self._seam(ref, 2, True) is None
+
+    # Gate-off vs gate-on differential through the real method.
+
+    def test_parity_bad_args_arms(self) -> None:
+        # The arity error is reported elsewhere; all four builtins
+        # short-circuit to ({}, {}).
+        for fullname, args in [
+            ("builtins.isinstance", 1),
+            ("builtins.issubclass", 1),
+            ("builtins.callable", 2),
+            ("builtins.hasattr", 1),
+        ]:
+            node = self._call(self._builtin_ref(fullname), [self._var_expr()] * args)
+            assert_equal(self._run(node), ({}, {}), f"bad args for {fullname}")
+
+    def test_parity_tail_non_literal_arg(self) -> None:
+        # A non-literal first argument skips narrowing and lands in the
+        # boolean-context tail.
+        inner = CallExpr(self._builtin_ref("mod.f"), [], [], [])
+        for fullname, args in [("builtins.isinstance", 2), ("builtins.callable", 1)]:
+            node = self._call(self._builtin_ref(fullname), [inner] * args)
+            result = self._run(node)
+            (if_map, else_map) = result
+            assert set(if_map) == {node} and set(else_map) == {node}
+
+    def test_parity_typeguard_tail_without_guard(self) -> None:
+        # A non-builtin callee without TypeGuard/TypeIs falls to the tail.
+        node = self._call(self._builtin_ref("mod.f"), [self._var_expr()])
+        result = self._run(node)
+        assert set(result[0]) == {node} and set(result[1]) == {node}
+
+    def test_parity_typeguard_guarded_type_map(self) -> None:
+        # A RefExpr callee with type_guard set narrows to TypeGuardedType.
+        from mypy.types import TypeGuardedType
+
+        callee = self._builtin_ref("mod.guard_fn")
+        callee.type_guard = self.fx.str_type
+        expr = self._var_expr()
+        node = self._call(callee, [expr])
+        expected = str(({expr: TypeGuardedType(self.fx.str_type)}, {}))
+        assert_equal(str(self._run(node)), expected)
+
+    def test_parity_alias_callee_defers_to_python(self) -> None:
+        # The alias deferral re-runs the pure-Python head, which treats the
+        # callee like any other non-builtin.
+        from mypy.nodes import TypeAlias
+
+        alias = TypeAlias(self.fx.str_type, "mod.A", "mod", -1, -1)
+        callee = self._builtin_ref("mod.A")
+        callee.node = alias
+        node = self._call(callee, [self._var_expr()])
+        result = self._run(node)
+        assert set(result[0]) == {node} and set(result[1]) == {node}
+
+    def test_parity_is_true_false_literal_precedes_seam(self) -> None:
+        # True/False literals short-circuit before the CallExpr dispatch.
+        from mypy.checker import TypeChecker
+        from mypy.types import UninhabitedType
+
+        def run(node: Any) -> Any:
+            def check_one() -> Any:
+                chk = TypeChecker.__new__(TypeChecker)
+                chk._type_maps = [{}]
+                return TypeChecker.find_isinstance_check_helper(
+                    chk, node, in_boolean_context=False
+                )
+
+            off = self._with_gate(False, check_one)
+            on = self._with_gate(True, check_one)
+            assert_equal(on, off, "true/false literal parity")
+            return on
+
+        true_ref = self._builtin_ref("builtins.True")
+        assert_equal(run(true_ref), ({}, {true_ref: UninhabitedType()}))
+        false_ref = self._builtin_ref("builtins.False")
+        assert_equal(run(false_ref), ({false_ref: UninhabitedType()}, {}))
+
+
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeIsValidConstructorSuite(Suite):
     """Parity for the Rust `is_valid_constructor` port (mypy.typeops, #967).
