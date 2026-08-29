@@ -975,6 +975,7 @@ pub(crate) fn rust_join_type_list(
 pub(crate) fn get_protocol_member_inner(
     py: Python<'_>,
     left: &Type,
+    self_type: &Type,
     member: &str,
     class_obj: bool,
     is_lvalue: bool,
@@ -1098,8 +1099,8 @@ pub(crate) fn get_protocol_member_inner(
                 }
             };
             // Member may be inherited (subclass receiver); Python maps the
-            // receiver to `method.info` before expanding, so pass
-            // allow_subclass_receiver (issue #1121).
+            // receiver to `method.info` via map_instance_to_supertype before
+            // expanding, so no same-class guard is needed.
             let method_fullname = match get_opt_str_attr(sym_info, "fullname") {
                 Some(f) => f,
                 None => {
@@ -1111,12 +1112,12 @@ pub(crate) fn get_protocol_member_inner(
                 left,
                 &signature,
                 &method_fullname,
-                left,
+                self_type,
                 member,
                 resolver,
                 strict_optional,
                 false, // is_class
-                true,  // allow_subclass_receiver
+                true,  // suppress_self_fail (find_member context)
             );
             match result {
                 Some(t) => Some(GetProtocolMemberResult::Found(t)),
@@ -1214,12 +1215,12 @@ pub(crate) fn get_protocol_member_inner(
                 left,
                 &signature,
                 &method_fullname,
-                left,
+                self_type,
                 member,
                 resolver,
                 strict_optional,
                 is_classmethod,
-                true, // allow_subclass_receiver
+                true, // suppress_self_fail (find_member context)
             ) {
                 Some(t) => {
                     // A property getter yields the getter return type,
@@ -1584,9 +1585,17 @@ pub(crate) fn rust_get_protocol_member(
     is_lvalue: bool,
     resolver: &mut NativeTypeResolver,
 ) -> Option<Vec<u8>> {
-    let _original = decode_type(original_left_bytes)?;
+    let original_left = decode_type(original_left_bytes)?;
     let left = decode_type(left_bytes)?;
-    match get_protocol_member_inner(py, &left, member, class_obj, is_lvalue, resolver.resolver())? {
+    match get_protocol_member_inner(
+        py,
+        &left,
+        &original_left,
+        member,
+        class_obj,
+        is_lvalue,
+        resolver.resolver(),
+    )? {
         GetProtocolMemberResult::NoneVal => Some(Vec::new()),
         GetProtocolMemberResult::Found(t) => encode_type(&t),
         GetProtocolMemberResult::Defer => None,
@@ -1661,8 +1670,8 @@ pub(crate) fn find_member_call_is_plain_callable(
             let signature = wire::read_type(&mut buf, None).ok()?;
             let method_fullname = get_opt_str_attr(sym_info_ref, "fullname")?;
             // is_operator=True, is_lvalue=False, class_obj=False; errors
-            // are suppressed on the Python side, which member_method_inner
-            // never emits anyway.
+            // are suppressed on the Python side, so the zero-match self
+            // filter keeps the original functype (as Python).
             let result = crate::checkmember::member_method_inner(
                 instance,
                 &signature,
@@ -1672,7 +1681,7 @@ pub(crate) fn find_member_call_is_plain_callable(
                 resolver.resolver(),
                 live_strict_optional(py),
                 false, // is_class
-                false, // allow_subclass_receiver
+                true,  // suppress_self_fail
             )?;
             Some(matches!(
                 result,
@@ -2226,7 +2235,8 @@ mod tests {
                 "builtins.type",
             ));
             let left = make_instance("builtins.type", vec![]);
-            let res = get_protocol_member_inner(py, &left, "__call__", false, false, r.resolver());
+            let res =
+                get_protocol_member_inner(py, &left, &left, "__call__", false, false, r.resolver());
             assert!(matches!(res, Some(GetProtocolMemberResult::NoneVal)));
         });
     }
@@ -2237,7 +2247,8 @@ mod tests {
         Python::with_gil(|py| {
             let r = make_native(make_resolver_with_metaclass("mymod.Foo", "builtins.type"));
             let left = make_instance("mymod.Foo", vec![]);
-            let res = get_protocol_member_inner(py, &left, "__call__", false, false, r.resolver());
+            let res =
+                get_protocol_member_inner(py, &left, &left, "__call__", false, false, r.resolver());
             assert!(matches!(res, Some(GetProtocolMemberResult::Defer)));
         });
     }
@@ -2248,7 +2259,8 @@ mod tests {
         Python::with_gil(|py| {
             let r = make_native(make_resolver_with_metaclass("mymod.Foo", "builtins.type"));
             let left = make_instance("mymod.Foo", vec![]);
-            let res = get_protocol_member_inner(py, &left, "__call__", true, false, r.resolver());
+            let res =
+                get_protocol_member_inner(py, &left, &left, "__call__", true, false, r.resolver());
             assert!(matches!(res, Some(GetProtocolMemberResult::Defer)));
         });
     }
@@ -2259,7 +2271,8 @@ mod tests {
         Python::with_gil(|py| {
             let r = make_native(TypeResolver::new());
             let left = make_instance("mymod.NotFound", vec![]);
-            let res = get_protocol_member_inner(py, &left, "__call__", false, false, r.resolver());
+            let res =
+                get_protocol_member_inner(py, &left, &left, "__call__", false, false, r.resolver());
             assert!(res.is_none());
         });
     }
@@ -2274,7 +2287,8 @@ mod tests {
                 source_any: None,
                 missing_import_name: None,
             };
-            let res = get_protocol_member_inner(py, &left, "__call__", false, false, r.resolver());
+            let res =
+                get_protocol_member_inner(py, &left, &left, "__call__", false, false, r.resolver());
             assert!(res.is_none());
         });
     }
@@ -2287,7 +2301,8 @@ mod tests {
             let left = make_instance("mymod.Foo", vec![]);
             // __init__ access filters to final/super; Rust defers so Python
             // decides CANNOT_ACCESS_INIT.
-            let res = get_protocol_member_inner(py, &left, "__init__", false, false, r.resolver());
+            let res =
+                get_protocol_member_inner(py, &left, &left, "__init__", false, false, r.resolver());
             assert!(matches!(res, Some(GetProtocolMemberResult::Defer)));
         });
     }
@@ -2299,7 +2314,7 @@ mod tests {
             let r = make_native(make_resolver_with_metaclass("mymod.Foo", "builtins.type"));
             let left = make_instance("mymod.Foo", vec![]);
             // lvalue needs setter / assignment paths -> defer.
-            let res = get_protocol_member_inner(py, &left, "foo", false, true, r.resolver());
+            let res = get_protocol_member_inner(py, &left, &left, "foo", false, true, r.resolver());
             assert!(matches!(res, Some(GetProtocolMemberResult::Defer)));
         });
     }

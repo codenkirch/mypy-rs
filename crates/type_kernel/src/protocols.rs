@@ -79,13 +79,24 @@ pub(crate) fn is_protocol_implementation_inner(
     if left_snap.is_some_and(|s| s.is_protocol) {
         return None;
     }
+    // Recursion guard (subtypes.py:1972-1976): the member loop always runs
+    // under `pop_on_exit(assuming, left, right)`, so a re-entered pair is
+    // assumed True; the entry path needs this once the sup fetch re-enters.
+    if crate::subtypes::assuming_contains(left, right, ctx.proper_subtype) {
+        return Some(true);
+    }
+    let _assuming =
+        crate::subtypes::AssumingPush::new(left.clone(), right.clone(), ctx.proper_subtype);
     let members: Vec<&String> = right_snap
         .protocol_members
         .iter()
         .filter(|m| !member_is_skipped(m, skip))
         .collect();
     for member in members {
-        let sub = match get_protocol_member_inner(py, left, member, false, false, resolver) {
+        // Python (subtypes.py:1906-1909): subtype = get_protocol_member(left,
+        // original_left, ...); supertype = find_member(member, right,
+        // original_left). self_type is original_left (== left) on both fetches.
+        let sub = match get_protocol_member_inner(py, left, left, member, false, false, resolver) {
             Some(GetProtocolMemberResult::Found(t)) => Some(t),
             Some(GetProtocolMemberResult::NoneVal) => None,
             Some(GetProtocolMemberResult::Defer) => {
@@ -95,7 +106,7 @@ pub(crate) fn is_protocol_implementation_inner(
                 return None;
             }
         };
-        let sup = match get_protocol_member_inner(py, right, member, false, false, resolver) {
+        let sup = match get_protocol_member_inner(py, right, left, member, false, false, resolver) {
             Some(GetProtocolMemberResult::Found(t)) => Some(t),
             Some(GetProtocolMemberResult::NoneVal) => None,
             Some(GetProtocolMemberResult::Defer) => {

@@ -2419,3 +2419,62 @@ directly to `main`.
   node preservation, tvt/missing-snapshot/cycle defers, chain-to-union,
   typed-args substitution with INSTANTIATE-leak check,
   instantiate-vs-flatten differential, no-TLS defer).
+- `rust_analyze_member_method` bind-plan port (issue #1214) — closes the
+  remaining member-method defers by mirroring `bind_self`'s generic solve
+  branch (typeops.py:1062-1108) with per-item bind plans instead of a
+  blanket defer on generic methods. Each filtered Callable/Overloaded
+  item builds an `ItemBindPlan` (`plan_item_bind`): `self_vars` are the
+  method tvars whose ids (TypeVarExtractor walk, ParamSpec/TypeVarTuple
+  keyed with a -1 meta-level sentinel) appear in the self param, and
+  `bare` is that subset represented by the self param itself when it is
+  a plain `TypeVarType` (modern mypy's synthesized `Self`). The Rust
+  tail runs the same order as Python: self filter (`check_self_arg`),
+  `map_instance_to_supertype` to the defining class, free
+  `expand_type_by_instance`, then per item: bare-subset substitution
+  with the receiver (`subst_tvar_keys`, ExpandTypeVisitor visiting
+  semantics: arg_types/ret_type/type_guard/type_is/instance_type and
+  nested callables, not `variables`), removal of the remaining
+  `self_vars` from `variables`, the freeze trio
+  (`freeze_item`, typeops.py:2102), and the `bind_self_fast_inner`
+  strip with `is_bound=True`. Defers: alias-carrying self param
+  (Python expands from the live alias node), a tvar-like receiver
+  combined with a bare-Self plan (solve-before-strip can diverge from
+  strip-before-solve), star-self / empty-args items are planned empty
+  (Python returns them unchanged), and any survivor typevar outside
+  every `variables` list (env miss: the wire expand keys by receiver
+  fullname, Python substitutes via live binders, e.g. a PEP695
+  function-local class). `check_self_arg_inner` gained a
+  `suppress_self_fail` flag (renamed from the dead
+  `_allow_subclass_receiver` param): in the error-suppressed
+  `find_member` contexts (protocol member fetches,
+  `find_member_call_is_plain_callable`) Python keeps the ORIGINAL
+  functype on a zero-match self filter and continues binding, so Rust
+  now returns that functype in its three Python-returns-functype arms
+  (no-formal-self, bad kind, pass-2 empty) instead of deferring;
+  production member access passes `false` and re-runs the Python body
+  to emit `incompatible_self_argument`. `get_protocol_member_inner`
+  takes `self_type` and threads `original_left` into both member
+  fetches (sub and sup; `rust_get_protocol_member` now decodes
+  `original_left` instead of discarding it, mirroring
+  find_member(member, left, original_left) vs
+  find_member(member, right, original_left)); inside
+  `is_protocol_implementation_inner` (top of the function
+  original_left == left) both fetches pass `left` as `self_type`.
+  The `assuming` recursion guard moved from `protocol_right_decision`
+  into `is_protocol_implementation_inner` (subtypes.py:1972-1976
+  `pop_on_exit(assuming, left, right)`, `assuming_contains` /
+  `AssumingPush` now `pub(crate)`) so the direct pyfunction path is
+  guarded too: without the stack entry the self-arg pass-2
+  `is_subtype(I, P)` re-entry recursed and the protocol suite's
+  decided-False tests failed. Cold self-check audit
+  (MYPY_DEFER_AUDIT_1214, stripped before landing): 1,103 seam defer
+  events @ ~0.3% native -> 79 (4 native, 75 defers; -93%). Covered by
+  the gate-on/off parity of `NativeProtocolImplementationSuite` /
+  `NativeProtocolMemberMissSuite` / `NativeProtocolMemberDeferSuite`
+  plus the reworked `NativeMemberAccessDispatchSuite` tests
+  (`test_dispatch_completes_subclass_receiver_generic`,
+  `test_dispatch_defers_subclass_receiver_tvar_self`;
+  `test_dispatch_defers_non_final_init` keeps deferring by design:
+  a non-final `__init__` with a `NoneType` self declaration is decided
+  by Python's `check_self_arg` error path, which emission the seam
+  must not swallow).

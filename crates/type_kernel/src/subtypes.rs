@@ -1897,7 +1897,7 @@ thread_local! {
     static ASSUMING: RefCell<Vec<(Type, Type, bool)>> = const { RefCell::new(Vec::new()) };
 }
 
-fn assuming_contains(left: &Type, right: &Type, proper: bool) -> bool {
+pub(crate) fn assuming_contains(left: &Type, right: &Type, proper: bool) -> bool {
     ASSUMING.with(|s| {
         s.borrow()
             .iter()
@@ -1908,10 +1908,10 @@ fn assuming_contains(left: &Type, right: &Type, proper: bool) -> bool {
 /// Pushes `(left, right, proper)` onto the assuming stack; pops on drop,
 /// covering every exit path including deferral (Python's `pop_on_exit`
 /// context manager, subtypes.py:1922).
-struct AssumingPush;
+pub(crate) struct AssumingPush;
 
 impl AssumingPush {
-    fn new(left: Type, right: Type, proper: bool) -> Self {
+    pub(crate) fn new(left: Type, right: Type, proper: bool) -> Self {
         ASSUMING.with(|s| s.borrow_mut().push((left, right, proper)));
         AssumingPush
     }
@@ -1946,13 +1946,8 @@ fn protocol_right_decision(
     if !resolver.has_live_info_map() {
         return None;
     }
-    // Recursion guard (subtypes.py:1972-1976): a pair already being
-    // checked is assumed True; wire structural equality mirrors Python's
-    // identity check on the re-encountered live pair.
-    if assuming_contains(left, right, ctx.proper_subtype) {
-        return Some(true);
-    }
-    let _guard = AssumingPush::new(left.clone(), right.clone(), ctx.proper_subtype);
+    // Recursion guard + stack push live in `is_protocol_implementation_inner`
+    // (mirroring Python's `pop_on_exit` inside `is_protocol_implementation`).
     pyo3::Python::with_gil(|py| {
         let left_info = resolver.live_typeinfo(py, left_ref)?;
         let right_info = resolver.live_typeinfo(py, right_ref)?;

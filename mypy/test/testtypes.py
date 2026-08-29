@@ -19238,7 +19238,7 @@ class NativeMemberAccessDispatchSuite(Suite):
         assert decoded.is_bound is True
         assert decoded.arg_types == []
 
-    def test_dispatch_defers_subclass_receiver_generic(self) -> None:
+    def test_dispatch_completes_subclass_receiver_generic(self) -> None:
         from mypy.nodes import ARG_POS
 
         self._add_method(
@@ -19246,8 +19246,33 @@ class NativeMemberAccessDispatchSuite(Suite):
             "m",
             self._sig([self.fx.o], [ARG_POS], ["x"], self.fx.a, variables=[self.fx.t]),
         )
-        # Generic signature: bind_self could take its generic branch, defer.
-        assert self._raw_dispatch(self.fx.c, "m") is None
+        # Issue #1214: the generic bind branch is decided by the bind plan.
+        # The self param carries no method tvar (T is declared but unused
+        # there), so the plan is the empty strip and the receiver completes.
+        _next_raw_id, _changed, decoded = self._dispatch(self.fx.c, "m", self.fx.c)
+        decoded = get_proper_type(decoded)
+        assert isinstance(decoded, CallableType)
+        assert decoded.ret_type == self.fx.a
+        assert decoded.is_bound is True
+        assert decoded.arg_types == []
+
+    def test_dispatch_defers_subclass_receiver_tvar_self(self) -> None:
+        from mypy.nodes import ARG_POS
+
+        self._add_method(
+            self.fx.ai,
+            "m",
+            self._sig([self.fx.t], [ARG_POS], ["x"], self.fx.a, variables=[self.fx.t]),
+        )
+        # The self param IS the method typevar: the bind plan is bare-Self
+        # and a subclass receiver still completes (Python solves T := the
+        # receiver). A defer only fires for a receiver carrying type vars.
+        _next_raw_id, _changed, decoded = self._dispatch(self.fx.c, "m", self.fx.c)
+        decoded = get_proper_type(decoded)
+        assert isinstance(decoded, CallableType)
+        assert decoded.ret_type == self.fx.a
+        assert decoded.is_bound is True
+        assert decoded.arg_types == []
 
     def test_dispatch_defers_non_final_init(self) -> None:
         from mypy.nodes import ARG_POS
