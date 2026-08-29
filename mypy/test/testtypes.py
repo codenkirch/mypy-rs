@@ -5758,25 +5758,64 @@ class NativeTypeopsDeferralSuite(Suite):
         assert_equal(str(on), str(off), f"instance fallback alias parity {alias}")
         assert on == self.str_inst
         # Native engagement proof: the seam expands the alias and returns
-        # the fallback bytes (non-None) rather than deferring.
+        # the decided (True, blob) pair instead of deferring. Blob decode
+        # defers (the fixture map lacks builtin refs) and Python answers.
         r = _type_kernel.rust_try_getting_instance_fallback(
             _serialize_type(alias), self._resolver
         )
         assert r is not None, "rust_try_getting_instance_fallback deferred on an alias"
+        decided, blob = r
+        assert decided and blob is not None, f"undecided pair: {r!r}"
 
     def test_instance_fallback_alias_direct_seam_engages(self) -> None:
-        from mypy.typeops import _serialize_type
+        from mypy.typeops import _deserialize_type, _serialize_type
         from mypy.types import TypeAliasType
 
         # A TypeAliasType operand expands to its Instance target and the
-        # seam returns the fallback (non-None) instead of deferring.
+        # seam returns the decided fallback pair instead of deferring.
         alias = TypeAliasType(self.rgb_alias, [])
         r = _type_kernel.rust_try_getting_instance_fallback(
             _serialize_type(alias), self._resolver
         )
         assert r is not None, "rust_try_getting_instance_fallback deferred on an alias"
-        # Round-tripped value equality is asserted through the public parity
-        # test; here engagement (non-None) is the point.
+        decided, blob = r
+        assert decided and blob is not None, f"undecided pair: {r!r}"
+        decoded = _deserialize_type(bytes(blob))
+        assert_equal(str(decoded), str(self.enum_inst))
+        # Round-tripped TypeInfo identity is asserted through the public
+        # parity test (on == self.str_inst); here the round-trip shape is
+        # the point.
+
+    def test_instance_fallback_decided_none_protocol(self) -> None:
+        # Issue #1101 decided-None protocol: proper shapes outside the
+        # isinstance chain hit Python's `else: return None` tail; the
+        # seam decides them as (True, None) instead of deferring (#1183).
+        from mypy.typeops import _serialize_type
+        from mypy.types import (
+            AnyType,
+            NoneType,
+            TypeOfAny,
+            TypeType,
+            UninhabitedType,
+            UnionType,
+        )
+
+        none_t = NoneType()
+        any_t = AnyType(TypeOfAny.explicit)
+        uni = UninhabitedType()
+        union = UnionType([none_t, any_t])
+        ttype = TypeType.make_normalized(self.str_inst)
+        for t in (none_t, any_t, uni, union, ttype):
+            r = _type_kernel.rust_try_getting_instance_fallback(
+                _serialize_type(t), self._resolver
+            )
+            assert r is not None, f"rust seam deferred on {type(t).__name__}"
+            decided, blob = r
+            assert decided and blob is None, f"undecided pair for {type(t).__name__}: {r!r}"
+        # The public path answers None for these without a Python-body
+        # recursion; parity with the gate off is trivially None on both.
+        for t in (none_t, any_t, uni, union, ttype):
+            assert try_getting_instance_fallback(t) is None
 
     def test_missing_snapshot_defers_to_python(self) -> None:
         # An alias NOT registered in the resolver cannot be expanded, so the
