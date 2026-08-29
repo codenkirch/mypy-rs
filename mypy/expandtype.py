@@ -125,6 +125,43 @@ def _needs_python(typ: Type, *, definition_gate: bool = True) -> bool:
     return False
 
 
+def _contains_alias_raw(t: Type) -> bool:
+    """True if any node in the raw type tree is a TypeAliasType.
+
+    Unlike ``_needs_python`` (which walks ``get_proper_type`` and so hides
+    non-recursive aliases behind their expansion), this walks the raw tree,
+    mirroring the Rust ``result_contains_typealias`` scan.
+    """
+    stack: list[Type] = [t]
+    visited: set[int] = set()
+    while stack:
+        typ = stack.pop()
+        if id(typ) in visited:
+            continue
+        visited.add(id(typ))
+        if isinstance(typ, TypeAliasType):
+            return True
+        # Deliberate raw-tree walk (no get_proper_type expansion): detect the
+        # literal alias nodes the substitution would round-trip through wire.
+        if isinstance(typ, Instance):  # type: ignore[misc]
+            stack.extend(typ.args)
+        elif isinstance(typ, CallableType):  # type: ignore[misc]
+            stack.append(typ.ret_type)
+            stack.extend(typ.arg_types)
+            for v in typ.variables:
+                stack.append(v.upper_bound)
+                stack.append(v.default)
+        elif isinstance(typ, UnionType):  # type: ignore[misc]
+            stack.extend(typ.items)
+        elif isinstance(typ, TupleType):  # type: ignore[misc]
+            stack.extend(typ.items)
+        elif isinstance(typ, TypeType):  # type: ignore[misc]
+            stack.append(typ.item)
+        elif isinstance(typ, UnpackType):
+            stack.append(typ.type)
+    return False
+
+
 def _env_substitutes_unsafe(typ: Type, env: Mapping[TypeVarId, Type]) -> bool:
     """True if substituting `env` into `typ` would introduce an unsafe node.
 
@@ -158,7 +195,14 @@ def _env_substitutes_unsafe(typ: Type, env: Mapping[TypeVarId, Type]) -> bool:
             stack.extend(p.items)
         elif isinstance(p, TypeType):
             stack.append(p.item)
-    return any((v.raw_id, v.namespace) in used and _needs_python(t) for v, t in env.items())
+    return any(
+        (v.raw_id, v.namespace) in used
+        # Env values carrying a TypeAliasType stay on the Python path: the
+        # substituted value would round-trip the wire as a decoded alias
+        # node; keeping the original live node by identity is safer.
+        and (_needs_python(t) or _contains_alias_raw(t))
+        for v, t in env.items()
+    )
 
 
 try:
@@ -324,7 +368,10 @@ def expand_type(typ: Type, env: Mapping[TypeVarId, Type]) -> Type:
                     decoded = read_type(_ReadBuffer(raw))
                     from mypy.wirefixup import fixup_wire_type
 
-                    fixed = fixup_wire_type(decoded)
+                    # resolve_aliases=True re-links wire-decoded TypeAliasType
+                    # nodes to live TypeAlias nodes; an alias missing from the
+                    # per-build map defers (None) to the pure-Python body.
+                    fixed = fixup_wire_type(decoded, resolve_aliases=True)
                     # The wire format does not carry line/column; decoded
                     # types default to line -1. Preserve the input type's
                     # location so derived contexts (e.g. plugin
@@ -528,7 +575,10 @@ def expand_type_by_instance(typ: Type, instance: Instance) -> Type:
             and _native_expand_type_active
             and _native_expand_type_resolver is not None
             and not _needs_python(typ, definition_gate=False)
-            and not any(_needs_python(a, definition_gate=False) for a in instance.args)
+            and not any(
+                _needs_python(a, definition_gate=False)
+                for a in instance.args
+            )
         ):
             try:
                 result = _type_kernel.rust_expand_type_by_instance(
