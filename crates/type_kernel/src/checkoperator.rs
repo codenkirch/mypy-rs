@@ -10,20 +10,21 @@
 //!   * normal: try `__op__` first, then `__rop__`.
 //!
 //! This module ports ONLY the variant-ordering decision. It returns an
-//! `Option<u8>` order code (0 = shortcut-single, 2 = normal) or `None` to
-//! defer to the pure-Python chain. The reverse-first branch (code 1) is
-//! never returned: it requires `covers_at_runtime` (subtype check with
-//! `erase_instances`), which the Rust kernel's `SubtypeContext` does not
-//! carry. Code 0 / code 2 are decided without that check, matching the
-//! short-circuit structure of the Python `if`/`elif`; for these the
-//! reverse-first condition is provably false so the outcome is exact.
+//! `Option<u8>`: 0 = shortcut-single, 1 = reverse-first, 2 = normal, or
+//! `None` to defer to the pure-Python chain. Code 1 rides the
+//! parity-tested `covers_at_runtime_inner` port (#1131): when the kernel
+//! decides `covers_at_runtime(right, left)`, the Python fold would return
+//! the same bool, so building the reverse-first variants from it is exact.
+//! Deferred (None) where the covers port defers (tuple-shaped operands,
+//! nested aliases, missing snapshots) or where any decision is layered on
+//! an undecided same-type check.
 //!
 //! Deferred (return None):
 //!   * Any operand — Python returns early before ordering (checkexpr.py:4660).
 //!   * `TypeAliasType` operand — the wire format carries no resolved alias
 //!     target, so `get_proper_type` cannot expand it.
-//!   * One operand not an `Instance` on the code-2 path.
-//!   * A subtype check that returns `None` (Rust unsupported subtyping).
+//!   * A subtype/covers check that returns `None` (Rust unsupported subtyping,
+//!     tuple-shaped or alias-carrying operands).
 //!   * A snapshot missing from the resolver (cannot distinguish "absent"
 //!     from "unknown").
 
@@ -56,10 +57,8 @@ const SHORTCUT_OPS: &[&str] = &[
 
 /// Return codes for `rust_check_operator`. Mirror the `variants_raw`
 /// construction branches in `check_op_reversible` (checkexpr.py:4702-4732).
-///
-/// Code 1 (reverse-first) is intentionally never returned: it needs
-/// `covers_at_runtime`, which cannot be computed on this seam.
 pub(crate) const OP_VARIANT_SHORTCUT_SINGLE: u8 = 0;
+pub(crate) const OP_VARIANT_REVERSE_FIRST: u8 = 1;
 pub(crate) const OP_VARIANT_NORMAL: u8 = 2;
 
 fn decode_type(bytes: &[u8]) -> Option<Type> {
@@ -141,8 +140,8 @@ fn is_same_type(
 /// Decide `check_op_reversible` STEP 2a variant ordering (see module doc).
 ///
 /// `op_name` is the non-reversed operator method (`__add__`, ...). Returns
-/// `Some(0)` for shortcut-single, `Some(2)` for normal order, or `None` to
-/// defer to the pure-Python chain. Never returns the reverse-first code 1.
+/// `Some(0)` for shortcut-single, `Some(1)` for reverse-first, `Some(2)`
+/// for normal order, or `None` to defer to the pure-Python chain.
 pub(crate) fn operator_plan_inner(
     op_name: &str,
     left: &Type,
@@ -150,7 +149,7 @@ pub(crate) fn operator_plan_inner(
     resolver: &TypeResolver,
     strict_optional: bool,
 ) -> Option<u8> {
-    // checkexpr.py:4660-4666: if either operand is Any, Python returns Any
+    // checkexpr.py:4660-4666: if either operand is Any, Python returns any
     // before any ordering. Defer so Python's early return stands.
     if matches!(left, Type::AnyType { .. }) || matches!(right, Type::AnyType { .. }) {
         return None;
@@ -160,43 +159,83 @@ pub(crate) fn operator_plan_inner(
         return None;
     }
 
-    if is_shortcut_op(op_name) && is_same_type(left, right, resolver, strict_optional)? {
-        return Some(OP_VARIANT_SHORTCUT_SINGLE);
+    if is_shortcut_op(op_name) {
+        match is_same_type(left, right, resolver, strict_optional) {
+            Some(true) => {
+                return Some(OP_VARIANT_SHORTCUT_SINGLE);
+            }
+            Some(false) => {}
+            None => {
+                return None;
+            }
+        }
     }
 
-    // Both-instance path for the code-2 (normal-order) elif. If either side
-    // is not an Instance, defer: the subclass/alt_promote checks need
-    // Instance semantics.
-    let (l_ref, r_ref) = match (left, right) {
-        (Type::Instance { type_ref: l, .. }, Type::Instance { type_ref: r, .. }) => {
-            (l.as_str(), r.as_str())
-        }
-        _ => return None,
+    // checkexpr.py:4702-4732. For a non-Instance pair the code-2 elif's
+    // `not (both instances)` disjunct provably fires, and the decision
+    // reduces to covers_at_runtime(right, left) (#19006).
+
+    // The same reduction applies for differing definers behind the
+    // alt_promote check.
+    if !matches!(left, Type::Instance { .. }) || !matches!(right, Type::Instance { .. }) {
+        return match crate::covers_at_runtime::covers_at_runtime_inner(
+            right,
+            left,
+            strict_optional,
+            resolver,
+        ) {
+            Some(false) => Some(OP_VARIANT_NORMAL),
+            Some(true) => Some(OP_VARIANT_REVERSE_FIRST),
+            None => None,
+        };
+    }
+    let l_ref = if let Type::Instance { type_ref, .. } = left {
+        type_ref.as_str()
+    } else {
+        unreachable!("checked Instance above")
+    };
+    let r_ref = if let Type::Instance { type_ref, .. } = right {
+        type_ref.as_str()
+    } else {
+        unreachable!("checked Instance above")
     };
 
     let rev_op = get_reverse_op_method(op_name).unwrap_or(op_name);
 
-    let definer_equal =
-        lookup_definer(resolver, l_ref, op_name) == lookup_definer(resolver, r_ref, rev_op);
-    if definer_equal {
+    let ldef = lookup_definer(resolver, l_ref, op_name);
+    let rdef = lookup_definer(resolver, r_ref, rev_op);
+    if ldef.is_none() || rdef.is_none() {
+        return None;
+    }
+    if ldef == rdef {
         // checkexpr.py:4712-4713: definers equal -> normal order.
         return Some(OP_VARIANT_NORMAL);
     }
     // alt_promote special case (checkexpr.py:4714-4716): left's alt_promote
     // is the right's type_ref -> NOT subclass, even though definers differ.
-    let left_alt = resolver.get(l_ref)?.alt_promote_fullname.as_deref();
+    let left_alt = match resolver.get(l_ref) {
+        Some(s) => s.alt_promote_fullname.as_deref(),
+        None => {
+            return None;
+        }
+    };
     if left_alt == Some(r_ref) {
         return Some(OP_VARIANT_NORMAL);
     }
-    // Differing definers and no alt_promote equality -> Python would
-    // evaluate covers_at_runtime (reverse-first candidate). Not portable.
-    None
+    // Differing definers and no alt_promote equality -> Python evaluates
+    // covers_at_runtime (reverse-first candidate), #19006.
+    match crate::covers_at_runtime::covers_at_runtime_inner(right, left, strict_optional, resolver)
+    {
+        Some(false) => Some(OP_VARIANT_NORMAL),
+        Some(true) => Some(OP_VARIANT_REVERSE_FIRST),
+        None => None,
+    }
 }
 
 /// PyO3 seam for the `check_op_reversible` STEP 2a ordering decision.
 ///
-/// Returns an `int | None` order code: 0 = shortcut-single, 2 = normal.
-/// `None` defers to the pure-Python chain.
+/// Returns an `int | None` order code: 0 = shortcut-single, 1 = reverse-first,
+/// 2 = normal. `None` defers to the pure-Python chain.
 #[pyfunction]
 pub(crate) fn rust_check_operator(
     resolver: &NativeTypeResolver,
@@ -207,11 +246,15 @@ pub(crate) fn rust_check_operator(
 ) -> PyResult<Option<u8>> {
     let left = match decode_type(left_bytes) {
         Some(t) => t,
-        None => return Ok(None),
+        None => {
+            return Ok(None);
+        }
     };
     let right = match decode_type(right_bytes) {
         Some(t) => t,
-        None => return Ok(None),
+        None => {
+            return Ok(None);
+        }
     };
     Ok(operator_plan_inner(
         op_name,
@@ -299,9 +342,10 @@ mod tests {
     }
 
     #[test]
-    fn shortcut_different_instances_falls_to_definer_path() {
-        // A + B same shortcut: not same type, definers differ -> defer
-        // (the covers_at_runtime branch decides).
+    fn shortcut_different_instances_normal_order() {
+        // A + B, not same type, definers differ (B's __radd__ undefined in
+        // the snapshots), and covers_at_runtime(B, A) is False -> the else
+        // branch: normal order (code 2). Pre-#1131 the seam deferred here.
         let mut a = snap("a.A", "A");
         a.member_info
             .entry("__add__".to_string())
@@ -309,7 +353,7 @@ mod tests {
         let r = make_resolver(vec![a, snap("a.B", "B")]);
         let la = make_instance("a.A", vec![]);
         let rb = make_instance("a.B", vec![]);
-        assert_eq!(plan("__add__", &la, &rb, &r), None);
+        assert_eq!(plan("__add__", &la, &rb, &r), Some(2));
     }
 
     #[test]
@@ -351,13 +395,13 @@ mod tests {
     }
 
     #[test]
-    fn non_instance_operand_defers() {
-        // LHS is NoneType: not shortcut-same (different types), and the
-        // both-instance path defers.
+    fn non_instance_operand_normal_order() {
+        // None + A: __add__ is a shortcut op but the operands differ, and
+        // covers_at_runtime(A, None) is False -> normal order (code 2).
         let r = make_resolver(vec![snap("a.A", "A")]);
         let n = Type::NoneType;
         let a = make_instance("a.A", vec![]);
-        assert_eq!(plan("__add__", &n, &a, &r), None);
+        assert_eq!(plan("__add__", &n, &a, &r), Some(2));
     }
 
     #[test]
@@ -413,6 +457,93 @@ mod tests {
         let r = make_resolver(vec![a, b]);
         let la = make_instance("a.A", vec![]);
         let rb = make_instance("a.B", vec![]);
+        assert_eq!(plan("__add__", &la, &rb, &r), Some(2));
+    }
+
+    #[test]
+    fn non_instance_covers_reverse_first() {
+        // TypedDict == dict: __eq__ is not a shortcut op, neither operand
+        // deferral applies, and covers_at_runtime(right, left) is True
+        // (typed dict instances are always dicts at runtime) -> code 1.
+        let res = make_resolver(vec![
+            snap("builtins.dict", "dict"),
+            snap("builtins.str", "str"),
+        ]);
+        let dict = make_instance("builtins.dict", vec![]);
+        let td = Type::TypedDictType {
+            fallback: Box::new(dict.clone()),
+            items: vec![],
+            required_keys: Default::default(),
+            readonly_keys: Default::default(),
+            is_closed: true,
+        };
+        assert_eq!(plan("__eq__", &dict, &td, &res), Some(1));
+    }
+
+    #[test]
+    fn non_instance_not_covers_normal() {
+        // TypedDict == str: covers_at_runtime(TypedDict, str) is False
+        // (isinstance(td_value, str) never holds) -> code 2.
+        let res = make_resolver(vec![
+            snap("builtins.dict", "dict"),
+            snap("builtins.str", "str"),
+        ]);
+        let td = Type::TypedDictType {
+            fallback: Box::new(make_instance("builtins.dict", vec![])),
+            items: vec![],
+            required_keys: Default::default(),
+            readonly_keys: Default::default(),
+            is_closed: true,
+        };
+        let str_inst = make_instance("builtins.str", vec![]);
+        assert_eq!(plan("__eq__", &str_inst, &td, &res), Some(2));
+    }
+
+    #[test]
+    fn differing_definers_right_subclass_reverse_first() {
+        // A.__add__ and B.__radd__ are defined in different classes and B
+        // is a subclass of A -> Python evaluates covers_at_runtime(B, A),
+        // which is True -> reverse-first (code 1).
+        let mut a = snap("a.A", "A");
+        a.member_info
+            .entry("__add__".to_string())
+            .or_insert((false, true));
+        let mut b = snap("b.B", "B");
+        b.member_info
+            .entry("__radd__".to_string())
+            .or_insert((false, true));
+        b.mro.push("a.A".to_string());
+        b.mro.push("builtins.object".to_string());
+        a.mro.push("builtins.object".to_string());
+        b.has_base.insert("a.A".to_string());
+        b.has_base.insert("builtins.object".to_string());
+        a.has_base.insert("builtins.object".to_string());
+        let r = make_resolver(vec![a, b, snap("builtins.object", "object")]);
+        let la = make_instance("a.A", vec![]);
+        let rb = make_instance("b.B", vec![]);
+        assert_eq!(plan("__add__", &la, &rb, &r), Some(1));
+    }
+
+    #[test]
+    fn differing_definers_not_covers_normal() {
+        // Same definer setup as above but B is unrelated to A:
+        // covers_at_runtime(B, A) is False -> normal order (code 2). The
+        // pre-#1131 seam deferred here.
+        let mut a = snap("a.A", "A");
+        a.member_info
+            .entry("__add__".to_string())
+            .or_insert((false, true));
+        let mut b = snap("b.B", "B");
+        b.member_info
+            .entry("__radd__".to_string())
+            .or_insert((false, true));
+        b.mro.push("builtins.object".to_string());
+        a.mro.push("builtins.object".to_string());
+        b.has_base.insert("builtins.object".to_string());
+        a.has_base.insert("builtins.object".to_string());
+        let r = make_resolver(vec![a, b, snap("builtins.object", "object")]);
+        let la = make_instance("a.A", vec![]);
+        let rb = make_instance("b.B", vec![]);
         assert_eq!(plan("__add__", &la, &rb, &r), Some(2));
     }
 }
