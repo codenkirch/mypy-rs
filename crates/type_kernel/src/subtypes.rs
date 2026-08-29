@@ -2395,7 +2395,7 @@ fn check_type_parameter(
 /// until no `TypeAliasType` remains. Returns `None` (defer to Python)
 /// when the alias is missing from the resolver, the alias is variadic
 /// (`tvar_tuple_index` set), or any child expansion defers.
-fn expand_aliases(
+pub(crate) fn expand_aliases(
     typ: &Type,
     alias_resolver: &crate::aliases::TypeAliasResolver,
     strict_optional: bool,

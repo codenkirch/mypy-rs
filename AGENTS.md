@@ -2395,6 +2395,31 @@ including:
   is_type_obj-True arm still defers). Parity: 11,027 passed
   (testtypes + testcheck, -n4); cold self-check 0 errors after fixing
   an implicit-reexport test import (ARG_POS off `mypy.types`).
+- solve-path alias expansion (issue #1241): the three defer walls in
+  the type-inference solve paths that cited an alias operand now
+  expand `TypeAliasType` nodes through the alias snapshot before
+  driving the kernel, mirroring Python's eager `get_proper_type` on
+  each operand. `rust_solve_pre_validate` expands the constraint
+  lower/upper-bounds before the replacement arc (no Python-side suite
+  reaches the replacement arc, so it is exercised by 5 Rust unit
+  tests), `expand_actual_arg` gains a 7th `alias_ok` parameter so an
+  actual argument that is (or nests) an alias survives to the
+  constraint engine, and the sgc formal and
+  actual branches of `rust_solve_generic_call` expand their operands
+  before serialization. Formal-path parity is verified at the byte
+  level: the formal result keeps a raw alias (`fixup_wire_type` still
+  refuses any tree containing `TypeAliasType`), so
+  `NativeSolveGenericCallSuite._seam_raw` asserts
+  `raw == _serialize_type_for_checkexpr(python_reference)` instead of
+  object equality. Cold self-check audit: defers
+  `rust_infer_function_type_arguments` 1162 -> 828,
+  `rust_solve_generic_call` 1207 -> 1127, `rust_is_subtype`
+  30422/1631 unchanged (total -414, no regression elsewhere). Covered
+  by `NativeSolvePreValidateAliasSuite` and the alias cases in
+  `NativeSolveGenericCallSuite` (mypy/test/testtypes.py) plus Rust
+  unit tests in `solve.rs` and `checkcall.rs`. Remaining known wall:
+  `s_bound_sub` defers can shift into the inst/inst and cc/cc engine
+  buckets on later audits.
 
 ## Pull Requests
 

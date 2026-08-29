@@ -823,15 +823,37 @@ pub fn rust_solve_generic_call(
         // Standard case: infer constraints for each actual against formal.
         for &ai in actual_indices {
             let actual_type = arg_types_vec.get(ai as usize)?;
-            // Skip None actuals (argument was in a deferred pass).
-            let actual_proper = get_proper_or_none(actual_type)?;
+            // Python's `infer_constraints` applies `get_proper_type` to both
+            // sides at entry (constraints.py:510-512); expand a resolvable
+            // top-level alias instead of deferring it.
+            let actual_expanded;
+            let actual_proper = match actual_type {
+                Type::TypeAliasType { .. } => {
+                    actual_expanded = crate::checkexpr_functions::get_proper_or_expand(
+                        actual_type,
+                        resolver.alias_resolver(),
+                    )?;
+                    get_proper_or_none(&actual_expanded)?
+                }
+                t => get_proper_or_none(t)?,
+            };
             // Star actuals (TupleType against `*args`) are gated Python-side
             // (checkexpr.py `any(k.is_star() ...)`), so a TupleType actual
             // here is positional; ArgTypeExpander passes it 1:1.
             if matches!(actual_proper, Type::UninhabitedType { .. }) {
                 return None;
             }
-            let formal_proper = get_proper_or_none(formal_type)?;
+            let formal_expanded;
+            let formal_proper = match formal_type {
+                Type::TypeAliasType { .. } => {
+                    formal_expanded = crate::checkexpr_functions::get_proper_or_expand(
+                        formal_type,
+                        resolver.alias_resolver(),
+                    )?;
+                    get_proper_or_none(&formal_expanded)?
+                }
+                t => get_proper_or_none(t)?,
+            };
             let constraints = match crate::constraints::infer_constraints_full_inner(
                 formal_proper,
                 actual_proper,
@@ -2156,6 +2178,15 @@ mod tests {
         arg_types: &[Type],
         formal_to_actual: Vec<Vec<i64>>,
     ) -> Option<Vec<u8>> {
+        solve_generic_bytes_with(&test_resolver(), callee, arg_types, formal_to_actual)
+    }
+
+    fn solve_generic_bytes_with(
+        resolver: &crate::typeinfo::NativeTypeResolver,
+        callee: &Type,
+        arg_types: &[Type],
+        formal_to_actual: Vec<Vec<i64>>,
+    ) -> Option<Vec<u8>> {
         let mut cb = WriteBuffer::new();
         write_type(&mut cb, callee).ok()?;
         let arg_blobs: Vec<Vec<u8>> = arg_types
@@ -2170,7 +2201,7 @@ mod tests {
         pyo3::Python::with_gil(|py| {
             rust_solve_generic_call(
                 py,
-                &test_resolver(),
+                &resolver,
                 &cb.into_bytes(),
                 arg_blobs,
                 formal_to_actual,
@@ -2610,5 +2641,105 @@ mod tests {
             &empty_resolver(),
         );
         assert_eq!(out, None);
+    }
+
+    // ------------------------------------------------------------------
+    // alias formal/actual expansion (issue #1241)
+    // ------------------------------------------------------------------
+
+    fn alias_resolver_with_int() -> crate::typeinfo::NativeTypeResolver {
+        let mut r = crate::typeinfo::TypeResolver::new();
+        for snap in [
+            solve_snap("builtins.int"),
+            solve_snap("builtins.str"),
+            solve_snap("builtins.object"),
+        ] {
+            r.insert(snap.fullname.clone(), snap);
+        }
+        let mut ar = crate::aliases::TypeAliasResolver::new();
+        let mut buf = WriteBuffer::new();
+        write_type(&mut buf, &int_instance()).expect("encode int");
+        ar.insert(
+            "mod.IntAlias".to_string(),
+            crate::aliases::TypeAliasSnapshot {
+                fullname: "mod.IntAlias".to_string(),
+                target: buf.into_bytes(),
+                no_args: true,
+                ..Default::default()
+            },
+        );
+        crate::typeinfo::NativeTypeResolver::new(r, ar)
+    }
+
+    #[test]
+    fn solve_generic_alias_actual_resolves() {
+        // identity(mod.IntAlias) with mod.IntAlias = int: the alias actual
+        // expands before constraint inference, so T solves to int; before
+        // the expansion the top-level alias deferred to Python.
+        let resolver = alias_resolver_with_int();
+        let callee = generic_identity();
+        let alias = Type::TypeAliasType {
+            args: vec![],
+            type_ref: "mod.IntAlias".to_string(),
+        };
+        let out = solve_generic_bytes_with(&resolver, &callee, &[alias], vec![vec![0]]);
+        let bytes = out.expect("expected successful solve, got deferral");
+        let mut rb = ReadBuffer::new(&bytes);
+        let resolved = read_type(&mut rb, None).unwrap();
+        assert!(
+            solved_typevar(&resolved),
+            "expected fully-resolved callable"
+        );
+        let Type::CallableType { arg_types, .. } = &resolved else {
+            panic!("expected callable");
+        };
+        assert_eq!(arg_types[0], int_instance());
+    }
+
+    #[test]
+    fn solve_generic_alias_formal_resolves() {
+        // def [T] (x: mod.TAlias) -> None with mod.TAlias = T: the alias
+        // formal expands to the bare TypeVar, so the constraint on T is
+        // inferred and solved; before the expansion it deferred to Python.
+        let mut r = crate::typeinfo::TypeResolver::new();
+        for snap in [
+            solve_snap("builtins.int"),
+            solve_snap("builtins.str"),
+            solve_snap("builtins.object"),
+        ] {
+            r.insert(snap.fullname.clone(), snap);
+        }
+        let mut ar = crate::aliases::TypeAliasResolver::new();
+        let tv = type_var();
+        let mut buf = WriteBuffer::new();
+        write_type(&mut buf, &tv).expect("encode typevar");
+        ar.insert(
+            "mod.TAlias".to_string(),
+            crate::aliases::TypeAliasSnapshot {
+                fullname: "mod.TAlias".to_string(),
+                target: buf.into_bytes(),
+                no_args: true,
+                ..Default::default()
+            },
+        );
+        let resolver = crate::typeinfo::NativeTypeResolver::new(r, ar);
+
+        let mut callee = callable_with_args(vec![Type::TypeAliasType {
+            args: vec![],
+            type_ref: "mod.TAlias".to_string(),
+        }]);
+        let Type::CallableType { variables, .. } = &mut callee else {
+            panic!("expected callable");
+        };
+        variables.push(tv);
+
+        let out = solve_generic_bytes_with(&resolver, &callee, &[int_instance()], vec![vec![0]]);
+        let bytes = out.expect("expected successful solve, got deferral");
+        let mut rb = ReadBuffer::new(&bytes);
+        let resolved = read_type(&mut rb, None).unwrap();
+        assert!(
+            solved_typevar(&resolved),
+            "expected fully-resolved callable"
+        );
     }
 }
