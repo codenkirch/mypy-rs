@@ -1484,112 +1484,6 @@ including:
   (direct seam tag tests + gate-off vs gate-on method differential +
   deferral audit), plus pure decision unit tests in `semanal_visitor.rs`.
 
-- `rust_refers_to_typeddict` (issue #980, mypy.checkexpr) — mirrors the
-  pure bool predicate `ExpressionChecker.refers_to_typeddict`
-  (checkexpr.py:1385-1393), which runs for every call expression. Rust
-  reads the live callee via PyO3 `is_instance` (mirroring
-  `rust_classify_lvalue_validity`): `RefExpr` gate, then `node` as
-  `TypeInfo` with `typeddict_type is not None` (direct reference), then
-  `node` as `TypeAlias` whose target proper-type — serialized to wire
-  bytes by the Python shim — decodes to `Type::TypedDictType`. Returns
-  a plain bool; the only raise is a TypeAlias node without decodable
-  target bytes (unreachable through the shim), which the Python shim
-  treats as a fallback to the pure-Python body. Python keeps the
-  consumer branch (`accept` + `check_typeddict_call`) unchanged.
-  Gated by `_native_checkexpr_active` (existing wiring, no build.py
-  change) and covered by `NativeRefersToTypedDictSuite` in
-  `mypy/test/testtypes.py` (direct seam calls plus gate-off vs gate-on
-  differential over all branches), plus wire round-trip unit tests in
-  `checkexpr_functions.rs`.
-- `rust_classify_tuple_type_implicit` (issue #983) — mirrors the
-  implicit-tuple message-arbitration head of
-  `TypeAnalyser.visit_tuple_type` (typeanal.py:2038-2058): Rust reads
-  three scalars (`t.implicit`, `allow_tuple_literal`, `len(t.items)`)
-  and returns a tag OK (0, normal named_type + anal_array
-  reconstruction), EMPTY (1, `Tuple[()]` suggestion), SINGLE (2,
-  spurious-trailing-comma suggestion), or MULTI (3, `Tuple[T1, ..., Tn]`
-  suggestion). The Python shim applies the
-  "Syntax error in type annotation" fail + one-of-three note and, on OK,
-  the reconstruction; the pure-Python arbitration is the fallback when
-  the gate is off. Never defers: all three facts are scalars, so every
-  triple maps to exactly one tag. Lives in `typeanal_special.rs`,
-  gated by `_set_native_typeanal_active` (wired from `mypy/build.py`)
-  and covered by `NativeTupleTypeImplicitSuite` in `mypy/test/testtypes.py`
-  (gate-off vs gate-on differential plus direct seam calls), plus pure
-  decision unit tests in `typeanal_special.rs`.
-- `rust_check_match_args` (issue #986, rework of the #970 tag-classifier
-  seam into the `rust_is_final_enum_value` pure-bool shape) — mirrors the
-  type predicate of `TypeChecker.check_match_args`
-  (checker.py:3128-3141): Rust reads one wire `typ`, resolves the proper
-  type (defers on an unresolved `TypeAliasType`), and returns
-  `isinstance(TupleType) and all(is_string_literal(item))` as a bool,
-  reusing `is_string_literal_inner` per item. The
-  `scope.active_class()` gate and the `LITERAL_REQ` note emission stay in
-  Python; the shim returns early on a decided bool and falls through to
-  the pure-Python body on `None`. Defers (`None`) on decode failure or an
-  item the string-literal kernel cannot decide (Python's
-  `try_getting_str_literals_from_type` fallback may still answer). Gated
-  differential plus direct seam and alias-deferral calls), and 6 pure
-  unit tests in `checker_functions.rs`.
-- `rust_classify_check_final` (issue #1011) — mirrors the decision head of
-  `TypeChecker.check_final` (checker.py:5095-5196): after the shim computes
-  `flatten_lvalues` and `is_final_decl`, everything left is a pure sequence
-  of message decisions. Rust reads the live lvalues via PyO3 (RefExpr ->
-  Var isinstance gate), the `final_without_value` scalar facts
-  (`final_unset_in_class`, `final_set_in_init`, `is_stub`, `s.type is not
-  None`, `active_class.is_named_tuple`), and the per-lvalue arbitration:
-  the MRO walk over `cls.mro[1:]` looking up `base.names[name]` for a
-  final base Var (emit-once + break) and the own `lv.node.is_final` check
-  (both messages can fire for one lvalue). Rust returns
-  `(without_value, [(name, info_is_none), ...])`; the Python shim applies
-  the `final_without_value` / `cant_assign_to_final` emissions and keeps
-  the pure-Python body as the fallback. Defers (`None`) on any unreadable
-  fact and when the `is_final_decl` pre-check would hit a Python `assert`
-  (non-RefExpr first lvalue / non-Var node) so the original body re-runs
-  and surfaces the same error. The fast no-final path exits after one
-  lookup. Gated by `_native_checker_active` (wired from `mypy/build.py`)
-  and covered by `NativeCheckFinalSuite` in `mypy/test/testtypes.py`
-  (gate-off vs gate-on differential plus direct seam calls), plus pure
-  decision unit tests in `checker_functions.rs`.
-- `rust_classify_class_pattern_ranges` (issue #987) — mirrors the dispatch
-  of `PatternChecker.get_class_pattern_type_ranges`
-  (checkpattern.py:794-832): Rust decodes the wire `typ` and recurses over
-  `UnionType` items Rust-side, returning one branch tag per leaf in union
-  pre-order (FAIL / TYPE_OBJ / CALLABLE_VAR / TYPE_TYPE / ANY). The three
-  class-ref scalars (`isinstance(o.class_ref.node, Var)`, `node.type is
-  not None`, `node.fullname == "typing.Callable"`) are read via PyO3.
-  Python keeps all TypeRange construction from live nodes
-  (`fill_typevars_with_any` / `callable_with_ellipsis` / `named_type`) and
-  the `self.msg.fail` with `typ.str_with_options`. Defers (`None`) on any
-  `TypeAliasType` in the union (Python's `get_proper_type` would expand it
-  from live symbols), an undecodable wire blob, an unreadable class-ref
-  attribute, and any `CallableType`/`Overloaded` whose fallback is not
-  provably `builtins.type` (`is_type_obj` needs the live
-  `fallback.type.is_metaclass()`); an alias ret_type also defers. An
-  `UninhabitedType` ret_type decides `is_type_obj == False` so the scalar
-  class-ref arm still engages. Gated by `_native_checkpattern_active`
-  (already wired from `mypy/build.py`) and covered by
-  `NativeClassPatternRangesSuite` in `mypy/test/testtypes.py` (gate-off vs
-  gate-on differential plus direct seam calls), plus pure decision unit
-  tests in `checkpattern.rs`.
-- `rust_classify_simple_literal_type` (issue #984) — mirrors the 5-way
-  dispatch head of `SemanticAnalyzer.analyze_simple_literal_type`
-  (semanal.py:4720-4749): function_stack truthiness (skip inside a
-  function) and the folded constant kind (None / complex / bool / int /
-  str / float) decide the type-name tag (builtins.bool/int/str/float or
-  None). The Python shim folds the rvalue via the already-native
-  `constant_fold_expr`, applies `named_type_or_none(type_name)`, and
-  when `is_final` wraps the result via
-  `copy_modified(last_known_value=LiteralType(...))`. `cur_mod_id` and
-  `is_final` are carried for signature fidelity but do not affect the
-  decision. Never defers in production: the shim only produces the six
-  known value kinds; an unknown kind (direct seam calls only) defers
-  (`None`) to the pure-Python body. Gated by
-  `_native_semanal_visitor_active` and covered by
-  `NativeSimpleLiteralTypeSuite` in `mypy/test/testtypes.py` (direct
-  seam tag tests + gate-off vs gate-on differential over int/str/float/
-  bool/complex/fold-failure/final-var-ref/inside-function), plus pure
-  decision unit tests in `semanal_visitor.rs`.
 - `rust_get_arg_infer_passes` (issue #1000, `checkcall.rs`) — mirrors
   `ExpressionChecker.get_arg_infer_passes` (checkexpr.py:3563-3633)
   wholesale: a pure two-pass argument-inference classifier with zero
@@ -1842,64 +1736,6 @@ including:
   ordering, reject stepping, star/typeobj/ParamSpec defers, direct
   generic solves) plus the testcheck parity differential.
 
-Stages 1/2 return `None` for any type class Rust does not handle, and
-the Python caller falls back to the pure-Python visitor. This is the
-strangler-fig per-call gate. See "Milestone 3/4/5 (Phase 4)" in
-`docs/rust-migration-strangler.md` for the staging roadmap.
-
-**Rebuild the extension after any change to
-`crates/type_kernel/src/lib.rs`.** The same stale-binary hazard as the
-native parser applies: the on-disk source can look correct while the
-installed `.so` is stale. Build via `cargo rustc` to a scratch dir (not
-`maturin develop`, for the same reason as the other crates):
-
-```bash
-cargo rustc -p mypy-type-kernel --features extension-module --lib \
-  --crate-type cdylib --release -- -C link-arg=-undefined -C link-arg=dynamic_lookup
-cp target/release/libtype_kernel.dylib \
-  /private/tmp/mypy-rs-local-typekernel/type_kernel.cpython-313-darwin.so
-```
-
-Run parity with all three extension dirs prepended to `PYTHONPATH`:
-
-```bash
-PYTHONPATH=/private/tmp/mypy-rs-local-typekernel:/private/tmp/mypy-rs-local-resolver:/private/tmp/mypy-rs-local-ast \
-  TEST_NATIVE_TYPE_KERNEL=1 TEST_NATIVE_PARSER=1 TEST_NATIVE_RESOLVER=1 \
-  uv run python -m pytest mypy/test/testtypes.py mypy/test/testcheck.py -q
-```
-
-The type-kernel gate is default-on in production (`native_type_kernel =
-True`). The `TEST_NATIVE_TYPE_KERNEL=1` env var is the parity
-differential: the test harnesses override the option *after* option
-parsing (`mypy/test/helpers.py`), so the kernel runs in direct
-comparison with the pure-Python visitors and parity is verified both
-ways. Without the env var the default-on option governs. The build
-manager propagates `Options.native_type_kernel` to module-level flags in
-each kernel module at the start of each build
-(`_set_native_erase_active` etc. in `mypy/build.py`), so the hot paths
-avoid an options lookup per call.
-
-## Pull Requests
-
-The default branch on this fork is `main` (not `master`). Always target
-`main` as the PR base. Branch from `main` before committing — do not commit
-directly to `main`.
-  all-inherited, mixed, base-slots-None, and multiple-bases cases).
-- `rust_is_recursive_pair` (issue #966) — mirrors
-  `mypy.typeops.is_recursive_pair` (typeops.py:249-274), the pure bool
-  predicate gating `join_types` / `meet_types` / `is_subtype` against
-  infinite recursion. Rust classifies two wire Type bytes plus the live
-  `is_recursive` flags (the wire `TypeAliasType` has no `is_recursive`
-  field; it needs the live `TypeAlias` node). The alias-chain expansion
-  (`get_proper_type`) runs through the snapshot alias resolver
-  (`expand_alias_shape`); a missing snapshot or an alias cycle defers
-  (`None`) and the Python caller falls back. `or`-chain short-circuit is
-  preserved by checking the resolver-free branch (`t_rec`/`s_rec`) first;
-  a later resolver-dependent branch defers only when no earlier branch
-  already returned `True`. Gated by `_native_typeops_active` (wired from
-  `mypy/build.py`) and covered by `NativeIsRecursivePairSuite` in
-  `mypy/test/testtypes.py` (gate-off vs gate-on differential plus direct
-  seam calls), plus 6 pure decision unit tests in `typeops.rs`.
 - `rust_make_inferred_type_note` (issue #982) — mirrors the pure bool
   decision of `Messages.make_inferred_type_note` (messages.py:3770-3800):
   Rust decodes the serialized subtype/supertype pair and runs the
@@ -2559,3 +2395,10 @@ directly to `main`.
   is_type_obj-True arm still defers). Parity: 11,027 passed
   (testtypes + testcheck, -n4); cold self-check 0 errors after fixing
   an implicit-reexport test import (ARG_POS off `mypy.types`).
+
+## Pull Requests
+
+The default branch on this fork is `main` (not `master`). Always target
+`main` as the PR base. Branch from `main` before committing — do not commit
+directly to `main`.
+
