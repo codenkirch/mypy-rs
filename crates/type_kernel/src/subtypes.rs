@@ -652,15 +652,56 @@ pub(crate) fn is_subtype(
         {
             return is_subtype(left_item, right_item, ctx, resolver);
         }
-        // right is CallableType: Type[X] <: Callable is unsound but done.
-        // We don't check __init__ signature.
-        if matches!(right, Type::CallableType { .. } | Type::Overloaded { .. }) {
-            // Check if left.item has a __call__ equivalent.
-            // Simplified: if left_item is Instance, get its type_object_type
-            // and check return type match. For full parity, we defer to Python
-
-            // the complex callable matching.
-            return None;
+        // right is Overloaded (subtypes.py:1240-1243): only a constructor
+        // overload qualifies (items[0].is_type_obj() decides); then
+        // `left <: right.items[0]`, a TypeType-vs-CallableType recursion.
+        if let Type::Overloaded { items: right_items } = right {
+            let Some(first) = right_items.first() else {
+                return None;
+            };
+            return match crate::callable_compat::is_type_obj(first, resolver) {
+                Some(true) => is_subtype(left, first, ctx, resolver),
+                Some(false) => Some(false),
+                None => None,
+            };
+        }
+        // right is CallableType (subtypes.py:1245-1278). Type[X] <: Callable
+        // is unsound (no __init__ check): the item is compared against
+        // right.ret_type, except for an Instance item (type_object_type).
+        if let Type::CallableType {
+            ret_type: right_ret, ..
+        } = right
+        {
+            // subtypes.py:1246-1250: a proper-subtype comparison of
+            // Type[X] against a non-type-object Callable is False
+            // (transitivity); a deferred is_type_obj defers.
+            if ctx.proper_subtype {
+                match crate::callable_compat::is_type_obj(right, resolver) {
+                    Some(false) => return Some(false),
+                    Some(true) => {}
+                    None => return None,
+                }
+            }
+            // subtypes.py:1251-1255: a TupleType item compares via its
+            // tuple_fallback; a fallback failure defers.
+            let mut item: Option<Type> = None;
+            let item_ref: &Type = if let Type::TupleType { .. } = left_item.as_ref() {
+                let Some(tf) = crate::typeops::tuple_fallback(left_item.as_ref(), resolver) else {
+                    return None;
+                };
+                item = Some(tf);
+                item.as_ref().unwrap()
+            } else {
+                left_item.as_ref()
+            };
+            // subtypes.py:1256-1268: an Instance item needs the live
+            // type_object_type (init/new MRO selection + class_callable),
+            // which the wire snapshot does not carry. Defer; Python re-runs.
+            if matches!(item_ref, Type::Instance { .. }) {
+                return None;
+            }
+            // subtypes.py:1271: fallthrough — unsound, no __init__ check.
+            return is_subtype(left_item, right_ret, ctx, resolver);
         }
         // right is Instance (subtypes.py:1244-1256).
         if let Type::Instance {
@@ -770,7 +811,23 @@ pub(crate) fn is_subtype(
             return Some(true);
         }
         let Type::Overloaded { items: right_items } = right else {
-            return None;
+            // subtypes.py:1169-1177 tail: right UnboundType -> True; right
+            // TypeType -> `left.is_type_obj() and left.items[0] <: right`
+            // (items share the type-object status); any other right: False.
+            if matches!(right, Type::UnboundType { .. }) {
+                return Some(true);
+            }
+            if let Type::TypeType { .. } = right {
+                let Some(first) = left_items.first() else {
+                    return None;
+                };
+                return match crate::callable_compat::is_type_obj(first, resolver) {
+                    Some(true) => is_subtype(first, right, ctx, resolver),
+                    Some(false) => Some(false),
+                    None => None,
+                };
+            }
+            return Some(false);
         };
         let mut previous_match_left_index: i64 = -1;
         let mut matched_overloads: HashSet<usize> = HashSet::new();
@@ -827,6 +884,16 @@ pub(crate) fn is_subtype(
             }
         }
         return Some(true);
+    }
+    // visit_parameters (subtypes.py:1381-1418): Parameters left. The
+    // right-Parameters case routes through `are_parameters_compatible` and
+    // defers; right-Instance is the pure `builtins.object` check; else False.
+    if let Type::Parameters(..) = left {
+        return match right {
+            Type::Instance { type_ref, .. } => Some(type_ref == "builtins.object"),
+            Type::Parameters(..) => None,
+            _ => Some(false),
+        };
     }
     // visit_callable_type (subtypes.py:807-889): CallableType left. The
     // Callable-vs-Callable case is handled by the separate callable_compat
@@ -1412,10 +1479,9 @@ fn visit_instance_noninstance_right(
         }
         // Fall through to the FunctionLike/literal/False tail.
     }
-    // FunctionLike right needs `find_member("__call__", ...)` (subtypes.py:678-
-    // 682). When the MRO snapshot provably has no `__call__` (is_operator=True
-    // skips the dunder accessor scan), Python misses and returns False directly;
-    // an existing `__call__` needs member analysis and still defers to Python.
+    // FunctionLike right needs `find_member("__call__", ...)` (subtypes.py:
+    // 678-682). A MRO snapshot without `__call__` (is_operator=True skips the
+    // dunder scan) answers False; an existing one still defers to Python.
     if matches!(right, Type::CallableType { .. } | Type::Overloaded { .. }) {
         if let Type::Instance {
             type_ref,
@@ -2376,9 +2442,8 @@ fn expand_aliases_depth(
                 Some(s) => s,
                 None => {
                     // Issue #1205 best-effort: an unexpansible alias node is
-                    // kept in place (the same contract the #1149 cut ships:
-                    // the engine defers on every alias node it meets), so
-                    // only comparisons that actually reach it defer.
+                    // kept in place (the #1149 contract: the engine defers on
+                    // every alias node), so only comparisons reaching it defer.
                     return Some(typ.clone());
                 }
             };
@@ -2450,9 +2515,8 @@ fn expand_aliases_depth(
                         Some(t) => t,
                         None => {
                             // Substitution walls (ParamSpec / Unpack
-                            // variables and var-args) are legitimate
-                            // Python-side work; keep this alias node
-                            // unexpanded rather than failing the entry.
+                            // variables and var-args) are Python-side work:
+                            // keep the alias node unexpanded, don't fail.
                             active.pop();
                             return Some(typ.clone());
                         }
@@ -5178,6 +5242,335 @@ mod tests {
         let left = Type::Overloaded { items: vec![item] };
         let right = instance("mod.CallProto", vec![]);
         assert_eq!(is_subtype(&left, &right, &ctx_nominal(), &r), None);
+    }
+
+    #[test]
+    fn overloaded_left_unbound_right_is_true() {
+        // subtypes.py:1169: right UnboundType -> True. Non-proper contexts
+        // short-circuit True at _is_subtype (subtypes.py:754-761), so a
+        // proper context is what reaches the visit_overloaded tail.
+        let r = make_resolver(vec![snap("builtins.function", "function")]);
+        let left = Type::Overloaded {
+            items: vec![callable_type(vec![], Type::NoneType, None)],
+        };
+        let right = Type::UnboundType {
+            name: "A".to_string(),
+            args: vec![],
+            original_str_expr: None,
+            original_str_fallback: None,
+        };
+        assert_eq!(is_subtype(&left, &right, &ctx_proper(), &r), Some(true));
+    }
+
+    #[test]
+    fn overloaded_left_non_type_obj_not_subtype_of_type_type() {
+        // subtypes.py:1171-1177: items[0].is_type_obj() is False (plain
+        // builtins.function fallback) -> False.
+        let r = make_resolver(vec![snap("builtins.function", "function")]);
+        let left = Type::Overloaded {
+            items: vec![callable_type(vec![], instance("a.A", vec![]), None)],
+        };
+        let right = Type::TypeType {
+            item: Box::new(instance("a.A", vec![])),
+            is_type_form: false,
+        };
+        assert_eq!(is_subtype(&left, &right, &ctx_nominal(), &r), Some(false));
+    }
+
+    #[test]
+    fn overloaded_left_type_obj_item_subtype_of_type_type_recurses() {
+        // subtypes.py:1171-1177: items[0].is_type_obj() is True (metaclass
+        // fallback); recurse on items[0]. A constructor callable with
+        // instance_type compares it against right.item.
+        let mut meta = snap("a.M", "M");
+        meta.has_base.insert("builtins.type".to_string());
+        meta.mro.push("builtins.type".to_string());
+        let r = make_resolver(vec![meta, snap("a.A", "A")]);
+        let ctor = Type::CallableType {
+            fallback: Box::new(instance("a.M", vec![])),
+            instance_type: Some(Box::new(instance("a.A", vec![]))),
+            is_ellipsis_args: false,
+            implicit: false,
+            is_bound: false,
+            from_concatenate: false,
+            imprecise_arg_kinds: false,
+            unpack_kwargs: false,
+            from_type_type: false,
+            arg_types: vec![],
+            arg_kinds: vec![],
+            arg_names: vec![],
+            ret_type: Box::new(instance("a.A", vec![])),
+            name: None,
+            variables: vec![],
+            type_guard: None,
+            type_is: None,
+        };
+        let left = Type::Overloaded {
+            items: vec![ctor.clone()],
+        };
+        let right = Type::TypeType {
+            item: Box::new(instance("a.A", vec![])),
+            is_type_form: false,
+        };
+        assert_eq!(is_subtype(&left, &right, &ctx_nominal(), &r), Some(true));
+    }
+
+    #[test]
+    fn overloaded_left_unresolvable_fallback_defers_on_type_type() {
+        // subtypes.py:1171-1177: items[0].is_type_obj() needs the fallback
+        // snapshot; a missing one defers.
+        let r = make_resolver(vec![]);
+        let left = Type::Overloaded {
+            items: vec![callable_type(vec![], instance("a.A", vec![]), None)],
+        };
+        let right = Type::TypeType {
+            item: Box::new(instance("a.A", vec![])),
+            is_type_form: false,
+        };
+        assert_eq!(is_subtype(&left, &right, &ctx_nominal(), &r), None);
+    }
+
+    #[test]
+    fn overloaded_left_not_subtype_of_none_right() {
+        // subtypes.py:1178: any other right shape (NoneType) -> False.
+        let r = make_resolver(vec![snap("builtins.function", "function")]);
+        let left = Type::Overloaded {
+            items: vec![callable_type(vec![], Type::NoneType, None)],
+        };
+        assert_eq!(
+            is_subtype(&left, &Type::NoneType, &ctx_nominal(), &r),
+            Some(false)
+        );
+    }
+
+    // ---- TypeType left, right CallableType/Overloaded (issue #1225,
+    // subtypes.py:1240-1278) ----
+
+    fn ctx_proper() -> SubtypeContext {
+        // (ignore_type_params, ignore_declared_variance, always_covariant,
+        //  ignore_promotions, proper_subtype, strict_optional)
+        SubtypeContext::new(false, false, false, false, true, true)
+    }
+
+    fn type_obj_callable(ret_type: Type) -> Type {
+        // A CallableType whose fallback is a metaclass so
+        // callable_compat::is_type_obj answers True.
+        Type::CallableType {
+            fallback: Box::new(instance("a.M", vec![])),
+            instance_type: None,
+            is_ellipsis_args: false,
+            implicit: false,
+            is_bound: false,
+            from_concatenate: false,
+            imprecise_arg_kinds: false,
+            unpack_kwargs: false,
+            from_type_type: false,
+            arg_types: vec![],
+            arg_kinds: vec![],
+            arg_names: vec![],
+            ret_type: Box::new(ret_type),
+            name: None,
+            variables: vec![],
+            type_guard: None,
+            type_is: None,
+        }
+    }
+
+    fn type_type(item: Type) -> Type {
+        Type::TypeType {
+            item: Box::new(item),
+            is_type_form: false,
+        }
+    }
+
+    #[test]
+    fn type_type_proper_subtype_of_non_type_obj_callable_is_false() {
+        // subtypes.py:1246-1250: a proper subtype check of Type[X] against
+        // a callable that is not a type object is False (transitivity).
+        let r = make_resolver(vec![snap("builtins.function", "function")]);
+        let left = type_type(Type::NoneType);
+        let right = callable_type(vec![], instance("builtins.object", vec![]), None);
+        assert_eq!(
+            is_subtype(&left, &right, &ctx_proper(), &r),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn type_type_instance_item_defers_on_callable_right() {
+        // subtypes.py:1256-1268: an Instance item needs the live
+        // type_object_type; defer. The proper gate passes (right is a
+        // metaclass-fallback callable, i.e. a type object).
+        let r = make_resolver(vec![
+            snap("builtins.function", "function"),
+            snap("a.A", "A"),
+        ]);
+        let left = type_type(instance("a.A", vec![]));
+        let right = type_obj_callable(instance("builtins.object", vec![]));
+        assert_eq!(is_subtype(&left, &right, &ctx_nominal(), &r), None);
+    }
+
+    #[test]
+    fn type_type_proper_gate_defers_when_right_fallback_unresolvable() {
+        // subtypes.py:1246-1250 with is_type_obj undecidable (missing
+        // fallback snapshot): defer.
+        let r = make_resolver(vec![snap("a.A", "A")]);
+        let left = type_type(instance("a.A", vec![]));
+        let right = callable_type(vec![], instance("builtins.object", vec![]), None);
+        assert_eq!(is_subtype(&left, &right, &ctx_proper(), &r), None);
+    }
+
+    #[test]
+    fn type_type_tuple_item_takes_fallback_then_defers() {
+        // subtypes.py:1251-1255: a TupleType item is compared via its
+        // tuple_fallback (an Instance builtins.tuple[...]), whose
+        // constructor needs live machinery -> defer.
+        let r = make_resolver(vec![
+            snap("builtins.function", "function"),
+            snap("a.A", "A"),
+        ]);
+        let left = type_type(tuple_type(vec![instance("builtins.int", vec![])]));
+        let right = type_obj_callable(instance("a.A", vec![]));
+        assert_eq!(is_subtype(&left, &right, &ctx_nominal(), &r), None);
+    }
+
+    #[test]
+    fn type_type_item_none_falls_through_to_ret_type_check() {
+        // subtypes.py:1271: otherwise the unsound fallthrough compares the
+        // item against right.ret_type: NoneType <: object -> True.
+        let r = make_resolver(vec![
+            snap("builtins.function", "function"),
+            snap("builtins.object", "object"),
+        ]);
+        let left = type_type(Type::NoneType);
+        let right = type_obj_callable(instance("builtins.object", vec![]));
+        assert_eq!(
+            is_subtype(&left, &right, &ctx_nominal(), &r),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn type_type_right_overloaded_non_type_obj_is_false() {
+        // subtypes.py:1240-1243: only a constructor overload qualifies;
+        // items[0].is_type_obj() is False -> the overload falls through the
+        // CallableType/Instance arms to `return False`.
+        let r = make_resolver(vec![snap("builtins.function", "function")]);
+        let left = type_type(Type::NoneType);
+        let right = Type::Overloaded {
+            items: vec![callable_type(vec![], instance("a.A", vec![]), None)],
+        };
+        assert_eq!(
+            is_subtype(&left, &right, &ctx_nominal(), &r),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn type_type_right_type_obj_overloaded_recurses_on_first_item() {
+        // subtypes.py:1240-1243: a constructor overload recurses on
+        // items[0]: Type[None] <: Callable[..., object] via the fallthrough
+        // -> True.
+        let mut meta = snap("a.M", "M");
+        meta.has_base.insert("builtins.type".to_string());
+        meta.mro.push("builtins.type".to_string());
+        let r = make_resolver(vec![
+            meta,
+            snap("builtins.function", "function"),
+            snap("builtins.object", "object"),
+        ]);
+        let left = type_type(Type::NoneType);
+        let right = Type::Overloaded {
+            items: vec![type_obj_callable(instance("builtins.object", vec![]))],
+        };
+        assert_eq!(is_subtype(&left, &right, &ctx_nominal(), &r), Some(true));
+    }
+
+    #[test]
+    fn type_type_right_overloaded_unresolvable_item_defers() {
+        // subtypes.py:1240-1243: is_type_obj on the first overload item
+        // needs its fallback snapshot; a missing one defers.
+        let r = make_resolver(vec![]);
+        let left = type_type(Type::NoneType);
+        let right = Type::Overloaded {
+            items: vec![callable_type(vec![], instance("a.A", vec![]), None)],
+        };
+        assert_eq!(is_subtype(&left, &right, &ctx_nominal(), &r), None);
+    }
+
+    #[test]
+    fn type_type_right_unbound_is_false() {
+        // subtypes.py:1279: a non-Callable, non-Overloaded, non-Instance
+        // right (UnboundType) falls to the tail -> False. Proper context:
+        // non-proper Unbound-right short-circuits True at _is_subtype.
+        let r = make_resolver(vec![snap("builtins.function", "function")]);
+        let left = type_type(Type::NoneType);
+        let right = Type::UnboundType {
+            name: "A".to_string(),
+            args: vec![],
+            original_str_expr: None,
+            original_str_fallback: None,
+        };
+        assert_eq!(is_subtype(&left, &right, &ctx_proper(), &r), Some(false));
+    }
+
+    // ---- Parameters left (issue #1225, visit_parameters
+    // subtypes.py:1381-1418) ----
+
+    fn parameters(arg_types: Vec<Type>) -> Type {
+        Type::Parameters(crate::wire::Parameters {
+            arg_types,
+            arg_kinds: vec![],
+            arg_names: vec![],
+            variables: vec![],
+            imprecise_arg_kinds: false,
+            is_ellipsis_args: false,
+        })
+    }
+
+    #[test]
+    fn parameters_left_subtype_of_object() {
+        // subtypes.py:1414-1416: right Instance builtins.object -> True.
+        let r = make_resolver(vec![]);
+        let left = parameters(vec![instance("builtins.int", vec![])]);
+        assert_eq!(
+            is_subtype(&left, &instance("builtins.object", vec![]), &ctx_nominal(), &r),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn parameters_left_not_subtype_of_other_instance() {
+        // subtypes.py:1414-1416: a non-object Instance right -> False.
+        let r = make_resolver(vec![snap("a.A", "A")]);
+        let left = parameters(vec![instance("builtins.int", vec![])]);
+        assert_eq!(
+            is_subtype(&left, &instance("a.A", vec![]), &ctx_nominal(), &r),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn parameters_left_defers_on_parameters_right() {
+        // subtypes.py:1392-1413: right Parameters routes through
+        // are_parameters_compatible; the engine cannot decide this shape ->
+        // defer to Python.
+        let r = make_resolver(vec![]);
+        let left = parameters(vec![instance("builtins.int", vec![])]);
+        let right = parameters(vec![instance("builtins.object", vec![])]);
+        assert_eq!(is_subtype(&left, &right, &ctx_nominal(), &r), None);
+    }
+
+    #[test]
+    fn parameters_left_not_subtype_of_callable() {
+        // subtypes.py:1417-1418: any other right (CallableType) -> False.
+        let r = make_resolver(vec![snap("builtins.function", "function")]);
+        let left = parameters(vec![instance("builtins.int", vec![])]);
+        let right = callable_type(vec![], Type::NoneType, None);
+        assert_eq!(
+            is_subtype(&left, &right, &ctx_nominal(), &r),
+            Some(false)
+        );
     }
 
     // ---- visit_callable_type (issue #443, subtypes.py:807-889) ----
