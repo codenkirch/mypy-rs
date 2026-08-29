@@ -931,6 +931,10 @@ def replace_modules_with_new_variants(
             merge_asts(preserved_module, preserved_module.names, new_module, new_module.names)
             manager.modules[id] = preserved_module
             graph[id].tree = preserved_module
+            # merge_asts re-homed merged TypeInfo identities onto the old
+            # AST nodes; the wirefixup maps installed during semantic
+            # analysis still hold the abandoned pre-merge objects.
+            manager._refresh_native_wirefixup_maps(preserved_module)
 
 
 def propagate_changes_using_dependencies(
@@ -1128,6 +1132,10 @@ def reprocess_nodes(
     for name in old_symbols:
         if name in new_symbols:
             merge_asts(file_node, old_symbols[name], file_node, new_symbols[name])
+    # Same wirefixup refresh as `replace_modules_with_new_variants`: the
+    # merges above re-homed merged TypeInfo identities onto the old AST
+    # nodes after semantic analysis installed the pre-merge objects.
+    manager._refresh_native_wirefixup_maps(file_node)
 
     # Type check.
     from mypy.types import _set_type_wire_cache_enabled

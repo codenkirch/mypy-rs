@@ -1672,28 +1672,9 @@ class BuildManager:
         # The accumulated typeinfo map is re-created for the new build;
         # wire decodes resolved against the old map must not survive.
         # Cleared here (per-manager reset), not by the per-SCC None reset.
-        from mypy.checker import _clear_checker_deser_cache
-        from mypy.checkexpr import _clear_argtypes_plan_cache
-        from mypy.checkmember import _clear_deser_cache
-        from mypy.erasetype import _clear_erase_decode_cache
-        from mypy.expandtype import _clear_expand_decode_cache
-        from mypy.maptype import _clear_map_supertype_decode_cache
-        from mypy.meet import _clear_narrow_decode_cache
-        from mypy.subtypes import _clear_subtype_batch, _clear_subtype_decode_cache
-        from mypy.typeops import _clear_typeops_decode_cache
-        from mypy.typevars import _clear_typevars_decode_cache
+        from mypy.wirefixup import clear_wire_decode_caches
 
-        _clear_deser_cache()
-        _clear_checker_deser_cache()
-        _clear_erase_decode_cache()
-        _clear_argtypes_plan_cache()
-        _clear_typeops_decode_cache()
-        _clear_typevars_decode_cache()
-        _clear_map_supertype_decode_cache()
-        _clear_subtype_decode_cache()
-        _clear_subtype_batch()
-        _clear_narrow_decode_cache()
-        _clear_expand_decode_cache()
+        clear_wire_decode_caches()
         from mypy.join import _set_native_join_resolver, _set_native_join_typeinfo_map
         from mypy.mro import _set_native_mro_resolver
         from mypy.nodes import _clear_native_metaclass_memo
@@ -1791,6 +1772,55 @@ class BuildManager:
         # invalidation `set_wire_typeinfo_map` owns.
         set_wire_typeinfo_map(self._native_typeinfo_map)
         set_wire_alias_map(self._native_alias_map)
+
+    def _refresh_native_wirefixup_maps(self, module: MypyFile) -> None:
+        """Re-home wirefixup map entries after fine-grained merge_asts.
+
+        `merge_asts` swaps merged module identities onto the old AST nodes
+        (old TypeInfo objects receive the new variant's state), but the
+        wirefixup maps installed during semantic analysis still hold the
+        abandoned pre-merge TypeInfo objects. Any post-merge wire decode
+        would then re-home to the abandoned object, so walk the merged
+        module's symbol tables and flip every entry whose value identity
+        changed, clearing the decode caches on any flip.
+        """
+        if not self.options.native_type_kernel:
+            return
+        from mypy.nodes import TypeAlias, TypeInfo
+        from mypy.wirefixup import (
+            clear_wire_decode_caches,
+            set_wire_alias_map,
+            set_wire_typeinfo_map,
+        )
+
+        changed = False
+        for sym in module.names.values():
+            node = sym.node
+            if isinstance(node, TypeInfo):
+                infos = [node]
+                self._collect_nested_type_infos(node, infos)
+                for info in infos:
+                    if self._native_typeinfo_map.get(info.fullname) is not info:
+                        self._native_typeinfo_map[info.fullname] = info
+                        changed = True
+                aliases: list[TypeAlias] = []
+                self._collect_nested_aliases(node, aliases)
+                for alias in aliases:
+                    if self._native_alias_map.get(alias.fullname) is not alias:
+                        self._native_alias_map[alias.fullname] = alias
+                        changed = True
+            elif isinstance(node, TypeAlias):
+                if self._native_alias_map.get(node.fullname) is not node:
+                    self._native_alias_map[node.fullname] = node
+                    changed = True
+        if changed:
+            # The map identity is unchanged, so `set_wire_typeinfo_map`'s
+            # invalidation would not fire; clear the decode caches
+            # explicitly (they may hold pre-merge resolutions).
+            clear_wire_decode_caches()
+            # Same-dict installs: re-point the module-level wire globals.
+            set_wire_typeinfo_map(self._native_typeinfo_map)
+            set_wire_alias_map(self._native_alias_map)
 
     def _build_plugin_hook_registry(self) -> None:
         """Build the Stage 4 plugin-hook snapshot and install it.
