@@ -1753,6 +1753,11 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         typeanal_queries::rust_find_self_type,
         module
     )?)?;
+    // Issue #1157: resolver-backed find_self_type with alias expansion.
+    module.add_function(wrap_pyfunction!(
+        typeanal_queries::rust_find_self_type_live,
+        module
+    )?)?;
     module.add_function(wrap_pyfunction!(
         typeanal_queries::rust_validate_instance,
         module

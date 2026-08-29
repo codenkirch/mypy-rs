@@ -27,7 +27,7 @@
 //!
 //! Live-object queries (Stage 18):
 //! - `find_self_type` — BoolTypeQuery with lookup callback, checks SELF_TYPE_NAMES.
-//! - `validate_instance` — argument count/position validation on a live Instance.
+//!   `TypeAliasType` expands through the alias snapshot (issue #1157).
 //! - `check_vec_type_args` — vec type argument validation.
 //! - `is_typevar_default_recursive` — BFS over `default_depends` graph.
 //! - `detect_diverging_alias` — DivergingAliasDetector visitor.
@@ -653,14 +653,16 @@ fn unknown_unpack_live_inner(t: &Type, aliases: &TypeAliasResolver) -> Option<bo
 
 /// `mypy.typeanal.find_self_type` — true if `typ` contains a Self type.
 ///
-/// Mirrors `HasSelfType` (typeanal.py:2846-2855): a `BoolTypeQuery` with
+/// Mirrors `HasSelfType` (typeanal.py:4361-4370): a `BoolTypeQuery` with
 /// `ANY_STRATEGY` that overrides `visit_unbound_type` to check if the
 /// unbound name resolves to a symbol in `SELF_TYPE_NAMES`. All other
 /// type variants use the default `BoolTypeQuery` descent (ANY_STRATEGY
 /// over children).
 ///
 /// `lookup` is a Python callable `Callable[[str], SymbolTableNode | None]`.
-/// Returns `None` (defer) when a type variant is not handled by Rust.
+/// Returns `None` (defer) when a type variant is not handled by Rust, or
+/// when a `TypeAliasType` cannot be expanded (no resolver — the Python
+/// fallback then runs the full `HasSelfType` visitor).
 #[pyfunction]
 pub(crate) fn rust_find_self_type(
     py: Python<'_>,
@@ -671,27 +673,109 @@ pub(crate) fn rust_find_self_type(
         Ok(r) => r,
         Err(_) => return Ok(None),
     };
-    let ctx = SelfTypeCtx {
+    let mut ctx = SelfTypeCtx {
         refs: &refs,
-        lookup,
+        lookup: &SelfLookup::Py(lookup),
+        aliases: None,
+        seen_aliases: Vec::new(),
     };
-    match find_self_type_inner(py, typ, &ctx) {
+    run_find_self_type(py, &mut ctx, typ)
+}
+
+/// Resolver-backed `rust_find_self_type` (issue #1157): the live walk is
+/// identical, but a `TypeAliasType` expands through the
+/// `NativeTypeResolver` alias snapshot, mirroring
+/// `BoolTypeQuery.visit_type_alias_type` (type_visitor.py:599-617):
+/// the substituted target, plus `t.args` for new-style (PEP 695)
+/// aliases, folded with ANY_STRATEGY. A missing snapshot, an unreadable
+/// alias node, or an undecidable expansion defers (`None`) to the
+/// pure-Python visitor.
+#[pyfunction]
+pub(crate) fn rust_find_self_type_live(
+    py: Python<'_>,
+    resolver: &NativeTypeResolver,
+    typ: &PyAny,
+    lookup: &PyAny,
+) -> PyResult<Option<bool>> {
+    let refs = match TypeRefs::try_new(py) {
+        Ok(r) => r,
+        Err(_) => return Ok(None),
+    };
+    let mut ctx = SelfTypeCtx {
+        refs: &refs,
+        lookup: &SelfLookup::Py(lookup),
+        aliases: Some(resolver.alias_resolver()),
+        seen_aliases: Vec::new(),
+    };
+    run_find_self_type(py, &mut ctx, typ)
+}
+
+fn run_find_self_type(
+    py: Python<'_>,
+    ctx: &mut SelfTypeCtx<'_>,
+    typ: &PyAny,
+) -> PyResult<Option<bool>> {
+    match find_self_type_inner(py, typ, ctx) {
         Ok(b) => Ok(Some(b)),
         Err(DeferError) => Ok(None),
     }
 }
 
+#[derive(Debug, PartialEq)]
 pub(crate) struct DeferError;
 
 struct SelfTypeCtx<'a> {
     refs: &'a TypeRefs<'a>,
-    lookup: &'a PyAny,
+    lookup: &'a SelfLookup<'a>,
+    /// Alias snapshots for `TypeAliasType` expansion; `None` defers.
+    aliases: Option<&'a TypeAliasResolver>,
+    /// `self.seen_aliases`: identity guard over the whole query,
+    /// push-never-pop like the Python set (type_visitor.py:602-608).
+    seen_aliases: Vec<usize>,
+}
+
+/// `HasSelfType.lookup` shim: the production seam takes a live Python
+/// callable; the cfg(test) unit tests use a plain name-to-fullname table.
+enum SelfLookup<'a> {
+    Py(&'a PyAny),
+    #[cfg(test)]
+    Table(std::collections::HashMap<String, String>),
+}
+
+impl SelfLookup<'_> {
+    /// `sym.fullname` for `lookup(name)`; `Ok(None)` on a miss, defer
+    /// on an unreadable symbol or a raising callback.
+    fn fullname(&self, name: &str) -> Result<Option<String>, DeferError> {
+        match self {
+            SelfLookup::Py(cb) => {
+                let sym = cb.call1((name,)).map_err(|_| DeferError)?;
+                if sym.is_none() {
+                    return Ok(None);
+                }
+                let fullname = sym.getattr("fullname").map_err(|_| DeferError)?;
+                if fullname.is_none() {
+                    return Ok(None);
+                }
+                let s = fullname.downcast::<PyString>().map_err(|_| DeferError)?;
+                s.to_str()
+                    .map(|f| Some(f.to_string()))
+                    .map_err(|_| DeferError)
+            }
+            #[cfg(test)]
+            SelfLookup::Table(table) => Ok(table.get(name).cloned()),
+        }
+    }
+}
+
+/// `SELF_TYPE_NAMES` (typeanal.py:146).
+fn is_self_fullname(fullname: &str) -> bool {
+    fullname == "typing.Self" || fullname == "typing_extensions.Self"
 }
 
 fn find_self_type_inner(
     py: Python<'_>,
     obj: &PyAny,
-    ctx: &SelfTypeCtx<'_>,
+    ctx: &mut SelfTypeCtx<'_>,
 ) -> Result<bool, DeferError> {
     // UnboundType: lookup name, check SELF_TYPE_NAMES, then descend args.
     if class_name_is(obj, "UnboundType") {
@@ -793,12 +877,11 @@ fn find_self_type_inner(
         let item = get_attr_or_defer(obj, "item")?;
         return find_self_type_inner(py, item, ctx);
     }
-    // TypeAliasType: recurse args only. Known divergence (#1122): the
-    // Python visit_type_alias_type also queries the resolved target (plus
-    // args for python_3_12_type_alias); porting needs live alias state.
+    // TypeAliasType: expand through the alias snapshot (issue #1157),
+    // mirroring BoolTypeQuery.visit_type_alias_type — the expanded
+    // proper target, plus `t.args` for PEP 695 aliases.
     if is_instance(obj, ctx.refs.type_alias_type) {
-        let args = get_attr_or_defer(obj, "args")?;
-        return self_type_any_seq(py, args, ctx);
+        return self_type_visit_alias(py, obj, ctx);
     }
     // Parameters: recurse arg_types.
     if class_name_is(obj, "Parameters") {
@@ -827,7 +910,7 @@ fn find_self_type_inner(
 fn self_type_visit_unbound(
     py: Python<'_>,
     obj: &PyAny,
-    ctx: &SelfTypeCtx<'_>,
+    ctx: &mut SelfTypeCtx<'_>,
 ) -> Result<bool, DeferError> {
     let name = obj.getattr("name").map_err(|_| DeferError)?;
     let name_str: String = if name.is_none() {
@@ -837,15 +920,9 @@ fn self_type_visit_unbound(
         s.to_str().map(|s| s.to_string()).map_err(|_| DeferError)?
     };
     // Call lookup(name) -> SymbolTableNode | None.
-    let sym = ctx.lookup.call1((&name_str,)).map_err(|_| DeferError)?;
-    if !sym.is_none() {
-        let fullname = sym.getattr("fullname").map_err(|_| DeferError)?;
-        if !fullname.is_none() {
-            let fn_str = fullname.downcast::<PyString>().map_err(|_| DeferError)?;
-            let fn_s = fn_str.to_str().map_err(|_| DeferError)?;
-            if fn_s == "typing.Self" || fn_s == "typing_extensions.Self" {
-                return Ok(true);
-            }
+    if let Some(fullname) = ctx.lookup.fullname(&name_str)? {
+        if is_self_fullname(&fullname) {
+            return Ok(true);
         }
     }
     // super().visit_unbound_type(t) -> query_types(t.args).
@@ -857,7 +934,7 @@ fn self_type_visit_unbound(
 fn self_type_any_seq(
     py: Python<'_>,
     seq: &PyAny,
-    ctx: &SelfTypeCtx<'_>,
+    ctx: &mut SelfTypeCtx<'_>,
 ) -> Result<bool, DeferError> {
     for child in iter_seq(seq)? {
         if find_self_type_inner(py, child, ctx)? {
@@ -872,7 +949,7 @@ fn self_type_any_children(
     py: Python<'_>,
     obj: &PyAny,
     attrs: &[&str],
-    ctx: &SelfTypeCtx<'_>,
+    ctx: &mut SelfTypeCtx<'_>,
     check_lkv: bool,
 ) -> Result<bool, DeferError> {
     for attr_name in attrs {
@@ -894,7 +971,7 @@ fn self_type_any_children(
 fn self_type_callable(
     py: Python<'_>,
     obj: &PyAny,
-    ctx: &SelfTypeCtx<'_>,
+    ctx: &mut SelfTypeCtx<'_>,
 ) -> Result<bool, DeferError> {
     let arg_types = get_attr_or_defer(obj, "arg_types")?;
     if self_type_any_seq(py, arg_types, ctx)? {
@@ -907,6 +984,244 @@ fn self_type_callable(
     let inst = obj.getattr("instance_type").map_err(|_| DeferError)?;
     if !inst.is_none() && find_self_type_inner(py, inst, ctx)? {
         return Ok(true);
+    }
+    Ok(false)
+}
+
+/// `BoolTypeQuery.visit_type_alias_type` (type_visitor.py:599-617) with a
+/// resolver: expand the proper target through the alias snapshot, then
+/// re-query the node's own args for new-style aliases. Seen-guard keyed
+/// by node identity, push-never-pop like the Python set. Everything
+/// undecidable (no resolver, missing snapshot, substituted expansion,
+/// unreadable facts) defers.
+fn self_type_visit_alias(
+    py: Python<'_>,
+    obj: &PyAny,
+    ctx: &mut SelfTypeCtx<'_>,
+) -> Result<bool, DeferError> {
+    let key = obj.as_ptr() as usize;
+    if ctx.seen_aliases.contains(&key) {
+        return Ok(false);
+    }
+    ctx.seen_aliases.push(key);
+    let aliases = match ctx.aliases {
+        Some(a) => a,
+        None => return Err(DeferError),
+    };
+    let alias = obj.getattr("alias").map_err(|_| DeferError)?;
+    if alias.is_none() {
+        // Python asserts `t.alias is not None`; defer so the fallback
+        // surfaces the same error.
+        return Err(DeferError);
+    }
+    let fullname = alias.getattr("fullname").map_err(|_| DeferError)?;
+    let type_ref = fullname
+        .downcast::<PyString>()
+        .map_err(|_| DeferError)?
+        .to_str()
+        .map_err(|_| DeferError)?
+        .to_string();
+    let args_seq = get_attr_or_defer(obj, "args")?;
+    let args = iter_seq(args_seq)?;
+    let snap = aliases.get(&type_ref).ok_or(DeferError)?;
+    if snap.no_args && !args.is_empty() {
+        // Python copies the live args into the bare target
+        // (types.py:453-457) — not representable from the snapshot.
+        return Err(DeferError);
+    }
+    if !snap.no_args && !snap.alias_tvars.is_empty() {
+        // Substitution needs the live args on the wire; conservative
+        // defer, the Python visitor answers identically from the live
+        // expansion.
+        return Err(DeferError);
+    }
+    let bare = Type::TypeAliasType {
+        args: Vec::new(),
+        type_ref: type_ref.clone(),
+    };
+    let (target, _, py312) = expanded_alias_target(&bare, aliases).ok_or(DeferError)?;
+    let target = if snap.no_args {
+        // `_expand_once` for a no_args alias asserts an Instance target
+        // and writes `args=[]` over it (types.py:453-457, the live args
+        // are empty here).
+        match target {
+            Type::Instance {
+                type_ref,
+                last_known_value,
+                extra_attrs,
+                ..
+            } => Type::Instance {
+                type_ref,
+                args: Vec::new(),
+                last_known_value,
+                extra_attrs,
+            },
+            _ => return Err(DeferError),
+        }
+    } else {
+        target
+    };
+    let mut wire_seen = Vec::new();
+    if find_self_type_wire(&target, ctx.lookup, aliases, &mut wire_seen)? {
+        return Ok(true);
+    }
+    if py312 && !args.is_empty() {
+        // Weird edge case in the Python visitor (type_visitor.py:610-615):
+        // if the expansion found nothing, still visit the node's own
+        // arguments — done only for new-style aliases.
+        return self_type_any_seq(py, args_seq, ctx);
+    }
+    Ok(false)
+}
+
+/// Wire-mode `HasSelfType` query over an expanded alias target with no
+/// live Python types. Decides the same leaf shapes as the live walk and
+/// defers on anything else. The `seen` set substitutes for the Python
+/// node-identity guard: aliases with substituted or copied args are
+/// already excluded upstream, so a type_ref's expansion is fixed for
+/// the whole query.
+fn find_self_type_wire(
+    t: &Type,
+    lookup: &SelfLookup<'_>,
+    aliases: &TypeAliasResolver,
+    seen: &mut Vec<String>,
+) -> Result<bool, DeferError> {
+    match t {
+        Type::TypeAliasType { args, type_ref } => {
+            if seen.contains(type_ref) {
+                return Ok(false);
+            }
+            seen.push(type_ref.clone());
+            let (target, _, py312) = expanded_alias_target(t, aliases).ok_or(DeferError)?;
+            if find_self_type_wire(&target, lookup, aliases, seen)? {
+                return Ok(true);
+            }
+            if py312 && !args.is_empty() {
+                return find_self_type_wire_seq(args, lookup, aliases, seen);
+            }
+            Ok(false)
+        }
+        Type::UnboundType { name, args, .. } => {
+            if let Some(fullname) = lookup.fullname(name)? {
+                if is_self_fullname(&fullname) {
+                    return Ok(true);
+                }
+            }
+            find_self_type_wire_seq(args, lookup, aliases, seen)
+        }
+        Type::Instance {
+            args,
+            last_known_value,
+            ..
+        } => {
+            if find_self_type_wire_seq(args, lookup, aliases, seen)? {
+                return Ok(true);
+            }
+            match last_known_value {
+                Some(lkv) => find_self_type_wire(lkv, lookup, aliases, seen),
+                None => Ok(false),
+            }
+        }
+        Type::CallableType {
+            arg_types,
+            ret_type,
+            instance_type,
+            ..
+        } => {
+            if find_self_type_wire_seq(arg_types, lookup, aliases, seen)? {
+                return Ok(true);
+            }
+            if find_self_type_wire(ret_type, lookup, aliases, seen)? {
+                return Ok(true);
+            }
+            match instance_type {
+                Some(inst) => find_self_type_wire(inst, lookup, aliases, seen),
+                None => Ok(false),
+            }
+        }
+        Type::TupleType {
+            items,
+            partial_fallback,
+            ..
+        } => {
+            if find_self_type_wire_seq(items, lookup, aliases, seen)? {
+                return Ok(true);
+            }
+            find_self_type_wire(partial_fallback, lookup, aliases, seen)
+        }
+        Type::TypedDictType { items, .. } => {
+            for (_, item) in items {
+                if find_self_type_wire(item, lookup, aliases, seen)? {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        }
+        Type::UnionType { items, .. } | Type::Overloaded { items } => {
+            find_self_type_wire_seq(items, lookup, aliases, seen)
+        }
+        Type::TypeType { item, .. } => find_self_type_wire(item, lookup, aliases, seen),
+        Type::UnpackType { typ } => find_self_type_wire(typ, lookup, aliases, seen),
+        Type::TypeVarType {
+            values,
+            upper_bound,
+            default,
+            ..
+        } => {
+            if find_self_type_wire(upper_bound, lookup, aliases, seen)? {
+                return Ok(true);
+            }
+            if find_self_type_wire(default, lookup, aliases, seen)? {
+                return Ok(true);
+            }
+            find_self_type_wire_seq(values, lookup, aliases, seen)
+        }
+        Type::ParamSpecType {
+            prefix,
+            upper_bound,
+            default,
+            ..
+        } => {
+            if find_self_type_wire(upper_bound, lookup, aliases, seen)? {
+                return Ok(true);
+            }
+            if find_self_type_wire(default, lookup, aliases, seen)? {
+                return Ok(true);
+            }
+            find_self_type_wire_seq(&prefix.arg_types, lookup, aliases, seen)
+        }
+        Type::TypeVarTupleType {
+            upper_bound,
+            default,
+            ..
+        } => {
+            if find_self_type_wire(upper_bound, lookup, aliases, seen)? {
+                return Ok(true);
+            }
+            find_self_type_wire(default, lookup, aliases, seen)
+        }
+        Type::Parameters(p) => find_self_type_wire_seq(&p.arg_types, lookup, aliases, seen),
+        Type::AnyType { .. }
+        | Type::NoneType
+        | Type::UninhabitedType { .. }
+        | Type::ErasedType
+        | Type::DeletedType { .. }
+        // visit_literal_type: strategy([]), the fallback is not queried.
+        | Type::LiteralType { .. } => Ok(false),
+    }
+}
+
+/// ANY_STRATEGY fold over a wire sequence of child types.
+fn find_self_type_wire_seq(
+    types: &[Type],
+    lookup: &SelfLookup<'_>,
+    aliases: &TypeAliasResolver,
+    seen: &mut Vec<String>,
+) -> Result<bool, DeferError> {
+    for child in types {
+        if find_self_type_wire(child, lookup, aliases, seen)? {
+            return Ok(true);
+        }
     }
     Ok(false)
 }
@@ -2279,6 +2594,128 @@ mod tests {
             make_instance("builtins.int", vec![]),
         ]);
         assert!(analyze_type_inner(&t2, false, false, true).is_some());
+    }
+
+    // find_self_type wire-mode walk over expanded alias targets (#1157).
+    // These run without a GIL: lookups go through SelfLookup::Table and
+    // alias snapshots are built from direct `Type` values.
+
+    use std::collections::HashMap;
+
+    use crate::aliases::TypeAliasSnapshot;
+
+    fn self_table(entries: &[(&str, &str)]) -> SelfLookup<'static> {
+        let mut map = HashMap::new();
+        for (name, fullname) in entries {
+            map.insert((*name).to_string(), (*fullname).to_string());
+        }
+        SelfLookup::Table(map)
+    }
+
+    fn alias_resolver_with(fullname: &str, target: &Type) -> TypeAliasResolver {
+        let mut resolver = TypeAliasResolver::new();
+        resolver.insert(
+            fullname.to_string(),
+            TypeAliasSnapshot {
+                fullname: fullname.to_string(),
+                target: encode_type(target).expect("target encodes"),
+                ..Default::default()
+            },
+        );
+        resolver
+    }
+
+    fn make_unbound(name: &str) -> Type {
+        Type::UnboundType {
+            name: name.to_string(),
+            args: Vec::new(),
+            original_str_expr: None,
+            original_str_fallback: None,
+        }
+    }
+
+    fn make_alias(type_ref: &str, args: Vec<Type>) -> Type {
+        Type::TypeAliasType {
+            args,
+            type_ref: type_ref.to_string(),
+        }
+    }
+
+    #[test]
+    fn test_find_self_type_wire_alias_target_is_self() {
+        let aliases = alias_resolver_with("mod.X", &make_unbound("Self"));
+        let lookup = self_table(&[("Self", "typing.Self")]);
+        let t = make_alias("mod.X", vec![]);
+        assert_eq!(
+            find_self_type_wire(&t, &lookup, &aliases, &mut Vec::new()),
+            Ok(true)
+        );
+        // Plain unbound target does not fire, even with the same table.
+        let aliases_plain = alias_resolver_with("mod.X", &make_unbound("int"));
+        assert_eq!(
+            find_self_type_wire(&t, &lookup, &aliases_plain, &mut Vec::new()),
+            Ok(false)
+        );
+    }
+
+    #[test]
+    fn test_find_self_type_wire_alias_cycle_defers() {
+        // Snapshot target re-encodes the alias itself: the chain cycle
+        // guard must defer, not loop.
+        let aliases = alias_resolver_with("mod.A", &make_alias("mod.A", vec![]));
+        let lookup = self_table(&[]);
+        let t = make_alias("mod.A", vec![]);
+        assert!(find_self_type_wire(&t, &lookup, &aliases, &mut Vec::new()).is_err());
+    }
+
+    #[test]
+    fn test_find_self_type_wire_missing_snapshot_defers() {
+        let aliases = alias_resolver_with("mod.X", &make_unbound("Self"));
+        let lookup = self_table(&[("Self", "typing.Self")]);
+        let t = make_alias("mod.MISSING", vec![]);
+        assert!(find_self_type_wire(&t, &lookup, &aliases, &mut Vec::new()).is_err());
+    }
+
+    #[test]
+    fn test_find_self_type_wire_py312_args_queried() {
+        // New-style alias: the target is plain, so the Self must come
+        // from the node's own args via the python_3_12 arm.
+        let aliases = alias_resolver_with("mod.Y", &make_any(SPECIAL_FORM));
+        let mut snap = TypeAliasSnapshot {
+            fullname: "mod.Y".to_string(),
+            target: encode_type(&make_any(SPECIAL_FORM)).expect("target encodes"),
+            ..Default::default()
+        };
+        snap.python_3_12_type_alias = true;
+        let mut resolver = TypeAliasResolver::new();
+        resolver.insert("mod.Y".to_string(), snap);
+        let lookup = self_table(&[("Self", "typing.Self")]);
+        let t = make_alias("mod.Y", vec![make_unbound("Self")]);
+        assert_eq!(
+            find_self_type_wire(&t, &lookup, &resolver, &mut Vec::new()),
+            Ok(true)
+        );
+        // Same alias with a non-Self arg stays False.
+        let t_plain = make_alias("mod.Y", vec![make_instance("builtins.int", vec![])]);
+        assert_eq!(
+            find_self_type_wire(&t_plain, &lookup, &resolver, &mut Vec::new()),
+            Ok(false)
+        );
+    }
+
+    #[test]
+    fn test_find_self_type_wire_seen_alias_returns_default() {
+        // A second occurrence of the same alias inside the expansion
+        // returns the ANY_STRATEGY default (False), like the Python
+        // seen_aliases cache.
+        let inner = make_instance("builtins.list", vec![make_alias("mod.A", vec![])]);
+        let aliases = alias_resolver_with("mod.A", &inner);
+        let lookup = self_table(&[]);
+        let t = make_alias("mod.A", vec![]);
+        assert_eq!(
+            find_self_type_wire(&t, &lookup, &aliases, &mut Vec::new()),
+            Ok(false)
+        );
     }
 }
 

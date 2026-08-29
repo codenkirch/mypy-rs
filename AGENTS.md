@@ -2128,4 +2128,18 @@ directly to `main`.
   @ 100% native). Gated by `_native_typeanal_active` (existing wiring)
   and covered by `NativeFindSelfTypeSuite` in `mypy/test/testtypes.py`
   (direct seam calls plus gate-off vs gate-on differential through
-  `find_self_type`).
+  `find_self_type`). Issue #1157: the walk formerly answered only from a
+  `TypeAliasType`'s written args and never looked at the alias target, so
+  `find_self_type(TypeAliasType(alias=X, ...))` missed `X = list[Self]`.
+  The resolver-less `rust_find_self_type` now defers (`None`) on any
+  `TypeAliasType`, and the live seam `rust_find_self_type_live(resolver,
+  typ, lookup)` (exported from `type_kernel`; resolver is the
+  `_native_typeanal_resolver` installed per build) expands the target
+  through the alias snapshot (seen-alias cycle guard; defers on a
+  missing snapshot, `no_args` with args, or non-`no_args` with alias
+  tvars), then walks the bare target for non-PEP-695 aliases and also
+  the written args under `python_3_12_type_alias`, mirroring
+  `BoolTypeQuery.visit_type_alias_type`. Covered by the alias cases in
+  `NativeFindSelfTypeSuite` (parity through a resolver-backed
+  `setUp`, defer proofs for the resolver-less and missing-snapshot
+  paths).
