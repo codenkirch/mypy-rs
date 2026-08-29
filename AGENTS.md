@@ -2221,10 +2221,16 @@ directly to `main`.
   Python computes the cheap AST literal facts (`literal` kind + five flags,
   placeholders for non-LITERAL_TYPE operands so the short-circuit order is
   preserved) and serializes each operand type; Rust returns one
-  narrowability bool per operand. `None` defers the whole call on a length
-  mismatch, an undecodable wire blob, a `TypeAliasType` operand
-  (`get_proper_type` needs the live alias), or an unresolved type-object
-  fallback snapshot; the shim re-runs the original pure-Python loop. The
+  narrowability bool per operand. Issue #1235: alias operands with an alias
+  snapshot expand via `get_proper_or_expand` exactly like Python's
+  `get_proper_type` (chain cycles and unsupported substitutions still
+  defer), and a `TypeAliasType` ret-type of the callable operand expands
+  too, deciding `is_type_obj() == False` when the expansion is
+  `UninhabitedType` before the fallback-class lookup. `None` defers the
+  whole call on a length mismatch, an undecodable wire blob, an alias
+  operand/ret whose snapshot is missing or not expandable, or an unresolved
+  type-object fallback snapshot (the audit's remaining wall); the shim
+  re-runs the original pure-Python loop. The
   literal-hash bookkeeping, the grouping (`rust_group_comparison_operands`
   unchanged), and the narrowing arm bodies stay Python-side. Gated by
   `_native_checker_active` + `_native_checker_resolver` (existing wiring,

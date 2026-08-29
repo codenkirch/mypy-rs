@@ -44812,7 +44812,10 @@ class NativeComparisonNarrowingSuite(Suite):
     LITERAL_TYPE` gate, the None / NotImplemented / True / False / enum
     literal suppressions, and the two non-narrowable proper-type tests
     (`FunctionLike.is_type_obj()` and `TypeType` over a `TypeVarType`).
-    Rust decides from wire types plus shim-side literal flags; the
+    Rust decides from wire types plus shim-side literal flags; alias
+    operands expand through the alias snapshot like `get_proper_type`
+    (#1235), and an alias ret-type expanding to `UninhabitedType` decides
+    `is_type_obj() == False`. Missing alias snapshots still defer. The
     literal-hash bookkeeping, chain grouping (already native via
     `rust_group_comparison_operands`), and the narrowing arm bodies stay
     Python-side.
@@ -44976,6 +44979,34 @@ class NativeComparisonNarrowingSuite(Suite):
         alias_type = TypeAliasType(TypeAlias(Instance(fx.ai, []), "mod.AAlias", "mod", -1, -1), [])
         assert self._seam([1], [self._no_flags()], [alias_type]) is None
 
+    # --- alias operands with a resolver snapshot decide natively (#1235) ---
+
+    def _rebuild_resolver(self, aliases: list[Any]) -> None:
+        from mypy.checker import _set_native_checker_resolver
+
+        self._resolver = _type_kernel.build_native_resolver(self._infos, aliases)
+        _set_native_checker_resolver(self._resolver)
+
+    def test_seam_alias_operand_expands_to_instance(self) -> None:
+        fx = self.fx
+        alias = TypeAlias(Instance(fx.ai, []), "mod.CAlias", "mod", -1, -1)
+        self._rebuild_resolver([alias])
+        assert self._seam([1], [self._no_flags()], [TypeAliasType(alias, [])]) == [True]
+
+    def test_seam_alias_operand_expands_to_type_object(self) -> None:
+        fx = self.fx
+        alias = TypeAlias(fx.callable_type(fx.a), "mod.DAlias", "mod", -1, -1)
+        self._rebuild_resolver([alias])
+        assert self._seam([1], [self._no_flags()], [TypeAliasType(alias, [])]) == [False]
+
+    def test_seam_alias_ret_expands_to_uninhabited(self) -> None:
+        fx = self.fx
+        alias = TypeAlias(UninhabitedType(), "mod.NAlias", "mod", -1, -1)
+        self._rebuild_resolver([alias])
+        fn = fx.callable(fx.a)
+        fn.ret_type = TypeAliasType(alias, [])
+        assert self._seam([1], [self._no_flags()], [fn]) == [True]
+
     def test_seam_length_mismatch_defers(self) -> None:
         fx = self.fx
         assert self._seam([1, 1], [self._no_flags()], [fx.str_type]) is None
@@ -45047,6 +45078,17 @@ class NativeComparisonNarrowingSuite(Suite):
             e1: TypeAliasType(TypeAlias(Instance(fx.ai, []), "mod.BAlias", "mod", -1, -1), []),
         }
         self._assert_par(node, types, "alias operand")
+
+    def test_parity_alias_operand_with_snapshot(self) -> None:
+        # The alias is resolvable, so both gates decide narrowable from the
+        # expanded Instance (#1235); parity of the recorded hash captures.
+        fx = self.fx
+        alias = TypeAlias(Instance(fx.ai, []), "mod.EAlias", "mod", -1, -1)
+        self._rebuild_resolver([alias])
+        e0, e1 = self._var_expr("x0"), self._var_expr("x1")
+        node = self._comparison(["==", "=="], [e0, e1, e0])
+        types = {e0: fx.str_type, e1: TypeAliasType(alias, [])}
+        self._assert_par(node, types, "alias operand with snapshot")
 
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
