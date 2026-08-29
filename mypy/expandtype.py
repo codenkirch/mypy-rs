@@ -74,12 +74,13 @@ def _clear_expand_decode_cache() -> None:
     _expand_remove_trivial_cache.clear()
 
 
-def _needs_python(typ: Type) -> bool:
+def _needs_python(typ: Type, *, definition_gate: bool = True) -> bool:
     """True if `typ` nests a node a kernel round-trip cannot carry.
 
-    Named callables lose their FuncDef/Decorator definition node, breaking
-    error formatting that names the function; recursive TypeAliasType would
-    loop while decoding. Both must defer to the pure-Python visitor.
+    Callers that re-stamp dropped ``definition`` links after the round-trip
+    via ``_resync_definitions`` pass ``definition_gate=False``; callers
+    without a re-stamp path (env values, remove_trivial) keep the gate.
+    Recursive TypeAliasType would loop while decoding and must defer.
     """
     stack: list[Type] = [typ]
     visited: set[int] = set()
@@ -105,6 +106,8 @@ def _needs_python(typ: Type) -> bool:
         elif isinstance(p, TypeVarType):
             # Fresh (meta) type variables lose identity across the wire
             # round-trip, so Rust dedup could merge distinct fresh vars.
+            # Meta relax tried (#1169) but leaks fresh-var identity through
+            # decode paths with no canonicalize_fresh_vars equivalent.
             if p.id.meta_level > 0 or p.has_default():
                 return True
         elif isinstance(p, UnpackType):
@@ -245,7 +248,7 @@ def _serialize_type(t: Type) -> bytes:
             return _BUILTIN_INSTANCE_BYTES[fn]
     buf = _WriteBuffer()
     result, saw_tvar = _serialize_with_taint_check(t, buf)
-    if not saw_tvar and _wire_cache_enabled() and (not isinstance(t, Instance) or t.type_ref is None):  # type: ignore[misc]
+    if not saw_tvar and _wire_cache_enabled() and (type(t) is not Instance or t.type_ref is None):
         _type_wire_cache[key] = (t, result)
     return result
 
@@ -292,7 +295,7 @@ def expand_type(typ: Type, env: Mapping[TypeVarId, Type]) -> Type:
         _HAS_TYPE_KERNEL
         and _native_expand_type_active
         and _native_expand_type_resolver is not None
-        and not _needs_python(typ)
+        and not _needs_python(typ, definition_gate=False)
         and not _env_substitutes_unsafe(typ, env)
     ):
         try:
@@ -314,37 +317,45 @@ def expand_type(typ: Type, env: Mapping[TypeVarId, Type]) -> Type:
                     fixed.column = typ.column
                     if isinstance(fixed, CallableType):
                         fixed.fallback.line = fixed.line
-                    return fixed
-                decoded = read_type(_ReadBuffer(raw))
-                from mypy.wirefixup import fixup_wire_type
+                    fixed = _resync_definitions(typ, fixed)
+                    if fixed is not None:
+                        return fixed
+                else:
+                    decoded = read_type(_ReadBuffer(raw))
+                    from mypy.wirefixup import fixup_wire_type
 
-                fixed = fixup_wire_type(decoded)
-                # The wire format does not carry line/column; decoded
-                # types default to line -1. Preserve the input type's
-                # location so derived contexts (e.g. plugin
+                    fixed = fixup_wire_type(decoded)
+                    # The wire format does not carry line/column; decoded
+                    # types default to line -1. Preserve the input type's
+                    # location so derived contexts (e.g. plugin
 
-                # default_return_type) report errors at the call site
-                # instead of a phantom line 0/-1.
-                if fixed is not None and isinstance(fixed, ProperType):
-                    fixed.line = typ.line
-                    fixed.column = typ.column
-                    if isinstance(fixed, CallableType):
-                        fixed.fallback.line = fixed.line
-                # Clear the process-global primitive decode singletons after
-                # a read so NOT_READY Instances cannot leak into later builds
-                # (read_type lazily fills instance_cache with
+                    # default_return_type) report errors at the call site
+                    # instead of a phantom line 0/-1.
+                    if fixed is not None and isinstance(fixed, ProperType):
+                        fixed.line = typ.line
+                        fixed.column = typ.column
+                        if isinstance(fixed, CallableType):
+                            fixed.fallback.line = fixed.line
+                    # Clear the process-global primitive decode singletons after
+                    # a read so NOT_READY Instances cannot leak into later builds
+                    # (read_type lazily fills instance_cache with
 
-                # Instance(NOT_READY, []) singletons for str/int/bool/etc).
-                from mypy.types import instance_cache
+                    # Instance(NOT_READY, []) singletons for str/int/bool/etc).
+                    from mypy.types import instance_cache
 
-                instance_cache.int_type = None
-                instance_cache.str_type = None
-                instance_cache.bool_type = None
-                instance_cache.object_type = None
-                instance_cache.function_type = None
-                if fixed is not None:
-                    _expand_type_decode_cache[raw] = fixed
-                    return fixed
+                    instance_cache.int_type = None
+                    instance_cache.str_type = None
+                    instance_cache.bool_type = None
+                    instance_cache.object_type = None
+                    instance_cache.function_type = None
+                    if fixed is not None:
+                        # Cache the definition-less decoded shape; each call
+                        # re-stamps definitions from its own input type (see
+                        # the cached branch above).
+                        _expand_type_decode_cache[raw] = fixed
+                        fixed = _resync_definitions(typ, fixed)
+                        if fixed is not None:
+                            return fixed
         except (NotImplementedError, AssertionError):
             # AssertionError: TypeInfo not yet fixed during semanal.
             # NotImplementedError: unserializable variant.
@@ -353,39 +364,142 @@ def expand_type(typ: Type, env: Mapping[TypeVarId, Type]) -> Type:
     return typ.accept(ExpandTypeVisitor(env))
 
 
-def _restore_expand_definition(original: Type, decoded: Type) -> Type:
-    """Copy the ``definition`` link from ``original`` onto ``decoded``.
+def _needs_definitions(typ: Type) -> bool:
+    """True if any callable anywhere in `typ` carries a definition node."""
+    stack: list[Type] = [typ]
+    visited: set[int] = set()
+    while stack:
+        t = stack.pop()
+        p = get_proper_type(t)
+        if id(p) in visited:
+            continue
+        visited.add(id(p))
+        if isinstance(p, CallableType):
+            if p.definition is not None:
+                return True
+            stack.append(p.ret_type)
+            stack.extend(p.arg_types)
+        elif isinstance(p, Overloaded):
+            stack.extend(p.items)
+        elif isinstance(p, Instance):
+            stack.extend(p.args)
+        elif isinstance(p, UnionType):
+            stack.extend(p.items)
+        elif isinstance(p, TupleType):
+            stack.extend(p.items)
+        elif isinstance(p, TypeType):
+            stack.append(p.item)
+        elif isinstance(p, UnpackType):
+            stack.append(p.type)
+    return False
 
-    The wire round-trip drops ``CallableType.definition`` (and the per-item
-    definitions on an ``Overloaded``); only used for error-message
-    self/cls prepending. Restore it from the pre-seam type so
-    ``pretty_callable`` shows the self argument. Mirrors
-    ``checkmember._restore_definition`` but inlined here to avoid a
-    circular import (checkmember imports expandtype).
+
+def _resync_definitions(original: Type, decoded: Type) -> Type | None:
+    """Re-stamp ``definition`` links the wire round-trip dropped.
+
+    The wire format carries no ``CallableType.definition``; the pure-Python
+    visitor preserves those links and a lost one changes error messages
+    that name the function (``pretty_callable``). Walk ``original`` and
+    ``decoded`` in parallel wherever substitution preserves structure and
+    copy definitions onto the decoded nodes. Return None when the trees
+    diverge below an original node that still carries definitions, so the
+    caller defers to the pure-Python visitor (parity over speed).
     """
-    if isinstance(original, CallableType) and isinstance(decoded, CallableType):  # type: ignore[misc]
-        if original.definition is not None and decoded.definition is None:
-            return decoded.copy_modified(definition=original.definition)
-    elif isinstance(original, Overloaded) and isinstance(decoded, Overloaded):  # type: ignore[misc]
-        if len(original.items) == len(decoded.items):
-            new_items = []
-            changed = False
-            for orig, dec in zip(original.items, decoded.items):
-                if orig.definition is not None and dec.definition is None:
-                    new_items.append(dec.copy_modified(definition=orig.definition))
-                    changed = True
-                else:
-                    new_items.append(dec)
-            if changed:
-                return Overloaded(new_items)
-    elif isinstance(original, Overloaded) and isinstance(decoded, CallableType):  # type: ignore[misc]
-        for orig in original.items:
-            if (
-                orig.definition is not None
-                and len(orig.arg_types) == len(decoded.arg_types)
-            ):
-                return decoded.copy_modified(definition=orig.definition)
-    return decoded
+    if not _needs_definitions(original):
+        return decoded
+    return _resync_definitions_inner(original, decoded)
+
+
+def _resync_definitions_inner(original: Type, decoded: Type) -> Type | None:
+    """Pairwise implementation of `_resync_definitions`.
+
+    Runs on raw nodes: the callers' gates exclude TypeAliasType inputs
+    (the kernel defers any result carrying an alias node), so no alias
+    unwrapping is needed here.
+    """
+    o = original
+    d = decoded
+    if type(o) is CallableType and type(d) is CallableType:
+        if len(o.arg_types) != len(d.arg_types):
+            return None
+        new_def = o.definition if o.definition is not None else d.definition
+        ret = _resync_definitions_inner(o.ret_type, d.ret_type)
+        if ret is None:
+            return None
+        new_args = []
+        for po, pd in zip(o.arg_types, d.arg_types):
+            pa = _resync_definitions_inner(po, pd)
+            if pa is None:
+                return None
+            new_args.append(pa)
+        return d.copy_modified(definition=new_def, ret_type=ret, arg_types=new_args)
+    if type(o) is Overloaded and type(d) is Overloaded:
+        if len(o.items) != len(d.items):
+            return None
+        new_items = []
+        for po, pd in zip(o.items, d.items):
+            pi = _resync_definitions_inner(po, pd)
+            if pi is None:
+                return None
+            new_items.append(pi)
+        return Overloaded(new_items)  # type: ignore[arg-type]
+    if type(o) is Overloaded and type(d) is CallableType:
+        # ETBI on an overload can return a callable after bind_self; the
+        # legacy top-level heuristic picked a same-arity item definition.
+        for orig in o.items:
+            if orig.definition is not None and len(orig.arg_types) == len(d.arg_types):
+                return d.copy_modified(definition=orig.definition)
+        return None
+    if type(o) is Instance and type(d) is Instance:
+        if len(o.args) != len(d.args):
+            return None
+        new_args = []
+        for po, pd in zip(o.args, d.args):
+            pa = _resync_definitions_inner(po, pd)
+            if pa is None:
+                return None
+            new_args.append(pa)
+        return d.copy_modified(args=new_args)
+    if type(o) is UnionType and type(d) is UnionType:
+        if len(o.items) != len(d.items):
+            return None
+        new_items = []
+        for po, pd in zip(o.items, d.items):
+            pi = _resync_definitions_inner(po, pd)
+            if pi is None:
+                return None
+            new_items.append(pi)
+        return UnionType(new_items)
+    if type(o) is TupleType and type(d) is TupleType:
+        if len(o.items) != len(d.items):
+            return None
+        new_items = []
+        for po, pd in zip(o.items, d.items):
+            pi = _resync_definitions_inner(po, pd)
+            if pi is None:
+                return None
+            new_items.append(pi)
+        return d.copy_modified(items=new_items)
+    if type(o) is TypeType and type(d) is TypeType:
+        pi = _resync_definitions_inner(o.item, d.item)
+        if pi is None:
+            return None
+        return TypeType.make_normalized(pi)
+    if type(o) is UnpackType and type(d) is UnpackType:
+        pi = _resync_definitions_inner(o.type, d.type)
+        if pi is None:
+            return None
+        return UnpackType(pi)
+    if type(o) is TypeVarType and type(d) is TypeVarType:
+        # Only an upper bound can nest other typevars and thus callables.
+        pb = _resync_definitions_inner(o.upper_bound, d.upper_bound)
+        if pb is None:
+            return None
+        return d.copy_modified(upper_bound=pb)
+    # Divergent node kinds (leaf types): nothing to re-stamp. The top-level
+    # check proved no unpaired definitions sit below a pairing node, and a
+    # leaf-level kind mismatch means no callable is involved at all.
+    return d
 
 
 @overload
@@ -413,8 +527,8 @@ def expand_type_by_instance(typ: Type, instance: Instance) -> Type:
             _HAS_TYPE_KERNEL
             and _native_expand_type_active
             and _native_expand_type_resolver is not None
-            and not _needs_python(typ)
-            and not any(_needs_python(a) for a in instance.args)
+            and not _needs_python(typ, definition_gate=False)
+            and not any(_needs_python(a, definition_gate=False) for a in instance.args)
         ):
             try:
                 result = _type_kernel.rust_expand_type_by_instance(
@@ -438,7 +552,10 @@ def expand_type_by_instance(typ: Type, instance: Instance) -> Type:
                         fixed.column = typ.column
                         if isinstance(fixed, CallableType):
                             fixed.fallback.line = fixed.line
-                        fixed = _restore_expand_definition(typ, fixed)
+                        # Definitions are dropped by the wire round-trip;
+                        # re-stamp from the pre-seam type (None defers
+                        # to the Python visitor).
+                        fixed = _resync_definitions(typ, fixed)
                     from mypy.types import instance_cache
 
                     instance_cache.int_type = None
@@ -495,7 +612,7 @@ def freshen_function_type_vars(callee: F) -> F:
             _HAS_TYPE_KERNEL
             and _native_expand_type_active
             and _native_expand_type_resolver is not None
-            and not _needs_python(callee)
+            and not _needs_python(callee, definition_gate=False)
         ):
             try:
                 result = _type_kernel.rust_freshen_function_type_vars(
@@ -532,7 +649,12 @@ def freshen_function_type_vars(callee: F) -> F:
                         # Wire round-trip loses fresh meta-var identity;
                         # re-unify occurrences before returning.
                         fixed = canonicalize_fresh_vars(fixed)
-                        return cast(F, fixed)
+                        # Definitions are dropped by the wire round-trip;
+                        # re-stamp from the input (None = unpairable,
+                        # defer to the Python path below).
+                        fixed = _resync_definitions(callee, fixed)
+                        if fixed is not None:
+                            return cast(F, fixed)
             except (AssertionError, NotImplementedError, ValueError, AttributeError):
                 # Defer to Python: semanal TypeInfo-not-fixed asserts,
                 # unserializable variants, failed wire reads, FakeInfo
@@ -583,13 +705,11 @@ def freshen_all_functions_type_vars(t: T) -> T:
             _HAS_TYPE_KERNEL
             and _native_expand_type_active
             and _native_expand_type_resolver is not None
-            and not _needs_python(t)
+            and not _needs_python(t, definition_gate=False)
         ):
             try:
                 call = _type_kernel.rust_freshen_all_functions_type_vars(
-                    TypeVarId.next_raw_id,
-                    _serialize_type(t),
-                    state.strict_optional,
+                    TypeVarId.next_raw_id, _serialize_type(t), state.strict_optional
                 )
                 if call is not None:
                     next_raw_id, changed, serialized = call
@@ -622,7 +742,11 @@ def freshen_all_functions_type_vars(t: T) -> T:
                             # Wire round-trip loses fresh meta-var identity;
                             # re-unify occurrences before returning.
                             fixed = canonicalize_fresh_vars(fixed)
-                            return cast(T, fixed)
+                            # Re-stamp wire-dropped definitions (None =
+                            # unpairable, defer to the Python path below).
+                            fixed = _resync_definitions(t, fixed)
+                            if fixed is not None:
+                                return cast(T, fixed)
             except (NotImplementedError, AssertionError):
                 pass
         result = t.accept(FreshenCallableVisitor())
@@ -1126,9 +1250,7 @@ def remove_trivial(types: Iterable[Type]) -> list[Type]:
 
             buf = _WriteBuffer()
             write_type_list(buf, types_list)
-            result = _type_kernel.rust_remove_trivial(
-                buf.getvalue(), state.strict_optional
-            )
+            result = _type_kernel.rust_remove_trivial(buf.getvalue(), state.strict_optional)
             if result is not None:
                 raw = bytes(result)
                 cached = _expand_remove_trivial_cache.get(raw)
