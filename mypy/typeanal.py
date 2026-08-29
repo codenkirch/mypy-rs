@@ -3724,6 +3724,7 @@ try:
         rust_collect_all_inner_types_live as _rust_collect_all_inner_types_live,
         rust_detect_diverging_alias as _rust_detect_diverging_alias,
         rust_find_self_type as _rust_find_self_type,
+        rust_find_self_type_live as _rust_find_self_type_live,
         rust_has_any_from_unimported_type as _rust_has_any_from_unimported_type,
         rust_has_any_from_unimported_type_live as _rust_has_any_from_unimported_type_live,
         rust_has_explicit_any as _rust_has_explicit_any,
@@ -3757,6 +3758,7 @@ except ImportError:
     _rust_validate_instance = None  # type: ignore[assignment]
     _rust_detect_diverging_alias = None  # type: ignore[assignment]
     _rust_find_self_type = None  # type: ignore[assignment]
+    _rust_find_self_type_live = None  # type: ignore[assignment]
     _rust_check_vec_type_args = None  # type: ignore[assignment]
     _rust_is_typevar_default_recursive = None  # type: ignore[assignment]
     _rust_instantiate_type_alias = None  # type: ignore[assignment]
@@ -4350,7 +4352,10 @@ def validate_instance(t: Instance, fail: MsgCallback, indexed: bool) -> bool:
 def find_self_type(typ: Type, lookup: Callable[[str], SymbolTableNode | None]) -> bool:
     if _TYPEANAL_HAS_KERNEL and _native_typeanal_active:
         try:
-            result = _rust_find_self_type(typ, lookup)
+            if _native_typeanal_resolver is not None:
+                result = _rust_find_self_type_live(_native_typeanal_resolver, typ, lookup)
+            else:
+                result = _rust_find_self_type(typ, lookup)
             if result is not None:
                 return result
         except (AssertionError, NotImplementedError):

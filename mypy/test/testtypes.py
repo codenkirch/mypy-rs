@@ -44536,14 +44536,44 @@ class NativeFindSelfTypeSuite(Suite):
     """
 
     def setUp(self) -> None:
-        from mypy.typeanal import _set_native_typeanal_active
+        from mypy.typeanal import (
+            _set_native_typeanal_active,
+            _set_native_typeanal_resolver,
+        )
 
         self.fx = TypeFixture()
         self._set_active = _set_native_typeanal_active
+        self._set_resolver = _set_native_typeanal_resolver
         self._set_active(True)
+        # Issue #1157: install a resolver snapshot covering the under-test
+        # aliases so the live seam expands alias targets instead of
+        # deferring; `alias_plain`'s Self resolution must NOT reach args.
+        self.alias_self = TypeAlias(UnboundType("Self"), "mod.X", "mod", 1, 1)
+        self.alias_list = TypeAlias(
+            Instance(self.fx.ai, [UnboundType("Self")]), "mod.L", "mod", 1, 1
+        )
+        self.alias_py312 = TypeAlias(
+            NoneType(), "mod.Y", "mod", 1, 1, python_3_12_type_alias=True
+        )
+        self.alias_plain = TypeAlias(Instance(self.fx.ai, [self.fx.o]), "mod.P", "mod", 1, 1)
+        infos = [
+            self.fx.oi,
+            self.fx.ai,
+            self.fx.bi,
+            self.fx.str_type_info,
+            self.fx.type_typei,
+            self.fx.std_tuplei,
+            self.fx.std_listi,
+        ]
+        self.resolver = _type_kernel.build_native_resolver(
+            infos, [self.alias_self, self.alias_list, self.alias_py312, self.alias_plain]
+        )
+        self.no_alias_resolver = _type_kernel.build_native_resolver(infos, [])
+        self._set_resolver(self.resolver)
 
     def tearDown(self) -> None:
         self._set_active(False)
+        self._set_resolver(None)
 
     def _with_gate(self, active: bool, fn: Callable[[], T]) -> T:
         self._set_active(active)
@@ -44773,6 +44803,59 @@ class NativeFindSelfTypeSuite(Suite):
         fallback = self.fx.std_tuple.copy_modified(args=[self.fx.o])
         t = TypedDictType({"x": UnboundType("Self")}, set(), set(), fallback)
         self._assert_par(t, {"Self": "typing.Self"}, True)
+
+    # Issue #1157. Python expands a TypeAliasType through the alias
+    # node's target (and, for PEP 695 aliases, also queries the written
+    # args); Rust must decide the same through the resolver snapshot.
+
+    def test_parity_alias_target_self(self) -> None:
+        t = TypeAliasType(self.alias_self, [])
+        self._assert_par(t, {"Self": "typing.Self"}, True)
+
+    def test_parity_alias_instance_with_self_arg(self) -> None:
+        t = TypeAliasType(self.alias_list, [])
+        self._assert_par(t, {"Self": "typing.Self"}, True)
+
+    def test_parity_alias_py312_args_self(self) -> None:
+        t = TypeAliasType(self.alias_py312, [UnboundType("Self")])
+        self._assert_par(t, {"Self": "typing.Self"}, True)
+
+    def test_parity_alias_py312_args_plain(self) -> None:
+        t = TypeAliasType(self.alias_py312, [self.fx.o])
+        self._assert_par(t, {"Self": "typing.Self"}, False)
+
+    def test_parity_alias_non_py312_args_ignored(self) -> None:
+        # Self appears only in the arguments: a non-PEP-695 alias must
+        # stay False on both sides.
+        t = TypeAliasType(self.alias_plain, [UnboundType("Self")])
+        self._assert_par(t, {"Self": "typing.Self"}, False)
+
+    def test_seam_resolverless_alias_defers(self) -> None:
+        lookup = self._lookup({"Self": "typing.Self"})
+        t = TypeAliasType(self.alias_self, [])
+        result = _type_kernel.rust_find_self_type(t, lookup)
+        assert result is None, f"resolver-less seam answered {result}"
+
+    def test_seam_live_alias_target_self(self) -> None:
+        lookup = self._lookup({"Self": "typing.Self"})
+        t = TypeAliasType(self.alias_self, [])
+        result = _type_kernel.rust_find_self_type_live(self.resolver, t, lookup)
+        assert result is True, f"live seam deferred or answered {result}"
+
+    def test_seam_live_alias_instance_with_self_arg(self) -> None:
+        lookup = self._lookup({"Self": "typing.Self"})
+        t = TypeAliasType(self.alias_list, [])
+        result = _type_kernel.rust_find_self_type_live(self.resolver, t, lookup)
+        assert result is True, f"live seam deferred or answered {result}"
+
+    def test_seam_live_missing_snapshot_defers(self) -> None:
+        alias_missing = TypeAlias(UnboundType("Self"), "mod.MISSING", "mod", 1, 1)
+        lookup = self._lookup({"Self": "typing.Self"})
+        t = TypeAliasType(alias_missing, [])
+        result = _type_kernel.rust_find_self_type_live(
+            self.no_alias_resolver, t, lookup
+        )
+        assert result is None, f"missing-snapshot seam answered {result}"
 
 
 class NativeSolveGenericCallSuite(Suite):
