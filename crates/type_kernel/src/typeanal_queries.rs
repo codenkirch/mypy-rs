@@ -1779,6 +1779,43 @@ use std::collections::HashSet;
 // detect_diverging_alias (DivergingAliasDetector visitor)
 // ---------------------------------------------------------------------------
 
+/// Collect-aliases walk over live Type objects, a mirror of
+/// `CollectAliasesVisitor` (types.py:4463-4483): for a `TypeAliasType`
+/// whose alias node was not seen yet, record it and recurse into the
+/// alias node's target and then the TypeAliasType args (args are walked
+/// for already-seen aliases too); every other kind walks its component
+/// children.
+fn collect_aliases_visit(
+    py: Python<'_>,
+    obj: &PyAny,
+    alias_seen: &mut HashSet<usize>,
+    aliases: &mut HashSet<usize>,
+    refs: &TypeRefs<'_>,
+) -> Result<(), DeferError> {
+    if is_instance(obj, refs.type_alias_type) {
+        let alias = obj.getattr("alias").map_err(|_| DeferError)?;
+        if alias.is_none() {
+            return Err(DeferError); // Python asserts t.alias is not None
+        }
+        let alias_ptr = alias.as_ptr() as usize;
+        if !alias_seen.contains(&alias_ptr) {
+            alias_seen.insert(alias_ptr);
+            aliases.insert(alias_ptr);
+            let target = alias.getattr("target").map_err(|_| DeferError)?;
+            collect_aliases_visit(py, target, alias_seen, aliases, refs)?;
+        }
+        let args = obj.getattr("args").map_err(|_| DeferError)?;
+        for arg in iter_seq(args)? {
+            collect_aliases_visit(py, arg, alias_seen, aliases, refs)?;
+        }
+        return Ok(());
+    }
+    for child in type_query_children(py, obj, refs)? {
+        collect_aliases_visit(py, child, alias_seen, aliases, refs)?;
+    }
+    Ok(())
+}
+
 /// `mypy.typeanal.detect_diverging_alias` — detect type aliases that
 /// will diverge during type checking.
 ///
@@ -1809,12 +1846,15 @@ fn detect_diverging_alias_inner(
     // is_recursive = node._is_recursive
     let is_recursive = node.getattr("_is_recursive").map_err(|_| DeferError)?;
     let is_rec: bool = if is_recursive.is_none() {
-        // node._is_recursive is None: compute via CollectAliasesVisitor.
-        // This requires a full traversal of target.accept(CollectAliases).
-        // Defer — the CollectAliasesVisitor is a complex visitor we
-
-        // don't port here. Python handles this path.
-        return Err(DeferError);
+        // node._is_recursive is None: compute via a Rust port of
+        // CollectAliasesVisitor (types.py:4463-4483) walking node.target
+        // (typeanal.py:3691-3693). No cache write: Python only caches the
+        // positive case on the node (and that write happens below).
+        let node_target = node.getattr("target").map_err(|_| DeferError)?;
+        let mut alias_seen: HashSet<usize> = HashSet::new();
+        let mut aliases: HashSet<usize> = HashSet::new();
+        collect_aliases_visit(py, node_target, &mut alias_seen, &mut aliases, refs)?;
+        aliases.contains(&(node.as_ptr() as usize))
     } else {
         is_recursive.is_true().map_err(|_| DeferError)?
     };
@@ -1828,6 +1868,19 @@ fn detect_diverging_alias_inner(
     let mut diverging = false;
     diverging_alias_visit(py, target, &seen, &mut diverging, refs)?;
     Ok(diverging)
+}
+
+/// `mypy.types.get_proper_type` via PyO3. The Python DivergingAliasDetector
+/// calls it inside its walk (typeanal.py:3652), so invoking it here at the
+/// same point reproduces the expansion (and any state it touches) exactly.
+/// Any error defers to the pure-Python body.
+fn get_proper_type_py<'a>(py: Python<'a>, obj: &'a PyAny) -> Result<&'a PyAny, DeferError> {
+    let types_mod = py.import("mypy.types").map_err(|_| DeferError)?;
+    let gpt = types_mod
+        .getattr("get_proper_type")
+        .map_err(|_| DeferError)?;
+    let expanded = gpt.call1((obj,)).map_err(|_| DeferError)?;
+    Ok(expanded)
 }
 
 /// Recursively walk `obj` looking for diverging alias expansions.
@@ -1876,20 +1929,16 @@ fn diverging_visit_alias_type(
         }
         return Ok(());
     }
-    // Not in seen: expand alias target, recurse with seen | {alias}.
+    // Not in seen: mirror typeanal.py:3652 —
+    // `get_proper_type(t).accept(visitor)`. Expand via the real Python
+    // get_proper_type (substitutes t.args into the alias target, no_args
+    // handling included) instead of reading `alias.target` raw, then walk
+    // the expansion with the extended seen set. Python does not visit
+    // t.args separately on this branch; the expansion already carries them.
     let mut new_seen = seen.clone();
     new_seen.insert(alias_ptr);
-    // get_proper_type(t).accept(visitor) — for a TypeAliasType, this
-    // expands the alias and recurses into the expansion. We need the
-    // alias target.
-    let target = alias.getattr("target").map_err(|_| DeferError)?;
-    diverging_alias_visit(py, target, &new_seen, diverging, refs)?;
-    // Also recurse into args of this alias type.
-    let args = obj.getattr("args").map_err(|_| DeferError)?;
-    let arg_list = iter_seq(args)?;
-    for arg in arg_list {
-        diverging_alias_visit(py, arg, &new_seen, diverging, refs)?;
-    }
+    let expanded = get_proper_type_py(py, obj)?;
+    diverging_alias_visit(py, expanded, &new_seen, diverging, refs)?;
     Ok(())
 }
 
@@ -2028,6 +2077,101 @@ fn has_type_vars_live(
     Ok(false)
 }
 
+/// Enumerate the component types of a live Type object for TypeQuery-based
+/// visitors (the shared `type_visitor.py query_types` child machinery the
+/// DivergingAliasDetector and CollectAliasesVisitor both inherit);
+/// `TypeAliasType` children are routed by the callers' alias visits and are
+/// never enumerated here. Keep the kind order and attribute reads identical
+/// to the previous longhand recurse walk.
+fn type_query_children<'a>(
+    _py: Python<'a>,
+    obj: &'a PyAny,
+    refs: &TypeRefs<'a>,
+) -> Result<Vec<&'a PyAny>, DeferError> {
+    let mut out: Vec<&PyAny> = Vec::new();
+    if is_instance(obj, refs.instance) {
+        let args = get_attr_or_defer(obj, "args")?;
+        out.extend(iter_seq(args)?);
+        return Ok(out);
+    }
+    if is_instance(obj, refs.callable_type) {
+        let arg_types = get_attr_or_defer(obj, "arg_types")?;
+        out.extend(iter_seq(arg_types)?);
+        let ret = get_attr_or_defer(obj, "ret_type")?;
+        out.push(ret);
+        let inst = obj.getattr("instance_type").map_err(|_| DeferError)?;
+        if !inst.is_none() {
+            out.push(inst);
+        }
+        return Ok(out);
+    }
+    if is_instance(obj, refs.union_type) {
+        let items = get_attr_or_defer(obj, "items")?;
+        out.extend(iter_seq(items)?);
+        return Ok(out);
+    }
+    if is_instance(obj, refs.tuple_type) {
+        let items = get_attr_or_defer(obj, "items")?;
+        out.extend(iter_seq(items)?);
+        let fb = get_attr_or_defer(obj, "partial_fallback")?;
+        out.push(fb);
+        return Ok(out);
+    }
+    if is_instance(obj, refs.typed_dict_type) {
+        let items = get_attr_or_defer(obj, "items")?;
+        let dict: &PyDict = items.downcast().map_err(|_| DeferError)?;
+        for (_, v) in dict.iter() {
+            out.push(v);
+        }
+        let fb = get_attr_or_defer(obj, "fallback")?;
+        out.push(fb);
+        return Ok(out);
+    }
+    if is_instance(obj, refs.type_type) {
+        let item = get_attr_or_defer(obj, "item")?;
+        out.push(item);
+        return Ok(out);
+    }
+    if is_instance(obj, refs.overloaded) {
+        let items = get_attr_or_defer(obj, "items")?;
+        out.extend(iter_seq(items)?);
+        return Ok(out);
+    }
+    if is_instance(obj, refs.literal_type) {
+        let fb = get_attr_or_defer(obj, "fallback")?;
+        out.push(fb);
+        return Ok(out);
+    }
+    if is_instance(obj, refs.unpack_type) {
+        let typ = get_attr_or_defer(obj, "type")?;
+        out.push(typ);
+        return Ok(out);
+    }
+    if is_instance(obj, refs.any_type) {
+        let sa = obj.getattr("source_any").map_err(|_| DeferError)?;
+        if !sa.is_none() {
+            out.push(sa);
+        }
+        return Ok(out);
+    }
+    if is_instance(obj, refs.type_var_type)
+        || is_instance(obj, refs.param_spec_type)
+        || is_instance(obj, refs.type_var_tuple_type)
+    {
+        // TypeVar-like: recurse upper_bound, default, values.
+        let ub = get_attr_or_defer(obj, "upper_bound")?;
+        out.push(ub);
+        let default = get_attr_or_defer(obj, "default")?;
+        out.push(default);
+        let values = get_attr_or_defer(obj, "values")?;
+        out.extend(iter_seq(values)?);
+        return Ok(out);
+    }
+    // NoneType, UninhabitedType, DeletedType, UnboundType, Parameters:
+    // no children to recurse.
+    Ok(out)
+}
+
 /// Recurse into all children of `obj` for diverging alias detection.
 fn diverging_recurse_children(
     py: Python<'_>,
@@ -2036,126 +2180,12 @@ fn diverging_recurse_children(
     diverging: &mut bool,
     refs: &TypeRefs<'_>,
 ) -> Result<(), DeferError> {
-    if is_instance(obj, refs.instance) {
-        let args = get_attr_or_defer(obj, "args")?;
-        for a in iter_seq(args)? {
-            diverging_alias_visit(py, a, seen, diverging, refs)?;
-            if *diverging {
-                return Ok(());
-            }
-        }
-        return Ok(());
-    }
-    if is_instance(obj, refs.callable_type) {
-        let arg_types = get_attr_or_defer(obj, "arg_types")?;
-        for a in iter_seq(arg_types)? {
-            diverging_alias_visit(py, a, seen, diverging, refs)?;
-            if *diverging {
-                return Ok(());
-            }
-        }
-        let ret = get_attr_or_defer(obj, "ret_type")?;
-        diverging_alias_visit(py, ret, seen, diverging, refs)?;
+    for child in type_query_children(py, obj, refs)? {
+        diverging_alias_visit(py, child, seen, diverging, refs)?;
         if *diverging {
             return Ok(());
         }
-        let inst = obj.getattr("instance_type").map_err(|_| DeferError)?;
-        if !inst.is_none() {
-            diverging_alias_visit(py, inst, seen, diverging, refs)?;
-        }
-        return Ok(());
     }
-    if is_instance(obj, refs.union_type) {
-        let items = get_attr_or_defer(obj, "items")?;
-        for a in iter_seq(items)? {
-            diverging_alias_visit(py, a, seen, diverging, refs)?;
-            if *diverging {
-                return Ok(());
-            }
-        }
-        return Ok(());
-    }
-    if is_instance(obj, refs.tuple_type) {
-        let items = get_attr_or_defer(obj, "items")?;
-        for a in iter_seq(items)? {
-            diverging_alias_visit(py, a, seen, diverging, refs)?;
-            if *diverging {
-                return Ok(());
-            }
-        }
-        let fb = get_attr_or_defer(obj, "partial_fallback")?;
-        return diverging_alias_visit(py, fb, seen, diverging, refs);
-    }
-    if is_instance(obj, refs.typed_dict_type) {
-        let items = get_attr_or_defer(obj, "items")?;
-        let dict: &PyDict = items.downcast().map_err(|_| DeferError)?;
-        for (_, v) in dict.iter() {
-            diverging_alias_visit(py, v, seen, diverging, refs)?;
-            if *diverging {
-                return Ok(());
-            }
-        }
-        let fb = get_attr_or_defer(obj, "fallback")?;
-        return diverging_alias_visit(py, fb, seen, diverging, refs);
-    }
-    if is_instance(obj, refs.type_type) {
-        let item = get_attr_or_defer(obj, "item")?;
-        return diverging_alias_visit(py, item, seen, diverging, refs);
-    }
-    if is_instance(obj, refs.overloaded) {
-        let items = get_attr_or_defer(obj, "items")?;
-        for a in iter_seq(items)? {
-            diverging_alias_visit(py, a, seen, diverging, refs)?;
-            if *diverging {
-                return Ok(());
-            }
-        }
-        return Ok(());
-    }
-    if is_instance(obj, refs.literal_type) {
-        let fb = get_attr_or_defer(obj, "fallback")?;
-        return diverging_alias_visit(py, fb, seen, diverging, refs);
-    }
-    if is_instance(obj, refs.unpack_type) {
-        let typ = get_attr_or_defer(obj, "type")?;
-        return diverging_alias_visit(py, typ, seen, diverging, refs);
-    }
-    if is_instance(obj, refs.any_type) {
-        let sa = obj.getattr("source_any").map_err(|_| DeferError)?;
-        if !sa.is_none() {
-            diverging_alias_visit(py, sa, seen, diverging, refs)?;
-        }
-        return Ok(());
-    }
-    if is_instance(obj, refs.type_var_type)
-        || is_instance(obj, refs.param_spec_type)
-        || is_instance(obj, refs.type_var_tuple_type)
-    {
-        // TypeVar-like: recurse upper_bound, default, values.
-        let ub = get_attr_or_defer(obj, "upper_bound")?;
-        diverging_alias_visit(py, ub, seen, diverging, refs)?;
-        if *diverging {
-            return Ok(());
-        }
-        let default = get_attr_or_defer(obj, "default")?;
-        diverging_alias_visit(py, default, seen, diverging, refs)?;
-        if *diverging {
-            return Ok(());
-        }
-        let values = get_attr_or_defer(obj, "values")?;
-        for v in iter_seq(values)? {
-            diverging_alias_visit(py, v, seen, diverging, refs)?;
-            if *diverging {
-                return Ok(());
-            }
-        }
-        return Ok(());
-    }
-    if is_instance(obj, refs.type_alias_type) {
-        return diverging_visit_alias_type(py, obj, seen, diverging, refs);
-    }
-    // NoneType, UninhabitedType, DeletedType, UnboundType, Parameters:
-    // no children to recurse.
     Ok(())
 }
 
@@ -2680,7 +2710,7 @@ mod tests {
     fn test_find_self_type_wire_py312_args_queried() {
         // New-style alias: the target is plain, so the Self must come
         // from the node's own args via the python_3_12 arm.
-        let aliases = alias_resolver_with("mod.Y", &make_any(SPECIAL_FORM));
+        let _aliases = alias_resolver_with("mod.Y", &make_any(SPECIAL_FORM));
         let mut snap = TypeAliasSnapshot {
             fullname: "mod.Y".to_string(),
             target: encode_type(&make_any(SPECIAL_FORM)).expect("target encodes"),

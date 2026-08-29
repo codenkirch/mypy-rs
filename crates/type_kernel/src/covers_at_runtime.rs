@@ -2,7 +2,10 @@
 //! will `isinstance(item, supertype)` always return True at runtime?
 //! Erases both operands (unless supertype is a type-object `FunctionLike`),
 //! then runs the proper-subtype / protocol / TypedDict / TypeVar / native-int
-//! checks. Defers (`None`) on wire-unrepresentable forms; subtype checks go
+//! checks. Tuple operands ride the normal erase flow
+//! (`argapprox::erase_type` maps a `TupleType` to its `partial_fallback`,
+//! mirroring `erasetype.py visit_tuple_type`), so they need no special
+//! defer. Defers (`None`) on wire-unrepresentable forms; subtype checks go
 //! through the Stage-3c kernel and erasures through the wire `erase_type`.
 //! The pyfunction seam expands top-level `TypeAliasType` operands via the
 //! alias resolver before entering the inner; the inner still defers on
@@ -38,23 +41,6 @@ pub(crate) fn covers_at_runtime_inner(
     let item = get_proper_or_none(item)?;
     let supertype = get_proper_or_none(supertype)?;
 
-    // Defer tuple-shaped operands: Python erases with erase_instances=True
-    // (subtypes.py:780) which the Rust kernel has no flag for, so Rust
-    // answers Some(false) where Python answers True (testReverseBinaryOperator4).
-    if matches!(item, Type::TupleType { .. }) || matches!(supertype, Type::TupleType { .. }) {
-        return None;
-    }
-    if let Type::Instance { type_ref, .. } = item {
-        if type_ref == "builtins.tuple" {
-            return None;
-        }
-    }
-    if let Type::Instance { type_ref, .. } = supertype {
-        if type_ref == "builtins.tuple" {
-            return None;
-        }
-    }
-
     // subtypes.py:2524-2526: runtime type checks ignore type arguments,
     // so erase the supertype unless it is a type-object (a `Type[cls]`
     // check is exact on `cls`, not on its erased form).
@@ -67,11 +53,15 @@ pub(crate) fn covers_at_runtime_inner(
     };
 
     // subtypes.py:2527-2530: `is_proper_subtype(erase_type(item), supertype,
-    // ignore_promotions=True, erase_instances=True)`; zero-arg
-    // `erase_type(item)` already neutralizes the `erase_instances` flag.
+    // ignore_promotions=True, erase_instances=True)`; the zero-arg
+    // `erase_type(item)` neutralizes the covers-level erase, but the
+    // `erase_instances` flag itself erases the instance Python maps to the
+    // supertype inside visit_instance (subtypes.py:1151-1155).
     let item_erased = argapprox::erase_type(item, strict_optional, resolver)?;
-    let ctx = SubtypeContext::new(false, false, false, true, true, strict_optional);
-    match subtypes::is_subtype(&item_erased, supertype_to_use, &ctx, resolver) {
+    let mut ctx = SubtypeContext::new(false, false, false, true, true, strict_optional);
+    ctx.erase_instances = true;
+    let decision = subtypes::is_subtype(&item_erased, supertype_to_use, &ctx, resolver);
+    match decision {
         Some(true) => return Some(true),
         None => return None,
         Some(false) => {}

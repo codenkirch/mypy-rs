@@ -1658,6 +1658,23 @@ including:
   `TypeAliasType`); the ~2.9k Python fallback body re-runs are gone from
   the self-check corpus. Covered by gated unit tests in `typeops.rs`
   and `NativeTryGettingStrLiteralsSuite` in `mypy/test/testtypes.py`.
+- `rust_any_constraints` original-constraint matching (issue #1171) —
+  `_try_native_any_constraints` no longer rebuilds result Constraints
+  from wire. The wire round-trip has no representation for
+  `extra_tvars` (attached by `visit_callable_type` during
+  polymorphic-overload inference), and rebuilding produced fresh
+  targets/origins that broke `defaultdict[T, list[T]]` partial-type
+  inference (`testPartialDefaultDict*` regressions). The shim now uses
+  the kernel's output purely as a decision: each returned
+  (origin-id, op, target) blob is matched back against the flattened
+  valid options (eager truthiness, ascending order, monotonic cursor)
+  and the original live Constraint object is returned; a constraint the
+  kernel rewrote (merge_with_any union target) never matches and the
+  whole call defers to the pure-Python body. Covered by
+  `NativeAnyConstraintsSuite` in `mypy/test/testtypes.py` (gate-off vs
+  gate-on differentials plus a direct seam call asserting the original
+  object and its extra_tvars survive and value-equal options
+  disambiguate).
 
 Stages 1/2 return `None` for any type class Rust does not handle, and
 the Python caller falls back to the pure-Python visitor. This is the
