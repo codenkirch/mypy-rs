@@ -45338,3 +45338,211 @@ class NativeConstraintUnionSuite(Suite):
         actual = TypeAliasType(alias, [])
         self._assert_par(self.fx.t, actual, SUPERTYPE_OF)
         self._assert_engages(self.fx.t, actual, SUPERTYPE_OF)
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeTryGettingStrLiteralsSuite(Suite):
+    """Issue #1168: the `try_getting_{str,int,bool}_literals_from_type`
+    seams under the #1101 decided-None protocol.
+
+    Rust answers `(true, values)` for a proven literal list and
+    `(true, None)` when Python provably answers None (plain Instance
+    without last_known_value, an Instance-with-lkv union item, a literal
+    whose fallback fullname or value kind does not match the target,
+    TupleType, Any, ...), so the shim no longer re-runs the Python body.
+    Only `TypeAliasType` candidates (top level or a union item) defer:
+    Python expands them via `get_proper_type`, but the wire has no alias
+    target. Direct seam calls prove the decided markers; gate-off vs
+    gate-on differentials prove the public functions answer identically
+    either way.
+    """
+
+    def setUp(self) -> None:
+        import type_kernel
+
+        from mypy.typeops import _serialize_type, _set_native_typeops_active
+
+        self._tk = type_kernel
+        self._serialize = _serialize_type
+        self._set_active = _set_native_typeops_active
+        self.fx = TypeFixture()
+        int_info = self.fx.make_type_info("builtins.int")
+        self.int_inst = Instance(int_info, [])
+        self.lit_int1 = LiteralType(1, self.int_inst)
+        self.lit_int1_inst = Instance(int_info, [], last_known_value=self.lit_int1)
+        # A bool literal value on an int fallback: the fallback gate fires
+        # first in Python, so this is not an int literal, but Literal[True]
+        # ON an int fallback is (isinstance(True, int)).
+        self.lit_true_on_int = LiteralType(True, self.int_inst)
+        self.lit_true_on_int_inst = Instance(
+            int_info, [], last_known_value=self.lit_true_on_int
+        )
+        self._set_active(True)
+
+    def tearDown(self) -> None:
+        self._set_active(False)
+
+    def _with_gate(self, active: bool, fn: Callable[[], Any]) -> Any:
+        self._set_active(active)
+        try:
+            return fn()
+        finally:
+            self._set_active(True)
+
+    def _seam(self, fn_name: str, typ: Type) -> tuple[bool, Any]:
+        """Direct seam call; pyfunction-None (deferral) raises TypeError."""
+        fn = getattr(self._tk, fn_name)
+        decided, result = fn(self._serialize(typ))
+        return decided, result
+
+    # --- direct seam calls (str target) ---
+
+    def test_str_seam_decided_values(self) -> None:
+        # Instance with a str last_known_value: the literal survives.
+        decided, result = self._seam(
+            "rust_try_getting_str_literals_from_type", self.fx.lit_str1_inst
+        )
+        assert decided is True and result == ["x"]
+        # Top-level LiteralType proper.
+        decided, result = self._seam(
+            "rust_try_getting_str_literals_from_type", self.fx.lit_str1
+        )
+        assert decided is True and result == ["x"]
+        # Union of LiteralType items.
+        u = UnionType([self.fx.lit_str1, self.fx.lit_str2])
+        decided, result = self._seam("rust_try_getting_str_literals_from_type", u)
+        assert decided is True and result == ["x", "y"]
+
+    def test_str_seam_decided_none(self) -> None:
+        # Plain Instance without last_known_value (the dominant defer class).
+        cases: list[Type] = [
+            self.fx.a,
+            self.fx.anyt,
+            self.fx.nonet,
+            self.fx.std_tuple,
+            # A literal with a non-str fallback: Python checks
+            # fallback.fullname before the value kind, so it is decided-None.
+            self.fx.lit1_inst,
+            # Union whose items are Instances-with-lkv (not LiteralTypes):
+            # Python's get_proper_types does not unwrap the items' lkv.
+            UnionType([self.fx.lit_str1_inst, self.fx.lit_str2_inst]),
+            UnionType([self.fx.lit_str1_inst, self.lit_int1_inst]),
+            UnionType([self.fx.lit_str1_inst, self.fx.a]),
+        ]
+        for typ in cases:
+            decided, result = self._seam("rust_try_getting_str_literals_from_type", typ)
+            assert decided is True and result is None
+
+    def test_str_seam_defers_on_aliases(self) -> None:
+        # A pyfunction-level None is the deferral marker: Python expands
+        # the alias via get_proper_type, so the shim must re-run its body
+        # (the public function still answers None; proven by parity below).
+        alias = TypeAlias(self.fx.a, "mod.A", "mod", -1, -1)
+        t = TypeAliasType(alias, [])
+        # A union with an alias item defers as a whole.
+        u = UnionType([self.fx.lit_str1_inst, t])
+        assert (
+            self._tk.rust_try_getting_str_literals_from_type(self._serialize(t)) is None
+        )
+        assert (
+            self._tk.rust_try_getting_str_literals_from_type(self._serialize(u)) is None
+        )
+
+    # --- int and bool targets ---
+
+    def test_int_seam(self) -> None:
+        decided, result = self._seam(
+            "rust_try_getting_int_literals_from_type", self.lit_int1_inst
+        )
+        assert decided is True and result == [1]
+        # Literal[True] with an int fallback counts as an int literal
+        # (isinstance(True, int)); decided into Scalar::Int by Rust.
+        decided, result = self._seam(
+            "rust_try_getting_int_literals_from_type", self.lit_true_on_int_inst
+        )
+        assert decided is True and result == [1]
+        # A str literal under the int target is decided-None.
+        decided, result = self._seam(
+            "rust_try_getting_int_literals_from_type", self.fx.lit_str1_inst
+        )
+        assert decided is True and result is None
+        # Literal[True] on the BOOL fallback fails the fallback gate first
+        # in Python: decided-None, not the bool-value->int fold.
+        bool_inst = Instance(
+            self.fx.bool_type_info, [], last_known_value=self.fx.lit_true
+        )
+        decided, result = self._seam(
+            "rust_try_getting_int_literals_from_type", bool_inst
+        )
+        assert decided is True and result is None
+
+    def test_bool_seam(self) -> None:
+        u = UnionType([self.fx.lit_true, self.fx.lit_false])
+        decided, result = self._seam("rust_try_getting_bool_literals_from_type", u)
+        assert decided is True and result == [True, False]
+        decided, result = self._seam(
+            "rust_try_getting_bool_literals_from_type", self.fx.lit_true
+        )
+        assert decided is True and result == [True]
+        # An int literal under the bool target is decided-None.
+        decided, result = self._seam(
+            "rust_try_getting_bool_literals_from_type", self.lit_int1_inst
+        )
+        assert decided is True and result is None
+
+    # --- gate-off vs gate-on parity through the public functions ---
+
+    def test_str_gate_parity(self) -> None:
+        from mypy.typeops import try_getting_str_literals_from_type
+
+        alias = TypeAlias(self.fx.a, "mod.A", "mod", -1, -1)
+        alias_t = TypeAliasType(alias, [])
+        cases = [
+            (self.fx.lit_str1_inst, ["x"]),
+            (UnionType([self.fx.lit_str1, self.fx.lit_str2]), ["x", "y"]),
+            (self.fx.a, None),
+            (self.fx.anyt, None),
+            (self.fx.std_tuple, None),
+            (self.fx.lit1_inst, None),
+            (UnionType([self.fx.lit_str1_inst, self.fx.lit_str2_inst]), None),
+            (alias_t, None),
+            (UnionType([self.fx.lit_str1_inst, alias_t]), None),
+        ]
+        for typ, expected in cases:
+            off = self._with_gate(
+                False, lambda: try_getting_str_literals_from_type(typ)
+            )
+            on = self._with_gate(True, lambda: try_getting_str_literals_from_type(typ))
+            assert off == on == expected, f"{typ}: off={off!r} on={on!r}"
+
+    def test_int_bool_gate_parity(self) -> None:
+        from mypy.typeops import (
+            try_getting_int_literals_from_type,
+            try_getting_literals_from_type,
+        )
+
+        int_cases = [
+            (self.lit_int1_inst, [1]),
+            (self.lit_true_on_int_inst, [1]),
+            (self.fx.lit_str1_inst, None),
+        ]
+        for typ, expected in int_cases:
+            off = self._with_gate(
+                False, lambda: try_getting_int_literals_from_type(typ)
+            )
+            on = self._with_gate(True, lambda: try_getting_int_literals_from_type(typ))
+            assert off == on == expected
+        bool_cases = [
+            (self.fx.lit_true, [True]),
+            (UnionType([self.fx.lit_true, self.fx.lit_false]), [True, False]),
+            (self.lit_int1_inst, None),
+        ]
+        for typ, expected in bool_cases:
+            off = self._with_gate(
+                False,
+                lambda: try_getting_literals_from_type(typ, bool, "builtins.bool"),
+            )
+            on = self._with_gate(
+                True, lambda: try_getting_literals_from_type(typ, bool, "builtins.bool")
+            )
+            assert off == on == expected
