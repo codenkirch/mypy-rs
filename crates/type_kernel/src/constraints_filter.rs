@@ -247,7 +247,7 @@ pub(crate) fn rust_unwrap_type_type(tp_bytes: &[u8]) -> Option<Vec<u8>> {
     Some(buf.into_bytes())
 }
 
-fn is_type_type_inner(tp: &Type) -> bool {
+pub(crate) fn is_type_type_inner(tp: &Type) -> bool {
     match tp {
         Type::TypeType { .. } => true,
         Type::UnionType { items, .. } => items.iter().all(|i| matches!(i, Type::TypeType { .. })),
@@ -255,7 +255,7 @@ fn is_type_type_inner(tp: &Type) -> bool {
     }
 }
 
-fn unwrap_type_type_inner(tp: &Type) -> Option<Type> {
+pub(crate) fn unwrap_type_type_inner(tp: &Type) -> Option<Type> {
     match tp {
         Type::TypeType { item, .. } => Some((**item).clone()),
         Type::UnionType { items, .. } => {
@@ -268,28 +268,10 @@ fn unwrap_type_type_inner(tp: &Type) -> Option<Type> {
                     _ => return None, // not all items are TypeType; defer
                 }
             }
-            if inner_items.is_empty() {
-                return None;
-            }
-            if inner_items.len() == 1 {
-                return Some(inner_items.into_iter().next().unwrap());
-            }
-            // UnionType.make_union = make_simplified_union. This needs a
-            // resolver + subtype context. Defer so Python builds the union.
-            // (The Python path calls UnionType.make_union which flattens
-
-            // and deduplicates; Rust can't do that without a resolver.)
-            // However, a simple UnionType with the items is sufficient
-            // for the constraint solver, which normalizes unions anyway.
-
-            // Return a plain UnionType — the Python caller will
-            // re-normalize via make_simplified_union in _infer_constraints.
-            Some(Type::UnionType {
-                items: inner_items,
-                uses_pep604_syntax: false,
-                can_be_true: true,
-                can_be_false: true,
-            })
+            // UnionType.make_union: 0 items -> UninhabitedType, 1 item ->
+            // the item itself, >1 -> UnionType(items) (types.py:3774-3780).
+            // The union gate guarantees TypeType items; an alias item defers.
+            Some(crate::setops::union_make_union(inner_items))
         }
         _ => None,
     }
@@ -316,6 +298,7 @@ pub(crate) fn rust_infer_directed_arg_constraints(
     left_bytes: &[u8],
     right_bytes: &[u8],
     direction: i64,
+    strict_optional: bool,
 ) -> Option<Vec<u8>> {
     let left = decode_type(left_bytes)?;
     let right = decode_type(right_bytes)?;
@@ -344,6 +327,7 @@ pub(crate) fn rust_infer_directed_arg_constraints(
         inferred_dir,
         resolver.resolver(),
         resolver.alias_resolver(),
+        strict_optional,
     )?;
 
     let mut output = WriteBuffer::new();
@@ -796,6 +780,7 @@ mod tests {
             &left_buf.into_bytes(),
             &right_buf.into_bytes(),
             SUBTYPE_OF,
+            true,
         )
         .unwrap();
         let decoded = read_constraint_list(&result).unwrap();
@@ -817,6 +802,7 @@ mod tests {
             &left_buf.into_bytes(),
             &right_buf.into_bytes(),
             SUBTYPE_OF,
+            true,
         )
         .unwrap();
         assert!(read_constraint_list(&result).unwrap().is_empty());
@@ -838,6 +824,7 @@ mod tests {
             &left_buf.into_bytes(),
             &right_buf.into_bytes(),
             SUBTYPE_OF,
+            true,
         );
         // The inner inference may defer (None) if the resolver doesn't
         // have builtins.int. That's fine — we just check it doesn't panic.

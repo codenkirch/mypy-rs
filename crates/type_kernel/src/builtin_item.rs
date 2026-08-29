@@ -141,7 +141,7 @@ fn builtin_item_type_inner(
                 }
             }
             let ctx = SubtypeContext::new(false, false, false, true, true, strict_optional);
-            make_simplified_union(&normalized, &ctx, r, true)
+            make_simplified_union(&normalized, &ctx, r, true, false)
         }
         // TypedDictType: the key type of the Mapping base found in the
         // fallback's mro (checker.py:9528-9534).

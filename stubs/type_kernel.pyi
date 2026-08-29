@@ -1028,19 +1028,23 @@ def rust_infer_constraints_full(
     direction: int,
     skip_neg_op: bool,
     erase_types: bool,
+    strict_optional: bool,
 ) -> list[bytes] | None: ...
 def rust_select_trivial(options_bytes: bytes) -> bytes | None: ...
 def rust_exclude_non_meta_vars(option_bytes: bytes) -> bytes | None: ...
 def rust_is_similar_constraints(x_bytes: bytes, y_bytes: bytes) -> bool | None: ...
 def rust_any_constraints(
-    options_bytes: bytes, eager: bool, resolver: NativeTypeResolver
+    options_bytes: bytes,
+    eager: bool,
+    strict_optional: bool,
+    resolver: NativeTypeResolver,
 ) -> list[bytes] | None: ...
 def rust_repack_callable_args(
     callable_bytes: bytes, resolver: NativeTypeResolver
 ) -> list[bytes] | None: ...
 def rust_merge_with_any(constraint_bytes: bytes) -> bool | None: ...
 def rust_filter_satisfiable(
-    option_bytes: bytes, resolver: NativeTypeResolver
+    option_bytes: bytes, strict_optional: bool, resolver: NativeTypeResolver
 ) -> bytes | None: ...
 def rust_is_same_constraints(
     x_bytes: bytes, y_bytes: bytes, resolver: NativeTypeResolver
@@ -1051,12 +1055,14 @@ def rust_infer_directed_arg_constraints(
     left_bytes: bytes,
     right_bytes: bytes,
     direction: int,
+    strict_optional: bool,
 ) -> bytes | None: ...
 def rust_infer_callable_arguments_constraints(
     resolver: NativeTypeResolver,
     template_bytes: bytes,
     actual_bytes: bytes,
     direction: int,
+    strict_optional: bool,
 ) -> bytes | None: ...
 def rust_is_type_type(tp_bytes: bytes) -> bool | None: ...
 def rust_skip_reverse_union_constraints(constraints_bytes: bytes) -> bytes | None: ...

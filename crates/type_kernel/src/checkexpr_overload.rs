@@ -85,7 +85,7 @@ fn simplified_union(
         strict_optional,
         ..Default::default()
     };
-    make_simplified_union(items, &sub_ctx, resolver.resolver(), true)
+    make_simplified_union(items, &sub_ctx, resolver.resolver(), true, false)
 }
 
 /// Replace a callable's arg_types/arg_kinds/arg_names/ret_type/variables.

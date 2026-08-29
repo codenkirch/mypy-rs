@@ -2430,7 +2430,7 @@ fn combined_context_inner(
 
     // aliases defer (flatten rejects them) -> Python get_proper_type.
     let ctx = SubtypeContext::new(false, false, false, true, true, true);
-    let result = crate::setops::make_simplified_union(&items, &ctx, resolver, true)?;
+    let result = crate::setops::make_simplified_union(&items, &ctx, resolver, true, false)?;
     encode_type(&result)
 }
 
@@ -6685,7 +6685,6 @@ pub(crate) fn rust_classify_index_with_type(
 
 #[cfg(test)]
 mod classify_index_with_type_tests {
-    use super::*;
 
     #[allow(clippy::too_many_arguments)]
     fn classify(

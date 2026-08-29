@@ -194,6 +194,16 @@ pub(crate) fn type_contains_alias(typ: &Type) -> bool {
     children(typ).into_iter().any(type_contains_alias)
 }
 
+/// True if `typ` contains any `ErasedType` node. ErasedType is not
+/// decodable by the Python `read_type` (tag 122), so any operand or
+/// result carrying one cannot cross the wire; callers defer.
+pub(crate) fn type_contains_erased(typ: &Type) -> bool {
+    if matches!(typ, Type::ErasedType) {
+        return true;
+    }
+    children(typ).into_iter().any(type_contains_erased)
+}
+
 /// Yield the direct child types of `typ` (for ANY_STRATEGY / ALL_STRATEGY
 /// traversal). Mirrors the `query_types` calls in `BoolTypeQuery.visit_*`.
 fn children(typ: &Type) -> Vec<&Type> {

@@ -488,8 +488,8 @@ fn narrow_with_len_inner(
             yes_types.extend(other_types.clone());
             no_types.extend(other_types);
             let ctx = SubtypeContext::new(false, false, false, true, true, true);
-            let yes_type = setops::make_simplified_union(&yes_types, &ctx, resolver, false)?;
-            let no_type = setops::make_simplified_union(&no_types, &ctx, resolver, false)?;
+            let yes_type = setops::make_simplified_union(&yes_types, &ctx, resolver, false, false)?;
+            let no_type = setops::make_simplified_union(&no_types, &ctx, resolver, false, false)?;
             Some((yes_type, no_type))
         }
         _ => None,

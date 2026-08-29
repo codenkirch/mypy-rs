@@ -316,8 +316,8 @@ pub(crate) fn conditional_types_inner(
             no_items.push(no_type?);
         }
         let ctx = SubtypeContext::new(false, false, false, true, true, strict_optional);
-        let yes = make_simplified_union(&yes_items, &ctx, resolver, true)?;
-        let no = make_simplified_union(&no_items, &ctx, resolver, true)?;
+        let yes = make_simplified_union(&yes_items, &ctx, resolver, true, false)?;
+        let no = make_simplified_union(&no_items, &ctx, resolver, true, false)?;
         return Some((Some(yes), Some(no)));
     }
 
@@ -325,7 +325,7 @@ pub(crate) fn conditional_types_inner(
     // unwrap, then flattened make_union (checker.py:9362-9371).
     let proposed_items: Vec<Type> = ranges.iter().map(|r| r.item.clone()).collect();
     let ctx = SubtypeContext::new(false, false, false, true, true, strict_optional);
-    let proposed = make_simplified_union(&proposed_items, &ctx, resolver, true)?;
+    let proposed = make_simplified_union(&proposed_items, &ctx, resolver, true, false)?;
     let proposed_proper = get_proper_or_none(&proposed).cloned();
     let mut items = match proposed_proper {
         Some(Type::UnionType { items, .. }) => items,

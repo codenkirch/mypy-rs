@@ -838,6 +838,7 @@ pub fn rust_solve_generic_call(
                 crate::constraints::SUPERTYPE_OF, // mirrors constraints.py:641
                 resolver.resolver(),
                 resolver.alias_resolver(),
+                strict_optional,
             ) {
                 Some(c) => c,
                 None => {
@@ -2233,7 +2234,6 @@ mod tests {
         // def [T] (a: T, b: T) -> T with int + str: two lowers are joined
         // by solve_one_inner instead of the old deferral for the
         // diagnostic; a satisfiable join solves natively.
-        let callee = generic_identity();
         let mut two = generic_identity();
         if let Type::CallableType {
             arg_types,

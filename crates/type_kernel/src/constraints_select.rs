@@ -30,10 +30,10 @@ use crate::wire::{self, ReadBuffer, Type, WireError, WriteBuffer};
 /// Each constraint on the wire is `origin Type | op int | target Type`
 /// (mirrors constraints_helpers.rs).
 #[derive(Clone)]
-struct ConstraintRep {
-    origin: Type,
-    op: i64,
-    target: Type,
+pub(crate) struct ConstraintRep {
+    pub(crate) origin: Type,
+    pub(crate) op: i64,
+    pub(crate) target: Type,
 }
 
 fn read_constraint(buf: &mut ReadBuffer<'_>) -> Option<ConstraintRep> {
@@ -377,7 +377,7 @@ fn exclude_non_meta_vars(
 /// The recursive body of `any_constraints` (constraints.py:853-908),
 /// returning the resulting constraints in order (wire `ConstraintRep`s),
 /// or `None` to defer the whole call to Python.
-fn any_constraints_inner(
+pub(crate) fn any_constraints_inner(
     options: &[Option<Vec<ConstraintRep>>],
     eager: bool,
     ctx: &SubtypeContext,
@@ -492,13 +492,13 @@ fn options_equal(a: &[Option<Vec<ConstraintRep>>], b: &[Option<Vec<ConstraintRep
 pub(crate) fn rust_any_constraints(
     options_bytes: &[u8],
     eager: bool,
+    strict_optional: bool,
     resolver: &mut NativeTypeResolver,
 ) -> Option<Vec<Vec<u8>>> {
     let options = read_options(options_bytes)?;
     // Matches the pure-Python `is_subtype` defaults (subtypes.py:260-270):
-    // all flags False except strict_optional, which follows the state
-    // default True.
-    let ctx = SubtypeContext::new(false, false, false, false, false, true);
+    // all flags False except strict_optional, which follows the state.
+    let ctx = SubtypeContext::new(false, false, false, false, false, strict_optional);
     let result = any_constraints_inner(&options, eager, &ctx, resolver.resolver())?;
     let mut out = Vec::with_capacity(result.len());
     for constraint in result {
@@ -550,13 +550,13 @@ pub(crate) fn rust_merge_with_any(constraint_bytes: &[u8]) -> Option<bool> {
 #[pyfunction]
 pub(crate) fn rust_filter_satisfiable(
     option_bytes: &[u8],
+    strict_optional: bool,
     resolver: &mut NativeTypeResolver,
 ) -> Option<Vec<u8>> {
     let option = read_option_list(option_bytes)?;
     // Matches the pure-Python `is_subtype` defaults (subtypes.py:260-270):
-    // all flags False except strict_optional, which follows the state
-    // default True.
-    let ctx = SubtypeContext::new(false, false, false, false, false, true);
+    // all flags False except strict_optional, which follows the state.
+    let ctx = SubtypeContext::new(false, false, false, false, false, strict_optional);
     let mut kept = Vec::with_capacity(option.len());
     for (i, c) in option.iter().enumerate() {
         let Type::TypeVarType {

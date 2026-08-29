@@ -244,7 +244,7 @@ pub(crate) fn join_types(
             let mut merged = Vec::with_capacity(s_items.len() + t_items.len());
             merged.extend(flatten_nested_unions(s_items)?);
             merged.extend(flatten_nested_unions(t_items)?);
-            let simplified = make_simplified_union(&merged, ctx, resolver, true)?;
+            let simplified = make_simplified_union(&merged, ctx, resolver, true, false)?;
             let mut wbuf = WriteBuffer::new();
             wire::write_type(&mut wbuf, &simplified).ok()?;
             return Some(SetOpResult::Encoded(wbuf.into_bytes()));
@@ -717,7 +717,7 @@ fn visit_meet(
             // Drop UninhabitedType items, then make_simplified_union
             // (which itself drops/contracts; defer when it can't).
             meets.retain(|item| !matches!(item, Type::UninhabitedType { .. }));
-            let joined = make_simplified_union(&meets, ctx, resolver, false)?;
+            let joined = make_simplified_union(&meets, ctx, resolver, false, false)?;
             let mut wbuf = WriteBuffer::new();
             wire::write_type(&mut wbuf, &joined).ok()?;
             Some(SetOpResult::Encoded(wbuf.into_bytes()))
@@ -792,7 +792,7 @@ fn meet_union(
     meets.retain(|item| !matches!(item, Type::UninhabitedType { .. }));
 
     // make_simplified_union returns Option<Type>; wrap as Encoded(SetOpResult)
-    let joined = make_simplified_union(&meets, ctx, resolver, false)?;
+    let joined = make_simplified_union(&meets, ctx, resolver, false, false)?;
     let mut wbuf = WriteBuffer::new();
     wire::write_type(&mut wbuf, &joined).ok()?;
     Some(SetOpResult::Encoded(wbuf.into_bytes()))
@@ -1668,12 +1668,9 @@ fn safe_meet(t: &Type, s: &Type, ctx: &SubtypeContext, resolver: &TypeResolver) 
 }
 
 // `join_similar_callables` (join.py:1086-1119): non-equivalent similar
-// callables. Per-arg safe_meet, ret join, instance_type join, fallback
-// pick. Returns Encoded(new CallableType) or None (defer).
-// Called with the (t, self.s) operand order from join.py:622; the
-// operands are passed through in that frame, and the field handling
+// callables. Per-arg safe_meet, ret join, instance_type join, fallback pick.
+// Operand order (t, self.s) from join.py:622; field handling per callsite.
 
-// mirrors `combine_similar_callables`' callsite (s=left, t=right).
 #[allow(clippy::too_many_arguments)]
 fn join_similar_callables_impl(
     s: &Type,
@@ -2051,6 +2048,7 @@ fn visit_join(
                             ctx,
                             resolver,
                             true,
+                            false,
                         )?;
                         let mut wbuf = WriteBuffer::new();
                         wire::write_type(&mut wbuf, &simplified).ok()?;
@@ -2558,8 +2556,13 @@ fn visit_join(
                         && is_enum_fallback(t_fb, resolver)
                         && s_fb.as_ref() == t_fb.as_ref()
                     {
-                        let simplified =
-                            make_simplified_union(&[s.clone(), t.clone()], ctx, resolver, true)?;
+                        let simplified = make_simplified_union(
+                            &[s.clone(), t.clone()],
+                            ctx,
+                            resolver,
+                            true,
+                            false,
+                        )?;
                         if !matches!(simplified, Type::Instance { .. } | Type::UnionType { .. }) {
                             return None;
                         }
@@ -3806,6 +3809,7 @@ pub(crate) fn make_simplified_union(
     ctx: &SubtypeContext,
     resolver: &TypeResolver,
     contract_literals: bool,
+    keep_erased: bool,
 ) -> Option<Type> {
     // Step 1: flatten nested unions. TypeAliasType defers.
     let flat = flatten_nested_unions(items)?;
@@ -3814,9 +3818,29 @@ pub(crate) fn make_simplified_union(
         return Some(flat.into_iter().next().unwrap());
     }
     // Step 3: remove redundant items. Defer when any is_subtype returns
-    // None (non-Instance pair, including LiteralType-vs-non-LiteralType
-    // where the Rust is_subtype only handles LiteralType == LiteralType).
-    let deduped = remove_redundant_union_items(flat, ctx, resolver)?;
+    // None (non-Instance pair, e.g. LiteralType-vs-non-LiteralType, where
+    // the Rust is_subtype only handles LiteralType == LiteralType).
+    let deduped = if keep_erased {
+        let mut dedup_ctx = ctx.clone();
+        dedup_ctx.ignore_promotions = true;
+        dedup_ctx.proper_subtype = true;
+        let mut current = flat;
+        for _direction in 0..2 {
+            current = crate::remove_redundant::remove_redundant_pass(
+                &current,
+                &dedup_ctx,
+                resolver,
+                keep_erased,
+            )?;
+            if current.len() <= 1 {
+                break;
+            }
+            current.reverse();
+        }
+        current
+    } else {
+        remove_redundant_union_items(flat, ctx, resolver)?
+    };
     // Step 4: contract literals (bool + enum) sharing a fallback
     // whose full value set is covered. Gated on >1 LiteralType item,
     // matching Python (typeops.py:785): a lone enum literal must stay a
@@ -3966,6 +3990,7 @@ fn visit_union_join(
         ctx,
         resolver,
         true,
+        false,
     )?;
     let mut wbuf = WriteBuffer::new();
     wire::write_type(&mut wbuf, &simplified).ok()?;
@@ -6524,7 +6549,7 @@ mod tests {
             instance_with_attrs("a.A", vec![("x", instance("builtins.int", vec![]))], vec![]),
             instance("a.A", vec![]),
         ];
-        let result = make_simplified_union(&items, &ctx(true), &r, true).expect("deferred");
+        let result = make_simplified_union(&items, &ctx(true), &r, true, false).expect("deferred");
         let expected = instance("a.A", vec![]);
         assert_eq!(result, expected);
     }
@@ -6543,7 +6568,7 @@ mod tests {
         let attrs_fn =
             || instance_with_attrs("a.A", vec![("x", instance("builtins.int", vec![]))], vec![]);
         let items = vec![attrs_fn(), attrs_fn()];
-        let result = make_simplified_union(&items, &ctx(true), &r, true).expect("deferred");
+        let result = make_simplified_union(&items, &ctx(true), &r, true, false).expect("deferred");
         assert_eq!(result, attrs_fn());
     }
 
@@ -6562,7 +6587,7 @@ mod tests {
             instance_with_attrs("a.A", vec![("x", instance("builtins.int", vec![]))], vec![]),
             instance_with_attrs("a.A", vec![("y", instance("builtins.str", vec![]))], vec![]),
         ];
-        let result = make_simplified_union(&items, &ctx(true), &r, true).expect("deferred");
+        let result = make_simplified_union(&items, &ctx(true), &r, true, false).expect("deferred");
         let expected = instance("a.A", vec![]);
         assert_eq!(result, expected);
     }

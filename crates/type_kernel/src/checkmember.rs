@@ -1059,9 +1059,8 @@ fn static_member_tail(
         }
     };
     // checkmember.py:451 `expand_type_by_instance(signature, typ)`. Expand
-    // the unbound callable first (binding would defer the expand). The
-    // free-result variant mirrors Python: `freeze_all_type_vars`
-    // (checkmember.py:504) reifies leftover method type vars on return.
+    // the unbound callable first (binding would defer the expand). The free-result
+    // variant mirrors Python (`freeze_all_type_vars` on return).
     let expanded = crate::expandtype::expand_type_by_instance_free(
         signature,
         &mapped_instance,
@@ -2369,7 +2368,7 @@ fn analyze_descriptor_access_inner(
                 }
             }
             let ctx = SubtypeContext::new(false, false, false, true, true, strict_optional);
-            let joined = make_simplified_union(&results, &ctx, resolver, true)?;
+            let joined = make_simplified_union(&results, &ctx, resolver, true, false)?;
             Some(DescriptorDecision::Value(joined))
         }
         Type::Instance { type_ref, .. } => {

@@ -587,6 +587,7 @@ fn add_secondary_constraints(
     lower: &Type,
     upper: &Type,
     resolver: &crate::typeinfo::TypeResolver,
+    strict_optional: bool,
 ) -> Result<(), ()> {
     if matches!(upper, Type::UnionType { .. }) && matches!(lower, Type::UnionType { .. }) {
         return Ok(());
@@ -601,6 +602,7 @@ fn add_secondary_constraints(
         crate::constraints::SUBTYPE_OF,
         resolver,
         &no_aliases,
+        strict_optional,
     )
     .ok_or(())?;
     for c in sub {
@@ -614,6 +616,7 @@ fn add_secondary_constraints(
         crate::constraints::SUPERTYPE_OF,
         resolver,
         &no_aliases,
+        strict_optional,
     )
     .ok_or(())?;
     for c in sup {
@@ -629,6 +632,7 @@ fn transitive_closure(
     tvars: &[TvId],
     constraints: &[Constraint],
     resolver: &crate::typeinfo::TypeResolver,
+    strict_optional: bool,
 ) -> Result<BoundSets, ()> {
     let tvars_set: HashSet<TvId> = tvars.iter().cloned().collect();
     let mut uppers: HashMap<TvId, Vec<Type>> = HashMap::new();
@@ -686,7 +690,7 @@ fn transitive_closure(
             // for lt in lowers[lower]: for ut in uppers[upper]: add_secondary
             for lt in &lower_bounds {
                 for ut in &upper_bounds {
-                    add_secondary_constraints(&mut remaining, lt, ut, resolver)?;
+                    add_secondary_constraints(&mut remaining, lt, ut, resolver, strict_optional)?;
                 }
             }
         } else if c.op == crate::constraints::SUBTYPE_OF {
@@ -704,7 +708,13 @@ fn transitive_closure(
                 }
             }
             for lt in lowers.get(&cv).cloned().unwrap_or_default() {
-                add_secondary_constraints(&mut remaining, &lt, &c.target, resolver)?;
+                add_secondary_constraints(
+                    &mut remaining,
+                    &lt,
+                    &c.target,
+                    resolver,
+                    strict_optional,
+                )?;
             }
         } else {
             // c.op == SUPERTYPE_OF
@@ -722,7 +732,13 @@ fn transitive_closure(
                 }
             }
             for ut in uppers.get(&cv).cloned().unwrap_or_default() {
-                add_secondary_constraints(&mut remaining, &c.target, &ut, resolver)?;
+                add_secondary_constraints(
+                    &mut remaining,
+                    &c.target,
+                    &ut,
+                    resolver,
+                    strict_optional,
+                )?;
             }
         }
     }
@@ -1146,7 +1162,8 @@ fn solve_with_dependent_native(
         .iter()
         .map(|t| tv_id(t).ok_or(()))
         .collect::<Result<_, _>>()?;
-    let (mut graph, mut lowers, mut uppers) = transitive_closure(&tvars, constraints, resolver)?;
+    let (mut graph, mut lowers, mut uppers) =
+        transitive_closure(&tvars, constraints, resolver, strict_optional)?;
     let dmap = compute_dependencies(&tvars, &graph, &lowers, &uppers);
 
     let vertices: HashSet<TvId> = tvars.iter().cloned().collect();
@@ -1638,6 +1655,7 @@ pub(crate) fn rust_infer_function_type_arguments(
                 crate::constraints::SUPERTYPE_OF,
                 resolver.resolver(),
                 resolver.alias_resolver(),
+                strict_optional,
             )?);
         }
     }

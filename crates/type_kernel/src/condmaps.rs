@@ -321,7 +321,7 @@ pub(crate) fn rust_or_conditional_maps(
                 t1.clone()
             } else {
                 let items = [t1.clone(), t2.clone()];
-                match make_simplified_union(&items, &ctx, r, true) {
+                match make_simplified_union(&items, &ctx, r, true, false) {
                     Some(t) => t,
                     None => return Ok(None),
                 }

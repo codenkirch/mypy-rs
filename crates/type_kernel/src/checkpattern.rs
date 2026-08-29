@@ -514,7 +514,7 @@ fn contract_with_unpack(
                 .collect();
             let res = resolver?;
             let ctx = SubtypeContext::new(false, false, false, true, true, true);
-            let merged = make_simplified_union(&new_middle, &ctx, res, true)?;
+            let merged = make_simplified_union(&new_middle, &ctx, res, true, false)?;
             let mut out = Vec::with_capacity(prefix.len() + 1 + suffix_types.len());
             out.extend(prefix);
             out.push(merged);
@@ -544,7 +544,7 @@ fn contract_no_unpack(
     }
     let res = resolver?;
     let ctx = SubtypeContext::new(false, false, false, true, true, true);
-    let merged = make_simplified_union(&types[pos..slice_end], &ctx, res, true)?;
+    let merged = make_simplified_union(&types[pos..slice_end], &ctx, res, true, false)?;
     let mut new_types = Vec::with_capacity(pos + 1 + (types.len() - slice_end));
     new_types.extend(types[..pos].iter().cloned());
     new_types.push(merged);
