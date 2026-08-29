@@ -5694,33 +5694,18 @@ def maybe_load_deps(graph: Graph, ascc: SCC, manager: BuildManager) -> None:
             gc.enable()
 
 
-def process_stale_scc(graph: Graph, ascc: SCC, manager: BuildManager) -> None:
-    """Process the modules in one SCC from source code."""
-    # First verify if all transitive dependencies are loaded in the current process.
-    t0 = time.time()
-    maybe_load_deps(graph, ascc, manager)
-    t1 = time.time()
-    # Process the SCC in stable order.
-    scc = order_ascc_ex(graph, ascc)
+def _clear_native_kernel_resolvers(manager: BuildManager) -> None:
+    """Drop the resolver globals installed by ``_build_native_resolvers``.
 
-    t2 = time.time()
-    stale = scc
-    # Parse before verify_dependencies so that inline config comments
-    # (e.g. "# mypy: disable-error-code") are applied to options.
-    manager.parse_all([graph[id] for id in stale], post_parse=False)
-    for id in stale:
-        # Re-generate import errors in case this module was loaded from the cache.
-        if graph[id].meta:
-            graph[id].verify_dependencies(suppressed_only=True)
-    if "typing" in scc:
-        # For historical reasons we need to manually add typing aliases
-        # for built-in generic collections, see docstring of
-        # SemanticAnalyzerPass2.add_builtin_aliases for details.
-        typing_mod = graph["typing"].tree
-        assert typing_mod, "The typing module was not parsed"
-    # Clear stale resolvers from the previous SCC so semantic-analysis
-    # calls (e.g. semanal_typeargs bound checks) in the next line use
-    # Python, not a snapshot missing the current SCC's classes.
+    Per-SCC clear, run before ``semantic_analysis_for_scc`` so that
+    semantic-analysis calls (e.g. semanal_typeargs bound checks) use
+    Python, not a snapshot missing the current SCC's classes. Unlike
+    ``BuildManager._clear_native_resolvers``, this leaves the
+    manager-held incremental resolver state and the wire-deser caches
+    untouched, so the post-semanal install keeps extending the same
+    snapshot. Shared by the single-process path (``process_stale_scc``)
+    and the parallel-worker path (``process_stale_scc_interface``).
+    """
     if manager.options.native_type_kernel:
         from mypy.join import _set_native_join_resolver, _set_native_join_typeinfo_map
         from mypy.mro import _set_native_mro_resolver
@@ -5748,6 +5733,36 @@ def process_stale_scc(graph: Graph, ascc: SCC, manager: BuildManager) -> None:
         from mypy.typeanal import _set_native_typeanal_resolver
 
         _set_native_typeanal_resolver(None)
+
+
+def process_stale_scc(graph: Graph, ascc: SCC, manager: BuildManager) -> None:
+    """Process the modules in one SCC from source code."""
+    # First verify if all transitive dependencies are loaded in the current process.
+    t0 = time.time()
+    maybe_load_deps(graph, ascc, manager)
+    t1 = time.time()
+    # Process the SCC in stable order.
+    scc = order_ascc_ex(graph, ascc)
+
+    t2 = time.time()
+    stale = scc
+    # Parse before verify_dependencies so that inline config comments
+    # (e.g. "# mypy: disable-error-code") are applied to options.
+    manager.parse_all([graph[id] for id in stale], post_parse=False)
+    for id in stale:
+        # Re-generate import errors in case this module was loaded from the cache.
+        if graph[id].meta:
+            graph[id].verify_dependencies(suppressed_only=True)
+    if "typing" in scc:
+        # For historical reasons we need to manually add typing aliases
+        # for built-in generic collections, see docstring of
+        # SemanticAnalyzerPass2.add_builtin_aliases for details.
+        typing_mod = graph["typing"].tree
+        assert typing_mod, "The typing module was not parsed"
+    # Clear stale resolvers from the previous SCC so semantic-analysis
+    # calls (e.g. semanal_typeargs bound checks) in the next line use
+    # Python, not a snapshot missing the current SCC's classes.
+    _clear_native_kernel_resolvers(manager)
 
     mypy.semanal_main.semantic_analysis_for_scc(graph, scc, manager.errors)
 
@@ -5854,9 +5869,18 @@ def process_stale_scc_interface(
         # explicitly which of them are from cache.
         if id in from_cache:
             graph[id].verify_dependencies(suppressed_only=True)
+    # Mirror the single-process `process_stale_scc` install/clear pairing
+    # (issue #1159): without it, resolver-backed type-kernel seams are
+    # inert in parallel builds (num_workers > 0).
+    _clear_native_kernel_resolvers(manager)
     mypy.semanal_main.semantic_analysis_for_scc(graph, scc, manager.errors)
 
     t3 = time.time()
+    # Install or extend the NativeTypeResolver snapshot post-semanal,
+    # mirroring `process_stale_scc`; the update is incremental
+    # (skips already-snapshotted fullnames, issue #599).
+    manager._build_native_resolvers(scc)
+
     # Track what modules aren't yet done, so we can finish them as soon
     # as possible, saving memory.
     unfinished_modules = set(stale)
