@@ -22,6 +22,7 @@ Instance would get a FakeInfo, leaking into the type graph.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import Any
 
 from librt.internal import ReadBuffer
@@ -232,18 +233,30 @@ class _FreshVarCanonicalizer(TypeTranslator):
     object carrying the same id, splitting metavariables and breaking
     inference. This pass makes all occurrences of a given fresh id share a
     single object, restoring Python-observable identity.
+
+    Variables in ``seed`` pre-register their identity: occurrences in the
+    tree unify onto those exact objects, keeping callers' expectations
+    that the variables slot and occurrences share objects (e.g. freeze).
     """
 
-    def __init__(self) -> None:
+    def __init__(self, seed: Sequence[TypeVarLikeType] | None = None) -> None:
         super().__init__()
         self._var_by_id: dict[tuple[int, int, str], TypeVarLikeType] = {}
+        if seed is not None:
+            for tv in seed:
+                self._var_by_id.setdefault(self._key(tv), tv)
 
     def _canonical(self, t: TypeVarLikeType, key: tuple[int, int, str]) -> TypeVarLikeType:
         existing = self._var_by_id.get(key)
         if existing is None:
             self._var_by_id[key] = t
             return t
-        return existing
+        if existing == t:
+            return existing
+        # Same id but different content (env-expanded occurrence, e.g. a
+        # ParamSpec whose prefix grew via Concatenate): an expansion result,
+        # not a wire-split copy. Leave it alone for downstream inference.
+        return t
 
     @staticmethod
     def _key(t: TypeVarLikeType) -> tuple[int, int, str]:
@@ -281,11 +294,43 @@ class _FreshVarCanonicalizer(TypeTranslator):
         )
 
 
-def canonicalize_fresh_vars(typ: Type) -> Type:
-    """Re-unify fresh meta-var occurrences by id (wire-path identity repair)."""
-    from mypy.types import instance_cache  # noqa: F401  (import side effect)
+def canonicalize_fresh_vars_reported(
+    typ: Type, seed: Sequence[TypeVarLikeType] | None = None
+) -> tuple[Type, bool]:
+    """Canonicalize and report whether any fresh meta-var was unified.
 
-    result = typ.accept(_FreshVarCanonicalizer())
+    Variables in ``seed`` pre-register their identity: occurrences in the
+    tree unify onto those exact objects, keeping the variables slot and
+    occurrences shared for callers that mutate vars in place (freeze).
+    Callers that cache decoded trees must not store fresh-var-bearing
+    results: the repair shares one object per id, so a cached tree would
+    let one caller's in-place freeze leak into later callers of the
+    identical blob.
+    """
+    canonicalizer = _FreshVarCanonicalizer(seed)
+    result = typ.accept(canonicalizer)
+    return result, bool(canonicalizer._var_by_id)
+
+
+def canonicalize_fresh_vars_reported_list(types: list[Type]) -> tuple[list[Type], bool]:
+    """Canonicalize a decoded list with one shared unifier, per identity.
+
+    A single canonicalizer instance unifies fresh ids across the items
+    (the same fresh var can appear in several items), and reports whether
+    any fresh var was seen: such trees must stay out of shared caches.
+    """
+    canonicalizer = _FreshVarCanonicalizer()
+    result: list[Type] = []
+    has_fresh = False
+    for t in types:
+        result.append(t.accept(canonicalizer))
+        has_fresh = has_fresh or bool(canonicalizer._var_by_id)
+    return result, has_fresh
+
+
+def canonicalize_fresh_vars(typ: Type, seed: Sequence[TypeVarLikeType] | None = None) -> Type:
+    """Re-unify fresh meta-var occurrences by id (wire-path identity repair)."""
+    result, _ = canonicalize_fresh_vars_reported(typ, seed)
     return result
 
 
