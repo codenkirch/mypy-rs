@@ -55,6 +55,7 @@ from mypy.types import (
     Type,
     TypeAliasType,
     TypedDictType,
+    TypeGuardedType,
     TypeOfAny,
     TypeQuery,
     TypeType,
@@ -2204,21 +2205,34 @@ def separate_union_literals(t: UnionType) -> tuple[Sequence[LiteralType], Sequen
 
 def try_getting_instance_fallback(typ: Type) -> Instance | None:
     """Returns the Instance fallback for this type if one exists or None."""
+    # Fast paths for get_proper_type + the dispatch tail: raw
+    # NoneType/AnyType decide None (the largest measured defer buckets)
+    # and TypeGuardedType unwraps like types.py:4068.
+    cls = type(typ)
+    if cls is NoneType or cls is AnyType:
+        return None
+    if cls is TypeGuardedType:
+        typ = cast(TypeGuardedType, typ).type_guard
     if (
         _HAS_TYPE_KERNEL
         and _native_typeops_active
         and _native_typeops_resolver is not None
     ):
         try:
+            # Issue #1101 decided-None protocol: (True, blob) is the
+            # fallback Instance bytes, (True, None) means the
+            # `else: return None` tail decided natively, None defers.
             result = _type_kernel.rust_try_getting_instance_fallback(
                 _serialize_type(typ), _native_typeops_resolver
             )
             if result is not None:
-                # deferred (missing alias snapshot, unresolved type_ref, or
-                # no fallback): fall back to the Python walk below.
-                decoded = _deserialize_type(bytes(result))
-                if isinstance(decoded, Instance):
-                    return decoded
+                decided, blob = result
+                if blob is not None:
+                    decoded = _deserialize_type(bytes(blob))
+                    if isinstance(decoded, Instance):
+                        return decoded
+                elif decided:
+                    return None
         except (AssertionError, NotImplementedError, ValueError):
             pass
     typ = get_proper_type(typ)

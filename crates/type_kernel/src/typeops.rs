@@ -749,17 +749,26 @@ fn literals_outcome(py: Python<'_>, out: LitOutcome) -> Option<(bool, PyObject)>
 }
 
 /// `#[pyfunction]` entry for `try_getting_instance_fallback`
-/// (typeops.py:1525-1539). Returns the Instance fallback for the type when
-/// one exists, encoded as wire bytes, or `None` to defer to Python.
+/// (typeops.py:1525-1539). Issue #1101 decided-None protocol: returns
+/// `(true, instance_bytes)` when the fallback exists, `(true, None)` when
+/// Python's dispatch decides no fallback, or `None` to defer to Python.
 #[pyfunction]
 #[pyo3(signature = (t_bytes, resolver))]
 pub(crate) fn rust_try_getting_instance_fallback(
+    py: Python<'_>,
     t_bytes: &[u8],
     resolver: &mut NativeTypeResolver,
-) -> Option<Vec<u8>> {
+) -> Option<(bool, PyObject)> {
     let t = decode_type(t_bytes)?;
-    let fallback = try_getting_instance_fallback(&t, resolver.alias_resolver())?;
-    encode_type(&fallback)
+    match try_getting_instance_fallback(&t, resolver.alias_resolver()) {
+        TgifOut::Fallback(fallback) => {
+            let bytes = encode_type(&fallback)?;
+            let boxed = pyo3::types::PyBytes::new(py, &bytes);
+            Some((true, boxed.into()))
+        }
+        TgifOut::DecidedNone => Some((true, py.None())),
+        TgifOut::Defer => None,
+    }
 }
 
 /// `#[pyfunction]` entry for `try_expanding_sum_type_to_union`
@@ -917,8 +926,23 @@ pub(crate) fn try_expanding_sum_type_to_union_inner(
     }
 }
 
+/// Issue #1101 decided-None protocol outcome for
+/// `try_getting_instance_fallback`.
+#[derive(Debug, PartialEq)]
+enum TgifOut {
+    /// Python dispatch answer: an Instance fallback.
+    Fallback(Type),
+    /// Python dispatch answer: no fallback (the `else: return None` tail,
+    /// or a recursion that bottoms out in that tail).
+    DecidedNone,
+    /// The kernel cannot decide: the only genuine defer here is a
+    /// top-level `TypeAliasType` whose snapshot is missing from the
+    /// resolver (Python's `get_proper_type` would expand it live).
+    Defer,
+}
+
 /// `mypy.typeops.try_getting_instance_fallback` — the Instance fallback for
-/// a proper type, or `None` if it has no such fallback.
+/// a proper type, or `DecidedNone` if it has no such fallback.
 ///
 /// Mirrors typeops.py:1525-1539:
 /// ```text
@@ -935,35 +959,44 @@ pub(crate) fn try_expanding_sum_type_to_union_inner(
 /// `Overloaded.fallback` is `items[0].fallback` (types.py:2758), so the
 /// Overloaded arm recurses through the first item. A `TypeAliasType`
 /// operand is expanded via the alias resolver (`get_proper_type` at the
-/// top of the Python body); a missing snapshot defers.
-fn try_getting_instance_fallback(
-    t: &Type,
-    aliases: &crate::aliases::TypeAliasResolver,
-) -> Option<Type> {
+/// top of the Python body); a missing snapshot defers. Every proper shape
+/// outside the isinstance chain (TypeType, Union, Uninhabited, Unbound,
+/// Unpack, Deleted, Erased, ParamSpec, TypeVarTuple, ...) hits Python's
+/// `else: return None` tail, so those decide natively now (#1183).
+fn try_getting_instance_fallback(t: &Type, aliases: &crate::aliases::TypeAliasResolver) -> TgifOut {
     // Python: `t = get_proper_type(t)`. Expand a top-level alias through
     // the resolver (nested aliases inside the target have no proper form
     // here and defer — parity-safe, Python would recurse).
     let proper: Type = match t {
-        Type::TypeAliasType { .. } => crate::checkexpr_functions::get_proper_or_expand(t, aliases)?,
+        Type::TypeAliasType { .. } => {
+            match crate::checkexpr_functions::get_proper_or_expand(t, aliases) {
+                Some(p) => p,
+                None => return TgifOut::Defer,
+            }
+        }
         _ => t.clone(),
     };
     match &proper {
-        Type::Instance { .. } => Some(proper.clone()),
-        Type::LiteralType { fallback, .. } => Some((**fallback).clone()),
-        Type::CallableType { fallback, .. } => Some((**fallback).clone()),
-        Type::Overloaded { items } => items
-            .first()
-            .and_then(|first| try_getting_instance_fallback(first, aliases)),
+        Type::Instance { .. } => TgifOut::Fallback(proper.clone()),
+        Type::LiteralType { fallback, .. } => TgifOut::Fallback((**fallback).clone()),
+        Type::CallableType { fallback, .. } => TgifOut::Fallback((**fallback).clone()),
+        Type::Overloaded { items } => match items.first() {
+            Some(first) => try_getting_instance_fallback(first, aliases),
+            // Python indexes items[0].fallback; an empty Overloaded never
+            // reaches this seam, so the unreachable tail mirrors the
+            // no-fallback decision instead of crashing.
+            None => TgifOut::DecidedNone,
+        },
         Type::TypeVarType { upper_bound, .. } => {
             try_getting_instance_fallback(upper_bound, aliases)
         }
         Type::TupleType {
             partial_fallback, ..
-        } => Some((**partial_fallback).clone()),
-        Type::TypedDictType { fallback, .. } => Some((**fallback).clone()),
-        // NoneType (fast path) and AnyType have no fallback, matching Python.
-        Type::NoneType | Type::AnyType { .. } => None,
-        _ => None,
+        } => TgifOut::Fallback((**partial_fallback).clone()),
+        Type::TypedDictType { fallback, .. } => TgifOut::Fallback((**fallback).clone()),
+        // NoneType and AnyType hit Python's fast-path comment; every other
+        // unmatched proper shape hits the `else: return None` tail.
+        _ => TgifOut::DecidedNone,
     }
 }
 
@@ -3626,33 +3659,74 @@ mod tests {
         let inst = plain_instance("builtins.int");
         assert_eq!(
             try_getting_instance_fallback(&inst, &empty_aliases()),
-            Some(inst.clone())
+            TgifOut::Fallback(inst.clone())
         );
     }
 
     #[test]
     fn instance_fallback_unwraps_literal_to_literal_fallback() {
         let lit = lit_str("hello");
-        let result = try_getting_instance_fallback(&lit, &empty_aliases()).unwrap();
-        assert_eq!(result, plain_instance("builtins.str"));
-    }
-
-    #[test]
-    fn instance_fallback_none_type_defers() {
         assert_eq!(
-            try_getting_instance_fallback(&Type::NoneType, &empty_aliases()),
-            None
+            try_getting_instance_fallback(&lit, &empty_aliases()),
+            TgifOut::Fallback(plain_instance("builtins.str"))
         );
     }
 
     #[test]
-    fn instance_fallback_any_type_defers() {
+    fn instance_fallback_none_type_decides_none() {
+        assert_eq!(
+            try_getting_instance_fallback(&Type::NoneType, &empty_aliases()),
+            TgifOut::DecidedNone
+        );
+    }
+
+    #[test]
+    fn instance_fallback_any_type_decides_none() {
         let any = Type::AnyType {
             type_of_any: 1,
             source_any: None,
             missing_import_name: None,
         };
-        assert_eq!(try_getting_instance_fallback(&any, &empty_aliases()), None);
+        assert_eq!(
+            try_getting_instance_fallback(&any, &empty_aliases()),
+            TgifOut::DecidedNone
+        );
+    }
+
+    #[test]
+    fn instance_fallback_dispatch_tail_decides_none() {
+        // Proper shapes outside the isinstance chain hit Python's
+        // `else: return None` tail; the seam now decides them (#1183).
+        for t in [
+            Type::UninhabitedType { ambiguous: false },
+            Type::UnionType {
+                items: vec![Type::NoneType],
+                uses_pep604_syntax: false,
+                can_be_true: true,
+                can_be_false: true,
+            },
+            Type::TypeType {
+                item: Box::new(plain_instance("builtins.object")),
+                is_type_form: false,
+            },
+            Type::DeletedType { source: None },
+            Type::ErasedType,
+            Type::UnboundType {
+                name: "X".to_string(),
+                args: vec![],
+                original_str_expr: None,
+                original_str_fallback: None,
+            },
+            Type::UnpackType {
+                typ: Box::new(Type::NoneType),
+            },
+        ] {
+            assert_eq!(
+                try_getting_instance_fallback(&t, &empty_aliases()),
+                TgifOut::DecidedNone,
+                "unexpected defer shape: {t:?}"
+            );
+        }
     }
 
     #[test]
@@ -3674,12 +3748,12 @@ mod tests {
         };
         assert_eq!(
             try_getting_instance_fallback(&tv, &empty_aliases()),
-            Some(plain_instance("builtins.object"))
+            TgifOut::Fallback(plain_instance("builtins.object"))
         );
     }
 
     #[test]
-    fn instance_fallback_typevar_none_upper_bound_defers() {
+    fn instance_fallback_typevar_none_upper_bound_decides_none() {
         let tv = Type::TypeVarType {
             name: "T".to_string(),
             fullname: "T".to_string(),
@@ -3691,7 +3765,10 @@ mod tests {
             variance: 1,
             meta_level: 1,
         };
-        assert_eq!(try_getting_instance_fallback(&tv, &empty_aliases()), None);
+        assert_eq!(
+            try_getting_instance_fallback(&tv, &empty_aliases()),
+            TgifOut::DecidedNone
+        );
     }
 
     #[test]
@@ -3703,7 +3780,7 @@ mod tests {
         };
         assert_eq!(
             try_getting_instance_fallback(&tup, &empty_aliases()),
-            Some(plain_instance("builtins.tuple"))
+            TgifOut::Fallback(plain_instance("builtins.tuple"))
         );
     }
 
@@ -3718,7 +3795,7 @@ mod tests {
         };
         assert_eq!(
             try_getting_instance_fallback(&td, &empty_aliases()),
-            Some(plain_instance("builtins.dict"))
+            TgifOut::Fallback(plain_instance("builtins.dict"))
         );
     }
 
@@ -3745,7 +3822,7 @@ mod tests {
         };
         assert_eq!(
             try_getting_instance_fallback(&callable, &empty_aliases()),
-            Some(plain_instance("builtins.function"))
+            TgifOut::Fallback(plain_instance("builtins.function"))
         );
     }
 
@@ -3774,7 +3851,7 @@ mod tests {
         };
         assert_eq!(
             try_getting_instance_fallback(&overloaded, &empty_aliases()),
-            Some(plain_instance("builtins.function"))
+            TgifOut::Fallback(plain_instance("builtins.function"))
         );
     }
 
@@ -3786,7 +3863,7 @@ mod tests {
         };
         assert_eq!(
             try_getting_instance_fallback(&alias, &empty_aliases()),
-            None
+            TgifOut::Defer
         );
     }
 
@@ -3805,7 +3882,7 @@ mod tests {
         };
         assert_eq!(
             try_getting_instance_fallback(&alias, &aliases),
-            Some(plain_instance("builtins.int"))
+            TgifOut::Fallback(plain_instance("builtins.int"))
         );
     }
 
@@ -3826,7 +3903,7 @@ mod tests {
         };
         assert_eq!(
             try_getting_instance_fallback(&alias, &aliases),
-            Some(plain_instance("builtins.tuple"))
+            TgifOut::Fallback(plain_instance("builtins.tuple"))
         );
     }
 
