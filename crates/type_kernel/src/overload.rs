@@ -270,7 +270,10 @@ fn evaluate_plain_target(
 
     // Step 4b: extra actual not appearing in any formal's mapped list.
     for ai in 0..arg_kinds.len() {
-        if !formal_to_actual.iter().any(|list| list.contains(&(ai as i64))) {
+        if !formal_to_actual
+            .iter()
+            .any(|list| list.contains(&(ai as i64)))
+        {
             return MatchDecision::No;
         }
     }
@@ -384,10 +387,12 @@ fn evaluate_generic_target(
 
     // The kernel defers on ParamSpec / TypeVarTuple variables (expand_type
     // cannot round-trip them); defer instead of asking for a defer blob.
-    if variables
-        .iter()
-        .any(|v| matches!(v, Type::ParamSpecType { .. } | Type::TypeVarTupleType { .. }))
-    {
+    if variables.iter().any(|v| {
+        matches!(
+            v,
+            Type::ParamSpecType { .. } | Type::TypeVarTupleType { .. }
+        )
+    }) {
         return MatchDecision::Undecided;
     }
 
@@ -420,7 +425,11 @@ fn evaluate_generic_target(
         None => return MatchDecision::Undecided,
     };
 
-    let Type::CallableType { variables: solved_vars, .. } = &solved else {
+    let Type::CallableType {
+        variables: solved_vars,
+        ..
+    } = &solved
+    else {
         return MatchDecision::Undecided;
     };
     if !solved_vars.is_empty() {
