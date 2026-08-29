@@ -1747,6 +1747,39 @@ including:
   (`test_dispatch_completes_subclass_receiver_nongeneric` /
   `test_dispatch_defers_subclass_receiver_generic`) plus Rust unit
   tests in `checkmember.rs` (PR #1193).
+- callable-vs-callable native constraint port (`visit_callable_type`
+  CallableType-actual arm, constraints.py:1656-1780, landed as
+  `callable_vs_callable_native` in `crates/type_kernel/src/
+  constraints.rs` with the `param_spec_of` /
+  `tuple_fallback_ref_from_unpack` / `repack_callable_args_wire`
+  helpers and the shared `infer_callable_arguments_constraints_core`)
+  — ports the ret-type constraint (with the type_guard / type_is
+  unwraps), the unpack-repack + `build_constraints_for_simple_unpack`
+  path, the plain-args `infer_callable_arguments_constraints` fold, and
+  the template-ParamSpec prefix + `param_spec_target` arm. Routed from
+  `mypy/constraints.py` `infer_callable_arguments_constraints` via
+  `_try_native_infer_callable_args` (`rust_infer_callable_arguments_
+  constraints`); `infer_directed_arg_constraints` keeps its existing
+  seam. Defers (`None`) on normalization failure, a shape the wire
+  cannot decide, or an actual carrying type variables: the
+  opposite-direction polymorphic inference attaches `extra_tvars` to
+  every emitted constraint and the wire format has no representation
+  for those (#1171 pattern). The wire drops `meta_level` on ParamSpec /
+  TypeVarTuple origin ids, so a decoded origin can never match a fresh
+  call-site variable; the Python shims rebuild it via the corrective
+  helper `_rebuild_wire_origin` (matches the input type vars by kind +
+  raw_id + namespace, copies the full live id, raises to the fallback
+  when the match is not unique). `repack_callable_args_wire` keeps the
+  star UnpackType untouched when its proper type is not a TupleType,
+  mirroring constraints.py:2162-2171 (the shipped Python repack seam
+  short-circuits on an Unpack star, so only the internal
+  callable-vs-callable path reaches that arm). Cold self-check audit:
+  1,409 callable-vs-callable seam calls @ 65.3% native (920 decided /
+  489 defers); residual defer buckets: cb-actual-generic 436
+  (polymorphic actual), cb-actual-overloaded 44, cb-actual-instance 6,
+  cb-actual-other 1, cb-norm-shape 2. Covered by the `test_cb_*` unit
+  tests in `constraints.rs` (plain, ellipsis, unpack-template, ParamSpec
+  prefix/target, ret-only) and the testcheck parity differential.
 
 Stages 1/2 return `None` for any type class Rust does not handle, and
 the Python caller falls back to the pure-Python visitor. This is the

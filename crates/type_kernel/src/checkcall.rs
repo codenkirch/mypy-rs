@@ -28,24 +28,24 @@ const ARG_NAMED_OPT: i64 = 5;
 
 /// The CallableType fields that `with_unpacked_kwargs` and
 /// `with_normalized_var_args` rewrite plus the immutable passes-through.
-struct CallableBase {
-    fallback: Box<Type>,
-    instance_type: Option<Box<Type>>,
-    is_ellipsis_args: bool,
-    implicit: bool,
-    is_bound: bool,
-    from_concatenate: bool,
-    imprecise_arg_kinds: bool,
-    unpack_kwargs: bool,
-    from_type_type: bool,
-    arg_types: Vec<Type>,
-    arg_kinds: Vec<i64>,
-    arg_names: Vec<Option<String>>,
-    ret_type: Box<Type>,
-    name: Option<String>,
-    variables: Vec<Type>,
-    type_guard: Option<Box<Type>>,
-    type_is: Option<Box<Type>>,
+pub(crate) struct CallableBase {
+    pub(crate) fallback: Box<Type>,
+    pub(crate) instance_type: Option<Box<Type>>,
+    pub(crate) is_ellipsis_args: bool,
+    pub(crate) implicit: bool,
+    pub(crate) is_bound: bool,
+    pub(crate) from_concatenate: bool,
+    pub(crate) imprecise_arg_kinds: bool,
+    pub(crate) unpack_kwargs: bool,
+    pub(crate) from_type_type: bool,
+    pub(crate) arg_types: Vec<Type>,
+    pub(crate) arg_kinds: Vec<i64>,
+    pub(crate) arg_names: Vec<Option<String>>,
+    pub(crate) ret_type: Box<Type>,
+    pub(crate) name: Option<String>,
+    pub(crate) variables: Vec<Type>,
+    pub(crate) type_guard: Option<Box<Type>>,
+    pub(crate) type_is: Option<Box<Type>>,
 }
 
 /// Classify an already-proper callee type into the `check_call` dispatch
@@ -95,7 +95,7 @@ pub(crate) fn rust_normalize_callable(callee_bytes: &[u8]) -> Option<Vec<u8>> {
     Some(out.into_bytes())
 }
 
-fn normalize_callable(callee: &Type) -> Result<Type, WireError> {
+pub(crate) fn normalize_callable(callee: &Type) -> Result<Type, WireError> {
     let Type::CallableType {
         fallback,
         instance_type,
@@ -291,7 +291,7 @@ fn with_normalized_var_args(base: &mut CallableBase) -> Result<(), WireError> {
 ///
 /// Returns `Err(WireError)` (caller defers to Python) when `callee` is not a
 /// `CallableType`, mirroring `normalize_callable`.
-fn callable_base(callee: &Type) -> Result<CallableBase, WireError> {
+pub(crate) fn callable_base(callee: &Type) -> Result<CallableBase, WireError> {
     let Type::CallableType {
         fallback,
         instance_type,
@@ -338,7 +338,7 @@ fn callable_base(callee: &Type) -> Result<CallableBase, WireError> {
 }
 
 impl CallableBase {
-    fn into_type(self) -> Type {
+    pub(crate) fn into_type(self) -> Type {
         Type::CallableType {
             fallback: self.fallback,
             instance_type: self.instance_type,
