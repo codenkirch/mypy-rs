@@ -403,9 +403,10 @@ including:
   absent an ErasedType replacement. That kernel path now defers on an
   `ErasedType` target (`rust_replace_meta_vars` guard) so inference
   semantics stay identical. **Invariant:** the Python `read_type` in
-  `mypy/types.py` deliberately does NOT decode tag 122 (there is no
-  `ERASED_TYPE` branch in `read_type`), so any Rust wire seam that
-  emits `ErasedType`-carrying bytes fails to round-trip through
+  `mypy/types.py` decodes tag 122 only behind the module-level opt-in
+  flag `_ALLOW_WIRE_ERASED_TYPE` (default False), flipped per decode
+  with a `finally` restore, so any Rust wire seam that emits
+  `ErasedType`-carrying bytes fails to round-trip through
   `read_type` and its `AssertionError`/`NotImplementedError` guard
   defers to the pure-Python fallback. `has_erased_component` itself is
   exempt: its Python seam passes bytes into the kernel and reads back a
