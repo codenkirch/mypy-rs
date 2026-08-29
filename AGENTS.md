@@ -847,6 +847,23 @@ including:
   removal, `rust_expand_and_bind_callable` went 54% → 98% native,
   `rust_expand_type_by_instance` 6% → 67%, `rust_expand_type` 85% → 91%.
   ParamSpec/Unpack walls stay deferred.
+- `_needs_python(definition_gate=False)` (issue #1169) — the
+  `mypy.expandtype._needs_python` dispatch gate no longer forces a Python
+  fallback just because a nested `CallableType` carries a `definition`; the
+  four top-level seams (`expand_type`, `expand_type_by_instance`,
+  `freshen_function_type_vars`, `freshen_all_functions_type_vars`) pass
+  `definition_gate=False` and, on the native path, repair the wire-decoded
+  result with the recursive `_resync_definitions(original, decoded)` — it
+  pairs Callables/Overloads/Instances/Unions/Tuples/TypeType/Unpack/
+  TypeVar upper bounds positionally and copies the live `definition`s over
+  (`TypeType` must be rebuilt via `TypeType.make_normalized`, it has no
+  `copy_modified`); a pairing mismatch returns `None` and the caller falls
+  back to the full Python expansion. Env values, `remove_trivial`, and the
+  meta-tvar branch (`p.id.meta_level > 0`) keep the default gate. The
+  meta-tvar relaxation was tried and reverted: fresh-variable identity on
+  wire-decoded TypeVarTypes leaks across the wire (no
+  `canonicalize_fresh_vars` equivalent on all decode paths;
+  `testTypedDictGetMethodTotalMixed` repro).
 - `expand_type_by_instance` recursive arms (subtypes.rs, behind the
   `rust_is_subtype` seam) — mirrors `expandtype.py`'s ExpandTypeVisitor:
   five new arms (CallableType, Overloaded, TupleType, TypeType,
