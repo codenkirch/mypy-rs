@@ -1693,6 +1693,30 @@ including:
   gate-on differentials plus a direct seam call asserting the original
   object and its extra_tvars survive and value-equal options
   disambiguate).
+- `rust_try_getting_instance_fallback` decided-None protocol (issue
+  #1183) — the kernel speaks the #1101 `(decided, blob)` protocol:
+  `(true, bytes)` for the fallback Instance, `(true, None)` for a
+  decided no-fallback, `None` defers. The kernel returns `Fallback` /
+  `DecidedNone` / `Defer` (`TgifOut` in `crates/type_kernel/src/
+  typeops.rs`): `DecidedNone` covers the `else: return None` dispatch
+  tail (TypeType, Union, Uninhabited, Unbound, Unpack, Deleted,
+  Erased, ParamSpec, TypeVarTuple — every proper shape outside the
+  isinstance chain) and the unreachable empty-`Overloaded` arm; the
+  only genuine defer left is a top-level `TypeAliasType` with a
+  missing alias snapshot. Python fast paths run before the seam: raw
+  `NoneType`/`AnyType` return `None` outright (the largest measured
+  cold-audit defer buckets, 1,518 calls) and `TypeGuardedType`
+  unwraps to `type_guard` (mirroring `get_proper_type` in
+  `types.py:4068`; the narrow fixup defers by design on alias-arg
+  Instances — fixup must not freeze aliases without an alias map).
+  Defer-audit (cold self-check, instrumentation stripped before
+  landing): 18,799 calls @ 86.5% native → 18,567 calls @ 98.3%
+  decided natively or by fast path (`native:instance` 87.7%,
+  `native:decided-none` 1.2%, fast paths 9.4%; `gate-off` 1.5%,
+  residual defers ~500, dominated by fixup-alias-args). Covered by
+  `NativeTypeopsDeferralSuite` in `mypy/test/testtypes.py` (rewritten
+  seam tests + `test_instance_fallback_decided_none_protocol`) plus
+  kernel unit tests in `typeops.rs`.
 
 Stages 1/2 return `None` for any type class Rust does not handle, and
 the Python caller falls back to the pure-Python visitor. This is the
