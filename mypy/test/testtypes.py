@@ -3845,6 +3845,131 @@ class NativeSubtypesDeferralSuite(Suite):
         finally:
             _set_native_checker_stmts_active(False)
 
+    def test_callable_protocol_right_no_call_non_typeobj_native(self) -> None:
+        """Issue #1233 (Port A): CallableType left vs protocol Instance
+        right without "__call__".
+
+        Python answers is_subtype(left.fallback, right) unless
+        left.is_type_obj() (subtypes.py:1372-1381); the seam used to
+        defer the whole arm and now decides the non-type-obj case with
+        the resolver-backed is_type_obj port. The fallback class has no
+        `f` member, so both engines answer False via the member-miss
+        path. builtins.function snapshots keep deferring here, so the
+        fixture class fallback stands in for the production shape.
+        """
+        from mypy.subtypes import (
+            _serialize_type,
+            _set_native_subtype_resolver,
+            is_subtype,
+        )
+        from mypy.types import CallableType, Instance
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        pinfo = self.fx.make_type_info("mod.PNoCall")
+        pinfo.mro = [pinfo, self.fx.oi]
+        pinfo.is_protocol = True
+        pinst = Instance(pinfo, [])
+        node = FuncDef("f", [], None, None)
+        node.info = pinfo
+        node.type = CallableType(
+            [pinst], [ARG_POS], [None], self.fx.a, self.fx.function
+        )
+        node.line = 1
+        node.column = 1
+        pinfo.names["f"] = SymbolTableNode(MDEF, node)
+        # Plain non-protocol, non-type-object class carrying the
+        # callable's fallback; is_type_obj() must come out False.
+        iinfo = self.fx.make_type_info("mod.FbNoCall")
+        iinfo.mro = [iinfo, self.fx.oi]
+        live = {iinfo.fullname: iinfo, pinfo.fullname: pinfo}
+        resolver = _type_kernel.build_native_resolver(
+            self._type_infos() + [iinfo, pinfo], []
+        )
+        resolver.set_live_typeinfo_map(live)
+        set_wire_typeinfo_map(live)
+        _set_native_subtype_resolver(resolver)
+        try:
+            left = CallableType(
+                [self.fx.a],
+                [ARG_POS],
+                [None],
+                self.fx.a,
+                Instance(iinfo, []),
+            )
+            self._set_gate(False)
+            expected = is_subtype(left, pinst)
+            self._set_gate(True)
+            assert is_subtype(left, pinst) is expected
+            rusted = _type_kernel.rust_is_subtype(
+                _serialize_type(left),
+                _serialize_type(pinst),
+                False,
+                False,
+                False,
+                False,
+                False,
+                True,
+                False,
+                False,
+                resolver,
+            )
+            assert rusted is not None, (
+                "non-type-obj protocol arm must decide natively"
+            )
+            assert rusted is expected
+        finally:
+            set_wire_typeinfo_map(None)
+            _set_native_subtype_resolver(self.resolver)
+
+    def test_callable_protocol_right_typeobj_still_defers(self) -> None:
+        """Issue #1233 (Port A): the is_type_obj()-True arm still defers.
+
+        Python then attempts is_protocol_implementation(class_obj=True)
+        (subtypes.py:1374-1381), which stays Python-side; a callable
+        whose fallback is builtins.type is a type object.
+        """
+        from mypy.subtypes import (
+            _serialize_type,
+            _set_native_subtype_resolver,
+            is_subtype,
+        )
+        from mypy.types import Instance
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        info = self.fx.make_type_info("mod.PNoCall2")
+        info.mro = [info, self.fx.oi]
+        info.is_protocol = True
+        inst = Instance(info, [])
+        resolver = _type_kernel.build_native_resolver(
+            self._type_infos() + [info], []
+        )
+        resolver.set_live_typeinfo_map({info.fullname: info})
+        set_wire_typeinfo_map({info.fullname: info})
+        _set_native_subtype_resolver(resolver)
+        try:
+            left = self.fx.callable_type(self.fx.a, self.fx.a)
+            self._set_gate(False)
+            expected = is_subtype(left, inst)
+            self._set_gate(True)
+            assert is_subtype(left, inst) is expected
+            rusted = _type_kernel.rust_is_subtype(
+                _serialize_type(left),
+                _serialize_type(inst),
+                False,
+                False,
+                False,
+                False,
+                False,
+                True,
+                False,
+                False,
+                resolver,
+            )
+            assert rusted is None, "type-obj protocol arm must still defer"
+        finally:
+            set_wire_typeinfo_map(None)
+            _set_native_subtype_resolver(self.resolver)
+
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeVariadicTupleRightSuite(Suite):
