@@ -2534,3 +2534,28 @@ directly to `main`.
   (`testtypes` + `testcheck`, `-n4`); the cold self-check failure set
   is unchanged against the HEAD baseline (14 pre-existing failures,
   tracked in #1228).
+- is_subtype defer round 5 (issue #1233) — two ports from the cold
+  self-check defer audit. Port B, the call-left/Instance-right protocol
+  arm (`protocol_right_decision` in `subtypes.rs`): Python only runs
+  `is_protocol_implementation(class_obj)` when `left.is_type_obj()`
+  (subtypes.py:876-883), otherwise the answer is
+  `is_subtype(left.fallback, right)`; Rust now decides `is_type_obj`
+  via `crate::callable_compat::is_type_obj` and returns that fallback
+  answer instead of deferring every Call|protocol-Instance pair
+  (measured call-inst-protocol-notypeobj bucket, 144 defers; a true or
+  unknown verdict still defers). Port A, `expand_aliases_depth` leaf
+  variants: TypeAliasType nodes inside TypeVarType values / upper_bound
+  / default, ParamSpecType prefix and bounds, TypeVarTupleType fallback
+  and bounds, UnpackType targets, TypedDictType fallback and items,
+  LiteralType fallback, and Parameters arg_types/variables are now
+  walked like the existing Instance arm (measured alias-operand bucket,
+  504 defers); the depth cap (50) and active-stack cut discipline are
+  kept. Python-side coverage is the existing gate-off/gate-on
+  differentials plus the cold self-check, and one new pair in
+  `NativeSubtypesDeferralSuite`
+  (`test_callable_protocol_right_no_call_non_typeobj_native` proves
+  direct seam engagement via the mod.FbNoCall fallback fixture,
+  `test_callable_protocol_right_typeobj_still_defers` proves the
+  is_type_obj-True arm still defers). Parity: 11,027 passed
+  (testtypes + testcheck, -n4); cold self-check 0 errors after fixing
+  an implicit-reexport test import (ARG_POS off `mypy.types`).
