@@ -2344,3 +2344,39 @@ directly to `main`.
   `NativeExpandTypeAliasSuite` in `mypy/test/testtypes.py`
   (direct-seam engagement + gate-off/on parity + missing-alias-map
   fallback) plus four Rust unit tests in `expandtype.rs`.
+- `rust_expand_type` union-flatten alias expansion (issue #1203): the
+  second defer audit found `flatten` 437 of the 6,744 fallbacks:
+  `expand_type_inner`'s union arm called the kernel's
+  `flatten_nested_unions`, which defers on any alias item, while the
+  Python tail (`make_union(remove_trivial(flatten_nested_unions(...)))`
+  with `get_proper_type`, types.py:4047-4064 + 5057-5100) expands
+  top-level alias chains before flattening. The port:
+  `TypeAliasResolver` exposes a cheap `shared()` `Arc` view of its
+  snapshot map (cached, invalidated per `insert`; inserts are rare,
+  first-seal-wins per snapshot pass), a new `AliasLookup` trait makes
+  the snapshot helpers (`expand_alias_shape`,
+  `expand_alias_target_raw`, `expanded_alias_target`,
+  `chain_resolve_alias_target`) take the map-shaped view, and
+  `rust_expand_type` installs the map into a `FLAT_ALIASES` TLS slot
+  for one call (RAII guard). The union arm then expands each top-level
+  alias item's chain via `flatten_union_expanding_aliases`, recursing
+  through union positions only and appending the ORIGINAL alias node
+  for a non-union expansion (types.py:5098-5099); during chain
+  substitution the union arm runs `InstantiateAliasVisitor` semantics
+  (types.py:5513-5525, plain rebuild, truthiness flags via
+  `union_item_can_be_*`, nested INSTANTIATE restores per guard).
+  Defers: no alias map installed (seams reaching
+  `expand_type_inner` without the expand entry keep the pre-1203
+  contract), missing snapshot, alias cycle, or a `tvar_tuple_index`
+  alias in the chain (the kernel zips args where Python splits the
+  middle via `split_with_prefix_and_suffix`). The `res_tvar` bucket
+  (6,277 -> 6,312 after: +35 flatten calls now surviving substitution
+  as fresh trees) is the remaining dominant defer and is an
+  object-identity contract (Python `t.visit_type_var` returns the
+  original `t`), left for a future revisit. Cold self-check audit:
+  113,468 calls / 6,744 fallbacks -> 6,342 fallbacks (-402; flatten
+  437 -> 0, 35 of those now defer as `res_tvar`). Covered by eight
+  Rust unit tests in `expandtype.rs` (alias-union expansion, original
+  node preservation, tvt/missing-snapshot/cycle defers, chain-to-union,
+  typed-args substitution with INSTANTIATE-leak check,
+  instantiate-vs-flatten differential, no-TLS defer).
