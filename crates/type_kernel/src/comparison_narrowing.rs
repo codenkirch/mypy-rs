@@ -12,17 +12,19 @@
 //! (`FunctionLike.is_type_obj()`, `TypeType` over a `TypeVarType`).
 //!
 //! Returns one narrowability bool per operand, or `None` (defer) when any
-//! operand cannot be classified: an undecodable wire blob, a
-//! `TypeAliasType` operand (`get_proper_type` would expand it from the
-//! live alias node), a length mismatch, or a type-object fact the
-//! resolver snapshot cannot decide. The Python shim then re-runs the
-//! original pure-Python loop. Everything downstream (literal-hash
-//! bookkeeping, chain grouping via `rust_group_comparison_operands`, the
-//! narrowing arm bodies, TypeMap returns) stays Python-side.
+//! operand cannot be classified: an undecodable wire blob, a `TypeAliasType`
+//! operand whose alias snapshot is missing or whose target/substitution the
+//! kernel cannot expand (chain cycle, ParamSpec/TypeVarTuple env, arg-count
+//! mismatch), a length mismatch, or a type-object fact the resolver snapshot
+//! cannot decide (fallback class not snapshotted yet). Alias operands with a
+//! snapshot expand exactly like Python's `get_proper_type` (issue #1235).
+//! The Python shim then re-runs the original pure-Python loop. Everything
+//! downstream (literal-hash bookkeeping, chain grouping via
+//! `rust_group_comparison_operands`, the narrowing arm bodies, TypeMap
+//! returns) stays Python-side.
 
 use pyo3::prelude::*;
 
-use crate::checker_helpers::get_proper_or_none;
 use crate::checkmember::decode_type;
 use crate::typeinfo::{NativeTypeResolver, TypeResolver};
 use crate::wire::Type;
@@ -40,6 +42,7 @@ pub(crate) fn classify_comparison_operands_inner(
     literal_kinds: &[i64],
     operand_flags: &[(bool, bool, bool, bool, bool)],
     operand_types: &[Type],
+    aliases: &crate::aliases::TypeAliasResolver,
     resolver: &TypeResolver,
 ) -> Option<Vec<bool>> {
     if literal_kinds.len() != operand_flags.len() || literal_kinds.len() != operand_types.len() {
@@ -57,12 +60,12 @@ pub(crate) fn classify_comparison_operands_inner(
             out.push(false);
             continue;
         }
-        let proper = get_proper_or_none(&operand_types[i])?;
-        match proper {
+        let proper = crate::checkexpr_functions::get_proper_or_expand(&operand_types[i], aliases)?;
+        match &proper {
             // CallableType type objects are usually already maximally
             // specific, so they are not narrowable.
             Type::CallableType { .. } | Type::Overloaded { .. } => {
-                match function_like_is_type_obj(proper, resolver) {
+                match function_like_is_type_obj(&proper, resolver, aliases) {
                     Some(false) => out.push(true),
                     Some(true) => out.push(false),
                     None => return None,
@@ -81,24 +84,33 @@ pub(crate) fn classify_comparison_operands_inner(
 
 /// `FunctionLike.is_type_obj()`: `CallableType` via
 /// `callable_compat::is_type_obj` (fallback.type.is_metaclass() and the
-/// ret-type not uninhabited); `Overloaded` via `items[0]`. Defers (`None`)
-/// when the resolver has no snapshot for the fallback class, when the
-/// ret-type is a `TypeAliasType` (Python's `get_proper_type` would expand
-/// it from the live alias), or on a malformed shape.
-fn function_like_is_type_obj(t: &Type, resolver: &TypeResolver) -> Option<bool> {
-    match t {
-        Type::CallableType { ret_type, .. } => {
-            if matches!(&**ret_type, Type::TypeAliasType { .. }) {
-                return None;
-            }
-            crate::callable_compat::is_type_obj(t, resolver)
+/// ret-type not uninhabited); `Overloaded` via `items[0]`. A `TypeAliasType`
+/// ret-type expands through the alias snapshot like Python's
+/// `get_proper_type` (issue #1235): expanding to `UninhabitedType` decides
+/// `is_type_obj == False` (not narrowable), otherwise the decision falls
+/// through to `is_type_obj` on the callable. Defers (`None`) when the
+/// resolver has no snapshot for the fallback class, when an alias ret-type
+/// cannot expand, or on a malformed shape.
+fn function_like_is_type_obj(
+    t: &Type,
+    resolver: &TypeResolver,
+    aliases: &crate::aliases::TypeAliasResolver,
+) -> Option<bool> {
+    let callable = match t {
+        Type::CallableType { .. } => t,
+        Type::Overloaded { items } => items.first()?,
+        _ => return None,
+    };
+    let Type::CallableType { ret_type, .. } = callable else {
+        return None;
+    };
+    if let Type::TypeAliasType { .. } = &**ret_type {
+        let proper = crate::checkexpr_functions::get_proper_or_expand(ret_type, aliases)?;
+        if matches!(proper, Type::UninhabitedType { .. }) {
+            return Some(false);
         }
-        Type::Overloaded { items } => {
-            let first = items.first()?;
-            crate::callable_compat::is_type_obj(first, resolver)
-        }
-        _ => None,
     }
+    crate::callable_compat::is_type_obj(callable, resolver)
 }
 
 /// `#[pyfunction]` entry for the shim in `mypy/checker.py`. Decodes each
@@ -118,10 +130,12 @@ pub(crate) fn rust_classify_comparison_operands(
     for bytes in &operand_wires {
         operand_types.push(decode_type(bytes)?);
     }
+    let aliases = resolver.alias_resolver();
     classify_comparison_operands_inner(
         &literal_kinds,
         &operand_flags,
         &operand_types,
+        aliases,
         resolver.resolver(),
     )
 }
@@ -130,6 +144,7 @@ pub(crate) fn rust_classify_comparison_operands(
 mod tests {
     use super::*;
 
+    use crate::aliases::{TypeAliasResolver, TypeAliasSnapshot};
     use crate::typeinfo::TypeInfoSnapshot;
 
     fn instance(type_ref: &str) -> Type {
@@ -189,9 +204,27 @@ mod tests {
         kinds: &[i64],
         flags: &[(bool, bool, bool, bool, bool)],
         types: &[Type],
+        aliases: &crate::aliases::TypeAliasResolver,
         resolver: &TypeResolver,
     ) -> Option<Vec<bool>> {
-        classify_comparison_operands_inner(kinds, flags, types, resolver)
+        classify_comparison_operands_inner(kinds, flags, types, aliases, resolver)
+    }
+
+    fn no_aliases() -> TypeAliasResolver {
+        TypeAliasResolver::new()
+    }
+
+    fn alias_resolver(fullname: &str, target: &Type) -> TypeAliasResolver {
+        let mut r = TypeAliasResolver::new();
+        r.insert(
+            fullname.to_string(),
+            TypeAliasSnapshot {
+                fullname: fullname.to_string(),
+                target: crate::checkmember::encode_type(target).unwrap(),
+                ..Default::default()
+            },
+        );
+        r
     }
 
     #[test]
@@ -202,6 +235,7 @@ mod tests {
                 &[1, 1],
                 &[flags(true), flags(true)],
                 &types,
+                &no_aliases(),
                 &TypeResolver::new()
             ),
             Some(vec![true, true])
@@ -218,6 +252,7 @@ mod tests {
                 &[0, 2],
                 &[flags(true), flags(true)],
                 &types,
+                &no_aliases(),
                 &TypeResolver::new()
             ),
             Some(vec![false, false])
@@ -235,7 +270,7 @@ mod tests {
             (false, false, false, false, true),
         ] {
             assert_eq!(
-                run(&[1], &[f], &types, &TypeResolver::new()),
+                run(&[1], &[f], &types, &no_aliases(), &TypeResolver::new()),
                 Some(vec![false]),
                 "flags {f:?} must suppress narrowing"
             );
@@ -253,7 +288,7 @@ mod tests {
         resolver.insert("builtins.type".to_string(), snap);
         let types = vec![callable(instance("builtins.object"), "builtins.type")];
         assert_eq!(
-            run(&[1], &[flags(true)], &types, &resolver),
+            run(&[1], &[flags(true)], &types, &no_aliases(), &resolver),
             Some(vec![false])
         );
     }
@@ -269,7 +304,7 @@ mod tests {
         resolver.insert("builtins.function".to_string(), snap);
         let types = vec![callable(instance("builtins.object"), "builtins.function")];
         assert_eq!(
-            run(&[1], &[flags(true)], &types, &resolver),
+            run(&[1], &[flags(true)], &types, &no_aliases(), &resolver),
             Some(vec![true])
         );
     }
@@ -288,7 +323,7 @@ mod tests {
             "builtins.type",
         )];
         assert_eq!(
-            run(&[1], &[flags(true)], &types, &resolver),
+            run(&[1], &[flags(true)], &types, &no_aliases(), &resolver),
             Some(vec![true])
         );
     }
@@ -299,7 +334,13 @@ mod tests {
         // decide either; the whole call defers.
         let types = vec![callable(instance("builtins.object"), "builtins.type")];
         assert_eq!(
-            run(&[1], &[flags(true)], &types, &TypeResolver::new()),
+            run(
+                &[1],
+                &[flags(true)],
+                &types,
+                &no_aliases(),
+                &TypeResolver::new()
+            ),
             None
         );
     }
@@ -317,7 +358,7 @@ mod tests {
             items: vec![callable(instance("builtins.object"), "builtins.type")],
         }];
         assert_eq!(
-            run(&[1], &[flags(true)], &types, &resolver),
+            run(&[1], &[flags(true)], &types, &no_aliases(), &resolver),
             Some(vec![false])
         );
     }
@@ -329,7 +370,13 @@ mod tests {
             is_type_form: false,
         }];
         assert_eq!(
-            run(&[1], &[flags(true)], &types, &TypeResolver::new()),
+            run(
+                &[1],
+                &[flags(true)],
+                &types,
+                &no_aliases(),
+                &TypeResolver::new()
+            ),
             Some(vec![false])
         );
     }
@@ -341,20 +388,114 @@ mod tests {
             is_type_form: false,
         }];
         assert_eq!(
-            run(&[1], &[flags(true)], &types, &TypeResolver::new()),
+            run(
+                &[1],
+                &[flags(true)],
+                &types,
+                &no_aliases(),
+                &TypeResolver::new()
+            ),
             Some(vec![true])
         );
     }
 
     #[test]
     fn test_alias_operand_defers() {
-        // get_proper_type would expand the alias from the live node; defer.
+        // No alias snapshot: Python's get_proper_type would expand from the
+        // live node; the kernel cannot decide, so the call defers.
         let types = vec![Type::TypeAliasType {
             args: Vec::new(),
             type_ref: "mod.Alias".to_string(),
         }];
         assert_eq!(
-            run(&[1], &[flags(true)], &types, &TypeResolver::new()),
+            run(
+                &[1],
+                &[flags(true)],
+                &types,
+                &no_aliases(),
+                &TypeResolver::new()
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn test_alias_operand_expands_to_instance() {
+        // A snapshotted alias operand expands like get_proper_type (issue
+        // #1235); expanding to a plain Instance is narrowable.
+        let aliases = alias_resolver("mod.Alias", &instance("builtins.int"));
+        let types = vec![Type::TypeAliasType {
+            args: Vec::new(),
+            type_ref: "mod.Alias".to_string(),
+        }];
+        assert_eq!(
+            run(&[1], &[flags(true)], &types, &aliases, &TypeResolver::new()),
+            Some(vec![true])
+        );
+    }
+
+    #[test]
+    fn test_alias_operand_expands_to_type_object() {
+        // Expanding to a type-object callable with a builtins.type fallback
+        // is not narrowable.
+        let mut resolver = TypeResolver::new();
+        let mut snap = TypeInfoSnapshot::default();
+        snap.fullname = "builtins.type".to_string();
+        snap.name = "type".to_string();
+        snap.has_base.insert("builtins.type".to_string());
+        resolver.insert("builtins.type".to_string(), snap);
+        let aliases = alias_resolver(
+            "mod.Alias",
+            &callable(instance("builtins.object"), "builtins.type"),
+        );
+        let types = vec![Type::TypeAliasType {
+            args: Vec::new(),
+            type_ref: "mod.Alias".to_string(),
+        }];
+        assert_eq!(
+            run(&[1], &[flags(true)], &types, &aliases, &resolver),
+            Some(vec![false])
+        );
+    }
+
+    #[test]
+    fn test_alias_ret_expands_to_uninhabited() {
+        // A snapshotted alias ret-type expanding to UninhabitedType decides
+        // is_type_obj == False (via the expansion fallback) without needing
+        // a fallback-class snapshot.
+        let aliases = alias_resolver("mod.Evil", &Type::UninhabitedType { ambiguous: false });
+        let types = vec![callable(
+            Type::TypeAliasType {
+                args: Vec::new(),
+                type_ref: "mod.Evil".to_string(),
+            },
+            "builtins.function",
+        )];
+        assert_eq!(
+            run(&[1], &[flags(true)], &types, &aliases, &TypeResolver::new()),
+            Some(vec![true])
+        );
+    }
+
+    #[test]
+    fn test_alias_ret_missing_snapshot_defers() {
+        // A ret-type alias without a snapshot still defers: Python expands
+        // it from the live alias node.
+        let types = vec![callable(
+            Type::TypeAliasType {
+                args: Vec::new(),
+                type_ref: "mod.Missing".to_string(),
+            },
+            "builtins.function",
+        )];
+        assert_eq!(
+            run(
+                &[1],
+                &[flags(true)],
+                &types,
+                &no_aliases(),
+                &TypeResolver::new()
+            ),
             None
         );
     }
@@ -363,7 +504,13 @@ mod tests {
     fn test_length_mismatch_defers() {
         let types = vec![instance("builtins.int")];
         assert_eq!(
-            run(&[1, 1], &[flags(true)], &types, &TypeResolver::new()),
+            run(
+                &[1, 1],
+                &[flags(true)],
+                &types,
+                &no_aliases(),
+                &TypeResolver::new()
+            ),
             None
         );
         assert_eq!(
@@ -371,6 +518,7 @@ mod tests {
                 &[1],
                 &[flags(true), flags(true)],
                 &types,
+                &no_aliases(),
                 &TypeResolver::new()
             ),
             None
@@ -379,7 +527,10 @@ mod tests {
 
     #[test]
     fn test_empty_operands() {
-        assert_eq!(run(&[], &[], &[], &TypeResolver::new()), Some(vec![]));
+        assert_eq!(
+            run(&[], &[], &[], &no_aliases(), &TypeResolver::new()),
+            Some(vec![])
+        );
     }
 
     #[test]

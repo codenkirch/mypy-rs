@@ -8743,9 +8743,9 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
                 return {}, {}
         operand_types = [self.lookup_type(expr) for expr in operands]
 
-        # Native type-kernel seam (#1087): Rust classifies operand
-        # narrowability from wire types plus cheap literal facts; the
-        # literal-hash bookkeeping stays Python-side. None defers below.
+        # Native type-kernel seam (#1087, #1235): Rust classifies operand
+        # narrowability from wire types plus cheap literal facts; alias
+        # operands expand through the resolver snapshot. None defers below.
         classified = None
         if (
             _CHECKER_HAS_TYPE_KERNEL
