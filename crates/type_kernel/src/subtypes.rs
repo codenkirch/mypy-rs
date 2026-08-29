@@ -948,15 +948,12 @@ pub(crate) fn is_subtype(
                     return None;
                 }
                 // Protocol without __call__: Python checks
-                // is_protocol_implementation(left.fallback, right) only if
-                // left.is_type_obj() (subtypes.py:878-883). Defer that too;
-
-                // the non-type-obj path falls to is_subtype(fallback, right).
-                // We can't distinguish is_type_obj here without the
-                // fallback.is_metaclass() check, so defer all protocol
-
-                // Instance right to be safe.
-                return None;
+                // is_protocol_implementation(class_obj) only when
+                // left.is_type_obj(). The port below decides that.
+                match crate::callable_compat::is_type_obj(left, resolver) {
+                    Some(false) => return is_subtype(left_fallback.as_ref(), right, ctx, resolver),
+                    _ => return None,
+                }
             }
             // Non-protocol Instance: is_subtype(left.fallback, right)
             // (subtypes.py:884).
@@ -2701,11 +2698,226 @@ fn expand_aliases_depth(
                 is_type_form: *is_type_form,
             })
         }
-        // Leaf types and unsupported variants: clone as-is. The
-        // TypeAliasType early-return in `is_subtype` catches anything we
-        // miss here.
+        Type::TypeVarType {
+            name,
+            fullname,
+            raw_id,
+            namespace,
+            values,
+            upper_bound,
+            default,
+            variance,
+            meta_level,
+        } => {
+            let new_values = values
+                .iter()
+                .map(|v| {
+                    expand_aliases_depth(v, alias_resolver, strict_optional, depth + 1, active)
+                })
+                .collect::<Option<Vec<_>>>()?;
+            let ub = Box::new(expand_aliases_depth(
+                upper_bound,
+                alias_resolver,
+                strict_optional,
+                depth + 1,
+                active,
+            )?);
+            let def = Box::new(expand_aliases_depth(
+                default,
+                alias_resolver,
+                strict_optional,
+                depth + 1,
+                active,
+            )?);
+            Some(Type::TypeVarType {
+                name: name.clone(),
+                fullname: fullname.clone(),
+                raw_id: *raw_id,
+                namespace: namespace.clone(),
+                values: new_values,
+                upper_bound: ub,
+                default: def,
+                variance: *variance,
+                meta_level: *meta_level,
+            })
+        }
+        Type::ParamSpecType {
+            prefix,
+            name,
+            fullname,
+            raw_id,
+            namespace,
+            flavor,
+            upper_bound,
+            default,
+        } => {
+            let new_prefix =
+                expand_parameters_depth(prefix, alias_resolver, strict_optional, depth, active)?;
+            let ub = Box::new(expand_aliases_depth(
+                upper_bound,
+                alias_resolver,
+                strict_optional,
+                depth + 1,
+                active,
+            )?);
+            let def = Box::new(expand_aliases_depth(
+                default,
+                alias_resolver,
+                strict_optional,
+                depth + 1,
+                active,
+            )?);
+            Some(Type::ParamSpecType {
+                prefix: Box::new(new_prefix),
+                name: name.clone(),
+                fullname: fullname.clone(),
+                raw_id: *raw_id,
+                namespace: namespace.clone(),
+                flavor: *flavor,
+                upper_bound: ub,
+                default: def,
+            })
+        }
+        Type::TypeVarTupleType {
+            tuple_fallback,
+            name,
+            fullname,
+            raw_id,
+            namespace,
+            upper_bound,
+            default,
+            min_len,
+        } => {
+            let fb = Box::new(expand_aliases_depth(
+                tuple_fallback,
+                alias_resolver,
+                strict_optional,
+                depth + 1,
+                active,
+            )?);
+            let ub = Box::new(expand_aliases_depth(
+                upper_bound,
+                alias_resolver,
+                strict_optional,
+                depth + 1,
+                active,
+            )?);
+            let def = Box::new(expand_aliases_depth(
+                default,
+                alias_resolver,
+                strict_optional,
+                depth + 1,
+                active,
+            )?);
+            Some(Type::TypeVarTupleType {
+                tuple_fallback: fb,
+                name: name.clone(),
+                fullname: fullname.clone(),
+                raw_id: *raw_id,
+                namespace: namespace.clone(),
+                upper_bound: ub,
+                default: def,
+                min_len: *min_len,
+            })
+        }
+        Type::UnpackType { typ } => {
+            let inner = Box::new(expand_aliases_depth(
+                typ,
+                alias_resolver,
+                strict_optional,
+                depth + 1,
+                active,
+            )?);
+            Some(Type::UnpackType { typ: inner })
+        }
+        Type::TypedDictType {
+            fallback,
+            items,
+            required_keys,
+            readonly_keys,
+            is_closed,
+        } => {
+            let fb = Box::new(expand_aliases_depth(
+                fallback,
+                alias_resolver,
+                strict_optional,
+                depth + 1,
+                active,
+            )?);
+            let new_items = items
+                .iter()
+                .map(|(k, v)| {
+                    Some((
+                        k.clone(),
+                        expand_aliases_depth(
+                            v,
+                            alias_resolver,
+                            strict_optional,
+                            depth + 1,
+                            active,
+                        )?,
+                    ))
+                })
+                .collect::<Option<Vec<_>>>()?;
+            Some(Type::TypedDictType {
+                fallback: fb,
+                items: new_items,
+                required_keys: required_keys.clone(),
+                readonly_keys: readonly_keys.clone(),
+                is_closed: *is_closed,
+            })
+        }
+        Type::LiteralType { fallback, value } => {
+            let fb = Box::new(expand_aliases_depth(
+                fallback,
+                alias_resolver,
+                strict_optional,
+                depth + 1,
+                active,
+            )?);
+            Some(Type::LiteralType {
+                fallback: fb,
+                value: value.clone(),
+            })
+        }
+        Type::Parameters(p) => {
+            let np = expand_parameters_depth(p, alias_resolver, strict_optional, depth, active)?;
+            Some(Type::Parameters(np))
+        }
+        // Scalars and the deliberately un-walked carriers (UnboundType args,
+        // AnyType.source_any): clone as-is. The TypeAliasType early-return
+        // in `is_subtype` catches anything we miss here.
         _ => Some(typ.clone()),
     }
+}
+
+/// Walk a `Parameters`' type-bearing fields (`arg_types`, `variables`) for
+/// `expand_aliases_depth`; the rest are scalars.
+fn expand_parameters_depth(
+    p: &wire::Parameters,
+    alias_resolver: &crate::aliases::TypeAliasResolver,
+    strict_optional: bool,
+    depth: u32,
+    active: &mut Vec<ActiveAlias>,
+) -> Option<wire::Parameters> {
+    let arg_types = p
+        .arg_types
+        .iter()
+        .map(|a| expand_aliases_depth(a, alias_resolver, strict_optional, depth + 1, active))
+        .collect::<Option<Vec<_>>>()?;
+    let variables = p
+        .variables
+        .iter()
+        .map(|v| expand_aliases_depth(v, alias_resolver, strict_optional, depth + 1, active))
+        .collect::<Option<Vec<_>>>()?;
+    Some(wire::Parameters {
+        arg_types,
+        arg_kinds: p.arg_kinds.clone(),
+        arg_names: p.arg_names.clone(),
+        variables,
+        imprecise_arg_kinds: p.imprecise_arg_kinds,
+        is_ellipsis_args: p.is_ellipsis_args,
+    })
 }
 
 /// Decode a wire-format `Type` blob via `wire::read_type`. Returns
