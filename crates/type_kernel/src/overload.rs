@@ -131,14 +131,10 @@ pub fn rust_check_overload_call(
     let nformals_hint = targets_bytes.len();
 
     // Decode all arg types once.
-    let arg_types: Vec<Type> = match arg_types_bytes
+    let arg_types: Vec<Type> = arg_types_bytes
         .iter()
         .map(|b| decode_type(b))
-        .collect::<Option<Vec<_>>>()
-    {
-        Some(v) => v,
-        None => return None,
-    };
+        .collect::<Option<Vec<_>>>()?;
 
     // Decode all targets once, validating shape. Callable targets (plain or
     // generic) stay; type-object fallbacks and non-callables defer whole call
