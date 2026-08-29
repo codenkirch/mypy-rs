@@ -656,9 +656,7 @@ pub(crate) fn is_subtype(
         // overload qualifies (items[0].is_type_obj() decides); then
         // `left <: right.items[0]`, a TypeType-vs-CallableType recursion.
         if let Type::Overloaded { items: right_items } = right {
-            let Some(first) = right_items.first() else {
-                return None;
-            };
+            let first = right_items.first()?;
             return match crate::callable_compat::is_type_obj(first, resolver) {
                 Some(true) => is_subtype(left, first, ctx, resolver),
                 Some(false) => Some(false),
@@ -684,17 +682,16 @@ pub(crate) fn is_subtype(
                 }
             }
             // subtypes.py:1251-1255: a TupleType item compares via its
-            // tuple_fallback; a fallback failure defers.
-            let mut item: Option<Type> = None;
-            let item_ref: &Type = if let Type::TupleType { .. } = left_item.as_ref() {
-                let Some(tf) = crate::typeops::tuple_fallback(left_item.as_ref(), resolver) else {
-                    return None;
-                };
-                item = Some(tf);
-                item.as_ref().unwrap()
+            // tuple_fallback (always a tuple Instance, so the Instance
+            // check below defers it); a fallback failure defers.
+            let item_ref: &Type;
+            let tuple_fb: Type;
+            if let Type::TupleType { .. } = left_item.as_ref() {
+                tuple_fb = crate::typeops::tuple_fallback(left_item.as_ref(), resolver)?;
+                item_ref = &tuple_fb;
             } else {
-                left_item.as_ref()
-            };
+                item_ref = left_item.as_ref();
+            }
             // subtypes.py:1256-1268: an Instance item needs the live
             // type_object_type (init/new MRO selection + class_callable),
             // which the wire snapshot does not carry. Defer; Python re-runs.
@@ -819,9 +816,7 @@ pub(crate) fn is_subtype(
                 return Some(true);
             }
             if let Type::TypeType { .. } = right {
-                let Some(first) = left_items.first() else {
-                    return None;
-                };
+                let first = left_items.first()?;
                 return match crate::callable_compat::is_type_obj(first, resolver) {
                     Some(true) => is_subtype(first, right, ctx, resolver),
                     Some(false) => Some(false),
