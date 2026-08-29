@@ -1124,8 +1124,9 @@ pub(crate) fn rust_analyze_instance_member_access(
 /// already maps the receiver to the defining class and `bind_self`'s
 /// non-generic strip is receiver-independent, so the equality guard can
 /// be dropped there. The `analyze_instance_member_access` dispatch keeps
-/// the exact-class guard (Python's `check_self_arg` + generic `bind_self`
-/// handle subclass receivers with error emission).
+/// the equality guard only for variable-carrying signatures, where
+/// Python's generic `bind_self` branch may run; variable-free signatures
+/// bind by strip only, so the dispatch drops the guard there too.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn member_method_inner(
     instance: &Type,
@@ -1141,19 +1142,17 @@ pub(crate) fn member_method_inner(
     // Class methods: bind_self's non-generic strip path is
     // is_classmethod-agnostic, so the same strip is valid here; the
     // generic path needs the TypeType-wrap, so defer.
-    if is_class {
-        let has_vars = matches!(
-            signature,
-            Type::CallableType { variables, .. } if !variables.is_empty()
-        ) || matches!(
-            signature,
-            Type::Overloaded { items } if items.iter().any(
-                |it| matches!(it, Type::CallableType { variables, .. } if !variables.is_empty())
-            )
-        );
-        if has_vars {
-            return None;
-        }
+    let has_vars = matches!(
+        signature,
+        Type::CallableType { variables, .. } if !variables.is_empty()
+    ) || matches!(
+        signature,
+        Type::Overloaded { items } if items.iter().any(
+            |it| matches!(it, Type::CallableType { variables, .. } if !variables.is_empty())
+        )
+    );
+    if is_class && has_vars {
+        return None;
     }
     let (left_ref, left_args) = match instance {
         Type::Instance { type_ref, args, .. } => (type_ref.as_str(), args.as_slice()),
@@ -1161,16 +1160,16 @@ pub(crate) fn member_method_inner(
             return None;
         }
     };
-    // Same-class guard, unless the caller handles subclass receivers
-    // (protocol lookup re-maps the receiver to `method_fullname`; the
-    // non-generic bind strip ignores it). Union receivers defer.
+    // Same-class guard unless the caller handles subclass receivers
+    // (protocol path re-maps them). Variable-free signatures strip
+    // exactly like Python's bind_self; variable-carrying ones defer.
     let self_ref = match self_type {
         Type::Instance { type_ref, .. } => type_ref.as_str(),
         _ => {
             return None;
         }
     };
-    if !allow_subclass_receiver && self_ref != method_fullname {
+    if !allow_subclass_receiver && self_ref != method_fullname && has_vars {
         return None;
     }
     // checkmember.py:769 `check_self_arg(signature, mx.self_type, ...)`:
@@ -5147,6 +5146,163 @@ mod tests {
             false, // allow_subclass_receiver (unit tests)
         );
         assert!(result.is_none(), "classmethod must defer");
+    }
+
+    fn make_ab_resolver() -> TypeResolver {
+        // A (plain) with subclass B: map_instance_to_supertype needs B's
+        // snapshot to carry A as a reachable base.
+        let mut r = TypeResolver::new();
+        let mut snap = |fullname: &str, mro: &[&str]| {
+            r.insert(
+                fullname.to_string(),
+                TypeInfoSnapshot {
+                    fullname: fullname.to_string(),
+                    name: fullname.to_string(),
+                    mro: mro.iter().map(|s| s.to_string()).collect(),
+                    has_base: mro.iter().map(|s| s.to_string()).collect(),
+                    ..Default::default()
+                },
+            );
+        };
+        snap(
+            "builtins.function",
+            &["builtins.function", "builtins.object"],
+        );
+        snap("builtins.object", &["builtins.object"]);
+        snap("A", &["A", "builtins.object"]);
+        // B's snapshot needs the serialized base Instance blob: the map
+        // derivation walk decodes `bases` blobs, it does not use `mro`.
+        let base_a = encode_type(&Type::Instance {
+            type_ref: "A".to_string(),
+            args: vec![],
+            last_known_value: None,
+            extra_attrs: None,
+        })
+        .expect("encode base A");
+        r.insert(
+            "B".to_string(),
+            TypeInfoSnapshot {
+                fullname: "B".to_string(),
+                name: "B".to_string(),
+                mro: vec![
+                    "B".to_string(),
+                    "A".to_string(),
+                    "builtins.object".to_string(),
+                ],
+                has_base: [
+                    "B".to_string(),
+                    "A".to_string(),
+                    "builtins.object".to_string(),
+                ]
+                .into_iter()
+                .collect(),
+                bases: vec![base_a],
+                ..Default::default()
+            },
+        );
+        r
+    }
+
+    fn make_ab_method(variables: Vec<Type>) -> Type {
+        // def foo(self: A, x: A) -> A, optionally `def foo[T](...)` via
+        // `variables`.
+        let (x_type, ret_type, variables) = if variables.is_empty() {
+            (
+                Box::new(make_instance("A")),
+                Box::new(make_instance("A")),
+                variables,
+            )
+        } else {
+            let tvar = Type::TypeVarType {
+                name: "T".to_string(),
+                fullname: "A.T".to_string(),
+                raw_id: 1,
+                namespace: "A".to_string(),
+                values: vec![],
+                upper_bound: Box::new(make_instance("builtins.object")),
+                default: Box::new(make_instance("builtins.object")),
+                variance: 0,
+                meta_level: 0,
+            };
+            (Box::new(tvar.clone()), Box::new(tvar), variables)
+        };
+        Type::CallableType {
+            fallback: Box::new(make_instance("builtins.function")),
+            instance_type: None,
+            is_ellipsis_args: false,
+            implicit: false,
+            is_bound: false,
+            from_concatenate: false,
+            imprecise_arg_kinds: false,
+            unpack_kwargs: false,
+            from_type_type: false,
+            arg_types: vec![make_instance("A"), *x_type],
+            arg_kinds: vec![ARG_POS, ARG_POS],
+            arg_names: vec![Some("self".to_string()), Some("x".to_string())],
+            ret_type: ret_type,
+            name: Some("foo".to_string()),
+            variables,
+            type_guard: None,
+            type_is: None,
+        }
+    }
+
+    fn make_b_receiver() -> Type {
+        Type::Instance {
+            type_ref: "B".to_string(),
+            args: vec![],
+            last_known_value: None,
+            extra_attrs: None,
+        }
+    }
+
+    #[test]
+    fn test_member_method_subclass_receiver_nongeneric_completes() {
+        // B receiver, method on A, variable-free signature: Python's full
+        // bind_self takes only the strip path, so the filter + map +
+        // expand + strip composition below decides the case natively.
+        let resolver = make_ab_resolver();
+        let method = make_ab_method(vec![]);
+        let b = make_b_receiver();
+        let result = member_method_inner(
+            &b, &method, "A", &b, "foo", &resolver, true, false, // is_class
+            false, // allow_subclass_receiver
+        );
+        match result {
+            Some(Type::CallableType {
+                arg_types,
+                is_bound,
+                ..
+            }) => {
+                assert!(is_bound);
+                assert_eq!(arg_types.len(), 1);
+            }
+            other => panic!("expected bound CallableType, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_member_method_subclass_receiver_generic_defers() {
+        // B receiver, generic method on A: bind_self's generic branch could
+        // fire (variables non-empty), so the equality guard keeps deferring.
+        let resolver = make_ab_resolver();
+        let method = make_ab_method(vec![Type::TypeVarType {
+            name: "T".to_string(),
+            fullname: "A.T".to_string(),
+            raw_id: 1,
+            namespace: "A".to_string(),
+            values: vec![],
+            upper_bound: Box::new(make_instance("builtins.object")),
+            default: Box::new(make_instance("builtins.object")),
+            variance: 0,
+            meta_level: 0,
+        }]);
+        let b = make_b_receiver();
+        let result = member_method_inner(
+            &b, &method, "A", &b, "foo", &resolver, true, false, // is_class
+            false, // allow_subclass_receiver
+        );
+        assert!(result.is_none(), "generic subclass receiver must defer");
     }
 
     // --- classify_type_type_member_access (issue #957) ---
