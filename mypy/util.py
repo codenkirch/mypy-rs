@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import atexit
 import hashlib
 import io
 import json
@@ -571,6 +572,9 @@ def hard_exit(status: int = 0) -> None:
     """
     sys.stdout.flush()
     sys.stderr.flush()
+    # os._exit skips atexit handlers, silently dropping diagnostics that
+    # instrumentation registered to dump on interpreter exit (#1061).
+    atexit._run_exitfuncs()
     os._exit(status)
 
 
