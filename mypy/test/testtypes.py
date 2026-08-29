@@ -17867,6 +17867,155 @@ class NativeCheckCallSuite(Suite):
         assert rust is True
 
 
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeOverloadCallSuite(Suite):
+    """Direct seam tests for `rust_check_overload_call` (issue #1204).
+
+    The Rust indexer picks the first-match target index for the
+    no-Any, no-union-arg, no-star-actual path. Since #1204 generic
+    targets (own type variables) are decided through the native
+    constraint-solve kernel: solve, then evaluate the fully
+    substituted form like a plain target. `None` always means defer;
+    Rust never decides no-match or ambiguity.
+
+    Categories: first-match ordering, per-target rejects, deferral
+    shapes (star / typeobj / ParamSpec), direct generic solves.
+    """
+
+    def setUp(self) -> None:
+        self.fx = TypeFixture()
+        self.resolver = _type_kernel.build_native_resolver(
+            self._collect_type_infos(), []
+        )
+
+    def _collect_type_infos(self) -> list[TypeInfo]:
+        infos = []
+        for name in dir(self.fx):
+            if not name.endswith("i"):
+                continue
+            value = getattr(self.fx, name)
+            if _is_type_info(value):
+                infos.append(value)
+        return infos
+
+    def _serialize(self, t: Type) -> bytes:
+        from mypy.checkexpr import _serialize_type_for_checkexpr
+
+        return _serialize_type_for_checkexpr(t)
+
+    def _call(
+        self,
+        targets: list[CallableType],
+        arg_types: list[Type],
+        arg_kinds: list[ArgKind] | None = None,
+        arg_names: list[str | None] | None = None,
+        strict_optional: bool = True,
+        strict: bool = False,
+        infer_unions: bool = False,
+    ) -> int | None:
+        kinds = (
+            [k.value for k in arg_kinds]
+            if arg_kinds is not None
+            else [ARG_POS.value] * len(arg_types)
+        )
+        import type_kernel as tk
+
+        return tk.rust_check_overload_call(
+            self.resolver,
+            [self._serialize(t) for t in targets],
+            [self._serialize(t) for t in arg_types],
+            kinds,
+            strict_optional,
+            arg_names,
+            strict,
+            infer_unions,
+        )
+
+    def _generic(self, tv: TypeVarType) -> CallableType:
+        """A generic callable: `def f(tv: tv) -> tv`."""
+        return CallableType([tv], [ARG_POS], [None], tv, self.fx.function, variables=[tv])
+
+    # --- first-match ordering and reject stepping ---
+
+    def test_first_match_order(self) -> None:
+        take_a = self.fx.callable(self.fx.b, self.fx.bool_type)
+        assert self._call([take_a], [self.fx.b]) == 0
+        # Target 0 rejects (A is not a subtype of B); target 1 matches.
+        take_b = self.fx.callable(self.fx.b, self.fx.bool_type)
+        take_str = self.fx.callable(self.fx.a, self.fx.str_type)
+        assert self._call([take_b, take_str], [self.fx.a]) == 1
+
+    def test_no_match_is_defer(self) -> None:
+        # Rust NEVER decides no-match: a lone rejected target defers.
+        take_str = self.fx.callable(self.fx.b, self.fx.str_type)
+        assert self._call([take_str], [self.fx.a]) is None
+
+    # --- whole-call deferral shapes ---
+
+    def test_star_actual_defers(self) -> None:
+        target = self.fx.callable(self.fx.a, self.fx.a)
+        assert self._call([target], [self.fx.b], arg_kinds=[ARG_STAR]) is None
+
+    def test_type_object_target_defers(self) -> None:
+        # callable_type() fallbacks to builtins.type: Python's check_call
+        # applies constructor calibration the wire cannot mirror.
+        target = self.fx.callable_type(self.fx.a, self.fx.a)
+        assert self._call([target], [self.fx.b]) is None
+
+    def test_undecodable_target_defers(self) -> None:
+        import type_kernel as tk
+
+        assert (
+            tk.rust_check_overload_call(
+                self.resolver,
+                [b"\xff garbage"],
+                [self._serialize(self.fx.b)],
+                [ARG_POS.value],
+                True,
+                None,
+                False,
+                False,
+            )
+            is None
+        )
+
+    # --- generic targets through the solve kernel (#1204) ---
+
+    def test_generic_target_solved_natively(self) -> None:
+        # def f(x: T) -> T with a concrete actual: solve substitutes
+        # T = B and the solved form evaluates as a plain match.
+        target = self._generic(self.fx.t)
+        assert self._call([target], [self.fx.b]) == 0
+
+    def test_generic_target_rejects_then_plain_matches(self) -> None:
+        # Substitution alone does not force a match: a rejected first
+        # target (B is not a subtype of str) still steps forward, and
+        # the generic target solves T = B and matches.
+        take_str = self.fx.callable(self.fx.str_type, self.fx.str_type)
+        generic = self._generic(self.fx.t)
+        assert self._call([take_str, generic], [self.fx.b]) == 1
+
+    def test_generic_param_spec_defers(self) -> None:
+        p = ParamSpecType(
+            "P",
+            "P",
+            TypeVarId(1),
+            ParamSpecFlavor.BARE,
+            self.fx.o,
+            AnyType(TypeOfAny.from_omitted_generics),
+        )
+        target = CallableType(
+            [p], [ARG_POS], [None], self.fx.a, self.fx.function, variables=[p]
+        )
+        assert self._call([target], [self.fx.b]) is None
+
+    def test_zero_formal_target_with_actual_rejects(self) -> None:
+        # A zero-formal target with a passed actual does not match; the
+        # exhausted search defers (never a decided no-match).
+        empty = CallableType([], [], [], self.fx.a, self.fx.function)
+        assert self._call([empty], [self.fx.b]) is None
+
+
 @skipUnless(
     _NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext"
 )
