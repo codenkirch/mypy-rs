@@ -1491,12 +1491,9 @@ pub(crate) fn member_method_inner(
             return None;
         }
     };
-    // checkmember.py:769 `check_self_arg(signature, mx.self_type, ...)`:
-    // Rust mirrors the overload-item self filter; a zero-match defers so
-    // Python emits `incompatible_self_argument` on the unfiltered signature.
-    // In the error-suppressed find_member contexts (protocol member
-    // fetches) Python keeps the original functype and continues binding,
-    // so callers pass suppress_self_fail=true there.
+    // checkmember.py:769 self filter: a zero match defers so Python emits
+    // `incompatible_self_argument`; in error-suppressed find_member contexts
+    // Python keeps the original functype (callers pass suppress_self_fail=true).
     let filtered = match check_self_arg_inner(
         signature,
         self_type,
@@ -1757,6 +1754,10 @@ fn freshen_signature(
 /// non-trivial tail dispatch. Returns `None` when any step needs Python
 /// (decorated methods, properties, lvalues, `__init__` guard failures,
 /// unresolvable live reads, unanalyzable signatures).
+///
+/// A `get_method` miss or a `Decorator` head falls through to the var arm
+/// (`dispatch_var_member_inner`), mirroring Python's
+/// `analyze_member_var_access` continuation.
 #[allow(clippy::too_many_arguments)]
 fn dispatch_instance_member_inner(
     py: Python<'_>,
@@ -1765,6 +1766,8 @@ fn dispatch_instance_member_inner(
     name: &str,
     override_info: Option<&str>,
     self_type: &Type,
+    is_operator: bool,
+    is_self: bool,
     preserve_type_var_ids: bool,
     next_raw_id: &mut i64,
     changed: &mut bool,
@@ -1789,11 +1792,22 @@ fn dispatch_instance_member_inner(
     }
     let method = match get_method_live(py, info, name) {
         Some(LiveMethod::FuncBase(node)) => node,
-        Some(LiveMethod::Decorator) => {
-            return None;
-        }
-        None => {
-            return None;
+        // checkmember.py:951: a get_method miss (or a Decorator head)
+        // continues into analyze_member_var_access; the var arm mirrors it.
+        Some(LiveMethod::Decorator) | None => {
+            return dispatch_var_member_inner(
+                py,
+                resolver,
+                instance,
+                name,
+                info,
+                is_operator,
+                is_self,
+                preserve_type_var_ids,
+                next_raw_id,
+                changed,
+                strict_optional,
+            );
         }
     };
     let method = method.as_ref(py);
@@ -1977,6 +1991,10 @@ pub(crate) fn rust_analyze_instance_member_dispatch(
         name,
         override_info.as_deref(),
         &self_type,
+        // The Python gate requires a found non-property method, so the
+        // var arm is unreachable from this entry point.
+        false,
+        false,
         preserve_type_var_ids,
         &mut next_raw_id,
         &mut changed,
@@ -1984,6 +2002,273 @@ pub(crate) fn rust_analyze_instance_member_dispatch(
     );
     let result = result?;
     Some((next_raw_id, changed, encode_type(&result)?))
+}
+
+/// Wire-portable var arm of the Instance member dispatch:
+/// `analyze_member_var_access` + `analyze_var` (checkmember.py:1235,
+/// 1759), the path Python takes when `get_method` misses or finds a
+/// `Decorator` head. Called from `dispatch_instance_member_inner` at both
+/// sites.
+///
+/// Handled by Rust: a plain `Var` hit and a non-deprecated `Decorator`
+/// head (unwrapped to `.var`), the `expand_without_binding` expansion, the
+/// class-var `call_type` arbitration for a single unbound CallableType,
+/// the `plugin_hook_known_absent` fast-path, and the non-descriptor
+/// pass-through of `analyze_descriptor_access`. Everything else defers
+/// (`None`) to the pure-Python body: `__init__` (guard + fail),
+/// deprecated decorators (`warn_deprecated` side effect), non-Var /
+/// non-Decorator nodes (module refs, synthesized static-reference Vars),
+/// enum classes (literal wrap / `enum.nonmember` unwrap), union or
+/// Overloaded `call_type` item loops, the non-trivial bind-self path,
+/// property-bearing `call_type` (Python's property-extract tail in
+/// `expand_and_bind_callable`), self-type expansion, partial or not-ready
+/// vars, a possible plugin hook, and descriptor `__get__`-bearing accesses.
+#[allow(clippy::too_many_arguments)]
+fn dispatch_var_member_inner(
+    py: Python<'_>,
+    resolver: &NativeTypeResolver,
+    instance: &Type,
+    name: &str,
+    info: &PyAny,
+    is_operator: bool,
+    is_self: bool,
+    preserve_type_var_ids: bool,
+    next_raw_id: &mut i64,
+    changed: &mut bool,
+    strict_optional: bool,
+) -> Option<Type> {
+    // `mx.is_self` routes through expand_self_type / bind_self with live
+    // Var state (checkmember.py:1898): defer to the Python body.
+
+    // `mx.is_super` is excluded by the caller's non-super gate; keep
+    // the guard symmetric.
+    if is_self {
+        return None;
+    }
+    // Python fails `__init__` access on a non-final class before the var
+    // path runs (checkmember.py:738); keep the whole name in Python.
+    if name == "__init__" {
+        return None;
+    }
+    let nodes_mod = py.import("mypy.nodes").ok()?;
+    let decorator_cls = nodes_mod.getattr("Decorator").ok()?;
+    let var_cls = nodes_mod.getattr("Var").ok()?;
+    // analyze_member_var_access: `node = info.get(name)`.
+    let entry = info.call_method1("get", (name,)).ok()?;
+    if entry.is_none() {
+        return None;
+    }
+    let implicit = entry.getattr("implicit").ok()?.extract::<bool>().ok()?;
+    let node = entry.getattr("node").ok()?;
+    if node.is_none() {
+        return None;
+    }
+    let is_trivial_self;
+    let var = if node.is_instance(decorator_cls).ok()? {
+        // Decorator head: `warn_deprecated` fires on `vv.func` and
+        // defers; `v = vv.var`, `is_trivial_self = vv.func.is_trivial_self
+        // and not vv.decorators` (checkmember.py:1252-1255).
+        let func = node.getattr("func").ok()?;
+        if !func.getattr("deprecated").ok()?.is_none() {
+            return None;
+        }
+        is_trivial_self = get_bool_flag(py, func, "is_trivial_self")?
+            && node.getattr("decorators").ok()?.len().ok()? == 0;
+        node.getattr("var").ok()?
+    } else if node.is_instance(var_cls).ok()? {
+        is_trivial_self = false;
+        node
+    } else {
+        return None;
+    };
+    if !var.is_instance(var_cls).ok()? {
+        return None;
+    }
+
+    // analyze_var scalar facts (checkmember.py:1801-1823).
+    let is_property = get_bool_flag(py, var, "is_property")?;
+    let is_initialized_in_class = get_bool_flag(py, var, "is_initialized_in_class")?;
+    let is_staticmethod = get_bool_flag(py, var, "is_staticmethod")?;
+    let var_info = var.getattr("info").ok()?;
+    let var_info_fullname: String = var_info.getattr("fullname").ok()?.extract().ok()?;
+    let var_info_is_enum = get_bool_flag(py, var_info, "is_enum")?;
+    let var_info_is_protocol = get_bool_flag(py, var_info, "is_protocol")?;
+    if var_info_is_enum {
+        return None;
+    }
+    // expand_without_binding native gate: `var.info.self_type is None or
+    // var.is_property` (checkmember.py:1902); otherwise expand_self_type
+    // needs the live Var.
+    if !var_info.getattr("self_type").ok()?.is_none() && !is_property {
+        return None;
+    }
+
+    // checkmember.py:1802 `itype = map_instance_to_supertype(itype,
+    // var.info)`; a snapshot miss defers.
+    let (inst_ref, inst_args) = match instance {
+        Type::Instance { type_ref, args, .. } => (type_ref, args),
+        _ => return None,
+    };
+    let mapped_args = crate::subtypes::map_instance_to_supertype(
+        inst_ref,
+        inst_args,
+        &var_info_fullname,
+        resolver.resolver(),
+    )?;
+    let itype = Type::Instance {
+        type_ref: var_info_fullname.clone(),
+        args: mapped_args,
+        last_known_value: None,
+        extra_attrs: None,
+    };
+
+    // `typ = var.type`; a None type (not-ready / implicit Any) and
+    // PartialType inference defer (checkmember.py:1810-1812).
+    let typ_obj = var.getattr("type").ok()?;
+    if typ_obj.is_none() {
+        return None;
+    }
+    let partial_cls = py.import("mypy.types").ok()?.getattr("PartialType").ok()?;
+    if typ_obj.is_instance(partial_cls).ok()? {
+        return None;
+    }
+    let typ = decode_type(&serialize_type_to_bytes(py, typ_obj)?)?;
+
+    // checkmember.py:1819 `result = expand_without_binding(typ, var, ...)`.
+    let (nri, ch, mut result) = expand_without_binding_inner(
+        &typ,
+        &itype,
+        preserve_type_var_ids,
+        *next_raw_id,
+        strict_optional,
+        resolver.resolver(),
+    )?;
+    *next_raw_id = nri;
+    if ch {
+        *changed = true;
+    }
+
+    // `is_instance_var(var)` (checkmember.py:1627) is consulted for the
+    // class-var arbitration and the descriptor gate; computed lazily so
+    // non-class, non-protocol hits do not pay for the interop call.
+    let is_instance_var_flag = if is_initialized_in_class || var_info_is_protocol {
+        Some(
+            py.import("mypy.checkmember")
+                .ok()?
+                .getattr("is_instance_var")
+                .ok()?
+                .call1((var,))
+                .ok()?
+                .extract::<bool>()
+                .ok()?,
+        )
+    } else {
+        None
+    };
+
+    // checkmember.py:1822-1831 class-var callable arbitration.
+    let mut call_type: Option<Type> = None;
+    if is_initialized_in_class && (!is_instance_var_flag.unwrap_or(false) || is_operator) {
+        let proper = get_proper_or_none(&typ)?;
+        let is_func_non_typeobj = match proper {
+            Type::CallableType {
+                fallback, ret_type, ..
+            } => !is_type_obj(fallback, ret_type, resolver.resolver()),
+            Type::Overloaded { items } => match items.first() {
+                Some(Type::CallableType {
+                    fallback, ret_type, ..
+                }) => !is_type_obj(fallback, ret_type, resolver.resolver()),
+                _ => false,
+            },
+            _ => false,
+        };
+        if is_func_non_typeobj {
+            call_type = Some(proper.clone());
+        } else if is_property {
+            // `__call__` recursion on the property type (checkmember.py:1827).
+            return None;
+        } else {
+            call_type = Some(proper.clone());
+        }
+    }
+
+    // checkmember.py:1840-1849 bound-method-alias loop. A UnionType
+    // call_type iterates items with per-item bind decisions; an Overloaded
+    // call_type iterates its items. Both defer.
+
+    // A CallableType item binds only on the trivial-self path; the
+    // non-trivial bind_self defers.
+    if let Some(ct) = call_type {
+        if !is_staticmethod {
+            match &ct {
+                Type::CallableType { is_bound, .. } => {
+                    // `p_ct.bound()` for a CallableType is its `is_bound`
+                    // flag (types.py:2048; items = [self]).
+                    if is_property {
+                        // Python's expand_and_bind_callable binds, then
+                        // returns the getter ret_type or the setter arg;
+                        // the inner port returns the raw CallableType, so defer.
+                        return None;
+                    }
+                    let (nri, ch, t) = if !is_bound {
+                        if !is_trivial_self {
+                            return None;
+                        }
+                        expand_and_bind_callable_inner(
+                            &ct,
+                            &itype,
+                            preserve_type_var_ids,
+                            *next_raw_id,
+                            strict_optional,
+                            resolver.resolver(),
+                        )?
+                    } else {
+                        expand_without_binding_inner(
+                            &ct,
+                            &itype,
+                            preserve_type_var_ids,
+                            *next_raw_id,
+                            strict_optional,
+                            resolver.resolver(),
+                        )?
+                    };
+                    *next_raw_id = nri;
+                    if ch {
+                        *changed = true;
+                    }
+                    result = t;
+                }
+                _ => return None,
+            }
+        }
+    }
+
+    // checkmember.py:1855-1863 plugin hook gate; a possible hook defers
+    // (AttributeContext application stays in Python).
+    let fullname = format!("{}.{}", var_info_fullname, name);
+    let hook_absent = py
+        .import("mypy.checkexpr")
+        .ok()?
+        .getattr("plugin_hook_known_absent")
+        .ok()?
+        .call1(("get_attribute_hook", &fullname))
+        .ok()?
+        .extract::<bool>()
+        .ok()?;
+    if !hook_absent {
+        return None;
+    }
+
+    // checkmember.py:1876-1877 descriptor pass-through: `not (implicit or
+    // var.info.is_protocol and is_instance_var(var))`.
+    if !(implicit || (var_info_is_protocol && is_instance_var_flag.unwrap_or(false))) {
+        match analyze_descriptor_access_inner(&result, false, strict_optional, resolver.resolver())?
+        {
+            DescriptorDecision::Orig => {}
+            DescriptorDecision::Value(t) => result = t,
+        }
+    }
+    Some(result)
 }
 
 // ---------------------------------------------------------------------------
@@ -2086,14 +2371,17 @@ fn classify_member_access_inner(typ: &Type, resolver: &TypeResolver) -> i64 {
 ///   * TypeAliasType → defer (wire format carries no alias target).
 ///
 /// Deferred to Python (return None):
-///   * Instance / UnionType / TypeType / TypedDictType / NoneType / DeletedType
+///   * Instance → dispatched through the native method + var arms, which
+///     defer back on any fact they cannot decide.
+///   * UnionType / TypeType / TypedDictType / NoneType / DeletedType
 ///     → need analyzer state, `mx`, or error reporting.  Rust must not drop a
 ///     diagnostic (e.g. `deleted_as_rvalue`) or mis-answer (`__bool__`).
 ///   * TypeVarType with values → needs `make_simplified_union`.
 ///   * UnboundType / Parameters / UnpackType → needs `report_missing_attribute`.
 #[pyfunction]
 #[pyo3(signature = (resolver, name, typ_bytes, self_type_bytes, is_lvalue, is_super,
-                    preserve_type_var_ids, start_raw_id, strict_optional))]
+                    is_operator, is_self, preserve_type_var_ids, start_raw_id,
+                    strict_optional))]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn rust_analyze_member_access(
     py: Python<'_>,
@@ -2103,6 +2391,8 @@ pub(crate) fn rust_analyze_member_access(
     self_type_bytes: &[u8],
     is_lvalue: bool,
     is_super: bool,
+    is_operator: bool,
+    is_self: bool,
     preserve_type_var_ids: bool,
     start_raw_id: i64,
     strict_optional: bool,
@@ -2118,6 +2408,8 @@ pub(crate) fn rust_analyze_member_access(
         self_type: &self_type,
         is_lvalue,
         is_super,
+        is_operator,
+        is_self,
         preserve_type_var_ids,
         next_raw_id: &mut next_raw_id,
         changed: &mut changed,
@@ -2140,6 +2432,8 @@ struct MemberAccessCtx<'a> {
     self_type: &'a Type,
     is_lvalue: bool,
     is_super: bool,
+    is_operator: bool,
+    is_self: bool,
     preserve_type_var_ids: bool,
     next_raw_id: &'a mut i64,
     changed: &'a mut bool,
@@ -2156,7 +2450,9 @@ fn analyze_member_access_inner<'a>(
         Type::Instance { .. } => {
             // Python: analyze_instance_member_access. With a ctx, route
             // rvalue/non-super Instance operands (incl. fallback recursion)
-            // through the native method branch; lvalue/super stay in Python.
+
+            // through the native method branch (with the var-arm fallback
+            // on a get_method miss); lvalue/super stay in Python.
             if let Some(ctx) = ctx.as_deref_mut() {
                 if !ctx.is_lvalue && !ctx.is_super {
                     let r = dispatch_instance_member_inner(
@@ -2166,6 +2462,8 @@ fn analyze_member_access_inner<'a>(
                         ctx.name,
                         None,
                         ctx.self_type,
+                        ctx.is_operator,
+                        ctx.is_self,
                         ctx.preserve_type_var_ids,
                         ctx.next_raw_id,
                         ctx.changed,
@@ -2397,6 +2695,11 @@ pub(crate) fn rust_analyze_union_member_access(
                     name,
                     None,
                     item,
+                    // Conservative: the var arm's own guards keep these
+                    // facts safe (is_operator only widens deferral;
+                    // is_self is re-guarded via the self_type check).
+                    false,
+                    false,
                     preserve_type_var_ids,
                     &mut next_raw_id,
                     &mut changed,
@@ -2488,6 +2791,9 @@ pub(crate) fn rust_analyze_none_member_access(
         name,
         None,
         &self_type,
+        // Conservative: same rationale as the union-item call site.
+        false,
+        false,
         preserve_type_var_ids,
         &mut next_raw_id,
         &mut changed,
@@ -2905,8 +3211,9 @@ fn check_self_arg_inner(
         }
         // Python checks item.arg_kinds[0] not in (ARG_POS, ARG_STAR).
         // Guard a length mismatch; if arg_kinds[0] is not ARG_POS/ARG_STAR,
-        // Python reports no_formal_self and returns functype. Defer in
-        // production; suppressed contexts keep functype.
+        // Python reports no_formal_self and returns functype.
+
+        // Defer in production; suppressed contexts keep functype.
         match arg_kinds.first() {
             Some(&k) if k == ARG_POS || k == ARG_STAR => {}
             _ => {

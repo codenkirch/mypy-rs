@@ -341,10 +341,9 @@ def _deserialize_type_for_checkmember(data: bytes, freeze: bool = False) -> Prop
     # occurrences before returning (mirrors expandtype.py:463-467).
     fixed = canonicalize_fresh_vars(fixed)
     if fixed is not None:
-        # Aliases resolve through the per-build wire alias map (issue
-        # #1224); an alias missing from the map sets fixer.missing, so a
-        # non-None result has every alias re-linked to its live TypeAlias
-        # node and is structurally a proper-type tree.
+        # Aliases resolve through the per-build wire alias map (issue #1224); an
+        # alias missing from the map sets fixer.missing, so a non-None result has
+        # every alias re-linked to its live TypeAlias node (proper-type tree).
         proper = cast(ProperType, fixed)
         _deser_caches[freeze][data] = proper
         return proper
@@ -383,6 +382,7 @@ def _restore_definition(original: Type, decoded: ProperType) -> ProperType:
         # check_self_arg filters an Overloaded to a single CallableType;
         # find the matching item by arg-type signature to restore its
         # definition link. bind_self may have stripped the self argument
+
         # (subclass receivers reach here through the dispatch seam), so an
         # item whose self arg is dropped matches with kind/name shift.
         n = len(decoded.arg_types)
@@ -604,11 +604,14 @@ def _analyze_member_access(
     # DeletedType, UninhabitedType, TupleType fallback recursion,
 
     # Literal/Callable/Overloaded fallback recursion,
-    # ParamSpec/TypeVarTuple fallback recursion).  Returns None (Python
-    # None) for branches needing plugin state, union construction, error
+    # ParamSpec/TypeVarTuple fallback recursion) plus, once a fallback
+    # recursion lands on an Instance, the full native method + var
 
-    # reporting, or resolver lookups: Python falls through.  The
-    # isinstance gate below also skips types Rust always defers on.
+    # analysis.  Returns None (Python None) for branches needing plugin
+    # state, union construction, error reporting, or resolver lookups:
+
+    # Python falls through.  The isinstance gate below also skips types
+    # Rust always defers on.
     if (
         _HAS_TYPE_KERNEL
         and _native_checkmember_active
@@ -628,6 +631,8 @@ def _analyze_member_access(
                 _serialize_type_for_checkmember(mx.self_type),
                 mx.is_lvalue,
                 mx.is_super,
+                mx.is_operator,
+                mx.is_self,
                 mx.preserve_type_var_ids,
                 TypeVarId.next_raw_id,
                 state.state.strict_optional,
@@ -1114,6 +1119,7 @@ def analyze_union_member_access(name: str, typ: UnionType, mx: MemberContext) ->
         # M20: gate the union-map through Rust when the kernel is active.
         # Rust maps relevant_items and returns per-item results; this shim
         # joins via make_simplified_union. Defer: property / Var / lvalue.
+
         # An item Rust cannot decide arrives as a None slot that the shim
         # fills through the pure-Python per-item loop, so one undecidable
         # item no longer discards whole-union work.
@@ -1185,6 +1191,7 @@ def analyze_none_member_access(name: str, typ: NoneType, mx: MemberContext) -> T
     # M20: gate the NoneType branch through Rust. __bool__ returns a pure
     # CallableType (ret=Literal[False]); any other name recurses on
     # builtins.object through the live-method dispatch with the caller's
+
     # mx facts (self_type / lvalue / super). Defer (None) when the
     # dispatch defers.
     if (

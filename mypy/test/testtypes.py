@@ -19937,6 +19937,8 @@ class NativeCheckmemberDeferralSuite(Suite):
             is_lvalue,
             is_super,
             False,
+            False,
+            False,
             start,
             False,
         )
@@ -35453,6 +35455,424 @@ class NativeAnalyzeVarSuite(Suite):
         var.has_explicit_value = True
         self.enum_info.names["RED"] = SymbolTableNode(MDEF, var)
         self._assert_differential("RED", var, Instance(self.enum_info, []))
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeMemberVarDispatchSuite(Suite):
+    """Parity tests for the var arm of the member-access dispatch
+    (issue #1234, `mypy.checkmember.analyze_member_var_access`).
+
+    The var arm reduces to a live-fact decision chain: a plain `Var` or a
+    non-deprecated `Decorator` head (unwrapped to `.var`), the
+    `expand_without_binding` expansion, the class-var `call_type`
+    arbitration for a single unbound CallableType, the trivial-self bind
+    path, the `plugin_hook_known_absent` fast path, and the descriptor
+    pass-through. Everything else defers (`None`) to the pure-Python
+    body; in particular a property-bearing `call_type` defers because
+    Python's `expand_and_bind_callable` runs the property-extract tail
+    (returns the getter ret_type or the setter arg on an lvalue), which
+    the bound-callable arm does not mirror.
+
+    Direct seam calls assert the exact result per branch; the gate-off
+    vs gate-on differential drives the real `analyze_union_member_access`
+    (the fill path for a deferred union item is the plain member access,
+    so a property item exercises the fallback end-to-end).
+    """
+
+    def setUp(self) -> None:
+        from mypy.checkexpr import _set_native_plugin_hook_registry
+        from mypy.checkmember import (
+            _set_native_checkmember_active,
+            _set_native_checkmember_resolver,
+        )
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        self._set_active = _set_native_checkmember_active
+        self._set_resolver = _set_native_checkmember_resolver
+        self._set_plugin_hook = _set_native_plugin_hook_registry
+        self._set_plugin_hook(SimpleNamespace(has_hook_for=lambda kind, fullname: False), False)
+        self._set_active(True)
+        self.info = self._typeinfo("mod.A")
+        self.base = self._typeinfo("mod.Base")
+        self.info.bases = [Instance(self.base, [])]
+        self.info.mro = [self.info, self.base]
+        self.prop_info = self._typeinfo("mod.P")
+        # Wire decode fixup needs the fallbacks of the __bool__ callable
+        # (builtins.bool/function) resolvable to live TypeInfos.
+        self.bool_info = self._typeinfo("builtins.bool")
+        self.function_info = self._typeinfo("builtins.function")
+        self._live_map = {
+            "mod.A": self.info,
+            "mod.Base": self.base,
+            "mod.P": self.prop_info,
+            "builtins.bool": self.bool_info,
+            "builtins.function": self.function_info,
+        }
+        self.resolver = _type_kernel.build_native_resolver(list(self._live_map.values()), [])
+        self.resolver.set_live_typeinfo_map(dict(self._live_map))
+        set_wire_typeinfo_map(dict(self._live_map))
+        self._set_resolver(self.resolver)
+
+    def tearDown(self) -> None:
+        self._set_plugin_hook(None, False)
+        self._set_resolver(None)
+        self._set_active(False)
+
+    def _with_gate(self, active: bool, fn: Callable[[], T]) -> T:
+        self._set_active(active)
+        try:
+            return fn()
+        finally:
+            self._set_active(True)
+
+    def _typeinfo(self, fullname: str = "mod.A") -> TypeInfo:
+        from mypy.nodes import Block, ClassDef, SymbolTable
+
+        defn = ClassDef(fullname.rsplit(".", 1)[-1], Block([]), None, [])
+        defn.fullname = fullname
+        info = TypeInfo(SymbolTable(), defn, "mod")
+        defn.info = info
+        info.mro = [info]
+        return info
+
+    def _register_var(
+        self,
+        info: TypeInfo,
+        name: str,
+        typ: Type | None,
+        *,
+        is_property: bool = False,
+        is_initialized_in_class: bool = False,
+        is_inferred: bool = False,
+        is_staticmethod: bool = False,
+        is_settable_property: bool = False,
+        setter_type: CallableType | None = None,
+        is_ready: bool = True,
+    ) -> Var:
+        var = Var(name, typ)
+        var.info = info
+        var.is_property = is_property
+        var.is_initialized_in_class = is_initialized_in_class
+        var.is_inferred = is_inferred
+        var.is_staticmethod = is_staticmethod
+        var.is_settable_property = is_settable_property
+        var.setter_type = setter_type
+        var.is_ready = is_ready
+        info.names[name] = SymbolTableNode(MDEF, var)
+        return var
+
+    def _register_decorator(
+        self,
+        info: TypeInfo,
+        name: str,
+        typ: FunctionLike,
+        *,
+        is_property: bool = False,
+        is_initialized_in_class: bool = False,
+        is_inferred: bool = False,
+        deprecated: str | None = None,
+        is_trivial_self: bool = True,
+    ) -> Decorator:
+        from mypy.nodes import Block, FuncDef
+
+        func = FuncDef(name, [], Block([]), typ)
+        func.info = info
+        func.is_trivial_self = is_trivial_self
+        func.deprecated = deprecated
+        var = Var(name, typ)
+        var.info = info
+        var.is_property = is_property
+        var.is_initialized_in_class = is_initialized_in_class
+        var.is_inferred = is_inferred
+        node = Decorator(func, [], var)
+        info.names[name] = SymbolTableNode(MDEF, node)
+        return node
+
+    def _seam(
+        self,
+        instance: Instance,
+        name: str,
+        *,
+        is_operator: bool = False,
+        is_self: bool = False,
+        start_raw_id: int = 100,
+    ) -> tuple[int, bool, Type] | None:
+        from mypy.checkmember import _serialize_type_for_checkmember
+
+        result = _type_kernel.rust_analyze_member_access(
+            self.resolver,
+            name,
+            _serialize_type_for_checkmember(instance),
+            _serialize_type_for_checkmember(instance),
+            False,  # is_lvalue
+            False,  # is_super
+            is_operator,
+            is_self,
+            False,  # preserve_type_var_ids
+            start_raw_id,
+            True,  # strict_optional
+        )
+        if result is None:
+            return None
+        next_raw_id, changed, wire_bytes = result
+        from mypy.checkmember import _deserialize_type_for_checkmember
+
+        decoded = _deserialize_type_for_checkmember(bytes(wire_bytes), freeze=True)
+        assert decoded is not None
+        return next_raw_id, changed, decoded
+
+    # --- direct seam tests ---
+
+    def test_seam_plain_var_engages(self) -> None:
+        self._register_var(self.info, "x", Instance(self.base, []))
+        result = self._seam(Instance(self.info, []), "x")
+        assert result is not None, "expected native result for a plain var"
+        _, _, decoded = result
+        assert str(decoded) == "mod.Base"
+
+    def test_seam_property_callable_defers(self) -> None:
+        # The regression shape: a property getter CallableType under the
+        # class-var call_type gate would bind and return the raw bound
+        # callable, losing the property-extract ret_type tail.
+        getter = CallableType(
+            [Instance(self.base, [])],
+            [ArgKind.ARG_POS],
+            ["self"],
+            Instance(self.base, []),
+            Instance(self.info, []),
+            name=None,
+        )
+        self._register_var(
+            self.info,
+            "x",
+            getter,
+            is_property=True,
+            is_initialized_in_class=True,
+            is_inferred=True,
+        )
+        assert self._seam(Instance(self.info, []), "x") is None
+
+    def test_seam_property_not_in_gate_engages(self) -> None:
+        # is_property with the call_type gate not entered (is_inferred True
+        # with is_operator access) is covered by the union fill differential;
+        # a property var outside the gate class path still passes through.
+        getter = CallableType(
+            [Instance(self.base, [])],
+            [ArgKind.ARG_POS],
+            ["self"],
+            Instance(self.base, []),
+            Instance(self.info, []),
+            name=None,
+        )
+        self._register_var(self.info, "x", getter, is_property=True)
+        result = self._seam(Instance(self.info, []), "x")
+        assert result is not None
+        _, _, decoded = result
+        assert str(decoded) == "def (self: mod.Base) -> mod.Base"
+
+    def test_seam_nontrivial_bind_defers(self) -> None:
+        # A plain (non-Decorator) var in the call_type gate has
+        # is_trivial_self False; the non-trivial bind path defers.
+        self._register_var(
+            self.base,
+            "x",
+            Instance(self.base, []),
+            is_initialized_in_class=True,
+            is_inferred=True,
+        )
+        assert self._seam(Instance(self.info, []), "x") is None
+
+    def test_seam_init_defers(self) -> None:
+        self._register_var(self.base, "__init__", Instance(self.base, []))
+        assert self._seam(Instance(self.info, []), "__init__") is None
+
+    def test_seam_non_var_node_defers(self) -> None:
+        from mypy.nodes import SymbolTableNode
+
+        self.info.names["x"] = SymbolTableNode(MDEF, self.base)
+        assert self._seam(Instance(self.info, []), "x") is None
+
+    def test_seam_deprecated_decorator_defers(self) -> None:
+        getter = CallableType(
+            [Instance(self.base, [])],
+            [ArgKind.ARG_POS],
+            ["self"],
+            Instance(self.base, []),
+            Instance(self.info, []),
+            name=None,
+        )
+        self._register_decorator(
+            self.info,
+            "x",
+            getter,
+            is_property=True,
+            is_initialized_in_class=True,
+            deprecated="gone",
+        )
+        assert self._seam(Instance(self.info, []), "x") is None
+
+    def test_seam_union_item_slots(self) -> None:
+        from mypy.checkmember import (
+            _deserialize_type_for_checkmember,
+            _serialize_type_for_checkmember,
+        )
+        from mypy.types import UnionType
+
+        self._register_var(self.info, "x", Instance(self.base, []))
+        getter = CallableType(
+            [Instance(self.prop_info, [])],
+            [ArgKind.ARG_POS],
+            ["self"],
+            Instance(self.base, []),
+            Instance(self.prop_info, []),
+            name=None,
+        )
+        self._register_var(
+            self.prop_info,
+            "x",
+            getter,
+            is_property=True,
+            is_initialized_in_class=True,
+            is_inferred=True,
+        )
+        union = UnionType([Instance(self.info, []), Instance(self.prop_info, [])])
+        result = _type_kernel.rust_analyze_union_member_access(
+            self.resolver,
+            _serialize_type_for_checkmember(union),
+            "x",
+            False,
+            False,
+            False,
+            False,
+            100,
+            True,
+        )
+        assert result is not None
+        _, changed, slots = result
+        assert not changed
+        assert len(slots) == 2
+        assert slots[0] is not None
+        plain = _deserialize_type_for_checkmember(bytes(slots[0]), freeze=True)
+        assert str(plain) == "mod.Base"
+        # The property item defers: Python fills the slot through the
+        # pure-Python per-item loop (the unionproperty regression).
+        assert slots[1] is None
+
+    def test_none_seam_bool_fixed(self) -> None:
+        from mypy.checkmember import (
+            _deserialize_type_for_checkmember,
+            _serialize_type_for_checkmember,
+        )
+
+        result = _type_kernel.rust_analyze_none_member_access(
+            self.resolver,
+            "__bool__",
+            _serialize_type_for_checkmember(NoneType()),
+            None,
+            False,
+            False,
+            False,
+            100,
+            True,
+        )
+        assert result is not None
+        _, _, wire_bytes = result
+        decoded = _deserialize_type_for_checkmember(bytes(wire_bytes), freeze=True)
+        assert str(decoded) == "def () -> Literal[False]"
+
+    def test_none_seam_object_miss_defers(self) -> None:
+        # builtins.object is not in the live map, so the dispatch defers.
+        from mypy.checkmember import _serialize_type_for_checkmember
+
+        result = _type_kernel.rust_analyze_none_member_access(
+            self.resolver,
+            "foo",
+            _serialize_type_for_checkmember(NoneType()),
+            None,
+            False,
+            False,
+            False,
+            100,
+            True,
+        )
+        assert result is None
+
+    # --- gate differentials ---
+
+    def _union_mx_and_calls(self, itype: Instance) -> tuple[Any, list[tuple[Any, ...]]]:
+        from contextlib import nullcontext
+        from types import SimpleNamespace
+
+        from mypy.checkmember import MemberContext
+
+        calls: list[tuple[Any, ...]] = []
+        msg = SimpleNamespace(
+            read_only_property=lambda *a: calls.append(("read_only_property",)),
+            cant_assign_to_classvar=lambda *a: calls.append(("cant_assign_to_classvar",)),
+            cant_assign_to_method=lambda *a: calls.append(("cant_assign_to_method",)),
+            disable_type_names=lambda: nullcontext(),
+        )
+        chk = SimpleNamespace(
+            msg=msg,
+            plugin=SimpleNamespace(get_attribute_hook=lambda fullname: None),
+            handle_cannot_determine_type=lambda name, ctx: calls.append(("not_ready", name)),
+            warn_deprecated=lambda *a: calls.append(("warn_deprecated",)),
+            get_final_context=lambda: None,
+        )
+        mx = MemberContext(
+            is_lvalue=False,
+            is_super=False,
+            is_operator=False,
+            original_type=itype,
+            context=NameExpr("A"),
+            chk=cast(Any, chk),
+        )
+        return mx, calls
+
+    def _assert_union_differential(self, union: UnionType, name: str) -> None:
+        from mypy.checkmember import analyze_union_member_access
+
+        def run() -> tuple[str, list[tuple[Any, ...]]]:
+            mx, calls = self._union_mx_and_calls(Instance(self.info, []))
+            result = analyze_union_member_access(name, union, mx)
+            # Native contention of non-diagnostic calls (warn_deprecated)
+            # is inherent: a natively-mapped item makes one fewer Python
+            # member-access call. Compare result and recorded diagnostics.
+            return str(result), [c for c in calls if c[0] != "warn_deprecated"]
+
+        off = self._with_gate(False, run)
+        on = self._with_gate(True, run)
+        assert off == on, f"gate mismatch: off={off!r} on={on!r}"
+
+    def test_differential_union_with_property_item(self) -> None:
+        # The rooted unionproperty regression: a property item must produce
+        # the same narrowed result with and without the native union map
+        # (Python fills the property slot either way; plain items go native).
+        self._register_var(self.info, "x", Instance(self.base, []))
+        getter = CallableType(
+            [Instance(self.prop_info, [])],
+            [ArgKind.ARG_POS],
+            ["self"],
+            Instance(self.base, []),
+            Instance(self.prop_info, []),
+            name=None,
+        )
+        self._register_var(
+            self.prop_info,
+            "x",
+            getter,
+            is_property=True,
+            is_initialized_in_class=True,
+            is_inferred=True,
+        )
+        union = UnionType([Instance(self.info, []), Instance(self.prop_info, [])])
+        self._assert_union_differential(union, "x")
+
+    def test_differential_union_plain_items(self) -> None:
+        self._register_var(self.info, "x", Instance(self.base, []))
+        self._register_var(self.base, "x", Instance(self.base, []))
+        union = UnionType([Instance(self.info, []), Instance(self.base, [])])
+        self._assert_union_differential(union, "x")
 
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
