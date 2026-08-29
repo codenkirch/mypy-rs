@@ -22939,6 +22939,7 @@ class NativeTupleConstraintsSuite(Suite):
             False,
             False,
             strict_optional_flag(),
+            True,
         )
         assert raw is not None, (
             f"Rust seam must engage for template={template!r} actual={actual!r}"
@@ -23189,6 +23190,7 @@ class NativeConstraintsDeferralSuite(Suite):
             False,
             False,
             strict_optional_flag(),
+            True,
         )
 
     def _assert_engages(self, template: Type, actual: Type, direction: int = SUBTYPE_OF) -> None:
@@ -23272,6 +23274,187 @@ class NativeConstraintsDeferralSuite(Suite):
         actual = self._list(TypeAliasType(alias, []))
         self._assert_par(template, actual)
         self._assert_defers(template, actual)
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeConstraintsPolyGateSuite(Suite):
+    """Parity suite for the skip_neg_op / infer_polymorphic gate (issue #1226).
+
+    The cb-actual-generic defer fired whenever the actual callable was
+    generic, but the sole skip_neg_op=True callers live inside the
+    polymorphic extra-tvars block itself (constraints.py:1780/1821), where
+    Python skips that block too (`not self.skip_neg_op`). So a generic
+    actual with skip_neg_op=True now proceeds natively: the emitted
+    param-spec target mirrors the infer_polymorphic ternary at
+    constraints.py:1845. Direct seam calls assert engagement/deferral;
+    gate-off vs gate-on differentials through `infer_constraints` assert
+    parity.
+    """
+
+    def setUp(self) -> None:
+        from mypy.constraints import _set_native_constraints_active
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        self.fx = TypeFixture()
+        self._set_active = _set_native_constraints_active
+        type_infos = [
+            value
+            for name in dir(self.fx)
+            if name.endswith("i")
+            for value in [getattr(self.fx, name)]
+            if isinstance(value, TypeInfo)
+        ]
+        set_wire_typeinfo_map({info.fullname: info for info in type_infos})
+        self.resolver = _type_kernel.build_native_resolver(type_infos, [])
+        self._set_active(False)
+
+    def tearDown(self) -> None:
+        from mypy.constraints import _set_native_constraints_resolver
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        self._set_active(False)
+        _set_native_constraints_resolver(None)
+        set_wire_typeinfo_map(None)
+
+    def _polymorphic_on(self) -> None:
+        # Restore via addCleanup so a failed assert cannot leak the flag.
+        # Save the entry value: xdist workers may hold leaked state from
+        # other modules.
+        from mypy.typestate import type_state
+
+        old = type_state.infer_polymorphic
+        type_state.infer_polymorphic = True
+        self.addCleanup(setattr, type_state, "infer_polymorphic", old)
+
+    def _generic_callable(self, name: str, var: TypeVarType) -> CallableType:
+        return CallableType(
+            [var], [ARG_POS], [None], var, self.fx.function, variables=[var], name=name
+        )
+
+    def _param_spec_template(self, p: ParamSpecType) -> CallableType:
+        return CallableType(
+            [p], [ARG_POS], [None], self.fx.a, self.fx.function, variables=[p]
+        )
+
+    def _plain_callable(self, arg: Type, ret: Type) -> CallableType:
+        return CallableType([arg], [ARG_POS], [None], ret, self.fx.function)
+
+    def _constraints(
+        self,
+        template: Type,
+        actual: Type,
+        direction: int,
+        native: bool,
+        skip_neg_op: bool = False,
+    ) -> list[Any]:
+        from mypy.constraints import (
+            _set_native_constraints_resolver,
+            infer_constraints,
+        )
+
+        self._set_active(native)
+        if native:
+            _set_native_constraints_resolver(self.resolver)
+        else:
+            _set_native_constraints_resolver(None)
+        return infer_constraints(template, actual, direction, skip_neg_op=skip_neg_op)
+
+    def _assert_par(
+        self,
+        template: Type,
+        actual: Type,
+        direction: int = SUBTYPE_OF,
+        skip_neg_op: bool = False,
+    ) -> None:
+        native = self._constraints(template, actual, direction, True, skip_neg_op)
+        python = self._constraints(template, actual, direction, False, skip_neg_op)
+        assert_equal(native, python, f"native={native!r} python={python!r}")
+
+    def _bytes_of(self, t: Type) -> bytes:
+        buf = _WriteBuffer()
+        t.write(buf)
+        return buf.getvalue()
+
+    def _rust(
+        self,
+        template: Type,
+        actual: Type,
+        direction: int = SUBTYPE_OF,
+        skip_neg_op: bool = False,
+        infer_polymorphic: bool = False,
+    ) -> Any:
+        from mypy.typestate import type_state
+
+        return _type_kernel.rust_infer_constraints_full(
+            self.resolver,
+            self._bytes_of(template),
+            self._bytes_of(actual),
+            direction,
+            skip_neg_op,
+            False,
+            strict_optional_flag(),
+            infer_polymorphic if infer_polymorphic else type_state.infer_polymorphic,
+        )
+
+    # --- skip_neg_op=True lets a generic actual proceed natively ---
+
+    def test_skip_true_generic_actual_engages(self) -> None:
+        t1 = self.fx.t
+        u1 = self.fx.s
+        template = self._generic_callable("f", t1)
+        actual = self._generic_callable("g", u1)
+        self._assert_par(template, actual, SUBTYPE_OF, skip_neg_op=True)
+        raw = self._rust(template, actual, SUBTYPE_OF, skip_neg_op=True)
+        assert raw is not None, "skip_neg_op=True must run the generic actual natively"
+
+    def test_skip_false_generic_actual_defers(self) -> None:
+        t1 = self.fx.t
+        u1 = self.fx.s
+        template = self._generic_callable("f", t1)
+        actual = self._generic_callable("g", u1)
+        # Gate-on run defers and falls back to Python, so parity holds.
+        self._assert_par(template, actual, SUBTYPE_OF, skip_neg_op=False)
+        raw = self._rust(template, actual, SUBTYPE_OF, skip_neg_op=False)
+        assert raw is None, "skip_neg_op=False with a generic actual must defer"
+
+    # --- param-spec target mirrors the infer_polymorphic ternary ---
+
+    def test_param_spec_target_with_skip_true_and_polymorphic(self) -> None:
+        self._polymorphic_on()
+        p = ParamSpecType(
+            "P",
+            "P",
+            TypeVarId(1),
+            ParamSpecFlavor.BARE,
+            self.fx.o,
+            AnyType(TypeOfAny.from_omitted_generics),
+        )
+        template = self._param_spec_template(p)
+        actual = self._plain_callable(self.fx.a, self.fx.a)
+        self._assert_par(template, actual, SUPERTYPE_OF, skip_neg_op=True)
+        raw = self._rust(
+            template, actual, SUPERTYPE_OF, skip_neg_op=True, infer_polymorphic=True
+        )
+        assert raw is not None, "param-spec target must engage with skip_neg_op=True"
+
+    def test_param_spec_target_keeps_variables_without_polymorphic(self) -> None:
+        # With infer_polymorphic=False (old inference or tests), the target
+        # keeps cactual.variables: parity must hold in that mode too.
+        p = ParamSpecType(
+            "P",
+            "P",
+            TypeVarId(1),
+            ParamSpecFlavor.BARE,
+            self.fx.o,
+            AnyType(TypeOfAny.from_omitted_generics),
+        )
+        template = self._param_spec_template(p)
+        actual = self._plain_callable(self.fx.a, self.fx.a)
+        self._assert_par(template, actual, SUPERTYPE_OF, skip_neg_op=True)
+        raw = self._rust(
+            template, actual, SUPERTYPE_OF, skip_neg_op=True, infer_polymorphic=False
+        )
+        assert raw is not None
 
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
@@ -46718,6 +46901,7 @@ class NativeConstraintUnionSuite(Suite):
             False,
             False,
             strict_optional_flag(),
+            True,
         )
 
     def _assert_engages(self, template: Type, actual: Type, direction: int) -> None:
