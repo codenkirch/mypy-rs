@@ -2233,51 +2233,89 @@ fn expand_aliases(
     alias_resolver: &crate::aliases::TypeAliasResolver,
     strict_optional: bool,
 ) -> Option<Type> {
-    expand_aliases_depth(typ, alias_resolver, strict_optional, 0)
+    let mut active: Vec<ActiveAlias> = Vec::new();
+    expand_aliases_depth(typ, alias_resolver, strict_optional, 0, &mut active)
 }
+
+/// Identity key of an alias occurrence on the current expansion path: the
+/// alias fullname plus its type arguments. Python never structurally
+/// re-derives an alias under itself (`_expand_once`, types.py:445-478,
+/// unrolls exactly once and `get_proper_type` leaves every nested alias
+/// node in place), so a repeat occurrence on the descent path is kept
+/// unexpanded (issue #1149).
+type ActiveAlias = (String, Vec<Type>);
 
 fn expand_aliases_depth(
     typ: &Type,
     alias_resolver: &crate::aliases::TypeAliasResolver,
     strict_optional: bool,
     depth: u32,
+    active: &mut Vec<ActiveAlias>,
 ) -> Option<Type> {
     if depth > 50 {
         return None;
     }
     match typ {
         Type::TypeAliasType { args, type_ref } => {
+            // Issue #1149: cut an alias already active on this descent (the
+            // `_expand_once` fixpoint). Keyed on args identity, so a sibling
+            // same-alias-different-args occurrence still expands in place.
+            if active.iter().any(|(r, a)| r == type_ref && *a == *args) {
+                return Some(typ.clone());
+            }
             let snap = alias_resolver.get(type_ref)?;
             if snap.tvar_tuple_index.is_some() {
                 return None;
             }
+            active.push((type_ref.clone(), args.clone()));
             let expanded_args: Vec<Type> = args
                 .iter()
-                .map(|a| expand_aliases_depth(a, alias_resolver, strict_optional, depth + 1))
+                .map(|a| {
+                    expand_aliases_depth(a, alias_resolver, strict_optional, depth + 1, active)
+                })
                 .collect::<Option<_>>()?;
-            if snap.no_args {
+            let res = if snap.no_args {
                 let target = decode_type(&snap.target)?;
                 if let Type::Instance { type_ref, .. } = &target {
-                    return Some(Type::Instance {
+                    Some(Type::Instance {
                         type_ref: type_ref.clone(),
                         args: expanded_args,
                         last_known_value: None,
                         extra_attrs: None,
-                    });
+                    })
+                } else {
+                    expand_aliases_depth(
+                        &target,
+                        alias_resolver,
+                        strict_optional,
+                        depth + 1,
+                        active,
+                    )
                 }
-                return expand_aliases_depth(&target, alias_resolver, strict_optional, depth + 1);
-            }
-            let mut env: std::collections::HashMap<crate::expandtype::EnvKey, Type> =
-                std::collections::HashMap::new();
-            for (tvar, arg) in snap.alias_tvars.iter().zip(expanded_args.iter()) {
-                env.insert(
-                    (tvar.raw_id, tvar.meta_level, tvar.namespace.clone()),
-                    arg.clone(),
-                );
-            }
-            let target = decode_type(&snap.target)?;
-            let substituted = crate::expandtype::expand_type_inner(&target, &env, strict_optional)?;
-            expand_aliases_depth(&substituted, alias_resolver, strict_optional, depth + 1)
+            } else {
+                let mut env: std::collections::HashMap<crate::expandtype::EnvKey, Type> =
+                    std::collections::HashMap::new();
+                for (tvar, arg) in snap.alias_tvars.iter().zip(expanded_args.iter()) {
+                    env.insert(
+                        (tvar.raw_id, tvar.meta_level, tvar.namespace.clone()),
+                        arg.clone(),
+                    );
+                }
+                let target = decode_type(&snap.target)?;
+                let substituted =
+                    crate::expandtype::expand_type_inner(&target, &env, strict_optional)?;
+                expand_aliases_depth(
+                    &substituted,
+                    alias_resolver,
+                    strict_optional,
+                    depth + 1,
+                    active,
+                )
+            };
+            // Pop on every decided return path: a leaky entry would cut a
+            // later sibling occurrence of the same alias+args.
+            active.pop();
+            res
         }
         Type::Instance {
             type_ref,
@@ -2290,7 +2328,9 @@ fn expand_aliases_depth(
             }
             let new_args = args
                 .iter()
-                .map(|a| expand_aliases_depth(a, alias_resolver, strict_optional, depth + 1))
+                .map(|a| {
+                    expand_aliases_depth(a, alias_resolver, strict_optional, depth + 1, active)
+                })
                 .collect::<Option<Vec<_>>>()?;
             Some(Type::Instance {
                 type_ref: type_ref.clone(),
@@ -2307,7 +2347,9 @@ fn expand_aliases_depth(
         } => {
             let new_items = items
                 .iter()
-                .map(|i| expand_aliases_depth(i, alias_resolver, strict_optional, depth + 1))
+                .map(|i| {
+                    expand_aliases_depth(i, alias_resolver, strict_optional, depth + 1, active)
+                })
                 .collect::<Option<Vec<_>>>()?;
             Some(Type::UnionType {
                 items: new_items,
@@ -2335,25 +2377,30 @@ fn expand_aliases_depth(
             type_guard,
             type_is,
         } => {
-            let fb = expand_aliases_depth(fallback, alias_resolver, strict_optional, depth + 1)?;
+            let fb =
+                expand_aliases_depth(fallback, alias_resolver, strict_optional, depth + 1, active)?;
             let it = match instance_type {
                 Some(it) => Some(Box::new(expand_aliases_depth(
                     it,
                     alias_resolver,
                     strict_optional,
                     depth + 1,
+                    active,
                 )?)),
                 None => None,
             };
             let ats: Vec<Type> = arg_types
                 .iter()
-                .map(|a| expand_aliases_depth(a, alias_resolver, strict_optional, depth + 1))
+                .map(|a| {
+                    expand_aliases_depth(a, alias_resolver, strict_optional, depth + 1, active)
+                })
                 .collect::<Option<_>>()?;
             let rt = Box::new(expand_aliases_depth(
                 ret_type,
                 alias_resolver,
                 strict_optional,
                 depth + 1,
+                active,
             )?);
             let tg = match type_guard {
                 Some(tg) => Some(Box::new(expand_aliases_depth(
@@ -2361,6 +2408,7 @@ fn expand_aliases_depth(
                     alias_resolver,
                     strict_optional,
                     depth + 1,
+                    active,
                 )?)),
                 None => None,
             };
@@ -2370,6 +2418,7 @@ fn expand_aliases_depth(
                     alias_resolver,
                     strict_optional,
                     depth + 1,
+                    active,
                 )?)),
                 None => None,
             };
@@ -2396,7 +2445,9 @@ fn expand_aliases_depth(
         Type::Overloaded { items } => {
             let new_items = items
                 .iter()
-                .map(|i| expand_aliases_depth(i, alias_resolver, strict_optional, depth + 1))
+                .map(|i| {
+                    expand_aliases_depth(i, alias_resolver, strict_optional, depth + 1, active)
+                })
                 .collect::<Option<Vec<_>>>()?;
             Some(Type::Overloaded { items: new_items })
         }
@@ -2407,13 +2458,16 @@ fn expand_aliases_depth(
         } => {
             let new_items = items
                 .iter()
-                .map(|i| expand_aliases_depth(i, alias_resolver, strict_optional, depth + 1))
+                .map(|i| {
+                    expand_aliases_depth(i, alias_resolver, strict_optional, depth + 1, active)
+                })
                 .collect::<Option<Vec<_>>>()?;
             let fb = Box::new(expand_aliases_depth(
                 partial_fallback,
                 alias_resolver,
                 strict_optional,
                 depth + 1,
+                active,
             )?);
             Some(Type::TupleType {
                 items: new_items,
@@ -2427,6 +2481,7 @@ fn expand_aliases_depth(
                 alias_resolver,
                 strict_optional,
                 depth + 1,
+                active,
             )?);
             Some(Type::TypeType {
                 item: new_item,
@@ -5448,6 +5503,145 @@ mod tests {
         let input = alias_type(vec![], "mod.A0");
         let result = expand_aliases(&input, &ar, true);
         assert_eq!(result, None);
+    }
+
+    fn recursive_union_alias_snap(fullname: &str) -> TypeAliasSnapshot {
+        // type A = Union[str, A]
+        let target = Type::UnionType {
+            items: vec![
+                instance("builtins.str", vec![]),
+                alias_type(vec![], fullname),
+            ],
+            uses_pep604_syntax: false,
+            can_be_true: true,
+            can_be_false: true,
+        };
+        TypeAliasSnapshot {
+            fullname: fullname.to_string(),
+            target: encode_for_alias(&target),
+            no_args: true,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn test_expand_aliases_self_recursive_union_cuts() {
+        // type A = Union[str, A]: get_proper_type keeps the inner alias node
+        // in place, so the fixpoint must terminate via the active-path cut
+        // (issue #1149) instead of recursing to the depth cap (a defer).
+        let ar = make_alias_resolver(vec![recursive_union_alias_snap("mod.A")]);
+        let input = alias_type(vec![], "mod.A");
+        let result = expand_aliases(&input, &ar, true);
+        assert_eq!(
+            result,
+            Some(Type::UnionType {
+                items: vec![
+                    instance("builtins.str", vec![]),
+                    alias_type(vec![], "mod.A"),
+                ],
+                uses_pep604_syntax: false,
+                can_be_true: true,
+                can_be_false: true,
+            })
+        );
+    }
+
+    #[test]
+    fn test_expand_aliases_recursive_reentry_consistent() {
+        // A repeat call re-enters with a fresh active stack (no cross-call
+        // pollution) and reproduces the same cut shape.
+        let ar = make_alias_resolver(vec![recursive_union_alias_snap("mod.A")]);
+        let input = alias_type(vec![], "mod.A");
+        let first = expand_aliases(&input, &ar, true);
+        let second = expand_aliases(&input, &ar, true);
+        assert_eq!(first, second);
+        // Re-expanding a cut shape terminates too: the union item unrolls
+        // one more level per call, but never defers (never returns None up
+        // to the depth cap); the engine defers onto cut nodes instead.
+        let deeper = expand_aliases(first.as_ref().unwrap(), &ar, true);
+        assert!(deeper.is_some());
+    }
+
+    #[test]
+    fn test_expand_aliases_sibling_same_alias_different_args_expands_both() {
+        // Union[A[int], A[str]] with A = List[T]: each occurrence carries
+        // different args, so the args-identity key must not cut the second
+        // one; both substitute.
+        let tvar = Type::TypeVarType {
+            name: "T".to_string(),
+            fullname: "mod.T".to_string(),
+            raw_id: 1,
+            namespace: "".to_string(),
+            values: vec![],
+            upper_bound: Box::new(instance("builtins.object", vec![])),
+            default: Box::new(any_type()),
+            variance: 1,
+            meta_level: 0,
+        };
+        let target = instance("builtins.list", vec![tvar]);
+        let snap = TypeAliasSnapshot {
+            fullname: "mod.A".to_string(),
+            target: encode_for_alias(&target),
+            alias_tvars: vec![alias_tvar_fn("T", 1)],
+            no_args: false,
+            ..Default::default()
+        };
+        let ar = make_alias_resolver(vec![snap]);
+        let input = Type::UnionType {
+            items: vec![
+                alias_type(vec![instance("builtins.int", vec![])], "mod.A"),
+                alias_type(vec![instance("builtins.str", vec![])], "mod.A"),
+            ],
+            uses_pep604_syntax: false,
+            can_be_true: true,
+            can_be_false: true,
+        };
+        let result = expand_aliases(&input, &ar, true);
+        assert_eq!(
+            result,
+            Some(Type::UnionType {
+                items: vec![
+                    instance("builtins.list", vec![instance("builtins.int", vec![])]),
+                    instance("builtins.list", vec![instance("builtins.str", vec![])]),
+                ],
+                uses_pep604_syntax: false,
+                can_be_true: true,
+                can_be_false: true,
+            })
+        );
+    }
+
+    #[test]
+    fn test_expand_aliases_sibling_same_alias_same_args_still_expands_after_pop() {
+        // Union[A, A] with A = str: a leaky active stack would cut the second
+        // occurrence; finishing one expansion must pop its entry, so each
+        // sibling expands fully.
+        let snap = TypeAliasSnapshot {
+            fullname: "mod.A".to_string(),
+            target: encode_for_alias(&instance("builtins.str", vec![])),
+            no_args: true,
+            ..Default::default()
+        };
+        let ar = make_alias_resolver(vec![snap]);
+        let input = Type::UnionType {
+            items: vec![alias_type(vec![], "mod.A"), alias_type(vec![], "mod.A")],
+            uses_pep604_syntax: false,
+            can_be_true: true,
+            can_be_false: true,
+        };
+        let result = expand_aliases(&input, &ar, true);
+        assert_eq!(
+            result,
+            Some(Type::UnionType {
+                items: vec![
+                    instance("builtins.str", vec![]),
+                    instance("builtins.str", vec![]),
+                ],
+                uses_pep604_syntax: false,
+                can_be_true: true,
+                can_be_false: true,
+            })
+        );
     }
 
     // -- equivalence / same-type / more-precise seam alias expansion --

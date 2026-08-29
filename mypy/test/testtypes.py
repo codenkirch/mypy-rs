@@ -3634,6 +3634,56 @@ class NativeSubtypesDeferralSuite(Suite):
         )
         assert rusted is True
 
+    def test_recursive_alias_gate_parity_no_wrong_verdict(self) -> None:
+        # Issue #1149: with R = Union[A, R], native expansion must
+        # terminate like Python's lazy get_proper_type, and the direct
+        # seam must never invent a verdict on a cut-node shape.
+        from mypy.nodes import TypeAlias
+        from mypy.subtypes import (
+            _serialize_type,
+            is_more_precise,
+            is_same_type,
+            is_subtype,
+        )
+        from mypy.types import UnionType
+
+        alias = TypeAlias(self.fx.a, "mod.R", "mod", -1, -1)
+        alias.target = UnionType([self.fx.a, TypeAliasType(alias, [])], False)
+        self._rebuild_with_aliases([alias])
+        r = TypeAliasType(alias, [])
+
+        cases: list[tuple[Callable[[], bool], str]] = []
+        cases.append((lambda: is_same_type(r, r), "is_same_type(R, R)"))
+        cases.append((lambda: is_subtype(r, r), "is_subtype(R, R)"))
+        cases.append((lambda: is_subtype(self.fx.a, r), "is_subtype(A, R)"))
+        cases.append((lambda: is_subtype(r, self.fx.a), "is_subtype(R, A)"))
+        cases.append((lambda: is_more_precise(r, self.fx.a), "is_more_precise(R, A)"))
+        for fn, label in cases:
+            self._set_gate(False)
+            expected = fn()
+            self._set_gate(True)
+            assert fn() == expected, f"gate-on != gate-off for {label}"
+            assert expected, f"both gates must answer True for {label}"
+
+        # Direct seam: expansion now succeeds (the cut terminates it), but
+        # the comparison still defers because an operand reaches a cut
+        # alias node. Assert deferral (never a wrong False).
+        self._set_gate(True)
+        rusted = _type_kernel.rust_is_subtype(
+            _serialize_type(r),
+            _serialize_type(self.fx.a),
+            False,
+            False,
+            False,
+            False,
+            False,
+            True,
+            False,
+            False,
+            self.resolver,
+        )
+        assert rusted is None
+
     def test_plain_equal_equivalent_engages(self) -> None:
         # A regression guard: plain (alias-free) operand pairs must still be
         # decided natively, not newly deferred by the seam expansion.
