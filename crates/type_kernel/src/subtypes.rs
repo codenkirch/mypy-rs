@@ -669,7 +669,8 @@ pub(crate) fn is_subtype(
         // is unsound (no __init__ check): the item is compared against
         // right.ret_type, except for an Instance item (type_object_type).
         if let Type::CallableType {
-            ret_type: right_ret, ..
+            ret_type: right_ret,
+            ..
         } = right
         {
             // subtypes.py:1246-1250: a proper-subtype comparison of
@@ -5390,10 +5391,7 @@ mod tests {
         let r = make_resolver(vec![snap("builtins.function", "function")]);
         let left = type_type(Type::NoneType);
         let right = callable_type(vec![], instance("builtins.object", vec![]), None);
-        assert_eq!(
-            is_subtype(&left, &right, &ctx_proper(), &r),
-            Some(false)
-        );
+        assert_eq!(is_subtype(&left, &right, &ctx_proper(), &r), Some(false));
     }
 
     #[test]
@@ -5444,10 +5442,7 @@ mod tests {
         ]);
         let left = type_type(Type::NoneType);
         let right = type_obj_callable(instance("builtins.object", vec![]));
-        assert_eq!(
-            is_subtype(&left, &right, &ctx_nominal(), &r),
-            Some(true)
-        );
+        assert_eq!(is_subtype(&left, &right, &ctx_nominal(), &r), Some(true));
     }
 
     #[test]
@@ -5460,10 +5455,7 @@ mod tests {
         let right = Type::Overloaded {
             items: vec![callable_type(vec![], instance("a.A", vec![]), None)],
         };
-        assert_eq!(
-            is_subtype(&left, &right, &ctx_nominal(), &r),
-            Some(false)
-        );
+        assert_eq!(is_subtype(&left, &right, &ctx_nominal(), &r), Some(false));
     }
 
     #[test]
@@ -5534,7 +5526,12 @@ mod tests {
         let r = make_resolver(vec![]);
         let left = parameters(vec![instance("builtins.int", vec![])]);
         assert_eq!(
-            is_subtype(&left, &instance("builtins.object", vec![]), &ctx_nominal(), &r),
+            is_subtype(
+                &left,
+                &instance("builtins.object", vec![]),
+                &ctx_nominal(),
+                &r
+            ),
             Some(true)
         );
     }
@@ -5567,10 +5564,7 @@ mod tests {
         let r = make_resolver(vec![snap("builtins.function", "function")]);
         let left = parameters(vec![instance("builtins.int", vec![])]);
         let right = callable_type(vec![], Type::NoneType, None);
-        assert_eq!(
-            is_subtype(&left, &right, &ctx_nominal(), &r),
-            Some(false)
-        );
+        assert_eq!(is_subtype(&left, &right, &ctx_nominal(), &r), Some(false));
     }
 
     // ---- visit_callable_type (issue #443, subtypes.py:807-889) ----
