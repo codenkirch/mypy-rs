@@ -2501,3 +2501,30 @@ directly to `main`.
   (seam engagement, gate-off/on parity, `on.args[0] is off.args[0] is
   self.fx.t` identity), plus the existing expand_type gate-on/off
   differentials.
+- checkmember/expand alias round-trip (issue #1224) — the IAMA defer
+  audit (temporary `MYPY_TK_IAMA_AUDIT` dump, stripped before landing)
+  found the two dominant alias defer classes in the member-access
+  pools: `exp_alias_input` (alias-bearing signature deferred at
+  `expand_type_by_instance_free`'s input gate) and `exp_alias_survives`
+  (alias node surviving expansion, which decode leaves `alias=None`).
+  The slice lets an alias-bearing method signature round-trip through
+  the seam: `expand_type_by_instance_free` threads the existing
+  `alias_ok` flag through `expand_type_by_instance_inner` (input and
+  survivor checks both relaxed; core/relink keep `false`), matching
+  Python's `visit_type_alias_type` (expand alias args, keep the node);
+  `_deserialize_type_for_checkmember` passes
+  `fixup_wire_type(decoded, resolve_aliases=True)` so decoded alias
+  nodes re-link to live `TypeAlias` nodes via `_wire_alias_map`, and
+  `set_wire_alias_map` now clears the wire decode caches when a new map
+  identity is installed (cached decodes pin re-linked aliases from the
+  previous map); `wirefixup._FreshVarCanonicalizer.visit_type_alias_type`
+  descends into alias args (was `return t`), restoring the live-tree
+  invariant that every occurrence of a type-var id shares one
+  `TypeVarType` object — without it the `Pairs[Self]` alias arg stayed
+  at meta level 1 after freeze-in-place, `bind_self`'s id-keyed env
+  missed it, and `Self` escaped into the final member type
+  (`testTypingSelfNestedInAlias`). An alias missing from the map keeps
+  deferring via `fixer.missing`. Parity: 11,021 passed
+  (`testtypes` + `testcheck`, `-n4`); the cold self-check failure set
+  is unchanged against the HEAD baseline (14 pre-existing failures,
+  tracked in #1228).

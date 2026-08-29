@@ -300,7 +300,15 @@ pub(crate) fn expand_type_by_instance_core(
     resolver: &TypeResolver,
     strict_optional: bool,
 ) -> Option<Type> {
-    expand_type_by_instance_inner(typ, instance, resolver, strict_optional, false, false)
+    expand_type_by_instance_inner(
+        typ,
+        instance,
+        resolver,
+        strict_optional,
+        false,
+        false,
+        false,
+    )
 }
 
 /// FFI-only variant of `expand_type_by_instance_core` with the
@@ -313,21 +321,26 @@ pub(crate) fn expand_type_by_instance_relink(
     resolver: &TypeResolver,
     strict_optional: bool,
 ) -> Option<Type> {
-    expand_type_by_instance_inner(typ, instance, resolver, strict_optional, false, true)
+    expand_type_by_instance_inner(typ, instance, resolver, strict_optional, false, true, false)
 }
 
 /// Free-result variant of `expand_type_by_instance_core`: leftover TypeVars
 /// in the expansion are returned instead of deferring, mirroring Python's
 /// `expand_type_by_instance` (which never defers on leftover method type
 /// vars — `freeze_all_type_vars` reifies them afterwards, typeops.py:2102).
-/// Used by the IAMA member tail, which freezes before returning.
+/// Used by the IAMA member tail, which freezes before returning. Aliases
+/// are allowed through in both directions (issue #1224): Python's
+/// `visit_type_alias_type` expands alias args and keeps the alias node, and
+/// the shim re-links the decoded alias through the wire alias map
+/// (`fixup_wire_type(resolve_aliases=True)`); an alias absent from the map
+/// defers via `fixer.missing`.
 pub(crate) fn expand_type_by_instance_free(
     typ: &Type,
     instance: &Type,
     resolver: &TypeResolver,
     strict_optional: bool,
 ) -> Option<Type> {
-    expand_type_by_instance_inner(typ, instance, resolver, strict_optional, true, false)
+    expand_type_by_instance_inner(typ, instance, resolver, strict_optional, true, false, true)
 }
 
 fn expand_type_by_instance_inner(
@@ -337,14 +350,17 @@ fn expand_type_by_instance_inner(
     strict_optional: bool,
     allow_free: bool,
     relink_ok: bool,
+    alias_ok: bool,
 ) -> Option<Type> {
     let Type::Instance { type_ref, args, .. } = instance else {
         return None;
     };
     // Wire-decoded TypeAliasType carries alias=None, which the Python
-    // graph asserts against (is_recursive/_expand_once, types.py:362/397).
-    // Preserve identity by deferring any alias-bearing input to Python.
-    if result_contains_typealias(typ) {
+    // graph asserts against (is_recursive/_expand_once, types.py:362/397)
+    // unless the shim re-links it. Callers with alias_ok=true run behind
+    // `fixup_wire_type(resolve_aliases=True)`; others defer alias-bearing
+    // input to Python.
+    if !alias_ok && result_contains_typealias(typ) {
         return None;
     }
     let snap = resolver.get(type_ref)?;
@@ -424,7 +440,7 @@ fn expand_type_by_instance_inner(
             &env,
             strict_optional,
             allow_free,
-            false,
+            alias_ok,
             relink_ok,
         );
     }
@@ -433,7 +449,7 @@ fn expand_type_by_instance_inner(
     for (raw_id, arg) in raw_ids.iter().zip(args) {
         env.insert((*raw_id, 0, env_ns.clone()), arg.clone());
     }
-    expand_type_with_env_inner(typ, &env, strict_optional, allow_free, false, relink_ok)
+    expand_type_with_env_inner(typ, &env, strict_optional, allow_free, alias_ok, relink_ok)
 }
 
 /// Decode a wire-format `Type` blob. Returns `None` on any read failure.

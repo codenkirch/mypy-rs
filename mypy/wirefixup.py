@@ -56,6 +56,7 @@ from mypy.type_visitor import TypeTranslator
 _wire_typeinfo_map: dict[str, Any] | None = None
 _last_real_map: dict[str, Any] | None = None
 _wire_alias_map: dict[str, Any] | None = None
+_last_alias_map: dict[str, Any] | None = None
 
 
 def clear_wire_decode_caches() -> None:
@@ -127,10 +128,15 @@ def set_wire_alias_map(alias_map: dict[str, Any] | None) -> None:
 
     Mirrors `set_wire_typeinfo_map`: the map lives for the lifetime of the
     resolver it was derived from (per-build in the daemon, per-case in the
-    parity suites), so it is cleared only by an explicit ``None`` (build
-    teardown / suite teardown), never by the per-SCC resolver resets.
+    parity suites). A brand-new map identity clears the Python-side decode
+    caches: cached decodes may carry aliases re-linked from the previous
+    map, which would point at stale TypeAlias nodes. An explicit ``None``
+    (build teardown / suite teardown) also clears.
     """
-    global _wire_alias_map
+    global _wire_alias_map, _last_alias_map
+    if _last_alias_map is not None and alias_map is not _last_alias_map:
+        clear_wire_decode_caches()
+    _last_alias_map = alias_map
     _wire_alias_map = alias_map
 
 
@@ -273,6 +279,17 @@ class _FreshVarCanonicalizer(TypeTranslator):
             return t
         return self._canonical(t, self._key(t))
 
+    def visit_type_alias_type(self, t: TypeAliasType, /) -> Type:
+        # Fresh vars also occur as alias arguments (e.g. Pairs[Self] in a
+        # method signature); re-unify them with the seed/tree occurrences
+        # so freeze-in-place and id-keyed substitution see one object.
+        # Never descends into ``t.alias.target`` (recursive-alias safe),
+        # matching the alias handling of the identity canonicalizer below.
+        if not t.args:
+            return t
+        args = [arg.accept(self) for arg in t.args]
+        return t.copy_modified(args=args)
+
     def visit_param_spec(self, t: ParamSpecType, /) -> Type:
         if not t.id.is_meta_var():
             return t
@@ -282,9 +299,6 @@ class _FreshVarCanonicalizer(TypeTranslator):
         if not t.id.is_meta_var():
             return t
         return self._canonical(t, self._key(t))
-
-    def visit_type_alias_type(self, t: TypeAliasType, /) -> Type:
-        return t
 
     def visit_callable_type(self, t: CallableType, /) -> Type:
         # Base translator leaves `variables`, `type_guard`, `type_is`

@@ -331,7 +331,7 @@ def _deserialize_type_for_checkmember(data: bytes, freeze: bool = False) -> Prop
     instance_cache.bool_type = None
     instance_cache.object_type = None
     instance_cache.function_type = None
-    fixed = fixup_wire_type(decoded)
+    fixed = fixup_wire_type(decoded, resolve_aliases=True)
     if fixed is None or not check_no_fake_info(fixed):
         # A decoded tree carrying a residual fake TypeInfo (stale wire
         # typeinfo entry across fine-grained refreshes) must not enter
@@ -341,8 +341,10 @@ def _deserialize_type_for_checkmember(data: bytes, freeze: bool = False) -> Prop
     # occurrences before returning (mirrors expandtype.py:463-467).
     fixed = canonicalize_fresh_vars(fixed)
     if fixed is not None:
-        # fixup_wire_type defers (returns None) on any TypeAliasType, so a
-        # non-None result is structurally a proper-type tree.
+        # Aliases resolve through the per-build wire alias map (issue
+        # #1224); an alias missing from the map sets fixer.missing, so a
+        # non-None result has every alias re-linked to its live TypeAlias
+        # node and is structurally a proper-type tree.
         proper = cast(ProperType, fixed)
         _deser_caches[freeze][data] = proper
         return proper
