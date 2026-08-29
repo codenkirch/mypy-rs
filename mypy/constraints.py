@@ -76,6 +76,23 @@ def _fix_wire_type(data: _ReadBuffer) -> Type | None:
     return fixup_wire_type(decoded, resolve_aliases=True)
 
 
+def _fix_wire_type_allow_erased(data: _ReadBuffer) -> Type | None:
+    """_fix_wire_type, but permit an ErasedType node during decode.
+
+    replace_meta_vars-legit targets (has_erased_component inference) may
+    carry tag 122; the opt-in flag lives at module level, so flip it via
+    the module attribute and restore in a finally.
+    """
+    import mypy.types
+
+    old = mypy.types._ALLOW_WIRE_ERASED_TYPE
+    mypy.types._ALLOW_WIRE_ERASED_TYPE = True
+    try:
+        return _fix_wire_type(data)
+    finally:
+        mypy.types._ALLOW_WIRE_ERASED_TYPE = old
+
+
 def _try_native_infer_constraints(
     template: Type, actual: Type, direction: int
 ) -> list[Constraint]:
@@ -120,7 +137,12 @@ def _try_native_infer_constraints(
 
 
 def _try_native_constraint_builder(
-    template: Type, actual: Type, direction: int, skip_neg_op: bool, erase_types: bool
+    template: Type,
+    actual: Type,
+    direction: int,
+    skip_neg_op: bool,
+    erase_types: bool,
+    infer_polymorphic: bool,
 ) -> list[Constraint] | None:
     """Route the full ConstraintBuilderVisitor port through Rust.
 
@@ -142,6 +164,7 @@ def _try_native_constraint_builder(
         skip_neg_op,
         erase_types,
         mypy.state.state.strict_optional,
+        infer_polymorphic,
     )
     if raw is None:
         raise NotImplementedError("constraint-builder path not supported")
@@ -150,7 +173,7 @@ def _try_native_constraint_builder(
     constraints: list[Constraint] = []
     for blob in raw:
         data = _ReadBuffer(bytes(blob))
-        origin = _fix_wire_type(data)
+        origin = _fix_wire_type_allow_erased(data)
         if not isinstance(origin, (TypeVarType, ParamSpecType, TypeVarTupleType)):
             raise NotImplementedError("origin not a type variable")
         if isinstance(origin, (ParamSpecType, TypeVarTupleType)):
@@ -171,7 +194,7 @@ def _try_native_constraint_builder(
                 raise NotImplementedError("origin id not resolvable in template")
             origin = origin.copy_modified(id=live[0].id)
         op = read_int(data)
-        target = _fix_wire_type(data)
+        target = _fix_wire_type_allow_erased(data)
         if target is None:
             raise NotImplementedError("target unresolvable on wire")
         constraints.append(Constraint(origin, op, target))
@@ -928,7 +951,12 @@ def _infer_constraints(
     if _native_constraints_active and _HAS_TYPE_KERNEL:
         try:
             res = _try_native_constraint_builder(
-                template, actual, direction, skip_neg_op, erase_types
+                template,
+                actual,
+                direction,
+                skip_neg_op,
+                erase_types,
+                type_state.infer_polymorphic,
             )
             if res is not None:
                 return res

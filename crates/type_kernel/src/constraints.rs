@@ -163,9 +163,10 @@ pub(crate) fn rust_infer_constraints_full(
     template_bytes: &[u8],
     actual_bytes: &[u8],
     direction: i64,
-    _skip_neg_op: bool,
+    skip_neg_op: bool,
     _erase_types: bool,
     strict_optional: bool,
+    infer_polymorphic: bool,
 ) -> Option<Vec<Vec<u8>>> {
     let mut tb = ReadBuffer::new(template_bytes);
     let template = read_type(&mut tb, None).ok()?;
@@ -178,6 +179,8 @@ pub(crate) fn rust_infer_constraints_full(
         resolver.resolver(),
         resolver.alias_resolver(),
         strict_optional,
+        skip_neg_op,
+        infer_polymorphic,
     )?;
     let mut out = Vec::with_capacity(constraints.len());
     for c in constraints {
@@ -203,6 +206,7 @@ pub(crate) fn rust_infer_constraints_full(
 ///    template emit, and actual-TypeVar rebinding (constraints.py:815-879).
 /// 3. The four union branches (constraints.py:884-931).
 /// 4. Per-shape visitor dispatch.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn infer_constraints_full_inner(
     template: &Type,
     actual: &Type,
@@ -210,6 +214,8 @@ pub(crate) fn infer_constraints_full_inner(
     resolver: &TypeResolver,
     aliases: &crate::aliases::TypeAliasResolver,
     strict_optional: bool,
+    skip_neg_op: bool,
+    infer_polymorphic: bool,
 ) -> Option<Vec<Constraint>> {
     // Mirror of constraints.py:729-753 (type_state.inferring, #1133): a
     // repeated (template, actual) pair yields no constraints; alias-bearing
@@ -235,6 +241,8 @@ pub(crate) fn infer_constraints_full_inner(
         resolver,
         aliases,
         strict_optional,
+        skip_neg_op,
+        infer_polymorphic,
     )
 }
 
@@ -256,6 +264,7 @@ impl Drop for InferringGuard {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn infer_constraints_dispatch(
     template: &Type,
     actual: &Type,
@@ -263,6 +272,8 @@ fn infer_constraints_dispatch(
     resolver: &TypeResolver,
     aliases: &crate::aliases::TypeAliasResolver,
     strict_optional: bool,
+    skip_neg_op: bool,
+    infer_polymorphic: bool,
 ) -> Option<Vec<Constraint>> {
     // `_infer_constraints` (constraints.py:815-943), top to bottom. `orig`
     // mirrors Python's `orig_template` (constraints.py:818): branch b
@@ -365,6 +376,8 @@ fn infer_constraints_dispatch(
                     resolver,
                     aliases,
                     strict_optional,
+                    false,
+                    false,
                 )?;
                 res.extend(cs);
             }
@@ -414,6 +427,8 @@ fn infer_constraints_dispatch(
                     resolver,
                     aliases,
                     strict_optional,
+                    false,
+                    false,
                 )?;
                 res.extend(cs);
             }
@@ -474,9 +489,16 @@ fn infer_constraints_dispatch(
         Type::TypeType { .. } => {
             visit_type_type_native(&t, &a, direction, resolver, aliases, strict_optional)
         }
-        Type::CallableType { .. } => {
-            visit_callable_native(&t, &a, direction, resolver, aliases, strict_optional)
-        }
+        Type::CallableType { .. } => visit_callable_native(
+            &t,
+            &a,
+            direction,
+            resolver,
+            aliases,
+            strict_optional,
+            skip_neg_op,
+            infer_polymorphic,
+        ),
         Type::Overloaded { .. } => {
             visit_overloaded_native(&t, &a, direction, resolver, aliases, strict_optional)
         }
@@ -658,6 +680,8 @@ fn infer_constraints_if_possible_inner(
         resolver,
         aliases,
         strict_optional,
+        false,
+        false,
     )
     .map(Some)
 }
@@ -733,6 +757,8 @@ fn handle_recursive_union_inner(
         resolver,
         aliases,
         strict_optional,
+        false,
+        false,
     )?;
     if !first.is_empty() {
         return Some(first);
@@ -744,6 +770,8 @@ fn handle_recursive_union_inner(
         resolver,
         aliases,
         strict_optional,
+        false,
+        false,
     )?;
     if !second.is_empty() {
         return Some(second);
@@ -1030,6 +1058,8 @@ fn visit_instance_tail_native(
                 resolver,
                 aliases,
                 strict_optional,
+                false,
+                false,
             )
         } else {
             Some(vec![])
@@ -1043,6 +1073,8 @@ fn visit_instance_tail_native(
             resolver,
             aliases,
             strict_optional,
+            false,
+            false,
         );
     }
     // TypeVarTupleType actual raises NotImplementedError in Python.
@@ -1806,6 +1838,7 @@ fn visit_type_type_native(
 ///    Parameters([any, any], [ARG_STAR, ARG_STAR2], [None, None]))` +
 ///    `infer_constraints(ret_type, any_type, direction)`. The Parameters
 ///    construction requires `imprecise_arg_kinds=True` (constraints.py:1489).
+#[allow(clippy::too_many_arguments)]
 fn visit_callable_native(
     template: &Type,
     actual: &Type,
@@ -1813,6 +1846,8 @@ fn visit_callable_native(
     resolver: &TypeResolver,
     aliases: &crate::aliases::TypeAliasResolver,
     strict_optional: bool,
+    skip_neg_op: bool,
+    infer_polymorphic: bool,
 ) -> Option<Vec<Constraint>> {
     // The CallableType actual takes the full template-vs-callable port
     // (constraints.py:1656-1780), which must see the raw template: the
@@ -1825,6 +1860,8 @@ fn visit_callable_native(
             resolver,
             aliases,
             strict_optional,
+            skip_neg_op,
+            infer_polymorphic,
         );
     }
     let callee = match template {
@@ -2052,12 +2089,19 @@ fn repack_callable_args_wire(
 /// or (template ParamSpec) the prefix + `param_spec_target` construction.
 ///
 /// Defers (`None`) when either side fails to normalize, any nested
-/// constraint step defers, or the actual carries type variables: the
-/// opposite-direction polymorphic inference (constraints.py:1732-1736)
-/// attaches `extra_tvars` to every emitted constraint and the wire format
-/// has no representation for those (#1171); with empty `cactual.variables`
-/// the `type_state.infer_polymorphic` / `skip_neg_op` gates provably
-/// cannot fire, so no checker state needs to cross the seam.
+/// constraint step defers, or the actual carries type variables while the
+/// polymorphic opposite-direction inference is live
+/// (constraints.py:1720-1743, 1778-1785): that path attaches `extra_tvars`
+/// to every emitted constraint and the wire format has no representation
+/// for those (#1171). The gate only fires for skip_neg_op=False entries:
+/// the sole skip_neg_op=True callers (constraints.py:1740/1782) live
+/// inside the polymorphic block itself, so there the Opposite-work is
+/// skipped in Python too (`not self.skip_neg_op`) and the call proceeds
+/// natively with `extra_tvars` staying False; the param-spec-target
+/// `variables` write then mirrors the `infer_polymorphic` ternary at
+/// constraints.py:1805. Nested Rust recursions always pass
+/// (false, false), matching the Python recursion sites' defaults.
+#[allow(clippy::too_many_arguments)]
 fn callable_vs_callable_native(
     template: &Type,
     actual: &Type,
@@ -2065,6 +2109,8 @@ fn callable_vs_callable_native(
     resolver: &TypeResolver,
     aliases: &crate::aliases::TypeAliasResolver,
     strict_optional: bool,
+    skip_neg_op: bool,
+    infer_polymorphic: bool,
 ) -> Option<Vec<Constraint>> {
     let templ = match crate::checkcall::normalize_callable(template) {
         Ok(t) => t,
@@ -2104,7 +2150,7 @@ fn callable_vs_callable_native(
 
     // Polymorphic / skip_neg_op gates (constraints.py:1674-1681,
     // 1732-1736) fire only when cactual has variables.
-    if !a_vars.is_empty() {
+    if !a_vars.is_empty() && !skip_neg_op {
         return defer_site("cb-actual-generic");
     }
 
@@ -2202,7 +2248,14 @@ fn callable_vs_callable_native(
                 arg_types: a_args[pl..].to_vec(),
                 arg_kinds: a_kinds[pl..].to_vec(),
                 arg_names: a_names[pl..].to_vec(),
-                variables: a_vars.clone(),
+                // constraints.py:1805: under polymorphic inference the
+                // target carries no variables (they live in extra_tvars,
+                // which the wire cannot express; the gate deferred first).
+                variables: if infer_polymorphic {
+                    Vec::new()
+                } else {
+                    a_vars.clone()
+                },
                 imprecise_arg_kinds: *a_imprecise,
                 is_ellipsis_args: false,
             }))
@@ -2389,7 +2442,16 @@ fn push_inner(
     aliases: &crate::aliases::TypeAliasResolver,
     strict_optional: bool,
 ) -> Option<Vec<Constraint>> {
-    infer_constraints_full_inner(&t, &other, direction, resolver, aliases, strict_optional)
+    infer_constraints_full_inner(
+        &t,
+        &other,
+        direction,
+        resolver,
+        aliases,
+        strict_optional,
+        false,
+        false,
+    )
 }
 
 /// std-only 3-way zip (avoids an itertools dependency).
@@ -2643,6 +2705,8 @@ pub(crate) fn infer_directed_arg_constraints_native(
         resolver,
         aliases,
         strict_optional,
+        false,
+        false,
     )
 }
 
@@ -2817,6 +2881,8 @@ mod tests {
             &resolver,
             &crate::aliases::TypeAliasResolver::new(),
             true,
+            false,
+            false,
         );
         assert!(res.is_some());
         let constraints = res.unwrap();
@@ -2842,7 +2908,9 @@ mod tests {
             SUBTYPE_OF,
             &resolver,
             &crate::aliases::TypeAliasResolver::new(),
-            true
+            true,
+            false,
+            false,
         )
         .is_none());
     }
@@ -2878,7 +2946,9 @@ mod tests {
             SUPERTYPE_OF,
             &resolver,
             &crate::aliases::TypeAliasResolver::new(),
-            true
+            true,
+            false,
+            false,
         )
         .is_none());
     }
@@ -2928,7 +2998,9 @@ mod tests {
             SUPERTYPE_OF,
             &resolver,
             &crate::aliases::TypeAliasResolver::new(),
-            true
+            true,
+            false,
+            false,
         )
         .is_none());
     }
@@ -3096,6 +3168,8 @@ mod tests {
             &resolver,
             &aliases,
             true,
+            false,
+            false,
         );
         let constraints = res.expect("alias template must resolve natively");
         assert_eq!(constraints.len(), 1);
@@ -3127,6 +3201,8 @@ mod tests {
             &resolver,
             &aliases,
             true,
+            false,
+            false,
         );
         let constraints = res.expect("alias actual must resolve natively");
         assert_eq!(constraints.len(), 1);
@@ -3148,6 +3224,8 @@ mod tests {
             &resolver,
             &aliases,
             true,
+            false,
+            false
         )
         .is_none());
     }
@@ -3175,6 +3253,8 @@ mod tests {
             &resolver,
             &aliases,
             true,
+            false,
+            false,
         );
         let constraints = res.expect("union actual must emit natively now");
         assert_eq!(constraints.len(), 1);
@@ -3205,7 +3285,9 @@ mod tests {
             SUPERTYPE_OF,
             &resolver,
             &crate::aliases::TypeAliasResolver::new(),
-            true
+            true,
+            false,
+            false
         )
         .is_some_and(|c| c.is_empty()));
     }
@@ -3225,6 +3307,8 @@ mod tests {
             &resolver,
             &crate::aliases::TypeAliasResolver::new(),
             true,
+            false,
+            false
         )
         .is_none());
     }
@@ -3237,8 +3321,9 @@ mod tests {
         let aliases = crate::aliases::TypeAliasResolver::new();
         let template = union_type(vec![generic_list(type_var(1, "T")), instance_str()]);
         let actual = generic_list(instance_int());
-        let res =
-            infer_constraints_full_inner(&template, &actual, SUBTYPE_OF, &resolver, &aliases, true);
+        let res = infer_constraints_full_inner(
+            &template, &actual, SUBTYPE_OF, &resolver, &aliases, true, false, false,
+        );
         let constraints = res.expect("branch a must compute natively");
         assert_eq!(constraints.len(), 1);
         assert_eq!(constraints[0].op, SUBTYPE_OF);
@@ -3264,6 +3349,8 @@ mod tests {
             &resolver,
             &crate::aliases::TypeAliasResolver::new(),
             true,
+            false,
+            false,
         );
         assert!(res.is_some_and(|c| c.is_empty()));
     }
@@ -3285,6 +3372,8 @@ mod tests {
             &resolver,
             &crate::aliases::TypeAliasResolver::new(),
             true,
+            false,
+            false,
         );
         let constraints = res.expect("branch b must compute natively");
         assert_eq!(constraints.len(), 2);
@@ -3319,6 +3408,8 @@ mod tests {
             &resolver,
             &crate::aliases::TypeAliasResolver::new(),
             true,
+            false,
+            false
         )
         .is_none());
     }
@@ -3409,6 +3500,8 @@ mod tests {
             &resolver,
             &aliases,
             true,
+            false,
+            false,
         );
         assert!(res.is_some_and(|c| c.is_empty()));
     }
@@ -3434,6 +3527,8 @@ mod tests {
                 &resolver,
                 &aliases,
                 true,
+                false,
+                false,
             );
             let constraints = res.expect("non-recursive call must compute natively");
             assert_eq!(constraints.len(), 1);
@@ -3522,6 +3617,8 @@ mod tests {
             &resolver,
             &aliases,
             true,
+            false,
+            false,
         )
         .expect("plain callable-vs-callable must decide natively");
         assert_eq!(res.len(), 2);
@@ -3575,6 +3672,8 @@ mod tests {
             &resolver,
             &aliases,
             true,
+            false,
+            false,
         )
         .expect("ellipsis template must decide natively");
         assert_eq!(res.len(), 1);
@@ -3622,6 +3721,8 @@ mod tests {
             &resolver,
             &aliases,
             true,
+            false,
+            false,
         )
         .expect("unpack template must decide natively");
         // Ret constraint (T vs int, SUPERTYPE_OF) plus the unpack-middle
@@ -3669,6 +3770,8 @@ mod tests {
             &resolver,
             &aliases,
             true,
+            false,
+            false,
         )
         .expect("ParamSpec template must decide natively");
         assert_eq!(res.len(), 2);
@@ -3724,6 +3827,8 @@ mod tests {
             &resolver,
             &aliases,
             true,
+            false,
+            false,
         )
         .expect("both-ParamSpec pair must decide natively");
         assert_eq!(res.len(), 1);
@@ -3767,7 +3872,151 @@ mod tests {
             &resolver,
             &aliases,
             true,
+            false,
+            false
         )
         .is_none());
+    }
+
+    #[test]
+    fn test_cb_generic_actual_skip_neg_op_proceeds() {
+        // The sole skip_neg_op=True callers (constraints.py:1740/1782) live
+        // inside the polymorphic block, which Python also enters only when
+        // skip_neg_op is False, so a generic actual proceeds natively (#1226).
+        let resolver = crate::typeinfo::TypeResolver::new();
+        let aliases = crate::aliases::TypeAliasResolver::new();
+        let tv = type_var(7, "T");
+        let template = cb_callable(
+            vec![tv.clone()],
+            vec![0],
+            vec![None],
+            tv.clone(),
+            Vec::new(),
+            false,
+        );
+        let actual = cb_callable(
+            vec![instance_str()],
+            vec![0],
+            vec![None],
+            instance_int(),
+            vec![type_var(2, "U")],
+            false,
+        );
+        let res = callable_vs_callable_native(
+            &template,
+            &actual,
+            SUPERTYPE_OF,
+            &resolver,
+            &aliases,
+            true,
+            true,
+            true,
+        )
+        .expect("skip_neg_op=true must run the generic actual natively");
+        // Per-arg constraint (T <: str under the arg direction) plus the
+        // ret constraint (T :> int under the call direction).
+        assert_eq!(res.len(), 2);
+        for c in &res {
+            assert_eq!(c.origin_type_var, tv);
+        }
+        assert!(res
+            .iter()
+            .any(|c| c.op == SUPERTYPE_OF && c.target == instance_int()));
+        assert!(res
+            .iter()
+            .any(|c| c.op == SUBTYPE_OF && c.target == instance_str()));
+    }
+
+    #[test]
+    fn test_cb_param_spec_target_variables_kept_when_not_polymorphic() {
+        // constraints.py:1845 keeps `cactual.variables` in the captured
+        // Parameters target when infer_polymorphic is off; with a generic
+        // actual and skip_neg_op=true the walk still engages.
+        let resolver = builtin_resolver();
+        let aliases = crate::aliases::TypeAliasResolver::new();
+        let tv = type_var(7, "T");
+        let ps = cb_param_spec("P", 5, vec![instance_int()]);
+        let template = cb_callable(
+            vec![instance_int(), ps.clone(), any_type()],
+            vec![0, 2, 4],
+            vec![None, None, None],
+            tv.clone(),
+            Vec::new(),
+            false,
+        );
+        let actual = cb_callable(
+            vec![instance_str()],
+            vec![0],
+            vec![None],
+            instance_str(),
+            vec![type_var(2, "U")],
+            false,
+        );
+        let res = callable_vs_callable_native(
+            &template,
+            &actual,
+            SUPERTYPE_OF,
+            &resolver,
+            &aliases,
+            true,
+            true,
+            false,
+        )
+        .expect("param-spec target with generic actual must engage (skip=true)");
+        let ps_c = res
+            .iter()
+            .find(|c| matches!(&c.target, Type::Parameters(_)))
+            .expect("param-spec constraint targets the captured Parameters");
+        assert_eq!(ps_c.origin_type_var, ps);
+        let Type::Parameters(target) = &ps_c.target else {
+            panic!("param-spec target not Parameters");
+        };
+        assert_eq!(target.variables, vec![type_var(2, "U")]);
+    }
+
+    #[test]
+    fn test_cb_param_spec_target_variables_empty_when_polymorphic() {
+        // Same shape under infer_polymorphic=true: the target carries no
+        // variables (they live in extra_tvars the wire cannot express;
+        // #1171).
+        let resolver = builtin_resolver();
+        let aliases = crate::aliases::TypeAliasResolver::new();
+        let tv = type_var(7, "T");
+        let ps = cb_param_spec("P", 5, vec![instance_int()]);
+        let template = cb_callable(
+            vec![instance_int(), ps.clone(), any_type()],
+            vec![0, 2, 4],
+            vec![None, None, None],
+            tv.clone(),
+            Vec::new(),
+            false,
+        );
+        let actual = cb_callable(
+            vec![instance_str()],
+            vec![0],
+            vec![None],
+            instance_str(),
+            vec![type_var(2, "U")],
+            false,
+        );
+        let res = callable_vs_callable_native(
+            &template,
+            &actual,
+            SUPERTYPE_OF,
+            &resolver,
+            &aliases,
+            true,
+            true,
+            true,
+        )
+        .expect("param-spec target with generic actual must engage (skip=true)");
+        let ps_c = res
+            .iter()
+            .find(|c| matches!(&c.target, Type::Parameters(_)))
+            .expect("param-spec constraint targets the captured Parameters");
+        let Type::Parameters(target) = &ps_c.target else {
+            panic!("param-spec target not Parameters");
+        };
+        assert!(target.variables.is_empty());
     }
 }

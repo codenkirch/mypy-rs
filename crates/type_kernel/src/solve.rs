@@ -603,6 +603,8 @@ fn add_secondary_constraints(
         resolver,
         &no_aliases,
         strict_optional,
+        false,
+        false,
     )
     .ok_or(())?;
     for c in sub {
@@ -617,6 +619,8 @@ fn add_secondary_constraints(
         resolver,
         &no_aliases,
         strict_optional,
+        false,
+        false,
     )
     .ok_or(())?;
     for c in sup {
@@ -1656,6 +1660,8 @@ pub(crate) fn rust_infer_function_type_arguments(
                 resolver.resolver(),
                 resolver.alias_resolver(),
                 strict_optional,
+                false,
+                false,
             )?);
         }
     }

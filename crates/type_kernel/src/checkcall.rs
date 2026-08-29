@@ -839,6 +839,8 @@ pub fn rust_solve_generic_call(
                 resolver.resolver(),
                 resolver.alias_resolver(),
                 strict_optional,
+                false,
+                false,
             ) {
                 Some(c) => c,
                 None => {
