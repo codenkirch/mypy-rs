@@ -10927,6 +10927,7 @@ class NativeAnalyzeTypeWithInfoSuite(Suite):
         self._assert_par(info, [])
         self._assert_engages(_TYPE_WITH_INFO_TAG_VEC, fullname="librt.vecs.vec", args_len=0)
 
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeCheckArgumentTypesPlanSuite(Suite):
     """Parity for the Rust `check_argument_types` plan port (mypy.checkexpr).
 
@@ -21854,6 +21855,7 @@ class NativeLookupSuite(Suite):
         assert r == ("not_found", None)
 
 
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeMypyFileLookupSuite(Suite):
     """Parity tests for the MypyFile branch of `rust_lookup_qualified`.
 
@@ -22222,6 +22224,7 @@ def strict_optional_flag() -> bool:
     return state.strict_optional
 
 
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeTupleConstraintsSuite(Suite):
     """Parity tests for the Rust `visit_tuple_type` constraint port.
 
@@ -22641,6 +22644,7 @@ class NativeConstraintsDeferralSuite(Suite):
         self._assert_defers(template, actual)
 
 
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeAreParametersCompatibleSuite(Suite):
     """Parity for the Rust `are_parameters_compatible` seam.
 
@@ -23080,6 +23084,7 @@ class _FakeNode:
         self.names = names
 
 
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeBinderSuite(Suite):
     """Parity tests for the Rust `get_declaration` (Issue #527).
 
@@ -23656,6 +23661,7 @@ class NativeExpandCallableVariantsSuite(Suite):
         assert_equal(len(on), 1)
         self._assert_engages(c)
 
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeBuiltinItemTypeSuite(Suite):
     """Parity for the Rust `builtin_item_type` port (mypy.checker).
 
@@ -24035,6 +24041,7 @@ class NativeUnsafeOverlappingOverloadSuite(Suite):
         )
         assert result is None, "Rust should defer on a non-callable signature"
 
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeOverloadingOverloadsSuite(Suite):
     """Parity for the Rust `check_overlapping_overloads` screening-loop port.
 
@@ -25053,6 +25060,7 @@ class NativeEqualityAmbiguitySuite(Suite):
         self._assert_engages(self.fx.o, b)
 
 
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeDangerousComparisonSuite(Suite):
     """Parity for the Rust `dangerous_comparison` port (mypy.checkexpr).
 
@@ -28837,6 +28845,7 @@ class NativeInferVarianceSeamSuite(Suite):
         assert result == 3, f"expected both flips, got {result}"
 
 
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeObjectOrAnyFromTypeSuite(Suite):
     """Parity for the Rust `object_or_any_from_type` port (joinfns.rs).
 
@@ -29063,6 +29072,7 @@ class NativeObjectFromInstanceSuite(Suite):
         assert result == "builtins.object", f"got {result!r}"
 
 
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeCombineSimilarCallablesSuite(Suite):
     """Parity for the Rust `combine_similar_callables` port (joinfns.rs).
 
@@ -29194,6 +29204,7 @@ class NativeCombineSimilarCallablesSuite(Suite):
         self._assert_parity(t, s)
 
 
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeAnyConstraintsSuite(Suite):
     """Parity tests for `rust_any_constraints`.
 
@@ -29505,6 +29516,7 @@ class NativeDivergingAliasSuite(Suite):
         assert _type_kernel.rust_detect_diverging_alias(plain_node, plain_target) is False
 
 
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeRepackCallableArgsSuite(Suite):
     """Parity tests for `rust_repack_callable_args`.
 
@@ -30344,6 +30356,7 @@ class NativeFindMatchingOverloadSuite(Suite):
         assert result is None
 
 
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeSolveOneSuite(Suite):
     """Parity for the Rust `solve_one` decision subcases (solve.rs).
 
@@ -31130,6 +31143,7 @@ class NativeCheckexprJoinAndTupleSuite(Suite):
     def test_no_unpack_plain_tuple(self) -> None:
         self._assert_tuple_parity([self.fx.a, self.fx.b], seen_unpack=False, engage=True)
 
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeCheckcallSetopsDeferSuite(Suite):
     """Parity for the checkcall.rs defer sites audited in issue #844.
 
@@ -31941,6 +31955,7 @@ class _FakeTypeInfo:
         self.is_enum = is_enum
 
 
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeLiteralParamSuite(Suite):
     """Parity for the Rust `analyze_literal_param` dispatch classifier.
 
@@ -34966,6 +34981,7 @@ class NativeIsRecursivePairSuite(Suite):
         self._assert_par(s, t)
 
 
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeTupleTypeImplicitSuite(Suite):
     """Parity for the Rust `visit_tuple_type` implicit-tuple classifier.
 
@@ -36683,6 +36699,7 @@ def _make_getattr_sig(ok: bool, cls: bool = False) -> object:
     )
 
 
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeTypeParameterSuite(Suite):
     """Parity for the Rust `check_type_parameter` dispatch-head port.
 
@@ -36855,6 +36872,7 @@ class NativeTypeParameterSuite(Suite):
         self._assert_par(fx.a, fx.b, 7, True)
 
 
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeCheckUnpacksInListSuite(Suite):
     """Parity for the Rust `check_unpacks_in_list` filter.
 
@@ -37158,6 +37176,7 @@ class NativeCheckWarnDeprecatedSuite(Suite):
 
 
 
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeHasNoAttrSuite(Suite):
     """Gate-on/off differential for rust_classify_has_no_attr (issue #1006).
 
@@ -37618,6 +37637,7 @@ class NativeAttributeTriggersSuite(Suite):
         self.assertEqual(triggers, [self.make_trigger("A.x")])
 
 
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeConstraintHelpersSuite(Suite):
     """Parity tests for the standalone constraint-list helper seams.
 
@@ -38218,6 +38238,7 @@ class NativeArgInferPassesSuite(Suite):
             1,
         )
         assert result == [1], f"expected skip result [1], got {result}"
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeTruthyTypeSuite(Suite):
     """Gate-off vs gate-on parity for check_for_truthy_type (issue #1010).
 
@@ -38603,6 +38624,7 @@ class NativeShouldWaitRhsSuite(Suite):
         off, on = self._run("index", sym=None)
         assert on[1] == [("lookup", "x", False)]
 
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeCheckFinalSuite(Suite):
     """Parity for the Rust `check_final` decision-head port.
 
@@ -39286,6 +39308,7 @@ class NativeMissingAnnotationsSuite(Suite):
             is_typeshed_stub=True,
             warn_incomplete_stub=True,
         )
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeReturnStmtSuite(Suite):
     """Parity for the Rust `check_return_stmt` two-phase decision port.
 
@@ -40618,6 +40641,7 @@ class NativePrepareMethodSignatureSuite(Suite):
         on = self._with_gate(True, check_one)
         assert_equal(on, off, "prepare_method_signature deferral parity")
 
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeTypeGuardArgSuite(Suite):
     """Parity for the Rust TypeGuard/TypeIs argument classifier (issue #1043).
 
@@ -40767,6 +40791,7 @@ class NativeTypeGuardArgSuite(Suite):
         )
         assert_equal(off, on, "typeis fail parity")
 
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeRemoveUnpackKwargsSuite(Suite):
     """Parity for the Rust `remove_unpack_kwargs` arbitration port (#1044).
 
@@ -42015,6 +42040,7 @@ class NativeTypeCheckRaiseSuite(Suite):
         on = self._run(fx.str_type, True, e=e)
         assert off == on, f"callee: off={off} on={on}"
         assert len([r for r in off if r[0] == "fail"]) == 1, f"expected fail: {off}"
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeCheckBooleanOpSuite(Suite):
     """Parity for `rust_classify_check_boolean_op` (issue #1049).
 
@@ -43966,6 +43992,7 @@ class NativeGetTargetTypeSuite(Suite):
         assert self._seam(tvar, TypeAliasType(alias, []), bound_ok=True) is None
 
 
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeComparisonNarrowingSuite(Suite):
     """Parity for the Rust comparison_type_narrowing operand front (#1087).
 
@@ -44864,6 +44891,7 @@ class NativeArgVarianceWalkSuite(Suite):
         assert self._differential(nr_str, nr_obj) is True
 
 
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeProtocolMemberMissSuite(Suite):
     """Parity for the find_member miss path in `get_protocol_member_inner`
     (issue #1099).
@@ -45717,6 +45745,7 @@ class NativeFindSelfTypeSuite(Suite):
         assert result is None, f"missing-snapshot seam answered {result}"
 
 
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeSolveGenericCallSuite(Suite):
     """Parity for the rust_solve_generic_call port (issue #1128).
 
@@ -45958,6 +45987,7 @@ class NativeSolveGenericCallSuite(Suite):
         assert self._seam(callee, [ga, gd], [[0], [1]]) is None, (
             "unsolvable invariant conflict must defer"
         )
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeConstraintUnionSuite(Suite):
     """Parity suite for the constraint-builder union dispatch (issue #1130).
 
