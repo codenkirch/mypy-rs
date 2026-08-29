@@ -189,19 +189,16 @@ pub(crate) fn is_subtype(
     {
         return Some(true);
     }
-    // TupleType left: handled by the visit_tuple_type port below, which
-    // returns None for the variadic cases (Unpack items, TypeVarTuple)
-    // that still defer to Python's SubtypeVisitor (subtypes.py:950-1037).
-    // _is_subtype (subtypes.py:363-410): when right is UnionType and
-    // left is not, left <: right iff left <: some item. Python handles
-    // this BEFORE the visitor dispatch; mirror it here so recursive
+    // TupleType left: the visit_tuple_type port below returns None for the
+    // variadic cases (Unpack items, TypeVarTuple), which defer to Python's
+    // SubtypeVisitor (subtypes.py:950-1037).
 
-    // calls from check_type_parameter (which bypass the Python shim)
-    // get the right answer for union-typed type arguments. Must fire
-    // before the NoneType handler (visit_none_type returns False for
+    // _is_subtype (subtypes.py:363-410): when right is UnionType and left is not,
+    // left <: right iff left <: some item. Python checks this before the visitor
+    // dispatch; it must fire before the NoneType handler (False for UnionType).
 
-    // UnionType right, but Python's _is_subtype short-circuit would
-    // have already found None <: some union item).
+    // check_type_parameter recursions bypass the Python shim, so mirroring it
+    // here is what gives union-typed type arguments the right answer.
     if let Type::UnionType { items, .. } = right {
         if !matches!(left, Type::UnionType { .. }) {
             if matches!(left, Type::TypeVarType { .. }) {
@@ -2114,20 +2111,17 @@ fn visit_instance_nominal(
         return None;
     }
 
-    // Map left to right's type. Fast path: left.type == right.type (no
-    // substitution needed). Slow path calls map_instance_to_supertype
-    // to walk the bases blobs and substitute TypeVars; it returns None
-    // when an unsupported Type variant is in the tree (e.g. UnpackType,
-    // ParamSpec), in which case Python falls through.
+    // Map left to right's type. Fast path: left.type == right.type needs no substitution.
+    // Slow path: map_instance_to_supertype walks the bases, substituting TypeVars;
+    // None on unsupported variants (UnpackType, ParamSpec), Python falls through.
     let mapped_args: Vec<Type> = if ctx.erase_instances {
-        // Python (subtypes.py:1151-1155) erases the *mapped* instance
-        // via `erase_type`, which replaces every arg with
-        // `AnyType(TypeOfAny.special_form)` for the supertype's own
-        // type_vars (erasetype.py:251-253). The per-arg checks below
-        // then compare erased args against the (already erased) right
-        // args, so relocatable subclass mappings that carry concrete
-        // base args still cover. TVT-bearing classes defer earlier, so
-        // a 1:1 Any per snapshot type var is the full erase.
+        // Python (subtypes.py:1151-1155) erases the *mapped* instance via
+        // `erase_type`: every arg becomes `AnyType(TypeOfAny.special_form)`
+        // over the supertype's own type_vars (erasetype.py:251-253).
+
+        // Per-arg checks compare erased left vs (already erased) right args:
+        // relocatable subclass mappings with concrete base args still cover.
+        // TVT classes defer earlier: a 1:1 Any per snapshot type var is full.
         (0..right_snap.type_vars_with_variance.len())
             .map(|_| any_type_of(ANY_SPECIAL_FORM))
             .collect()
@@ -2138,11 +2132,9 @@ fn visit_instance_nominal(
         // Instance(right, []) (no args to substitute).
         Vec::new()
     } else {
-        // Generic substitution path: map_instance_to_supertype walks
-        // class_derivation_paths over the snapshot's bases blobs,
-        // substituting TypeVars via expand_type_by_instance. Returns
-        // None when an unsupported Type variant is in the tree (e.g.
-        // UnpackType, ParamSpec), in which case Python falls through.
+        // Generic path: map_instance_to_supertype walks class_derivation_paths over
+        // the bases blobs, substituting TypeVars via expand_type_by_instance; None on
+        // an unsupported Type variant (UnpackType, ParamSpec), Python falls through.
         map_instance_to_supertype(left_ref, left_args, right_ref, resolver)?
     };
 

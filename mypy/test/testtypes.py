@@ -20710,9 +20710,8 @@ class NativeCoversAtRuntimeSuite(Suite):
 
     def test_tuple_operands_parity(self) -> None:
         # Tuple operands erase to their partial_fallback Instance (mirrors
-        # `erasetype.py visit_tuple_type`), so tuple shapes engage the
-        # normal erase + subtype flow instead of blanked-deferring
-        # (issue #1171: 1,600 calls @0% native).
+        # erasetype.py visit_tuple_type), engaging the normal erase + subtype
+        # flow instead of blanked-deferring (issue #1171: 1,600 calls @0% native).
         t1 = TupleType([self.fx.a], self.fx.std_tuple)
         t2 = TupleType([self.fx.b], self.fx.std_tuple)
         self.assert_par(t1, t2)
@@ -29737,11 +29736,9 @@ class NativeAnyConstraintsSuite(Suite):
         )
 
     def test_seam_engages_with_none_option(self) -> None:
-        # A differential-only suite passes silently when the kernel defers
-        # and Python answers both sides. That is exactly how the None-option
-        # marker (-1) bug survived: read_size rejected it and every call
-        # deferred. Call the seam directly to prove the wire decodes
-        # (issue #1171).
+        # A differential-only suite passes silently when the kernel defers and Python answers
+        # both sides. That is how the None-option (-1) bug survived: read_size rejected it and
+        # every call deferred. Call the seam directly to prove the wire decodes (issue #1171).
         from mypy.cache import write_int_bare  # type: ignore[attr-defined]
         from mypy.constraints import _set_native_constraints_resolver, _write_option
 
@@ -29766,13 +29763,13 @@ class NativeAnyConstraintsSuite(Suite):
         assert len(raw) == 1
 
     def test_seam_preserves_extra_tvars_identity(self) -> None:
-        # Polymorphic-call inference attaches extra_tvars to constraints,
-        # and the wire format has no representation for them, so returning
-        # wire-rebuilt Constraints silently drops them (issue #1171).
-        # The shim must match each wire blob back to the original live
-        # Constraint and return it; value-equal-but-distinct options also
-        # disambiguate (the all-same branch returns the first valid
-        # option's constraints, exactly as the pure-Python body does).
+        # Polymorphic-call inference attaches extra_tvars to constraints; the
+        # wire format has no slot for them, so returning wire-rebuilt
+        # Constraints silently drops them (issue #1171).
+
+        # The shim must match each wire blob back to the original live Constraint and
+        # return it; value-equal-but-distinct options disambiguate (the all-same branch
+        # returns the first valid option's constraints, exactly as the pure-Python body does).
         from mypy.constraints import (
             _set_native_constraints_resolver,
             _try_native_any_constraints,
