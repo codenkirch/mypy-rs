@@ -1895,10 +1895,18 @@ def rust_analyze_union_member_access(
     preserve_type_var_ids: bool,
     start_raw_id: int,
     strict_optional: bool,
-) -> tuple[int, bool, list[bytes]] | None: ...
+) -> tuple[int, bool, list[bytes | None]] | None: ...
 def rust_analyze_none_member_access(
-    resolver: NativeTypeResolver, name: str, typ_bytes: bytes, strict_optional: bool
-) -> bytes | None: ...
+    resolver: NativeTypeResolver,
+    name: str,
+    typ_bytes: bytes,
+    self_type_bytes: bytes | None,
+    is_lvalue: bool,
+    is_super: bool,
+    preserve_type_var_ids: bool,
+    start_raw_id: int,
+    strict_optional: bool,
+) -> tuple[int, bool, bytes] | None: ...
 def rust_analyze_typeddict_access(
     resolver: NativeTypeResolver, name: str, typ_bytes: bytes, strict_optional: bool
 ) -> bytes | None: ...

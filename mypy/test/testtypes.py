@@ -18449,7 +18449,10 @@ class NativeMemberAccessDispatchSuite(Suite):
         _next_raw_id, changed, per_item = result
         assert changed is False
         assert len(per_item) == 2
-        decoded = [_deserialize_type_for_checkmember(bytes(b)) for b in per_item]
+        decoded = []
+        for item in per_item:
+            assert item is not None
+            decoded.append(_deserialize_type_for_checkmember(bytes(item)))
         assert isinstance(decoded[0], CallableType) and isinstance(decoded[1], CallableType)
         assert decoded[0].ret_type == self.fx.a
         assert decoded[1].ret_type == self.fx.b
@@ -18469,6 +18472,177 @@ class NativeMemberAccessDispatchSuite(Suite):
         )
         assert result is None
 
+    def test_union_seam_none_slot_for_methodless_item(self) -> None:
+        # A union item without a dispatch context (a bare callable:
+        # fallback recursion into an Instance defers) arrives as a
+        # None slot instead of discarding whole-union work.
+        from mypy.checkmember import _deserialize_type_for_checkmember
+
+        self._add_method(self.fx.ai, "m2", self._sig([], [], [], self.fx.a), is_static=True)
+        bare_callable = self._sig([], [], [], self.fx.a)
+        union = UnionType([self.fx.a, bare_callable])
+        result = self._tk.rust_analyze_union_member_access(
+            self.resolver,
+            self._bytes_of(union),
+            "m2",
+            False,
+            False,
+            False,
+            True,
+            100,
+            False,
+        )
+        assert result is not None
+        _next_raw_id, _changed, per_item = result
+        assert len(per_item) == 2
+        assert isinstance(per_item[0], (bytes, list)) and per_item[1] is None
+        decoded = _deserialize_type_for_checkmember(bytes(per_item[0]))
+        assert isinstance(decoded, CallableType)
+        assert decoded.ret_type == self.fx.a
+
+    def test_none_seam_bool_callable(self) -> None:
+        from mypy.checkmember import _deserialize_type_for_checkmember
+
+        none_bytes = self._bytes_of(NoneType())
+        for strict in (False, True):
+            result = self._tk.rust_analyze_none_member_access(
+                self.resolver,
+                "__bool__",
+                none_bytes,
+                None,
+                False,
+                False,
+                False,
+                100,
+                strict,
+            )
+            assert result is not None
+            next_raw_id, changed, wire_bytes = result
+            assert (next_raw_id, changed) == (100, False)
+            decoded = _deserialize_type_for_checkmember(bytes(wire_bytes))
+            assert isinstance(decoded, CallableType)
+            assert decoded.is_bound is False
+            ret = get_proper_type(decoded.ret_type)
+            assert isinstance(ret, LiteralType)
+            assert ret.value is False
+            assert ret.fallback.type.fullname == "builtins.bool"
+
+    def test_none_seam_object_method_binds(self) -> None:
+        # None.foo with a method on builtins.object: recursion rides the
+        # live dispatch; self_type = the object instance passes the
+        # same-class guard and binds the method.
+        from mypy.checkmember import _deserialize_type_for_checkmember
+        from mypy.nodes import ARG_POS
+
+        self._add_method(
+            self.fx.oi,
+            "obj_m",
+            self._sig([self.fx.o, self.fx.a], [ARG_POS, ARG_POS], ["self", "x"], self.fx.a),
+        )
+        result = self._tk.rust_analyze_none_member_access(
+            self.resolver,
+            "obj_m",
+            self._bytes_of(NoneType()),
+            self._bytes_of(self.fx.o),
+            False,
+            False,
+            False,
+            100,
+            False,
+        )
+        assert result is not None
+        _next_raw_id, changed, wire_bytes = result
+        decoded = _deserialize_type_for_checkmember(bytes(wire_bytes))
+        assert isinstance(decoded, CallableType)
+        assert decoded.is_bound is True
+        assert decoded.arg_types == [self.fx.a]
+
+    def test_none_seam_defers(self) -> None:
+        # lvalue / super defer (per-item lvalue/super semantics stay
+        # Python-side), an absent self_type defers, and an unknown name
+        # defers through the object dispatch.
+        none_bytes = self._bytes_of(NoneType())
+        self_bytes = self._bytes_of(self.fx.o)
+        base = (self.resolver, "obj_m", none_bytes)
+        assert (
+            self._tk.rust_analyze_none_member_access(
+                *base, self_bytes, True, False, False, 100, False
+            )
+            is None
+        )
+        assert (
+            self._tk.rust_analyze_none_member_access(
+                *base, self_bytes, False, True, False, 100, False
+            )
+            is None
+        )
+        assert (
+            self._tk.rust_analyze_none_member_access(
+                *base, None, False, False, False, 100, False
+            )
+            is None
+        )
+        self._add_method(self.fx.ai, "unrelated", self._sig([], [], [], self.fx.a))
+        assert (
+            self._tk.rust_analyze_none_member_access(
+                self.resolver, "unrelated", none_bytes, self_bytes, False, False, False, 100, False
+            )
+            is None
+        )
+
+    def test_union_shim_fills_none_slot(self) -> None:
+        # End-to-end shim: union [A(has __bool__), None] with
+        # strict_optional=True. The None slot fills via
+        # _analyze_member_access, re-entering the native __bool__ seam.
+        from types import SimpleNamespace
+
+        from mypy import state as mypy_state
+        from mypy.checkmember import MemberContext, analyze_union_member_access
+
+        class _NoopCtx:
+            def __enter__(self) -> None:
+                pass
+
+            def __exit__(self, *a: object) -> None:
+                pass
+
+        self._add_method(self.fx.ai, "__bool__", self._sig([], [], [], self.fx.a), is_static=True)
+        union = UnionType([self.fx.a, NoneType()])
+        chk = SimpleNamespace(
+            named_type=lambda n: self.fx.oi,
+            msg=SimpleNamespace(
+                filter_errors=lambda *a, **kw: _NoopCtx(),
+                disable_type_names=lambda: _NoopCtx(),
+                fail=lambda *a, **kw: None,
+            ),
+        )
+        mx = MemberContext(
+            is_lvalue=False,
+            is_super=False,
+            is_operator=False,
+            original_type=union,
+            context=NameExpr("x"),
+            chk=cast(Any, chk),
+        )
+        old_strict = mypy_state.state.strict_optional
+        try:
+            mypy_state.state.strict_optional = True
+            result = analyze_union_member_access("__bool__", union, mx)
+        finally:
+            mypy_state.state.strict_optional = old_strict
+        # The shim fills the None slot via the NoneType __bool__ native
+        # path and joins: [A.__bool__ callable, None.__bool__ callable].
+        result = get_proper_type(result)
+        assert isinstance(result, UnionType)
+        assert len(result.items) == 2
+        first = get_proper_type(result.items[0])
+        assert isinstance(first, CallableType)
+        assert first.ret_type == self.fx.a
+        second = get_proper_type(result.items[1])
+        assert isinstance(second, CallableType)
+        second_ret = get_proper_type(second.ret_type)
+        assert isinstance(second_ret, LiteralType)
+        assert second_ret.value is False
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeCheckmemberDeferralSuite(Suite):
