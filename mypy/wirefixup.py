@@ -32,14 +32,20 @@ from mypy.types import (
     AnyType,
     CallableType,
     Instance,
+    LiteralType,
+    Overloaded,
     Parameters,
     ParamSpecType,
+    TupleType,
     Type,
     TypeAliasType,
+    TypedDictType,
     TypeType,
     TypeVarLikeType,
     TypeVarTupleType,
     TypeVarType,
+    UnionType,
+    UnpackType,
     get_proper_type,
 )
 
@@ -331,6 +337,196 @@ def canonicalize_fresh_vars_reported_list(types: list[Type]) -> tuple[list[Type]
 def canonicalize_fresh_vars(typ: Type, seed: Sequence[TypeVarLikeType] | None = None) -> Type:
     """Re-unify fresh meta-var occurrences by id (wire-path identity repair)."""
     result, _ = canonicalize_fresh_vars_reported(typ, seed)
+    return result
+
+
+def _collect_typevar_likes(t: Type, seed: dict[tuple[int, int, str], TypeVarLikeType]) -> None:
+    """Collect every TypeVar-like node in the raw tree of `t` into `seed`.
+
+    Raw-tree walk (no get_proper_type): the seed must hold the exact
+    objects Python's ExpandTypeVisitor would return by identity, i.e.
+    vars occurring as-is plus vars nested inside upper bounds, defaults,
+    value lists, prefixes and callable variables slots. Non-recursive
+    alias targets are walked with a cycle guard; a match exposes the
+    alias target's vars under the alias's own tree.
+    """
+    alias_seen: set[int] = set()
+    stack: list[Type] = [t]
+    while stack:
+        cur = stack.pop()
+        if isinstance(cur, TypeVarLikeType):
+            seed.setdefault((cur.id.raw_id, cur.id.meta_level, cur.id.namespace), cur)
+            stack.append(cur.upper_bound)
+            stack.append(cur.default)
+            if isinstance(cur, TypeVarType):
+                stack.extend(cur.values)
+            elif isinstance(cur, ParamSpecType):
+                stack.append(cur.prefix)
+            elif isinstance(cur, TypeVarTupleType):
+                stack.append(cur.tuple_fallback)
+        elif isinstance(cur, CallableType):  # type: ignore[misc]
+            stack.extend(cur.arg_types)
+            stack.append(cur.ret_type)
+            stack.append(cur.fallback)
+            stack.extend(cur.variables)
+            if cur.instance_type is not None:
+                stack.append(cur.instance_type)
+        elif isinstance(cur, Parameters):
+            stack.extend(cur.arg_types)
+            stack.extend(cur.variables)
+        elif isinstance(cur, Overloaded):  # type: ignore[misc]
+            stack.extend(cur.items)
+        elif isinstance(cur, Instance):  # type: ignore[misc]
+            stack.extend(cur.args)
+        elif isinstance(cur, UnionType):  # type: ignore[misc]
+            stack.extend(cur.items)
+        elif isinstance(cur, TupleType):  # type: ignore[misc]
+            stack.extend(cur.items)
+            stack.append(cur.partial_fallback)
+        elif isinstance(cur, TypedDictType):  # type: ignore[misc]
+            stack.extend(cur.items.values())
+            stack.append(cur.fallback)
+        elif isinstance(cur, TypeType):  # type: ignore[misc]
+            stack.append(cur.item)
+        elif isinstance(cur, UnpackType):
+            stack.append(cur.type)
+        elif isinstance(cur, TypeAliasType):
+            stack.extend(cur.args)
+            if cur.alias is not None and id(cur.alias) not in alias_seen:
+                alias_seen.add(id(cur.alias))
+                stack.append(cur.alias.target)
+
+
+class _VarIdentityCanonicalizer(TypeTranslator):
+    """Re-link wire-decoded TypeVar-like nodes to their live originals.
+
+    Python's ExpandTypeVisitor preserves TypeVar identity: an unbound var
+    returns the original occurrence (expandtype.py visit_type_var) and a
+    bound var returns the original env-value object. The wire round-trip
+    hands back fresh copies, so downstream consumers that compare vars by
+    identity or mutate them in place would observe a split.
+
+    This pass seeds a canonical map from the ORIGINAL tree plus the env
+    values (all vars reachable, including bounds/defaults), then replaces
+    each decoded occurrence whose (raw_id, meta_level, namespace) matches
+    AND is structurally equal to a seeded original with that original.
+    Structurally unequal nodes are genuine expansion results and keep the
+    decoded copy; matches are deterministic per key, independent of the
+    call, so callers may cache the pre-repair decoded shape.
+
+    Meta vars without a seed entry behave like `_FreshVarCanonicalizer`
+    (share the first occurrence). A non-meta var absent from the seed is
+    a collection gap: `missing_seed` is set and the caller defers.
+    """
+
+    def __init__(self, typ: Type, env_values: Sequence[Type]) -> None:
+        super().__init__()
+        self._typ = typ
+        self._env_values = env_values
+        self._seed: dict[tuple[int, int, str], TypeVarLikeType] | None = None
+        self.missing_seed = False
+
+    def _canon(self, t: TypeVarLikeType) -> Type:
+        if self._seed is None:
+            self._seed = {}
+            _collect_typevar_likes(self._typ, self._seed)
+            for v in self._env_values:
+                _collect_typevar_likes(v, self._seed)
+        existing = self._seed.get((t.id.raw_id, t.id.meta_level, t.id.namespace))
+        if existing is None:
+            if not t.id.is_meta_var():
+                self.missing_seed = True
+            self._seed[(t.id.raw_id, t.id.meta_level, t.id.namespace)] = t
+            return t
+        if existing == t:
+            return existing
+        return t
+
+    def visit_type_var(self, t: TypeVarType, /) -> Type:
+        return self._canon(t)
+
+    def visit_param_spec(self, t: ParamSpecType, /) -> Type:
+        return self._canon(t)
+
+    def visit_type_var_tuple(self, t: TypeVarTupleType, /) -> Type:
+        return self._canon(t)
+
+    def visit_type_alias_type(self, t: TypeAliasType, /) -> Type:
+        return t
+
+    def visit_callable_type(self, t: CallableType, /) -> Type:
+        # Base translator leaves `variables`, `type_guard`, `type_is`
+        # untranslated; traverse them so var occurrences inside are relinked.
+        result = get_proper_type(super().visit_callable_type(t))
+        if not isinstance(result, CallableType):
+            return result
+        variables = [v.accept(self) for v in result.variables]
+        type_guard = t.type_guard.accept(self) if t.type_guard is not None else None
+        type_is = t.type_is.accept(self) if t.type_is is not None else None
+        return result.copy_modified(
+            variables=variables, type_guard=type_guard, type_is=type_is  # type: ignore[arg-type]
+        )
+
+
+def contains_typevar_like(typ: Type) -> bool:
+    """Does the decoded tree contain any TypeVar-like node?
+
+    Mirrors the Rust `result_has_typevar` scan. Decoded var-bearing
+    results only appear on the identity-repair path, so callers use this
+    to cheaply skip the seed-walk repair for the common var-free case.
+    """
+    stack: list[Type] = [typ]
+    while stack:
+        cur = stack.pop()
+        if isinstance(cur, TypeVarLikeType):
+            return True
+        if isinstance(cur, CallableType):  # type: ignore[misc]
+            stack.extend(cur.arg_types)
+            stack.append(cur.ret_type)
+            stack.append(cur.fallback)
+            stack.extend(cur.variables)
+        elif isinstance(cur, Overloaded):  # type: ignore[misc]
+            stack.extend(cur.items)
+        elif isinstance(cur, Parameters):
+            stack.extend(cur.arg_types)
+            stack.extend(cur.variables)
+        elif isinstance(cur, Instance):  # type: ignore[misc]
+            stack.extend(cur.args)
+        elif isinstance(cur, UnionType):  # type: ignore[misc]
+            stack.extend(cur.items)
+        elif isinstance(cur, TupleType):  # type: ignore[misc]
+            stack.extend(cur.items)
+            stack.append(cur.partial_fallback)
+        elif isinstance(cur, TypedDictType):  # type: ignore[misc]
+            stack.extend(cur.items.values())
+            stack.append(cur.fallback)
+        elif isinstance(cur, TypeType):  # type: ignore[misc]
+            stack.append(cur.item)
+        elif isinstance(cur, UnpackType):
+            stack.append(cur.type)
+        elif isinstance(cur, TypeAliasType):
+            stack.extend(cur.args)
+        elif isinstance(cur, LiteralType):  # type: ignore[misc]
+            stack.append(cur.fallback)
+    return False
+
+
+def resync_var_identities(typ: Type, decoded: Type, env_values: Sequence[Type]) -> Type | None:
+    """Re-link wire-decoded TypeVar-like occurrences to their live originals.
+
+    Python's ExpandTypeVisitor preserves TypeVar identity; a wire
+    round-trip does not. Seeds from the ORIGINAL tree plus the env
+    values, replaces structurally-equal decoded occurrences with their
+    originals, and returns None to defer when a non-meta var has no
+    seeded original (a collection gap, e.g. an alias target the walk
+    could not see). See `_VarIdentityCanonicalizer`.
+    """
+    if not contains_typevar_like(decoded):
+        return decoded
+    cand = _VarIdentityCanonicalizer(typ, env_values)
+    result = decoded.accept(cand)
+    if cand.missing_seed:
+        return None
     return result
 
 
