@@ -1717,6 +1717,31 @@ including:
   `NativeTypeopsDeferralSuite` in `mypy/test/testtypes.py` (rewritten
   seam tests + `test_instance_fallback_decided_none_protocol`) plus
   kernel unit tests in `typeops.rs`.
+- `rust_analyze_member_method` subclass-receiver guard narrowing (issue
+  #1184) — hoists `has_vars` (a CallableType with non-empty
+  `variables`, or any Overloaded item carrying variables) to the seam
+  entry and applies the classmethod / same-class equality guards only
+  when the signature is variable-carrying: for a variable-free
+  signature Python's full `bind_self` can only take its non-generic
+  strip path, so the seam's filter + map + expand + strip composition
+  is exactly the Python tail and the guard is redundant; genuinely
+  generic shapes still defer at `mm::has_typevar`. The port exposed a
+  real Python bug, fixed in `mypy/checkmember.py`
+  `_restore_definition`: the Overloaded-to-CallableType matcher
+  accepted only exact arg counts, so a `check_self_arg`-filtered
+  overload lost its `definition` link after `bind_self` stripped self
+  and `pretty_callable` rendered `def f() -> int` instead of
+  `def f(self) -> int` (the full-suite ordering flake in
+  `testSelfTypeOverrideCompatibility`). Measured (cold self-check):
+  IAMA dispatch 92,585 calls / 4,353 fallbacks → 92,575 / 4,225 (95%
+  native); total Python type-kernel fallbacks 31,496 → 29,115. CC
+  stays deferred: 450/496 of its seam defers are generic callables
+  needing Python's `unify_generic_callable`, not portable under the
+  per-call classifier gate. Covered by
+  `NativeMemberAccessDispatchSuite` in `mypy/test/testtypes.py`
+  (`test_dispatch_completes_subclass_receiver_nongeneric` /
+  `test_dispatch_defers_subclass_receiver_generic`) plus Rust unit
+  tests in `checkmember.rs` (PR #1193).
 
 Stages 1/2 return `None` for any type class Rust does not handle, and
 the Python caller falls back to the pure-Python visitor. This is the
