@@ -4458,6 +4458,139 @@ class NativeExpandTypeEmptyEnvSuite(Suite):
 
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeExpandTypeAliasSuite(Suite):
+    """Parity for the Rust `expand_type` alias-arg handling (#1195).
+
+    The seam used to defer every alias-bearing input (the alias_entry
+    guard) and any result still carrying a TypeAliasType. Alias args now
+    expand natively (mirroring visit_type_alias_type) and the Python shim
+    re-links wire-decoded alias nodes to live TypeAlias nodes via
+    fixup_wire_type(resolve_aliases=True); a decoded alias missing from
+    the per-build alias map defers to the pure-Python body, and parity
+    holds either way.
+    """
+
+    def setUp(self) -> None:
+        from mypy.expandtype import (
+            _set_native_expand_type_active,
+            _set_native_expand_type_resolver,
+            _set_native_expand_type_typeinfo_map,
+        )
+        from mypy.wirefixup import set_wire_alias_map, set_wire_typeinfo_map
+
+        self.fx = TypeFixture()
+        self._set_active = _set_native_expand_type_active
+        self._set_resolver = _set_native_expand_type_resolver
+        self._set_map = _set_native_expand_type_typeinfo_map
+        type_infos = []
+        for name in dir(self.fx):
+            if not name.endswith("i"):
+                continue
+            value = getattr(self.fx, name)
+            if _is_type_info(value):
+                type_infos.append(value)
+        # A = List[T], generic in the fixture typevar, so both bare and
+        # arg-bearing references exist and substitution inside the alias
+        # args is observable.
+        from mypy.nodes import TypeAlias
+
+        self.alias = TypeAlias(
+            Instance(self.fx.std_listi, [self.fx.t]), "mod.A", "mod", -1, -1
+        )
+        self._rebuild_resolver([self.alias])
+        self._set_map({info.fullname: info for info in type_infos})
+        set_wire_typeinfo_map({info.fullname: info for info in type_infos})
+        set_wire_alias_map({self.alias.fullname: self.alias})
+        self._set_active(True)
+
+    def tearDown(self) -> None:
+        from mypy.wirefixup import set_wire_alias_map, set_wire_typeinfo_map
+
+        self._set_active(False)
+        self._set_resolver(None)
+        self._set_map(None)
+        set_wire_typeinfo_map(None)
+        set_wire_alias_map(None)
+
+    def _rebuild_resolver(self, aliases: list[Any]) -> None:
+        type_infos = []
+        for name in dir(self.fx):
+            if not name.endswith("i"):
+                continue
+            value = getattr(self.fx, name)
+            if _is_type_info(value):
+                type_infos.append(value)
+        self._resolver = _type_kernel.build_native_resolver(type_infos, aliases)
+        self._set_resolver(self._resolver)
+
+    def _with_gate(self, active: bool, fn: Callable[[], Any]) -> Any:
+        self._set_active(active)
+        try:
+            return fn()
+        finally:
+            self._set_active(True)
+
+    def _expand(self, typ: Type) -> Type:
+        from mypy.expandtype import expand_type
+
+        return expand_type(typ, {self.fx.t.id: self.fx.a})
+
+    def _assert_par(self, typ: Type) -> None:
+        off = str(self._with_gate(False, lambda: self._expand(typ)))
+        on = str(self._with_gate(True, lambda: self._expand(typ)))
+        assert_equal(on, off, f"expand_type(alias) parity {typ}")
+
+    def test_alias_args_expand_natively(self) -> None:
+        # expand_type(A[T], {T: A}) -> A[A]: alias args substitute in Rust
+        # and the surviving alias node re-links through the alias map.
+        from mypy.expandtype import _serialize_env, _serialize_type
+
+        alias_t = TypeAliasType(self.alias, [self.fx.t])
+        result = _type_kernel.rust_expand_type(
+            self._resolver,
+            _serialize_type(alias_t),
+            _serialize_env({self.fx.t.id: self.fx.a}),
+            state.strict_optional,
+        )
+        assert result is not None, "alias-arg expand_type deferred (alias_entry guard back?)"
+        self._assert_par(alias_t)
+
+    def test_bare_alias_passes_through(self) -> None:
+        # expand_type(A, {T: A}) (no args): Python returns t unchanged; the
+        # seam engages and the wire clone re-links to the live TypeAlias.
+        from mypy.expandtype import _serialize_env, _serialize_type
+
+        bare = TypeAliasType(self.alias, [])
+        result = _type_kernel.rust_expand_type(
+            self._resolver,
+            _serialize_type(bare),
+            _serialize_env({self.fx.t.id: self.fx.a}),
+            state.strict_optional,
+        )
+        assert result is not None, "bare alias expand_type deferred"
+        self._assert_par(bare)
+
+    def test_alias_inside_instance_parity(self) -> None:
+        # G[A[int]]: an alias nested inside a non-alias input must also
+        # survive the round-trip (the fixup re-links the nested node).
+        alias_int = TypeAliasType(self.alias, [self.fx.a])
+        self._assert_par(Instance(self.fx.gi, [alias_int]))
+
+    def test_missing_alias_map_defers_to_python(self) -> None:
+        # Without a wire alias map the fixup cannot re-link the decoded
+        # alias; the shim must fall back to the pure-Python body and both
+        # gates still agree.
+        from mypy.wirefixup import set_wire_alias_map
+
+        alias_t = TypeAliasType(self.alias, [self.fx.t])
+        set_wire_alias_map(None)
+        try:
+            self._assert_par(alias_t)
+        finally:
+            set_wire_alias_map({self.alias.fullname: self.alias})
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeTypeTypeContextSuite(Suite):
     """Parity suite for the Rust `is_type_type_context` port (Phase B3a, #591).
 

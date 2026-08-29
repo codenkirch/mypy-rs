@@ -2267,3 +2267,25 @@ directly to `main`.
   same-alias-different-args expansion, pop-then-expand) plus
   `test_recursive_alias_gate_parity_no_wrong_verdict` in
   `NativeSubtypesDeferralSuite` (mypy/test/testtypes.py).
+- `rust_expand_type` alias-entry defer removal (issue #1195) — the
+  `expand_type` seam no longer defers alias-bearing inputs: the
+  `alias_entry` guard (any `TypeAliasType` input) and the
+  `res_alias` survivor check are gone from the entry path. Alias args
+  expand natively (mirroring `visit_type_alias_type`) and the Python
+  shim re-links wire-decoded alias nodes to live `TypeAlias` nodes via
+  `fixup_wire_type(resolve_aliases=True)` (per-build
+  `_wire_alias_map`, cleared per build in `mypy/build.py`); a decoded
+  alias missing from the map defers to the pure-Python body. The
+  `alias_ok` flag threads through `expand_type_with_env_inner`: only
+  the `rust_expand_type` entry passes `true` — `expand_type_with_env`
+  (infer_variance / expand_variants callers) keeps the survivor defer,
+  since those callers have no re-link path. The env gate
+  (`_env_substitutes_unsafe`) gained a raw-tree alias scan
+  (`_contains_alias_raw`): a *used* env value carrying a TypeAliasType
+  still defers, keeping the substituted node live-identity. Cold
+  self-check audit: 65,618 calls @ 94.07% native / 3,901 fallbacks
+  -> 64,961 @ 96.72% native / 2,121 fallbacks, zero alias defers
+  (alias_entry 1,345 + res_alias 645 -> 0). Covered by
+  `NativeExpandTypeAliasSuite` in `mypy/test/testtypes.py`
+  (direct-seam engagement + gate-off/on parity + missing-alias-map
+  fallback) plus four Rust unit tests in `expandtype.rs`.

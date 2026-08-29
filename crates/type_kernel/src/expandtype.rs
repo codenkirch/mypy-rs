@@ -58,16 +58,10 @@ pub(crate) fn rust_expand_type(
     let _ = resolver; // reserved for future Instance.has_type_var_tuple lookups
     let typ = decode_type(type_bytes)?;
     let env = decode_env(env_bytes)?;
-    // Wire-decoded TypeAliasType carries alias=None, which the Python graph
-    // asserts against on access (types.py:362/397). Defer alias-bearing
-    // inputs to Python, preserving object identity.
-    if result_contains_typealias(&typ) {
-        return None;
-    }
-    // An empty env is fully wire-portable: no substitution happens, so
-    // typevar-free inputs complete natively while the result_has_typevar
-    // guard still defers the identity-critical leftover-TypeVar cases.
-    expand_with_env(&typ, &env, strict_optional)
+    // Empty env is fully wire-portable; alias-bearing inputs are fine too:
+    // alias args expand natively (mirroring visit_type_alias_type) and the
+    // Python shim re-links decoded alias nodes via resolve_aliases fixup.
+    expand_with_env(&typ, &env, strict_optional, true)
 }
 
 /// Shared tail of the expand FFI entries: run the substitution and ship
@@ -77,8 +71,9 @@ fn expand_with_env(
     typ: &Type,
     env: &HashMap<EnvKey, Type>,
     strict_optional: bool,
+    alias_ok: bool,
 ) -> Option<Vec<u8>> {
-    let expanded = expand_type_with_env(typ, env, strict_optional)?;
+    let expanded = expand_type_with_env_inner(typ, env, strict_optional, false, alias_ok)?;
     encode_type(&expanded)
 }
 
@@ -90,7 +85,7 @@ pub(crate) fn expand_type_with_env(
     env: &HashMap<EnvKey, Type>,
     strict_optional: bool,
 ) -> Option<Type> {
-    expand_type_with_env_inner(typ, env, strict_optional, false)
+    expand_type_with_env_inner(typ, env, strict_optional, false, false)
 }
 
 /// Free-result variant: leftover TypeVars are returned instead of deferring
@@ -103,6 +98,7 @@ fn expand_type_with_env_inner(
     env: &HashMap<EnvKey, Type>,
     strict_optional: bool,
     allow_free: bool,
+    alias_ok: bool,
 ) -> Option<Type> {
     // Leaf types carry no TypeVars; Python returns the original object
     // (identity). We return a cloned copy — structurally identical, wire-safe.
@@ -113,11 +109,10 @@ fn expand_type_with_env_inner(
     if !allow_free && result_has_typevar(&expanded) {
         return None;
     }
-    // A surviving TypeAliasType decodes from the wire with alias=None, and
-    // Python's TypeAliasType.is_recursive asserts alias is not None
-    // (types.py:397), so an unfixed alias crashes the caller. Defer any
-    // expansion whose result still contains a TypeAliasType node.
-    if result_contains_typealias(&expanded) {
+    // A surviving alias decodes with alias=None (types.py:397 asserts), so
+    // unfixed aliases crash the caller. With alias_ok=true the shim
+    // re-links survivors; other callers keep the defer.
+    if !alias_ok && result_contains_typealias(&expanded) {
         return None;
     }
     Some(expanded)
@@ -278,14 +273,14 @@ fn expand_type_by_instance_inner(
                 env.insert((raw_id, 0, env_ns.clone()), arg.clone());
             }
         }
-        return expand_type_with_env_inner(typ, &env, strict_optional, allow_free);
+        return expand_type_with_env_inner(typ, &env, strict_optional, allow_free, false);
     }
     // Non-variadic: fast path + binding (expandtype.py:407-409).
     let raw_ids = &snap.type_var_raw_ids;
     for (raw_id, arg) in raw_ids.iter().zip(args) {
         env.insert((*raw_id, 0, env_ns.clone()), arg.clone());
     }
-    expand_type_with_env_inner(typ, &env, strict_optional, allow_free)
+    expand_type_with_env_inner(typ, &env, strict_optional, allow_free, false)
 }
 
 /// Decode a wire-format `Type` blob. Returns `None` on any read failure.
@@ -1357,5 +1352,75 @@ mod tests {
         let typ = instance("builtins.list", vec![tvar(0)]);
         let env: HashMap<EnvKey, Type> = HashMap::new();
         assert!(expand_type_with_env(&typ, &env, false).is_none());
+    }
+
+    fn alias_type(type_ref: &str, args: Vec<Type>) -> Type {
+        // Wire-decoded shape: alias=None is not carried, only args + type_ref
+        // (the Python fixup re-links the live TypeAlias via the alias map).
+        Type::TypeAliasType {
+            args,
+            type_ref: type_ref.to_string(),
+        }
+    }
+
+    #[test]
+    fn expand_alias_entry_substitutes_args_natively() {
+        // `expand_type(X[int], {T: int})`: alias args expand in Rust
+        // (mirrors visit_type_alias_type); the shim re-links the survivor.
+        let typ = alias_type("foo.Alias", vec![tvar(0)]);
+        let env: HashMap<EnvKey, Type> = HashMap::from([((0, 0, String::new()), any())]);
+        match expand_with_env(&typ, &env, false, true) {
+            Some(bytes) => {
+                let out = decode_type(&bytes).unwrap();
+                match out {
+                    Type::TypeAliasType { args, type_ref } => {
+                        assert_eq!(type_ref, "foo.Alias");
+                        assert!(matches!(args.as_slice(), [Type::AnyType { .. }]));
+                    }
+                    other => panic!("expected TypeAliasType, got {:?}", other),
+                }
+            }
+            None => panic!("alias-arg expansion must not defer"),
+        }
+    }
+
+    #[test]
+    fn expand_alias_entry_empty_args_passes_through() {
+        // Bare alias reference `X` (no args): Python returns t unchanged;
+        // the wire clone carries type_ref for the shim's alias fixup.
+        let typ = alias_type("foo.Alias", vec![]);
+        let env: HashMap<EnvKey, Type> = HashMap::new();
+        match expand_with_env(&typ, &env, false, true) {
+            Some(bytes) => match decode_type(&bytes).unwrap() {
+                Type::TypeAliasType { args, type_ref } => {
+                    assert!(args.is_empty());
+                    assert_eq!(type_ref, "foo.Alias");
+                }
+                other => panic!("expected TypeAliasType, got {:?}", other),
+            },
+            None => panic!("bare alias pass-through must not defer"),
+        }
+    }
+
+    #[test]
+    fn expand_alias_entry_unmatched_tvar_inside_args_defers() {
+        // `expand_type(X[T], {})` leaves T unmatched inside the alias args;
+        // the leftover-TypeVar identity guard still fires (res_tvar_head
+        // shape), independent of alias_ok.
+        let typ = alias_type("foo.Alias", vec![tvar(0)]);
+        let env: HashMap<EnvKey, Type> = HashMap::new();
+        assert!(expand_with_env(&typ, &env, false, true).is_none());
+    }
+
+    #[test]
+    fn expand_alias_survivor_defers_without_alias_ok() {
+        // The shared wrapper (infer_variance / expand_variants callers)
+        // keeps the old contract: a result still carrying a TypeAliasType
+        // defers, because those callers have no resolve_aliases fixup.
+        let typ = instance("builtins.list", vec![alias_type("foo.Alias", vec![])]);
+        let env: HashMap<EnvKey, Type> = HashMap::new();
+        assert!(expand_type_with_env(&typ, &env, false).is_none());
+        // Same input via the alias_ok=true entry completes.
+        assert!(expand_with_env(&typ, &env, false, true).is_some());
     }
 }
