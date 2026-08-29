@@ -2,17 +2,29 @@
 
 from __future__ import annotations
 
+import os
 import sys
 from collections.abc import Set as AbstractSet
 
-from mypy.build import BuildManager, BuildSourceSet, State, order_ascc, sorted_components
+import mypy.subtypes as subtypes
+from mypy.build import (
+    SCC,
+    BuildManager,
+    BuildSourceSet,
+    State,
+    build,
+    order_ascc,
+    process_stale_scc_interface,
+    sorted_components,
+)
 from mypy.errors import Errors
 from mypy.fscache import FileSystemCache
 from mypy.graph_utils import strongly_connected_components, topsort
-from mypy.modulefinder import SearchPaths
+from mypy.modulefinder import BuildSource, SearchPaths
 from mypy.options import Options
 from mypy.plugin import Plugin
 from mypy.report import Reports
+from mypy.subtypes import _set_native_subtype_resolver
 from mypy.test.helpers import Suite, assert_equal
 from mypy.version import __version__
 
@@ -136,3 +148,36 @@ class GraphSuite(Suite):
         ascc = res[1]
         scc = order_ascc(graph, ascc)
         assert_equal(scc, ["d", "c", "b", "a"])
+
+    def test_worker_scc_interface_installs_native_resolvers(self) -> None:
+        """Interface path mirrors the single-process resolver install/clear.
+
+        Workers only run `process_stale_scc_interface` (issue #1159):
+        it must pair the per-SCC clear with the
+        `_build_native_resolvers` install, or every resolver-backed
+        type-kernel seam is inert under `num_workers > 0`.
+        """
+        try:
+            import type_kernel  # noqa: F401
+        except ImportError:
+            self.skipTest("type_kernel extension not available")
+
+        def run_interface(kernel: bool) -> object:
+            """Build a real graph, clear globals, run the worker path."""
+            options = Options()
+            options.use_builtins_fixtures = True
+            options.native_type_kernel = kernel
+            options.cache_dir = os.devnull
+            text = "def f(x: int) -> int:\n    return x\n"
+            res = build([BuildSource("main.py", "main", text)], options)
+            _set_native_subtype_resolver(None)
+            process_stale_scc_interface(res.graph, SCC({"main"}), res.manager, from_cache=set())
+            # Read the module attribute, not a snapshot import: the
+            # install rebinds the global and a from-import goes stale.
+            installed = subtypes._native_subtype_resolver
+            res.manager._clear_native_resolvers()
+            return installed
+
+        self.assertIsNone(run_interface(kernel=False))
+        self.assertIsNotNone(run_interface(kernel=True))
+        self.assertIsNone(subtypes._native_subtype_resolver)
