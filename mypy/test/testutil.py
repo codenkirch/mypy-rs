@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import atexit
 import os
 from unittest import TestCase, mock
 
 from mypy.inspections import parse_location
-from mypy.util import _generate_junit_contents, get_terminal_width
+from mypy.util import _generate_junit_contents, get_terminal_width, hard_exit
 
 
 class TestGetTerminalSize(TestCase):
@@ -109,3 +110,16 @@ Error line 2</failure>
             platform="test-plat",
         )
         assert result == expected
+
+
+class TestHardExit(TestCase):
+    def test_hard_exit_runs_atexit_handlers(self) -> None:
+        # os._exit skips atexit handlers, which silently dropped diagnostics
+        # registered by instrumentation kernels (#1061); hard_exit must run
+        # them explicitly before the hard kill.
+        seen: list[int] = []
+        atexit.register(lambda: seen.append(1))
+        with mock.patch("os._exit") as fake_exit:
+            hard_exit(0)
+        assert seen == [1]
+        fake_exit.assert_called_once_with(0)
