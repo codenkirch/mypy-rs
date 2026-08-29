@@ -3684,6 +3684,89 @@ class NativeSubtypesDeferralSuite(Suite):
         )
         assert rusted is None
 
+    def test_instance_callable_probe_engages(self) -> None:
+        # Issue #1205 (Port B): an Instance parsed across the MRO snapshot
+        # with no `__call__` definition decides the Instance <: Callable
+        # arm natively (Python's find_member miss returns False).
+        from mypy.subtypes import _serialize_type, is_subtype
+
+        right = self.fx.callable(self.fx.a, self.fx.bool_type)
+        self._set_gate(False)
+        assert not is_subtype(self.fx.a, right)
+        self._set_gate(True)
+        assert not is_subtype(self.fx.a, right)
+        rusted = _type_kernel.rust_is_subtype(
+            _serialize_type(self.fx.a),
+            _serialize_type(right),
+            False,
+            False,
+            False,
+            False,
+            False,
+            True,
+            False,
+            False,
+            self.resolver,
+        )
+        assert rusted is False
+
+    def test_overload_right_ordered_match_engages(self) -> None:
+        # Issue #1205 (Port C): Overloaded <: Overloaded mirrors
+        # visit_overloaded's ordered-match loop. Covers the out-of-order
+        # overlap probe (subtypes.py:1160-1168) for reordered items.
+        from mypy.subtypes import _serialize_type, is_subtype
+        from mypy.types import Overloaded
+
+        f = self.fx.callable(self.fx.a, self.fx.bool_type)
+        g = self.fx.callable(self.fx.b, self.fx.bool_type)
+
+        # Ordered subset: every right item is matched in non-decreasing
+        # left order -> True.
+        left = Overloaded([f, g])
+        right = Overloaded([f])
+        self._set_gate(False)
+        assert is_subtype(left, right)
+        self._set_gate(True)
+        assert is_subtype(left, right)
+        rusted = _type_kernel.rust_is_subtype(
+            _serialize_type(left),
+            _serialize_type(right),
+            False,
+            False,
+            False,
+            False,
+            False,
+            True,
+            False,
+            False,
+            self.resolver,
+        )
+        assert rusted is True
+
+        # Reordered overlap: right item `f` is matched only by the left
+        # item at index 1 (fixture B <: A, so g <: f is False), forcing
+        # `g` out of order; the overlap probe answers False.
+        left = Overloaded([g, f])
+        right = Overloaded([f, g])
+        self._set_gate(False)
+        assert not is_subtype(left, right)
+        self._set_gate(True)
+        assert not is_subtype(left, right)
+        rusted = _type_kernel.rust_is_subtype(
+            _serialize_type(left),
+            _serialize_type(right),
+            False,
+            False,
+            False,
+            False,
+            False,
+            True,
+            False,
+            False,
+            self.resolver,
+        )
+        assert rusted is False
+
     def test_plain_equal_equivalent_engages(self) -> None:
         # A regression guard: plain (alias-free) operand pairs must still be
         # decided natively, not newly deferred by the seam expansion.
