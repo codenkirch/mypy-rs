@@ -20290,6 +20290,19 @@ class NativeTypeAnalSuite(Suite):
         self.assertIsNone(result)
         # Python fallback would look up "Foo" and process it.
 
+    def test_defer_union_with_unbound_item(self) -> None:
+        """A union with an unbound leaf defers (issue #1167 fast path).
+
+        Rust rejects the unbound child after a full wire round-trip, so the
+        shim short-circuits before serializing; the caller falls back to the
+        Python visitor either way.
+        """
+        self._set_active(True)
+        u1 = UnionType([UnboundType("Foo"), NoneType()], line=1, column=0)
+        self.assertIsNone(native_analyze_type(u1))
+        u2 = UnionType([UnboundType("Foo"), UnboundType("Bar")], line=1, column=0)
+        self.assertIsNone(native_analyze_type(u2))
+
     def test_defer_type_alias_type_no_map(self) -> None:
         """TypeAliasType defers when no alias map is installed.
 
