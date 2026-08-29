@@ -1621,10 +1621,10 @@ including:
   `(ERR_*, index, 0)` record translated to a message by the Python
   shim. A `TypeAliasType` actual defers (`None`) via
   `ACTUAL_ALIAS` (proper-expanded aliases classify PLAIN). The
-  `is_duplicate_mapping_inner` shape lookup reads shapes by mapping
-  POSITION rather than the mapped actual index (the wire-era
-  behaviour), preserving a pre-existing decision bug verbatim; tracked
-  in #1152. Covered by `NativeCheckArgCountSuite` in
+  `is_duplicate_mapping_inner` shape lookup indexes
+  `actual_shapes` by the mapped actual index (`mapping[i]`),
+  matching Python's `actual_types[m]` facts (#1152). Covered by
+  `NativeCheckArgCountSuite` in
   `mypy/test/testtypes.py` (direct seam calls over every `ERR_*` record
   shape plus gate-off vs gate-on parity through the real method), and
   pure decision unit tests in `checkexpr_argcount.rs`.
