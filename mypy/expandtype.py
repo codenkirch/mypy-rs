@@ -694,14 +694,14 @@ def freshen_function_type_vars(callee: F) -> F:
             if tv.has_default():
                 # Point to fresh ids in case defaults depend on previous variables.
                 tv.default = expand_type(tv.default, tvmap)
-        fresh = expand_type(callee, tvmap)
+        fresh = expand_type(callee, tvmap).copy_modified(variables=tvs)
         from mypy.wirefixup import canonicalize_fresh_vars
 
         # The expand_type kernel seam re-decodes occurrences as distinct
-        # objects: unify them onto the freshened tvs so the variables slot
-        # and occurrences share identity for downstream in-place freeze.
-        fresh = canonicalize_fresh_vars(fresh, seed=tvs).copy_modified(variables=tvs)
-        return cast(F, fresh)
+        # objects: unify them onto the freshened tvs (pre-registered via
+        # seed) so the variables slot and occurrences share identity for
+        # downstream in-place freeze.
+        return cast(F, canonicalize_fresh_vars(fresh, seed=tvs))
     else:
         assert isinstance(callee, Overloaded)
         fresh_overload = Overloaded([freshen_function_type_vars(item) for item in callee.items])
