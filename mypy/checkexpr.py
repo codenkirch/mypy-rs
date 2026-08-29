@@ -166,9 +166,6 @@ from mypy.typeops import (
 from mypy.types import (
     LITERAL_TYPE_NAMES,
     TUPLE_LIKE_INSTANCE_NAMES,
-    _encode_no_arg_instance,
-    _serialize_stats,
-    _serialize_stats_on,
     AnyType,
     CallableType,
     DeletedType,
@@ -199,6 +196,9 @@ from mypy.types import (
     UninhabitedType,
     UnionType,
     UnpackType,
+    _encode_no_arg_instance,
+    _serialize_stats,
+    _serialize_stats_on,
     _serialize_with_taint_check,
     _type_wire_cache,
     _wire_cache_enabled,
@@ -250,19 +250,19 @@ try:
         rust_check_overload_call as _rust_check_overload_call,
         rust_classify_call as _rust_classify_call,
         rust_classify_check_arg as _rust_classify_check_arg,
+        rust_classify_check_boolean_op as _rust_classify_check_boolean_op,
+        rust_classify_index_with_type as _rust_classify_index_with_type,
         rust_classify_protocol_test_callee as _rust_classify_protocol_test_callee,
         rust_classify_reveal_imported as _rust_classify_reveal_imported,
-        rust_classify_index_with_type as _rust_classify_index_with_type,
         rust_classify_super_arg_types as _rust_classify_super_arg_types,
-        rust_classify_visit_op_expr as _rust_classify_visit_op_expr,
-        rust_classify_check_boolean_op as _rust_classify_check_boolean_op,
         rust_classify_typeddict_call as _rust_classify_typeddict_call,
-        rust_refers_to_typeddict as _rust_refers_to_typeddict,
+        rust_classify_visit_op_expr as _rust_classify_visit_op_expr,
         rust_combine_function_signatures as _rust_combine_function_signatures,
         rust_compute_arg_context_indices as _rust_compute_arg_context_indices,
         rust_conditional_expr_join as _rust_conditional_expr_join,
         rust_container_type as _rust_container_type,
         rust_dangerous_comparison as _rust_dangerous_comparison,
+        rust_get_arg_infer_passes as _rust_get_arg_infer_passes,
         rust_get_partial_instance_type as _rust_get_partial_instance_type,
         rust_has_abstract_type as _rust_has_abstract_type,
         rust_has_ambiguous_uninhabited_component as _rust_has_ambiguous_uninhabited_component,
@@ -270,7 +270,6 @@ try:
         rust_has_bytes_component as _rust_has_bytes_component,
         rust_has_coroutine_decorator as _rust_has_coroutine_decorator,
         rust_has_erased_component as _rust_has_erased_component,
-        rust_get_arg_infer_passes as _rust_get_arg_infer_passes,
         rust_has_uninhabited_component as _rust_has_uninhabited_component,
         rust_infer_function_type_arguments as _rust_infer_function_type_arguments,
         rust_is_async_def as _rust_is_async_def,
@@ -288,6 +287,7 @@ try:
         rust_normalize_callable as _rust_normalize_callable,
         rust_possible_none_type_var_overlap as _rust_possible_none_type_var_overlap,
         rust_real_union as _rust_real_union,
+        rust_refers_to_typeddict as _rust_refers_to_typeddict,
         rust_solve_generic_call as _rust_solve_generic_call,
         rust_star_expr as _rust_star_expr,
         rust_try_getting_int_literals as _rust_try_getting_int_literals,
@@ -759,6 +759,7 @@ def _decode_argtypes_plan(
         return cached
     try:
         from librt.internal import read_int as read_int_bare
+
         from mypy.cache import read_int_list
         from mypy.nodes import ArgKind
         from mypy.wirefixup import fixup_wire_type
@@ -886,6 +887,17 @@ def _try_native_check_boolean_op(
     """
     if _native_checkexpr_resolver is None:
         return None
+    # The union expanded-left is the dominant defer bucket (issue #1161):
+    # restricted Uninhabited-ness depends only on the live type tree, so
+    # compute the verdict here instead of deferring to the Python tail.
+    restricted_uninhabited: bool | None = None
+    # try_expanding_sum_type_to_union already returns a proper type.
+    if isinstance(get_proper_type(expanded_left_type), UnionType):
+        if e.op == "and":
+            restricted = false_only(expanded_left_type)
+        else:
+            restricted = true_only(expanded_left_type)
+        restricted_uninhabited = isinstance(restricted, UninhabitedType)
     try:
         left_values = [_serialize_type_for_checkexpr(v) for v in left_map.values()]
         right_values = [_serialize_type_for_checkexpr(v) for v in right_map.values()]
@@ -899,6 +911,7 @@ def _try_native_check_boolean_op(
             expanded_left_type.can_be_true,
             expanded_left_type.can_be_false,
             state.strict_optional,
+            restricted_uninhabited,
             _native_checkexpr_resolver,
         )
     except (AssertionError, NotImplementedError, ValueError, TypeError):

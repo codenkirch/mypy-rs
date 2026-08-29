@@ -1113,6 +1113,7 @@ def rust_classify_check_boolean_op(
     can_be_true: bool,
     can_be_false: bool,
     strict_optional: bool,
+    restricted_uninhabited: bool | None,
     resolver: NativeTypeResolver,
 ) -> tuple[int, bool, bool, int] | None: ...
 def rust_classify_index_with_type(left_type: Any, chk: Any, expand_variadic: bool) -> int | None: ...

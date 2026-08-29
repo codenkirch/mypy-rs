@@ -41281,20 +41281,29 @@ class NativeCheckBooleanOpSuite(Suite):
         resolver = self.resolver
         seam = _type_kernel.rust_classify_check_boolean_op
         # Both maps unreachable -> UNINHABITED (3).
-        r = seam(True, False, False, [unin_b], [unin_b], int_b, True, True, True, resolver)
+        r = seam(True, False, False, [unin_b], [unin_b], int_b, True, True, True, None, resolver)
         assert r == (2, True, True, 3)
         # Right unreachable -> RETURN_LEFT (result tag 0).
-        r = seam(True, False, False, [], [unin_b], int_b, True, True, True, resolver)
+        r = seam(True, False, False, [], [unin_b], int_b, True, True, True, None, resolver)
         assert r == (2, False, True, 0)
         # Left unreachable -> RETURN_RIGHT (result tag 1).
-        r = seam(True, False, False, [unin_b], [], int_b, True, True, True, resolver)
+        r = seam(True, False, False, [unin_b], [], int_b, True, True, True, None, resolver)
         assert r == (2, True, False, 1)
         # Live tail: false_only(int) -> LiteralType(0), result_is_left False -> UNION (2).
-        r = seam(True, False, False, [], [], int_b, True, True, True, resolver)
+        r = seam(True, False, False, [], [], int_b, True, True, True, None, resolver)
         assert r == (2, False, False, 2)
-        # Union expanded_left defers the tail.
+        # Union expanded_left: a shim-precomputed UninhabitedType verdict decides
+        # the tail natively (and: left truthy -> RETURN_RIGHT; verdict False ->
+        # UNION; or: left falsy -> RETURN_RIGHT).
         union_b = b(UnionType([self.int_inst, self.str_inst]))
-        assert seam(True, False, False, [], [], union_b, True, True, True, resolver) is None
+        r = seam(True, False, False, [], [], union_b, True, True, True, True, resolver)
+        assert r == (2, False, False, 1)
+        r = seam(True, False, False, [], [], union_b, True, True, True, False, resolver)
+        assert r == (2, False, False, 2)
+        r = seam(False, False, False, [], [], union_b, True, True, True, True, resolver)
+        assert r == (3, False, False, 1)
+        # No verdict -> defer.
+        assert seam(True, False, False, [], [], union_b, True, True, True, None, resolver) is None
 
     def test_par_right_always(self) -> None:
         e = self._make_op("or", right_always=True)
@@ -41370,18 +41379,19 @@ class NativeCheckBooleanOpSuite(Suite):
         assert off == on, f"both-unreachable: off={off} on={on}"
         assert off[0] == "Never", off
 
-    def test_par_defer_union_left(self) -> None:
-        # expanded_left is a UnionType: the Rust tail defers (None) and the
-        # whole body falls back to the pure-Python tail. Gate-on must equal
-        # gate-off, and the shim must actually defer.
+    def test_par_union_left_decided(self) -> None:
+        # expanded_left is a UnionType: the shim precomputes the
+        # UninhabitedType verdict from the expanded items, so the Rust tail
+        # decides instead of deferring. Gate-on must equal gate-off.
         e = self._make_op("and")
         fic: tuple[TypeMap, TypeMap] = ({}, {e.left: self.int_inst})
         left = UnionType([self.int_inst, self.str_inst])
-        assert self._try_native(e, fic[1], fic[0], left) is None
+        r = self._try_native(e, fic[1], fic[0], left)
+        assert r is not None and r[3] == 2  # UNION tail, decided natively
         make = lambda: self._make_ec(fic, left, self.str_inst)
         off = self._run(False, e, make)
         on = self._run(True, e, make)
-        assert off == on, f"defer-union: off={off} on={on}"
+        assert off == on, f"union-left: off={off} on={on}"
 
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
