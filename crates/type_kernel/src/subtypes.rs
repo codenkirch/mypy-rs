@@ -780,8 +780,7 @@ pub(crate) fn is_subtype(
         for right_item in right_items {
             let mut found_match = false;
             for (left_index, left_item) in left_items.iter().enumerate() {
-                let subtype_match =
-                    is_subtype(left_item, right_item, ctx, resolver);
+                let subtype_match = is_subtype(left_item, right_item, ctx, resolver);
                 if subtype_match.is_none() {
                     return None;
                 }
@@ -1430,7 +1429,10 @@ fn visit_instance_noninstance_right(
             ..
         } = left
         {
-            if !extra_attrs.iter().any(|attrs| attrs.attrs.contains_key("__call__")) {
+            if !extra_attrs
+                .iter()
+                .any(|attrs| attrs.attrs.contains_key("__call__"))
+            {
                 let snap = resolver.get(type_ref);
                 if let Some(snap) = snap {
                     if !snap.fallback_to_any
@@ -2747,16 +2749,12 @@ fn is_erased_arg(arg: &Type) -> Option<bool> {
             let first = inner_args.first()?;
             match first {
                 Type::AnyType { .. } => Some(true),
-                Type::TypeAliasType { .. } => {
-                    None
-                }
+                Type::TypeAliasType { .. } => None,
                 _ => Some(false),
             }
         }
         Type::AnyType { .. } => Some(true),
-        Type::TypeAliasType { .. } => {
-            None
-        }
+        Type::TypeAliasType { .. } => None,
         _ => Some(false),
     }
 }
@@ -2816,9 +2814,7 @@ fn erase_return_self_types_wire(typ: &Type, self_type: &Type) -> Option<Type> {
         } => {
             if !match ret_type.as_ref() {
                 Type::Instance { .. } => ret_type.as_ref() == self_type,
-                Type::TypeAliasType { .. } => {
-                    return None
-                }
+                Type::TypeAliasType { .. } => return None,
                 _ => false,
             } {
                 return Some(typ.clone());
@@ -5541,10 +5537,7 @@ mod tests {
             args: vec![],
             last_known_value: None,
             extra_attrs: Some(wire::ExtraAttrs {
-                attrs: attrs
-                    .into_iter()
-                    .map(|(k, v)| (k.to_string(), v))
-                    .collect(),
+                attrs: attrs.into_iter().map(|(k, v)| (k.to_string(), v)).collect(),
                 immutable: HashSet::new(),
                 mod_name: None,
             }),
