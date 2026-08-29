@@ -34,14 +34,6 @@ use crate::wire::{
     ReadBuffer, Type, WriteBuffer,
 };
 
-/// Marker for a tagged defer site. Tags exist so a future defer audit can
-/// re-instrument individual sites without re-inventing them.
-#[inline(always)]
-fn defer_site<T>(site: &'static str) -> Option<T> {
-    let _ = site;
-    None
-}
-
 // Alias-expanding union flatten (`flatten_nested_unions`, types.py:5057,
 // with handle_type_alias_type=True). Seams that reach `expand_type_inner`
 // without the expand entry keep the previous behavior (defer on aliases).
@@ -199,16 +191,21 @@ pub(crate) fn rust_expand_type(
 }
 
 /// Shared tail of the expand FFI entries: run the substitution and ship
-/// only concrete (typevar-free) results. Python's solver is identity
-/// based, so any leftover TypeVar after a wire round-trip defers.
+/// the result bytes.
 fn expand_with_env(
     typ: &Type,
     env: &HashMap<EnvKey, Type>,
     strict_optional: bool,
     alias_ok: bool,
 ) -> Option<Vec<u8>> {
-    let expanded = expand_type_with_env_inner(typ, env, strict_optional, false, alias_ok)?;
-    encode_type(&expanded)
+    encode_type(&expand_type_with_env_inner(
+        typ,
+        env,
+        strict_optional,
+        false,
+        alias_ok,
+        true,
+    )?)
 }
 
 /// Inner expansion returning the raw `Type`: leaves that carry no TypeVars
@@ -219,7 +216,7 @@ pub(crate) fn expand_type_with_env(
     env: &HashMap<EnvKey, Type>,
     strict_optional: bool,
 ) -> Option<Type> {
-    expand_type_with_env_inner(typ, env, strict_optional, false, false)
+    expand_type_with_env_inner(typ, env, strict_optional, false, false, false)
 }
 
 /// Free-result variant: leftover TypeVars are returned instead of deferring
@@ -233,6 +230,7 @@ fn expand_type_with_env_inner(
     strict_optional: bool,
     allow_free: bool,
     alias_ok: bool,
+    relink_ok: bool,
 ) -> Option<Type> {
     // Leaf types carry no TypeVars; Python returns the original object
     // (identity). We return a cloned copy — structurally identical, wire-safe.
@@ -240,14 +238,14 @@ fn expand_type_with_env_inner(
         return Some(typ.clone());
     }
     let expanded = expand_type_inner(typ, env, strict_optional)?;
-    if !allow_free && result_has_typevar(&expanded) {
-        return defer_site("res_tvar");
+    if !allow_free && !relink_ok && result_has_typevar(&expanded) {
+        return None;
     }
     // A surviving alias decodes with alias=None (types.py:397 asserts), so
     // unfixed aliases crash the caller. With alias_ok=true the shim
     // re-links survivors; other callers keep the defer.
     if !alias_ok && result_contains_typealias(&expanded) {
-        return defer_site("res_alias");
+        return None;
     }
     Some(expanded)
 }
@@ -276,7 +274,7 @@ pub(crate) fn rust_expand_type_by_instance(
     let typ = decode_type(type_bytes)?;
     let instance = decode_type(instance_bytes)?;
     let expanded =
-        expand_type_by_instance_core(&typ, &instance, resolver.resolver(), strict_optional)?;
+        expand_type_by_instance_relink(&typ, &instance, resolver.resolver(), strict_optional)?;
     encode_type(&expanded)
 }
 
@@ -302,7 +300,20 @@ pub(crate) fn expand_type_by_instance_core(
     resolver: &TypeResolver,
     strict_optional: bool,
 ) -> Option<Type> {
-    expand_type_by_instance_inner(typ, instance, resolver, strict_optional, false)
+    expand_type_by_instance_inner(typ, instance, resolver, strict_optional, false, false)
+}
+
+/// FFI-only variant of `expand_type_by_instance_core` with the
+/// identity-repair contract: leftover TypeVars are returned and the
+/// Python shim relinks them (`wirefixup.resync_var_identities`). Internal
+/// Rust callers keep the core's leftover-TypeVar exclusion.
+pub(crate) fn expand_type_by_instance_relink(
+    typ: &Type,
+    instance: &Type,
+    resolver: &TypeResolver,
+    strict_optional: bool,
+) -> Option<Type> {
+    expand_type_by_instance_inner(typ, instance, resolver, strict_optional, false, true)
 }
 
 /// Free-result variant of `expand_type_by_instance_core`: leftover TypeVars
@@ -316,7 +327,7 @@ pub(crate) fn expand_type_by_instance_free(
     resolver: &TypeResolver,
     strict_optional: bool,
 ) -> Option<Type> {
-    expand_type_by_instance_inner(typ, instance, resolver, strict_optional, true)
+    expand_type_by_instance_inner(typ, instance, resolver, strict_optional, true, false)
 }
 
 fn expand_type_by_instance_inner(
@@ -325,6 +336,7 @@ fn expand_type_by_instance_inner(
     resolver: &TypeResolver,
     strict_optional: bool,
     allow_free: bool,
+    relink_ok: bool,
 ) -> Option<Type> {
     let Type::Instance { type_ref, args, .. } = instance else {
         return None;
@@ -407,14 +419,21 @@ fn expand_type_by_instance_inner(
                 env.insert((raw_id, 0, env_ns.clone()), arg.clone());
             }
         }
-        return expand_type_with_env_inner(typ, &env, strict_optional, allow_free, false);
+        return expand_type_with_env_inner(
+            typ,
+            &env,
+            strict_optional,
+            allow_free,
+            false,
+            relink_ok,
+        );
     }
     // Non-variadic: fast path + binding (expandtype.py:407-409).
     let raw_ids = &snap.type_var_raw_ids;
     for (raw_id, arg) in raw_ids.iter().zip(args) {
         env.insert((*raw_id, 0, env_ns.clone()), arg.clone());
     }
-    expand_type_with_env_inner(typ, &env, strict_optional, allow_free, false)
+    expand_type_with_env_inner(typ, &env, strict_optional, allow_free, false, relink_ok)
 }
 
 /// Decode a wire-format `Type` blob. Returns `None` on any read failure.
@@ -579,10 +598,7 @@ pub(crate) fn expand_type_inner(
             }
             let flat = match flatten_union_expanding_aliases(&expanded) {
                 Some(flat) => flat,
-                None => match flatten_nested_unions(&expanded) {
-                    Some(flat) => flat,
-                    None => return defer_site("flatten"),
-                },
+                None => flatten_nested_unions(&expanded)?,
             };
             let simplified = union_make_union(remove_trivial(&flat, strict_optional));
             Some(simplified)
@@ -687,7 +703,7 @@ pub(crate) fn expand_type_inner(
             // variable is a ParamSpecType, return None.
             for v in variables {
                 if matches!(v, Type::ParamSpecType { .. }) {
-                    return defer_site("call_param_spec_vars");
+                    return None;
                 }
             }
             // `is_bound` needs no special handling here: it survives
@@ -698,7 +714,7 @@ pub(crate) fn expand_type_inner(
             // deferred: if a var_arg is an UnpackType, defer to Python.
             for at in arg_types {
                 if matches!(at, Type::UnpackType { .. }) {
-                    return defer_site("call_unpack_arg");
+                    return None;
                 }
             }
             // ExpandTypeVisitor (expandtype.py:676) expands arg_types, ret_type,
@@ -793,7 +809,7 @@ pub(crate) fn expand_type_inner(
 
         // Deferred variants: ParamSpecType (prefix merging too complex for
         // this stage).
-        Type::ParamSpecType { .. } => defer_site("param_spec_type"),
+        Type::ParamSpecType { .. } => None,
 
         // TypeVarTupleType (expandtype.py:703-715): expand the replacement
         // if bound; Any/Uninhabited build tuple_fallback[args=[repl]];
@@ -826,11 +842,11 @@ pub(crate) fn expand_type_inner(
                             extra_attrs: extra_attrs.clone(),
                         }
                     } else {
-                        return defer_site("tvt_fallback_noninst");
+                        return None;
                     };
                     Some(new_fallback)
                 }
-                Some(_) => defer_site("tvt_bad_repl"),
+                Some(_) => None,
                 None => Some(Type::TypeVarTupleType {
                     tuple_fallback: tuple_fallback.clone(),
                     name: name.clone(),
@@ -978,10 +994,7 @@ fn expand_unpack(tvt: &Type, env: &HashMap<EnvKey, Type>) -> Option<Vec<Type>> {
         // TypeVarTupleType wire has no meta_level yet; env meta is 0.
         let key = (*raw_id, 0, namespace.clone());
         // Unmatched TypeVarTuple: defer to Python.
-        match env.get(&key) {
-            Some(t) => t,
-            None => return defer_site("unpack_env_miss"),
-        }
+        env.get(&key)?
     } else {
         return None;
     };
@@ -1023,13 +1036,13 @@ fn expand_unpack(tvt: &Type, env: &HashMap<EnvKey, Type>) -> Option<Vec<Type>> {
                     extra_attrs: extra_attrs.clone(),
                 }
             } else {
-                return defer_site("unpack_fb_noninst");
+                return None;
             };
             Some(vec![Type::UnpackType {
                 typ: Box::new(new_fallback),
             }])
         }
-        _ => defer_site("unpack_invalid_repl"), // invalid replacement: defer to Python
+        _ => None, // invalid replacement: defer to Python
     }
 }
 
@@ -1563,13 +1576,26 @@ mod tests {
     }
 
     #[test]
-    fn expand_alias_entry_unmatched_tvar_inside_args_defers() {
+    fn expand_alias_entry_unmatched_tvar_expands_via_relink() {
         // `expand_type(X[T], {})` leaves T unmatched inside the alias args;
-        // the leftover-TypeVar identity guard still fires (res_tvar_head
-        // shape), independent of alias_ok.
+        // with relink_ok the FFI entry returns the expansion and the Python
+        // shim relinks the decoded TypeVar onto the live original
+        // (`wirefixup.resync_var_identities`, NativeExpandTypeEmptyEnvSuite).
         let typ = alias_type("foo.Alias", vec![tvar(0)]);
         let env: HashMap<EnvKey, Type> = HashMap::new();
-        assert!(expand_with_env(&typ, &env, false, true).is_none());
+        match expand_with_env(&typ, &env, false, true) {
+            Some(bytes) => match decode_type(&bytes).unwrap() {
+                Type::TypeAliasType { args, type_ref } => {
+                    assert_eq!(type_ref, "foo.Alias");
+                    assert!(matches!(args.as_slice(), [Type::TypeVarType { .. }]));
+                }
+                other => panic!("expected TypeAliasType, got {:?}", other),
+            },
+            None => panic!("relink entry must not defer on a leftover tvar"),
+        }
+        // The old relink-less wrapper (infer_variance / expand_variants
+        // callers) keeps the identity defer.
+        assert!(expand_type_with_env(&typ, &env, false).is_none());
     }
 
     #[test]
