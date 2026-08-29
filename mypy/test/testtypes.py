@@ -4443,6 +4443,129 @@ class NativeExpandTypeFreezeIdentitySuite(Suite):
 
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeExpandTypeDefinitionGateSuite(Suite):
+    """Parity for the `definition_gate` flag in expandtype._needs_python (#1220).
+
+    The CallableType arm of `mypy.expandtype._needs_python` checked
+    `p.definition is not None` unconditionally, so callers passing
+    `definition_gate=False` (expand_type, expand_type_by_instance,
+    freshen_all_functions_type_vars) over-deferred to Python whenever the
+    type nested a callable carrying a `definition` node, even though each
+    repairs the wire-decoded result via `_resync_definitions`. The twin
+    `mypy.typeops._needs_python` already mirrors
+    `if definition_gate and p.definition is not None`.
+
+    Scope note: freshen_function_type_vars keeps the gate. Its decoded
+    result re-enters error reporting as a plugin FunctionContext
+    (`ctx.default_return_type`), and wire-decoded nested types carry no
+    locations, so relaxing it there loses error line numbers.
+
+    Locks: with `definition_gate=False` a definition-bearing callable must
+    no longer defer (the direct rust_expand_type seam returns bytes), while
+    `definition_gate=True` keeps the defer; gate off vs gate on must agree
+    on the expanded str and re-stamp the same live definition node.
+    """
+
+    def setUp(self) -> None:
+        from mypy.expandtype import (
+            _set_native_expand_type_active,
+            _set_native_expand_type_resolver,
+            _set_native_expand_type_typeinfo_map,
+        )
+        from mypy.nodes import ARG_POS, FuncDef
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        self.fx = TypeFixture()
+        self._set_active = _set_native_expand_type_active
+        self._set_resolver = _set_native_expand_type_resolver
+        self._set_map = _set_native_expand_type_typeinfo_map
+        type_infos = []
+        for name in dir(self.fx):
+            if not name.endswith("i"):
+                continue
+            value = getattr(self.fx, name)
+            if _is_type_info(value):
+                type_infos.append(value)
+        self._type_infos = type_infos
+        self._resolver = _type_kernel.build_native_resolver(type_infos, [])
+        self._set_resolver(self._resolver)
+        self._set_map({info.fullname: info for info in type_infos})
+        set_wire_typeinfo_map({info.fullname: info for info in type_infos})
+        self._set_active(True)
+
+        fx = self.fx
+        defn = FuncDef("f")
+        self._callee = CallableType(
+            [fx.t],
+            [ARG_POS],
+            [None],
+            fx.t,
+            fx.function,
+            name="f",
+            definition=defn,
+        )
+        self._defn = defn
+
+    def tearDown(self) -> None:
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        self._set_active(False)
+        self._set_resolver(None)
+        self._set_map(None)
+        set_wire_typeinfo_map(None)
+
+    def _with_gate(self, active: bool, fn: Callable[[], T]) -> T:
+        self._set_active(active)
+        try:
+            return fn()
+        finally:
+            self._set_active(True)
+
+    def test_definition_gate_false_stops_deferring(self) -> None:
+        from mypy.expandtype import _needs_python
+
+        assert _needs_python(self._callee), "gate=True must defer on definition"
+        assert not _needs_python(
+            self._callee, definition_gate=False
+        ), "gate=False must not defer on a re-stamped callable"
+        # A nested definition-carrying callable must also pass relaxed.
+        nested = UnionType([self._callee, self.fx.b])
+        assert not _needs_python(nested, definition_gate=False)
+
+    def test_seam_engages_with_definition(self) -> None:
+        # Direct seam call: the wire format drops the definition node, so
+        # engagement is decidable; the composite gate previously bounced
+        # the whole call here (issue #1220).
+        from mypy.expandtype import _serialize_env, _serialize_type
+
+        fx = self.fx
+        result = _type_kernel.rust_expand_type(
+            self._resolver,
+            _serialize_type(self._callee),
+            _serialize_env({fx.t.id: fx.b}),
+            state.strict_optional,
+        )
+        assert result is not None, "Rust expand_type did not engage for definition-carrying callable"
+
+    def test_expand_type_gate_parity_definition_restamped(self) -> None:
+        from mypy.expandtype import expand_type
+
+        fx = self.fx
+
+        def run() -> Type:
+            return expand_type(self._callee, {fx.t.id: fx.b})
+
+        off = self._with_gate(False, lambda: str(run()))
+        on_gateway = self._with_gate(True, run)
+        on = str(on_gateway)
+        assert_equal(on, off, "expand_type parity on definition-carrying callable")
+        on_proper = get_proper_type(on_gateway)
+        assert isinstance(on_proper, CallableType)
+        # The native path must re-stamp the same live definition node.
+        assert on_proper.definition is self._defn
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeExpandTypeEmptyEnvSuite(Suite):
     """Parity for the Rust `expand_type` empty-env fast path.
 
