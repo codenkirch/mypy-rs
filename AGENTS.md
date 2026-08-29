@@ -2063,8 +2063,10 @@ directly to `main`.
   reflexive `left == right` fast path at the top. `VARIANCE_NOT_READY`
   still defers, but `mypy/build.py` (`_build_native_resolvers`, right
   after `_collect_incremental`) now pre-infers snapshot variance via
-  `infer_class_variances` for infos carrying a NOT_READY TypeVarType;
-  known limitation: classes with unannotated attribute Vars fail
+  `infer_class_variances` for infos carrying a NOT_READY TypeVarType,
+  skipped entirely on empty-`scc` daemon mid-propagation calls
+  (transitional `self.modules` pins wrong variance; #1146); known
+  limitation: classes with unannotated attribute Vars fail
   build-time inference (Var.type is None at semanal) and keep deferring.
   Covered by `NativeArgVarianceWalkSuite` in `mypy/test/testtypes.py`
   (gate-off vs gate-on differentials for covariant/contravariant/
