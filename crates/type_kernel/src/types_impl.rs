@@ -336,9 +336,9 @@ fn can_be_any_bool_for(
 /// itself an alias, so feed the result back in until it lands on a
 /// non-alias type. `None` defers: missing snapshot, alias cycle, or a
 /// substitution the kernel cannot perform exactly.
-fn chain_resolve_alias_target(
+pub(crate) fn chain_resolve_alias_target(
     typ: &Type,
-    aliases: &crate::aliases::TypeAliasResolver,
+    aliases: &dyn crate::aliases::AliasLookup,
 ) -> Option<Type> {
     let mut current = typ.clone();
     // Guards mutual recursion across no_args aliases (A -> B, B -> A):

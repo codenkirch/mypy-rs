@@ -75,9 +75,17 @@ impl TypeAliasSnapshot {
 /// Resolver: maps `TypeAlias.fullname` (the `type_ref` string on
 /// `Type::TypeAliasType`) to a snapshot. Built once per type-checking
 /// pass from the live Python symbol table. Lookups are `O(1)` HashMap.
+/// Inserts are rare (first-seal-wins, per build-manager snapshot pass),
+/// so the cached `shared()` view is rebuilt at most once per pass.
+/// Single-threaded access: this is a build-local snapshot, owned by the
+/// pyclass, so the `RefCell` is safe.
 #[allow(dead_code)]
 pub(crate) struct TypeAliasResolver {
     snapshots: HashMap<String, TypeAliasSnapshot>,
+    /// Cheap shareable full-map view for the expand kernel's TLS install
+    /// (expandtype.rs): a clone-at-most-once cache, dropped by `insert`
+    /// so a later install sees the grown map.
+    shared: std::cell::RefCell<Option<std::sync::Arc<HashMap<String, TypeAliasSnapshot>>>>,
 }
 
 #[allow(dead_code)]
@@ -85,15 +93,27 @@ impl TypeAliasResolver {
     pub fn new() -> Self {
         Self {
             snapshots: HashMap::new(),
+            shared: std::cell::RefCell::new(None),
         }
     }
 
     pub fn insert(&mut self, fullname: String, snap: TypeAliasSnapshot) {
         self.snapshots.insert(fullname, snap);
+        // Any snapshot change must invalidate the frozen view.
+        *self.shared.borrow_mut() = None;
     }
 
     pub fn get(&self, fullname: &str) -> Option<&TypeAliasSnapshot> {
         self.snapshots.get(fullname)
+    }
+
+    /// Full map as a cheap-to-clone `Arc` (built at most once between
+    /// inserts). The map is frozen between build-manager snapshot passes,
+    /// so per-call installs in the expand kernel pay one refcount bump.
+    pub(crate) fn shared(&self) -> std::sync::Arc<HashMap<String, TypeAliasSnapshot>> {
+        let mut slot = self.shared.borrow_mut();
+        slot.get_or_insert_with(|| std::sync::Arc::new(self.snapshots.clone()))
+            .clone()
     }
 
     pub fn len(&self) -> usize {
@@ -102,6 +122,25 @@ impl TypeAliasResolver {
 
     pub fn is_empty(&self) -> bool {
         self.snapshots.is_empty()
+    }
+}
+
+/// Read-only alias snapshot lookup. Lets the expand kernel's TLS hold a
+/// cheap `Arc<HashMap<..>>` view while the snapshot helpers keep taking a
+/// resolver-shaped reference at their existing call sites.
+pub(crate) trait AliasLookup {
+    fn get(&self, fullname: &str) -> Option<&TypeAliasSnapshot>;
+}
+
+impl AliasLookup for TypeAliasResolver {
+    fn get(&self, fullname: &str) -> Option<&TypeAliasSnapshot> {
+        self.snapshots.get(fullname)
+    }
+}
+
+impl AliasLookup for std::sync::Arc<HashMap<String, TypeAliasSnapshot>> {
+    fn get(&self, fullname: &str) -> Option<&TypeAliasSnapshot> {
+        (**self).get(fullname)
     }
 }
 

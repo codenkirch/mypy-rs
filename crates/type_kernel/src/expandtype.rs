@@ -19,11 +19,14 @@
 //!     `NotImplementedError` in Python for non-trivial replacements; we
 //!     defer those to Python rather than raise over FFI.
 
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 
 use pyo3::prelude::*;
 
-use crate::setops::{flatten_nested_unions, union_make_union};
+use crate::setops::{
+    flatten_nested_unions, union_item_can_be_false, union_item_can_be_true, union_make_union,
+};
 use crate::typeinfo::{NativeTypeResolver, TypeResolver};
 use crate::visitor::split_with_prefix_and_suffix_inner;
 use crate::wire::{
@@ -31,6 +34,136 @@ use crate::wire::{
     ReadBuffer, Type, WriteBuffer,
 };
 
+/// Marker for a tagged defer site. Tags exist so a future defer audit can
+/// re-instrument individual sites without re-inventing them.
+#[inline(always)]
+fn defer_site<T>(site: &'static str) -> Option<T> {
+    let _ = site;
+    None
+}
+
+// Alias-expanding union flatten (`flatten_nested_unions`, types.py:5057,
+// with handle_type_alias_type=True). Seams that reach `expand_type_inner`
+// without the expand entry keep the previous behavior (defer on aliases).
+type AliasMap = std::sync::Arc<HashMap<String, crate::aliases::TypeAliasSnapshot>>;
+
+thread_local! {
+    /// Alias snapshots for `flatten_union_expanding_aliases`, installed
+    /// by `rust_expand_type` for the duration of one call. `None` keeps
+    /// the pre-1203 contract (defer on any alias item) for seams that
+    /// reach `expand_type_inner` without the expand entry.
+    static FLAT_ALIASES: RefCell<Option<AliasMap>> = const { RefCell::new(None) };
+    /// InstantiateAliasVisitor mode (types.py:5513-5525): during alias
+    /// substitution, `expand_type_inner`'s union arm rebuilds a plain
+    /// translated union instead of flatten+simplify.
+    static INSTANTIATE: Cell<bool> = const { Cell::new(false) };
+}
+
+/// RAII: installs the alias map for one `rust_expand_type` call, clears
+/// it on drop (panic-safe).
+struct FlatAliasGuard;
+
+impl FlatAliasGuard {
+    fn install(resolver: &NativeTypeResolver) -> Self {
+        let map = resolver.alias_resolver().shared();
+        FLAT_ALIASES.with(|c| *c.borrow_mut() = Some(map));
+        FlatAliasGuard
+    }
+}
+
+impl Drop for FlatAliasGuard {
+    fn drop(&mut self) {
+        FLAT_ALIASES.with(|c| *c.borrow_mut() = None);
+    }
+}
+
+/// RAII for `INSTANTIATE`: sets the flag around alias substitution and
+/// restores the previous value on drop (panic-safe, nesting-aware).
+struct InstantiateGuard(bool);
+
+impl InstantiateGuard {
+    fn new() -> Self {
+        let prev = INSTANTIATE.with(Cell::get);
+        INSTANTIATE.with(|c| c.set(true));
+        InstantiateGuard(prev)
+    }
+}
+
+impl Drop for InstantiateGuard {
+    fn drop(&mut self) {
+        INSTANTIATE.with(|c| c.set(self.0));
+    }
+}
+
+/// Walks an item's top-level alias chain and returns `Some(true)` when
+/// the chain must defer: any snapshot with a `tvar_tuple_index` (the
+/// kernel's arg substitution zips `alias_tvars`/`args` directly, while
+/// Python splits the middle via `split_with_prefix_and_suffix`,
+/// types.py:452-466). `Some(false)` = safe to substitute; `None` = defer
+/// (missing snapshot or alias cycle, mirroring the seen-walk in
+/// `chain_resolve_alias_target`). A `no_args` snapshot ends the walk:
+/// Python's `_expand_once` asserts its target is an Instance
+/// (types.py:445-449), never a union, and the chain cannot continue.
+fn alias_chain_needs_defer(type_ref: &str, map: &AliasMap) -> Option<bool> {
+    let mut seen: Vec<String> = Vec::new();
+    let mut current_ref = type_ref.to_owned();
+    loop {
+        if seen.contains(&current_ref) {
+            return None;
+        }
+        seen.push(current_ref.clone());
+        let snap = map.get(&current_ref)?;
+        if snap.tvar_tuple_index.is_some() {
+            return Some(true);
+        }
+        if snap.no_args {
+            return Some(false);
+        }
+        let target = read_type(&mut ReadBuffer::new(&snap.target), None).ok()?;
+        match &target {
+            Type::TypeAliasType { type_ref: next, .. } => current_ref = next.clone(),
+            _ => return Some(false),
+        }
+    }
+}
+
+/// `flatten_nested_unions` (types.py:5057-5100) with
+/// `handle_type_alias_type=True`: top-level alias items are chain-expanded
+/// via the installed alias map (mirroring `get_proper_type`,
+/// types.py:4047-4064), recursing through union positions only; a
+/// non-union expansion appends the ORIGINAL alias node ("Must preserve
+/// original aliases when possible", types.py:5098-5099). Returns `None`
+/// to defer: no alias map installed, missing snapshot, alias cycle, or a
+/// `tvar_tuple_index` alias in the chain (see `alias_chain_needs_defer`).
+fn flatten_union_expanding_aliases(items: &[Type]) -> Option<Vec<Type>> {
+    let map = FLAT_ALIASES.with(|c| c.borrow().clone())?;
+    let mut flat = Vec::with_capacity(items.len());
+    for t in items {
+        match t {
+            Type::TypeAliasType { type_ref, .. } => {
+                if alias_chain_needs_defer(type_ref, &map)? {
+                    return None;
+                }
+                let tp = {
+                    // InstantiateAliasVisitor, not the simplifying union
+                    // arm (types.py:5513-5525).
+                    let _guard = InstantiateGuard::new();
+                    crate::types_impl::chain_resolve_alias_target(t, &map)?
+                };
+                if let Type::UnionType { items: inner, .. } = tp {
+                    flat.extend(flatten_union_expanding_aliases(&inner)?);
+                } else {
+                    flat.push(t.clone());
+                }
+            }
+            Type::UnionType { items: inner, .. } => {
+                flat.extend(flatten_union_expanding_aliases(inner)?);
+            }
+            _ => flat.push(t.clone()),
+        }
+    }
+    Some(flat)
+}
 /// Key for the env: `(raw_id, meta_level, namespace)`. Mirrors
 /// `TypeVarId.__eq__` (types.py:574-576), which compares `raw_id`,
 /// `meta_level`, and `namespace`.
@@ -56,6 +189,7 @@ pub(crate) fn rust_expand_type(
     strict_optional: bool,
 ) -> Option<Vec<u8>> {
     let _ = resolver; // reserved for future Instance.has_type_var_tuple lookups
+    let _flat_alias_guard = FlatAliasGuard::install(resolver);
     let typ = decode_type(type_bytes)?;
     let env = decode_env(env_bytes)?;
     // Empty env is fully wire-portable; alias-bearing inputs are fine too:
@@ -107,13 +241,13 @@ fn expand_type_with_env_inner(
     }
     let expanded = expand_type_inner(typ, env, strict_optional)?;
     if !allow_free && result_has_typevar(&expanded) {
-        return None;
+        return defer_site("res_tvar");
     }
     // A surviving alias decodes with alias=None (types.py:397 asserts), so
     // unfixed aliases crash the caller. With alias_ok=true the shim
     // re-links survivors; other callers keep the defer.
     if !alias_ok && result_contains_typealias(&expanded) {
-        return None;
+        return defer_site("res_alias");
     }
     Some(expanded)
 }
@@ -421,12 +555,35 @@ pub(crate) fn expand_type_inner(
         // UnionType: Python calls
         // make_union(remove_trivial(flatten_nested_unions(expanded))) then
         // get_proper_type, which collapses and deduplicates items.
-        Type::UnionType { items, .. } => {
+        Type::UnionType {
+            items,
+            uses_pep604_syntax,
+            ..
+        } => {
             let mut expanded = Vec::with_capacity(items.len());
             for item in items {
                 expanded.push(expand_type_inner(item, env, strict_optional)?);
             }
-            let flat = flatten_nested_unions(&expanded)?;
+            if INSTANTIATE.get() {
+                // InstantiateAliasVisitor.visit_union_type
+                // (types.py:5513-5525): plain rebuild, truthiness flags
+                // recomputed from items.
+                let can_t = expanded.iter().any(union_item_can_be_true);
+                let can_f = expanded.iter().any(union_item_can_be_false);
+                return Some(Type::UnionType {
+                    items: expanded,
+                    uses_pep604_syntax: *uses_pep604_syntax,
+                    can_be_true: can_t,
+                    can_be_false: can_f,
+                });
+            }
+            let flat = match flatten_union_expanding_aliases(&expanded) {
+                Some(flat) => flat,
+                None => match flatten_nested_unions(&expanded) {
+                    Some(flat) => flat,
+                    None => return defer_site("flatten"),
+                },
+            };
             let simplified = union_make_union(remove_trivial(&flat, strict_optional));
             Some(simplified)
         }
@@ -530,7 +687,7 @@ pub(crate) fn expand_type_inner(
             // variable is a ParamSpecType, return None.
             for v in variables {
                 if matches!(v, Type::ParamSpecType { .. }) {
-                    return None;
+                    return defer_site("call_param_spec_vars");
                 }
             }
             // `is_bound` needs no special handling here: it survives
@@ -541,7 +698,7 @@ pub(crate) fn expand_type_inner(
             // deferred: if a var_arg is an UnpackType, defer to Python.
             for at in arg_types {
                 if matches!(at, Type::UnpackType { .. }) {
-                    return None;
+                    return defer_site("call_unpack_arg");
                 }
             }
             // ExpandTypeVisitor (expandtype.py:676) expands arg_types, ret_type,
@@ -636,7 +793,7 @@ pub(crate) fn expand_type_inner(
 
         // Deferred variants: ParamSpecType (prefix merging too complex for
         // this stage).
-        Type::ParamSpecType { .. } => None,
+        Type::ParamSpecType { .. } => defer_site("param_spec_type"),
 
         // TypeVarTupleType (expandtype.py:703-715): expand the replacement
         // if bound; Any/Uninhabited build tuple_fallback[args=[repl]];
@@ -669,11 +826,11 @@ pub(crate) fn expand_type_inner(
                             extra_attrs: extra_attrs.clone(),
                         }
                     } else {
-                        return None;
+                        return defer_site("tvt_fallback_noninst");
                     };
                     Some(new_fallback)
                 }
-                Some(_) => None,
+                Some(_) => defer_site("tvt_bad_repl"),
                 None => Some(Type::TypeVarTupleType {
                     tuple_fallback: tuple_fallback.clone(),
                     name: name.clone(),
@@ -821,7 +978,10 @@ fn expand_unpack(tvt: &Type, env: &HashMap<EnvKey, Type>) -> Option<Vec<Type>> {
         // TypeVarTupleType wire has no meta_level yet; env meta is 0.
         let key = (*raw_id, 0, namespace.clone());
         // Unmatched TypeVarTuple: defer to Python.
-        env.get(&key)?
+        match env.get(&key) {
+            Some(t) => t,
+            None => return defer_site("unpack_env_miss"),
+        }
     } else {
         return None;
     };
@@ -863,13 +1023,13 @@ fn expand_unpack(tvt: &Type, env: &HashMap<EnvKey, Type>) -> Option<Vec<Type>> {
                     extra_attrs: extra_attrs.clone(),
                 }
             } else {
-                return None;
+                return defer_site("unpack_fb_noninst");
             };
             Some(vec![Type::UnpackType {
                 typ: Box::new(new_fallback),
             }])
         }
-        _ => None, // invalid replacement: defer to Python
+        _ => defer_site("unpack_invalid_repl"), // invalid replacement: defer to Python
     }
 }
 
@@ -1422,5 +1582,269 @@ mod tests {
         assert!(expand_type_with_env(&typ, &env, false).is_none());
         // Same input via the alias_ok=true entry completes.
         assert!(expand_with_env(&typ, &env, false, true).is_some());
+    }
+
+    // --- alias-expanding union flatten (types.py:5057, issue #1203) ---
+
+    use crate::aliases::{AliasTvar, TypeAliasSnapshot};
+
+    fn union(items: Vec<Type>) -> Type {
+        let can_be_true = items.iter().any(union_item_can_be_true);
+        let can_be_false = items.iter().any(union_item_can_be_false);
+        Type::UnionType {
+            items,
+            uses_pep604_syntax: false,
+            can_be_true,
+            can_be_false,
+        }
+    }
+
+    fn alias_snapshot(fullname: &str, target: &Type) -> TypeAliasSnapshot {
+        TypeAliasSnapshot {
+            fullname: fullname.to_owned(),
+            target: encode(target),
+            alias_tvars: vec![],
+            tvar_tuple_index: None,
+            no_args: false,
+            python_3_12_type_alias: false,
+        }
+    }
+
+    fn alias_tvar(raw_id: i64) -> AliasTvar {
+        AliasTvar {
+            name: "T".to_string(),
+            raw_id,
+            meta_level: 0,
+            namespace: String::new(),
+            is_type_var_tuple: false,
+        }
+    }
+
+    fn with_alias_map(map: HashMap<String, TypeAliasSnapshot>, f: impl FnOnce()) {
+        FLAT_ALIASES.with(|c| *c.borrow_mut() = Some(std::sync::Arc::new(map)));
+        f();
+        // Restore the unset state so test order cannot interfere.
+        FLAT_ALIASES.with(|c| *c.borrow_mut() = None);
+    }
+
+    #[test]
+    fn flatten_expands_top_level_alias_union_item() {
+        // A = Union[int, str]: flatten([A, bytes]) -> [int, str, bytes].
+        let mut map = HashMap::new();
+        map.insert(
+            "testmod.A".to_string(),
+            alias_snapshot(
+                "testmod.A",
+                &union(vec![
+                    instance("builtins.int", vec![]),
+                    instance("builtins.str", vec![]),
+                ]),
+            ),
+        );
+        with_alias_map(map, || {
+            let out = flatten_union_expanding_aliases(&[
+                alias_type("testmod.A", vec![]),
+                instance("builtins.bytes", vec![]),
+            ])
+            .unwrap();
+            match out.as_slice() {
+                [t1, t2, t3] => {
+                    let refs: Vec<&str> = [t1, t2, t3]
+                        .iter()
+                        .map(|t| match t {
+                            Type::Instance { type_ref, .. } => type_ref.as_str(),
+                            other => panic!("expected Instance, got {:?}", other),
+                        })
+                        .collect();
+                    assert_eq!(refs, ["builtins.int", "builtins.str", "builtins.bytes"]);
+                }
+                other => panic!("expected 3 flat items, got {:?}", other),
+            }
+        });
+    }
+
+    #[test]
+    fn flatten_preserves_alias_non_union_item() {
+        // A = list[int]: the expansion is not a union, so the ORIGINAL
+        // alias node is appended (types.py:5098-5099).
+        let mut map = HashMap::new();
+        map.insert(
+            "testmod.A".to_string(),
+            alias_snapshot(
+                "testmod.A",
+                &instance("builtins.list", vec![instance("builtins.int", vec![])]),
+            ),
+        );
+        with_alias_map(map, || {
+            let out = flatten_union_expanding_aliases(&[alias_type("testmod.A", vec![])]).unwrap();
+            match out.as_slice() {
+                [Type::TypeAliasType { type_ref, args }] => {
+                    assert_eq!(type_ref, "testmod.A");
+                    assert!(args.is_empty());
+                }
+                other => panic!("expected the original alias node, got {:?}", other),
+            }
+        });
+    }
+
+    #[test]
+    fn flatten_defers_on_tvt_alias() {
+        // A `tvar_tuple_index` alias cannot be substituted exactly here:
+        // Python splits the middle (split_with_prefix_and_suffix), the
+        // kernel zips, so flatten defers (parity-safe).
+        let mut snap = alias_snapshot(
+            "testmod.Pair",
+            &union(vec![
+                instance("builtins.int", vec![]),
+                instance("builtins.str", vec![]),
+            ]),
+        );
+        snap.tvar_tuple_index = Some(0);
+        let mut map = HashMap::new();
+        map.insert("testmod.Pair".to_string(), snap);
+        with_alias_map(map, || {
+            assert!(
+                flatten_union_expanding_aliases(&[alias_type("testmod.Pair", vec![])]).is_none()
+            );
+        });
+    }
+
+    #[test]
+    fn flatten_defers_on_missing_snapshot() {
+        with_alias_map(HashMap::new(), || {
+            assert!(
+                flatten_union_expanding_aliases(&[alias_type("testmod.Missing", vec![])]).is_none()
+            );
+        });
+    }
+
+    #[test]
+    fn flatten_defers_on_alias_chain_cycle() {
+        // A -> B -> A (mirrors get_proper_type's guardless loop; the
+        // kernel's seen-walk defers).
+        let mut map = HashMap::new();
+        map.insert("testmod.A".to_string(), {
+            let mut s = alias_snapshot("testmod.A", &alias_type("testmod.B", vec![]));
+            s.fullname = "testmod.A".to_string();
+            s
+        });
+        map.insert("testmod.B".to_string(), {
+            let mut s = alias_snapshot("testmod.B", &alias_type("testmod.A", vec![]));
+            s.fullname = "testmod.B".to_string();
+            s
+        });
+        with_alias_map(map, || {
+            assert!(flatten_union_expanding_aliases(&[alias_type("testmod.A", vec![])]).is_none());
+        });
+    }
+
+    #[test]
+    fn flatten_follows_chain_to_union() {
+        // A = B, B = Union[int, str]: the chain ends on a union, so the
+        // items are flattened.
+        let mut map = HashMap::new();
+        map.insert(
+            "testmod.A".to_string(),
+            alias_snapshot("testmod.A", &alias_type("testmod.B", vec![])),
+        );
+        map.insert(
+            "testmod.B".to_string(),
+            alias_snapshot(
+                "testmod.B",
+                &union(vec![
+                    instance("builtins.int", vec![]),
+                    instance("builtins.str", vec![]),
+                ]),
+            ),
+        );
+        with_alias_map(map, || {
+            let out = flatten_union_expanding_aliases(&[alias_type("testmod.A", vec![])]).unwrap();
+            assert_eq!(out.len(), 2);
+        });
+    }
+
+    #[test]
+    fn flatten_substitutes_alias_args_without_simplifying() {
+        // A[T] = Union[list[T], str]: the target substitutes under the
+        // InstantiateAliasVisitor contract, then recurses into the
+        // result's union items.
+        let target = union(vec![
+            instance("builtins.list", vec![tvar(0)]),
+            instance("builtins.str", vec![]),
+        ]);
+        let mut snap = alias_snapshot("testmod.A", &target);
+        snap.alias_tvars = vec![alias_tvar(0)];
+        let mut map = HashMap::new();
+        map.insert("testmod.A".to_string(), snap);
+        with_alias_map(map, || {
+            let out = flatten_union_expanding_aliases(&[alias_type(
+                "testmod.A",
+                vec![instance("builtins.int", vec![])],
+            )])
+            .unwrap();
+            match out.as_slice() {
+                [t1, t2] => {
+                    assert!(matches!(t1, Type::Instance { type_ref, args, .. }
+                        if type_ref == "builtins.list"));
+                    if let Type::Instance { args, .. } = t1 {
+                        assert!(matches!(args.as_slice(),
+                            [Type::Instance { type_ref: ir, .. }] if ir == "builtins.int"));
+                    }
+                    assert!(
+                        matches!(t2, Type::Instance { type_ref, .. } if type_ref == "builtins.str")
+                    );
+                }
+                other => panic!("expected substituted union items, got {:?}", other),
+            }
+            // The nested substitution must not have leaked INSTANTIATE.
+            assert!(!INSTANTIATE.get());
+        });
+    }
+
+    #[test]
+    fn instantiate_mode_rebuilds_plain_union() {
+        // InstantiateAliasVisitor.visit_union_type (types.py:5513-5525):
+        // no flatten, no simplify; structure and truthiness flags only.
+        let typ = union(vec![
+            union(vec![
+                instance("builtins.int", vec![]),
+                instance("builtins.str", vec![]),
+            ]),
+            instance("builtins.bytes", vec![]),
+        ]);
+        INSTANTIATE.with(|c| c.set(true));
+        let out = expand_type_inner(&typ, &HashMap::new(), false).unwrap();
+        INSTANTIATE.with(|c| c.set(false));
+        match out {
+            Type::UnionType {
+                items,
+                can_be_true,
+                can_be_false,
+                ..
+            } => {
+                assert_eq!(items.len(), 2); // nested union preserved
+                assert!(matches!(items[0], Type::UnionType { .. }));
+                assert!(can_be_true);
+                assert!(can_be_false);
+            }
+            other => panic!("expected plain rebuilt union, got {:?}", other),
+        }
+        // Normal mode flattens the same input to 3 items.
+        let out = expand_type_inner(&typ, &HashMap::new(), false).unwrap();
+        match out {
+            Type::UnionType { items, .. } => assert_eq!(items.len(), 3),
+            other => panic!("expected flattened union, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn union_arm_defers_on_alias_without_alias_map() {
+        // TLS unset (e.g. expand_type_by_instance callers): an alias item
+        // keeps the pre-1203 defer.
+        let typ = union(vec![
+            alias_type("testmod.A", vec![]),
+            instance("builtins.int", vec![]),
+        ]);
+        assert!(expand_type_inner(&typ, &HashMap::new(), false).is_none());
     }
 }

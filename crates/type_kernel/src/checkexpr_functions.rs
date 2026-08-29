@@ -106,7 +106,7 @@ pub(crate) fn get_proper_or_expand(
 /// to defer (missing snapshot, undecodable target, or a cycle).
 pub(crate) fn expand_alias_shape(
     typ: &Type,
-    aliases: &crate::aliases::TypeAliasResolver,
+    aliases: &dyn crate::aliases::AliasLookup,
 ) -> Option<Type> {
     let mut current = typ.clone();
     let mut seen: Vec<String> = Vec::new();
@@ -144,7 +144,7 @@ pub(crate) fn expand_alias_shape(
 /// substitution-requiring alias.
 pub(crate) fn expand_alias_target_raw(
     typ: &Type,
-    aliases: &crate::aliases::TypeAliasResolver,
+    aliases: &dyn crate::aliases::AliasLookup,
 ) -> Option<Type> {
     let mut current = typ.clone();
     let mut seen: Vec<String> = Vec::new();
@@ -188,7 +188,7 @@ pub(crate) fn expand_alias_target_raw(
 /// parity-safe: the caller falls back to the pure-Python visitor.
 pub(crate) fn expanded_alias_target(
     typ: &Type,
-    aliases: &crate::aliases::TypeAliasResolver,
+    aliases: &dyn crate::aliases::AliasLookup,
 ) -> Option<(Type, Vec<Type>, bool)> {
     let mut current = typ.clone();
     let mut args: Vec<Type> = Vec::new();
