@@ -859,12 +859,17 @@ including:
   TypeVar upper bounds positionally and copies the live `definition`s over
   (`TypeType` must be rebuilt via `TypeType.make_normalized`, it has no
   `copy_modified`); a pairing mismatch returns `None` and the caller falls
-  back to the full Python expansion. Env values, `remove_trivial`, and the
-  meta-tvar branch (`p.id.meta_level > 0`) keep the default gate. The
-  meta-tvar relaxation was tried and reverted: fresh-variable identity on
-  wire-decoded TypeVarTypes leaks across the wire (no
-  `canonicalize_fresh_vars` equivalent on all decode paths;
-  `testTypedDictGetMethodTotalMixed` repro).
+  back to the full Python expansion. Env values keep the default gate.
+  Meta-tvar relax round two (issue #1180): the whole-tree seams now take
+  fresh (meta) vars across the wire and repair identity after decode via
+  `canonicalize_fresh_vars` (optionally `seed=`ed with the variables
+  slot), while `remove_trivial` keeps the meta check through the new
+  `_needs_python(meta_gate=True)` kwarg: as a partial-list seam it has
+  no enclosing variables context to seed, so a decoded fresh var there
+  would stay a distinct object and `freeze_all_type_vars` (in-place
+  `meta_level` mutation) would miss it. Fresh-var-bearing decoded trees
+  stay out of the shared decode caches (an in-place freeze on a cached
+  tree would leak across callers).
 - `expand_type_by_instance` recursive arms (subtypes.rs, behind the
   `rust_is_subtype` seam) — mirrors `expandtype.py`'s ExpandTypeVisitor:
   five new arms (CallableType, Overloaded, TupleType, TypeType,
