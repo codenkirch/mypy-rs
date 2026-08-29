@@ -18538,12 +18538,31 @@ class NativeMemberAccessDispatchSuite(Suite):
         self.fx.ai.names["m"] = SymbolTableNode(MDEF, Var("m"))
         assert self._raw_dispatch(self.fx.a, "m") is None
 
-    def test_dispatch_defers_subclass_receiver(self) -> None:
+    def test_dispatch_completes_subclass_receiver_nongeneric(self) -> None:
         from mypy.nodes import ARG_POS
 
         self._add_method(
             self.fx.ai, "m", self._sig([self.fx.o], [ARG_POS], ["x"], self.fx.a)
         )
+        # Non-generic signature: Python's bind_self takes the strip path, so
+        # the subclass receiver completes in Rust (filter + map + expand +
+        # strip), mirroring the Python tail.
+        _next_raw_id, _changed, decoded = self._dispatch(self.fx.c, "m", self.fx.c)
+        decoded = get_proper_type(decoded)
+        assert isinstance(decoded, CallableType)
+        assert decoded.ret_type == self.fx.a
+        assert decoded.is_bound is True
+        assert decoded.arg_types == []
+
+    def test_dispatch_defers_subclass_receiver_generic(self) -> None:
+        from mypy.nodes import ARG_POS
+
+        self._add_method(
+            self.fx.ai,
+            "m",
+            self._sig([self.fx.o], [ARG_POS], ["x"], self.fx.a, variables=[self.fx.t]),
+        )
+        # Generic signature: bind_self could take its generic branch, defer.
         assert self._raw_dispatch(self.fx.c, "m") is None
 
     def test_dispatch_defers_non_final_init(self) -> None:

@@ -380,9 +380,21 @@ def _restore_definition(original: Type, decoded: ProperType) -> ProperType:
     elif isinstance(original, Overloaded) and isinstance(decoded, CallableType):
         # check_self_arg filters an Overloaded to a single CallableType;
         # find the matching item by arg-type signature to restore its
-        # definition link.
+        # definition link. bind_self may have stripped the self argument
+        # (subclass receivers reach here through the dispatch seam), so an
+        # item whose self arg is dropped matches with kind/name shift.
+        n = len(decoded.arg_types)
         for orig in original.items:
-            if orig.definition is not None and len(orig.arg_types) == len(decoded.arg_types):
+            if orig.definition is None:
+                continue
+            if len(orig.arg_types) == n:
+                return decoded.copy_modified(definition=orig.definition)
+            if (
+                len(orig.arg_types) == n + 1
+                and orig.arg_kinds[0].is_positional()
+                and orig.arg_kinds[1:] == decoded.arg_kinds
+                and orig.arg_names[1:] == decoded.arg_names
+            ):
                 return decoded.copy_modified(definition=orig.definition)
     return decoded
 
