@@ -1884,6 +1884,8 @@ def rust_analyze_member_access(
     self_type_bytes: bytes,
     is_lvalue: bool,
     is_super: bool,
+    is_operator: bool,
+    is_self: bool,
     preserve_type_var_ids: bool,
     start_raw_id: int,
     strict_optional: bool,
