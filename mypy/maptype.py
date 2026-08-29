@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import copy
-from typing import Any
+from typing import Any, cast
 
 from mypy.expandtype import expand_type_by_instance
 from mypy.nodes import TypeInfo
@@ -90,7 +90,10 @@ def _needs_python(typ: Type) -> bool:
 
     Named callables lose their FuncDef/Decorator definition node, breaking
     error formatting that names the function; TypeAliasType would loop while
-    decoding. Both must defer to the pure-Python path.
+    decoding. Both must defer to the pure-Python path. Fresh meta-vars
+    (TypeVarType with meta_level > 0) need no branch: the wire carries them
+    fine, and the decode steps re-unify split occurrences
+    (canonicalize_fresh_vars, #1198).
     """
     stack: list[Type] = [typ]
     visited: set[int] = set()
@@ -150,16 +153,30 @@ def _native_map_instance_to_supertype(
             fixed.column = instance.column
             return fixed
         decoded = read_type(_ReadBuffer(raw))
-        from mypy.wirefixup import fixup_wire_type
+        from mypy.wirefixup import (
+            canonicalize_fresh_vars_reported,
+            fixup_wire_type,
+        )
 
         fixed = fixup_wire_type(decoded)
+        # The wire round-trip splits fresh meta-var occurrences of one id
+        # into distinct equal-id objects; re-unify them here (#1198). Note
+        # that `fixup_wire_type` itself does not canonicalize.
         if isinstance(fixed, Instance):  # type: ignore[misc]
+            canonical, has_fresh = canonicalize_fresh_vars_reported(fixed)
+            # The canonicalizer only rebuilds nested occurrences; the
+            # Instance shape is preserved.
+            fixed = cast(Instance, canonical)
             # The wire format does not carry line/column; decoded types
             # default to line -1. Preserve the input location so derived
             # contexts report errors at the call site.
             fixed.line = instance.line
             fixed.column = instance.column
-            _map_supertype_decode_cache[raw] = fixed
+            if not has_fresh:
+                # Fresh-bearing trees must stay out of the shared decode
+                # cache: the re-unified tree shares one object per fresh
+                # id, so an in-place freeze would leak into later callers.
+                _map_supertype_decode_cache[raw] = fixed
             return fixed
         return None
     except (AssertionError, NotImplementedError, ValueError):
@@ -245,13 +262,16 @@ def _native_map_step_frontier(
         mapped: list[Instance] = []
         if bytes(encoded_results):
             decoded_all = read_type_list(_ReadBuffer(bytes(encoded_results)))
-            from mypy.wirefixup import fixup_wire_type
+            from mypy.wirefixup import canonicalize_fresh_vars, fixup_wire_type
 
             for decoded in decoded_all:
                 fixed = fixup_wire_type(decoded)
                 if not isinstance(fixed, Instance):  # type: ignore[misc]
                     return None
-                mapped.append(fixed)
+                # Re-unify fresh meta-var occurrences split by the decode;
+                # no cache here, but unmapped consumers still see one fresh
+                # id as several objects without it (#1198).
+                mapped.append(cast(Instance, canonicalize_fresh_vars(fixed)))
         # Reassemble by index: supported members that Rust mapped take the
         # decoded results in order; everything else re-runs in Python.
         out: list[Instance] = []

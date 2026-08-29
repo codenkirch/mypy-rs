@@ -5331,6 +5331,193 @@ class NativeMapInstanceToSupertypesSuite(Suite):
 
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeMapFreshVarRepairSuite(Suite):
+    """Fresh-var identity repair at the map decode seams (#1198).
+
+    Fresh (meta_level > 0) type vars reach the map seams via constraint
+    template mapping; a native map of a fresh-bearing instance round-trips
+    the var through the wire, and the decode splits re-occurrences of one
+    id into distinct equal-id objects. The single seam re-unifies via
+    canonicalize_fresh_vars_reported and keeps fresh-bearing trees out of
+    the binary-blob decode cache (a cached tree shares one object per id,
+    so an in-place freeze would leak into later callers of the identical
+    blob); the frontier step has no cache and canonicalizes too, while
+    fresh-bearing members still defer per-member via the sentinel flag.
+    """
+
+    def setUp(self) -> None:
+        from mypy.maptype import (
+            _clear_map_supertype_decode_cache,
+            _set_native_map_active,
+            _set_native_map_resolver,
+        )
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        self.fx = TypeFixture()
+        # GS3[T, S] <: G[H[S, S]]: the base instance mentions the class's
+        # own S var in two positions, so mapping a fresh-bearing GS3
+        # instance to G yields a result carrying the same fresh id twice.
+        self._gs3 = self.fx.make_type_info(
+            "GS3",
+            mro=[self.fx.gi, self.fx.oi],
+            typevars=["T", "S"],
+            variances=[COVARIANT, COVARIANT],
+        )
+        # Class-frame tvars must follow the convention the Rust expander
+        # matches on: raw_id is the 1-based slot position, namespace the
+        # declaring class's fullname (fixture globals use "").
+        gs3_tvar = TypeVarType(
+            "T", "GS3.T", TypeVarId(1, namespace="GS3"), [], self.fx.o, self.fx.o, COVARIANT
+        )
+        gs3_svar = TypeVarType(
+            "S", "GS3.S", TypeVarId(2, namespace="GS3"), [], self.fx.o, self.fx.o, COVARIANT
+        )
+        self._gs3.defn.type_vars = [gs3_tvar, gs3_svar]
+        self._gs3.bases = [
+            Instance(self.fx.gi, [Instance(self.fx.hi, [gs3_svar, gs3_svar])])
+        ]
+        # GS4[T, S] <: G[S]: the base instance mentions S once, so a
+        # fresh-bearing instance maps to a result carrying the fresh id
+        # exactly once (a single decoded occurrence, no split risk).
+        self._gs4 = self.fx.make_type_info(
+            "GS4",
+            mro=[self.fx.gi, self.fx.oi],
+            typevars=["T", "S"],
+            variances=[COVARIANT, COVARIANT],
+        )
+        self._gs4.defn.type_vars = [gs3_tvar, gs3_svar]
+        self._gs4.bases = [Instance(self.fx.gi, [gs3_svar])]
+        type_infos = []
+        for name in dir(self.fx):
+            if not name.endswith("i"):
+                continue
+            value = getattr(self.fx, name)
+            if _is_type_info(value):
+                type_infos.append(value)
+        type_infos.extend([self._gs3, self._gs4])
+        self._resolver = _type_kernel.build_native_resolver(type_infos, [])
+        _set_native_map_active(True)
+        _set_native_map_resolver(self._resolver)
+        set_wire_typeinfo_map({info.fullname: info for info in type_infos})
+        _clear_map_supertype_decode_cache()
+        self._fresh = TypeVarType(
+            "Fresh", "Test.Fresh", TypeVarId(500, meta_level=1), [], self.fx.o, self.fx.o
+        )
+
+    def tearDown(self) -> None:
+        from mypy.maptype import (
+            _clear_map_supertype_decode_cache,
+            _set_native_map_active,
+            _set_native_map_resolver,
+        )
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        _clear_map_supertype_decode_cache()
+        _set_native_map_active(False)
+        _set_native_map_resolver(None)
+        set_wire_typeinfo_map(None)
+
+    def _with_gate(self, active: bool, fn: Callable[[], T]) -> T:
+        from mypy.maptype import _set_native_map_active
+
+        _set_native_map_active(active)
+        try:
+            return fn()
+        finally:
+            _set_native_map_active(True)
+
+    def _assert_same_id(self, t: Type, raw_id: int, meta_level: int) -> None:
+        p = get_proper_type(t)
+        assert isinstance(p, TypeVarType)
+        assert p.id.raw_id == raw_id
+        assert p.id.meta_level == meta_level
+
+    def test_fresh_recurrence_identity_repaired(self) -> None:
+        import type_kernel as _tk
+
+        from mypy.maptype import (  # type: ignore[attr-defined]
+            _map_supertype_decode_cache,
+            _WriteBuffer,
+            map_instance_to_supertype,
+        )
+
+        fx = self.fx
+        inst = Instance(self._gs3, [self._fresh, self._fresh])
+        before_keys = set(_map_supertype_decode_cache)
+        off = self._with_gate(False, lambda: map_instance_to_supertype(inst, fx.gi))
+        on = self._with_gate(True, lambda: map_instance_to_supertype(inst, fx.gi))
+        assert_equal(str(on), str(off), "fresh-bearing map str parity")
+        # Python (gate-off) rebuilds the tree by substitution and keeps
+        # object identity; the Rust result re-unifies at the decode seam
+        # instead: both occurrences of the fresh id share one object.
+        inner = get_proper_type(on.args[0])
+        assert isinstance(inner, Instance)
+        assert inner.args[0] is inner.args[1], "decode split the fresh id into two objects"
+        self._assert_same_id(inner.args[0], 500, 1)
+        # The seam must not cache fresh-bearing decoded trees.
+        from mypy.maptype import _map_supertype_decode_cache
+
+        assert set(_map_supertype_decode_cache) == before_keys, (
+            "fresh-bearing call inserted into the shared decode cache"
+        )
+        # Engagement: the Rust seam actually maps the fresh-bearing
+        # instance instead of silently deferring to Python.
+        buf = _WriteBuffer()
+        inst.write(buf)
+        result = _tk.rust_map_instance_to_supertype(
+            self._resolver, inst.type.fullname, buf.getvalue(), fx.gi.fullname
+        )
+        assert result is not None, "Rust map seam deferred on a fresh-bearing instance"
+
+    def test_fresh_singlet_no_cache_insert(self) -> None:
+        from mypy.maptype import _map_supertype_decode_cache, map_instance_to_supertype
+
+        fx = self.fx
+        # Single base occurrence: the output carries the fresh id exactly
+        # once, but it is still a fresh-bearing tree -> no cache insert.
+        inst = Instance(self._gs4, [fx.a, self._fresh])
+        off = self._with_gate(False, lambda: map_instance_to_supertype(inst, fx.gi))
+        before = set(_map_supertype_decode_cache)
+        on = self._with_gate(True, lambda: map_instance_to_supertype(inst, fx.gi))
+        assert_equal(str(on), str(off), "fresh singlet map str parity")
+        assert set(_map_supertype_decode_cache) == before, (
+            "fresh-bearing call inserted into the shared decode cache"
+        )
+        self._assert_same_id(on.args[0], 500, 1)
+
+    def test_clean_call_caches_and_hits(self) -> None:
+        from mypy.maptype import _map_supertype_decode_cache, map_instance_to_supertype
+
+        fx = self.fx
+        inst = Instance(self._gs3, [fx.a, fx.b])
+        before = set(_map_supertype_decode_cache)
+        first = self._with_gate(True, lambda: map_instance_to_supertype(inst, fx.gi))
+        added = set(_map_supertype_decode_cache) - before
+        assert len(added) == 1, "clean call did not populate the decode cache"
+        second = self._with_gate(True, lambda: map_instance_to_supertype(inst, fx.gi))
+        assert second is not first, "cache hit must return a shallow copy"
+        assert_equal(str(second), str(first), "cache-hit result differs")
+
+    def test_frontier_fresh_member_defers_per_member(self) -> None:
+        from mypy.maptype import (
+            _native_map_step_frontier,
+            map_instance_to_direct_supertypes,
+        )
+
+        fx = self.fx
+        inst = Instance(self._gs3, [self._fresh, self._fresh])
+        off = [m for m in map_instance_to_direct_supertypes(inst, fx.gi)]
+        on = self._with_gate(True, lambda: _native_map_step_frontier([inst], fx.gi))
+        assert on is not None
+        assert_equal([str(x) for x in on], [str(x) for x in off], "frontier fresh parity")
+        # The fresh-bearing member re-runs in Python (sentinel flag), so
+        # the output preserves the fresh object's identity directly.
+        inner = get_proper_type(on[0].args[0])
+        assert isinstance(inner, Instance)
+        assert inner.args[0] is inner.args[1]
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeTypeObjectTypeSuite(Suite):
     """Parity for the Rust `type_object_type_from_function` composite seam
     (mypy.typeops.type_object_type_from_function, issue #492 family).
