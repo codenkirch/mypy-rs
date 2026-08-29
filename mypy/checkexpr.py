@@ -4459,8 +4459,8 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
                     [_serialize_type_for_checkexpr(t) for t in plausible_targets],
                     [_serialize_type_for_checkexpr(t) for t in arg_types],
                     [k.value for k in arg_kinds],
-                    list(arg_names) if arg_names is not None else None,
                     self.chk.options.strict_optional,
+                    list(arg_names) if arg_names is not None else None,
                 )
             except (AssertionError, NotImplementedError, ValueError, TypeError, IndexError):
                 native_idx = None
@@ -4479,6 +4479,10 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
                     )
             if not w.has_new_errors():
                 self.chk.store_types(m)
+                # Step 3's tail warns on the matched item's definition after
+                # infer_overload_return_type; this early return bypasses it.
+                if isinstance(c := get_proper_type(infer_type), CallableType):
+                    self.chk.warn_deprecated(c.definition, context)
                 return ret_type, infer_type
 
         # Step 2: If the arguments contain a union, we try performing union math first,

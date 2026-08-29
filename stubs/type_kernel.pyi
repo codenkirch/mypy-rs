@@ -831,8 +831,8 @@ def rust_check_overload_call(
     targets_bytes: list[bytes],
     arg_types_bytes: list[bytes],
     arg_kinds: list[int],
-    arg_names: list[str | None] | None,
     strict_optional: bool,
+    arg_names: list[str | None] | None,
 ) -> int | None: ...
 def rust_find_matching_overload_items(
     resolver: NativeTypeResolver,

@@ -255,6 +255,12 @@ pub fn rust_check_overload_call(
                 match subtypes::is_subtype(actual, &formal_type, &ctx, resolver_ref) {
                     Some(true) => {}
                     Some(false) => {
+                        // A subtype-`false` may be overturned by context
+                        // re-analysis (literal refinement, TypedDict checks,
+                        // typevar instantiation); defer if any flip applies.
+                        if pair_flip_possible(actual, &formal_type) {
+                            return None;
+                        }
                         target_match = false;
                         break;
                     }
@@ -275,6 +281,100 @@ pub fn rust_check_overload_call(
 
 fn is_named(kind: i64) -> bool {
     kind == ARG_NAMED || kind == ARG_NAMED_OPT
+}
+
+/// Whether `actual` could be re-derived by context re-analysis into a form
+/// matching a literal formal whose fallback has the given base fullname.
+/// Mirrors the fallback-family rule: only the exact base class (or a
+/// typevar passthrough) can re-refine to that literal family.
+// Context-flip analysis (issue #1094): Python re-infers each actual argument
+// with the formal as expected context; a subtype-`false` on empty-context
+// actuals can flip via literal refinement, TypedDict checks, or TypeVars.
+fn literal_flip_possible(actual: &Type, fallback_type_ref: &str) -> bool {
+    match actual {
+        Type::Instance {
+            type_ref,
+            last_known_value: None,
+            ..
+        } => type_ref == fallback_type_ref,
+        Type::TypeVarType { .. } => true,
+        _ => false,
+    }
+}
+
+/// The base fullname of a literal form's fallback, if it is a plain
+/// argless Instance. `None` for anything else (defer-free no-flip).
+fn literal_fallback_ref(fallback: &Type) -> Option<&str> {
+    match fallback {
+        Type::Instance { type_ref, .. } => Some(type_ref),
+        _ => None,
+    }
+}
+
+/// Whether Python's per-target acceptance could accept a target despite a
+/// subtype-`false` (actual, formal) pair, because the formal's context
+/// re-analysis can flip the verdict. Any `true` defers the whole call.
+fn pair_flip_possible(actual: &Type, formal: &Type) -> bool {
+    match formal {
+        // Literal families: only a same-value-class actual (or a typevar
+        // passthrough) can re-refine into the literal's fallback family.
+        Type::LiteralType { fallback, .. } => match literal_fallback_ref(fallback) {
+            Some(fref) => literal_flip_possible(actual, fref),
+            None => true, // odd fallback: defer rather than reject
+        },
+        Type::Instance {
+            last_known_value: Some(lkv),
+            ..
+        } => match lkv.as_ref() {
+            Type::LiteralType { fallback, .. } => match literal_fallback_ref(fallback) {
+                Some(fref) => literal_flip_possible(actual, fref),
+                None => true,
+            },
+            _ => true,
+        },
+        Type::TypeVarType { .. } | Type::TypedDictType { .. } => true,
+        // Position-matched nesting: refinement can also happen on the
+        // leaves of a composite actual (tuple/dict/list literals), so
+        // walk matching formal components when the actual mirrors them.
+        Type::UnionType { items, .. } => items.iter().any(|i| pair_flip_possible(actual, i)),
+        Type::Instance {
+            last_known_value: None,
+            args: formal_args,
+            ..
+        } => match actual {
+            Type::Instance {
+                args: actual_args,
+                last_known_value: None,
+                ..
+            } => {
+                actual_args.len() == formal_args.len()
+                    && actual_args
+                        .iter()
+                        .zip(formal_args)
+                        .any(|(a, f)| pair_flip_possible(a, f))
+            }
+            Type::TypeVarType { .. } => true,
+            _ => false,
+        },
+        Type::TupleType {
+            items: formal_items,
+            ..
+        } => match actual {
+            Type::TupleType {
+                items: actual_items,
+                ..
+            } => {
+                actual_items.len() == formal_items.len()
+                    && actual_items
+                        .iter()
+                        .zip(formal_items)
+                        .any(|(a, f)| pair_flip_possible(a, f))
+            }
+            Type::TypeVarType { .. } => true,
+            _ => false,
+        },
+        _ => false,
+    }
 }
 
 /// Whether a wire `Type` is a TypeVarTuple/ParamSpec variant (or a
@@ -370,5 +470,203 @@ fn has_variadic_arg(t: &Type) -> bool {
             ..
         } => arg_types.iter().any(is_variadic_tvar) || is_variadic_tvar(ret_type),
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod pair_flip_tests {
+    use super::*;
+    use crate::wire::LiteralValue;
+
+    fn instance(fullname: &str) -> Type {
+        Type::Instance {
+            type_ref: fullname.to_string(),
+            args: vec![],
+            last_known_value: None,
+            extra_attrs: None,
+        }
+    }
+
+    fn list_of(args: Vec<Type>) -> Type {
+        Type::Instance {
+            type_ref: "builtins.list".to_string(),
+            args,
+            last_known_value: None,
+            extra_attrs: None,
+        }
+    }
+
+    fn literal_of(fullname: &str, value: LiteralValue) -> Type {
+        Type::LiteralType {
+            fallback: Box::new(instance(fullname)),
+            value,
+        }
+    }
+
+    fn lkv_instance(fullname: &str, value: LiteralValue) -> Type {
+        Type::Instance {
+            type_ref: fullname.to_string(),
+            args: vec![],
+            last_known_value: Some(Box::new(literal_of(fullname, value))),
+            extra_attrs: None,
+        }
+    }
+
+    fn tvar() -> Type {
+        Type::TypeVarType {
+            name: "T".to_string(),
+            fullname: "T".to_string(),
+            raw_id: 1,
+            namespace: "".to_string(),
+            values: vec![],
+            upper_bound: Box::new(instance("builtins.object")),
+            default: Box::new(instance("builtins.object")),
+            variance: 0,
+            meta_level: 0,
+        }
+    }
+
+    fn tuple_of(items: Vec<Type>) -> Type {
+        Type::TupleType {
+            partial_fallback: Box::new(instance("builtins.tuple")),
+            items,
+            implicit: false,
+        }
+    }
+
+    fn union_of(items: Vec<Type>) -> Type {
+        Type::UnionType {
+            items,
+            uses_pep604_syntax: false,
+            can_be_true: true,
+            can_be_false: true,
+        }
+    }
+
+    #[test]
+    fn literal_formal_same_family_flips() {
+        let formal = literal_of("builtins.int", LiteralValue::Int(4));
+        assert!(pair_flip_possible(&instance("builtins.int"), &formal));
+    }
+
+    #[test]
+    fn literal_formal_cross_family_no_flip() {
+        let formal = literal_of("builtins.int", LiteralValue::Int(4));
+        assert!(!pair_flip_possible(&instance("builtins.str"), &formal));
+    }
+
+    #[test]
+    fn literal_formal_literal_actual_no_flip() {
+        let formal = literal_of("builtins.int", LiteralValue::Int(4));
+        assert!(!pair_flip_possible(&formal.clone(), &formal));
+    }
+
+    #[test]
+    fn literal_formal_typevar_actual_defers() {
+        let formal = literal_of("builtins.int", LiteralValue::Int(4));
+        assert!(pair_flip_possible(&tvar(), &formal));
+    }
+
+    #[test]
+    fn lkv_formal_same_family_defers() {
+        let formal = lkv_instance("builtins.str", LiteralValue::Str("a".to_string()));
+        assert!(pair_flip_possible(&instance("builtins.str"), &formal));
+    }
+
+    #[test]
+    fn lkv_formal_cross_family_no_flip() {
+        let formal = lkv_instance("builtins.str", LiteralValue::Str("a".to_string()));
+        assert!(!pair_flip_possible(&instance("builtins.int"), &formal));
+    }
+
+    #[test]
+    fn typed_dict_formal_defers() {
+        let formal = Type::TypedDictType {
+            fallback: Box::new(instance("typing.TypedDict")),
+            items: vec![],
+            required_keys: Default::default(),
+            readonly_keys: Default::default(),
+            is_closed: false,
+        };
+        assert!(pair_flip_possible(&instance("builtins.str"), &formal));
+    }
+
+    #[test]
+    fn typevar_formal_defers() {
+        assert!(pair_flip_possible(&instance("builtins.str"), &tvar()));
+    }
+
+    #[test]
+    fn union_formal_flips_on_any_item() {
+        let formal = union_of(vec![
+            literal_of("builtins.int", LiteralValue::Int(4)),
+            literal_of("builtins.str", LiteralValue::Str("x".to_string())),
+        ]);
+        assert!(pair_flip_possible(&instance("builtins.str"), &formal));
+    }
+
+    #[test]
+    fn union_formal_all_plain_no_flip() {
+        let formal = union_of(vec![instance("builtins.int"), instance("builtins.str")]);
+        assert!(!pair_flip_possible(&instance("builtins.str"), &formal));
+    }
+
+    #[test]
+    fn nested_instance_args_flip() {
+        let formal = list_of(vec![literal_of("builtins.int", LiteralValue::Int(4))]);
+        let actual = list_of(vec![instance("builtins.int")]);
+        assert!(pair_flip_possible(&actual, &formal));
+    }
+
+    #[test]
+    fn nested_instance_args_arity_mismatch_no_flip() {
+        let formal = list_of(vec![literal_of("builtins.int", LiteralValue::Int(4))]);
+        let actual = list_of(vec![instance("builtins.int"), instance("builtins.str")]);
+        assert!(!pair_flip_possible(&actual, &formal));
+    }
+
+    #[test]
+    fn tuple_items_flip() {
+        let formal = tuple_of(vec![
+            instance("builtins.int"),
+            literal_of("builtins.str", LiteralValue::Str("x".to_string())),
+        ]);
+        let actual = tuple_of(vec![instance("builtins.int"), instance("builtins.str")]);
+        assert!(pair_flip_possible(&actual, &formal));
+    }
+
+    #[test]
+    fn tuple_shape_mismatch_no_flip() {
+        let formal = tuple_of(vec![instance("builtins.int")]);
+        assert!(!pair_flip_possible(&instance("builtins.str"), &formal));
+    }
+
+    #[test]
+    fn plain_instances_no_flip() {
+        assert!(!pair_flip_possible(
+            &instance("builtins.str"),
+            &instance("builtins.int")
+        ));
+        assert!(!pair_flip_possible(
+            &instance("builtins.str"),
+            &instance("builtins.str")
+        ));
+    }
+
+    #[test]
+    fn fallback_ref_helpers() {
+        assert_eq!(
+            literal_fallback_ref(&instance("builtins.int")),
+            Some("builtins.int")
+        );
+        assert_eq!(
+            literal_fallback_ref(&literal_of("builtins.int", LiteralValue::Int(1))),
+            None
+        );
+        assert!(literal_flip_possible(&tvar(), "builtins.int"));
+        assert!(!literal_flip_possible(
+            &instance("builtins.str"),
+            "builtins.int"
+        ));
     }
 }
