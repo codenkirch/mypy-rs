@@ -892,6 +892,24 @@ including:
   Covered by `NativeMapFreshVarRepairSuite` in `mypy/test/testtypes.py`
   (gate-off vs gate-on parity plus freshness identity, no-cache-insert,
   cache-hit-copy, and frontier per-member checks). No Rust change.
+- typeops definition-gate relax (issue #1207): the two typeops wire
+  seams (`type_object_type_from_function`, `map_type_from_supertype`)
+  rode ~100% gate defers on the cold self-check because `_needs_python`
+  bailed on the nested `CallableType.definition` every named
+  `__init__`/`__new__` signature carries. Both seams now pass
+  `definition_gate=False` (the #1169 pattern) and re-stamp the dropped
+  links after the round-trip: `map_type_from_supertype` reuses
+  `expandtype._resync_definitions` positionally (a pairing divergence
+  defers), and the type-object composite gets a specialized
+  `_restamp_composite_definitions`: the pure-Python body preserves
+  definitions verbatim through bind_self / map_type_from_supertype /
+  class_callable (all `copy_modified`), so the input signature's
+  definitions are copied back per overload item, and an item-count
+  divergence defers. No Rust change. Cold self-check audit: gate defers
+  map 2,396/2,579 -> 0/453, type-object 2,396/2,645 -> 0/2,596 (the map
+  total also drops because the composite's internal mapping stops
+  crossing the Python seam); residual defers are genuine kernel
+  decisions (generic signatures, recursive aliases), not gate defers.
 - `expand_type_by_instance` recursive arms (subtypes.rs, behind the
   `rust_is_subtype` seam) — mirrors `expandtype.py`'s ExpandTypeVisitor:
   five new arms (CallableType, Overloaded, TupleType, TypeType,
