@@ -754,6 +754,21 @@ def class_callable(
             if result is not None:
                 ret_type_blob, var_blobs = result
                 ret_type = _deserialize_type(bytes(ret_type_blob))
+                if (
+                    ret_type is not None
+                    and isinstance(ret_type, Instance)
+                    and ret_type.type is not info
+                    and ret_type.type.fullname == info.fullname
+                ):
+                    # Fine-grained regression guard (mirror of fill_typevars'):
+                    # re-home a decoded ret_type naming the caller's own class
+                    # to the live TypeInfo so its identity survives merge_asts.
+                    ret_type = Instance(
+                        info,
+                        ret_type.args,
+                        last_known_value=ret_type.last_known_value,
+                        extra_attrs=ret_type.extra_attrs,
+                    )
                 if ret_type is not None:
                     rust_variables: list[TypeVarLikeType] = []
                     deferred = False
