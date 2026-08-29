@@ -74,13 +74,25 @@ def _clear_expand_decode_cache() -> None:
     _expand_remove_trivial_cache.clear()
 
 
-def _needs_python(typ: Type, *, definition_gate: bool = True) -> bool:
+def _canonicalize_fresh_type_list(types: list[Type]) -> tuple[list[Type], bool]:
+    """Wire-path identity repair for a decoded list; reports fresh-var presence."""
+    from mypy.wirefixup import canonicalize_fresh_vars_reported_list
+
+    return canonicalize_fresh_vars_reported_list(types)
+
+
+def _needs_python(typ: Type, *, definition_gate: bool = True, meta_gate: bool = False) -> bool:
     """True if `typ` nests a node a kernel round-trip cannot carry.
 
     Callers that re-stamp dropped ``definition`` links after the round-trip
     via ``_resync_definitions`` pass ``definition_gate=False``; callers
     without a re-stamp path (env values, remove_trivial) keep the gate.
-    Recursive TypeAliasType would loop while decoding and must defer.
+    Callers whose decoded result is a partial list that cannot be
+    re-unified with an enclosing variables slot (remove_trivial) pass
+    ``meta_gate=True``: a decoded fresh (meta) type var is a distinct
+    object, so in-place id mutation by ``freeze_all_type_vars`` would
+    miss it. Recursive TypeAliasType would loop while decoding and must
+    defer.
     """
     stack: list[Type] = [typ]
     visited: set[int] = set()
@@ -104,11 +116,10 @@ def _needs_python(typ: Type, *, definition_gate: bool = True) -> bool:
             # `Unpack[tuple[Never, ...]]` items, corrupting union results.
             return True
         elif isinstance(p, TypeVarType):
-            # Fresh (meta) type variables lose identity across the wire
-            # round-trip, so Rust dedup could merge distinct fresh vars.
-            # Meta relax tried (#1169) but leaks fresh-var identity through
-            # decode paths with no canonicalize_fresh_vars equivalent.
-            if p.id.meta_level > 0 or p.has_default():
+            # Meta relax: whole-tree callers re-unify via canonicalize_fresh_vars
+            # and may take fresh (meta) vars across the wire. Partial-list
+            # callers pass meta_gate=True (decoded meta vars cannot re-unify).
+            if p.has_default() or (meta_gate and p.id.meta_level > 0):
                 return True
         elif isinstance(p, UnpackType):
             # Walk through Unpack: `Unpack[tuple[Never, ...]]` nests a
@@ -289,7 +300,6 @@ def expand_type(typ: Type, env: Mapping[TypeVarId, Type]) -> Type:
     # Stage 3c type-kernel seam: try the Rust expand_type path. Rust
     # returns None for unsupported cases (ParamSpec, TypeAliasType, etc.);
     # we then fall through to the pure-Python visitor. Mirrors the
-
     # erasetype.py strangler-fig contract.
     if (
         _HAS_TYPE_KERNEL
@@ -322,7 +332,7 @@ def expand_type(typ: Type, env: Mapping[TypeVarId, Type]) -> Type:
                         return fixed
                 else:
                     decoded = read_type(_ReadBuffer(raw))
-                    from mypy.wirefixup import fixup_wire_type
+                    from mypy.wirefixup import canonicalize_fresh_vars_reported, fixup_wire_type
 
                     fixed = fixup_wire_type(decoded)
                     # The wire format does not carry line/column; decoded
@@ -349,10 +359,15 @@ def expand_type(typ: Type, env: Mapping[TypeVarId, Type]) -> Type:
                     instance_cache.object_type = None
                     instance_cache.function_type = None
                     if fixed is not None:
-                        # Cache the definition-less decoded shape; each call
-                        # re-stamps definitions from its own input type (see
-                        # the cached branch above).
-                        _expand_type_decode_cache[raw] = fixed
+                        # The wire round-trip splits fresh meta-var occurrences
+                        # into distinct objects: re-unify them before a downstream
+                        # in-place freeze, and keep those trees out of the cache.
+                        fixed, has_fresh = canonicalize_fresh_vars_reported(fixed)
+                        if not has_fresh:
+                            # Cache the definition-less decoded shape; each
+                            # call re-stamps definitions from its own input
+                            # type (see the cached branch above).
+                            _expand_type_decode_cache[raw] = fixed
                         fixed = _resync_definitions(typ, fixed)
                         if fixed is not None:
                             return fixed
@@ -539,13 +554,17 @@ def expand_type_by_instance(typ: Type, instance: Instance) -> Type:
                 )
                 if result is not None:
                     decoded = read_type(_ReadBuffer(bytes(result)))
-                    from mypy.wirefixup import fixup_wire_type
+                    from mypy.wirefixup import canonicalize_fresh_vars, fixup_wire_type
 
                     fixed = fixup_wire_type(decoded)
+                    # The wire round-trip splits fresh meta-var occurrences
+                    # into distinct objects: re-unify them so a downstream
+                    # in-place freeze touches every occurrence (pre-stamping).
+                    if fixed is not None:
+                        fixed = canonicalize_fresh_vars(fixed)
                     # The wire format does not carry line/column; decoded
                     # types default to line -1. Preserve the input type's
                     # location so derived contexts report errors at the
-
                     # call site instead of a phantom line 0/-1.
                     if fixed is not None and isinstance(fixed, ProperType):
                         fixed.line = typ.line
@@ -594,7 +613,13 @@ def expand_type_by_instance(typ: Type, instance: Instance) -> Type:
             assert isinstance(binder, TypeVarLikeType)
             variables[binder.id] = arg
 
-        return expand_type(typ, variables)
+        result = expand_type(typ, variables)
+        # The pure-Python visitor's union path re-decodes ret occurrences
+        # through the native remove_trivial seam: re-unify them so callers
+        # that mutate the vars in place (freeze) see every occurrence.
+        from mypy.wirefixup import canonicalize_fresh_vars
+
+        return canonicalize_fresh_vars(result)
 
 
 F = TypeVar("F", bound=FunctionLike)
@@ -670,7 +695,13 @@ def freshen_function_type_vars(callee: F) -> F:
                 # Point to fresh ids in case defaults depend on previous variables.
                 tv.default = expand_type(tv.default, tvmap)
         fresh = expand_type(callee, tvmap).copy_modified(variables=tvs)
-        return cast(F, fresh)
+        from mypy.wirefixup import canonicalize_fresh_vars
+
+        # The expand_type kernel seam re-decodes occurrences as distinct
+        # objects: unify them onto the freshened tvs (pre-registered via
+        # seed) so the variables slot and occurrences share identity for
+        # downstream in-place freeze.
+        return cast(F, canonicalize_fresh_vars(fresh, seed=tvs))
     else:
         assert isinstance(callee, Overloaded)
         fresh_overload = Overloaded([freshen_function_type_vars(item) for item in callee.items])
@@ -1243,7 +1274,7 @@ def remove_trivial(types: Iterable[Type]) -> list[Type]:
     if (
         _HAS_TYPE_KERNEL
         and _native_expand_type_active
-        and not any(_needs_python(t) for t in types_list)
+        and not any(_needs_python(t, meta_gate=True) for t in types_list)
     ):
         try:
             from mypy.types import read_type_list, write_type_list
@@ -1276,7 +1307,11 @@ def remove_trivial(types: Iterable[Type]) -> list[Type]:
                         break
                     fixed_types.append(fixed)
                 else:
-                    _expand_remove_trivial_cache[raw] = fixed_types
+                    # Same identity repair + cache policy as expand_type:
+                    # fresh-var trees stay out of the shared cache.
+                    fixed_types, has_fresh = _canonicalize_fresh_type_list(fixed_types)
+                    if not has_fresh:
+                        _expand_remove_trivial_cache[raw] = fixed_types
                     return fixed_types
         except (AssertionError, NotImplementedError, ValueError, AttributeError):
             # Defer to Python: semanal TypeInfo-not-fixed asserts,

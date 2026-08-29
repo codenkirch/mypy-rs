@@ -4192,6 +4192,174 @@ class NativeExpandTypeByInstanceSuite(Suite):
 
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeExpandTypeFreezeIdentitySuite(Suite):
+    """Fresh-var object identity across the freshen -> apply freeze chain (#1180).
+
+    `freeze_all_type_vars` (typeops.py) mutates `TypeVarId.meta_level` in
+    place, so it only works when the type vars the enclosing `variables`
+    slot lists are the *same objects* as the occurrences in the tree. The
+    wire decode creates fresh objects, so any seam that rebuilds a
+    subtree through the wire must either re-canonicalize ids against a
+    seeded object or defer. `remove_trivial` is a partial-list seam: it
+    has no `variables` context and no live object to seed, so it keeps
+    the meta gate (`_needs_python(t, meta_gate=True)`); the other
+    relaxed callers (expand_type / expand_type_by_instance / freshen)
+    canonicalize or are seeded and stay relaxed.
+
+    Locks the regression: a decorated generic signature whose return
+    union is rebuilt through Python `expand_type` -> `visit_union_type`
+    -> native `remove_trivial` used to split the fresh var into two
+    objects, leaving `variables` frozen while the arg/ret occurrences
+    stayed meta-level 1.
+    """
+
+    def setUp(self) -> None:
+        from mypy.expandtype import (
+            _set_native_expand_type_active,
+            _set_native_expand_type_resolver,
+            _set_native_expand_type_typeinfo_map,
+        )
+        from mypy.nodes import ARG_POS
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        self.fx = TypeFixture()
+        self._set_active = _set_native_expand_type_active
+        self._set_resolver = _set_native_expand_type_resolver
+        self._set_map = _set_native_expand_type_typeinfo_map
+        type_infos = []
+        for name in dir(self.fx):
+            if not name.endswith("i"):
+                continue
+            value = getattr(self.fx, name)
+            if _is_type_info(value):
+                type_infos.append(value)
+        self._type_infos = type_infos
+        self._resolver = _type_kernel.build_native_resolver(type_infos, [])
+        self._set_resolver(self._resolver)
+        self._set_map({info.fullname: info for info in type_infos})
+        set_wire_typeinfo_map({info.fullname: info for info in type_infos})
+        self._set_active(True)
+
+        fx = self.fx
+        self._callee = CallableType(
+            [fx.t],
+            [ARG_POS],
+            [None],
+            UnionType([fx.t, fx.b]),
+            fx.function,
+            name="dec",
+            variables=[fx.t],
+        )
+
+    def tearDown(self) -> None:
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        self._set_active(False)
+        self._set_resolver(None)
+        self._set_map(None)
+        set_wire_typeinfo_map(None)
+
+    def _with_gate(self, active: bool, fn: Callable[[], T]) -> T:
+        self._set_active(active)
+        try:
+            return fn()
+        finally:
+            self._set_active(True)
+
+    def _occurrences(self, t: Type) -> list[TypeVarType]:
+        out: list[TypeVarType] = []
+        stack: list[Type] = [t]
+        seen: set[int] = set()
+        while stack:
+            p = get_proper_type(stack.pop())
+            if id(p) in seen:
+                continue
+            seen.add(id(p))
+            if isinstance(p, TypeVarType):
+                out.append(p)
+            elif isinstance(p, UnionType):
+                stack.extend(p.items)
+            elif isinstance(p, Instance):
+                stack.extend(p.args)
+            elif isinstance(p, CallableType):
+                stack.append(p.ret_type)
+                stack.extend(p.arg_types)
+        return out
+
+    def test_freshen_retains_occurrence_identity(self) -> None:
+        from mypy.expandtype import freshen_function_type_vars
+
+        fresh = freshen_function_type_vars(self._callee)
+        assert isinstance(fresh, CallableType)
+        var = fresh.variables[0]
+        occs = self._occurrences(fresh.ret_type) + self._occurrences(fresh.arg_types[0])
+        assert occs, "expected tvar occurrences in the freshened signature"
+        for o in occs:
+            assert o is var, "freshen split the fresh var into distinct objects"
+
+        # freeze_all_type_vars relies on object identity: the
+        # in-place meta_level mutation must reach every occurrence.
+        from mypy.typeops import freeze_all_type_vars
+
+        freeze_all_type_vars(fresh)
+        assert var.id.meta_level == 0
+        for o in occs:
+            assert o is var
+            assert o.id.meta_level == 0
+
+        # Gate parity on the frozen result.
+        off = str(self._with_gate(False, lambda: str(fresh)))
+        assert off == str(fresh)
+
+    def test_apply_substitution_preserves_identity(self) -> None:
+        # Root-cause regression: apply_generic_arguments substitutes the
+        # fresh var by another free var; the ret union is rebuilt through
+        # visit_union_type -> native remove_trivial. g must be identical.
+        from mypy.expandtype import expand_type, freshen_function_type_vars
+
+        fresh = freshen_function_type_vars(self._callee)
+        assert isinstance(fresh, CallableType)
+        var = fresh.variables[0]
+        g = var.copy_modified(id=TypeVarId(var.id.raw_id + 900, meta_level=1))
+        out = expand_type(fresh, {var.id: g})
+        assert isinstance(out, CallableType)
+        occs = self._occurrences(out.ret_type) + self._occurrences(out.arg_types[0])
+        assert occs
+        for o in occs:
+            assert o is g, "apply chain rebuilt a split copy of the fresh var"
+
+    def test_remove_trivial_defers_on_fresh_vars(self) -> None:
+        # A meta (fresh) var in the input list must take the pure-Python
+        # path: the decoded wire copy is a distinct object, so the native
+        # rebuild could never preserve freeze_all_type_vars's identity.
+        from mypy.expandtype import remove_trivial
+
+        fx = self.fx
+        v = TypeVarType("Fresh", "Test.Fresh", TypeVarId(500, meta_level=1), [], fx.o, fx.o)
+        result = remove_trivial([v, fx.b])
+        assert result[0] is v
+        assert result[1] is fx.b
+
+    def test_freeze_identity_gate_parity(self) -> None:
+        # Gate on vs gate off must agree str-wise on the full
+        # freshen -> substitute chain that previously split.
+        from mypy.expandtype import expand_type, freshen_function_type_vars
+
+        def run() -> str:
+            fresh = freshen_function_type_vars(self._callee)
+            assert isinstance(fresh, CallableType)
+            var = fresh.variables[0]
+            g = var.copy_modified(id=TypeVarId(var.id.raw_id + 900, meta_level=1))
+            out = expand_type(fresh, {var.id: g})
+            assert isinstance(out, CallableType)
+            return str(out)
+
+        on = str(self._with_gate(True, run))
+        off = str(self._with_gate(False, run))
+        assert_equal(on, off, "freshen+apply gate parity regression")
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeExpandTypeEmptyEnvSuite(Suite):
     """Parity for the Rust `expand_type` empty-env fast path.
 
