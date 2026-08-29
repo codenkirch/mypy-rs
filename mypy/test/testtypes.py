@@ -40540,10 +40540,10 @@ class NativeCheckArgCountSuite(Suite):
         assert not ok and not unexpected
         assert errors == [(6, 0, 0)], errors
 
-    def test_seam_duplicate_shape_lookup_is_by_position(self) -> None:
-        # Preserved verbatim (issue #1152): is_duplicate_mapping_inner reads
-        # shapes[i] by mapping POSITION, not by the actual index mapping[i]
-        # holds; the unmapped TD actual also fires the too-many record first.
+    def test_seam_duplicate_shape_lookup_by_mapped_actual(self) -> None:
+        # Issue #1152 repro: shapes must be indexed by the mapped actual
+        # index mapping[i] holds (Python reads actual_types[m]), not by
+        # position. The mapping holds actuals 2 and 3 (both plain dicts).
         result = self._seam(
             [int(ARG_POS.value)],
             [int(ARG_STAR2.value)] * 4,
@@ -40555,7 +40555,9 @@ class NativeCheckArgCountSuite(Suite):
         assert result is not None
         ok, errors, unexpected = result
         assert not ok and unexpected
-        assert errors == [(3, 0, 0), (6, 0, 0)], errors
+        # The unmapped TypedDict actual 0 fires the too-many record first;
+        # the duplicate record must NOT fire.
+        assert errors == [(3, 0, 0)], errors
 
     def test_seam_star_plus_kwargs_mapping_ok(self) -> None:
         # f(..., *args, **kwargs): two actuals may share one formal.
@@ -40820,6 +40822,25 @@ class NativeCheckArgCountSuite(Suite):
             [[0, 1]],
         )
         assert ("dup", "0") in off, off
+
+    def test_par_dup_plain_kwargs_shared_formal_ok(self) -> None:
+        # Issue #1152 repro through the real method: four **kwargs actuals,
+        # only actual 0 is a TypedDict, and the shared formal maps actuals
+        # 2 and 3 (both plain dicts), so no duplicate error may fire.
+        fx = TypeFixture()
+        callee = CallableType(
+            [fx.anyt], [ARG_POS], [None], fx.anyt, fx.function, name="f"
+        )
+        td = TypedDictType({"a": fx.a}, set(), set(), fx.function)
+        off = self._parity(
+            callee,
+            [td, fx.function, fx.function, fx.function],
+            [ARG_STAR2] * 4,
+            [None] * 4,
+            [[2, 3]],
+        )
+        assert ("too_many_td",) in off, off
+        assert not any(m[0] == "dup" for m in off), off
 
     def test_par_star_plus_kwargs_ok(self) -> None:
         fx = TypeFixture()

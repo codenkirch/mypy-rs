@@ -92,9 +92,9 @@ fn is_star(kind: i64) -> bool {
 }
 
 /// `is_duplicate_mapping` (checkexpr.py:8922-8940), inner logic over the
-/// shim-provided shape tags. Note the shape lookup uses the mapping
-/// position (i), exactly as the wire-era seam did; preserved verbatim
-/// so decisions stay byte-identical.
+/// shim-provided shape tags. Shapes are looked up by the mapped actual
+/// index (`mapping[i]`), not by the mapping position (#1152), matching
+/// Python's `actual_types[m]` facts.
 fn is_duplicate_mapping_inner(
     mapping: &[i64],
     actual_kinds: &[i64],
@@ -112,14 +112,16 @@ fn is_duplicate_mapping_inner(
         }
     }
     // All non-TypedDict **kwargs actuals: duplicates allowed at runtime.
+    // Python reads facts via `actual_types[m]`/`actual_kinds[m]` for each
+    // mapped actual m; the shape must come from the same actual.
     let mut all_non_typeddict_star2 = true;
-    for (i, &idx) in mapping.iter().enumerate() {
+    for &idx in mapping {
         let kind = *actual_kinds.get(idx as usize)?;
         if kind != ARG_STAR2 {
             all_non_typeddict_star2 = false;
             break;
         }
-        let shape = *actual_shapes.get(i)?;
+        let shape = *actual_shapes.get(idx as usize)?;
         if shape == ACTUAL_TYPEDDICT {
             all_non_typeddict_star2 = false;
             break;
@@ -867,6 +869,31 @@ mod tests {
             true,
         );
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_duplicate_mapping_shape_by_mapped_actual() {
+        // Issue #1152 repro: 4x ARG_STAR2 actuals, only actual 0 is a
+        // TypedDict; the shared formal maps actuals 2 and 3 (both plain).
+        // Shapes must be indexed by mapped actual, not by position.
+        let result = argcount_output(
+            &[ARG_POS],
+            false,
+            None,
+            &[ARG_STAR2, ARG_STAR2, ARG_STAR2, ARG_STAR2],
+            &[None; 4],
+            &[TYPEDDICT, PLAIN, PLAIN, PLAIN],
+            &[1, 0, 0, 0],
+            vec![vec![2, 3]],
+            false,
+            None,
+            true,
+        );
+        let r = result.expect("should decide");
+        // Actual 0 (TypedDict, 1 item) is unmapped, so its leftover-items
+        // error still fires; the duplicate record must not.
+        assert!(r.1.iter().any(|&(k, _, _)| k == ERR_TOO_MANY_TD));
+        assert!(r.1.iter().all(|&(k, _, _)| k != ERR_DUPLICATE));
     }
 
     #[test]
