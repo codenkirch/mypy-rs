@@ -3975,6 +3975,15 @@ def native_analyze_type(
     # the hot path does not serialize+decode for known-deferred inputs.
     if isinstance(t, (UnboundType, PlaceholderType)):
         return None
+    # A union with an unbound item always defers in Rust (issue #1167:
+    # all 8,598 cold self-check defers had exactly this shape), so skip
+    # the wire round-trip. ProperType satisfies the self-check isinstance idiom.
+    if (
+        isinstance(t, ProperType)
+        and isinstance(t, UnionType)
+        and any(isinstance(i, UnboundType) for i in t.items)
+    ):
+        return None
     try:
         payload = _serialize_typeanal_type(t)
         result = _rust_type_analyze(payload, allow_tuple_literal, allow_param_spec_literals, allow_unpack)
