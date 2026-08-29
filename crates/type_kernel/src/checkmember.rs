@@ -44,6 +44,7 @@
 
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyType};
+use std::collections::HashSet;
 
 use crate::freshen::freshen_type;
 use crate::setops::make_simplified_union;
@@ -636,7 +637,6 @@ pub(crate) fn rust_defined_in_superclass(
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
-// TEMPORARY audit instrumentation (issue #1129) — removed before commit.
 // ---------------------------------------------------------------------------
 
 /// The `maptype.py:326-345` `builtins.tuple` special case inside
@@ -1115,18 +1115,349 @@ pub(crate) fn rust_analyze_instance_member_access(
     encode_type(&result)
 }
 
+// ---------------------------------------------------------------------------
+// bind_self generic self-solve (issue #1214)
+// ---------------------------------------------------------------------------
+
+type BindTVarKey = (i64, i64, String);
+
+fn contains_tvar_like(typ: &Type) -> bool {
+    match typ {
+        Type::TypeVarType { .. } | Type::ParamSpecType { .. } | Type::TypeVarTupleType { .. } => {
+            true
+        }
+        Type::Instance { args, .. } => args.iter().any(contains_tvar_like),
+        Type::CallableType {
+            arg_types,
+            ret_type,
+            instance_type,
+            variables,
+            type_guard,
+            type_is,
+            ..
+        } => {
+            arg_types.iter().any(contains_tvar_like)
+                || contains_tvar_like(ret_type)
+                || instance_type.as_deref().is_some_and(contains_tvar_like)
+                || type_guard.as_deref().is_some_and(contains_tvar_like)
+                || type_is.as_deref().is_some_and(contains_tvar_like)
+                || variables.iter().any(contains_tvar_like)
+        }
+        Type::Overloaded { items } => items.iter().any(contains_tvar_like),
+        Type::UnionType { items, .. } => items.iter().any(contains_tvar_like),
+        Type::TupleType {
+            items,
+            partial_fallback,
+            ..
+        } => items.iter().any(contains_tvar_like) || contains_tvar_like(partial_fallback),
+        Type::TypedDictType {
+            items, fallback, ..
+        } => items.iter().any(|(_, t)| contains_tvar_like(t)) || contains_tvar_like(fallback),
+        Type::TypeType { item, .. } => contains_tvar_like(item),
+        Type::UnpackType { typ } => contains_tvar_like(typ),
+        Type::Parameters(p) => p.arg_types.iter().any(contains_tvar_like),
+        _ => false,
+    }
+}
+
+/// Per-item plan of `bind_self`'s generic solve branch (typeops.py:1062):
+/// `self_vars` are the method tvars in the item's self param, `bare` the
+/// subset replaced by the receiver; None defers, star-self/empty empty.
+struct ItemBindPlan {
+    self_vars: Vec<BindTVarKey>,
+    bare: Vec<BindTVarKey>,
+}
+
+fn plan_item_bind(item: &Type) -> Option<ItemBindPlan> {
+    let (arg_types, arg_kinds, variables) = match item {
+        Type::CallableType {
+            arg_types,
+            arg_kinds,
+            variables,
+            ..
+        } => (arg_types, arg_kinds, variables),
+        _ => return None,
+    };
+    let empty = ItemBindPlan {
+        self_vars: vec![],
+        bare: vec![],
+    };
+    let Some(self_t) = arg_types.first() else {
+        return Some(empty);
+    };
+    match arg_kinds.first() {
+        Some(&kind) if kind == ARG_STAR || kind == ARG_STAR2 => return Some(empty),
+        _ => {}
+    }
+    if crate::expandtype::result_contains_typealias(self_t) {
+        return None;
+    }
+    let mut self_ids: HashSet<BindTVarKey> = HashSet::new();
+    collect_bind_self_ids(self_t, &mut self_ids);
+    if self_ids.is_empty() {
+        return Some(empty);
+    }
+    let mut self_vars: Vec<BindTVarKey> = vec![];
+    for v in variables {
+        match v {
+            Type::TypeVarType {
+                raw_id,
+                meta_level,
+                namespace,
+                ..
+            } => {
+                let key = (*raw_id, *meta_level, namespace.clone());
+                if self_ids.contains(&key) {
+                    self_vars.push(key);
+                }
+            }
+            Type::ParamSpecType {
+                raw_id, namespace, ..
+            }
+            | Type::TypeVarTupleType {
+                raw_id, namespace, ..
+            } => {
+                let key = (*raw_id, -1, namespace.clone());
+                if self_ids.contains(&key) {
+                    self_vars.push(key);
+                }
+            }
+            _ => {}
+        }
+    }
+    let bare = match self_t {
+        // Only a plain TypeVarType self param is substituted with the
+        // receiver; nested tvars were bound by the expand from the mapped
+        // receiver args, exactly as Python's solve inference derives them.
+        Type::TypeVarType {
+            raw_id,
+            meta_level,
+            namespace,
+            ..
+        } => {
+            let key = (*raw_id, *meta_level, namespace.clone());
+            if self_vars.contains(&key) {
+                vec![key]
+            } else {
+                vec![]
+            }
+        }
+        _ => vec![],
+    };
+    Some(ItemBindPlan { self_vars, bare })
+}
+
+/// Tvar id collection for the self-solve plan (TypeVarExtractor semantics
+/// over the wire walk; ParamSpec/TypeVarTuple entries use the -1
+/// meta-level sentinel, matching the plan's variable-key build).
+fn collect_bind_self_ids(typ: &Type, out: &mut HashSet<BindTVarKey>) {
+    match typ {
+        Type::TypeVarType {
+            raw_id,
+            meta_level,
+            namespace,
+            ..
+        } => {
+            out.insert((*raw_id, *meta_level, namespace.clone()));
+        }
+        Type::ParamSpecType {
+            raw_id, namespace, ..
+        }
+        | Type::TypeVarTupleType {
+            raw_id, namespace, ..
+        } => {
+            out.insert((*raw_id, -1, namespace.clone()));
+        }
+        Type::Instance { args, .. } => {
+            for a in args {
+                collect_bind_self_ids(a, out);
+            }
+        }
+        Type::CallableType {
+            arg_types,
+            ret_type,
+            instance_type,
+            ..
+        } => {
+            for a in arg_types {
+                collect_bind_self_ids(a, out);
+            }
+            collect_bind_self_ids(ret_type, out);
+            if let Some(it) = instance_type {
+                collect_bind_self_ids(it, out);
+            }
+        }
+        Type::Overloaded { items } => {
+            for i in items {
+                collect_bind_self_ids(i, out);
+            }
+        }
+        Type::UnionType { items, .. } => {
+            for i in items {
+                collect_bind_self_ids(i, out);
+            }
+        }
+        Type::TupleType {
+            partial_fallback,
+            items,
+            ..
+        } => {
+            collect_bind_self_ids(partial_fallback, out);
+            for i in items {
+                collect_bind_self_ids(i, out);
+            }
+        }
+        Type::TypedDictType {
+            fallback, items, ..
+        } => {
+            collect_bind_self_ids(fallback, out);
+            for (_, t) in items {
+                collect_bind_self_ids(t, out);
+            }
+        }
+        Type::TypeType { item, .. } => collect_bind_self_ids(item, out),
+        Type::UnpackType { typ } => collect_bind_self_ids(typ, out),
+        Type::Parameters(p) => {
+            for a in &p.arg_types {
+                collect_bind_self_ids(a, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Substitute the bare self-var keys with `val` everywhere Python's solve
+/// expand_type reaches: arg/ret types, type_guard/type_is, instance_type,
+/// nested callables; variables/fallback excluded (expandtype.py:1158-1171).
+fn subst_tvar_keys(typ: &mut Type, keys: &[BindTVarKey], val: &Type) {
+    if let Type::TypeVarType {
+        raw_id,
+        meta_level,
+        namespace,
+        ..
+    } = typ
+    {
+        if keys
+            .iter()
+            .any(|(r, m, ns)| *r == *raw_id && *m == *meta_level && ns == namespace)
+        {
+            *typ = val.clone();
+        }
+        return;
+    }
+    match typ {
+        Type::Instance { args, .. } => {
+            for a in args {
+                subst_tvar_keys(a, keys, val);
+            }
+        }
+        Type::CallableType {
+            arg_types,
+            ret_type,
+            instance_type,
+            type_guard,
+            type_is,
+            ..
+        } => {
+            for a in arg_types {
+                subst_tvar_keys(a, keys, val);
+            }
+            subst_tvar_keys(ret_type, keys, val);
+            if let Some(it) = instance_type.as_deref_mut() {
+                subst_tvar_keys(it, keys, val);
+            }
+            if let Some(g) = type_guard.as_deref_mut() {
+                subst_tvar_keys(g, keys, val);
+            }
+            if let Some(i) = type_is.as_deref_mut() {
+                subst_tvar_keys(i, keys, val);
+            }
+        }
+        Type::Overloaded { items } => {
+            for item in items {
+                subst_tvar_keys(item, keys, val);
+            }
+        }
+        Type::UnionType { items, .. } => {
+            for item in items {
+                subst_tvar_keys(item, keys, val);
+            }
+        }
+        Type::TupleType {
+            items,
+            partial_fallback,
+            ..
+        } => {
+            subst_tvar_keys(partial_fallback, keys, val);
+            for item in items {
+                subst_tvar_keys(item, keys, val);
+            }
+        }
+        Type::TypedDictType {
+            items, fallback, ..
+        } => {
+            subst_tvar_keys(fallback, keys, val);
+            for (_, t) in items.iter_mut() {
+                subst_tvar_keys(t, keys, val);
+            }
+        }
+        Type::TypeType { item, .. } => subst_tvar_keys(item, keys, val),
+        Type::UnpackType { typ } => subst_tvar_keys(typ, keys, val),
+        Type::Parameters(p) => {
+            for a in &mut p.arg_types {
+                subst_tvar_keys(a, keys, val);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Remove the solved self-var entries from the item's `variables` list
+/// (Python: `variables = [v for v in func.variables if v not in self_vars]`).
+fn remove_self_vars(item: &mut Type, keys: &[BindTVarKey]) {
+    if let Type::CallableType { variables, .. } = item {
+        variables.retain(|v| match v {
+            Type::TypeVarType {
+                raw_id,
+                meta_level,
+                namespace,
+                ..
+            } => {
+                let key = (*raw_id, *meta_level, namespace.clone());
+                !keys.contains(&key)
+            }
+            Type::ParamSpecType {
+                raw_id, namespace, ..
+            }
+            | Type::TypeVarTupleType {
+                raw_id, namespace, ..
+            } => {
+                let key = (*raw_id, -1, namespace.clone());
+                !keys.contains(&key)
+            }
+            _ => true,
+        });
+    }
+}
+
+/// Freeze the freshened method typevars of one item (typeops.py:2102
+/// `freeze_all_type_vars` mirror): collect the `variables`-declared ids,
+/// verify every survivor is among them, zero their meta levels, else defer.
+fn freeze_item(mut item: Type) -> Option<Type> {
+    let mut freeze_ids: Vec<(i64, i64, String)> = Vec::new();
+    collect_freeze_ids(&mut item, &mut freeze_ids);
+    if !survivors_freezable(&mut item, &freeze_ids) {
+        return None;
+    }
+    apply_freeze(&mut item, &freeze_ids);
+    Some(item)
+}
+
 /// Non-trivial-instance-method tail of `analyze_instance_member_access`
 /// (checkmember.py:717-731): receiver-validated bind + map + expand in one
-/// wire call. Defers (None) when any step needs Python's object semantics.
-///
-/// `allow_subclass_receiver`: the `find_member` protocol path (issue #1121)
-/// looks members up on subclass receivers; `map_instance_to_supertype`
-/// already maps the receiver to the defining class and `bind_self`'s
-/// non-generic strip is receiver-independent, so the equality guard can
-/// be dropped there. The `analyze_instance_member_access` dispatch keeps
-/// the equality guard only for variable-carrying signatures, where
-/// Python's generic `bind_self` branch may run; variable-free signatures
-/// bind by strip only, so the dispatch drops the guard there too.
+/// wire call, deferring on Python's object semantics. `suppress_self_fail`
+/// is set in the error-suppressed protocol member-fetch contexts where a
+/// zero-match self filter keeps binding Python-side.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn member_method_inner(
     instance: &Type,
@@ -1137,7 +1468,7 @@ pub(crate) fn member_method_inner(
     resolver: &TypeResolver,
     strict_optional: bool,
     is_class: bool,
-    allow_subclass_receiver: bool,
+    suppress_self_fail: bool,
 ) -> Option<Type> {
     // Class methods: bind_self's non-generic strip path is
     // is_classmethod-agnostic, so the same strip is valid here; the
@@ -1160,21 +1491,12 @@ pub(crate) fn member_method_inner(
             return None;
         }
     };
-    // Same-class guard unless the caller handles subclass receivers
-    // (protocol path re-maps them). Variable-free signatures strip
-    // exactly like Python's bind_self; variable-carrying ones defer.
-    let self_ref = match self_type {
-        Type::Instance { type_ref, .. } => type_ref.as_str(),
-        _ => {
-            return None;
-        }
-    };
-    if !allow_subclass_receiver && self_ref != method_fullname && has_vars {
-        return None;
-    }
     // checkmember.py:769 `check_self_arg(signature, mx.self_type, ...)`:
     // Rust mirrors the overload-item self filter; a zero-match defers so
     // Python emits `incompatible_self_argument` on the unfiltered signature.
+    // In the error-suppressed find_member contexts (protocol member
+    // fetches) Python keeps the original functype and continues binding,
+    // so callers pass suppress_self_fail=true there.
     let filtered = match check_self_arg_inner(
         signature,
         self_type,
@@ -1182,6 +1504,7 @@ pub(crate) fn member_method_inner(
         name,
         strict_optional,
         resolver,
+        suppress_self_fail,
     ) {
         Some(f) => f,
         None => {
@@ -1206,55 +1529,81 @@ pub(crate) fn member_method_inner(
         last_known_value: None,
         extra_attrs: None,
     };
-    // checkmember.py:729 `expand_type_by_instance` runs on the unbound
-    // callable (the wire expand Callable arm defers on `is_bound`); the
-    // binding after only strips `arg_types[1:]`, so the orders agree.
-    let expanded = crate::expandtype::expand_type_by_instance_core(
+    // checkmember.py:729-731 runs bind_self first (generic solve,
+    // typeops.py:1062-1108) and expands afterwards; the plans below gate
+    // the solve outcome on the expand tail and defer unbuildable items.
+    let bind_plans: Vec<ItemBindPlan> = match &filtered {
+        Type::CallableType { .. } => vec![plan_item_bind(&filtered)?],
+        Type::Overloaded { items } => {
+            if items.is_empty() {
+                return None;
+            }
+            let mut plans = Vec::with_capacity(items.len());
+            for it in items {
+                plans.push(plan_item_bind(it)?);
+            }
+            plans
+        }
+        _ => return None,
+    };
+    // A bare-Self plan injects the receiver wholesale, while Python solves
+    // against the receiver first; when the receiver itself carries type
+    // vars the two orders can diverge, so defer.
+    if bind_plans.iter().any(|p| !p.bare.is_empty()) && contains_tvar_like(self_type) {
+        return None;
+    }
+    let expanded = match crate::expandtype::expand_type_by_instance_free(
         &filtered,
         &mapped_instance,
         resolver,
         strict_optional,
-    );
-    let expanded = match expanded {
+    ) {
         Some(e) => e,
         None => {
             return None;
         }
     };
-    if crate::expandtype::result_has_typevar(&expanded) {
-        return None; // free type vars need object-preserving Python path.
-    }
-    // bind_self (non-generic path): the same-class guard + self-arg filter
-    // kept only items whose self is compatible with the concrete receiver,
-    // so `bind_self_fast_inner` mirrors it exactly: strip, set `is_bound`.
-    let bound = match expanded {
+    // bind_self (strip tail): the self-arg filter kept only receiver-
+    // compatible items, so `bind_self_fast_inner` strips and sets
+    // `is_bound`; leftover typevars after bare-subst + freeze defer.
+    let bound_items: Vec<Type> = match expanded {
         Type::Overloaded { items } => {
-            if items.is_empty() {
+            if items.len() != bind_plans.len() {
                 return None;
             }
             let mut new_items = Vec::with_capacity(items.len());
-            for item in items {
-                let item = match bind_self_fast_inner(&item) {
+            for (mut item, plan) in items.into_iter().zip(bind_plans) {
+                subst_tvar_keys(&mut item, &plan.bare, self_type);
+                remove_self_vars(&mut item, &plan.self_vars);
+                let item = match freeze_item(item) {
                     Some(i) => i,
                     None => {
                         return None;
                     }
                 };
-                new_items.push(item);
+                new_items.push(bind_self_fast_inner(&item)?);
             }
-            Type::Overloaded { items: new_items }
+            new_items
         }
-        Type::CallableType { .. } => match bind_self_fast_inner(&expanded) {
-            Some(b) => b,
-            None => {
-                return None;
-            }
-        },
-        _ => {
-            return None;
+        item @ Type::CallableType { .. } => {
+            let plan = bind_plans.into_iter().next()?;
+            let mut item = item;
+            subst_tvar_keys(&mut item, &plan.bare, self_type);
+            remove_self_vars(&mut item, &plan.self_vars);
+            let item = match freeze_item(item) {
+                Some(i) => i,
+                None => {
+                    return None;
+                }
+            };
+            vec![bind_self_fast_inner(&item)?]
         }
+        _ => return None,
     };
-    Some(bound)
+    if bound_items.len() == 1 && !matches!(filtered, Type::Overloaded { .. }) {
+        return bound_items.into_iter().next();
+    }
+    Some(Type::Overloaded { items: bound_items })
 }
 
 /// `#[pyfunction]` entry: `rust_analyze_member_method`.
@@ -1287,7 +1636,6 @@ pub(crate) fn rust_analyze_member_method(
     encode_type(&result)
 }
 
-// ---------------------------------------------------------------------------
 // analyze_instance_member_access (method-branch dispatch, issue #805)
 // ---------------------------------------------------------------------------
 
@@ -2498,6 +2846,7 @@ pub(crate) fn rust_check_self_arg(
         name,
         strict_optional,
         resolver.resolver(),
+        false,
     );
     // check_self_arg only filters overload items — it does not freshen.
     // Return (next_raw_id=0, changed=false, wire_bytes) so the Python
@@ -2512,6 +2861,7 @@ fn check_self_arg_inner(
     name: &str,
     strict_optional: bool,
     resolver: &TypeResolver,
+    suppress_self_fail: bool,
 ) -> Option<Type> {
     let items = match functype {
         Type::CallableType { .. } => vec![functype.clone()],
@@ -2545,16 +2895,26 @@ fn check_self_arg_inner(
             _ => return None,
         };
         if arg_types.is_empty() {
-            // Python: msg.no_formal_self, then return functype. Defer (Python
-            // reports the error).
+            // Python: msg.no_formal_self, then `return functype`. Defer in
+            // production (Python reports the error); the error-suppressed
+            // find_member contexts keep the original functype, as Python.
+            if suppress_self_fail {
+                return Some(functype.clone());
+            }
             return None;
         }
         // Python checks item.arg_kinds[0] not in (ARG_POS, ARG_STAR).
         // Guard a length mismatch; if arg_kinds[0] is not ARG_POS/ARG_STAR,
-        // Python reports no_formal_self and returns functype. Defer.
+        // Python reports no_formal_self and returns functype. Defer in
+        // production; suppressed contexts keep functype.
         match arg_kinds.first() {
             Some(&k) if k == ARG_POS || k == ARG_STAR => {}
-            _ => return None,
+            _ => {
+                if suppress_self_fail {
+                    return Some(functype.clone());
+                }
+                return None;
+            }
         }
         let selfarg = get_proper_or_none(&arg_types[0])?;
         match (&dispatched, selfarg) {
@@ -2647,7 +3007,11 @@ fn check_self_arg_inner(
 
     if pass2.is_empty() {
         // Python reports incompatible_self_argument, then returns functype.
-        // Defer so Python can report the error.
+        // Defer in production so Python can report the error; suppressed
+        // find_member contexts keep the original functype, as Python.
+        if suppress_self_fail {
+            return Some(functype.clone());
+        }
         return None;
     }
     if pass2.len() == 1 {
@@ -4122,7 +4486,7 @@ mod tests {
             ..
         } = &mut sig
         {
-            *ret_type = Box::new(tvar.clone());
+            **ret_type = tvar.clone();
             variables.push(tvar);
         }
         let inst = make_instance("builtins.int");
@@ -4175,7 +4539,7 @@ mod tests {
         let resolver = snap_resolver();
         let mut sig = make_callable(vec![], false);
         if let Type::CallableType { ret_type, .. } = &mut sig {
-            *ret_type = Box::new(make_meta_tvar(7, "__main__.B@3", 0));
+            **ret_type = make_meta_tvar(7, "__main__.B@3", 0);
         }
         let inst = Type::Instance {
             type_ref: "builtins.int".to_string(),
@@ -4648,6 +5012,7 @@ mod tests {
             "f",
             true,
             &resolver,
+            false,
         )
         .expect("matching selfarg returns item");
         match result {
@@ -4665,7 +5030,8 @@ mod tests {
             false,
             "f",
             true,
-            &resolver
+            &resolver,
+            false
         )
         .is_none());
     }
@@ -4699,7 +5065,8 @@ mod tests {
             false,
             "f",
             true,
-            &resolver
+            &resolver,
+            false
         )
         .is_none());
     }
@@ -4719,6 +5086,7 @@ mod tests {
             "f",
             true,
             &resolver,
+            false,
         );
     }
 
@@ -5032,8 +5400,15 @@ mod tests {
         };
         // Step 1b: check_self_arg filter passes for the generic `self: G[T]`
         // receiver `G[A]` (the TypeVar overlaps with the concrete arg).
-        let filtered =
-            check_self_arg_inner(&method, &make_ga_instance(), false, "foo", true, &resolver);
+        let filtered = check_self_arg_inner(
+            &method,
+            &make_ga_instance(),
+            false,
+            "foo",
+            true,
+            &resolver,
+            false,
+        );
         assert!(filtered.is_some(), "TypeVar self must survive the filter");
         // Step 2: expand runs on the unbound callable; the Callable arm of
         // expand_type_inner defers on is_bound, so bind must come after.
@@ -5089,7 +5464,7 @@ mod tests {
             &resolver,
             true,
             false, // is_class
-            false, // allow_subclass_receiver (unit tests)
+            false, // suppress_self_fail
         );
         match result {
             Some(Type::CallableType { is_bound, .. }) => assert!(is_bound),
@@ -5125,7 +5500,7 @@ mod tests {
             &resolver,
             true,
             false, // is_class
-            false, // allow_subclass_receiver (unit tests)
+            false, // suppress_self_fail
         );
         assert!(result.is_none(), "incompatible self must defer");
     }
@@ -5143,7 +5518,7 @@ mod tests {
             &resolver,
             true,
             true,  // is_class
-            false, // allow_subclass_receiver (unit tests)
+            false, // suppress_self_fail
         );
         assert!(result.is_none(), "classmethod must defer");
     }
@@ -5239,7 +5614,7 @@ mod tests {
             arg_types: vec![make_instance("A"), *x_type],
             arg_kinds: vec![ARG_POS, ARG_POS],
             arg_names: vec![Some("self".to_string()), Some("x".to_string())],
-            ret_type: ret_type,
+            ret_type,
             name: Some("foo".to_string()),
             variables,
             type_guard: None,
@@ -5266,7 +5641,7 @@ mod tests {
         let b = make_b_receiver();
         let result = member_method_inner(
             &b, &method, "A", &b, "foo", &resolver, true, false, // is_class
-            false, // allow_subclass_receiver
+            false, // suppress_self_fail
         );
         match result {
             Some(Type::CallableType {
@@ -5282,9 +5657,10 @@ mod tests {
     }
 
     #[test]
-    fn test_member_method_subclass_receiver_generic_defers() {
-        // B receiver, generic method on A: bind_self's generic branch could
-        // fire (variables non-empty), so the equality guard keeps deferring.
+    fn test_member_method_subclass_receiver_generic_completes() {
+        // B receiver, `def [T] foo(self: A, x: T) -> T` on A: the self param
+        // carries no method typevar, so the plan is the plain strip and the
+        // receiver completes like the nongeneric case (bind plan).
         let resolver = make_ab_resolver();
         let method = make_ab_method(vec![Type::TypeVarType {
             name: "T".to_string(),
@@ -5300,9 +5676,19 @@ mod tests {
         let b = make_b_receiver();
         let result = member_method_inner(
             &b, &method, "A", &b, "foo", &resolver, true, false, // is_class
-            false, // allow_subclass_receiver
+            false, // suppress_self_fail
         );
-        assert!(result.is_none(), "generic subclass receiver must defer");
+        match result {
+            Some(Type::CallableType {
+                arg_types,
+                is_bound,
+                ..
+            }) => {
+                assert!(is_bound);
+                assert_eq!(arg_types.len(), 1);
+            }
+            other => panic!("expected bound CallableType, got {other:?}"),
+        }
     }
 
     // --- classify_type_type_member_access (issue #957) ---
