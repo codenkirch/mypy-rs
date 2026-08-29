@@ -1443,9 +1443,6 @@ fn dispatch_instance_member_inner(
     let method = match get_method_live(py, info, name) {
         Some(LiveMethod::FuncBase(node)) => node,
         Some(LiveMethod::Decorator) => {
-            // The Python shim pre-gates Decorator / property / lvalue /
-            // super for the instance path; the union path bypasses it, so
-            // Rust re-checks here.
             return None;
         }
         None => {
@@ -1988,20 +1985,24 @@ fn analyze_member_access_inner<'a>(
 // ---------------------------------------------------------------------------
 
 /// `mypy.checkmember.analyze_union_member_access` (checkmember.py:892-925),
-/// per-item Rust subset (issue #805). Returns per-item results, not the
-/// joined union: the Python shim joins via `make_simplified_union` after
-/// restoring each item's `definition` link, mirroring the pure-Python loop
-/// (checkmember.py:920-925). An Instance item is dispatched through
-/// `dispatch_instance_member_inner` (self_type = item, override_info =
-/// None); any other item goes through `analyze_member_access_inner`.
-/// Defers (None) when any item defers or when `is_lvalue` / `is_super`
-/// (the Python shim pre-gates those for the instance path; per-item
-/// lvalue/super semantics stay in Python).
+/// per-item Rust subset (issue #805, extended by #1170). Returns per-item
+/// results, not the joined union: the Python shim joins via
+/// `make_simplified_union` after restoring each item's `definition` link,
+/// mirroring the pure-Python loop (checkmember.py:920-925). An Instance
+/// item is dispatched through `dispatch_instance_member_inner`
+/// (self_type = item, override_info = None); any other item goes through
+/// `analyze_member_access_inner` without a dispatch context. A slot is a
+/// `None` when the item defers (dispatch failure, non-Instance singleton,
+/// undecodable result): the Python shim fills exactly those slots through
+/// the pure-Python per-item loop instead of discarding whole-union work.
+/// The whole call defers (None) for `is_lvalue` / `is_super` (the Python
+/// shim pre-gates those for the instance path; per-item lvalue/super
+/// semantics stay in Python) or a union-shape mismatch.
 #[pyfunction]
 #[pyo3(signature = (resolver, union_bytes, name, is_lvalue, is_super,
                     _no_deferral, preserve_type_var_ids, start_raw_id,
                     strict_optional))]
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
 pub(crate) fn rust_analyze_union_member_access(
     py: Python<'_>,
     resolver: &NativeTypeResolver,
@@ -2013,14 +2014,16 @@ pub(crate) fn rust_analyze_union_member_access(
     preserve_type_var_ids: bool,
     start_raw_id: i64,
     strict_optional: bool,
-) -> Option<(i64, bool, Vec<Vec<u8>>)> {
+) -> Option<(i64, bool, Vec<Option<Vec<u8>>>)> {
     if is_lvalue || is_super {
         return None;
     }
     let typ = decode_type(union_bytes)?;
     let items = match typ {
         Type::UnionType { items, .. } => items,
-        _ => return None,
+        _ => {
+            return None;
+        }
     };
     // relevant_items(): skip NoneType when not strict_optional.
     let relevant: Vec<&Type> = if strict_optional {
@@ -2033,9 +2036,9 @@ pub(crate) fn rust_analyze_union_member_access(
     };
     let mut next_raw_id = start_raw_id;
     let mut changed = false;
-    let mut results = Vec::with_capacity(relevant.len());
-    for item in &relevant {
-        let r = match item {
+    let mut results: Vec<Option<Vec<u8>>> = Vec::with_capacity(relevant.len());
+    for item in relevant.iter() {
+        let item_result: Option<Type> = match item {
             Type::Instance { .. } => {
                 // Python binds self_type per union item
                 // (mx.copy_modified(self_type=subtype) at
@@ -2051,16 +2054,16 @@ pub(crate) fn rust_analyze_union_member_access(
                     &mut next_raw_id,
                     &mut changed,
                     strict_optional,
-                )?
+                )
             }
             _ => {
                 // Non-Instance union item: route through the general path
                 // without a dispatch context (Python keeps Instance operands
                 // in Python here via `_analyze_member_access` on the item).
-                analyze_member_access_inner(item, None, resolver.resolver())?
+                analyze_member_access_inner(item, None, resolver.resolver())
             }
         };
-        results.push(encode_type(&r)?);
+        results.push(item_result.as_ref().and_then(encode_type));
     }
     Some((next_raw_id, changed, results))
 }
@@ -2072,76 +2075,121 @@ pub(crate) fn rust_analyze_union_member_access(
 /// `mypy.checkmember.analyze_none_member_access` (checkmember.py:666-677).
 ///
 /// `__bool__` returns a pure CallableType ret=Literal[False]. Any other
-/// name recurses on `builtins.object` via `_analyze_member_access`. Defer
-/// (None) when the recursion on `builtins.object` defers.
+/// name recurses on `builtins.object` through the live-method dispatch
+/// with the caller's mx facts: `self_type` (bound per union item on the
+/// `analyze_union_member_access` fill path or the narrowed receiver;
+/// `MemberContext.__init__` falls back to `original_type`, so Python
+/// never carries None here), `preserve_type_var_ids`, and the raw-id
+/// counter shared with the caller's `TypeVarId.next_raw_id`. Defer
+/// (None) for `is_lvalue` / `is_super` (per-item lvalue/super semantics
+/// stay in Python) or when the dispatch defers.
 #[pyfunction]
+#[pyo3(signature = (resolver, name, typ_bytes, self_type_bytes, is_lvalue, is_super,
+                    preserve_type_var_ids, start_raw_id, strict_optional))]
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn rust_analyze_none_member_access(
+    py: Python<'_>,
     resolver: &NativeTypeResolver,
     name: &str,
     typ_bytes: &[u8],
+    self_type_bytes: Option<Vec<u8>>,
+    is_lvalue: bool,
+    is_super: bool,
+    preserve_type_var_ids: bool,
+    start_raw_id: i64,
     strict_optional: bool,
-) -> PyResult<Option<Vec<u8>>> {
+) -> PyResult<Option<(i64, bool, Vec<u8>)>> {
     // We only accept NoneType input; any other type is a caller bug — defer.
     if !matches!(decode_type(typ_bytes), Some(Type::NoneType)) {
         return Ok(None);
     }
-    Ok(
-        analyze_none_member_access_inner(name, strict_optional, resolver.resolver())
-            .and_then(|t| encode_type(&t)),
-    )
+    if name == "__bool__" {
+        return Ok(Some((
+            start_raw_id,
+            false,
+            match encode_type(&analyze_none_bool_type()) {
+                Some(b) => b,
+                None => return Ok(None),
+            },
+        )));
+    }
+    if is_lvalue || is_super {
+        return Ok(None);
+    }
+    let self_type = match self_type_bytes {
+        Some(b) => match decode_type(&b) {
+            Some(t) => t,
+            None => {
+                return Ok(None);
+            }
+        },
+        None => return Ok(None),
+    };
+    // _analyze_member_access(name, builtins.object, mx)
+    let object_inst = Type::Instance {
+        type_ref: "builtins.object".to_string(),
+        args: vec![],
+        last_known_value: None,
+        extra_attrs: None,
+    };
+    let mut next_raw_id = start_raw_id;
+    let mut changed = false;
+    let result = match dispatch_instance_member_inner(
+        py,
+        resolver,
+        &object_inst,
+        name,
+        None,
+        &self_type,
+        preserve_type_var_ids,
+        &mut next_raw_id,
+        &mut changed,
+        strict_optional,
+    ) {
+        Some(r) => r,
+        None => {
+            return Ok(None);
+        }
+    };
+    Ok(encode_type(&result).map(|b| (next_raw_id, changed, b)))
 }
 
-fn analyze_none_member_access_inner(
-    name: &str,
-    _strict_optional: bool,
-    resolver: &TypeResolver,
-) -> Option<Type> {
-    if name == "__bool__" {
-        // LiteralType(False, fallback=builtins.bool)
-        let bool_inst = Type::Instance {
-            type_ref: "builtins.bool".to_string(),
-            args: vec![],
-            last_known_value: None,
-            extra_attrs: None,
-        };
-        let literal_false = Type::LiteralType {
-            fallback: Box::new(bool_inst.clone()),
-            value: crate::wire::LiteralValue::Bool(false),
-        };
-        let func_inst = Type::Instance {
-            type_ref: "builtins.function".to_string(),
-            args: vec![],
-            last_known_value: None,
-            extra_attrs: None,
-        };
-        Some(Type::CallableType {
-            fallback: Box::new(func_inst),
-            instance_type: None,
-            is_ellipsis_args: false,
-            implicit: false,
-            is_bound: false,
-            from_concatenate: false,
-            imprecise_arg_kinds: false,
-            unpack_kwargs: false,
-            from_type_type: false,
-            arg_types: vec![],
-            arg_kinds: vec![],
-            arg_names: vec![],
-            ret_type: Box::new(literal_false),
-            name: None,
-            variables: vec![],
-            type_guard: None,
-            type_is: None,
-        })
-    } else {
-        // _analyze_member_access(name, builtins.object, mx)
-        let object_inst = Type::Instance {
-            type_ref: "builtins.object".to_string(),
-            args: vec![],
-            last_known_value: None,
-            extra_attrs: None,
-        };
-        analyze_member_access_inner(&object_inst, None, resolver)
+fn analyze_none_bool_type() -> Type {
+    // LiteralType(False, fallback=builtins.bool)
+    let bool_inst = Type::Instance {
+        type_ref: "builtins.bool".to_string(),
+        args: vec![],
+        last_known_value: None,
+        extra_attrs: None,
+    };
+    let literal_false = Type::LiteralType {
+        fallback: Box::new(bool_inst.clone()),
+        value: crate::wire::LiteralValue::Bool(false),
+    };
+    let func_inst = Type::Instance {
+        type_ref: "builtins.function".to_string(),
+        args: vec![],
+        last_known_value: None,
+        extra_attrs: None,
+    };
+    Type::CallableType {
+        fallback: Box::new(func_inst),
+        instance_type: None,
+        is_ellipsis_args: false,
+        implicit: false,
+        is_bound: false,
+        from_concatenate: false,
+        imprecise_arg_kinds: false,
+        unpack_kwargs: false,
+        from_type_type: false,
+        arg_types: vec![],
+        arg_kinds: vec![],
+        arg_names: vec![],
+        ret_type: Box::new(literal_false),
+        name: None,
+        variables: vec![],
+        type_guard: None,
+        type_is: None,
     }
 }
 
@@ -4232,13 +4280,11 @@ mod tests {
         }
     }
 
-    // --- analyze_none_member_access_inner ---
+    // --- analyze_none_bool_type ---
 
     #[test]
     fn test_none_access_bool_returns_callable_literal_false() {
-        let resolver = TypeResolver::new();
-        let result = analyze_none_member_access_inner("__bool__", true, &resolver)
-            .expect("__bool__ returns a callable");
+        let result = analyze_none_bool_type();
         match result {
             Type::CallableType {
                 arg_types,
@@ -4256,13 +4302,6 @@ mod tests {
             }
             other => panic!("expected CallableType, got {other:?}"),
         }
-    }
-
-    #[test]
-    fn test_none_access_object_defers() {
-        let resolver = TypeResolver::new();
-        // builtins.object is an Instance -> analyze_member_access_inner defers.
-        assert!(analyze_none_member_access_inner("foo", true, &resolver).is_none());
     }
 
     // --- analyze_typeddict_access_inner ---

@@ -1100,6 +1100,9 @@ def analyze_union_member_access(name: str, typ: UnionType, mx: MemberContext) ->
         # M20: gate the union-map through Rust when the kernel is active.
         # Rust maps relevant_items and returns per-item results; this shim
         # joins via make_simplified_union. Defer: property / Var / lvalue.
+        # An item Rust cannot decide arrives as a None slot that the shim
+        # fills through the pure-Python per-item loop, so one undecidable
+        # item no longer discards whole-union work.
         if (
             _HAS_TYPE_KERNEL
             and _native_checkmember_active
@@ -1126,6 +1129,14 @@ def analyze_union_member_access(name: str, typ: UnionType, mx: MemberContext) ->
                     if len(per_item) == len(relevant):
                         decoded_items = []
                         for subtype, item_bytes in zip(relevant, per_item):
+                            if item_bytes is None:
+                                # Self types should be bound to every
+                                # individual item of a union.
+                                item_mx = mx.copy_modified(self_type=subtype)
+                                decoded_items.append(
+                                    _analyze_member_access(name, subtype, item_mx)
+                                )
+                                continue
                             decoded = _deserialize_type_for_checkmember(bytes(item_bytes))
                             if decoded is None:
                                 break
@@ -1138,14 +1149,13 @@ def analyze_union_member_access(name: str, typ: UnionType, mx: MemberContext) ->
                                     and method.type is not None
                                 ):
                                     decoded = _restore_definition(method.type, decoded)
+                            if isinstance(decoded, ProperType):
+                                decoded.line = typ.line
+                                decoded.column = typ.column
+                                if isinstance(decoded, CallableType):
+                                    decoded.fallback.line = decoded.line
                             decoded_items.append(decoded)
                         else:
-                            for decoded in decoded_items:
-                                if isinstance(decoded, ProperType):
-                                    decoded.line = typ.line
-                                    decoded.column = typ.column
-                                    if isinstance(decoded, CallableType):
-                                        decoded.fallback.line = decoded.line
                             return make_simplified_union(decoded_items)
             except (AssertionError, NotImplementedError, ValueError):
                 pass
@@ -1160,7 +1170,9 @@ def analyze_union_member_access(name: str, typ: UnionType, mx: MemberContext) ->
 def analyze_none_member_access(name: str, typ: NoneType, mx: MemberContext) -> Type:
     # M20: gate the NoneType branch through Rust. __bool__ returns a pure
     # CallableType (ret=Literal[False]); any other name recurses on
-    # builtins.object. Defer (None) when the recursion defers.
+    # builtins.object through the live-method dispatch with the caller's
+    # mx facts (self_type / lvalue / super). Defer (None) when the
+    # dispatch defers.
     if (
         _HAS_TYPE_KERNEL
         and _native_checkmember_active
@@ -1172,10 +1184,18 @@ def analyze_none_member_access(name: str, typ: NoneType, mx: MemberContext) -> T
                 _native_checkmember_resolver,
                 name,
                 _serialize_type_for_checkmember(typ),
+                _serialize_type_for_checkmember(mx.self_type),
+                mx.is_lvalue,
+                mx.is_super,
+                mx.preserve_type_var_ids,
+                TypeVarId.next_raw_id,
                 state.state.strict_optional,
             )
             if result is not None:
-                decoded = _deserialize_type_for_checkmember(bytes(result))
+                next_raw_id, changed, wire_bytes = result
+                if changed:
+                    TypeVarId.next_raw_id = next_raw_id
+                decoded = _deserialize_type_for_checkmember(bytes(wire_bytes))
                 if decoded is not None:
                     if isinstance(decoded, ProperType):
                         decoded.line = typ.line
