@@ -1522,15 +1522,19 @@ class BuildManager:
         from mypy.subtypes import infer_class_variances
         from mypy.types import TypeVarType
 
-        for info in type_infos:
-            try:
-                if any(
-                    isinstance(tv, TypeVarType) and tv.variance == VARIANCE_NOT_READY
-                    for tv in info.defn.type_vars
-                ):
-                    infer_class_variances(info)
-            except (AssertionError, NotImplementedError):
-                pass
+        # Empty-`scc` calls (daemon mid-propagation) walk a transitional
+        # `self.modules` (reused member Vars rebound to fresh infos, class
+        # infos old); the checker's lazy inference fills variance instead.
+        if scc:
+            for info in type_infos:
+                try:
+                    if any(
+                        isinstance(tv, TypeVarType) and tv.variance == VARIANCE_NOT_READY
+                        for tv in info.defn.type_vars
+                    ):
+                        infer_class_variances(info)
+                except (AssertionError, NotImplementedError):
+                    pass
         if self._native_resolver is None:
             resolver = _type_kernel.build_native_resolver(type_infos, aliases, self.modules)
             # Grow the accumulated fullname -> TypeInfo map with this

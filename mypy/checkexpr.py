@@ -3017,7 +3017,15 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
                                 # cannot resolve to a live TypeInfo; defer.
                                 # The isinstance narrows None out of the union.
                                 if isinstance(resolved_callee, CallableType):
-                                    callee = resolved_callee
+                                    # Wire round-trip drops provenance needed
+                                    # by fine-grained notes ("Called function
+                                    # defined here") and AstNode contexts.
+                                    callee = resolved_callee.copy_modified(
+                                        name=callee.name,
+                                        definition=callee.definition,
+                                        line=callee.line,
+                                        column=callee.column,
+                                    )
                                     # Native solve succeeded; skip Python's infer pass.
                                     native_solved = True
                             # Rust returned None: fall through to Python below.
