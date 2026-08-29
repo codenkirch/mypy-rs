@@ -31577,6 +31577,183 @@ class NativeSolveDependentNoopSuite(Suite):
 
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeSolvePreValidateAliasSuite(Suite):
+    """Parity for the solve-path alias expansion (Wave-10, issue #1241).
+
+    The solver previously deferred whenever a typevar upper bound carried
+    a top-level TypeAliasType node: the pre_validate bound check could not
+    compare the solution against an unexpanded bound. The check now expands
+    the solution, the bound, and each constraint target through the alias
+    resolver (mirroring get_proper_type at Python's is_subtype entry), and
+    a missing snapshot still defers the whole solve to Python.
+
+    Differential harness: gate-on vs gate-off through the public
+    solve_constraints with the flags the native gate requires; direct
+    rust_solve_constraints calls prove engagement (non-None) or the
+    documented deferral (None).
+    """
+
+    def setUp(self) -> None:
+        from mypy.solve import _set_native_solve_active
+        from mypy.state import state
+        from mypy.typestate import type_state
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        self.fx = TypeFixture(INVARIANT)
+        type_infos = []
+        for name in dir(self.fx):
+            if not name.endswith("i"):
+                continue
+            value = getattr(self.fx, name)
+            if _is_type_info(value):
+                type_infos.append(value)
+        type_infos.extend([self.fx.str_type_info, self.fx.bool_type_info])
+        set_wire_typeinfo_map({info.fullname: info for info in type_infos})
+        self._type_infos = type_infos
+        self._set_native_solve_active = _set_native_solve_active
+        self._resolver = self._build_resolver([])
+        self._activate(True)
+        self._infer_unions = type_state.infer_unions
+        self._strict_optional = state.strict_optional
+        type_state.infer_unions = True
+        state.strict_optional = True
+
+    def tearDown(self) -> None:
+        from mypy.solve import _set_native_solve_active, _set_native_solve_resolver
+        from mypy.state import state
+        from mypy.typestate import type_state
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        type_state.infer_unions = self._infer_unions
+        state.strict_optional = self._strict_optional
+        _set_native_solve_active(False)
+        _set_native_solve_resolver(None)
+        set_wire_typeinfo_map(None)
+
+    def _build_resolver(self, aliases: list[Any]) -> Any:
+        from mypy.solve import _set_native_solve_resolver
+
+        resolver = _type_kernel.build_native_resolver(self._type_infos, aliases)
+        _set_native_solve_resolver(resolver)
+        return resolver
+
+    def _activate(self, active: bool) -> None:
+        from mypy.solve import _set_native_solve_active, _set_native_solve_resolver
+
+        _set_native_solve_active(active)
+        _set_native_solve_resolver(self._resolver if active else None)
+
+    def _alias_tvar(self, alias: Any) -> Any:
+        from mypy.types import AnyType, TypeOfAny, TypeVarId, TypeVarType
+
+        return TypeVarType(
+            "T",
+            "mod.T",
+            TypeVarId(7),
+            values=[],
+            upper_bound=alias,
+            default=AnyType(TypeOfAny.special_form),
+        )
+
+    def _assert_solve_par(self, tv: Any, constraints: list[Any]) -> list[str]:
+        from mypy.solve import solve_constraints
+
+        self._activate(False)
+        ref = [str(s) for s in solve_constraints([tv], constraints)[0]]
+        self._activate(True)
+        res = [str(s) for s in solve_constraints([tv], constraints)[0]]
+        assert res == ref, f"gate-on={res} gate-off={ref}"
+        return res
+
+    def test_alias_ub_in_bound_parity(self) -> None:
+        # T's upper bound is mod.A (= A); the lower is B <: A. The bound
+        # check expands the alias and keeps the solution unchanged.
+        from mypy.constraints import SUPERTYPE_OF, Constraint
+        from mypy.solve import _serialize_constraint_list, _serialize_type_list
+
+        alias = self.fx.non_rec_alias(self.fx.a)
+        self._resolver = self._build_resolver([alias.alias])
+        self._activate(True)
+        tv = self._alias_tvar(alias)
+        cons = [Constraint(tv, SUPERTYPE_OF, self.fx.b)]
+        self._assert_solve_par(tv, cons)
+        # Direct seam call proves native engagement (non-None).
+        result = _type_kernel.rust_solve_constraints(
+            _serialize_type_list([tv]),
+            _serialize_type_list([tv]),
+            _serialize_constraint_list(cons),
+            True,
+            True,
+            True,
+            False,
+            self._resolver,
+        )
+        assert result is not None, "alias-ub bound check must engage natively"
+        from mypy.solve import _native_solve_dependent_result
+
+        out = _native_solve_dependent_result(result, {tv.id: tv})
+        assert out is not None
+        solutions, _ = out
+        assert_equal(solutions[tv.id], self.fx.b)
+
+    def test_alias_ub_violation_no_replacement_parity(self) -> None:
+        # Lower D is disjoint from the alias bound A: the bound check
+        # fails (after expansion) and the constraint targets fail the
+        # bound-satisfies fold too, so the solution is kept on both sides.
+        from mypy.constraints import SUPERTYPE_OF, Constraint
+        from mypy.solve import _serialize_constraint_list, _serialize_type_list
+
+        alias = self.fx.non_rec_alias(self.fx.a)
+        self._resolver = self._build_resolver([alias.alias])
+        self._activate(True)
+        tv = self._alias_tvar(alias)
+        cons = [Constraint(tv, SUPERTYPE_OF, self.fx.d)]
+        self._assert_solve_par(tv, cons)
+        result = _type_kernel.rust_solve_constraints(
+            _serialize_type_list([tv]),
+            _serialize_type_list([tv]),
+            _serialize_constraint_list(cons),
+            True,
+            True,
+            True,
+            False,
+            self._resolver,
+        )
+        assert result is not None, "violation path must engage natively"
+        from mypy.solve import _native_solve_dependent_result
+
+        out = _native_solve_dependent_result(result, {tv.id: tv})
+        assert out is not None
+        solutions, _ = out
+        assert_equal(solutions[tv.id], self.fx.d)
+
+    def test_alias_ub_missing_snapshot_defers(self) -> None:
+        # The bound alias is not registered in the alias resolver: the
+        # expansion fails and the whole solve defers to Python (None),
+        # so gate-on == gate-off through the public path.
+        from mypy.constraints import SUPERTYPE_OF, Constraint
+        from mypy.solve import _serialize_constraint_list, _serialize_type_list
+
+        alias = self.fx.non_rec_alias(self.fx.a)
+        self._resolver = self._build_resolver([])
+        self._activate(True)
+        tv = self._alias_tvar(alias)
+        cons = [Constraint(tv, SUPERTYPE_OF, self.fx.b)]
+        self._assert_solve_par(tv, cons)
+        result = _type_kernel.rust_solve_constraints(
+            _serialize_type_list([tv]),
+            _serialize_type_list([tv]),
+            _serialize_constraint_list(cons),
+            True,
+            True,
+            True,
+            False,
+            self._resolver,
+        )
+        assert result is None, "missing alias snapshot must defer"
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeJoinInstancesSuite(Suite):
     """Parity for the Rust `InstanceJoiner.join_instances` port
     (join.py:208-303, setops.rs `join_instances_core`).
@@ -47185,6 +47362,7 @@ class NativeSolveGenericCallSuite(Suite):
         self.fx = TypeFixture(INVARIANT)
         self._set_active = _set_native_checkexpr_active
         self._set_resolver = _set_native_checkexpr_resolver
+        self._aliases: list[Any] = []
         self._set_active(True)
         self._set_resolver(self.resolver_for(self.fx))
         typeinfo_map = {info.fullname: info for info in self._type_infos(self.fx)}
@@ -47210,11 +47388,17 @@ class NativeSolveGenericCallSuite(Suite):
                 infos.append(value)
         return infos
 
-    def _resolver_for(self, fx: TypeFixture) -> Any:
-        return _type_kernel.build_native_resolver(self._type_infos(fx), [])
+    def _resolver_for(self, fx: TypeFixture, aliases: list[Any] | None = None) -> Any:
+        return _type_kernel.build_native_resolver(
+            self._type_infos(fx), self._aliases if aliases is None else aliases
+        )
 
     def resolver_for(self, fx: TypeFixture) -> Any:
         return self._resolver_for(fx)
+
+    def _rebuild_with_aliases(self, aliases: list[Any]) -> None:
+        self._aliases = aliases
+        self._set_resolver(self.resolver_for(self.fx))
 
     def _generic_t(self) -> Any:
         from mypy.types import TypeVarType
@@ -47238,12 +47422,12 @@ class NativeSolveGenericCallSuite(Suite):
             variables=[t],
         )
 
-    def _seam(
+    def _seam_raw(
         self,
         callee: CallableType,
         arg_types: list[Type],
         formal_to_actual: list[list[int]],
-    ) -> Any:
+    ) -> bytes | None:
         from mypy.checkexpr import _serialize_type_for_checkexpr
 
         blobs = [_serialize_type_for_checkexpr(t) for t in arg_types]
@@ -47258,9 +47442,20 @@ class NativeSolveGenericCallSuite(Suite):
         )
         if result is None:
             return None
+        return bytes(result)
+
+    def _seam(
+        self,
+        callee: CallableType,
+        arg_types: list[Type],
+        formal_to_actual: list[list[int]],
+    ) -> Any:
+        result = self._seam_raw(callee, arg_types, formal_to_actual)
+        if result is None:
+            return None
         from mypy.checkexpr import _deserialize_type_from_checkexpr
 
-        return _deserialize_type_from_checkexpr(bytes(result))
+        return _deserialize_type_from_checkexpr(result)
 
     def _python_reference(
         self,
@@ -47385,6 +47580,49 @@ class NativeSolveGenericCallSuite(Suite):
         assert self._seam(callee, [ga, gd], [[0], [1]]) is None, (
             "unsolvable invariant conflict must defer"
         )
+
+    def test_alias_actual_parity(self) -> None:
+        # identity(mod.A) with mod.A = A: the alias actual expands before
+        # constraint inference, so T solves to A. Before the expansion,
+        # the top-level alias actual deferred the whole call.
+        from mypy.nodes import TypeAlias
+        from mypy.types import TypeAliasType
+
+        alias = TypeAlias(self.fx.a, "mod.A", "mod", -1, -1)
+        self._rebuild_with_aliases([alias])
+        t = self._generic_t()
+        callee = self._callee_of([t], t, t)
+        self._assert_seam_parity(callee, [TypeAliasType(alias, [])], [[0]])
+
+    def test_alias_formal_no_constraint_parity(self) -> None:
+        # def (x: mod.A) -> None accepts B: the alias formal expands to A
+        # before infer_constraints (previously a top-level alias formal
+        # deferred the seam to Python); the callable is non-generic.
+        from mypy.nodes import TypeAlias
+        from mypy.types import TypeAliasType
+
+        alias = TypeAlias(self.fx.a, "mod.A", "mod", -1, -1)
+        self._rebuild_with_aliases([alias])
+        callee = CallableType(
+            [TypeAliasType(alias, [])],
+            [ARG_POS],
+            [None],
+            AnyType(TypeOfAny.special_form),
+            self.fx.function,
+        )
+        # The applied output keeps the raw formal, but _seam's fixup
+        # refuses any TypeAliasType, so the result survives only as wire
+        # bytes: byte-compare against the serialized Python reference.
+        from mypy.checkexpr import _serialize_type_for_checkexpr
+
+        raw = self._seam_raw(callee, [self.fx.b], [[0]])
+        assert raw is not None, "Rust deferred on def (A) -> Any [B]"
+        py = self._python_reference(callee, [self.fx.b], [ARG_POS], None, [[0]])
+        assert raw == _serialize_type_for_checkexpr(py), (
+            f"solve parity: native={raw!r} python={py!r}"
+        )
+
+
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeConstraintUnionSuite(Suite):
     """Parity suite for the constraint-builder union dispatch (issue #1130).

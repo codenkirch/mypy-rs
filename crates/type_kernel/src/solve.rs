@@ -1367,8 +1367,10 @@ fn solve_constraints_native(
     infer_unions: bool,
     strict_optional: bool,
     skip_unsatisfied: bool,
-    resolver: &crate::typeinfo::TypeResolver,
+    resolver: &crate::typeinfo::NativeTypeResolver,
 ) -> Result<(Vec<u8>, Vec<u8>), ()> {
+    let r = resolver.resolver();
+    let alr = resolver.alias_resolver();
     let original_ids: HashSet<TvId> = original_vars
         .iter()
         .map(|t| tv_id(t).ok_or(()))
@@ -1423,7 +1425,7 @@ fn solve_constraints_native(
                 &filtered_uppers,
                 infer_unions,
                 strict_optional,
-                resolver,
+                r,
             ) {
                 Some(o) => o,
                 None => {
@@ -1487,29 +1489,40 @@ fn solve_constraints_native(
         for (t, s) in original_vars.iter().zip(ordered.iter()) {
             let tv = tv_id(t).ok_or(())?;
             let ub = upper_bound_of(t).ok_or(())?;
-            if is_callable_protocol(&ub, resolver) {
+            if is_callable_protocol(&ub, r) {
                 validated.push((tv, s.1.clone()));
                 continue;
             }
+            // Python's `is_subtype` applies `get_proper_type` at entry
+            // (subtypes.py:905); mirror it by expanding alias nodes here
+            // instead of defering on every alias-bearing bound/solution.
             if let Some(sol) = &s.1 {
-                if !subtypes::is_subtype(sol, &ub, &ctx, resolver).ok_or(())? {
+                let sol = subtypes::expand_aliases(sol, alr, strict_optional).ok_or(())?;
+                let ub_e = subtypes::expand_aliases(&ub, alr, strict_optional).ok_or(())?;
+                if !subtypes::is_subtype(&sol, &ub_e, &ctx, r).ok_or(())? {
                     let mut bound_satisfies_all = true;
                     for c in constraints {
-                        if c.op == crate::constraints::SUBTYPE_OF
-                            && !subtypes::is_subtype(&ub, &c.target, &ctx, resolver).ok_or(())?
-                        {
-                            bound_satisfies_all = false;
-                            break;
+                        if c.op == crate::constraints::SUBTYPE_OF {
+                            let target = subtypes::expand_aliases(&c.target, alr, strict_optional)
+                                .ok_or(())?;
+                            if !subtypes::is_subtype(&ub_e, &target, &ctx, r).ok_or(())? {
+                                bound_satisfies_all = false;
+                                break;
+                            }
                         }
-                        if c.op == crate::constraints::SUPERTYPE_OF
-                            && !subtypes::is_subtype(&c.target, &ub, &ctx, resolver).ok_or(())?
-                        {
-                            bound_satisfies_all = false;
-                            break;
+                        if c.op == crate::constraints::SUPERTYPE_OF {
+                            let target = subtypes::expand_aliases(&c.target, alr, strict_optional)
+                                .ok_or(())?;
+                            if !subtypes::is_subtype(&target, &ub_e, &ctx, r).ok_or(())? {
+                                bound_satisfies_all = false;
+                                break;
+                            }
                         }
                     }
                     if bound_satisfies_all {
-                        validated.push((tv, Some(ub)));
+                        // Python pushes the raw `t.upper_bound`, not the
+                        // proper-expanded copy used for the comparison.
+                        validated.push((tv, Some(ub.clone())));
                         continue;
                     }
                 }
@@ -1563,7 +1576,7 @@ pub(crate) fn rust_solve_constraints(
         infer_unions,
         strict_optional,
         skip_unsatisfied,
-        resolver.resolver(),
+        resolver,
     ) {
         Ok(o) => o,
         Err(()) => return None,
@@ -1652,6 +1665,7 @@ pub(crate) fn rust_infer_function_type_arguments(
                 actual_kind,
                 formal_name,
                 formal_kind,
+                resolver.alias_resolver(),
             )?;
             constraints.extend(crate::constraints::infer_constraints_full_inner(
                 formal_type,
@@ -1676,7 +1690,7 @@ pub(crate) fn rust_infer_function_type_arguments(
         infer_unions,
         strict_optional,
         false,
-        resolver.resolver(),
+        resolver,
     )
     .ok()?;
     // Re-encode in `variables` order as an optional-type list. The Python
@@ -1713,14 +1727,29 @@ fn expand_actual_arg(
     actual_kind: i64,
     formal_name: Option<&str>,
     formal_kind: i64,
+    alias_resolver: &crate::aliases::TypeAliasResolver,
 ) -> Option<Type> {
-    // `get_proper_type`: wire has no alias target, defer.
-    if matches!(
-        actual,
-        Type::TypeAliasType { .. } | Type::UnboundType { .. }
-    ) {
+    if matches!(actual, Type::UnboundType { .. }) {
         return None;
     }
+    // `get_proper_type` (argmap.py:300): expand a top-level alias through
+    // the snapshot; an unresolvable or residual alias still defers.
+    let expanded_actual;
+    let actual = match actual {
+        Type::TypeAliasType { .. } => {
+            expanded_actual =
+                crate::checkexpr_functions::get_proper_or_expand(actual, alias_resolver)?;
+            let expanded = &expanded_actual;
+            if matches!(
+                expanded,
+                Type::TypeAliasType { .. } | Type::UnboundType { .. }
+            ) {
+                return None;
+            }
+            expanded
+        }
+        other => other,
+    };
     match actual_kind {
         2 => match actual {
             Type::TupleType { items, .. } => {
@@ -2414,7 +2443,7 @@ mod tests {
         // solve_constraints with no constraints: every var gets a strict
         // ambiguous Never (solve.py:326-331), so `rust_infer_function_
         // type_arguments` no longer needs its empty-constraints defer.
-        let r = make_resolver(vec![]);
+        let r = NativeTypeResolver::from_resolver(make_resolver(vec![]));
         let tv = tv_type(7, "T");
         let (sol_blob, _free) = solve_constraints_native(
             std::slice::from_ref(&tv),
@@ -2436,7 +2465,7 @@ mod tests {
     #[test]
     fn empty_constraints_fill_lax_any() {
         // Non-strict: every var gets AnyType(TypeOfAny.special_form).
-        let r = make_resolver(vec![]);
+        let r = NativeTypeResolver::from_resolver(make_resolver(vec![]));
         let tv = tv_type(7, "T");
         let (sol_blob, _free) = solve_constraints_native(
             std::slice::from_ref(&tv),
@@ -2474,5 +2503,217 @@ mod tests {
         assert!(!wire_unsafe_solution(&any));
         let bytes = encode_type(&any).unwrap();
         assert_eq!(decode_type(&bytes).unwrap(), any);
+    }
+
+    // ------------------------------------------------------------------
+    // pre_validate alias expansion + expand_actual_arg (issue #1241)
+    // ------------------------------------------------------------------
+
+    use crate::aliases::{TypeAliasResolver, TypeAliasSnapshot};
+
+    fn encode_for_alias(t: &Type) -> Vec<u8> {
+        let mut buf = WriteBuffer::new();
+        wire::write_type(&mut buf, t).expect("encode type");
+        buf.into_bytes()
+    }
+
+    fn alias_type(args: Vec<Type>, type_ref: &str) -> Type {
+        Type::TypeAliasType {
+            args,
+            type_ref: type_ref.to_string(),
+        }
+    }
+
+    fn no_args_alias(ref_fullname: &str, target: &Type) -> TypeAliasSnapshot {
+        TypeAliasSnapshot {
+            fullname: ref_fullname.to_string(),
+            target: encode_for_alias(target),
+            no_args: true,
+            ..Default::default()
+        }
+    }
+
+    fn test_int_alias_resolver() -> NativeTypeResolver {
+        let r = make_resolver(vec![
+            snap("builtins.int"),
+            snap("builtins.str"),
+            snap("builtins.object"),
+        ]);
+        let mut ar = TypeAliasResolver::new();
+        ar.insert(
+            "mod.IntAlias".to_string(),
+            no_args_alias("mod.IntAlias", &instance("builtins.int", vec![])),
+        );
+        NativeTypeResolver::new(r, ar)
+    }
+
+    fn tv_bound(raw_id: i64, upper_bound: Type) -> Type {
+        Type::TypeVarType {
+            name: "T".to_string(),
+            fullname: "mod.T".to_string(),
+            raw_id,
+            namespace: "fn".to_string(),
+            values: Vec::new(),
+            upper_bound: Box::new(upper_bound),
+            default: Box::new(Type::UninhabitedType { ambiguous: false }),
+            variance: 0,
+            meta_level: 1,
+        }
+    }
+
+    #[test]
+    fn pre_validate_alias_bound_solution_satisfies() {
+        // T bound by an alias resolving to int; solution int. The old
+        // `is_subtype` deferral on the alias operand Err'd the whole solve;
+        // expansion now decides true and the solution survives.
+        let nr = test_int_alias_resolver();
+        let tv = tv_bound(7, alias_type(vec![], "mod.IntAlias"));
+        let con = crate::constraints::Constraint {
+            origin_type_var: tv_type(7, "T"),
+            op: crate::constraints::SUPERTYPE_OF,
+            target: instance("builtins.int", vec![]),
+        };
+        let (sol_blob, _) = solve_constraints_native(
+            std::slice::from_ref(&tv),
+            std::slice::from_ref(&tv),
+            &[con],
+            true,
+            false,
+            true,
+            false,
+            &nr,
+        )
+        .unwrap();
+        let sols = decode_solve_solutions_here(&sol_blob).unwrap();
+        assert_eq!(sols.len(), 1);
+        assert_eq!(sols[0].1, Some(instance("builtins.int", vec![])));
+    }
+
+    #[test]
+    fn pre_validate_alias_bound_violation_implication_tests() {
+        // Solution str against an alias-to-int bound: violates; the bound
+        // fails its own constraint check, so the solution survives.
+        let nr = test_int_alias_resolver();
+        let tv = tv_bound(7, alias_type(vec![], "mod.IntAlias"));
+        let con = crate::constraints::Constraint {
+            origin_type_var: tv_type(7, "T"),
+            op: crate::constraints::SUBTYPE_OF,
+            target: instance("builtins.str", vec![]),
+        };
+        let (sol_blob, _) = solve_constraints_native(
+            std::slice::from_ref(&tv),
+            std::slice::from_ref(&tv),
+            &[con],
+            true,
+            false,
+            true,
+            false,
+            &nr,
+        )
+        .unwrap();
+        let sols = decode_solve_solutions_here(&sol_blob).unwrap();
+        assert_eq!(sols[0].1, Some(instance("builtins.str", vec![])));
+    }
+
+    #[test]
+    fn pre_validate_alias_solution_expanded_for_compare() {
+        // Solution is an alias node resolving to int, bound int. The alias
+        // must expand for the comparison; the raw alias node is kept in
+        // the returned solution (Python stores the unexpanded solution).
+        let nr = test_int_alias_resolver();
+        let tv = tv_bound(7, instance("builtins.int", vec![]));
+        let sol_alias = alias_type(vec![], "mod.IntAlias");
+        let con = crate::constraints::Constraint {
+            origin_type_var: tv_type(7, "T"),
+            op: crate::constraints::SUPERTYPE_OF,
+            target: sol_alias.clone(),
+        };
+        let (sol_blob, _) = solve_constraints_native(
+            std::slice::from_ref(&tv),
+            std::slice::from_ref(&tv),
+            &[con],
+            true,
+            false,
+            true,
+            false,
+            &nr,
+        )
+        .unwrap();
+        let sols = decode_solve_solutions_here(&sol_blob).unwrap();
+        assert_eq!(sols[0].1, Some(sol_alias));
+    }
+
+    #[test]
+    fn pre_validate_alias_bound_missing_snapshot_defers() {
+        // An alias that is not in the snapshot snapshot cannot expand
+        // (expand_aliases keeps the node) and engine still defers: the
+        // whole solve still Errs, matching the pre-port behavior.
+        let nr = NativeTypeResolver::from_resolver(make_resolver(vec![]));
+        let tv = tv_bound(7, alias_type(vec![], "mod.IntAlias"));
+        let con = crate::constraints::Constraint {
+            origin_type_var: tv_type(7, "T"),
+            op: crate::constraints::SUPERTYPE_OF,
+            target: instance("builtins.int", vec![]),
+        };
+        assert!(solve_constraints_native(
+            std::slice::from_ref(&tv),
+            std::slice::from_ref(&tv),
+            &[con],
+            true,
+            false,
+            true,
+            false,
+            &nr,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn expand_actual_arg_alias_to_tuple_item() {
+        // *args actual typed with an alias to tuple[int, str]: the first
+        // item feeds the formal; before the port the whole call deferred.
+        let mut ar = TypeAliasResolver::new();
+        ar.insert(
+            "mod.IntStrAlias".to_string(),
+            no_args_alias(
+                "mod.IntStrAlias",
+                &Type::TupleType {
+                    partial_fallback: Box::new(instance("builtins.tuple", vec![])),
+                    items: vec![
+                        instance("builtins.int", vec![]),
+                        instance("builtins.str", vec![]),
+                    ],
+                    implicit: false,
+                },
+            ),
+        );
+        let actual = alias_type(vec![], "mod.IntStrAlias");
+        let mut tuple_index = 0;
+        let mut kwargs_used = None;
+        let out = expand_actual_arg(
+            &mut tuple_index,
+            &mut kwargs_used,
+            &actual,
+            2, // ARG_STAR
+            None,
+            2,
+            &ar,
+        )
+        .unwrap();
+        assert_eq!(out, instance("builtins.int", vec![]));
+        // Unresolvable alias defers; UnboundType still defers.
+        let ar2 = TypeAliasResolver::new();
+        let mut ti2 = 0;
+        assert!(expand_actual_arg(&mut ti2, &mut kwargs_used, &actual, 2, None, 2, &ar2).is_none());
+        let unbound = Type::UnboundType {
+            name: "x".to_string(),
+            args: Vec::new(),
+            original_str_expr: None,
+            original_str_fallback: None,
+        };
+        let mut ti3 = 0;
+        assert!(
+            expand_actual_arg(&mut ti3, &mut kwargs_used, &unbound, 2, None, 2, &ar2).is_none()
+        );
     }
 }
