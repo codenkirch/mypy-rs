@@ -780,11 +780,8 @@ pub(crate) fn is_subtype(
         for right_item in right_items {
             let mut found_match = false;
             for (left_index, left_item) in left_items.iter().enumerate() {
-                let subtype_match = is_subtype(left_item, right_item, ctx, resolver);
-                if subtype_match.is_none() {
-                    return None;
-                }
-                if subtype_match.unwrap() && previous_match_left_index <= left_index as i64 {
+                let subtype_match = is_subtype(left_item, right_item, ctx, resolver)?;
+                if subtype_match && previous_match_left_index <= left_index as i64 {
                     previous_match_left_index = left_index as i64;
                     found_match = true;
                     matched_overloads.insert(left_index);
@@ -3173,18 +3170,10 @@ pub(crate) fn rust_is_same_type(
     strict_optional: bool,
     resolver: &mut NativeTypeResolver,
 ) -> Option<bool> {
-    let Some(a) = decode_type(a_bytes) else {
-        return None;
-    };
-    let Some(b) = decode_type(b_bytes) else {
-        return None;
-    };
-    let Some(a) = expand_aliases(&a, resolver.alias_resolver(), strict_optional) else {
-        return None;
-    };
-    let Some(b) = expand_aliases(&b, resolver.alias_resolver(), strict_optional) else {
-        return None;
-    };
+    let a = decode_type(a_bytes)?;
+    let b = decode_type(b_bytes)?;
+    let a = expand_aliases(&a, resolver.alias_resolver(), strict_optional)?;
+    let b = expand_aliases(&b, resolver.alias_resolver(), strict_optional)?;
     let answer = is_same_type(
         &a,
         &b,
@@ -3219,18 +3208,10 @@ pub(crate) fn rust_is_subtype(
     strict_concatenate: bool,
     resolver: &mut NativeTypeResolver,
 ) -> Option<bool> {
-    let Some(left) = decode_type(left_bytes) else {
-        return None;
-    };
-    let Some(right) = decode_type(right_bytes) else {
-        return None;
-    };
-    let Some(left) = expand_aliases(&left, resolver.alias_resolver(), strict_optional) else {
-        return None;
-    };
-    let Some(right) = expand_aliases(&right, resolver.alias_resolver(), strict_optional) else {
-        return None;
-    };
+    let left = decode_type(left_bytes)?;
+    let right = decode_type(right_bytes)?;
+    let left = expand_aliases(&left, resolver.alias_resolver(), strict_optional)?;
+    let right = expand_aliases(&right, resolver.alias_resolver(), strict_optional)?;
     let ctx = SubtypeContext::with_callable_flags(
         ignore_type_params,
         ignore_declared_variance,
