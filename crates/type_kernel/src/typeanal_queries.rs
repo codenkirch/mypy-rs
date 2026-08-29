@@ -694,18 +694,43 @@ fn find_self_type_inner(
     ctx: &SelfTypeCtx<'_>,
 ) -> Result<bool, DeferError> {
     // UnboundType: lookup name, check SELF_TYPE_NAMES, then descend args.
-    if is_instance(obj, ctx.refs.unpack_type) && class_name_is(obj, "UnboundType") {
-        return self_type_visit_unbound(py, obj, ctx);
-    }
     if class_name_is(obj, "UnboundType") {
         return self_type_visit_unbound(py, obj, ctx);
     }
-    // TypeVar-like types: no Self type inside.
-    if is_instance(obj, ctx.refs.type_var_type)
-        || is_instance(obj, ctx.refs.param_spec_type)
-        || is_instance(obj, ctx.refs.type_var_tuple_type)
-    {
-        return Ok(false);
+    // TypeVar-like types: query the Python child lists (issue #1122),
+    // mirroring visit_type_var / visit_param_spec / visit_type_var_tuple
+    // in type_visitor.py.
+    if is_instance(obj, ctx.refs.type_var_type) {
+        let upper = get_attr_or_defer(obj, "upper_bound")?;
+        if find_self_type_inner(py, upper, ctx)? {
+            return Ok(true);
+        }
+        let default = get_attr_or_defer(obj, "default")?;
+        if find_self_type_inner(py, default, ctx)? {
+            return Ok(true);
+        }
+        let values = get_attr_or_defer(obj, "values")?;
+        return self_type_any_seq(py, values, ctx);
+    }
+    if is_instance(obj, ctx.refs.param_spec_type) {
+        let upper = get_attr_or_defer(obj, "upper_bound")?;
+        if find_self_type_inner(py, upper, ctx)? {
+            return Ok(true);
+        }
+        let default = get_attr_or_defer(obj, "default")?;
+        if find_self_type_inner(py, default, ctx)? {
+            return Ok(true);
+        }
+        let prefix = get_attr_or_defer(obj, "prefix")?;
+        return find_self_type_inner(py, prefix, ctx);
+    }
+    if is_instance(obj, ctx.refs.type_var_tuple_type) {
+        let upper = get_attr_or_defer(obj, "upper_bound")?;
+        if find_self_type_inner(py, upper, ctx)? {
+            return Ok(true);
+        }
+        let default = get_attr_or_defer(obj, "default")?;
+        return find_self_type_inner(py, default, ctx);
     }
     // AnyType: no Self type.
     if is_instance(obj, ctx.refs.any_type) {
@@ -746,7 +771,8 @@ fn find_self_type_inner(
         let fb = get_attr_or_defer(obj, "partial_fallback")?;
         return find_self_type_inner(py, fb, ctx);
     }
-    // TypedDictType: recurse items values + fallback.
+    // TypedDictType: recurse items values only (visit_typeddict_type in
+    // type_visitor.py does not descend into the fallback; #1122).
     if is_instance(obj, ctx.refs.typed_dict_type) {
         let items = get_attr_or_defer(obj, "items")?;
         let dict: &PyDict = items.downcast().map_err(|_| DeferError)?;
@@ -755,8 +781,7 @@ fn find_self_type_inner(
                 return Ok(true);
             }
         }
-        let fb = get_attr_or_defer(obj, "fallback")?;
-        return find_self_type_inner(py, fb, ctx);
+        return Ok(false);
     }
     // UnionType: recurse items (ANY_STRATEGY).
     if is_instance(obj, ctx.refs.union_type) {
@@ -768,9 +793,9 @@ fn find_self_type_inner(
         let item = get_attr_or_defer(obj, "item")?;
         return find_self_type_inner(py, item, ctx);
     }
-    // TypeAliasType: recurse args (skip alias target, matching
-    // BoolTypeQuery default with skip_alias_target not set — the
-    // default visit_type_alias_type in BoolTypeQuery queries args).
+    // TypeAliasType: recurse args only. Known divergence (#1122): the
+    // Python visit_type_alias_type also queries the resolved target (plus
+    // args for python_3_12_type_alias); porting needs live alias state.
     if is_instance(obj, ctx.refs.type_alias_type) {
         let args = get_attr_or_defer(obj, "args")?;
         return self_type_any_seq(py, args, ctx);

@@ -44632,6 +44632,102 @@ class NativeFindSelfTypeSuite(Suite):
         t = CallableType([], [], [], UnboundType("int"), self.fx.function)
         self._assert_par(t, {}, False)
 
+    # The TypeVar-like shapes below construct the #1122 divergent shapes: a
+    # Self unbound name hiding in the Python child lists (upper_bound /
+    # default / values / prefix) that the pre-fix Rust shortcut returned False for.
+
+    def test_seam_tvar_upper_bound_self(self) -> None:
+        t = TypeVarType(
+            "T", "mod.T", TypeVarId(1), [], UnboundType("Self"), AnyType(TypeOfAny.special_form)
+        )
+        self._assert_seam(t, {"Self": "typing.Self"}, True)
+
+    def test_parity_tvar_upper_bound_self(self) -> None:
+        t = TypeVarType(
+            "T", "mod.T", TypeVarId(1), [], UnboundType("Self"), AnyType(TypeOfAny.special_form)
+        )
+        self._assert_par(t, {"Self": "typing.Self"}, True)
+
+    def test_parity_tvar_default_self(self) -> None:
+        t = TypeVarType("T", "mod.T", TypeVarId(1), [], self.fx.o, UnboundType("Self"))
+        self._assert_par(t, {"Self": "typing.Self"}, True)
+
+    def test_parity_tvar_values_self(self) -> None:
+        t = TypeVarType(
+            "T",
+            "mod.T",
+            TypeVarId(1),
+            [UnboundType("Self")],
+            self.fx.o,
+            AnyType(TypeOfAny.special_form),
+        )
+        self._assert_par(t, {"Self": "typing.Self"}, True)
+
+    def test_seam_paramspec_prefix_self(self) -> None:
+        prefix = Parameters([UnboundType("Self")], [ARG_POS], [None])
+        t = ParamSpecType(
+            "P",
+            "mod.P",
+            TypeVarId(1),
+            ParamSpecFlavor.BARE,
+            self.fx.o,
+            AnyType(TypeOfAny.special_form),
+            prefix=prefix,
+        )
+        self._assert_seam(t, {"Self": "typing.Self"}, True)
+
+    def test_parity_paramspec_prefix_self(self) -> None:
+        prefix = Parameters([UnboundType("Self")], [ARG_POS], [None])
+        t = ParamSpecType(
+            "P",
+            "mod.P",
+            TypeVarId(1),
+            ParamSpecFlavor.BARE,
+            self.fx.o,
+            AnyType(TypeOfAny.special_form),
+            prefix=prefix,
+        )
+        self._assert_par(t, {"Self": "typing.Self"}, True)
+
+    def test_seam_tvt_upper_bound_self(self) -> None:
+        t = TypeVarTupleType(
+            "Ts",
+            "mod.Ts",
+            TypeVarId(1),
+            UnboundType("Self"),
+            self.fx.std_tuple,
+            AnyType(TypeOfAny.special_form),
+        )
+        self._assert_seam(t, {"Self": "typing.Self"}, True)
+
+    def test_parity_tvt_upper_bound_self(self) -> None:
+        t = TypeVarTupleType(
+            "Ts",
+            "mod.Ts",
+            TypeVarId(1),
+            UnboundType("Self"),
+            self.fx.std_tuple,
+            AnyType(TypeOfAny.special_form),
+        )
+        self._assert_par(t, {"Self": "typing.Self"}, True)
+
+    def test_seam_typeddict_fallback_self(self) -> None:
+        # Artificial shape: Python never puts Self in a fallback, but the
+        # Rust port must not descend into the fallback at all.
+        fallback = self.fx.std_tuple.copy_modified(args=[UnboundType("Self")])
+        t = TypedDictType({}, set(), set(), fallback)
+        self._assert_seam(t, {"Self": "typing.Self"}, False)
+
+    def test_parity_typeddict_fallback_self(self) -> None:
+        fallback = self.fx.std_tuple.copy_modified(args=[UnboundType("Self")])
+        t = TypedDictType({}, set(), set(), fallback)
+        self._assert_par(t, {"Self": "typing.Self"}, False)
+
+    def test_parity_typeddict_items_self(self) -> None:
+        fallback = self.fx.std_tuple.copy_modified(args=[self.fx.o])
+        t = TypedDictType({"x": UnboundType("Self")}, set(), set(), fallback)
+        self._assert_par(t, {"Self": "typing.Self"}, True)
+
 
 class NativeSolveGenericCallSuite(Suite):
     """Parity for the rust_solve_generic_call port (issue #1128).
