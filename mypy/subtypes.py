@@ -61,8 +61,8 @@ from mypy.types import (
     TypedDictType,
     TypeOfAny,
     TypeType,
-    TypeVarTupleType,
     TypeVarLikeType,
+    TypeVarTupleType,
     TypeVarType,
     TypeVisitor,
     UnboundType,
@@ -88,13 +88,13 @@ from mypy.typevars import fill_typevars, fill_typevars_with_any
 try:
     import type_kernel as _type_kernel
     from librt.internal import ReadBuffer as _ReadBuffer, WriteBuffer as _WriteBuffer
-
     from type_kernel import (
         rust_are_args_compatible as _rust_are_args_compatible,
         rust_classify_find_member as _rust_classify_find_member,
         rust_classify_type_parameter as _rust_classify_type_parameter,
         rust_infer_variance_member as _rust_infer_variance_member,
     )
+
     from mypy.types import read_type as _read_type
 
     _HAS_TYPE_KERNEL = True
@@ -183,11 +183,7 @@ def _native_find_member_prelude_active() -> bool:
 
 def _native_are_args_compatible_active() -> bool:
     """Guard for the `are_args_compatible` dispatch seam."""
-    return (
-        _HAS_TYPE_KERNEL
-        and _native_subtype_active
-        and _rust_are_args_compatible is not None
-    )
+    return _HAS_TYPE_KERNEL and _native_subtype_active and _rust_are_args_compatible is not None
 
 
 def _native_params_compat_nested_proper(
@@ -246,9 +242,7 @@ NATIVE_TYPEPARAM_EQUIVALENT = 5
 def _native_type_parameter_active() -> bool:
     """Guard for the `check_type_parameter` dispatch seam."""
     return (
-        _HAS_TYPE_KERNEL
-        and _native_subtype_active
-        and _rust_classify_type_parameter is not None
+        _HAS_TYPE_KERNEL and _native_subtype_active and _rust_classify_type_parameter is not None
     )
 
 
@@ -347,9 +341,7 @@ def _deserialize_type(data: bytes) -> ProperType | None:
     return fixed
 
 
-def _restore_protocol_member_definition(
-    left: Instance, member: str, decoded: ProperType
-) -> Type:
+def _restore_protocol_member_definition(left: Instance, member: str, decoded: ProperType) -> Type:
     """Restore ``definition`` links lost in the wire round-trip.
 
     The Rust seam returns a bound (self-stripped, ``is_bound``) FunctionLike
@@ -409,9 +401,7 @@ def _strict_concatenate_flag(subtype_context: SubtypeContext) -> bool:
     """Same strict_concatenate computation the single-pair shim uses."""
     if subtype_context.options is None:
         return False
-    return bool(
-        subtype_context.options.extra_checks or subtype_context.options.strict_concatenate
-    )
+    return bool(subtype_context.options.extra_checks or subtype_context.options.strict_concatenate)
 
 
 def _flush_subtype_batch() -> dict[tuple[bytes, bytes, tuple[bool, ...]], bool]:
@@ -919,7 +909,10 @@ def _is_subtype(
                 state.strict_optional,
                 subtype_context.ignore_pos_arg_names,
                 (
-                    (subtype_context.options.extra_checks or subtype_context.options.strict_concatenate)
+                    (
+                        subtype_context.options.extra_checks
+                        or subtype_context.options.strict_concatenate
+                    )
                     if subtype_context.options
                     else False
                 ),
@@ -1364,9 +1357,11 @@ class SubtypeVisitor(TypeVisitor[bool]):
                         _serialize_type(right),
                         self.proper_subtype,
                         self.subtype_context.ignore_pos_arg_names,
-                        (self.options.extra_checks or self.options.strict_concatenate)
-                        if self.options
-                        else False,
+                        (
+                            (self.options.extra_checks or self.options.strict_concatenate)
+                            if self.options
+                            else False
+                        ),
                         state.strict_optional,
                         _native_subtype_resolver,
                     )
@@ -2103,11 +2098,9 @@ def find_member(
         # This is needed to avoid infinite recursion in situations involving protocols like
         #     class P(Protocol[T]):
         #         def combine(self, other: P[S]) -> P[Tuple[T, S]]: ...
-
         # Normally we call freshen_all_functions_type_vars() during attribute access,
         # to avoid type variable id collisions, but for protocols this means we can't
         # use the assumption stack, that will grow indefinitely.
-
         # TODO: find a cleaner solution that doesn't involve massive perf impact.
         preserve_type_var_ids=True,
     )
@@ -2208,7 +2201,7 @@ def get_member_flags(name: str, itype: Instance, class_obj: bool = False) -> set
                 _native_subtype_resolver,
             )
             if result is not None:
-                return set(int(flag) for flag in result)
+                return {int(flag) for flag in result}
         except (AssertionError, NotImplementedError, ValueError):
             pass
     info = itype.type
@@ -2260,7 +2253,12 @@ def get_member_flags(name: str, itype: Instance, class_obj: bool = False) -> set
 
 
 def is_descriptor(typ: Type | None) -> bool:
-    if typ is not None and _HAS_TYPE_KERNEL and _native_subtype_active and _native_subtype_resolver is not None:
+    if (
+        typ is not None
+        and _HAS_TYPE_KERNEL
+        and _native_subtype_active
+        and _native_subtype_resolver is not None
+    ):
         try:
             type_bytes = _serialize_type(typ)
         except Exception:

@@ -50,7 +50,7 @@ try:
     _node, _errors, _ignores = native_parse(
         "sentinel.py",
         _options,
-        source="try:\n    x\nexcept* ValueError:\n    y\nelse:\n    z\nfinally:\n    w\n".encode(),
+        source=b"try:\n    x\nexcept* ValueError:\n    y\nelse:\n    z\nfinally:\n    w\n",
     )
     # Fully deserialize so a wire-format mismatch (e.g. a pip-published
     # upstream ast_serialize that imports but writes an incompatible format)

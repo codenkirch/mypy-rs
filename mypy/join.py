@@ -25,9 +25,6 @@ from mypy.types import (
     ErasedType,
     FunctionLike,
     Instance,
-    _serialize_with_taint_check,
-    _type_wire_cache,
-    _wire_cache_enabled,
     LiteralType,
     NoneType,
     Overloaded,
@@ -51,6 +48,9 @@ from mypy.types import (
     UninhabitedType,
     UnionType,
     UnpackType,
+    _serialize_with_taint_check,
+    _type_wire_cache,
+    _wire_cache_enabled,
     find_unpack_in_list,
     get_proper_type,
     get_proper_types,
@@ -185,9 +185,7 @@ def _try_native_object_or_any_from_type(typ: ProperType) -> ProperType | None:
     return _deserialize_type(bytes(result))
 
 
-def _try_native_combine_similar_callables(
-    t: CallableType, s: CallableType
-) -> CallableType | None:
+def _try_native_combine_similar_callables(t: CallableType, s: CallableType) -> CallableType | None:
     """Try `combine_similar_callables` in Rust; None defers to Python.
 
     The kernel returns None for the both-generic case (Rust cannot
@@ -196,10 +194,7 @@ def _try_native_combine_similar_callables(
     """
     try:
         result = _type_kernel.rust_combine_similar_callables(
-            _serialize_type(t),
-            _serialize_type(s),
-            state.strict_optional,
-            _native_join_resolver,
+            _serialize_type(t), _serialize_type(s), state.strict_optional, _native_join_resolver
         )
     except (AssertionError, NotImplementedError, ValueError, AttributeError):
         return None
@@ -261,11 +256,17 @@ class InstanceJoiner:
                         return cast(ProperType, fixed)
                     # Fall through to Python.
                 elif disc == 5:
-                    if _native_join_typeinfo_map is not None and fullname in _native_join_typeinfo_map:
+                    if (
+                        _native_join_typeinfo_map is not None
+                        and fullname in _native_join_typeinfo_map
+                    ):
                         return Instance(_native_join_typeinfo_map[fullname], [])
                     # Fall through to Python.
                 elif disc == 6:
-                    if _native_join_typeinfo_map is None or fullname not in _native_join_typeinfo_map:
+                    if (
+                        _native_join_typeinfo_map is None
+                        or fullname not in _native_join_typeinfo_map
+                    ):
                         # Fall through to Python.
                         pass
                     else:
@@ -625,7 +626,9 @@ def join_types(s: Type, t: Type, instance_joiner: InstanceJoiner | None = None) 
                                 else t_args[i]
                             )
                             new_args.append(
-                                AnyType(TypeOfAny.from_another_any, cast(AnyType, get_proper_type(src)))
+                                AnyType(
+                                    TypeOfAny.from_another_any, cast(AnyType, get_proper_type(src))
+                                )
                             )
                     return Instance(type_info, new_args)
         # Rust returned None (unsupported case) — fall through to Python.
@@ -884,11 +887,7 @@ class TypeJoinVisitor(TypeVisitor[ProperType]):
         """
         # Stage 4 (M494) type-kernel seam: try the Rust join_tuples path.
         # Rust returns None for unhandled cases (defer to Python).
-        if (
-            _HAS_TYPE_KERNEL
-            and _native_join_active
-            and _native_join_resolver is not None
-        ):
+        if _HAS_TYPE_KERNEL and _native_join_active and _native_join_resolver is not None:
             try:
                 result = _type_kernel.rust_join_tuples(
                     _serialize_type(s),
@@ -1199,9 +1198,7 @@ def is_better(t: Type, s: Type) -> bool:
     ):
         try:
             result = _type_kernel.rust_is_better(
-                _serialize_type(t),
-                _serialize_type(s),
-                _native_join_resolver,
+                _serialize_type(t), _serialize_type(s), _native_join_resolver
             )
         except (AssertionError, NotImplementedError, ValueError, AttributeError):
             result = None
@@ -1380,11 +1377,7 @@ def safe_meet(t: Type, s: Type) -> Type:
 
 
 def combine_similar_callables(t: CallableType, s: CallableType) -> CallableType:
-    if (
-        _HAS_TYPE_KERNEL
-        and _native_join_active
-        and _native_join_resolver is not None
-    ):
+    if _HAS_TYPE_KERNEL and _native_join_active and _native_join_resolver is not None:
         res = _try_native_combine_similar_callables(t, s)
         if res is not None:
             return res
@@ -1485,11 +1478,7 @@ def object_from_instance(instance: Instance) -> Instance:
 
 
 def object_or_any_from_type(typ: ProperType) -> ProperType:
-    if (
-        _HAS_TYPE_KERNEL
-        and _native_join_active
-        and _native_join_resolver is not None
-    ):
+    if _HAS_TYPE_KERNEL and _native_join_active and _native_join_resolver is not None:
         res = _try_native_object_or_any_from_type(typ)
         if res is not None:
             return res

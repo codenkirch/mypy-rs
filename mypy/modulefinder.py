@@ -36,15 +36,15 @@ from mypy.util import os_path_join
 # extension is importable, else falls back to the pure-Python body.
 try:
     from type_kernel import (
-        rust_is_init_file as _rust_is_init_file,
-        rust_parse_version as _rust_parse_version,
-        rust_mypy_path as _rust_mypy_path,
-        rust_typeshed_py_version as _rust_typeshed_py_version,
+        rust_compute_search_paths as _rust_compute_search_paths,
         rust_default_lib_path as _rust_default_lib_path,
+        rust_get_search_dirs as _rust_get_search_dirs,
+        rust_is_init_file as _rust_is_init_file,
         rust_load_stdlib_py_versions as _rust_load_stdlib_py_versions,
         rust_matches_exclude as _rust_matches_exclude,
-        rust_get_search_dirs as _rust_get_search_dirs,
-        rust_compute_search_paths as _rust_compute_search_paths,
+        rust_mypy_path as _rust_mypy_path,
+        rust_parse_version as _rust_parse_version,
+        rust_typeshed_py_version as _rust_typeshed_py_version,
     )
 
     _HAS_RUST_MODULEFINDER = True
@@ -243,10 +243,7 @@ class FindModuleCache:
         # Pre-computed stubinfo tables for the native resolver. Rust
         # replicates stub_distribution_name() using _stub_flat and
         # _stub_namespace (flattened namespace lookup, longest-first).
-        self._stub_flat: set[str] = {
-            *non_bundled_packages_flat,
-            *_legacy_bundled_packages,
-        }
+        self._stub_flat: set[str] = {*non_bundled_packages_flat, *_legacy_bundled_packages}
         self._stub_namespace: dict[str, str] = {}
         for _ns_top, _ns_map in non_bundled_packages_namespace.items():
             self._stub_namespace.update(_ns_map)
@@ -418,10 +415,7 @@ class FindModuleCache:
             assert self._native_resolver is not None
             assert self.options is not None
             return _native_resolve(
-                self._native_resolver,
-                id,
-                use_typeshed=use_typeshed,
-                options=self.options,
+                self._native_resolver, id, use_typeshed=use_typeshed, options=self.options
             )
         return self._find_module(id, use_typeshed)
 

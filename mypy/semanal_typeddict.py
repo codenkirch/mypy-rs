@@ -59,9 +59,10 @@ from mypy.types import (
 try:
     from type_kernel import (
         rust_primary_source as _rust_primary_source,
-        rust_verify_requiredness_compatibility as _rust_verify_requiredness_compatibility,
         rust_verify_field_against_closed_bases as _rust_verify_field_against_closed_bases,
+        rust_verify_requiredness_compatibility as _rust_verify_requiredness_compatibility,
     )
+
     _HAS_RUST_TYPEDDICT = True
 except ImportError:
     _rust_primary_source = None  # type: ignore[assignment]

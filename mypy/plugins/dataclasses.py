@@ -82,8 +82,8 @@ if TYPE_CHECKING:
 # On `None` from Rust, Python falls back to `DataclassTransformer`.
 try:
     from type_kernel import (
-        rust_dataclass_transform as _rust_dataclass_transform,
         rust_dataclass_post_init_transform as _rust_dataclass_post_init_transform,
+        rust_dataclass_transform as _rust_dataclass_transform,
     )
 
     _HAS_NATIVE_DATACLASS = True
@@ -203,9 +203,7 @@ def _parse_native_init_signature(rust_result: bytes) -> tuple[list[str], list[in
 
 
 def _apply_native_dataclass_transform(
-    transformer: DataclassTransformer,
-    rust_result: bytes,
-    attributes: list[DataclassAttribute],
+    transformer: DataclassTransformer, rust_result: bytes, attributes: list[DataclassAttribute]
 ) -> None:
     """Validate the Rust result against Python's own computation, then apply.
 
@@ -216,7 +214,11 @@ def _apply_native_dataclass_transform(
     rust_names, rust_kinds = _parse_native_init_signature(rust_result)
     expected_names = [attr.alias or attr.name for attr in attributes]
     expected_kinds = [
-        5 if attr.kw_only and attr.has_default else 3 if attr.kw_only else 1 if attr.has_default else 0
+        (
+            5
+            if attr.kw_only and attr.has_default
+            else 3 if attr.kw_only else 1 if attr.has_default else 0
+        )
         for attr in attributes
     ]
     if rust_names != expected_names or rust_kinds != expected_kinds:
@@ -255,7 +257,9 @@ def _try_native_dataclass_transform(
     if not _HAS_NATIVE_DATACLASS or not _native_dataclasses_active:
         return False
     try:
-        filtered = [a for a in attributes if a.is_in_init and not transformer._is_kw_only_type(a.type)]
+        filtered = [
+            a for a in attributes if a.is_in_init and not transformer._is_kw_only_type(a.type)
+        ]
         rust_result = _rust_dataclass_transform(
             _serialize_dataclass_fields_for_rust(filtered),
             transformer._cls.fullname,
@@ -286,8 +290,7 @@ def _try_native_dataclass_post_init(
         return False
     try:
         rust_result = _rust_dataclass_post_init_transform(
-            _serialize_dataclass_fields_for_rust(attributes),
-            transformer._cls.fullname,
+            _serialize_dataclass_fields_for_rust(attributes), transformer._cls.fullname
         )
         if rust_result is None:
             return False
@@ -907,7 +910,7 @@ class DataclassTransformer:
                     node.final_set_in_init = True
 
             if sym.type is None and node.is_final and node.is_inferred:
-                                # Special case: assignment like x: Final = 42 is classified as annotated
+                # Special case: assignment like x: Final = 42 is classified as annotated
                 # above, but mypy strips `Final` turning it into x = 42. We only infer
                 # simple literals in dataclasses, otherwise require an explicit type.
                 typ = self._api.analyze_simple_literal_type(stmt.rvalue, is_final=True)

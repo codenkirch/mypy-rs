@@ -47,14 +47,15 @@ from mypy.types import (
 from mypy.visitor import NodeVisitor
 
 try:
-    from type_kernel import rust_fixup_type as _rust_fixup_type
-    from type_kernel import rust_fixup_type_info as _rust_fixup_type_info
-    from type_kernel import rust_resolve_cross_ref as _rust_resolve_cross_ref
-    from type_kernel import rust_fixup_symbol_table as _rust_fixup_symbol_table
     from type_kernel import (
+        rust_fixup_decorator as _rust_fixup_decorator,
         rust_fixup_overloaded_func_def as _rust_fixup_overloaded_func_def,
+        rust_fixup_symbol_table as _rust_fixup_symbol_table,
+        rust_fixup_type as _rust_fixup_type,
+        rust_fixup_type_info as _rust_fixup_type_info,
+        rust_resolve_cross_ref as _rust_resolve_cross_ref,
     )
-    from type_kernel import rust_fixup_decorator as _rust_fixup_decorator
+
     _HAS_RUST_FIXUP = True
 except ImportError:
     _rust_fixup_type = None  # type: ignore[assignment]
@@ -142,9 +143,7 @@ class NodeFixer(NodeVisitor[None]):
     def visit_symbol_table(self, symtab: SymbolTable) -> None:
         if _HAS_RUST_FIXUP:
             try:
-                if _rust_fixup_symbol_table(
-                    symtab, self.modules, self.allow_missing
-                ):
+                if _rust_fixup_symbol_table(symtab, self.modules, self.allow_missing):
                     return
             except Exception:
                 pass
@@ -170,9 +169,7 @@ class NodeFixer(NodeVisitor[None]):
         """Replace cross-reference with an actual referred node."""
         if _HAS_RUST_FIXUP:
             try:
-                if _rust_resolve_cross_ref(
-                    value, self.modules, self.allow_missing
-                ):
+                if _rust_resolve_cross_ref(value, self.modules, self.allow_missing):
                     return
             except Exception:
                 pass
@@ -220,9 +217,7 @@ class NodeFixer(NodeVisitor[None]):
     def visit_overloaded_func_def(self, o: OverloadedFuncDef) -> None:
         if _HAS_RUST_FIXUP:
             try:
-                if _rust_fixup_overloaded_func_def(
-                    o, self.modules, self.allow_missing
-                ):
+                if _rust_fixup_overloaded_func_def(o, self.modules, self.allow_missing):
                     return
             except Exception:
                 pass

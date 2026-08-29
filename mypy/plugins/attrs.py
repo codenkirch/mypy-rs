@@ -129,9 +129,7 @@ _ATTRS_INIT_SIG = 201
 _ATTRS_METHOD_INFO = 202
 
 
-def _serialize_attrs_fields_for_rust(
-    attributes: list[Attribute],
-) -> bytes:
+def _serialize_attrs_fields_for_rust(attributes: list[Attribute]) -> bytes:
     """Serialize field metadata into bytes for rust_transform_attrs.
 
     Wire: count(short-int) + for each field:
@@ -177,7 +175,7 @@ def _serialize_attrs_fields_for_rust(
             _write_short_int(0)
 
     buf = bytearray()
-    _write_short_int(len(attributes),)
+    _write_short_int(len(attributes))
 
     for attr in attributes:
         # Tag.
@@ -265,33 +263,32 @@ def _apply_native_init(
         return b
 
     def _read_short_int() -> int:
+        nonlocal pos
         first = _read_u8()
         TWO_BYTES_BIT = 1
         FOUR_BYTES_BIT = 2
         MIN_ONE = -10
         if (first & TWO_BYTES_BIT) == 0:
-            return ((first >> 1) + MIN_ONE)
+            return (first >> 1) + MIN_ONE
         elif (first & FOUR_BYTES_BIT) == 0:
             second = _read_u8()
-            return ((second << 6) + ((first >> 2)) - 100)
+            return (second << 6) + (first >> 2) - 100
         else:
             second = _read_u8()
             pos += 2
             two_more = buf[pos - 2] | (buf[pos - 1] << 8)
-            higher = ((two_more << 13) + (second << 5))
-            return (higher + ((first >> 3)) - 10000)
+            higher = (two_more << 13) + (second << 5)
+            return higher + (first >> 3) - 10000
 
     # Skip the ATTRS_INIT_SIG tag.
     _read_u8()
 
-    # Read init_name (should match method_name).
+    # Read and skip the init name and info blob; only the arg structure is
+    # consumed here (Python rebuilds names and types from the Attribute data).
     init_name_len = _read_short_int()
-    rust_init_name = bytes(buf[pos:pos + init_name_len]).decode("utf-8")
     pos += init_name_len
 
-    # Read init_info blob.
     init_info_len = _read_short_int()
-    init_info = bytes(buf[pos:pos + init_info_len])
     pos += init_info_len
 
     # Read ordering methods info (we don't inject them here; Python handles
@@ -318,14 +315,11 @@ def _apply_native_init(
                     init_vars = get_type_vars(attr.init_type)
                     if converter_vars and len(converter_vars) == len(init_vars):
                         variables = {
-                            binder.id: arg
-                            for binder, arg in zip(converter_vars, init_vars)
+                            binder.id: arg for binder, arg in zip(converter_vars, init_vars)
                         }
                         init_type = expand_type(attr.init_type, variables)
             else:
-                ctx.api.fail(
-                    "Cannot determine __init__ type from converter", attr.context
-                )
+                ctx.api.fail("Cannot determine __init__ type from converter", attr.context)
                 init_type = AnyType(TypeOfAny.from_error)
         else:
             init_type = attr.init_type or ctx.cls.info[attr.name].type
@@ -372,6 +366,8 @@ def _apply_native_init(
             a.variable.type = AnyType(TypeOfAny.implementation_artifact)
             a.type_annotation = AnyType(TypeOfAny.implementation_artifact)
     adder.add_method(method_name, args, NoneType())
+
+
 attr_class_makers: Final = {"attr.s", "attr.attrs", "attr.attributes"}
 attr_dataclass_makers: Final = {"attr.dataclass"}
 attr_frozen_makers: Final = {"attr.frozen", "attrs.frozen"}

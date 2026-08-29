@@ -88,16 +88,14 @@ from collections import defaultdict
 # falling back to Python `TypeTriggersVisitor` for unsupported types.
 try:
     from type_kernel import (
+        rust_attribute_triggers as _rust_attribute_triggers,
         rust_compute_target_modules as _rust_compute_target_modules,
-    )
-    from type_kernel import (
         rust_compute_wildcard_triggers as _rust_compute_wildcard_triggers,
+        rust_get_type_triggers as _rust_get_type_triggers,
+        rust_has_user_bases as _rust_has_user_bases,
+        rust_merge_dependencies as _rust_merge_dependencies,
+        rust_non_trivial_bases as _rust_non_trivial_bases,
     )
-    from type_kernel import rust_get_type_triggers as _rust_get_type_triggers
-    from type_kernel import rust_attribute_triggers as _rust_attribute_triggers
-    from type_kernel import rust_merge_dependencies as _rust_merge_dependencies
-    from type_kernel import rust_non_trivial_bases as _rust_non_trivial_bases
-    from type_kernel import rust_has_user_bases as _rust_has_user_bases
 
     _HAS_TYPE_KERNEL = True
 except ImportError:
@@ -134,8 +132,7 @@ def _set_native_server_deps_active(active: bool) -> None:
 
 
 def rust_compute_wildcard_triggers_pure(
-    changed_names: list[str],
-    package_nesting_level: int,
+    changed_names: list[str], package_nesting_level: int
 ) -> list[str] | None:
     """Compute wildcard triggers from changed symbol names.
 

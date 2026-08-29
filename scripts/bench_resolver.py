@@ -14,18 +14,17 @@ Three columns:
                    import set into one Rust call closes the per-module
                    boundary-overhead gap.
 """
+
 from __future__ import annotations
 
 import ast
-import os
-import sys
 import time
 from pathlib import Path
 
-from mypy.modulefinder import FindModuleCache, compute_search_paths
 from mypy.fscache import FileSystemCache
+from mypy.modulefinder import FindModuleCache, compute_search_paths
+from mypy.native_resolve import resolve_modules
 from mypy.options import Options
-from mypy.native_resolve import make_resolver, resolve_modules
 
 REPO = Path(__file__).resolve().parent.parent
 
@@ -143,4 +142,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

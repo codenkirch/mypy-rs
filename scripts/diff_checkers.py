@@ -21,11 +21,11 @@ PATH when invoked through the project venv).
 The script is intentionally dependency-free (stdlib only) so it runs
 in any venv that has mypy installed, without requiring pyrefly or ty.
 """
+
 from __future__ import annotations
 
 import argparse
 import json
-import os
 import re
 import shutil
 import subprocess
@@ -286,9 +286,7 @@ def parse_ty_json(stdout: str, stderr: str) -> list[Diagnostic]:
         col = int(start.get("character") or start.get("column") or 0)
         code = diag.get("code") or "ty"
         message = diag.get("message") or ""
-        diags.append(
-            Diagnostic(path=path, line=line, col=col, code=str(code), message=message)
-        )
+        diags.append(Diagnostic(path=path, line=line, col=col, code=str(code), message=message))
     return diags
 
 
@@ -328,9 +326,7 @@ def bucket_disagreements(results: list[CheckerResult]) -> dict[str, list[tuple]]
 
 
 def render_report(
-    results: list[CheckerResult],
-    buckets: dict[str, list[tuple]],
-    corpus_size: int,
+    results: list[CheckerResult], buckets: dict[str, list[tuple]], corpus_size: int
 ) -> str:
     """Render the disagreement report as markdown."""
     lines: list[str] = []
@@ -343,9 +339,7 @@ def render_report(
     lines.append("| Checker | Available | Diagnostics | Note |")
     lines.append("|---------|-----------|-------------|------|")
     for r in results:
-        lines.append(
-            f"| {r.name} | {r.available} | {len(r.diagnostics)} | {r.note} |"
-        )
+        lines.append(f"| {r.name} | {r.available} | {len(r.diagnostics)} | {r.note} |")
     lines.append("")
     lines.append("## Disagreement buckets")
     lines.append("")
@@ -378,22 +372,13 @@ def render_report(
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "--corpus",
-        type=Path,
-        default=REPO,
-        help="Corpus root (default: repo root).",
+        "--corpus", type=Path, default=REPO, help="Corpus root (default: repo root)."
     )
     parser.add_argument(
-        "--out",
-        type=Path,
-        default=None,
-        help="Output report path (default: stdout).",
+        "--out", type=Path, default=None, help="Output report path (default: stdout)."
     )
     parser.add_argument(
-        "--limit",
-        type=int,
-        default=None,
-        help="Cap corpus size (for smoke testing).",
+        "--limit", type=int, default=None, help="Cap corpus size (for smoke testing)."
     )
     args = parser.parse_args(argv)
 

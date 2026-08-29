@@ -34,16 +34,17 @@ from mypy.traverser import TraverserVisitor
 
 try:
     from type_kernel import (
+        rust_assert_will_always_fail as _rust_assert_will_always_fail,
+        rust_consider_sys_platform as _rust_consider_sys_platform,
+        rust_consider_sys_version_info as _rust_consider_sys_version_info,
+        rust_contains_int_or_tuple_of_ints as _rust_contains_int_or_tuple_of_ints,
+        rust_contains_sys_version_info as _rust_contains_sys_version_info,
+        rust_fixed_comparison as _rust_fixed_comparison,
         rust_infer_condition_value as _rust_infer_condition_value,
         rust_infer_pattern_value as _rust_infer_pattern_value,
-        rust_assert_will_always_fail as _rust_assert_will_always_fail,
-        rust_consider_sys_version_info as _rust_consider_sys_version_info,
-        rust_consider_sys_platform as _rust_consider_sys_platform,
         rust_is_sys_attr as _rust_is_sys_attr,
-        rust_contains_sys_version_info as _rust_contains_sys_version_info,
-        rust_contains_int_or_tuple_of_ints as _rust_contains_int_or_tuple_of_ints,
-        rust_fixed_comparison as _rust_fixed_comparison,
     )
+
     _HAS_RUST_REACHABILITY = True
 except ImportError:
     _rust_infer_condition_value = None  # type: ignore[assignment]
