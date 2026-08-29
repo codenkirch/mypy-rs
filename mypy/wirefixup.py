@@ -51,6 +51,42 @@ _last_real_map: dict[str, Any] | None = None
 _wire_alias_map: dict[str, Any] | None = None
 
 
+def clear_wire_decode_caches() -> None:
+    """Invalidate every Python-side wire-decode cache.
+
+    Called by `set_wire_typeinfo_map` when a brand-new map identity
+    replaces the previous one, by `BuildManager._clear_native_resolvers`
+    on the per-build reset, and by `BuildManager._refresh_native_wirefixup_maps`
+    when merge_asts re-homes map entries in place (same dict identity, so
+    the identity check there would not clear anything).
+    """
+    from mypy.checker import _clear_checker_deser_cache
+    from mypy.checkexpr import _clear_argtypes_plan_cache
+    from mypy.checkmember import _clear_deser_cache
+    from mypy.erasetype import _clear_erase_decode_cache
+    from mypy.expandtype import _clear_expand_decode_cache
+    from mypy.maptype import _clear_map_supertype_decode_cache
+    from mypy.meet import _clear_narrow_decode_cache
+    from mypy.subtypes import _clear_subtype_batch, _clear_subtype_decode_cache
+    from mypy.typeops import _clear_typeops_decode_cache
+    from mypy.typevars import _clear_typevars_decode_cache
+
+    _clear_deser_cache()
+    _clear_checker_deser_cache()
+    _clear_erase_decode_cache()
+    _clear_argtypes_plan_cache()
+    _clear_typeops_decode_cache()
+    _clear_typevars_decode_cache()
+    _clear_map_supertype_decode_cache()
+    _clear_subtype_decode_cache()
+    # Serialized subtype answer pairs are keyed on the previous map's
+    # TypeInfo graph; a per-build reset (or a merge_asts re-home) must
+    # drop them alongside the decode caches.
+    _clear_subtype_batch()
+    _clear_narrow_decode_cache()
+    _clear_expand_decode_cache()
+
+
 def set_wire_typeinfo_map(typeinfo_map: dict[str, Any] | None) -> None:
     """Install the fullname -> TypeInfo map shared by all wire-round-trip paths.
 
@@ -74,27 +110,7 @@ def set_wire_typeinfo_map(typeinfo_map: dict[str, Any] | None) -> None:
         # A brand-new map identity (parity tests per case, daemon
         # rechecks): cached decodes from the previous map must not
         # survive, they would resolve into stale TypeInfo objects.
-        from mypy.checker import _clear_checker_deser_cache
-        from mypy.checkexpr import _clear_argtypes_plan_cache
-        from mypy.checkmember import _clear_deser_cache
-        from mypy.erasetype import _clear_erase_decode_cache
-        from mypy.expandtype import _clear_expand_decode_cache
-        from mypy.maptype import _clear_map_supertype_decode_cache
-        from mypy.meet import _clear_narrow_decode_cache
-        from mypy.subtypes import _clear_subtype_decode_cache
-        from mypy.typeops import _clear_typeops_decode_cache
-        from mypy.typevars import _clear_typevars_decode_cache
-
-        _clear_deser_cache()
-        _clear_checker_deser_cache()
-        _clear_erase_decode_cache()
-        _clear_argtypes_plan_cache()
-        _clear_typeops_decode_cache()
-        _clear_typevars_decode_cache()
-        _clear_map_supertype_decode_cache()
-        _clear_subtype_decode_cache()
-        _clear_narrow_decode_cache()
-        _clear_expand_decode_cache()
+        clear_wire_decode_caches()
     _last_real_map = typeinfo_map
     _wire_typeinfo_map = typeinfo_map
 
