@@ -4447,11 +4447,8 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
         )
 
         # Native overload dispatch: Rust returns the first-match target index
-        # for the no-Any, no-union-arg, no-star-actual, non-generic-target path.
-        # We re-run check_call on the chosen target inside filter_errors and
-
-        # trust it only when it produces no new errors; otherwise Python flow
-        # proceeds unchanged.
+        # (generic targets via the constraint-solve kernel). Re-run check_call
+        # on the chosen target; trust only when it adds no new errors.
         native_idx: int | None = None
         if (
             _CHECKEXPR_HAS_TYPE_KERNEL
@@ -4469,6 +4466,8 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
                     [k.value for k in arg_kinds],
                     self.chk.options.strict_optional,
                     list(arg_names) if arg_names is not None else None,
+                    self.chk.in_checked_function(),
+                    type_state.infer_unions,
                 )
             except (AssertionError, NotImplementedError, ValueError, TypeError, IndexError):
                 native_idx = None

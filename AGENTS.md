@@ -1820,6 +1820,27 @@ including:
   cb-actual-other 1, cb-norm-shape 2. Covered by the `test_cb_*` unit
   tests in `constraints.rs` (plain, ellipsis, unpack-template, ParamSpec
   prefix/target, ret-only) and the testcheck parity differential.
+- generic overload-target dispatch through the solve kernel (issue
+  #1204) — `rust_check_overload_call` no longer whole-call defers on a
+  target carrying its own `variables`: the seam classifies each target
+  into plain vs generic (via `is_type_obj` + `variables`) and evaluates
+  a generic target by calling `rust_solve_generic_call` (first-match
+  index semantics: solve, then evaluate the fully-substituted form like
+  a plain target), deferring on ParamSpec / TypeVarTuple variables, a
+  solve defer, or a residual unsolved callable. Per-target steps moved
+  into `evaluate_plain_target` / `evaluate_generic_target` with a
+  `MatchDecision` (Yes / No / Undecided) so a generic defer is
+  indistinguishable from Python-level uncertainty. Python passes two
+  new flags, `chk.in_checked_function()` (`strict`) and
+  `type_state.infer_unions`, matching the solve shim thread. Cold
+  self-check audit (instrumentation stripped before landing): seam
+  defers 13,170 @ 68% native -> whole-call defers 3,917 -> 1,662
+  (`shape_generic` 3,573 -> 37), native matches ~8,955 -> 11,501
+  (~87%); remaining defers dominated by `gen_solve_defer` (948: the
+  solve kernel's own ParamSpec/TVT/bounds defers). Covered by
+  `NativeOverloadCallSuite` in `mypy/test/testtypes.py` (first-match
+  ordering, reject stepping, star/typeobj/ParamSpec defers, direct
+  generic solves) plus the testcheck parity differential.
 
 Stages 1/2 return `None` for any type class Rust does not handle, and
 the Python caller falls back to the pure-Python visitor. This is the
