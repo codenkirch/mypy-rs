@@ -342,9 +342,8 @@ def expand_type(typ: Type, env: Mapping[TypeVarId, Type]) -> Type:
     environment.
     """
     # Stage 3c type-kernel seam: try the Rust expand_type path. Rust
-    # returns None for unsupported cases (ParamSpec, TypeAliasType, etc.);
-    # we then fall through to the pure-Python visitor. Mirrors the
-    # erasetype.py strangler-fig contract.
+    # returns None for unsupported cases (ParamSpec, TypeAliasType, etc.),
+    # so we then fall through to the pure-Python visitor (strangler-fig).
     if (
         _HAS_TYPE_KERNEL
         and _native_expand_type_active
@@ -363,6 +362,8 @@ def expand_type(typ: Type, env: Mapping[TypeVarId, Type]) -> Type:
                 raw = bytes(result)
                 cached = _expand_type_decode_cache.get(raw)
                 if cached is not None and isinstance(cached, ProperType):
+                    from mypy.wirefixup import resync_var_identities
+
                     # Shallow copy: callers mutate top-level line/column;
                     # identical blobs must not cross-contaminate sites
                     # applying different locations.
@@ -371,12 +372,18 @@ def expand_type(typ: Type, env: Mapping[TypeVarId, Type]) -> Type:
                     fixed.column = typ.column
                     if isinstance(fixed, CallableType):
                         fixed.fallback.line = fixed.line
-                    fixed = _resync_definitions(typ, fixed)
-                    if fixed is not None:
-                        return fixed
+                    relinked = resync_var_identities(typ, fixed, list(env.values()))
+                    if relinked is not None:
+                        fixed = _resync_definitions(typ, relinked)
+                        if fixed is not None:
+                            return fixed
                 else:
                     decoded = read_type(_ReadBuffer(raw))
-                    from mypy.wirefixup import canonicalize_fresh_vars_reported, fixup_wire_type
+                    from mypy.wirefixup import (
+                        canonicalize_fresh_vars_reported,
+                        fixup_wire_type,
+                        resync_var_identities,
+                    )
 
                     # resolve_aliases=True re-links wire-decoded TypeAliasType
                     # nodes to live TypeAlias nodes; an alias missing from the
@@ -415,9 +422,14 @@ def expand_type(typ: Type, env: Mapping[TypeVarId, Type]) -> Type:
                             # call re-stamps definitions from its own input
                             # type (see the cached branch above).
                             _expand_type_decode_cache[raw] = fixed
-                        fixed = _resync_definitions(typ, fixed)
-                        if fixed is not None:
-                            return fixed
+                        # The wire round-trip also splits TypeVar identity:
+                        # re-link structurally-equal decoded vars to the
+                        # originals from typ/env values; unmatched defers.
+                        relinked = resync_var_identities(typ, fixed, list(env.values()))
+                        if relinked is not None:
+                            fixed = _resync_definitions(typ, relinked)
+                            if fixed is not None:
+                                return fixed
         except (NotImplementedError, AssertionError):
             # AssertionError: TypeInfo not yet fixed during semanal.
             # NotImplementedError: unserializable variant.
@@ -590,10 +602,7 @@ def expand_type_by_instance(typ: Type, instance: Instance) -> Type:
             and _native_expand_type_active
             and _native_expand_type_resolver is not None
             and not _needs_python(typ, definition_gate=False)
-            and not any(
-                _needs_python(a, definition_gate=False)
-                for a in instance.args
-            )
+            and not any(_needs_python(a, definition_gate=False) for a in instance.args)
         ):
             try:
                 result = _type_kernel.rust_expand_type_by_instance(
@@ -604,7 +613,11 @@ def expand_type_by_instance(typ: Type, instance: Instance) -> Type:
                 )
                 if result is not None:
                     decoded = read_type(_ReadBuffer(bytes(result)))
-                    from mypy.wirefixup import canonicalize_fresh_vars, fixup_wire_type
+                    from mypy.wirefixup import (
+                        canonicalize_fresh_vars,
+                        fixup_wire_type,
+                        resync_var_identities,
+                    )
 
                     fixed = fixup_wire_type(decoded)
                     # The wire round-trip splits fresh meta-var occurrences
@@ -612,19 +625,26 @@ def expand_type_by_instance(typ: Type, instance: Instance) -> Type:
                     # in-place freeze touches every occurrence (pre-stamping).
                     if fixed is not None:
                         fixed = canonicalize_fresh_vars(fixed)
-                    # The wire format does not carry line/column; decoded
-                    # types default to line -1. Preserve the input type's
-                    # location so derived contexts report errors at the
-                    # call site instead of a phantom line 0/-1.
+                    # The wire format carries no line/column (decoded types
+                    # default to line -1): preserve the input's location so
+                    # derived contexts report at the call site, not line 0.
                     if fixed is not None and isinstance(fixed, ProperType):
                         fixed.line = typ.line
                         fixed.column = typ.column
                         if isinstance(fixed, CallableType):
                             fixed.fallback.line = fixed.line
-                        # Definitions are dropped by the wire round-trip;
-                        # re-stamp from the pre-seam type (None defers
-                        # to the Python visitor).
-                        fixed = _resync_definitions(typ, fixed)
+                        # The wire round-trip splits TypeVar identity: relink
+                        # structurally-equal decoded vars to the originals
+                        # from `typ` and the instance args; unmatched defers.
+                        relinked = resync_var_identities(typ, fixed, instance.args)
+                        if relinked is None:
+                            fixed = None
+                        else:
+                            fixed = relinked
+                            # Definitions are dropped by the wire round-trip;
+                            # re-stamp from the pre-seam type (None defers
+                            # to the Python visitor).
+                            fixed = _resync_definitions(typ, fixed)
                     from mypy.types import instance_cache
 
                     instance_cache.int_type = None
@@ -747,10 +767,9 @@ def freshen_function_type_vars(callee: F) -> F:
         fresh = expand_type(callee, tvmap).copy_modified(variables=tvs)
         from mypy.wirefixup import canonicalize_fresh_vars
 
-        # The expand_type kernel seam re-decodes occurrences as distinct
-        # objects: unify them onto the freshened tvs (pre-registered via
-        # seed) so the variables slot and occurrences share identity for
-        # downstream in-place freeze.
+        # The expand_type kernel seam re-decodes occurrences as distinct objects:
+        # unify them onto the freshened tvs (pre-registered via seed) so the
+        # variables slot and occurrences share identity for downstream freeze.
         return cast(F, canonicalize_fresh_vars(fresh, seed=tvs))
     else:
         assert isinstance(callee, Overloaded)

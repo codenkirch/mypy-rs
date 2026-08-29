@@ -2478,3 +2478,26 @@ directly to `main`.
   a non-final `__init__` with a `NoneType` self declaration is decided
   by Python's `check_self_arg` error path, which emission the seam
   must not swallow).
+- `rust_expand_type` leftover-tvar relink (issue #1215, defer round 3): the
+  third audit showed both pools back to one dominant defer class
+  (`expand/res_tvar` 6,332, by-instance `res_tvar` 268), the
+  object-identity contract (Python `visit_type_var` returns the original
+  `t`) left standing after #1203. The seam now returns the expansion
+  instead of deferring when unmatched TypeVars remain:
+  `expand_type_with_env_inner` / `expand_type_by_instance_inner` gain a
+  `relink_ok` flag threaded from the two FFI entries, and the Python shim
+  (`mypy/wirefixup.py:resync_var_identities`) relinks each
+  structurally-equal decoded TypeVar onto the live original (unmatched
+  vars are matched against `env.values()` / instance args), returning
+  `None` (defer to the pure-Python body) when an occurrence cannot be
+  matched, including `TypedDictType.items` whose wire shape is a plain
+  `dict[str, Type]`. Measured (cold self-check, instrumented run,
+  instrumentation stripped before landing): `rust_expand_type` 113,804
+  calls / 30 fallbacks (was 6,362; res_tvar 6,332 -> 0; residual: encode
+  29 (issue #1209, out of scope) + call_unpack_arg 1);
+  `rust_expand_type_by_instance` pool 715 -> 472 (res_tvar 268 -> 0;
+  remaining res_alias 442, flatten 29, call_unpack_arg 1). Covered by
+  `test_typevar_result_relinks_identity` in `NativeExpandTypeEmptyEnvSuite`
+  (seam engagement, gate-off/on parity, `on.args[0] is off.args[0] is
+  self.fx.t` identity), plus the existing expand_type gate-on/off
+  differentials.

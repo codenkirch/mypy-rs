@@ -189,19 +189,16 @@ pub(crate) fn is_subtype(
     {
         return Some(true);
     }
-    // TupleType left: handled by the visit_tuple_type port below, which
-    // returns None for the variadic cases (Unpack items, TypeVarTuple)
-    // that still defer to Python's SubtypeVisitor (subtypes.py:950-1037).
-    // _is_subtype (subtypes.py:363-410): when right is UnionType and
-    // left is not, left <: right iff left <: some item. Python handles
-    // this BEFORE the visitor dispatch; mirror it here so recursive
+    // TupleType left: the visit_tuple_type port below returns None for the
+    // variadic cases (Unpack items, TypeVarTuple), which defer to Python's
+    // SubtypeVisitor (subtypes.py:950-1037).
 
-    // calls from check_type_parameter (which bypass the Python shim)
-    // get the right answer for union-typed type arguments. Must fire
-    // before the NoneType handler (visit_none_type returns False for
+    // _is_subtype (subtypes.py:363-410): when right is UnionType and left is not,
+    // left <: right iff left <: some item. Python checks this before the visitor
+    // dispatch; it must fire before the NoneType handler (False for UnionType).
 
-    // UnionType right, but Python's _is_subtype short-circuit would
-    // have already found None <: some union item).
+    // check_type_parameter recursions bypass the Python shim, so mirroring it
+    // here is what gives union-typed type arguments the right answer.
     if let Type::UnionType { items, .. } = right {
         if !matches!(left, Type::UnionType { .. }) {
             if matches!(left, Type::TypeVarType { .. }) {
@@ -766,12 +763,70 @@ pub(crate) fn is_subtype(
             }
             return Some(false);
         }
-        // right is Overloaded: structural overload matching (order-sensitive).
-        // Simplified: if left == right, True. Otherwise defer complex matching.
+        // right is Overloaded: structural overload matching mirroring
+        // visit_overloaded (subtypes.py:1148-1170): each right item
+        // matched in order; overlap-only is a fail.
         if left == right {
             return Some(true);
         }
-        return None;
+        let Type::Overloaded { items: right_items } = right else {
+            return None;
+        };
+        let mut previous_match_left_index: i64 = -1;
+        let mut matched_overloads: HashSet<usize> = HashSet::new();
+        for right_item in right_items {
+            let mut found_match = false;
+            for (left_index, left_item) in left_items.iter().enumerate() {
+                let subtype_match = is_subtype(left_item, right_item, ctx, resolver)?;
+                if subtype_match && previous_match_left_index <= left_index as i64 {
+                    previous_match_left_index = left_index as i64;
+                    found_match = true;
+                    matched_overloads.insert(left_index);
+                    break;
+                }
+                // Not an exact in-order match: a potential-error probe
+                // (subtypes.py:1160-1168) on the unmatched left index; the
+                // entire comparison defers when a probe is undecidable.
+                if !matched_overloads.contains(&left_index) {
+                    let compat_lr = crate::callable_compat::callables_compatible_with_ignore_return(
+                        left_item,
+                        right_item,
+                        ctx.ignore_pos_arg_names,
+                        ctx.strict_concatenate,
+                        ctx,
+                        resolver,
+                        true,
+                    );
+                    if compat_lr == Some(true) {
+                        return Some(false);
+                    }
+                    let compat_rl = if compat_lr.is_some() {
+                        crate::callable_compat::callables_compatible_with_ignore_return(
+                            right_item,
+                            left_item,
+                            ctx.ignore_pos_arg_names,
+                            ctx.strict_concatenate,
+                            ctx,
+                            resolver,
+                            true,
+                        )
+                    } else {
+                        None
+                    };
+                    match (compat_lr, compat_rl) {
+                        (Some(true), _) | (_, Some(true)) => return Some(false),
+                        (Some(false), Some(false)) => {}
+                        _ => {
+                            return None;
+                        }
+                    }
+                }
+            }
+            if !found_match {
+                return Some(false);
+            }
+        }
+        return Some(true);
     }
     // visit_callable_type (subtypes.py:807-889): CallableType left. The
     // Callable-vs-Callable case is handled by the separate callable_compat
@@ -897,7 +952,9 @@ pub(crate) fn is_subtype(
     }
     let (left_ref, left_args) = match left {
         Type::Instance { type_ref, args, .. } => (type_ref.as_str(), args.as_slice()),
-        _ => return None,
+        _ => {
+            return None;
+        }
     };
     // Python's visit_instance falls through to `return False` when right
     // is Any under a proper-subtype check (the _is_subtype Any
@@ -1355,9 +1412,37 @@ fn visit_instance_noninstance_right(
         }
         // Fall through to the FunctionLike/literal/False tail.
     }
-    // FunctionLike right needs `find_member("__call__", ...)`
-    // (subtypes.py:678-682) -> defer.
+    // FunctionLike right needs `find_member("__call__", ...)` (subtypes.py:678-
+    // 682). When the MRO snapshot provably has no `__call__` (is_operator=True
+    // skips the dunder accessor scan), Python misses and returns False directly;
+    // an existing `__call__` needs member analysis and still defers to Python.
     if matches!(right, Type::CallableType { .. } | Type::Overloaded { .. }) {
+        if let Type::Instance {
+            type_ref,
+            extra_attrs,
+            ..
+        } = left
+        {
+            if !extra_attrs
+                .iter()
+                .any(|attrs| attrs.attrs.contains_key("__call__"))
+            {
+                let snap = resolver.get(type_ref);
+                if let Some(snap) = snap {
+                    if !snap.fallback_to_any
+                        && snap.mro.iter().all(|base| {
+                            resolver
+                                .get(base)
+                                .map(|b| !b.member_info.contains_key("__call__"))
+                                .unwrap_or(false)
+                        })
+                    {
+                        // `find_member` returns None -> Python's `return False`.
+                        return Some(false);
+                    }
+                }
+            }
+        }
         return None;
     }
     // Anything else: Python's `else: return False` (subtypes.py:683). Includes
@@ -1406,7 +1491,9 @@ fn visit_instance_variadic_right(
     // subtypes.py:619: map_instance_to_supertype(left, tf_fb.type).
     let (left_ref, left_args) = match left {
         Type::Instance { type_ref, args, .. } => (type_ref.as_str(), args.as_slice()),
-        _ => return None,
+        _ => {
+            return None;
+        }
     };
     let mapped = map_instance_to_supertype(left_ref, left_args, fb_ref, resolver)?;
     let first = match mapped.first() {
@@ -1451,7 +1538,9 @@ fn visit_typeddict_subtype(
             readonly_keys,
             *is_closed,
         ),
-        _ => return None,
+        _ => {
+            return None;
+        }
     };
     // right is Instance: is_subtype(left.fallback, right)
     // (subtypes.py:1041-1042).
@@ -2109,20 +2198,17 @@ fn visit_instance_nominal(
         return None;
     }
 
-    // Map left to right's type. Fast path: left.type == right.type (no
-    // substitution needed). Slow path calls map_instance_to_supertype
-    // to walk the bases blobs and substitute TypeVars; it returns None
-    // when an unsupported Type variant is in the tree (e.g. UnpackType,
-    // ParamSpec), in which case Python falls through.
+    // Map left to right's type. Fast path: left.type == right.type needs no substitution.
+    // Slow path: map_instance_to_supertype walks the bases, substituting TypeVars;
+    // None on unsupported variants (UnpackType, ParamSpec), Python falls through.
     let mapped_args: Vec<Type> = if ctx.erase_instances {
-        // Python (subtypes.py:1151-1155) erases the *mapped* instance
-        // via `erase_type`, which replaces every arg with
-        // `AnyType(TypeOfAny.special_form)` for the supertype's own
-        // type_vars (erasetype.py:251-253). The per-arg checks below
-        // then compare erased args against the (already erased) right
-        // args, so relocatable subclass mappings that carry concrete
-        // base args still cover. TVT-bearing classes defer earlier, so
-        // a 1:1 Any per snapshot type var is the full erase.
+        // Python (subtypes.py:1151-1155) erases the *mapped* instance via
+        // `erase_type`: every arg becomes `AnyType(TypeOfAny.special_form)`
+        // over the supertype's own type_vars (erasetype.py:251-253).
+
+        // Per-arg checks compare erased left vs (already erased) right args:
+        // relocatable subclass mappings with concrete base args still cover.
+        // TVT classes defer earlier: a 1:1 Any per snapshot type var is full.
         (0..right_snap.type_vars_with_variance.len())
             .map(|_| any_type_of(ANY_SPECIAL_FORM))
             .collect()
@@ -2133,11 +2219,9 @@ fn visit_instance_nominal(
         // Instance(right, []) (no args to substitute).
         Vec::new()
     } else {
-        // Generic substitution path: map_instance_to_supertype walks
-        // class_derivation_paths over the snapshot's bases blobs,
-        // substituting TypeVars via expand_type_by_instance. Returns
-        // None when an unsupported Type variant is in the tree (e.g.
-        // UnpackType, ParamSpec), in which case Python falls through.
+        // Generic path: map_instance_to_supertype walks class_derivation_paths over
+        // the bases blobs, substituting TypeVars via expand_type_by_instance; None on
+        // an unsupported Type variant (UnpackType, ParamSpec), Python falls through.
         map_instance_to_supertype(left_ref, left_args, right_ref, resolver)?
     };
 
@@ -2277,6 +2361,7 @@ fn expand_aliases_depth(
     active: &mut Vec<ActiveAlias>,
 ) -> Option<Type> {
     if depth > 50 {
+        // Over-broad: defer the whole entry rather than guess.
         return None;
     }
     match typ {
@@ -2287,19 +2372,47 @@ fn expand_aliases_depth(
             if active.iter().any(|(r, a)| r == type_ref && *a == *args) {
                 return Some(typ.clone());
             }
-            let snap = alias_resolver.get(type_ref)?;
+            let snap = match alias_resolver.get(type_ref) {
+                Some(s) => s,
+                None => {
+                    // Issue #1205 best-effort: an unexpansible alias node is
+                    // kept in place (the same contract the #1149 cut ships:
+                    // the engine defers on every alias node it meets), so
+                    // only comparisons that actually reach it defer.
+                    return Some(typ.clone());
+                }
+            };
             if snap.tvar_tuple_index.is_some() {
-                return None;
+                // Variadic alias target needs the Unpack splicing machinery
+                // (expandtype) that is Python-side; keep the node instead of
+                // failing the whole entry.
+                return Some(typ.clone());
             }
             active.push((type_ref.clone(), args.clone()));
-            let expanded_args: Vec<Type> = args
+            let expanded_args: Vec<Type> = match args
                 .iter()
                 .map(|a| {
                     expand_aliases_depth(a, alias_resolver, strict_optional, depth + 1, active)
                 })
-                .collect::<Option<_>>()?;
+                .collect::<Option<_>>()
+            {
+                Some(a) => a,
+                None => {
+                    // Recursion depth cap only (nested failures are now kept
+                    // locally, so a child can no longer fail from alias
+                    // expansion problems).
+                    active.pop();
+                    return Some(typ.clone());
+                }
+            };
             let res = if snap.no_args {
-                let target = decode_type(&snap.target)?;
+                let target = match decode_type(&snap.target) {
+                    Some(t) => t,
+                    None => {
+                        active.pop();
+                        return Some(typ.clone());
+                    }
+                };
                 if let Type::Instance { type_ref, .. } = &target {
                     Some(Type::Instance {
                         type_ref: type_ref.clone(),
@@ -2325,9 +2438,25 @@ fn expand_aliases_depth(
                         arg.clone(),
                     );
                 }
-                let target = decode_type(&snap.target)?;
+                let target = match decode_type(&snap.target) {
+                    Some(t) => t,
+                    None => {
+                        active.pop();
+                        return Some(typ.clone());
+                    }
+                };
                 let substituted =
-                    crate::expandtype::expand_type_inner(&target, &env, strict_optional)?;
+                    match crate::expandtype::expand_type_inner(&target, &env, strict_optional) {
+                        Some(t) => t,
+                        None => {
+                            // Substitution walls (ParamSpec / Unpack
+                            // variables and var-args) are legitimate
+                            // Python-side work; keep this alias node
+                            // unexpanded rather than failing the entry.
+                            active.pop();
+                            return Some(typ.clone());
+                        }
+                    };
                 expand_aliases_depth(
                     &substituted,
                     alias_resolver,
@@ -3032,13 +3161,14 @@ pub(crate) fn rust_is_same_type(
     let b = decode_type(b_bytes)?;
     let a = expand_aliases(&a, resolver.alias_resolver(), strict_optional)?;
     let b = expand_aliases(&b, resolver.alias_resolver(), strict_optional)?;
-    is_same_type(
+    let answer = is_same_type(
         &a,
         &b,
         ignore_promotions,
         strict_optional,
         resolver.resolver(),
-    )
+    );
+    answer
 }
 
 /// `#[pyfunction]` entry: the Python-side shim calls this with the
@@ -3079,7 +3209,8 @@ pub(crate) fn rust_is_subtype(
         ignore_pos_arg_names,
         strict_concatenate,
     );
-    is_subtype(&left, &right, &ctx, resolver.resolver())
+    let answer = is_subtype(&left, &right, &ctx, resolver.resolver());
+    answer
 }
 
 /// `#[pyfunction]` entry: batch variant of `rust_is_subtype`.
@@ -5341,6 +5472,104 @@ mod tests {
         assert_eq!(got, vec![1, -1]);
     }
 
+    #[test]
+    fn test_engine_defers_on_kept_alias() {
+        // Issue #1205 keep-node contract: an alias missing from the alias
+        // resolver is kept as a node and the engine defers on comparisons
+        // that must reach it.
+        let mut native = NativeTypeResolver::new(
+            make_resolver(vec![snap("builtins.int", "int")]),
+            make_alias_resolver(vec![]),
+        );
+        let left = encode(&alias_type(vec![], "mod.Missing"));
+        let right = encode(&instance("builtins.int", vec![]));
+        let got = rust_is_subtype(
+            &left,
+            &right,
+            false, // ignore_type_params
+            false, // ignore_declared_variance
+            false, // always_covariant
+            false, // ignore_promotions
+            false, // proper_subtype
+            true,  // strict_optional
+            false, // ignore_pos_arg_names
+            false, // strict_concatenate
+            &mut native,
+        );
+        assert_eq!(got, None);
+    }
+
+    fn instance_with_attrs(type_ref: &str, attrs: Vec<(&str, Type)>) -> Type {
+        Type::Instance {
+            type_ref: type_ref.to_string(),
+            args: vec![],
+            last_known_value: None,
+            extra_attrs: Some(wire::ExtraAttrs {
+                attrs: attrs.into_iter().map(|(k, v)| (k.to_string(), v)).collect(),
+                immutable: HashSet::new(),
+                mod_name: None,
+            }),
+        }
+    }
+
+    #[test]
+    fn member_call_fast_false_without_call_in_mro() {
+        // Issue #1205: Instance <: Callable with no resolvable `__call__`
+        // anywhere in the MRO is decided False (find_member miss).
+        let r = make_resolver(vec![snap("a.A", "A")]);
+        let left = instance("a.A", vec![]);
+        let right = callable_type(vec![], instance("builtins.bool", vec![]), None);
+        assert_eq!(is_subtype(&left, &right, &ctx_nominal(), &r), Some(false));
+    }
+
+    #[test]
+    fn member_call_defers_when_call_present() {
+        let mut a = snap("a.A", "A");
+        a.member_info.insert("__call__".to_string(), (false, false));
+        let r = make_resolver(vec![a]);
+        let left = instance("a.A", vec![]);
+        let right = callable_type(vec![], instance("builtins.bool", vec![]), None);
+        assert_eq!(is_subtype(&left, &right, &ctx_nominal(), &r), None);
+    }
+
+    #[test]
+    fn member_call_defers_on_fallback_to_any() {
+        // Under a proper-subtype comparison the fallback_to_any
+        // short-circuit does not fire, so the probe defer applies.
+        let a = SubtypeContext::new(false, false, false, false, true, true);
+        let mut s = snap("a.A", "A");
+        s.fallback_to_any = true;
+        let r = make_resolver(vec![s]);
+        let left = instance("a.A", vec![]);
+        let right = callable_type(vec![], instance("builtins.bool", vec![]), None);
+        assert_eq!(is_subtype(&left, &right, &a, &r), None);
+    }
+
+    #[test]
+    fn member_call_defers_on_missing_base_snapshot() {
+        // A base missing from the resolver cannot prove the miss, so the
+        // fast-False probe must not fire.
+        let mut a = snap("a.A", "A");
+        a.mro.push("a.MissingBase".to_string());
+        let r = make_resolver(vec![a]);
+        let left = instance("a.A", vec![]);
+        let right = callable_type(vec![], instance("builtins.bool", vec![]), None);
+        assert_eq!(is_subtype(&left, &right, &ctx_nominal(), &r), None);
+    }
+
+    #[test]
+    fn member_call_defers_with_extra_attrs_call() {
+        // An extra_attrs carrier with a `__call__` key defers: the member
+        // may resolve through module attributes.
+        let r = make_resolver(vec![snap("a.A", "A")]);
+        let left = instance_with_attrs(
+            "a.A",
+            vec![("__call__", instance("builtins.object", vec![]))],
+        );
+        let right = callable_type(vec![], instance("builtins.bool", vec![]), None);
+        assert_eq!(is_subtype(&left, &right, &ctx_nominal(), &r), None);
+    }
+
     // --- expand_aliases unit tests ---
 
     use crate::aliases::{AliasTvar, TypeAliasResolver, TypeAliasSnapshot};
@@ -5447,17 +5676,19 @@ mod tests {
     }
 
     #[test]
-    fn test_expand_aliases_missing_in_resolver_defers() {
-        // Alias not in resolver -> None (defer to Python)
+    fn test_expand_aliases_missing_keeps_node() {
+        // Issue #1205: an alias missing from the resolver is kept in place
+        // (best-effort expansion) instead of failing the whole entry.
         let ar = make_alias_resolver(vec![]);
         let input = alias_type(vec![], "mod.Missing");
         let result = expand_aliases(&input, &ar, true);
-        assert_eq!(result, None);
+        assert_eq!(result, Some(input.clone()));
     }
 
     #[test]
-    fn test_expand_aliases_variadic_defers() {
-        // tvar_tuple_index set -> None (variadic, defer)
+    fn test_expand_aliases_variadic_keeps_node() {
+        // tvar_tuple_index set: the variadic target needs the Python-side
+        // Unpack splicing machinery; the node is kept instead of failing.
         let target = instance("builtins.tuple", vec![]);
         let snap = TypeAliasSnapshot {
             fullname: "mod.A".to_string(),
@@ -5468,7 +5699,45 @@ mod tests {
         let ar = make_alias_resolver(vec![snap]);
         let input = alias_type(vec![], "mod.A");
         let result = expand_aliases(&input, &ar, true);
-        assert_eq!(result, None);
+        assert_eq!(result, Some(input.clone()));
+    }
+
+    #[test]
+    fn test_expand_aliases_partial_keep_union_sibling() {
+        // A missing-alias union item is kept while a sibling alias in the
+        // same union still expands (partial keep, issue #1205).
+        let target = instance("builtins.str", vec![]);
+        let snap = TypeAliasSnapshot {
+            fullname: "mod.A".to_string(),
+            target: encode_for_alias(&target),
+            no_args: true,
+            ..Default::default()
+        };
+        let ar = make_alias_resolver(vec![snap]);
+        let input = Type::UnionType {
+            items: vec![
+                alias_type(vec![], "mod.Missing"),
+                alias_type(vec![], "mod.A"),
+                instance("builtins.int", vec![]),
+            ],
+            uses_pep604_syntax: false,
+            can_be_true: true,
+            can_be_false: false,
+        };
+        let result = expand_aliases(&input, &ar, true);
+        assert_eq!(
+            result,
+            Some(Type::UnionType {
+                items: vec![
+                    alias_type(vec![], "mod.Missing"),
+                    instance("builtins.str", vec![]),
+                    instance("builtins.int", vec![]),
+                ],
+                uses_pep604_syntax: false,
+                can_be_true: true,
+                can_be_false: false,
+            })
+        );
     }
 
     #[test]

@@ -2077,10 +2077,28 @@ pub(crate) fn write_type(buf: &mut WriteBuffer, t: &Type) -> Result<(), WireErro
                 write_type_opt(buf, last_known_value.as_deref())?;
                 match extra_attrs {
                     None => write_tag(buf, LITERAL_NONE),
-                    Some(_) => {
-                        return Err(WireError::invalid(
-                            "extra_attrs encoder not implemented (no set-ops visitor produces it)",
-                        ));
+                    Some(ea) => {
+                        // Mirror Python's ExtraAttrs.write element order:
+                        // attrs map, sorted(immutable), mod_name, END_TAG.
+                        // Keys sorted: HashMap order is nondeterministic.
+                        write_tag(buf, EXTRA_ATTRS);
+                        let mut attrs: Vec<(&String, &Type)> = ea.attrs.iter().collect();
+                        attrs.sort_unstable_by(|a, b| a.0.cmp(b.0));
+                        write_tag(buf, DICT_STR_GEN);
+                        write_int_bare(buf, attrs.len() as i64)?;
+                        for (key, value) in attrs {
+                            write_str_bare(buf, key)?;
+                            write_type(buf, value)?;
+                        }
+                        let mut immutable: Vec<&String> = ea.immutable.iter().collect();
+                        immutable.sort();
+                        write_tag(buf, LIST_STR);
+                        write_int_bare(buf, immutable.len() as i64)?;
+                        for item in immutable {
+                            write_str_bare(buf, item)?;
+                        }
+                        write_str_opt(buf, ea.mod_name.as_deref())?;
+                        write_tag(buf, END_TAG);
                     }
                 }
                 write_tag(buf, END_TAG);
@@ -2741,6 +2759,83 @@ mod tests {
             extra_attrs: None,
         };
         assert_eq!(round_trip(&t), t);
+    }
+
+    #[test]
+    fn write_then_read_instance_extra_attrs_round_trips() {
+        let t = module_instance_with_extra_attrs();
+        assert_eq!(round_trip(&t), t);
+    }
+
+    /// mod_name-less variant: `write_str_opt` must emit LITERAL_NONE.
+    #[test]
+    fn write_then_read_instance_extra_attrs_no_mod_name_round_trips() {
+        let mut t = module_instance_with_extra_attrs();
+        if let Type::Instance { extra_attrs, .. } = &mut t {
+            extra_attrs.as_mut().unwrap().mod_name = None;
+        }
+        assert_eq!(round_trip(&t), t);
+    }
+
+    /// The fast path (five singletons + INSTANCE_SIMPLE) must NOT fire for
+    /// an args-less Instance that carries extra_attrs; it always takes
+    /// INSTANCE_GENERIC so the extra_attrs element survives.
+    #[test]
+    fn write_instance_with_extra_attrs_uses_generic_path() {
+        let t = module_instance_with_extra_attrs();
+        let mut buf = WriteBuffer::new();
+        write_type(&mut buf, &t).expect("write_type failed");
+        let bytes = buf.into_bytes();
+        assert_eq!(bytes[0], INSTANCE);
+        assert_eq!(bytes[1], INSTANCE_GENERIC);
+    }
+
+    /// Byte-level order check mirroring Python's `ExtraAttrs.write`
+    /// element order (attrs, sorted(immutable), mod_name, END_TAG).
+    #[test]
+    fn write_instance_extra_attrs_element_order_matches_read_extra_attrs() {
+        let t = module_instance_with_extra_attrs();
+        let mut buf = WriteBuffer::new();
+        write_type(&mut buf, &t).expect("write_type failed");
+        let bytes = buf.into_bytes();
+        let mut rbuf = ReadBuffer::new(&bytes);
+        assert_eq!(read_tag(&mut rbuf).unwrap(), INSTANCE);
+        assert_eq!(read_tag(&mut rbuf).unwrap(), INSTANCE_GENERIC);
+        assert!(read_str(&mut rbuf).is_ok());
+        read_type_list(&mut rbuf).unwrap();
+        assert_eq!(read_tag(&mut rbuf).unwrap(), LITERAL_NONE);
+        assert_eq!(read_tag(&mut rbuf).unwrap(), EXTRA_ATTRS);
+        assert!(read_type_map(&mut rbuf).is_ok());
+        let immutable = read_str_list(&mut rbuf).unwrap();
+        let mut sorted = immutable.clone();
+        sorted.sort();
+        assert_eq!(immutable, sorted);
+        let _ = read_str_opt(&mut rbuf).unwrap();
+        assert_eq!(read_tag(&mut rbuf).unwrap(), END_TAG);
+        assert_eq!(read_tag(&mut rbuf).unwrap(), END_TAG);
+    }
+
+    fn module_instance_with_extra_attrs() -> Type {
+        let mut attrs: HashMap<String, Type> = HashMap::new();
+        attrs.insert(
+            "func".to_string(),
+            Type::AnyType {
+                type_of_any: 2,
+                source_any: None,
+                missing_import_name: None,
+            },
+        );
+        attrs.insert("unset".to_string(), Type::NoneType);
+        Type::Instance {
+            type_ref: "mypy.util".to_string(),
+            args: Vec::new(),
+            last_known_value: None,
+            extra_attrs: Some(ExtraAttrs {
+                attrs,
+                immutable: HashSet::from(["func".to_string(), "unset".to_string()]),
+                mod_name: Some("mypy.util".to_string()),
+            }),
+        }
     }
 
     #[test]

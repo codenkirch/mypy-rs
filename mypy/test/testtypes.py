@@ -3684,6 +3684,89 @@ class NativeSubtypesDeferralSuite(Suite):
         )
         assert rusted is None
 
+    def test_instance_callable_probe_engages(self) -> None:
+        # Issue #1205 (Port B): an Instance parsed across the MRO snapshot
+        # with no `__call__` definition decides the Instance <: Callable
+        # arm natively (Python's find_member miss returns False).
+        from mypy.subtypes import _serialize_type, is_subtype
+
+        right = self.fx.callable(self.fx.a, self.fx.bool_type)
+        self._set_gate(False)
+        assert not is_subtype(self.fx.a, right)
+        self._set_gate(True)
+        assert not is_subtype(self.fx.a, right)
+        rusted = _type_kernel.rust_is_subtype(
+            _serialize_type(self.fx.a),
+            _serialize_type(right),
+            False,
+            False,
+            False,
+            False,
+            False,
+            True,
+            False,
+            False,
+            self.resolver,
+        )
+        assert rusted is False
+
+    def test_overload_right_ordered_match_engages(self) -> None:
+        # Issue #1205 (Port C): Overloaded <: Overloaded mirrors
+        # visit_overloaded's ordered-match loop. Covers the out-of-order
+        # overlap probe (subtypes.py:1160-1168) for reordered items.
+        from mypy.subtypes import _serialize_type, is_subtype
+        from mypy.types import Overloaded
+
+        f = self.fx.callable(self.fx.a, self.fx.bool_type)
+        g = self.fx.callable(self.fx.b, self.fx.bool_type)
+
+        # Ordered subset: every right item is matched in non-decreasing
+        # left order -> True.
+        left = Overloaded([f, g])
+        right = Overloaded([f])
+        self._set_gate(False)
+        assert is_subtype(left, right)
+        self._set_gate(True)
+        assert is_subtype(left, right)
+        rusted = _type_kernel.rust_is_subtype(
+            _serialize_type(left),
+            _serialize_type(right),
+            False,
+            False,
+            False,
+            False,
+            False,
+            True,
+            False,
+            False,
+            self.resolver,
+        )
+        assert rusted is True
+
+        # Reordered overlap: right item `f` is matched only by the left
+        # item at index 1 (fixture B <: A, so g <: f is False), forcing
+        # `g` out of order; the overlap probe answers False.
+        left = Overloaded([g, f])
+        right = Overloaded([f, g])
+        self._set_gate(False)
+        assert not is_subtype(left, right)
+        self._set_gate(True)
+        assert not is_subtype(left, right)
+        rusted = _type_kernel.rust_is_subtype(
+            _serialize_type(left),
+            _serialize_type(right),
+            False,
+            False,
+            False,
+            False,
+            False,
+            True,
+            False,
+            False,
+            self.resolver,
+        )
+        assert rusted is False
+
     def test_plain_equal_equivalent_engages(self) -> None:
         # A regression guard: plain (alias-free) operand pairs must still be
         # decided natively, not newly deferred by the seam expansion.
@@ -4366,11 +4449,12 @@ class NativeExpandTypeEmptyEnvSuite(Suite):
     `expand_type(typ, {})` performs no substitution. The seam used to bail
     on ANY empty env (expandtype.rs returned None inside rust_expand_type),
     forcing a pure-Python rebuild even for typevar-free types. Now an empty
-    env is wire-portable: `expand_type_with_env` rebuilds the tree and only
-    defers when a leftover TypeVar would break the caller's object-identity
-    expectations (the `result_has_typevar` guard). This suite locks the
-    differential: a typevar-free type must engage natively, a typevar-bearing
-    type must keep deferring (identity), and gate-on == gate-off for both.
+    env is wire-portable: `expand_type_with_env` rebuilds the tree and
+    returns leftover TypeVars instead of deferring; the shim re-links the
+    decoded vars to the live originals (`resync_var_identities`), so the
+    caller keeps object identity. This suite locks the differential: a
+    typevar-free type must engage natively and gate-on == gate-off for
+    both typevar-free and typevar-bearing input.
     """
 
     def setUp(self) -> None:
@@ -4441,10 +4525,10 @@ class NativeExpandTypeEmptyEnvSuite(Suite):
         # G[A] (no typevars): native rebuild must equal Python rebuild.
         self._assert_par(self.fx.ga)
 
-    def test_typevar_still_defers_for_identity(self) -> None:
-        # G[T] with an empty env leaves T unmatched. Python keeps the
-        # original T object; a wire clone would break identity, so the seam
-        # must return None and defer, while gate-on still equals gate-off.
+    def test_typevar_result_relinks_identity(self) -> None:
+        # G[T] with an empty env leaves T unmatched. The seam returns the
+        # expansion with the leftover T; the shim re-links every decoded T
+        # occurrence to the live original (identity parity, gate-on == off).
         from mypy.expandtype import _serialize_env, _serialize_type
 
         result = _type_kernel.rust_expand_type(
@@ -4453,8 +4537,15 @@ class NativeExpandTypeEmptyEnvSuite(Suite):
             _serialize_env({}),
             state.strict_optional,
         )
-        assert result is None, "empty-env typevar-bearing expand_type must defer for identity"
-        self._assert_par(self.fx.gt)
+        assert (
+            result is not None
+        ), "empty-env typevar-bearing expand_type must return the leftover-tvar result"
+        off = self._with_gate(False, lambda: self._expand(self.fx.gt))
+        on = self._with_gate(True, lambda: self._expand(self.fx.gt))
+        assert_equal(str(on), str(off), "expand_type(empty env) parity")
+        assert isinstance(on, Instance), str(on)  # type: ignore[misc]
+        assert isinstance(off, Instance), str(off)  # type: ignore[misc]
+        assert on.args[0] is off.args[0] is self.fx.t, "decoded TypeVar must relink to original"
 
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
@@ -20735,9 +20826,8 @@ class NativeCoversAtRuntimeSuite(Suite):
 
     def test_tuple_operands_parity(self) -> None:
         # Tuple operands erase to their partial_fallback Instance (mirrors
-        # `erasetype.py visit_tuple_type`), so tuple shapes engage the
-        # normal erase + subtype flow instead of blanked-deferring
-        # (issue #1171: 1,600 calls @0% native).
+        # erasetype.py visit_tuple_type), engaging the normal erase + subtype
+        # flow instead of blanked-deferring (issue #1171: 1,600 calls @0% native).
         t1 = TupleType([self.fx.a], self.fx.std_tuple)
         t2 = TupleType([self.fx.b], self.fx.std_tuple)
         self.assert_par(t1, t2)
@@ -29762,11 +29852,9 @@ class NativeAnyConstraintsSuite(Suite):
         )
 
     def test_seam_engages_with_none_option(self) -> None:
-        # A differential-only suite passes silently when the kernel defers
-        # and Python answers both sides. That is exactly how the None-option
-        # marker (-1) bug survived: read_size rejected it and every call
-        # deferred. Call the seam directly to prove the wire decodes
-        # (issue #1171).
+        # A differential-only suite passes silently when the kernel defers and Python answers
+        # both sides. That is how the None-option (-1) bug survived: read_size rejected it and
+        # every call deferred. Call the seam directly to prove the wire decodes (issue #1171).
         from mypy.cache import write_int_bare  # type: ignore[attr-defined]
         from mypy.constraints import _set_native_constraints_resolver, _write_option
 
@@ -29791,13 +29879,13 @@ class NativeAnyConstraintsSuite(Suite):
         assert len(raw) == 1
 
     def test_seam_preserves_extra_tvars_identity(self) -> None:
-        # Polymorphic-call inference attaches extra_tvars to constraints,
-        # and the wire format has no representation for them, so returning
-        # wire-rebuilt Constraints silently drops them (issue #1171).
-        # The shim must match each wire blob back to the original live
-        # Constraint and return it; value-equal-but-distinct options also
-        # disambiguate (the all-same branch returns the first valid
-        # option's constraints, exactly as the pure-Python body does).
+        # Polymorphic-call inference attaches extra_tvars to constraints; the
+        # wire format has no slot for them, so returning wire-rebuilt
+        # Constraints silently drops them (issue #1171).
+
+        # The shim must match each wire blob back to the original live Constraint and
+        # return it; value-equal-but-distinct options disambiguate (the all-same branch
+        # returns the first valid option's constraints, exactly as the pure-Python body does).
         from mypy.constraints import (
             _set_native_constraints_resolver,
             _try_native_any_constraints,
