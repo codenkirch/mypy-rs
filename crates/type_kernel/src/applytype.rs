@@ -990,20 +990,6 @@ mod tests {
         }
     }
 
-    fn make_self_typevar() -> Type {
-        Type::TypeVarType {
-            name: "Self".to_string(),
-            fullname: "mod.Self".to_string(),
-            raw_id: 1,
-            namespace: "ns".to_string(),
-            values: vec![],
-            upper_bound: Box::new(make_instance("builtins.object", vec![])),
-            default: Box::new(make_omitted_any()),
-            variance: 0,
-            meta_level: 0,
-        }
-    }
-
     fn tags(
         tvar: &Type,
         type_arg: &Type,

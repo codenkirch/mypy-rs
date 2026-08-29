@@ -118,7 +118,7 @@ fn true_or_false(t: &Type) -> Type {
 /// exact-duplicates (via a seen map), and subtypes of earlier items.
 /// Mirrors the pure-Python loop including the LiteralType fallback-set
 /// optimization and the last_known_value guard.
-fn remove_redundant_pass(
+pub(crate) fn remove_redundant_pass(
     items: &[Type],
     ctx: &SubtypeContext,
     resolver: &TypeResolver,

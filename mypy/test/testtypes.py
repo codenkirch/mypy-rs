@@ -21517,6 +21517,13 @@ class NativeCallableArgConstraintsSuite(Suite):
         self._assert_par(template, actual, direction=SUPERTYPE_OF)
 
 
+def strict_optional_flag() -> bool:
+    """The `strict_optional` flag threaded into the constraint seam."""
+    from mypy.state import state
+
+    return state.strict_optional
+
+
 class NativeTupleConstraintsSuite(Suite):
     """Parity tests for the Rust `visit_tuple_type` constraint port.
 
@@ -21600,11 +21607,11 @@ class NativeTupleConstraintsSuite(Suite):
             direction,
             False,
             False,
+            strict_optional_flag(),
         )
         assert raw is not None, (
             f"Rust seam must engage for template={template!r} actual={actual!r}"
         )
-
     # --- Template has an Unpack, actual is a varlength tuple ---
 
     def test_unpack_template_varlength_tuple_tvt(self) -> None:
@@ -21756,9 +21763,10 @@ class NativeConstraintsDeferralSuite(Suite):
     `TypeAliasType` operand anywhere in the recursion deferred the whole call
     to Python. Now `infer_constraints_full_inner` expands both operands
     through the alias resolver at the top (mirroring `get_proper_type` at
-    constraints.py:548-549), so a nested alias resolves natively. Union
-    operands (including an alias that expands into one) and unresolvable
-    (missing-snapshot) aliases still defer.
+    constraints.py:548-549), so a nested alias resolves natively. Since
+    #1130 the union-dispatch branches run natively too, so union operands
+    (including an alias that expands into one) engage instead of deferring;
+    only an unresolvable (missing-snapshot) alias still defers.
 
     Differential harness: runs `infer_constraints` with the gate on
     (resolver + wire map installed) and off (pure Python), asserting equal
@@ -21849,6 +21857,7 @@ class NativeConstraintsDeferralSuite(Suite):
             direction,
             False,
             False,
+            strict_optional_flag(),
         )
 
     def _assert_engages(self, template: Type, actual: Type, direction: int = SUBTYPE_OF) -> None:
@@ -21885,10 +21894,10 @@ class NativeConstraintsDeferralSuite(Suite):
         self._assert_par(template, actual)
         self._assert_engages(template, actual)
 
-    def test_alias_expanding_to_union_defers(self) -> None:
-        # List[T] vs List[Alias->(A | B)]: expansion yields a union, which
-        # needs make_simplified_union, so the native seam defers and Python
-        # constrains T against each union item.
+    def test_alias_expanding_to_union_engages(self) -> None:
+        # List[T] vs List[Alias->(A | B)]: expansion yields a union, whose
+        # dispatch branch is now ported (issue #1130), so the native seam
+        # emits the same per-item constraints as Python.
         from mypy.types import UnionType
 
         alias = self._alias(
@@ -21898,27 +21907,27 @@ class NativeConstraintsDeferralSuite(Suite):
         template = self._list(self.fx.t)
         actual = self._list(TypeAliasType(alias, []))
         self._assert_par(template, actual)
-        self._assert_defers(template, actual)
+        self._assert_engages(template, actual)
 
-    # --- union operands still defer ---
+    # --- union operands engage natively (issue #1130) ---
 
-    def test_actual_union_operand_defers(self) -> None:
-        # List[T] vs List[A | B]: the union actual arg cannot re-run
-        # make_simplified_union, so the native seam defers to Python.
+    def test_actual_union_operand_engages(self) -> None:
+        # List[T] vs List[A | B]: the union dispatch branch is ported
+        # (issue #1130), so the seam handles the union actual natively.
         actual_union = UnionType.make_union([self.fx.a, self.fx.b])
         template = self._list(self.fx.t)
         actual = self._list(actual_union)
         self._assert_par(template, actual)
-        self._assert_defers(template, actual)
+        self._assert_engages(template, actual)
 
-    def test_template_union_operand_defers(self) -> None:
-        # H[T, (A | B)] vs H[A, A]: the union template arg defers before the
-        # other position constrains, so the seam falls back to Python.
+    def test_template_union_operand_engages(self) -> None:
+        # H[T, (A | B)] vs H[A, A]: the union template arg is dispatched
+        # natively (issue #1130) before the other position constrains.
         template_union = UnionType.make_union([self.fx.a, self.fx.b])
         template = Instance(self.fx.hi, [self.fx.t, template_union])
         actual = Instance(self.fx.hi, [self.fx.a, self.fx.a])
         self._assert_par(template, actual)
-        self._assert_defers(template, actual)
+        self._assert_engages(template, actual)
 
     # --- unresolvable alias defers to Python ---
 
@@ -37018,20 +37027,26 @@ class NativeConstraintHelpersSuite(Suite):
         # B <: A in the fixture: both targets satisfy the A upper bound.
         t = self._tvar("t", 11, self.fx.a)
         option = [self.Constraint(t, 0, self.fx.a), self.Constraint(t, 0, self.fx.b)]
-        raw = _type_kernel.rust_filter_satisfiable(self._wire_option(option), self.resolver)
+        raw = _type_kernel.rust_filter_satisfiable(
+            self._wire_option(option), strict_optional_flag(), self.resolver
+        )
         assert raw is not None
         assert _read_index_list(bytes(raw)) == [0, 1]
         # All filtered: A is not a subtype of the B upper bound.
         t2 = self._tvar("t2", 12, self.fx.b)
         raw = _type_kernel.rust_filter_satisfiable(
-            self._wire_option([self.Constraint(t2, 0, self.fx.a)]), self.resolver
+            self._wire_option([self.Constraint(t2, 0, self.fx.a)]),
+            strict_optional_flag(),
+            self.resolver,
         )
         assert raw is not None
         assert _read_index_list(bytes(raw)) == []
 
     def test_direct_filter_paramspec_defers(self) -> None:
         raw = _type_kernel.rust_filter_satisfiable(
-            self._wire_option([self.Constraint(self._pspec(), 0, self.fx.o)]), self.resolver
+            self._wire_option([self.Constraint(self._pspec(), 0, self.fx.o)]),
+            strict_optional_flag(),
+            self.resolver,
         )
         assert raw is None
 
@@ -44970,3 +44985,192 @@ class NativeSolveGenericCallSuite(Suite):
         assert self._seam(callee, [ga, gd], [[0], [1]]) is None, (
             "unsolvable invariant conflict must defer"
         )
+class NativeConstraintUnionSuite(Suite):
+    """Parity suite for the constraint-builder union dispatch (issue #1130).
+
+    `rust_infer_constraints_full` previously deferred (`None`) every call
+    with a `UnionType` operand. The four union-dispatch branches of
+    `_infer_constraints` (constraints.py:833-880) now run natively inside
+    `infer_constraints_full_inner`:
+
+    - branch a: SUBTYPE_OF template union -> per-item recursion
+    - branch b: SUPERTYPE_OF actual union -> per-item recursion with
+      `orig_template`, re-wrapping each item through
+      `TypeType.make_normalized` when the top-level `type[...]`/union
+      fixup looked up the template
+    - branch c: SUBTYPE_OF actual union -> `any_constraints` over
+      `infer_constraints_if_possible` per item (eager first match)
+    - branch d: SUPERTYPE_OF template union -> `any_constraints` over
+      `infer_constraints_if_possible` per item, empty result -> []
+    - proper-form expansion now unwraps a top-level alias whose target
+      is a union (instead of deferring), including the
+      suggestion_history-free emit path
+
+    Differential harness mirrors NativeConstraintsDeferralSuite: each
+    case runs the public `infer_constraints` with the gate on and off
+    and asserts equal `str()` constraint lists; a direct
+    `rust_infer_constraints_full` call proves native engagement for the
+    shapes that used to defer (returning constraint blobs instead of
+    `None`).
+    """
+
+    def setUp(self) -> None:
+        from mypy.constraints import _set_native_constraints_resolver
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        self.fx = TypeFixture()
+        self._active = False
+        type_infos = [
+            value
+            for name in dir(self.fx)
+            if name.endswith("i")
+            for value in [getattr(self.fx, name)]
+            if isinstance(value, TypeInfo)
+        ]
+        set_wire_typeinfo_map({info.fullname: info for info in type_infos})
+        self.resolver = _type_kernel.build_native_resolver(type_infos, [])
+        _set_native_constraints_resolver(self.resolver)
+
+    def tearDown(self) -> None:
+        from mypy.constraints import (
+            _set_native_constraints_active,
+            _set_native_constraints_resolver,
+        )
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        _set_native_constraints_active(self._active)
+        _set_native_constraints_resolver(None)
+        set_wire_typeinfo_map(None)
+
+    def _rebuild_with_aliases(self, aliases: list[Any]) -> None:
+        from mypy.constraints import _set_native_constraints_resolver
+
+        type_infos = [
+            value
+            for name in dir(self.fx)
+            if name.endswith("i")
+            for value in [getattr(self.fx, name)]
+            if isinstance(value, TypeInfo)
+        ]
+        self.resolver = _type_kernel.build_native_resolver(type_infos, aliases)
+        _set_native_constraints_resolver(self.resolver)
+
+    def _cons(self, template: Type, actual: Type, direction: int, native: bool) -> list[str]:
+        from mypy.constraints import (
+            _set_native_constraints_active,
+            _set_native_constraints_resolver,
+            infer_constraints,
+        )
+
+        _set_native_constraints_active(native)
+        if native:
+            _set_native_constraints_resolver(self.resolver)
+        else:
+            _set_native_constraints_resolver(None)
+        return [str(c) for c in infer_constraints(template, actual, direction)]
+
+    def _assert_par(self, template: Type, actual: Type, direction: int = SUBTYPE_OF) -> None:
+        native = self._cons(template, actual, direction, native=True)
+        python = self._cons(template, actual, direction, native=False)
+        assert native == python, f"native={native!r} python={python!r}"
+
+    def _rust(self, template: Type, actual: Type, direction: int) -> Any:
+        tb = _WriteBuffer()
+        template.write(tb)
+        ab = _WriteBuffer()
+        actual.write(ab)
+        return _type_kernel.rust_infer_constraints_full(
+            self.resolver,
+            tb.getvalue(),
+            ab.getvalue(),
+            direction,
+            False,
+            False,
+            strict_optional_flag(),
+        )
+
+    def _assert_engages(self, template: Type, actual: Type, direction: int) -> None:
+        assert self._rust(template, actual, direction) is not None, (
+            f"Rust seam must engage for template={template!r} actual={actual!r}"
+        )
+
+    # --- branch a: SUBTYPE_OF with a union template ---
+
+    def test_branch_a_template_union_subtypes(self) -> None:
+        # Union[G[T], List[T]] <: A: per-item recursion yields T :> A
+        # (twice) and nothing for the tvar-less list item.
+        template = UnionType([self.fx.gt, Instance(self.fx.std_listi, [self.fx.t])])
+        self._assert_par(template, self.fx.a, SUBTYPE_OF)
+        self._assert_engages(template, self.fx.a, SUBTYPE_OF)
+
+    def test_branch_a_item_union_recurse(self) -> None:
+        # Both operands are unions: branch a wins (SUBTYPE_OF + union
+        # template first), and each item then dispatches through branch c.
+        template = UnionType([self.fx.gt, self.fx.gs])
+        actual = UnionType([self.fx.ga, self.fx.gd])
+        self._assert_par(template, actual, SUBTYPE_OF)
+        self._assert_engages(template, actual, SUBTYPE_OF)
+
+    # --- branch b: SUPERTYPE_OF with a union actual ---
+
+    def test_branch_b_actual_union_supertypes(self) -> None:
+        # G[T] :> (G[A] | G[D]): recursion emits both T :> A and T :> D.
+        actual = UnionType([self.fx.ga, self.fx.gd])
+        self._assert_par(self.fx.gt, actual, SUPERTYPE_OF)
+        self._assert_engages(self.fx.gt, actual, SUPERTYPE_OF)
+
+    def test_branch_b_type_type_items_rewrapped(self) -> None:
+        # Template type[T] and actual type[G[A]] | type[G[D]]: the
+        # type[...]-union fixup unwraps both sides, then branch b re-wraps
+        # each actual item via TypeType.make_normalized before recursing.
+        template = TypeType.make_normalized(self.fx.t)
+        actual = UnionType(
+            [
+                TypeType.make_normalized(self.fx.ga),
+                TypeType.make_normalized(self.fx.gd),
+            ]
+        )
+        self._assert_par(template, actual, SUPERTYPE_OF)
+        self._assert_engages(template, actual, SUPERTYPE_OF)
+
+    # --- branch c: SUBTYPE_OF with a union actual ---
+
+    def test_branch_c_actual_union_first_item_matches(self) -> None:
+        # G[T] <: (G[A] | G[D]): any_constraints(eager=True) stops at the
+        # first compatible item, so only G[A] constrains T.
+        actual = UnionType([self.fx.ga, self.fx.gd])
+        self._assert_par(self.fx.gt, actual, SUBTYPE_OF)
+        self._assert_engages(self.fx.gt, actual, SUBTYPE_OF)
+
+    def test_branch_c_actual_union_no_item_matches(self) -> None:
+        # List[A] <: (G[A] | G[D]): no item resolves against the tvar-less
+        # template, so the result is empty on both sides.
+        actual = UnionType([self.fx.ga, self.fx.gd])
+        self._assert_par(self.fx.lsta, actual, SUBTYPE_OF)
+
+    # --- branch d: SUPERTYPE_OF with a union template ---
+
+    def test_branch_d_template_union_supertypes(self) -> None:
+        # (G[T] | List[T]) :> G[A]: the List item is not a possible target,
+        # so only the G[T] item constrains T.
+        template = UnionType([self.fx.gt, self.fx.lsta])
+        self._assert_par(template, self.fx.ga, SUPERTYPE_OF)
+        self._assert_engages(template, self.fx.ga, SUPERTYPE_OF)
+
+    def test_branch_d_template_union_empty_result(self) -> None:
+        # (List[A] | List[B]) :> G[A]: no item produces constraints.
+        template = UnionType([self.fx.lsta, self.fx.lstb])
+        self._assert_par(template, self.fx.ga, SUPERTYPE_OF)
+
+    # --- top-level alias expanding into a union ---
+
+    def test_alias_actual_expands_to_union(self) -> None:
+        # T :> alias -> Union[G[A], None]: the alias expands to a union
+        # before the emit, so the constraint target is the expanded union
+        # (previously the whole call deferred on the alias operand).
+        target = UnionType([self.fx.ga, self.fx.nonet])
+        alias = TypeAlias(target, "mod.OptGA", "mod", -1, -1)
+        self._rebuild_with_aliases([alias])
+        actual = TypeAliasType(alias, [])
+        self._assert_par(self.fx.t, actual, SUPERTYPE_OF)
+        self._assert_engages(self.fx.t, actual, SUPERTYPE_OF)

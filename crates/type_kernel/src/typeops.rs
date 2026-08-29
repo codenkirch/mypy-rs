@@ -554,7 +554,7 @@ pub(crate) fn rust_make_simplified_union(
     // items_bytes is a LIST_GEN-tagged list of serialized types.
     let mut buf = ReadBuffer::new(items_bytes);
     let items = wire::read_type_list(&mut buf).ok()?;
-    let _ = (line, column, keep_erased, handle_recursive);
+    let _ = (line, column, handle_recursive);
     // Step 1 mirror (typeops.py:1057): expand each alias item to its
     // chain-resolved raw target (flatten_nested_unions parity; arg
     // substitution skipped); missing snapshot or cycle defers.
@@ -567,8 +567,13 @@ pub(crate) fn rust_make_simplified_union(
     // preserved; strict_optional must flow from the caller so that
     // --no-strict-optional drops NoneType items (None <: T is true then).
     let ctx = SubtypeContext::new(false, false, false, true, true, strict_optional);
-    let result =
-        setops::make_simplified_union(&expanded, &ctx, resolver.resolver(), contract_literals)?;
+    let result = setops::make_simplified_union(
+        &expanded,
+        &ctx,
+        resolver.resolver(),
+        contract_literals,
+        keep_erased,
+    )?;
     encode_type(&result)
 }
 
@@ -1047,7 +1052,7 @@ pub(crate) fn tuple_fallback(typ: &Type, resolver: &TypeResolver) -> Option<Type
 
     // behavior matches the Python handle_recursive=False call.
     let ctx = SubtypeContext::new(false, false, false, true, true, true);
-    let union_type = crate::setops::make_simplified_union(&collected, &ctx, resolver, true)?;
+    let union_type = crate::setops::make_simplified_union(&collected, &ctx, resolver, true, false)?;
     let union_type = get_proper_type_or_none(&union_type)?;
     Some(Type::Instance {
         type_ref: type_ref.clone(),
@@ -4003,9 +4008,8 @@ mod tests {
     #[test]
     fn separate_union_literals_alias_defers() {
         // A TypeAliasType in a union item defers the whole call: Python
-        // classifies via get_proper_type (expands aliases), which Rust cannot
-        // bucket without the resolver. The wire now carries the alias as-is
-        // (args + type_ref), but the union classification must still defer.
+        // classifies via get_proper_type (expands aliases), which Rust
+        // cannot bucket without the resolver, though the wire carries it.
         let alias = Type::TypeAliasType {
             args: vec![],
             type_ref: "mod.Alias".to_string(),

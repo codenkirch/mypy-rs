@@ -23,6 +23,7 @@ except ImportError:
     _WriteBuffer = None  # type: ignore[assignment,misc]
     _HAS_TYPE_KERNEL = False
 
+
 # Module-level flag, set by the build manager from
 # `Options.native_type_kernel` at the start of each build. When active
 # but no Rust result, the shim falls through to Python.
@@ -69,7 +70,10 @@ def _fix_wire_type(data: _ReadBuffer) -> Type | None:
     instance_cache.bool_type = None
     instance_cache.object_type = None
     instance_cache.function_type = None
-    return fixup_wire_type(decoded)
+    # resolve_aliases=True: the alias map is installed for the whole build
+    # (mypy/build.py), and a decoded constraint origin/target that still
+    # carries a lazy TypeAliasType must not abort the whole call's decode.
+    return fixup_wire_type(decoded, resolve_aliases=True)
 
 
 def _try_native_infer_constraints(
@@ -137,6 +141,7 @@ def _try_native_constraint_builder(
         direction,
         skip_neg_op,
         erase_types,
+        mypy.state.state.strict_optional,
     )
     if raw is None:
         raise NotImplementedError("constraint-builder path not supported")
@@ -269,7 +274,9 @@ def _try_native_filter_satisfiable(option: list[Constraint]) -> list[Constraint]
         return None
     buf = _WriteBuffer()
     _write_option(buf, option)
-    raw = _type_kernel.rust_filter_satisfiable(buf.getvalue(), _native_constraints_resolver)
+    raw = _type_kernel.rust_filter_satisfiable(
+        buf.getvalue(), mypy.state.state.strict_optional, _native_constraints_resolver
+    )
     if raw is None:
         raise NotImplementedError("kernel deferred filter_satisfiable")
     kept = [option[i] for i in _read_index_list(bytes(raw))]
@@ -320,7 +327,7 @@ def _try_native_any_constraints(
         else:
             _write_option(buf, option)
     raw = _type_kernel.rust_any_constraints(
-        buf.getvalue(), eager, _native_constraints_resolver
+        buf.getvalue(), eager, mypy.state.state.strict_optional, _native_constraints_resolver
     )
     if raw is None:
         raise NotImplementedError("kernel deferred any_constraints")
@@ -380,9 +387,7 @@ def _try_native_repack_callable_args(
         # The star normalization emits `Instance(builtins.tuple, [*args: X])`;
         # re-wrap with the live `tuple_type` TypeInfo (the wire carries only
         # fullnames), matching `UnpackType(Instance(tuple_type, [star_type]))`.
-        if isinstance(item, UnpackType) and isinstance(
-            get_proper_type(item.type), Instance
-        ):
+        if isinstance(item, UnpackType) and isinstance(get_proper_type(item.type), Instance):
             tp = get_proper_type(item.type)
             if isinstance(tp, Instance) and tp.type.fullname == "builtins.tuple":
                 item = UnpackType(Instance(tuple_type, tp.args))
@@ -2232,7 +2237,11 @@ def _try_native_infer_directed_arg_constraints(
     right_buf = _WriteBuffer()
     right.write(right_buf)
     raw = _type_kernel.rust_infer_directed_arg_constraints(
-        _native_constraints_resolver, left_buf.getvalue(), right_buf.getvalue(), direction
+        _native_constraints_resolver,
+        left_buf.getvalue(),
+        right_buf.getvalue(),
+        direction,
+        mypy.state.state.strict_optional,
     )
     if raw is None:
         raise NotImplementedError("kernel deferred infer_directed_arg_constraints")
@@ -2271,7 +2280,11 @@ def _try_native_infer_callable_args(
     actual_buf = _WriteBuffer()
     actual.write(actual_buf)
     raw = _type_kernel.rust_infer_callable_arguments_constraints(
-        _native_constraints_resolver, template_buf.getvalue(), actual_buf.getvalue(), direction
+        _native_constraints_resolver,
+        template_buf.getvalue(),
+        actual_buf.getvalue(),
+        direction,
+        mypy.state.state.strict_optional,
     )
     if raw is None:
         raise NotImplementedError("kernel deferred infer_callable_arguments_constraints")

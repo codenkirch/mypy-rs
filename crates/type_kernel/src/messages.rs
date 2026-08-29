@@ -2372,7 +2372,6 @@ pub fn rust_classify_has_no_attr(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::suggestions::rust_best_matches;
 
     #[test]
     fn test_classify_has_no_attr_not_assignable() {

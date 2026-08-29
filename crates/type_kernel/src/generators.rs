@@ -233,7 +233,7 @@ fn get_generator_yield_type_inner(
                 )?);
             }
             let union_ctx = SubtypeContext::new(false, false, false, true, true, strict_optional);
-            make_simplified_union(&outs, &union_ctx, res, true)
+            make_simplified_union(&outs, &union_ctx, res, true, false)
         }
         _ => {
             if !is_any_generator_return_type(return_type, is_coroutine, strict_optional, res)? {
@@ -281,7 +281,7 @@ fn get_generator_receive_type_inner(
                 )?);
             }
             let union_ctx = SubtypeContext::new(false, false, false, true, true, strict_optional);
-            make_simplified_union(&outs, &union_ctx, res, true)
+            make_simplified_union(&outs, &union_ctx, res, true, false)
         }
         _ => {
             if !is_any_generator_return_type(return_type, is_coroutine, strict_optional, res)? {
@@ -361,7 +361,7 @@ pub(crate) fn get_generator_return_type_inner(
                 )?);
             }
             let union_ctx = SubtypeContext::new(false, false, false, true, true, strict_optional);
-            make_simplified_union(&outs, &union_ctx, res, true)
+            make_simplified_union(&outs, &union_ctx, res, true, false)
         }
         _ => {
             if !is_generator_return_type(return_type, is_coroutine, strict_optional, res)? {

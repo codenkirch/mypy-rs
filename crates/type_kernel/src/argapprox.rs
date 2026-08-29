@@ -148,6 +148,7 @@ fn erase_typevar(t: &Type, strict_optional: bool, res: &TypeResolver) -> Option<
                     &SubtypeContext::new(false, false, false, true, true, strict_optional),
                     res,
                     true,
+                    false,
                 )
             } else {
                 let ub = get_proper_or_defer(upper_bound.as_ref())?;
@@ -222,6 +223,7 @@ fn tuple_fallback(t: &Type, strict_optional: bool, res: &TypeResolver) -> Option
         &SubtypeContext::new(false, false, false, true, true, strict_optional),
         res,
         true,
+        false,
     )?;
     Some(Type::Instance {
         type_ref: type_ref.clone(),
@@ -293,6 +295,7 @@ pub(crate) fn erase_type(t: &Type, strict_optional: bool, res: &TypeResolver) ->
                 &SubtypeContext::new(false, false, false, true, true, strict_optional),
                 res,
                 true,
+                false,
             )
         }
         // visit_type_type (erasetype.py:239-242): TypeType.make_normalized.
@@ -338,7 +341,7 @@ fn erase_instance(t: &Type, res: &TypeResolver) -> Option<Type> {
 /// `TypeType.make_normalized` (types.py:3676-3691): with `is_type_form`
 /// keep the wrapper; otherwise split a UnionType item into a union of
 /// `TypeType`s.
-fn make_normalized_type_type(item: Type, is_type_form: bool) -> Option<Type> {
+pub(crate) fn make_normalized_type_type(item: Type, is_type_form: bool) -> Option<Type> {
     if is_type_form {
         return Some(Type::TypeType {
             item: Box::new(item),

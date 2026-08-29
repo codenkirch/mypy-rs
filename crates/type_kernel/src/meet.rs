@@ -1257,6 +1257,7 @@ pub(crate) fn narrow_rec(
             &SubtypeContext::new(false, false, false, false, false, strict_optional),
             res,
             true,
+            false,
         );
     }
 
@@ -1275,6 +1276,7 @@ pub(crate) fn narrow_rec(
             &SubtypeContext::new(false, false, false, false, false, strict_optional),
             res,
             true,
+            false,
         );
     }
 
@@ -1347,6 +1349,7 @@ pub(crate) fn narrow_rec(
             &SubtypeContext::new(false, false, false, false, false, strict_optional),
             res,
             true,
+            false,
         );
     }
 
