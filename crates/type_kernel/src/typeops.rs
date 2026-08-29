@@ -688,46 +688,64 @@ fn is_literal_type_like(t: &Type) -> Option<bool> {
 }
 
 /// `#[pyfunction]` entry for `try_getting_str_literals_from_type`
-/// (typeops.py:1186-1194). Returns the Python `list[str]` of literal values,
-/// or `None` to defer to Python when any candidate is not a matching
-/// LiteralType.
+/// (typeops.py:1186-1194). Returns `(decided, values)`: `Some((true, list))`
+/// when the wire form proves the literal list, `Some((true, None))` when
+/// Python would provably answer None (the #1101 decided-None protocol, so the
+/// shim must not re-run the Python body), and `None` to defer (TypeAliasType
+/// anywhere in the candidates — the wire has no alias target to expand).
 #[pyfunction]
 pub(crate) fn rust_try_getting_str_literals_from_type(
     py: Python<'_>,
     t_bytes: &[u8],
-) -> Option<PyObject> {
+) -> Option<(bool, PyObject)> {
     let t = decode_type(t_bytes)?;
-    let vals = try_getting_literals(&t, "builtins.str", LiteralKind::Str)?;
-    Some(pyo3::types::PyList::new(py, vals.into_iter().map(|v| v.into_pyobject(py))).into())
+    literals_outcome(
+        py,
+        try_getting_literals(&t, "builtins.str", LiteralKind::Str).ok()?,
+    )
 }
 
 /// `#[pyfunction]` entry for `try_getting_int_literals_from_type`
-/// (typeops.py:1197-1205). Returns the Python `list[int]` of literal values,
-/// or `None` to defer to Python when any candidate is not a matching
-/// LiteralType.
+/// (typeops.py:1197-1205). Same `(decided, values)` protocol as the str seam.
 #[pyfunction]
 pub(crate) fn rust_try_getting_int_literals_from_type(
     py: Python<'_>,
     t_bytes: &[u8],
-) -> Option<PyObject> {
+) -> Option<(bool, PyObject)> {
     let t = decode_type(t_bytes)?;
-    let vals = try_getting_literals(&t, "builtins.int", LiteralKind::Int)?;
-    Some(pyo3::types::PyList::new(py, vals.into_iter().map(|v| v.into_pyobject(py))).into())
+    literals_outcome(
+        py,
+        try_getting_literals(&t, "builtins.int", LiteralKind::Int).ok()?,
+    )
 }
 
 /// `#[pyfunction]` entry for `try_getting_literals_from_type` with bool
 /// target (typeops.py:1236-1256, called from dataclasses.py:897 with
 /// `target_literal_type=bool`). Returns the Python `list[bool]` of literal
 /// values (real Python bools, not 0/1: dataclasses uses the value directly
-/// as the field's default), or `None` to defer to Python.
+/// as the field's default) under the same `(decided, values)` protocol as
+/// the str seam.
 #[pyfunction]
 pub(crate) fn rust_try_getting_bool_literals_from_type(
     py: Python<'_>,
     t_bytes: &[u8],
-) -> Option<PyObject> {
+) -> Option<(bool, PyObject)> {
     let t = decode_type(t_bytes)?;
-    let vals = try_getting_literals(&t, "builtins.bool", LiteralKind::Bool)?;
-    Some(pyo3::types::PyList::new(py, vals.into_iter().map(|v| v.into_pyobject(py))).into())
+    literals_outcome(
+        py,
+        try_getting_literals(&t, "builtins.bool", LiteralKind::Bool).ok()?,
+    )
+}
+
+/// Package a `LitOutcome` into the Python-side `(decided, values)` tuple.
+fn literals_outcome(py: Python<'_>, out: LitOutcome) -> Option<(bool, PyObject)> {
+    Some(match out {
+        LitOutcome::DecidedNone => (true, py.None()),
+        LitOutcome::Values(vals) => (
+            true,
+            pyo3::types::PyList::new(py, vals.into_iter().map(|v| v.into_pyobject(py))).into(),
+        ),
+    })
 }
 
 /// `#[pyfunction]` entry for `try_getting_instance_fallback`
@@ -1072,58 +1090,87 @@ fn get_proper_type_or_none(t: &Type) -> Option<Type> {
     Some(t.clone())
 }
 
-/// The shared walk behind `try_getting_str/int_literals_from_type`
-/// (typeops.py:1211-1264). Returns the scalar literal values when every
-/// candidate is a `LiteralType` whose fallback fullname equals
-/// `target_fullname` and whose value is of the `expect` kind; `None`
-/// (defer) otherwise.
+/// The shared walk behind `try_getting_str/int/bool_literals_from_type`
+/// (typeops.py:1211-1264), under the #1101 decided-None protocol.
 ///
-/// Mirrors the Python walk exactly: one candidate (the type itself or its
-/// `last_known_value`) or the union items, each checked against the target.
+/// `Values` answers with the scalar literal values when every candidate is a
+/// `LiteralType` whose fallback fullname equals `target_fullname` and whose
+/// value is of the `expect` kind. `DecidedNone` reports that Python provably
+/// answers None: the candidate set is fixed (one candidate or the union
+/// items) and at least one is a proper type that is not a matching
+/// LiteralType — plain Instance without last_known_value, TupleType,
+/// CallableType, an int literal under the str target, and so on — so the
+/// shim may return None without re-running the Python body. Defers (the
+/// `Err(())` the caller maps to shim-level None) are reserved for
+/// `TypeAliasType` candidates, which Python expands via `get_proper_type`
+/// but the wire cannot carry: the shim then re-runs the Python body.
 fn try_getting_literals(
     t: &Type,
     target_fullname: &str,
     expect: LiteralKind,
-) -> Option<Vec<Scalar>> {
-    let candidates = match t {
+) -> Result<LitOutcome, ()> {
+    // Python (typeops.py:1770-1776): typ = get_proper_type(typ), then
+    // candidates = [typ.last_known_value] | list(typ.items) | [typ]. A
+    // TypeAliasType top level needs the alias target; defer.
+    let candidates: Vec<Type> = match t {
+        Type::TypeAliasType { .. } => return Err(()),
         Type::Instance {
-            last_known_value, ..
-        } => last_known_value
-            .as_ref()
-            .map(|v| vec![v.as_ref().clone()])
-            .unwrap_or_else(|| vec![t.clone()]),
-        Type::UnionType { items, .. } => items.clone(),
+            last_known_value: Some(v),
+            ..
+        } => {
+            if let Type::TypeAliasType { .. } = v.as_ref() {
+                return Err(());
+            }
+            vec![v.as_ref().clone()]
+        }
+        Type::Instance { .. } => vec![t.clone()],
+        Type::UnionType { items, .. } => {
+            if items
+                .iter()
+                .any(|i| matches!(i, Type::TypeAliasType { .. }))
+            {
+                return Err(());
+            }
+            items.clone()
+        }
         _ => vec![t.clone()],
     };
     let mut out: Vec<Scalar> = Vec::new();
-    for c in candidates {
-        // Python: get_proper_types(...) per candidate; a TypeAliasType is not
-        // a proper type, resolving here would need a target we don't have.
-        match c {
-            Type::LiteralType { fallback, value } => {
-                let Type::Instance { type_ref, .. } = fallback.as_ref() else {
-                    return None;
-                };
-                if type_ref != target_fullname {
-                    return None;
-                }
-                let s = match value {
-                    LiteralValue::Str(s) if expect == LiteralKind::Str => Scalar::Str(s.clone()),
-                    LiteralValue::Int(i) if expect == LiteralKind::Int => Scalar::Int(i),
-                    LiteralValue::Bool(b) if expect == LiteralKind::Int => {
-                        // Python: isinstance(True, int) is True, so Literal[True]
-                        // counts as an int literal.
-                        Scalar::Int(if b { 1 } else { 0 })
-                    }
-                    LiteralValue::Bool(b) if expect == LiteralKind::Bool => Scalar::Bool(b),
-                    _ => return None,
-                };
-                out.push(s);
-            }
-            _ => return None,
+    for lit in candidates {
+        // Python: get_proper_types(...) per candidate. Everything that
+        // reaches here is already proper (alias candidates were excluded
+        // above), so the per-candidate re-proper-type is a no-op.
+        let Type::LiteralType { fallback, value } = lit else {
+            return Ok(LitOutcome::DecidedNone);
+        };
+        // Python: lit.fallback.type.fullname == target_fullname. The wire
+        // fallback Instance carries that fullname in type_ref.
+        let Type::Instance { type_ref, .. } = fallback.as_ref() else {
+            return Ok(LitOutcome::DecidedNone);
+        };
+        if type_ref != target_fullname {
+            return Ok(LitOutcome::DecidedNone);
         }
+        let s = match value {
+            LiteralValue::Str(s) if expect == LiteralKind::Str => Scalar::Str(s),
+            LiteralValue::Int(i) if expect == LiteralKind::Int => Scalar::Int(i),
+            LiteralValue::Bool(b) if expect == LiteralKind::Int => {
+                // Python: isinstance(True, int) is True, so Literal[True]
+                // counts as an int literal.
+                Scalar::Int(if b { 1 } else { 0 })
+            }
+            LiteralValue::Bool(b) if expect == LiteralKind::Bool => Scalar::Bool(b),
+            _ => return Ok(LitOutcome::DecidedNone),
+        };
+        out.push(s);
     }
-    Some(out)
+    Ok(LitOutcome::Values(out))
+}
+
+#[derive(Debug, PartialEq)]
+enum LitOutcome {
+    Values(Vec<Scalar>),
+    DecidedNone,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -3383,7 +3430,7 @@ mod tests {
     fn literals_str_literal_returns_value() {
         assert_eq!(
             try_getting_literals(&lit_str("x"), "builtins.str", LiteralKind::Str),
-            Some(vec![Scalar::Str("x".to_string())])
+            Ok(LitOutcome::Values(vec![Scalar::Str("x".to_string())]))
         );
     }
 
@@ -3391,7 +3438,7 @@ mod tests {
     fn literals_int_literal_returns_value() {
         assert_eq!(
             try_getting_literals(&lit_int(42), "builtins.int", LiteralKind::Int),
-            Some(vec![Scalar::Int(42)])
+            Ok(LitOutcome::Values(vec![Scalar::Int(42)]))
         );
     }
 
@@ -3400,23 +3447,26 @@ mod tests {
         // Python: isinstance(True, int) is True, so Literal[True] is an int.
         assert_eq!(
             try_getting_literals(&lit_bool(true), "builtins.int", LiteralKind::Int),
-            Some(vec![Scalar::Int(1)])
+            Ok(LitOutcome::Values(vec![Scalar::Int(1)]))
         );
         assert_eq!(
             try_getting_literals(&lit_bool(false), "builtins.int", LiteralKind::Int),
-            Some(vec![Scalar::Int(0)])
+            Ok(LitOutcome::Values(vec![Scalar::Int(0)]))
         );
     }
 
     #[test]
-    fn literals_plain_instance_defers() {
+    fn literals_plain_instance_decides_none() {
+        // Python: candidates = [typ]; a plain Instance is not a LiteralType,
+        // so try_getting_literals_from_type answers None without needing
+        // anything the wire cannot carry — decided, not deferred.
         assert_eq!(
             try_getting_literals(
                 &plain_instance("builtins.str"),
                 "builtins.str",
                 LiteralKind::Str
             ),
-            None
+            Ok(LitOutcome::DecidedNone)
         );
     }
 
@@ -3425,7 +3475,18 @@ mod tests {
         let t = instance_with_last_known(lit_str("x"));
         assert_eq!(
             try_getting_literals(&t, "builtins.str", LiteralKind::Str),
-            Some(vec![Scalar::Str("x".to_string())])
+            Ok(LitOutcome::Values(vec![Scalar::Str("x".to_string())]))
+        );
+    }
+
+    #[test]
+    fn literals_instance_lkv_wrong_target_decides_none() {
+        // Literal[42] under the str target: Python fails the isinstance
+        // check and answers None — a decision, not a defer.
+        let t = instance_with_last_known(lit_int(7));
+        assert_eq!(
+            try_getting_literals(&t, "builtins.str", LiteralKind::Str),
+            Ok(LitOutcome::DecidedNone)
         );
     }
 
@@ -3434,43 +3495,70 @@ mod tests {
         let t = union_of(vec![lit_str("a"), lit_str("b")]);
         assert_eq!(
             try_getting_literals(&t, "builtins.str", LiteralKind::Str),
-            Some(vec![
+            Ok(LitOutcome::Values(vec![
                 Scalar::Str("a".to_string()),
                 Scalar::Str("b".to_string())
-            ])
+            ]))
         );
     }
 
     #[test]
-    fn literals_union_mixed_kind_defers() {
+    fn literals_union_mixed_kind_decides_none() {
         // Python returns None as soon as any candidate is not a matching
         // literal.
         let t = union_of(vec![lit_str("a"), lit_int(1)]);
         assert_eq!(
             try_getting_literals(&t, "builtins.str", LiteralKind::Str),
-            None
+            Ok(LitOutcome::DecidedNone)
         );
     }
 
     #[test]
-    fn literals_union_wrong_fallback_defers() {
+    fn literals_union_with_nonliteral_item_decides_none() {
+        let t = union_of(vec![lit_str("a"), plain_instance("builtins.str")]);
+        assert_eq!(
+            try_getting_literals(&t, "builtins.str", LiteralKind::Str),
+            Ok(LitOutcome::DecidedNone)
+        );
+    }
+
+    #[test]
+    fn literals_union_wrong_fallback_decides_none() {
         let t = union_of(vec![lit_str("a"), lit_str("b")]);
         assert_eq!(
             try_getting_literals(&t, "builtins.int", LiteralKind::Int),
-            None
+            Ok(LitOutcome::DecidedNone)
         );
     }
 
     #[test]
-    fn literals_type_alias_defers() {
+    fn literals_type_alias_top_level_defers() {
         let t = Type::TypeAliasType {
             args: vec![],
             type_ref: "mod.Alias".to_string(),
         };
         assert_eq!(
             try_getting_literals(&t, "builtins.str", LiteralKind::Str),
-            None
+            Err(())
         );
+    }
+
+    #[test]
+    fn literals_union_with_alias_item_defers() {
+        // Python get_proper_types() would expand the alias item; the wire
+        // has no alias target, so the whole call defers.
+        let t = union_of(vec![lit_str("a"), alias_type("mod.Alias")]);
+        assert_eq!(
+            try_getting_literals(&t, "builtins.str", LiteralKind::Str),
+            Err(())
+        );
+    }
+
+    fn alias_type(fullname: &str) -> Type {
+        Type::TypeAliasType {
+            args: vec![],
+            type_ref: fullname.to_string(),
+        }
     }
 
     fn lit_bool_typed(value: bool) -> Type {
@@ -3489,11 +3577,11 @@ mod tests {
     fn literals_bool_kind_returns_bool() {
         assert_eq!(
             try_getting_literals(&lit_bool_typed(true), "builtins.bool", LiteralKind::Bool),
-            Some(vec![Scalar::Bool(true)])
+            Ok(LitOutcome::Values(vec![Scalar::Bool(true)]))
         );
         assert_eq!(
             try_getting_literals(&lit_bool_typed(false), "builtins.bool", LiteralKind::Bool),
-            Some(vec![Scalar::Bool(false)])
+            Ok(LitOutcome::Values(vec![Scalar::Bool(false)]))
         );
     }
 
@@ -3502,27 +3590,30 @@ mod tests {
         let t = union_of(vec![lit_bool_typed(true), lit_bool_typed(false)]);
         assert_eq!(
             try_getting_literals(&t, "builtins.bool", LiteralKind::Bool),
-            Some(vec![Scalar::Bool(true), Scalar::Bool(false)])
+            Ok(LitOutcome::Values(vec![
+                Scalar::Bool(true),
+                Scalar::Bool(false)
+            ]))
         );
     }
 
     #[test]
-    fn literals_bool_kind_wrong_fallback_defers() {
+    fn literals_bool_kind_wrong_fallback_decides_none() {
         // Python requires lit.fallback.type.fullname == "builtins.bool"; an
         // int-backed Literal[True] does not match the bool target.
         assert_eq!(
             try_getting_literals(&lit_bool(true), "builtins.bool", LiteralKind::Bool),
-            None
+            Ok(LitOutcome::DecidedNone)
         );
     }
 
     #[test]
-    fn literals_bool_kind_int_literal_defers() {
+    fn literals_bool_kind_int_literal_decides_none() {
         // Literal[1] has an int fallback: not a bool literal for the bool
         // target.
         assert_eq!(
             try_getting_literals(&lit_int(1), "builtins.bool", LiteralKind::Bool),
-            None
+            Ok(LitOutcome::DecidedNone)
         );
     }
 

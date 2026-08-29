@@ -1712,11 +1712,11 @@ def try_getting_str_literals_from_type(typ: Type) -> list[str] | None:
     """
     if _HAS_TYPE_KERNEL and _native_typeops_active:
         try:
-            result = _type_kernel.rust_try_getting_str_literals_from_type(
-                _serialize_type(typ)
-            )
-            if result is not None:
-                return result
+            wire = _type_kernel.rust_try_getting_str_literals_from_type(_serialize_type(typ))
+            if wire is not None:
+                decided, result = wire
+                if decided:
+                    return result
         except (AssertionError, NotImplementedError):
             pass
     return try_getting_literals_from_type(typ, str, "builtins.str")
@@ -1732,11 +1732,11 @@ def try_getting_int_literals_from_type(typ: Type) -> list[int] | None:
     """
     if _HAS_TYPE_KERNEL and _native_typeops_active:
         try:
-            result = _type_kernel.rust_try_getting_int_literals_from_type(
-                _serialize_type(typ)
-            )
-            if result is not None:
-                return result
+            wire = _type_kernel.rust_try_getting_int_literals_from_type(_serialize_type(typ))
+            if wire is not None:
+                decided, result = wire
+                if decided:
+                    return result
         except (AssertionError, NotImplementedError):
             pass
     return try_getting_literals_from_type(typ, int, "builtins.int")
@@ -1760,11 +1760,11 @@ def try_getting_literals_from_type(
         and target_fullname == "builtins.bool"
     ):
         try:
-            result = _type_kernel.rust_try_getting_bool_literals_from_type(
-                _serialize_type(typ)
-            )
-            if result is not None:
-                return result  # type: ignore[return-value]
+            wire = _type_kernel.rust_try_getting_bool_literals_from_type(_serialize_type(typ))
+            if wire is not None:
+                decided, result = wire
+                if decided:
+                    return result  # type: ignore[return-value]
         except (AssertionError, NotImplementedError):
             pass
     typ = get_proper_type(typ)

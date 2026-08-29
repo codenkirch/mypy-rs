@@ -1640,6 +1640,24 @@ including:
   hold strong refs to (info, mro) so a key id cannot be recycled.
   Covered by `NativeTypeinfoMetaclassMemoSuite` in
   `mypy/test/testtypes.py`.
+- `try_getting_*_literals_from_type` decided-None protocol (issue #1168) —
+  the three pyfunctions behind the typeops literal probes now return
+  `(decided, values)` (#1101 protocol): `Some((true, list))` for a
+  proven literal list, `Some((true, None))` when Python provably answers
+  None (the dominant cold-self-check defer classes: plain Instance
+  without `last_known_value` ~43% and non-str `last_known_value` ~34%,
+  plus wrong-fallback literals / Instance-with-lkv union items /
+  TupleType / AnyType), and shim-level `None` (defer) only for
+  `TypeAliasType` candidates (top level or union item), where Python's
+  `get_proper_type` needs the live alias target. Note Python checks
+  fallback fullname before the value kind, so `Literal[True]` on a bool
+  fallback is decided-None under the int target; the fallback-first
+  order is mirrored in Rust. Cold self-check audit
+  (before/after): str seam 3,310 calls @ 457 native (13.8%) / 2,853
+  defers → 1,678 calls @ 1,676 native (99.9%) / 2 defers (both
+  `TypeAliasType`); the ~2.9k Python fallback body re-runs are gone from
+  the self-check corpus. Covered by gated unit tests in `typeops.rs`
+  and `NativeTryGettingStrLiteralsSuite` in `mypy/test/testtypes.py`.
 
 Stages 1/2 return `None` for any type class Rust does not handle, and
 the Python caller falls back to the pure-Python visitor. This is the
