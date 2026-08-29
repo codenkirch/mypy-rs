@@ -178,6 +178,31 @@ def _try_native_constraint_builder(
     return constraints
 
 
+def _rebuild_wire_origin(origin: Type, *inputs: Type) -> Type:
+    """Restore the live id on a wire-decoded ParamSpec/TypeVarTuple origin.
+
+    The wire proto drops meta_level for ParamSpecType and TypeVarTupleType
+    origins (c.f. _try_native_constraint_builder), so a decoded origin can
+    never match a fresh call-site variable (meta_level > 0) and the
+    constraint would be dropped or mis-solved downstream. Search the live
+    inputs for a variable with the same type, raw_id and namespace and copy
+    its full id across; defer (raise) when it cannot be found.
+    """
+    if not isinstance(origin, (ParamSpecType, TypeVarTupleType)):
+        return origin
+    candidates = [v for t in inputs for v in mypy.typeops.get_all_type_vars(t)]
+    live = [
+        v
+        for v in candidates
+        if type(v) is type(origin)
+        and v.id.raw_id == origin.id.raw_id
+        and v.id.namespace == origin.id.namespace
+    ]
+    if len(live) != 1:
+        raise NotImplementedError("origin id not resolvable in inputs")
+    return origin.copy_modified(id=live[0].id)
+
+
 def _write_constraint(buf: _WriteBuffer, constraint: Constraint) -> None:
     """Serialize a single constraint: origin Type | op int | target Type.
 
@@ -2275,6 +2300,7 @@ def _try_native_infer_directed_arg_constraints(
         origin = _fix_wire_type(data)
         if origin is None:
             raise NotImplementedError("origin unresolvable on wire")
+        origin = _rebuild_wire_origin(origin, left, right)
         from mypy.cache import read_int
 
         op = read_int(data)
@@ -2318,6 +2344,7 @@ def _try_native_infer_callable_args(
         origin = _fix_wire_type(data)
         if origin is None:
             raise NotImplementedError("origin unresolvable on wire")
+        origin = _rebuild_wire_origin(origin, template, actual)
         from mypy.cache import read_int
 
         op = read_int(data)

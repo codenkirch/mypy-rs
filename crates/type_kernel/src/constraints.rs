@@ -1814,6 +1814,19 @@ fn visit_callable_native(
     aliases: &crate::aliases::TypeAliasResolver,
     strict_optional: bool,
 ) -> Option<Vec<Constraint>> {
+    // The CallableType actual takes the full template-vs-callable port
+    // (constraints.py:1656-1780), which must see the raw template: the
+    // param-spec/unpack-formal gates below only guard the Any branch.
+    if matches!(actual, Type::CallableType { .. }) {
+        return callable_vs_callable_native(
+            template,
+            actual,
+            direction,
+            resolver,
+            aliases,
+            strict_optional,
+        );
+    }
     let callee = match template {
         Type::CallableType {
             arg_types,
@@ -1904,6 +1917,340 @@ fn visit_callable_native(
         aliases,
         strict_optional,
     )?);
+    Some(res)
+}
+
+/// `CallableType.param_spec()` (types.py:2696-2712), returning the real
+/// ParamSpecType: flavor forced to BARE and prefix rebuilt as
+/// `Parameters(arg_types[:-2], arg_kinds[:-2], arg_names[:-2])`.
+fn param_spec_of(
+    arg_types: &[Type],
+    arg_kinds: &[i64],
+    arg_names: &[Option<String>],
+) -> Option<Type> {
+    if arg_types.len() < 2 {
+        return None;
+    }
+    let n = arg_kinds.len();
+    // ARG_STAR = 2, ARG_STAR2 = 4 (nodes.py:2486,2490).
+    if arg_kinds[n - 2] != 2 || arg_kinds[n - 1] != 4 {
+        return None;
+    }
+    match &arg_types[arg_types.len() - 2] {
+        Type::ParamSpecType {
+            prefix: _,
+            name,
+            fullname,
+            raw_id,
+            namespace,
+            flavor: _,
+            upper_bound,
+            default,
+        } => {
+            let m = arg_types.len();
+            let names_len = arg_names.len();
+            Some(Type::ParamSpecType {
+                prefix: Box::new(crate::wire::Parameters {
+                    arg_types: arg_types[..m - 2].to_vec(),
+                    arg_kinds: arg_kinds[..n - 2].to_vec(),
+                    arg_names: arg_names[..names_len.saturating_sub(2)].to_vec(),
+                    variables: Vec::new(),
+                    imprecise_arg_kinds: false,
+                    is_ellipsis_args: false,
+                }),
+                name: name.clone(),
+                fullname: fullname.clone(),
+                raw_id: *raw_id,
+                namespace: namespace.clone(),
+                flavor: 0, // ParamSpecFlavor.BARE
+                upper_bound: upper_bound.clone(),
+                default: default.clone(),
+            })
+        }
+        _ => None,
+    }
+}
+
+/// `get_tuple_fallback_from_unpack` (constraints.py:2111-2124) on the wire
+/// form: only the shapes whose fallback is decidable without the live MRO.
+fn tuple_fallback_ref_from_unpack(t: &Type) -> Option<String> {
+    match t {
+        Type::UnpackType { typ } => match typ.as_ref() {
+            Type::Instance { type_ref, .. } if type_ref == "builtins.tuple" => {
+                Some(type_ref.clone())
+            }
+            Type::TypeVarTupleType { tuple_fallback, .. } => match tuple_fallback.as_ref() {
+                Type::Instance { type_ref, .. } => Some(type_ref.clone()),
+                _ => None,
+            },
+            Type::TupleType {
+                partial_fallback, ..
+            } => match partial_fallback.as_ref() {
+                // Python walks `partial_fallback.type.mro` for builtins.tuple;
+                // the wire cannot walk that MRO, so only the exact fallback
+                // is decidable here.
+                Type::Instance { type_ref, .. } if type_ref == "builtins.tuple" => {
+                    Some(type_ref.clone())
+                }
+                _ => None,
+            },
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// `repack_callable_args` (constraints.py:2132-2155) on the wire form.
+/// The tuple fallback only matters when re-wrapping a bare star type.
+fn repack_callable_args_wire(
+    arg_types: &[Type],
+    arg_kinds: &[i64],
+    tuple_ref: &str,
+) -> Option<Vec<Type>> {
+    let star_index = match arg_kinds.iter().position(|k| *k == 2) {
+        Some(i) => i,
+        // Python: `if ARG_STAR not in callable.arg_kinds: return callable.arg_types`.
+        None => return Some(arg_types.to_vec()),
+    };
+    let mut out: Vec<Type> = arg_types[..star_index].to_vec();
+    let star_out: Type = match &arg_types[star_index] {
+        Type::UnpackType { typ } => match typ.as_ref() {
+            Type::TupleType { items, .. } => {
+                // Python asserts the first item is itself an UnpackType,
+                // splices it as the middle and keeps the rest as the suffix.
+                if !matches!(items[0], Type::UnpackType { .. }) {
+                    return None;
+                }
+                out.push(items[0].clone());
+                out.extend(items[1..].iter().cloned());
+                return Some(out);
+            }
+            Type::TypeAliasType { .. } => return None, // get_proper_type needs the live alias
+            // Python keeps the star UnpackType untouched when its proper
+            // type is not a TupleType (constraints.py:2165-2170).
+            _ => arg_types[star_index].clone(),
+        },
+        // Re-normalize *args: X -> *args: *tuple[X, ...].
+        not_unpack => Type::UnpackType {
+            typ: Box::new(Type::Instance {
+                type_ref: tuple_ref.to_string(),
+                args: vec![not_unpack.clone()],
+                last_known_value: None,
+                extra_attrs: None,
+            }),
+        },
+    };
+    out.push(star_out);
+    Some(out)
+}
+
+/// Port of the `isinstance(self.actual, CallableType)` branch of
+/// `visit_callable_type` (constraints.py:1656-1780): normalize both sides
+/// (`with_unpacked_kwargs().with_normalized_var_args()`), infer the
+/// ret-type constraint (with type_guard/type_is arms), then either the
+/// unpack-repack + simple-unpack path, `infer_callable_arguments_constraints`,
+/// or (template ParamSpec) the prefix + `param_spec_target` construction.
+///
+/// Defers (`None`) when either side fails to normalize, any nested
+/// constraint step defers, or the actual carries type variables: the
+/// opposite-direction polymorphic inference (constraints.py:1732-1736)
+/// attaches `extra_tvars` to every emitted constraint and the wire format
+/// has no representation for those (#1171); with empty `cactual.variables`
+/// the `type_state.infer_polymorphic` / `skip_neg_op` gates provably
+/// cannot fire, so no checker state needs to cross the seam.
+fn callable_vs_callable_native(
+    template: &Type,
+    actual: &Type,
+    direction: i64,
+    resolver: &TypeResolver,
+    aliases: &crate::aliases::TypeAliasResolver,
+    strict_optional: bool,
+) -> Option<Vec<Constraint>> {
+    let templ = match crate::checkcall::normalize_callable(template) {
+        Ok(t) => t,
+        Err(_) => return defer_site("cb-normalize-template"),
+    };
+    let cact = match crate::checkcall::normalize_callable(actual) {
+        Ok(t) => t,
+        Err(_) => return defer_site("cb-normalize-actual"),
+    };
+    let Type::CallableType {
+        arg_types: t_args,
+        arg_kinds: t_kinds,
+        arg_names: t_names,
+        ret_type: t_ret,
+        is_ellipsis_args: t_ellipsis,
+        type_guard: t_guard,
+        type_is: t_is,
+        ..
+    } = &templ
+    else {
+        return defer_site("cb-norm-shape");
+    };
+    let Type::CallableType {
+        arg_types: a_args,
+        arg_kinds: a_kinds,
+        arg_names: a_names,
+        ret_type: a_ret,
+        variables: a_vars,
+        type_guard: a_guard,
+        type_is: a_is,
+        imprecise_arg_kinds: a_imprecise,
+        ..
+    } = &cact
+    else {
+        return defer_site("cb-norm-shape");
+    };
+
+    // Polymorphic / skip_neg_op gates (constraints.py:1674-1681,
+    // 1732-1736) fire only when cactual has variables.
+    if !a_vars.is_empty() {
+        return defer_site("cb-actual-generic");
+    }
+
+    // Ret constraint with the type_guard / type_is arms
+    // (constraints.py:1662-1672).
+    let mut t_ret_ref: &Type = t_ret;
+    let mut a_ret_ref: &Type = a_ret;
+    if let (Some(tg), Some(ag)) = (t_guard, a_guard) {
+        t_ret_ref = tg;
+        a_ret_ref = ag;
+    }
+    if let (Some(ti), Some(ai)) = (t_is, a_is) {
+        t_ret_ref = ti;
+        a_ret_ref = ai;
+    }
+    let mut res = push_inner(
+        t_ret_ref.clone(),
+        a_ret_ref.clone(),
+        direction,
+        resolver,
+        aliases,
+        strict_optional,
+    )?;
+
+    let param_spec = param_spec_of(t_args, t_kinds, t_names);
+    if param_spec.is_none() {
+        // We can't infer constraints from arguments if the template is
+        // Callable[..., T] (constraints.py:1694-1695).
+        if !*t_ellipsis {
+            let unpack_present = find_unpack_in_list_inner(t_args);
+            let cactual_ps = param_spec_of(a_args, a_kinds, a_names);
+            if unpack_present >= 0 && cactual_ps.is_none() {
+                // Re-normalize args to the tuple form and use the same
+                // helper as for tuple types (constraints.py:1698-1726).
+                let tuple_ref = tuple_fallback_ref_from_unpack(&t_args[unpack_present as usize])?;
+                let template_types = repack_callable_args_wire(t_args, t_kinds, &tuple_ref)?;
+                let actual_types = repack_callable_args_wire(a_args, a_kinds, &tuple_ref)?;
+                res.extend(simple_unpack_native(
+                    &template_types,
+                    &actual_types,
+                    neg_op(direction),
+                    resolver,
+                    aliases,
+                    strict_optional,
+                )?);
+            } else {
+                res.extend(infer_callable_arguments_constraints_core(
+                    &templ,
+                    &cact,
+                    direction,
+                    resolver,
+                    aliases,
+                    strict_optional,
+                )?);
+            }
+        }
+        return Some(res);
+    }
+    // ParamSpec prefix branch (constraints.py:1719-1779).
+    let Some(param_spec) = param_spec else {
+        unreachable!("is_none branch returned above");
+    };
+    let Type::ParamSpecType { prefix, .. } = &param_spec else {
+        unreachable!("param_spec_of returns a ParamSpecType");
+    };
+    let prefix_len = prefix.arg_types.len();
+    let cactual_ps = param_spec_of(a_args, a_kinds, a_names);
+
+    // Compare prefixes as well (constraints.py:1743-1754).
+    let mut cbase = match crate::checkcall::callable_base(&cact) {
+        Ok(b) => b,
+        Err(_) => return defer_site("cb-norm-shape"),
+    };
+    cbase.arg_types.truncate(prefix_len);
+    cbase.arg_kinds.truncate(prefix_len);
+    cbase.arg_names.truncate(prefix_len);
+    let cactual_prefix = cbase.into_type();
+    let prefix_type = Type::Parameters((**prefix).clone());
+    res.extend(infer_callable_arguments_constraints_core(
+        &prefix_type,
+        &cactual_prefix,
+        direction,
+        resolver,
+        aliases,
+        strict_optional,
+    )?);
+
+    let param_spec_target: Option<Type> = match &cactual_ps {
+        None => {
+            // max_prefix_len = number of positional+optional kinds
+            // (constraints.py:1756-1765); ARG_POS = 0, ARG_OPT = 1.
+            let max_prefix_len = a_kinds.iter().filter(|k| **k == 0 || **k == 1).count();
+            let pl = prefix_len.min(max_prefix_len);
+            Some(Type::Parameters(crate::wire::Parameters {
+                arg_types: a_args[pl..].to_vec(),
+                arg_kinds: a_kinds[pl..].to_vec(),
+                arg_names: a_names[pl..].to_vec(),
+                variables: a_vars.clone(),
+                imprecise_arg_kinds: *a_imprecise,
+                is_ellipsis_args: false,
+            }))
+        }
+        Some(cp) => {
+            let Type::ParamSpecType {
+                prefix: cp_prefix,
+                name,
+                fullname,
+                raw_id,
+                namespace,
+                flavor,
+                upper_bound,
+                default,
+            } = cp
+            else {
+                unreachable!("cactual_ps is a ParamSpecType");
+            };
+            if prefix_len <= cp_prefix.arg_types.len() {
+                Some(Type::ParamSpecType {
+                    prefix: Box::new(crate::wire::Parameters {
+                        arg_types: cp_prefix.arg_types[prefix_len..].to_vec(),
+                        arg_kinds: cp_prefix.arg_kinds[prefix_len..].to_vec(),
+                        arg_names: cp_prefix.arg_names[prefix_len..].to_vec(),
+                        variables: Vec::new(),
+                        imprecise_arg_kinds: cp_prefix.imprecise_arg_kinds,
+                        is_ellipsis_args: false,
+                    }),
+                    name: name.clone(),
+                    fullname: fullname.clone(),
+                    raw_id: *raw_id,
+                    namespace: namespace.clone(),
+                    flavor: *flavor,
+                    upper_bound: upper_bound.clone(),
+                    default: default.clone(),
+                })
+            } else {
+                None
+            }
+        }
+    };
+    if let Some(target) = param_spec_target {
+        res.push(Constraint {
+            origin_type_var: param_spec,
+            op: direction,
+            target,
+        });
+    }
     Some(res)
 }
 
@@ -2117,21 +2464,49 @@ pub(crate) fn rust_infer_callable_arguments_constraints(
     direction: i64,
     strict_optional: bool,
 ) -> Option<Vec<u8>> {
+    let template = read_type(&mut ReadBuffer::new(template_bytes), None).ok()?;
+    let actual = read_type(&mut ReadBuffer::new(actual_bytes), None).ok()?;
+    let res = infer_callable_arguments_constraints_core(
+        &template,
+        &actual,
+        direction,
+        resolver.resolver(),
+        resolver.alias_resolver(),
+        strict_optional,
+    )?;
+    let mut output = WriteBuffer::new();
+    crate::wire::write_int_bare(&mut output, res.len() as i64).ok()?;
+    for c in &res {
+        write_type(&mut output, &c.origin_type_var).ok()?;
+        write_int(&mut output, c.op).ok()?;
+        write_type(&mut output, &c.target).ok()?;
+    }
+    Some(output.into_bytes())
+}
+
+/// Shared core of `infer_callable_arguments_constraints`
+/// (constraints.py:2032-2102), callable from both the standalone pyfunction
+/// and the callable-vs-callable branch of the full constraint builder.
+pub(crate) fn infer_callable_arguments_constraints_core(
+    template: &Type,
+    actual: &Type,
+    direction: i64,
+    resolver: &TypeResolver,
+    aliases: &crate::aliases::TypeAliasResolver,
+    strict_optional: bool,
+) -> Option<Vec<Constraint>> {
     use crate::callable_compat::{
         argument_by_name, argument_by_position, callable_corresponding_argument, formal_arguments,
         kind_is_positional, kind_is_star, kw_arg, try_synthesizing_arg_from_kwarg,
         try_synthesizing_arg_from_vararg, var_arg,
     };
 
-    let template = read_type(&mut ReadBuffer::new(template_bytes), None).ok()?;
-    let actual = read_type(&mut ReadBuffer::new(actual_bytes), None).ok()?;
-
     // Mirror `direction == SUBTYPE_OF: left, right = template, actual` else
     // `left, right = actual, template` (constraints.py:2039-2042).
     let (left, right): (&Type, &Type) = if direction == SUBTYPE_OF {
-        (&template, &actual)
+        (template, actual)
     } else {
-        (&actual, &template)
+        (actual, template)
     };
     let (left_types, left_kinds, left_names) = callable_arg_fields(left)?;
     let (right_types, right_kinds, right_names) = callable_arg_fields(right)?;
@@ -2149,8 +2524,8 @@ pub(crate) fn rust_infer_callable_arguments_constraints(
             ls.typ.clone(),
             rs.typ.clone(),
             direction,
-            resolver.resolver(),
-            resolver.alias_resolver(),
+            resolver,
+            aliases,
             strict_optional,
         )?);
     }
@@ -2159,8 +2534,8 @@ pub(crate) fn rust_infer_callable_arguments_constraints(
             ls2.typ.clone(),
             rs2.typ.clone(),
             direction,
-            resolver.resolver(),
-            resolver.alias_resolver(),
+            resolver,
+            aliases,
             strict_optional,
         )?);
     }
@@ -2181,8 +2556,8 @@ pub(crate) fn rust_infer_callable_arguments_constraints(
             left_arg.typ.clone(),
             right_arg.typ.clone(),
             direction,
-            resolver.resolver(),
-            resolver.alias_resolver(),
+            resolver,
+            aliases,
             strict_optional,
         )?);
     }
@@ -2200,8 +2575,8 @@ pub(crate) fn rust_infer_callable_arguments_constraints(
                 left_by_position.typ.clone(),
                 right_by_position.typ.clone(),
                 direction,
-                resolver.resolver(),
-                resolver.alias_resolver(),
+                resolver,
+                aliases,
                 strict_optional,
             )?);
             j += 1;
@@ -2228,22 +2603,14 @@ pub(crate) fn rust_infer_callable_arguments_constraints(
                     left_by_name.typ.clone(),
                     right_by_name.typ.clone(),
                     direction,
-                    resolver.resolver(),
-                    resolver.alias_resolver(),
+                    resolver,
+                    aliases,
                     strict_optional,
                 )?);
             }
         }
     }
-
-    let mut output = WriteBuffer::new();
-    crate::wire::write_int_bare(&mut output, res.len() as i64).ok()?;
-    for c in &res {
-        write_type(&mut output, &c.origin_type_var).ok()?;
-        write_int(&mut output, c.op).ok()?;
-        write_type(&mut output, &c.target).ok()?;
-    }
-    Some(output.into_bytes())
+    Some(res)
 }
 
 /// `infer_directed_arg_constraints` core (constraints_filter.rs:310-365):
@@ -3071,5 +3438,336 @@ mod tests {
             let constraints = res.expect("non-recursive call must compute natively");
             assert_eq!(constraints.len(), 1);
         }
+    }
+
+    // -- callable_vs_callable_native (visit_callable_type actual-Callable
+    //    arm, constraints.py:1656-1780, issue #1194) --
+
+    #[allow(clippy::too_many_arguments)]
+    fn cb_callable(
+        arg_types: Vec<Type>,
+        arg_kinds: Vec<i64>,
+        arg_names: Vec<Option<String>>,
+        ret: Type,
+        variables: Vec<Type>,
+        is_ellipsis_args: bool,
+    ) -> Type {
+        Type::CallableType {
+            fallback: Box::new(instance_builtins_object()),
+            instance_type: None,
+            is_ellipsis_args,
+            implicit: false,
+            is_bound: false,
+            from_concatenate: false,
+            imprecise_arg_kinds: false,
+            unpack_kwargs: false,
+            from_type_type: false,
+            arg_types,
+            arg_kinds,
+            arg_names,
+            ret_type: Box::new(ret),
+            name: None,
+            variables,
+            type_guard: None,
+            type_is: None,
+        }
+    }
+
+    fn cb_param_spec(name: &str, raw_id: i64, prefix_types: Vec<Type>) -> Type {
+        Type::ParamSpecType {
+            prefix: Box::new(crate::wire::Parameters {
+                arg_types: prefix_types.clone(),
+                arg_kinds: vec![0; prefix_types.len()], // ARG_POS
+                arg_names: vec![None; prefix_types.len()],
+                variables: Vec::new(),
+                imprecise_arg_kinds: false,
+                is_ellipsis_args: false,
+            }),
+            name: name.to_string(),
+            fullname: format!("mod.{}", name),
+            raw_id,
+            namespace: "fn".to_string(),
+            flavor: 0, // BARE
+            upper_bound: Box::new(any_type()),
+            default: Box::new(any_type()),
+        }
+    }
+
+    #[test]
+    fn test_cb_plain_callable_ret_and_args() {
+        let resolver = crate::typeinfo::TypeResolver::new();
+        let aliases = crate::aliases::TypeAliasResolver::new();
+        let tv = type_var(7, "T");
+        // template: Callable[[T], T]; actual: Callable[[str], int].
+        let template = cb_callable(
+            vec![tv.clone()],
+            vec![0],
+            vec![None],
+            tv.clone(),
+            Vec::new(),
+            false,
+        );
+        let actual = cb_callable(
+            vec![instance_str()],
+            vec![0],
+            vec![None],
+            instance_int(),
+            Vec::new(),
+            false,
+        );
+        let res = callable_vs_callable_native(
+            &template,
+            &actual,
+            SUPERTYPE_OF,
+            &resolver,
+            &aliases,
+            true,
+        )
+        .expect("plain callable-vs-callable must decide natively");
+        assert_eq!(res.len(), 2);
+        let ret_c = res
+            .iter()
+            .find(|c| {
+                matches!(&c.target, Type::Instance { type_ref, .. } if type_ref == "builtins.int")
+            })
+            .expect("ret constraint targets the actual ret type");
+        assert_eq!(ret_c.op, SUPERTYPE_OF);
+        assert_eq!(ret_c.origin_type_var, tv);
+        let arg_c = res
+            .iter()
+            .find(|c| {
+                matches!(&c.target, Type::Instance { type_ref, .. } if type_ref == "builtins.str")
+            })
+            .expect("arg constraint targets the actual arg type");
+        assert_eq!(arg_c.origin_type_var, tv);
+        // The formal is invariant-facing: the argument-side constraint flips
+        // the direction (infer_directed_arg_constraints core).
+        assert_eq!(arg_c.op, SUBTYPE_OF);
+    }
+
+    #[test]
+    fn test_cb_ellipsis_template_infers_ret_only() {
+        // constraints.py:1694-1696: no arg constraints when the template is
+        // Callable[..., T] (literal ellipsis).
+        let resolver = crate::typeinfo::TypeResolver::new();
+        let aliases = crate::aliases::TypeAliasResolver::new();
+        let tv = type_var(7, "T");
+        let template = cb_callable(
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            tv.clone(),
+            Vec::new(),
+            true,
+        );
+        let actual = cb_callable(
+            vec![instance_str()],
+            vec![0],
+            vec![None],
+            instance_int(),
+            Vec::new(),
+            false,
+        );
+        let res = callable_vs_callable_native(
+            &template,
+            &actual,
+            SUPERTYPE_OF,
+            &resolver,
+            &aliases,
+            true,
+        )
+        .expect("ellipsis template must decide natively");
+        assert_eq!(res.len(), 1);
+        assert_eq!(res[0].op, SUPERTYPE_OF);
+        assert_eq!(res[0].origin_type_var, tv);
+        assert_eq!(res[0].target, instance_int());
+    }
+
+    #[test]
+    fn test_cb_unpack_template_simple_unpack() {
+        // constraints.py:1698-1726: an Unpack formal routes through repack +
+        // build_constraints_for_simple_unpack. Template: Callable[[int,
+        // *tuple[T, ...]], T]; actual: Callable[[str, *tuple[str, ...]], int].
+        let resolver = builtin_resolver();
+        let aliases = crate::aliases::TypeAliasResolver::new();
+        let tv = type_var(7, "T");
+        let tuple_unpack = |inner: Type| Type::UnpackType {
+            typ: Box::new(Type::Instance {
+                type_ref: "builtins.tuple".to_string(),
+                args: vec![inner],
+                last_known_value: None,
+                extra_attrs: None,
+            }),
+        };
+        let template = cb_callable(
+            vec![instance_int(), tuple_unpack(tv.clone())],
+            vec![0, 2],
+            vec![None, None],
+            tv.clone(),
+            Vec::new(),
+            false,
+        );
+        let actual = cb_callable(
+            vec![instance_str(), tuple_unpack(instance_str())],
+            vec![0, 2],
+            vec![None, None],
+            instance_int(),
+            Vec::new(),
+            false,
+        );
+        let res = callable_vs_callable_native(
+            &template,
+            &actual,
+            SUPERTYPE_OF,
+            &resolver,
+            &aliases,
+            true,
+        )
+        .expect("unpack template must decide natively");
+        // Ret constraint (T vs int, SUPERTYPE_OF) plus the unpack-middle
+        // arg constraint (T vs str, direction-inverted to SUBTYPE_OF);
+        // constraints.py:1662-1672 + 1698-1726.
+        assert_eq!(res.len(), 2);
+        let arg_c = res
+            .iter()
+            .find(|c| matches!(&c.target, Type::Instance { type_ref, .. } if type_ref == "builtins.str"))
+            .expect("unpack-middle constraint targets the actual arg type");
+        assert_eq!(arg_c.op, SUBTYPE_OF);
+        assert_eq!(arg_c.origin_type_var, tv);
+        assert_eq!(arg_c.target, instance_str());
+    }
+
+    #[test]
+    fn test_cb_param_spec_prefix_and_target_from_plain_actual() {
+        // constraints.py:1719-1765: template ParamSpec prefix comparison plus
+        // the Parameters(param_spec_target) arm for a non-ParamSpec actual.
+        // Template: Callable[[int, *P, **P], T]; actual: Callable[[int, str], str].
+        let resolver = builtin_resolver();
+        let aliases = crate::aliases::TypeAliasResolver::new();
+        let tv = type_var(7, "T");
+        let ps = cb_param_spec("P", 5, vec![instance_int()]);
+        let template = cb_callable(
+            vec![instance_int(), ps.clone(), any_type()],
+            vec![0, 2, 4],
+            vec![None, None, None],
+            tv.clone(),
+            Vec::new(),
+            false,
+        );
+        let actual = cb_callable(
+            vec![instance_int(), instance_str()],
+            vec![0, 0],
+            vec![None, None],
+            instance_str(),
+            Vec::new(),
+            false,
+        );
+        let res = callable_vs_callable_native(
+            &template,
+            &actual,
+            SUPERTYPE_OF,
+            &resolver,
+            &aliases,
+            true,
+        )
+        .expect("ParamSpec template must decide natively");
+        assert_eq!(res.len(), 2);
+        let ret_c = res
+            .iter()
+            .find(|c| matches!(&c.target, Type::Instance { type_ref, .. } if type_ref == "builtins.str"))
+            .expect("ret constraint targets the actual ret type");
+        assert_eq!(ret_c.op, SUPERTYPE_OF);
+        assert_eq!(ret_c.origin_type_var, tv);
+        let ps_c = res
+            .iter()
+            .find(|c| matches!(&c.target, Type::Parameters(_)))
+            .expect("param-spec constraint targets the captured Parameters");
+        assert_eq!(ps_c.op, SUPERTYPE_OF);
+        assert_eq!(ps_c.origin_type_var, ps);
+        let Type::Parameters(target) = &ps_c.target else {
+            panic!("param-spec target not Parameters");
+        };
+        // The captured target is the actual's args past the template prefix.
+        assert_eq!(target.arg_types, vec![instance_str()]);
+        assert_eq!(target.arg_kinds, vec![0]);
+    }
+
+    #[test]
+    fn test_cb_param_spec_target_from_actual_param_spec() {
+        // constraints.py:1767-1776: the actual also carries a ParamSpec, so
+        // the target is the actual's ParamSpec with the template prefix
+        // stripped from its own prefix (template arg prefix [int]).
+        let resolver = builtin_resolver();
+        let aliases = crate::aliases::TypeAliasResolver::new();
+        let ps = cb_param_spec("P", 5, vec![instance_int()]);
+        let ps_q = cb_param_spec("Q", 8, vec![instance_int(), instance_str()]);
+        let template = cb_callable(
+            vec![instance_int(), ps.clone(), any_type()],
+            vec![0, 2, 4],
+            vec![None, None, None],
+            instance_int(),
+            Vec::new(),
+            false,
+        );
+        let actual = cb_callable(
+            vec![instance_int(), instance_str(), ps_q.clone(), any_type()],
+            vec![0, 0, 2, 4],
+            vec![None, None, None, None],
+            instance_int(),
+            Vec::new(),
+            false,
+        );
+        let res = callable_vs_callable_native(
+            &template,
+            &actual,
+            SUPERTYPE_OF,
+            &resolver,
+            &aliases,
+            true,
+        )
+        .expect("both-ParamSpec pair must decide natively");
+        assert_eq!(res.len(), 1);
+        assert_eq!(res[0].op, SUPERTYPE_OF);
+        assert_eq!(res[0].origin_type_var, ps);
+        let Type::ParamSpecType { prefix, .. } = &res[0].target else {
+            panic!("param-spec target not a ParamSpecType");
+        };
+        // Q's prefix loses the one template-prefix arg: [int, str] -> [str].
+        assert_eq!(prefix.arg_types, vec![instance_str()]);
+    }
+
+    #[test]
+    fn test_cb_generic_actual_defers() {
+        // constraints.py:1674-1686: polymorphic inference on a generic
+        // actual attaches extra_tvars the wire cannot represent (#1171);
+        // the port must defer.
+        let resolver = crate::typeinfo::TypeResolver::new();
+        let aliases = crate::aliases::TypeAliasResolver::new();
+        let tv = type_var(7, "T");
+        let template = cb_callable(
+            vec![tv.clone()],
+            vec![0],
+            vec![None],
+            tv.clone(),
+            Vec::new(),
+            false,
+        );
+        let actual = cb_callable(
+            vec![instance_str()],
+            vec![0],
+            vec![None],
+            instance_int(),
+            vec![type_var(2, "U")],
+            false,
+        );
+        assert!(callable_vs_callable_native(
+            &template,
+            &actual,
+            SUPERTYPE_OF,
+            &resolver,
+            &aliases,
+            true,
+        )
+        .is_none());
     }
 }
