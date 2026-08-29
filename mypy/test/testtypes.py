@@ -5113,6 +5113,26 @@ class NativeMapTypeFromSupertypeSuite(Suite):
         )
         self._assert_par(callable, self.fx.gs2i, self.fx.gi)
 
+    def test_parity_definition_restamped(self) -> None:
+        # A callable carrying a FuncDef definition: the wire round-trip drops
+        # it (#1207, the #1169 repair pattern), so the native path re-stamps
+        # it positionally instead of deferring (gate on/off must agree).
+        defn = FuncDef("<init>")
+        callable = CallableType(
+            [self.fx.o, self.fx.t],
+            [ARG_POS, ARG_POS],
+            [None, None],
+            Instance(self.fx.gi, [self.fx.t]),
+            self.fx.function,
+            name="<init>",
+            definition=defn,
+        )
+        off = self._with_gate(False, lambda: self._map(callable, self.fx.gs2i, self.fx.gi))
+        on = self._with_gate(True, lambda: self._map(callable, self.fx.gs2i, self.fx.gi))
+        assert get_proper_type(on) == get_proper_type(off)
+        mapped = cast(CallableType, on)
+        assert mapped.definition is defn
+
     def test_seam_engages_direct(self) -> None:
         # Call the Rust seam directly on the typevar-free hot path (B->A
         # frame mapping an object-typed type) and confirm it returns bytes,
@@ -5577,7 +5597,7 @@ class NativeTypeObjectTypeSuite(Suite):
             name="<init>",
         )
 
-    def _type_object(self, sig: CallableType, info: TypeInfo, is_new: bool) -> FunctionLike:
+    def _type_object(self, sig: FunctionLike, info: TypeInfo, is_new: bool) -> FunctionLike:
         from mypy.typeops import type_object_type_from_function
 
         return type_object_type_from_function(sig, info, info, self.fx.type_type, is_new)
@@ -5646,13 +5666,39 @@ class NativeTypeObjectTypeSuite(Suite):
         )
         self._assert_par(sig, self.fx.bi)
 
-    def test_parity_definition_defers(self) -> None:
+    def test_parity_definition_restamped(self) -> None:
         # An __init__ signature carrying a FuncDef `definition` node: the wire
-        # round-trip drops it, breaking error formatting that names the function.
-        # The `_needs_python` guard defers to pure Python, so gate on/off agree.
+        # round-trip drops it (#1207), so the native path re-stamps it
+        # positionally instead of deferring (the #1169 repair pattern).
         sig = self._init_sig(self.fx.ai, self.fx.ai)
-        sig = sig.copy_modified(definition=FuncDef("__init__"))
-        self._assert_par(sig, self.fx.ai)
+        defn = FuncDef("__init__")
+        sig = sig.copy_modified(definition=defn)
+        off = self._with_gate(False, lambda: self._type_object(sig, self.fx.ai, False))
+        on = self._with_gate(True, lambda: self._type_object(sig, self.fx.ai, False))
+        assert_equal(str(on), str(off), "type_object_type parity with definition")
+        assert isinstance(on, CallableType) and isinstance(off, CallableType)
+        assert on.definition is off.definition
+        assert on.definition is defn
+
+    def test_parity_definition_restamped_overloaded(self) -> None:
+        # Same as above for an overloaded __init__: each item keeps its own
+        # definition, matched positionally (item-count divergence defers).
+        d1, d2 = FuncDef("__init__"), FuncDef("__init__")
+        item1 = self._init_sig(self.fx.ai, self.fx.ai).copy_modified(definition=d1)
+        item2 = self._init_sig(self.fx.ai, self.fx.ai).copy_modified(
+            arg_types=[Instance(self.fx.ai, []), NoneType()],
+            arg_kinds=[ARG_POS, ARG_POS],
+            arg_names=[None, None],
+            definition=d2,
+        )
+        sig: FunctionLike = Overloaded([item1, item2])
+        off = self._with_gate(False, lambda: self._type_object(sig, self.fx.ai, False))
+        on = self._with_gate(True, lambda: self._type_object(sig, self.fx.ai, False))
+        assert_equal(str(on), str(off), "type_object_type overload parity with definitions")
+        assert isinstance(on, Overloaded) and isinstance(off, Overloaded)
+        assert len(on.items) == len(off.items) == 2
+        assert on.items[0].definition is d1
+        assert on.items[1].definition is d2
 
     def test_seam_engages_direct(self) -> None:
         # Call the Rust seam directly (no Python shim) and confirm it returns

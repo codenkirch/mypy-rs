@@ -13,7 +13,11 @@ from typing import Any, Final, TypeVar, cast
 
 from mypy.checker_state import checker_state
 from mypy.copytype import copy_type
-from mypy.expandtype import expand_type, expand_type_by_instance
+from mypy.expandtype import (
+    _resync_definitions as _resync_wire_definitions,
+    expand_type,
+    expand_type_by_instance,
+)
 from mypy.lookup import lookup_stdlib_typeinfo
 from mypy.maptype import map_instance_to_supertype
 from mypy.modules_state import modules_state
@@ -106,15 +110,18 @@ NATIVE_TYPE_OBJECT_NEW = 3
 NATIVE_TYPE_OBJECT_TIE_ANY = 4
 
 
-def _needs_python(typ: Type) -> bool:
+def _needs_python(typ: Type, *, definition_gate: bool = True) -> bool:
     """True if `typ` nests a node a kernel round-trip cannot carry.
 
     Mirrors `mypy.expandtype._needs_python`: named callables lose their
     FuncDef/Decorator definition node (breaking error formatting that names
     the function), and recursive TypeAliasType would loop while decoding.
-    Both must defer to the pure-Python path. Fresh meta-vars round-trip
-    fine and need no branch: wire-decode seams re-unify split occurrences
-    via canonicalize_fresh_vars (#1198).
+    Callers that re-stamp dropped ``definition`` links after the round-trip
+    (the #1207 seams, mirroring the #1169 expandtype pattern) pass
+    ``definition_gate=False``. Both must defer to the pure-Python path.
+
+    Fresh meta-vars round-trip fine and need no branch: wire-decode seams
+    re-unify split occurrences via canonicalize_fresh_vars (#1198).
     """
     stack: list[Type] = [typ]
     visited: set[int] = set()
@@ -125,7 +132,7 @@ def _needs_python(typ: Type) -> bool:
             continue
         visited.add(id(p))
         if isinstance(p, CallableType):
-            if p.definition is not None:
+            if definition_gate and p.definition is not None:
                 return True
             stack.append(p.ret_type)
             stack.extend(p.arg_types)
@@ -604,19 +611,44 @@ def is_valid_constructor(n: SymbolNode | None) -> bool:
     return False
 
 
+def _restamp_composite_definitions(
+    signature: FunctionLike, decoded: FunctionLike
+) -> FunctionLike | None:
+    """Re-stamp ``definition`` links the type-object round-trip dropped (#1207).
+
+    The #1169 pattern, specialized to the type-object composite: the
+    pure-Python body (bind_self, map_type_from_supertype, class_callable)
+    preserves ``CallableType.definition`` through copy_modified, so the
+    result carries exactly the input ``signature``'s definitions, per
+    overload item. Pair positionally; ``None`` defers to the pure-Python
+    body when the shapes diverge.
+    """
+    if isinstance(signature, CallableType) and isinstance(decoded, CallableType):
+        return decoded.copy_modified(definition=signature.definition)
+    if isinstance(signature, Overloaded) and isinstance(decoded, Overloaded):
+        if len(signature.items) != len(decoded.items):
+            return None
+        items = [
+            item.copy_modified(definition=orig.definition)
+            for orig, item in zip(signature.items, decoded.items)
+        ]
+        return Overloaded(items)
+    return None
+
+
 def type_object_type_from_function(
     signature: FunctionLike, info: TypeInfo, def_info: TypeInfo, fallback: Instance, is_new: bool
 ) -> FunctionLike:
-    # #492 composite seam: Rust mirrors the whole body on the wire signature.
-    # Unhandled shapes defer (None); the final object is rebuilt via copy_modified
-    # so non-wire fields (special_sig, def, line/col) survive.
+    # #492 composite seam: Rust mirrors the whole body on the wire signature,
+    # defers on unhandled shapes, and rebuilds the final object via copy_modified
+    # (non-wire fields survive); #1207 relaxes the gate and re-stamps links.
     special_sig_seam: str | None = "dict" if def_info.fullname == "builtins.dict" else None
     default_ret_seam = fill_typevars(info)
     if (
         _HAS_TYPE_KERNEL
         and _native_typeops_active
         and _native_typeops_resolver is not None
-        and not _needs_python(signature)
+        and not _needs_python(signature, definition_gate=False)
     ):
         try:
             result = _type_kernel.rust_type_object_type_from_function(
@@ -631,21 +663,23 @@ def type_object_type_from_function(
             if result is not None:
                 decoded = _deserialize_type(bytes(result))
                 if decoded is not None and isinstance(decoded, FunctionLike):
-                    if isinstance(decoded, CallableType):
-                        return decoded.copy_modified(
-                            special_sig=special_sig_seam,
-                            instance_type=default_ret_seam,
-                        )
-                    ov_items = []
-                    for item in decoded.items:
-                        assert isinstance(item, CallableType)
-                        ov_items.append(
-                            item.copy_modified(
+                    fixed = _restamp_composite_definitions(signature, decoded)
+                    if fixed is not None:
+                        if isinstance(fixed, CallableType):
+                            return fixed.copy_modified(
                                 special_sig=special_sig_seam,
                                 instance_type=default_ret_seam,
                             )
-                        )
-                    return Overloaded(ov_items)
+                        ov_items = []
+                        for item in fixed.items:
+                            assert isinstance(item, CallableType)
+                            ov_items.append(
+                                item.copy_modified(
+                                    special_sig=special_sig_seam,
+                                    instance_type=default_ret_seam,
+                                )
+                            )
+                        return Overloaded(ov_items)
         except (AssertionError, NotImplementedError, ValueError):
             pass
 
@@ -857,16 +891,14 @@ def map_type_from_supertype(typ: Type, sub_info: TypeInfo, super_info: TypeInfo)
     Now S in the context of D would be mapped to E[T] in the context of C.
     """
     # Native composite seam (#492 family): the whole body below is one Rust
-    # call — fill_typevars(sub_info), the TupleType fallback, the maptype
-    # up-promotion, and the final expand_type_by_instance. Defer to Python
-
-    # when `typ` cannot cross the wire (definition-bearing callables,
-    # recursive aliases) or when the resolver is unavailable.
+    # call, deferred when `typ` cannot cross the wire (recursive aliases)
+    # or the resolver is unavailable. #1207 relaxes the definition gate and
+    # re-stamps the dropped links via ``_resync_definitions``.
     if (
         _HAS_TYPE_KERNEL
         and _native_typeops_active
         and _native_typeops_resolver is not None
-        and not _needs_python(typ)
+        and not _needs_python(typ, definition_gate=False)
     ):
         try:
             result = _type_kernel.rust_map_type_from_supertype(
@@ -878,11 +910,11 @@ def map_type_from_supertype(typ: Type, sub_info: TypeInfo, super_info: TypeInfo)
             )
             if result is not None:
                 decoded = _deserialize_type(bytes(result))
+                fixed = None
                 if decoded is not None:
                     # The wire format does not carry line/column; decoded
                     # types default to line -1. Preserve the input type's
                     # location so derived contexts report errors at the
-
                     # call site instead of a phantom line 0/-1 (mirrors the
                     # expand_type_by_instance seam).
                     if isinstance(decoded, ProperType):
@@ -890,7 +922,12 @@ def map_type_from_supertype(typ: Type, sub_info: TypeInfo, super_info: TypeInfo)
                         decoded.column = typ.column
                         if isinstance(decoded, CallableType):
                             decoded.fallback.line = decoded.line
-                    return decoded
+                    # The wire also drops CallableType.definition; the
+                    # pure-Python expansion preserves it, so re-stamp
+                    # positionally. A pairing divergence (None) defers.
+                    fixed = _resync_wire_definitions(typ, decoded)
+                if fixed is not None:
+                    return fixed
         except (AssertionError, NotImplementedError, ValueError):
             # AssertionError: TypeInfo not yet fixed during semanal.
             # NotImplementedError: unserializable variant.
