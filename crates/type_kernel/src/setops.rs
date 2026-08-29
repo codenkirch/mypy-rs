@@ -24,9 +24,12 @@
 //! * `visit_uninhabited_type` -> `s` (SameS).
 //! * `visit_deleted_type` -> `s` (SameS).
 //!
-//! `visit_erased_type` (join.py:373-374) is not ported: `ErasedType`
-//! has no wire-format variant (see `wire::Type`), so it cannot arrive
-//! over FFI; it stays on the Python path.
+//! `visit_erased_type` (join.py:373-374 / meet.py:875) is not ported:
+//! top-level Erased operands are filtered by the Python shims
+//! (join.py/meet.py gate on `isinstance(..., ErasedType)`), and a nested
+//! Erased leaf defers via the `_ => None` fallbacks below, so Python
+//! decides it through its own visitors. ErasedType IS on the wire
+//! (tag 122; see `wire::Type`), which is why nested leaves can arrive.
 //!
 //! The strangler-fig contract mirrors `erase::erase_type`
 //! (erasetype.py:80-86): `None` means "Rust doesn't handle this, let
@@ -262,8 +265,8 @@ pub(crate) fn join_types(
     }
 
     // join.py:317-318 (isinstance(s, ErasedType) -> return t) is
-    // unreachable here: ErasedType has no wire-format variant, so
-    // the Python shim never serializes it across FFI.
+    // unreachable here: top-level Erased operands are filtered by the
+    // shim (join.py:524-525); nested ones defer in visit_join below.
 
     // join.py:320-321: isinstance(s, NoneType) and not isinstance(t,
     // NoneType) -> swap. Post-swap, s is non-None, t is None.
@@ -427,9 +430,9 @@ pub(crate) fn meet_types(
         }
     }
 
-    // meet.py:143-144 (isinstance(s, ErasedType) -> return s) is
-    // unreachable: ErasedType has no wire-format variant.
-    // meet.py:145-146: isinstance(s, AnyType) -> return t (SameT).
+    // meet.py:143-144 (isinstance(s, ErasedType) -> return s) is unreachable:
+    // top-level Erased operands are filtered by the shim (meet.py one-pair gate);
+    // nested ones defer in visit_meet below. meet.py:145-146: s is Any -> SameT.
     if matches!(s, Type::AnyType { .. }) {
         return Some(SetOpResult::SameT);
     }
@@ -521,8 +524,9 @@ fn visit_meet(
             }
         }
 
-        // visit_erased_type (meet.py:875) is unreachable: ErasedType
-        // has no wire-format variant.
+        // visit_erased_type (meet.py:875) is unhandled: top-level Erased
+        // operands are filtered by the shim's meet gate; a nested Erased
+        // t has no arm here and defers via the wildcard.
 
         // visit_unbound_type (meet.py:864-873): NoneType + strict_optional
         // -> Bottom; UninhabitedType -> SameS; else -> AnyType. AnyType
@@ -2067,8 +2071,9 @@ fn visit_join(
         // visit_deleted_type (join.py:370-371): return s.
         Type::DeletedType { .. } => Some(SetOpResult::SameS),
 
-        // visit_erased_type (join.py:373-374) is unhandled: ErasedType
-        // has no wire-format variant, so it cannot arrive over FFI.
+        // visit_erased_type (join.py:373-374) is unhandled: top-level
+        // Erased operands are filtered by the shim (join.py:524-525); a
+        // nested Erased t has no arm here and defers via the wildcard.
 
         // visit_instance (join.py:421-454), Instance-vs-Instance nominal
         // subset. Only handles args-less instances (no type params) and

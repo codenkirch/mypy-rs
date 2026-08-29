@@ -147,7 +147,8 @@ impl SubtypeContext {
 /// Returns `Some(bool)` when Rust decided the check; `None` when the
 /// variant is not handled (Python falls through). The Python shim is
 /// responsible for `get_proper_type` expansion, the `AnyType`/`UnboundType`/
-/// `ErasedType` right short-circuit (subtypes.py:306-313), the `UnionType`
+/// `ErasedType` right short-circuit (subtypes.py:754-761; mirrored below
+/// for the shim-bypassing recursive paths), the `UnionType`
 /// right dispatch (subtypes.py:317-364), the `TypeVarType`-with-values
 /// right (subtypes.py:366-374), and the `assuming` recursion guard
 /// (subtypes.py:167-189) BEFORE calling this.
@@ -158,31 +159,39 @@ pub(crate) fn is_subtype(
     ctx: &SubtypeContext,
     resolver: &TypeResolver,
 ) -> Option<bool> {
-    // subtypes.py:352-359: non-proper subtype of Any/Unbound/Erased is
-    // always True (unless left is UnpackType, which the wire format
-    // doesn't produce in this recursive path). The Python shim handles
-
-    // this at the top-level entry, but recursive calls from
-    // check_type_parameter and the internal visit_* recursions
-    // (e.g. TypeType-vs-TypeType recursing on items, subtypes.py:1323)
-
-    // bypass the shim, so we must mirror it here. UnboundType right is
-    // produced by forward references ("A?") that survive get_proper_type;
-    // ErasedType has no wire representation (left/right args are never
-
-    // Erased after the shim filters them).
     if matches!(left, Type::TypeAliasType { .. }) || matches!(right, Type::TypeAliasType { .. }) {
         // Python expands both operands with get_proper_type before every
         // comparison (subtypes.py:346-347); recursive check_type_parameter
         // and callable-compat paths bypass that, so defer unexpanded aliases.
         return None;
     }
+    // subtypes.py:754-761: a non-proper subtype of an Any/Unbound/Erased
+    // right is always True, unless left is UnpackType (defer mirroring
+    // Python's `not isinstance(left, UnpackType)` guard).
+
+    // The shim applies this at the top-level entry only, but recursive
+    // calls from check_type_parameter and the internal visit_* recursions
+    // (e.g. TypeType-vs-TypeType items, subtypes.py:1323) bypass it.
+
+    // UnboundType right comes from forward references that survive
+    // get_proper_type. Nested ErasedType (wire tag 122) still crosses
+    // FFI: the shim gate filters only top-level Erased (subtypes.py:842).
+
+    // left=ErasedType defers at the visit_* dispatch below (Python's
+    // visit_erased_type answers `not keep_erased_types`, which native
+    // contexts never set).
+    if !ctx.proper_subtype
+        && matches!(
+            right,
+            Type::AnyType { .. } | Type::UnboundType { .. } | Type::ErasedType
+        )
+        && !matches!(left, Type::UnpackType { .. })
+    {
+        return Some(true);
+    }
     // TupleType left: handled by the visit_tuple_type port below, which
     // returns None for the variadic cases (Unpack items, TypeVarTuple)
     // that still defer to Python's SubtypeVisitor (subtypes.py:950-1037).
-    if !ctx.proper_subtype && matches!(right, Type::AnyType { .. } | Type::UnboundType { .. }) {
-        return Some(true);
-    }
     // _is_subtype (subtypes.py:363-410): when right is UnionType and
     // left is not, left <: right iff left <: some item. Python handles
     // this BEFORE the visitor dispatch; mirror it here so recursive
@@ -1351,9 +1360,9 @@ fn visit_instance_noninstance_right(
     if matches!(right, Type::CallableType { .. } | Type::Overloaded { .. }) {
         return None;
     }
-    // Anything else: Python's `else: return False` (subtypes.py:683).
-    // Includes NoneType, UninhabitedType, DeletedType, TypedDictType,
-    // ParamSpecType, UnpackType, LiteralType (no lkv).
+    // Anything else: Python's `else: return False` (subtypes.py:683). Includes
+    // NoneType, UninhabitedType, DeletedType, ErasedType (non-proper Erased right
+    // is caught by the fast path), TypedDictType, ParamSpecType, LiteralType.
     Some(false)
 }
 
@@ -3615,6 +3624,65 @@ mod tests {
         let left = instance("typing.Iterator", vec![alias.clone()]);
         let right = instance("typing.Iterator", vec![alias]);
         assert_eq!(is_subtype(&left, &right, &ctx_nominal(), &r), None);
+    }
+
+    #[test]
+    fn erased_right_non_proper_fast_path() {
+        // subtypes.py:754-761: non-proper subtype of an ErasedType right is always
+        // True. The shim gate (subtypes.py:842-844) filters only top-level Erased
+        // operands, so nested leaves ride this path; the Instance tail says False.
+        let r = make_resolver(vec![snap("a.A", "A"), snap("builtins.object", "object")]);
+        let left = instance("a.A", vec![]);
+        assert_eq!(
+            is_subtype(&left, &Type::ErasedType, &ctx_nominal(), &r),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn union_right_with_erased_item_true() {
+        // subtypes.py:363-410 union-right recursion per item; the non-proper check
+        // matches the Erased item via the fast path, so union-right answers True
+        // though the other item is unrelated (Python: same result).
+        let r = make_resolver(vec![
+            snap("a.A", "A"),
+            snap("b.B", "B"),
+            snap("builtins.object", "object"),
+        ]);
+        let left = instance("a.A", vec![]);
+        let right = Type::UnionType {
+            items: vec![instance("b.B", vec![]), Type::ErasedType],
+            uses_pep604_syntax: false,
+            can_be_true: true,
+            can_be_false: true,
+        };
+        assert_eq!(is_subtype(&left, &right, &ctx_nominal(), &r), Some(true));
+    }
+
+    #[test]
+    fn erased_right_proper_subtype_false() {
+        // proper_subtype=True: the fast path does not fire; Python's
+        // SubtypeVisitor.visit_instance falls through to `else: return
+        // False` for an ErasedType right (subtypes.py:683).
+        let r = make_resolver(vec![snap("a.A", "A"), snap("builtins.object", "object")]);
+        let left = instance("a.A", vec![]);
+        let ctx = SubtypeContext::new(false, false, false, false, true, true);
+        assert_eq!(is_subtype(&left, &Type::ErasedType, &ctx, &r), Some(false));
+    }
+
+    #[test]
+    fn unpack_left_erased_right_defers() {
+        // Python's fast-path guard is `not isinstance(left, UnpackType)`
+        // (subtypes.py:757-760); mirror it as a defer so the pure-Python
+        // body decides the rare Unpack-vs-Erased pair.
+        let r = make_resolver(vec![snap("a.A", "A")]);
+        let left = Type::UnpackType {
+            typ: Box::new(instance("a.A", vec![])),
+        };
+        assert_eq!(
+            is_subtype(&left, &Type::ErasedType, &ctx_nominal(), &r),
+            None
+        );
     }
 
     #[test]

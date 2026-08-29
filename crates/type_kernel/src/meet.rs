@@ -260,12 +260,16 @@ fn overlap_impl(
     let left = &left;
     let right = &right;
 
-    // 1. illegal types: Unbound/Deleted in Python are an overlap (True).
-    // ErasedType is not on the wire; PartialType corrupts the wire so the
-    // shim asserts first. `||` is Rust's operator for Python's `and`.
-    if matches!(left, Type::UnboundType { .. } | Type::DeletedType { .. })
-        || matches!(right, Type::UnboundType { .. } | Type::DeletedType { .. })
-    {
+    // 1. illegal types: Unbound/Erased/Deleted overlap in Python (True, meet.py:568).
+    // The overlap shim does not filter Erased operands (meet.py:520-533 guards only
+    // TypeGuardedType/PartialType), so a wire tag-122 leaf arrives; `||` = `and`.
+    if matches!(
+        left,
+        Type::UnboundType { .. } | Type::DeletedType { .. } | Type::ErasedType
+    ) || matches!(
+        right,
+        Type::UnboundType { .. } | Type::DeletedType { .. } | Type::ErasedType
+    ) {
         return Some(true);
     }
 
@@ -1979,6 +1983,40 @@ mod tests {
         // No snapshot -> the pre-#874 TypeAliasType defer is preserved.
         let empty = crate::aliases::TypeAliasResolver::new();
         assert!(get_possible_variants(&alias, &r, Some(&empty)).is_none());
+    }
+
+    #[test]
+    fn overlap_erased_operand_is_true() {
+        // meet.py:568: Unbound/Erased/Deleted operands overlap (True). The overlap
+        // shim serializes Erased operands unfiltered, so the wire tag-122 leaf
+        // decides step 1; pre-#1185 this pair fell to the tie check: Some(false).
+        let r = make_resolver();
+        assert_eq!(
+            overlap_impl(
+                &instance("builtins.int"),
+                &Type::ErasedType,
+                true,
+                false,
+                false,
+                &r,
+                None,
+                0,
+            ),
+            Some(true)
+        );
+        assert_eq!(
+            overlap_impl(
+                &Type::ErasedType,
+                &instance("builtins.int"),
+                true,
+                false,
+                false,
+                &r,
+                None,
+                0,
+            ),
+            Some(true)
+        );
     }
 
     #[test]

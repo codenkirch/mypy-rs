@@ -392,9 +392,9 @@ fn encode_type_owned(t: &Type) -> Option<Vec<u8>> {
 // overrides (checker.py:9785-9799):
 //   * `visit_uninhabited_type`: returns `t.ambiguous` (base: default=False).
 
-//   * `visit_erased_type`: returns `True` (unreachable on the wire, since
-//     `ErasedType` has no `write`/`read` in mypy/types.py, so it can never
-//     appear in serialized input).
+//   * `visit_erased_type`: returns `True` — `ErasedType` IS on the wire
+//     (tag 122; Python's `ErasedType.write` + unconditional Rust reader),
+//     so a nested erased type ("can happen inside a lambda") reaches FFI.
 
 //   * `visit_type_var`: returns `t.id.is_meta_var()` i.e. `meta_level > 0`
 //     (base: query upper_bound + default + values).
@@ -479,7 +479,9 @@ fn invalid_inferred_types_query(typ: &Type) -> Option<bool> {
     match typ {
         // visit_uninhabited_type: returns t.ambiguous.
         Type::UninhabitedType { ambiguous } => Some(*ambiguous),
-        // visit_erased_type returns True, but ErasedType is not on the wire.
+        // visit_erased_type: ErasedType is always invalid (checker.py:
+        // "This can happen inside a lambda").
+        Type::ErasedType => Some(true),
         // visit_type_var: returns t.id.is_meta_var() (meta_level > 0),
         // NOT the base query of upper_bound/default/values.
         Type::TypeVarType { meta_level, .. } => Some(*meta_level > 0),
@@ -581,7 +583,7 @@ fn invalid_inferred_children(typ: &Type) -> Vec<&Type> {
             ..
         } => out.push(sa),
         // NoneType, UninhabitedType, AnyType (no source_any), DeletedType,
-        // Parameters (standalone): no children. ErasedType unreachable.
+        // ErasedType, Parameters (standalone): no children.
         _ => {}
     }
     out
@@ -1500,6 +1502,33 @@ mod tests {
     #[test]
     fn valid_inferred_uninhabited() {
         let t = uninhabited();
+        assert_eq!(
+            is_valid_inferred_type_inner(&t, false, false, false),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn valid_inferred_erased_top_level() {
+        // ErasedType is wire tag 122; visit_erased_type answers True (invalid
+        // inside a lambda). The shim does not filter Erased operands, so it
+        // must not fall through to the base-query default, which answers valid.
+        let t = Type::ErasedType;
+        assert_eq!(
+            is_valid_inferred_type_inner(&t, false, false, false),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn valid_inferred_union_with_erased_item() {
+        // Nested Erased items recurse through the ANY_STRATEGY union arm.
+        let t = Type::UnionType {
+            items: vec![instance("builtins.int"), Type::ErasedType],
+            uses_pep604_syntax: false,
+            can_be_true: true,
+            can_be_false: true,
+        };
         assert_eq!(
             is_valid_inferred_type_inner(&t, false, false, false),
             Some(false)
