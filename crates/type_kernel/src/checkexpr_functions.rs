@@ -7069,8 +7069,10 @@ const CHECK_BOOLEAN_OP_MAP_OR: i64 = 3;
 /// * Result tail: `restricted_left_type = false_only/true_only(
 ///   expanded_left)` from the live `can_be_true`/`can_be_false` flags
 ///   (steps 1-2) plus the typeops leaf kernels (dunder lookup +
-///   final/enum via the live resolver). Union recursion reads live
-///   per-item flags the wire does not carry -> defer.
+///   final/enum via the live resolver). A `UnionType` expanded-left
+///   recursion reads live per-item flags the wire does not carry, so
+///   the shim precomputes its Uninhabited verdict and passes it in
+///   (`restricted_uninhabited`, issue #1161); a missing verdict defers.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn classify_check_boolean_op(
     py: Python<'_>,
@@ -7083,6 +7085,7 @@ pub(crate) fn classify_check_boolean_op(
     can_be_true: bool,
     can_be_false: bool,
     strict_optional: bool,
+    restricted_uninhabited_arg: Option<bool>,
     resolver: &NativeTypeResolver,
 ) -> Option<(i64, bool, bool, i64)> {
     let map_tag = if right_always {
@@ -7136,7 +7139,8 @@ pub(crate) fn classify_check_boolean_op(
 
     // Tail: restricted_left_type = false_only/true_only(expanded_left);
     // result_is_left = not expanded.can_be_true (and) / not can_be_false (or).
-    // Mirrors Python's flag-decidable steps 1-2; union recursion defers.
+    // Mirrors Python's flag-decidable steps 1-2; the union Uninhabited
+    // verdict is precomputed Python-side and passed in (issue #1161).
     let restricted_uninhabited: bool = if op_is_and {
         if !can_be_false {
             // false_only: UninhabitedType under strict_optional, else NoneType.
@@ -7145,11 +7149,18 @@ pub(crate) fn classify_check_boolean_op(
             matches!(expanded_left, Type::UninhabitedType { .. })
         } else {
             match expanded_left {
-                Type::TypeAliasType { .. } | Type::UnionType { .. } => return None,
-                _ => matches!(
-                    crate::typeops::false_only(py, expanded_left, strict_optional, resolver)?,
-                    crate::typeops::TruthinessResult::Uninhabited
-                ),
+                Type::TypeAliasType { .. } => return None,
+                Type::UnionType { .. } => {
+                    // Python precomputes false_only(union) -> Uninhabited?
+                    // and hands the verdict in (issue #1161).
+                    restricted_uninhabited_arg?
+                }
+                _ => {
+                    matches!(
+                        crate::typeops::false_only(py, expanded_left, strict_optional, resolver)?,
+                        crate::typeops::TruthinessResult::Uninhabited
+                    )
+                }
             }
         }
     } else {
@@ -7160,11 +7171,18 @@ pub(crate) fn classify_check_boolean_op(
             matches!(expanded_left, Type::UninhabitedType { .. })
         } else {
             match expanded_left {
-                Type::TypeAliasType { .. } | Type::UnionType { .. } => return None,
-                _ => matches!(
-                    crate::typeops::true_only(py, expanded_left, resolver)?,
-                    crate::typeops::TruthinessResult::Uninhabited
-                ),
+                Type::TypeAliasType { .. } => return None,
+                Type::UnionType { .. } => {
+                    // Python precomputes true_only(union) -> Uninhabited?
+                    // and hands the verdict in (issue #1161).
+                    restricted_uninhabited_arg?
+                }
+                _ => {
+                    matches!(
+                        crate::typeops::true_only(py, expanded_left, resolver)?,
+                        crate::typeops::TruthinessResult::Uninhabited
+                    )
+                }
             }
         }
     };
@@ -7189,8 +7207,11 @@ pub(crate) fn classify_check_boolean_op(
 /// `#[pyfunction]` entry for the `check_boolean_op` decision head
 /// (issue #1049). `left_map_values`/`right_map_values` are the
 /// wire-serialized map values; `expanded_left_bytes` is one
-/// serialization of the expanded left operand type. Defers (`None`)
-/// on any decode failure.
+/// serialization of the expanded left operand type.
+/// `restricted_uninhabited` is the Python-precomputed
+/// false_only/true_only(union) -> Uninhabited verdict for a union
+/// expanded-left (issue #1161); `None` defers that bucket. Defers
+/// (`None`) on any decode failure.
 #[pyfunction]
 #[allow(clippy::type_complexity, clippy::too_many_arguments)]
 #[pyo3(signature = (
@@ -7203,6 +7224,7 @@ pub(crate) fn classify_check_boolean_op(
     can_be_true,
     can_be_false,
     strict_optional,
+    restricted_uninhabited,
     resolver,
 ))]
 pub(crate) fn rust_classify_check_boolean_op(
@@ -7216,6 +7238,7 @@ pub(crate) fn rust_classify_check_boolean_op(
     can_be_true: bool,
     can_be_false: bool,
     strict_optional: bool,
+    restricted_uninhabited: Option<bool>,
     resolver: &NativeTypeResolver,
 ) -> Option<(i64, bool, bool, i64)> {
     let expanded_left = decode_type(expanded_left_bytes)?;
@@ -7238,6 +7261,7 @@ pub(crate) fn rust_classify_check_boolean_op(
         can_be_true,
         can_be_false,
         strict_optional,
+        restricted_uninhabited,
         resolver,
     )
 }
@@ -7293,6 +7317,7 @@ mod classify_check_boolean_op_tests {
                 true,
                 true,
                 true,
+                None,
                 &empty_resolver(),
             )
         })
@@ -7316,6 +7341,7 @@ mod classify_check_boolean_op_tests {
                 true,
                 true,
                 true,
+                None,
                 &empty_resolver(),
             )
         })
@@ -7341,6 +7367,7 @@ mod classify_check_boolean_op_tests {
                 true,
                 true,
                 true,
+                None,
                 &empty_resolver(),
             )
         })
@@ -7364,6 +7391,7 @@ mod classify_check_boolean_op_tests {
                 true,
                 true,
                 true,
+                None,
                 &empty_resolver(),
             )
         })
@@ -7387,6 +7415,7 @@ mod classify_check_boolean_op_tests {
                 true,
                 true,
                 true,
+                None,
                 &empty_resolver(),
             )
         })
@@ -7409,6 +7438,7 @@ mod classify_check_boolean_op_tests {
                 true,
                 true,
                 true,
+                None,
                 &empty_resolver(),
             )
         })
@@ -7433,6 +7463,7 @@ mod classify_check_boolean_op_tests {
                 true,
                 false,
                 true,
+                None,
                 &empty_resolver(),
             )
         })
@@ -7456,6 +7487,7 @@ mod classify_check_boolean_op_tests {
                 false,
                 false,
                 false,
+                None,
                 &empty_resolver(),
             )
         })
@@ -7479,6 +7511,7 @@ mod classify_check_boolean_op_tests {
                 true,
                 false,
                 true,
+                None,
                 &empty_resolver(),
             )
         })
@@ -7503,6 +7536,7 @@ mod classify_check_boolean_op_tests {
                 false,
                 true,
                 true,
+                None,
                 &empty_resolver(),
             )
         })
@@ -7532,6 +7566,7 @@ mod classify_check_boolean_op_tests {
                 true,
                 true,
                 true,
+                None,
                 &empty_resolver(),
             )
         });
@@ -7562,6 +7597,7 @@ mod classify_check_boolean_op_tests {
                 true,
                 true,
                 true,
+                None,
                 &empty_resolver(),
             )
         });
@@ -7588,10 +7624,161 @@ mod classify_check_boolean_op_tests {
                 true,
                 true,
                 true,
+                None,
                 &empty_resolver(),
             )
         });
         assert!(r.is_none());
+    }
+
+    fn union_type() -> Type {
+        Type::UnionType {
+            items: vec![int_instance(), any_type()],
+            uses_pep604_syntax: false,
+            can_be_true: true,
+            can_be_false: true,
+        }
+    }
+
+    #[test]
+    fn union_expanded_left_and_restricted_uninhabited_returns_right() {
+        // and, both flags true: Python's false_only(union) verdict is
+        // Uninhabited -> RETURN_RIGHT without deferring (issue #1161).
+        let r = with_py(|py| {
+            classify_check_boolean_op(
+                py,
+                true,
+                false,
+                false,
+                &[],
+                &[],
+                &union_type(),
+                true,
+                true,
+                true,
+                Some(true),
+                &empty_resolver(),
+            )
+        })
+        .unwrap();
+        assert_eq!(r.0, CHECK_BOOLEAN_OP_MAP_AND);
+        assert_eq!(r.3, CHECK_BOOLEAN_OP_RETURN_RIGHT);
+    }
+
+    #[test]
+    fn union_expanded_left_and_restricted_inhabited_unions() {
+        // and, restricted left inhabited, can_be_true -> UNION tail.
+        let r = with_py(|py| {
+            classify_check_boolean_op(
+                py,
+                true,
+                false,
+                false,
+                &[],
+                &[],
+                &union_type(),
+                true,
+                true,
+                true,
+                Some(false),
+                &empty_resolver(),
+            )
+        })
+        .unwrap();
+        assert_eq!(r.3, CHECK_BOOLEAN_OP_UNION);
+    }
+
+    #[test]
+    fn union_expanded_left_or_restricted_uninhabited_returns_right() {
+        // or, both flags true, true_only(union) verdict Uninhabited.
+        let r = with_py(|py| {
+            classify_check_boolean_op(
+                py,
+                false,
+                false,
+                false,
+                &[],
+                &[],
+                &union_type(),
+                true,
+                true,
+                true,
+                Some(true),
+                &empty_resolver(),
+            )
+        })
+        .unwrap();
+        assert_eq!(r.0, CHECK_BOOLEAN_OP_MAP_OR);
+        assert_eq!(r.3, CHECK_BOOLEAN_OP_RETURN_RIGHT);
+    }
+
+    #[test]
+    fn union_expanded_left_or_restricted_inhabited_unions() {
+        // or, restricted left inhabited, can_be_false -> UNION tail.
+        let r = with_py(|py| {
+            classify_check_boolean_op(
+                py,
+                false,
+                false,
+                false,
+                &[],
+                &[],
+                &union_type(),
+                true,
+                true,
+                true,
+                Some(false),
+                &empty_resolver(),
+            )
+        })
+        .unwrap();
+        assert_eq!(r.3, CHECK_BOOLEAN_OP_UNION);
+    }
+
+    #[test]
+    fn union_expanded_left_missing_verdict_defers() {
+        // Without the Python-precomputed verdict the union arm still defers.
+        let r = with_py(|py| {
+            classify_check_boolean_op(
+                py,
+                true,
+                false,
+                false,
+                &[],
+                &[],
+                &union_type(),
+                true,
+                true,
+                true,
+                None,
+                &empty_resolver(),
+            )
+        });
+        assert!(r.is_none());
+    }
+
+    #[test]
+    fn union_expanded_left_and_never_true_returns_left() {
+        // and, !can_be_true: restricted step decides by the Uninhabited
+        // match, no verdict needed -> result_is_left -> RETURN_LEFT.
+        let r = with_py(|py| {
+            classify_check_boolean_op(
+                py,
+                true,
+                false,
+                false,
+                &[],
+                &[],
+                &union_type(),
+                false,
+                true,
+                true,
+                None,
+                &empty_resolver(),
+            )
+        })
+        .unwrap();
+        assert_eq!(r.3, CHECK_BOOLEAN_OP_RETURN_LEFT);
     }
 }
 
