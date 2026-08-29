@@ -19879,6 +19879,21 @@ class NativeCoversAtRuntimeSuite(Suite):
         sup = Instance(int_info, [])
         self.assert_par(item, sup)
 
+    def test_tuple_operands_parity(self) -> None:
+        # Tuple operands erase to their partial_fallback Instance (mirrors
+        # `erasetype.py visit_tuple_type`), so tuple shapes engage the
+        # normal erase + subtype flow instead of blanked-deferring
+        # (issue #1171: 1,600 calls @0% native).
+        t1 = TupleType([self.fx.a], self.fx.std_tuple)
+        t2 = TupleType([self.fx.b], self.fx.std_tuple)
+        self.assert_par(t1, t2)
+        self.assert_par(t1, t1)
+        self.assert_par(t1, self.fx.std_tuple)
+        self.assert_par(t2, t1)
+        assert self.assert_engages(t1, t2) is True
+        assert self.assert_engages(t1, t1) is True
+        assert self.assert_engages(t1, self.fx.std_tuple) is True
+
     def test_seam_engages(self) -> None:
         # The direct seam call returns a decided bool, proving the Rust
         # path engages rather than deferring (None).
@@ -28881,6 +28896,167 @@ class NativeAnyConstraintsSuite(Suite):
             ],
             eager=False,
         )
+
+    def test_seam_engages_with_none_option(self) -> None:
+        # A differential-only suite passes silently when the kernel defers
+        # and Python answers both sides. That is exactly how the None-option
+        # marker (-1) bug survived: read_size rejected it and every call
+        # deferred. Call the seam directly to prove the wire decodes
+        # (issue #1171).
+        from mypy.cache import write_int_bare  # type: ignore[attr-defined]
+        from mypy.constraints import _set_native_constraints_resolver, _write_option
+
+        options: list[list[Constraint] | None] = [
+            None,
+            [self.Constraint(self.fx.t, 0, self.fx.a)],
+        ]
+        buf = _WriteBuffer()
+        write_int_bare(buf, len(options))
+        write_int_bare(buf, -1)
+        option1 = options[1]
+        assert option1 is not None
+        _write_option(buf, option1)
+        _set_native_constraints_resolver(self.resolver)
+        try:
+            raw = _type_kernel.rust_any_constraints(
+                buf.getvalue(), False, state.strict_optional, self.resolver
+            )
+        finally:
+            _set_native_constraints_resolver(None)
+        assert raw is not None, "seam must not defer on a None (-1) option"
+        assert len(raw) == 1
+
+    def test_seam_preserves_extra_tvars_identity(self) -> None:
+        # Polymorphic-call inference attaches extra_tvars to constraints,
+        # and the wire format has no representation for them, so returning
+        # wire-rebuilt Constraints silently drops them (issue #1171).
+        # The shim must match each wire blob back to the original live
+        # Constraint and return it; value-equal-but-distinct options also
+        # disambiguate (the all-same branch returns the first valid
+        # option's constraints, exactly as the pure-Python body does).
+        from mypy.constraints import (
+            _set_native_constraints_resolver,
+            _try_native_any_constraints,
+        )
+
+        c1 = self.Constraint(self.fx.t, 0, self.fx.a)
+        c2 = self.Constraint(self.fx.t, 0, self.fx.a)
+        extra_a = self._tvar("EA", 900, self.fx.o)
+        extra_b = self._tvar("EB", 901, self.fx.o)
+        c1.extra_tvars = [extra_a]
+        c2.extra_tvars = [extra_b]
+        assert c1 == c2  # value-equal so the kernel takes the all-same path
+
+        _set_native_constraints_resolver(self.resolver)
+        try:
+            res2 = _try_native_any_constraints([[c2], [c1]], eager=False)
+        finally:
+            _set_native_constraints_resolver(None)
+        assert res2 is not None, "seam must not defer on verbatim options"
+        assert res2[0] is c2, "seam must return the live original Constraint"
+        assert res2[0].extra_tvars == [extra_b], "extra_tvars must survive"
+        # Differential: gate-on vs gate-off result equality.
+        self._assert_par([[c2], [c1]], eager=False)
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeDivergingAliasSuite(Suite):
+    """Parity tests for `rust_detect_diverging_alias` (mypy.typeanal.detect_diverging_alias).
+
+    Builds fresh alias nodes per path (the positive verdict is cached on
+    `node._is_recursive`, so gate-on and gate-off must not share nodes) and
+    asserts the native path matches the pure-Python body, including the
+    `_is_recursive is None` collect-aliases front ported in issue #1171
+    (previously a 100%-defer seam with zero test coverage).
+    """
+
+    def setUp(self) -> None:
+        from mypy.typeanal import _set_native_typeanal_active
+
+        self.fx = TypeFixture()
+        self._set_active = _set_native_typeanal_active
+
+    def tearDown(self) -> None:
+        self._set_active(False)
+
+    def _make_diverging_pair(self) -> tuple[TypeAlias, Type]:
+        # F = tuple[F[list[T]]]: the alias reappears in a seen chain with a
+        # typevar-carrying arg, so both the recursive-alias front
+        # (collect-aliases walk) and the diverging-expansion back end fire.
+        from mypy.nodes import TypeAlias
+
+        a = TypeAliasType(None, [])
+        node = TypeAlias(self.fx.anyt, "__main__.F", "__main__", -1, -1)
+        arg = TypeAliasType(node, [Instance(self.fx.std_listi, [self.fx.t])])
+        target = Instance(self.fx.std_tuplei, [arg])
+        a.alias = node
+        node.target = target
+        return node, target
+
+    def _make_recursive_not_diverging_pair(self) -> tuple[TypeAlias, Type]:
+        # A = tuple[Union[B, A]]: recursive but every occurrence is bare, so
+        # the alias is recursive yet not diverging.
+        from mypy.nodes import TypeAlias
+
+        a = TypeAliasType(None, [])
+        node = TypeAlias(self.fx.anyt, "__main__.R", "__main__", -1, -1)
+        arg = TypeAliasType(node, [])
+        target = Instance(self.fx.std_tuplei, [UnionType([self.fx.b, arg])])
+        a.alias = node
+        node.target = target
+        return node, target
+
+    def _make_plain_pair(self) -> tuple[TypeAlias, Type]:
+        from mypy.nodes import TypeAlias
+
+        node = TypeAlias(self.fx.std_tuple, "__main__.P", "__main__", -1, -1)
+        return node, node.target
+
+    def test_diverging_recursion(self) -> None:
+        from mypy.typeanal import detect_diverging_alias
+
+        self._set_active(False)
+        node_py, target_py = self._make_diverging_pair()
+        expected = detect_diverging_alias(node_py, target_py)
+        self._set_active(True)
+        node_na, target_na = self._make_diverging_pair()
+        actual = detect_diverging_alias(node_na, target_na)
+        self.assertEqual(actual, expected)
+        self.assertTrue(expected)
+        self.assertTrue(node_na._is_recursive, "positive verdict is cached")
+
+    def test_recursive_not_diverging(self) -> None:
+        from mypy.typeanal import detect_diverging_alias
+
+        self._set_active(False)
+        node_py, target_py = self._make_recursive_not_diverging_pair()
+        expected = detect_diverging_alias(node_py, target_py)
+        self._set_active(True)
+        node_na, target_na = self._make_recursive_not_diverging_pair()
+        actual = detect_diverging_alias(node_na, target_na)
+        self.assertEqual(actual, expected)
+        self.assertFalse(expected)
+        self.assertTrue(node_na._is_recursive, "recursive verdict is cached on the node")
+
+    def test_non_recursive_alias(self) -> None:
+        from mypy.typeanal import detect_diverging_alias
+
+        self._set_active(False)
+        node_py, target_py = self._make_plain_pair()
+        expected = detect_diverging_alias(node_py, target_py)
+        self._set_active(True)
+        node_na, target_na = self._make_plain_pair()
+        actual = detect_diverging_alias(node_na, target_na)
+        self.assertEqual(actual, expected)
+        self.assertFalse(expected)
+
+    def test_seam_engages(self) -> None:
+        self._set_active(True)
+        node, target = self._make_diverging_pair()
+        result = _type_kernel.rust_detect_diverging_alias(node, target)
+        self.assertTrue(result)
+        plain_node, plain_target = self._make_plain_pair()
+        assert _type_kernel.rust_detect_diverging_alias(plain_node, plain_target) is False
 
 
 class NativeRepackCallableArgsSuite(Suite):

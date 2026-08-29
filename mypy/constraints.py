@@ -303,20 +303,16 @@ def _try_native_any_constraints(
 
     Requires a NativeTypeResolver snapshot (installed by the build manager
     per SCC): the internal helpers need is_same_type / is_subtype with
-    resolved Instance refs. The kernel returns fully serialized result
-    constraints; origins are re-mapped onto the live type variables from
-    the input options because the wire round-trip drops meta_level identity
-    (c.f. solve.py:706-719 for the same concern).
+    resolved Instance refs. The kernel decides which constraints survive
+    but the wire round-trip drops extra_tvars and inner tvar identity, so
+    the wire result is only used as a *decision*: each returned (op,
+    target, origin-id) triple is matched back against the original live
+    Constraint it was serialized from, and that original object is
+    returned. Transformations that rewrite a target (merge_with_any
+    unions Any into it) never match and defer to the pure-Python body.
     """
     if _native_constraints_resolver is None:
         return None
-    live_vars: list[TypeVarLikeType] = []
-    for option in options:
-        if option is None:
-            continue
-        for c in option:
-            if c.origin_type_var not in live_vars:
-                live_vars.append(c.origin_type_var)
     buf = _WriteBuffer()
     from mypy.cache import write_int_bare  # type: ignore[attr-defined]
 
@@ -333,7 +329,21 @@ def _try_native_any_constraints(
         raise NotImplementedError("kernel deferred any_constraints")
     from mypy.cache import read_int
 
+    # Kernel's notion of "valid option" mirrors the pure-Python
+    # pre-filter (constraints.py:1170-1173): eager drops empty lists,
+    # otherwise only None. Every decidable kernel path returns
+    # constraints carried over verbatim from these valid options, in
+    # ascending option order, so scan a flattened list with a monotonic
+    # cursor to also disambiguate value-equal duplicates.
+    if eager:
+        valid_options = [option for option in options if option]
+    else:
+        valid_options = [option for option in options if option is not None]
+    flat: list[Constraint] = []
+    for option in valid_options:
+        flat.extend(option)
     result: list[Constraint] = []
+    cursor = 0
     for blob in raw:
         data = _ReadBuffer(bytes(blob))
         origin = _fix_wire_type(data)
@@ -343,16 +353,27 @@ def _try_native_any_constraints(
         target = _fix_wire_type(data)
         if target is None:
             raise NotImplementedError("target unresolvable on wire")
-        live = [
-            v
-            for v in live_vars
-            if type(v) is type(origin)
-            and v.id.raw_id == origin.id.raw_id
-            and v.id.namespace == origin.id.namespace
-        ]
-        if len(live) != 1:
-            raise NotImplementedError("origin id not resolvable in options")
-        result.append(Constraint(live[0], op, target))
+        matched = None
+        for i in range(cursor, len(flat)):
+            pc = flat[i]
+            pid = pc.origin_type_var.id
+            oid = origin.id
+            if (
+                type(pc.origin_type_var) is type(origin)
+                and pid.raw_id == oid.raw_id
+                and pid.namespace == oid.namespace
+                and pc.op == op
+                and pc.target == target
+            ):
+                matched = pc
+                cursor = i + 1
+                break
+        if matched is None:
+            # The kernel rewrote the constraint (e.g. merge_with_any);
+            # rebuilding it on the wire would drop extra_tvars, so defer
+            # to the pure-Python body.
+            raise NotImplementedError("no original constraint matches kernel result")
+        result.append(matched)
     return result
 
 

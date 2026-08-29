@@ -51,7 +51,9 @@ fn read_options(bytes: &[u8]) -> Option<Vec<Option<Vec<ConstraintRep>>>> {
     let n = read_size(&mut buf)?;
     let mut out = Vec::with_capacity(n as usize);
     for _ in 0..n {
-        let m = read_size(&mut buf)?;
+        // A None option marker is a bare `-1`; read_size rejects negatives,
+        // so read the bare int here and branch on the sign.
+        let m = wire::read_int_bare(&mut buf).ok()?;
         if m < 0 {
             out.push(None);
             continue;
@@ -680,4 +682,52 @@ pub(crate) fn rust_repack_callable_args(
         result.push(blob.into_bytes());
     }
     Some(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_read_options_none_marker() {
+        // Wire: count=2, None option (-1), one-constraint option. The None
+        // marker must decode without killing the whole call (issue #1171).
+        let origin = Type::TypeVarType {
+            name: "T".to_string(),
+            fullname: "T".to_string(),
+            raw_id: 1,
+            namespace: "__main__".to_string(),
+            upper_bound: Box::new(Type::Instance {
+                type_ref: "builtins.object".to_string(),
+                args: vec![],
+                last_known_value: None,
+                extra_attrs: None,
+            }),
+            default: Box::new(Type::UninhabitedType { ambiguous: false }),
+            values: vec![],
+            variance: 0,
+            meta_level: 0,
+        };
+        let target = Type::AnyType {
+            type_of_any: 2,
+            source_any: None,
+            missing_import_name: None,
+        };
+        let mut buf = WriteBuffer::new();
+        wire::write_int_bare(&mut buf, 2).unwrap();
+        wire::write_int_bare(&mut buf, -1).unwrap();
+        wire::write_int_bare(&mut buf, 1).unwrap();
+        wire::write_type(&mut buf, &origin).unwrap();
+        wire::write_int(&mut buf, 0).unwrap();
+        wire::write_type(&mut buf, &target).unwrap();
+        let options = read_options(&buf.into_bytes()).expect("options must decode");
+        assert_eq!(options.len(), 2);
+        assert!(
+            options[0].is_none(),
+            "the -1 marker decodes to a None option"
+        );
+        let present = options[1].as_ref().expect("second option decodes");
+        assert_eq!(present.len(), 1);
+        assert_eq!(present[0].op, 0);
+    }
 }

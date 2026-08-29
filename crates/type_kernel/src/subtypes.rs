@@ -85,6 +85,12 @@ pub(crate) struct SubtypeContext {
     /// stored on the context so the `visit_callable_type` port can forward
     /// it to the native engine without an options lookup.
     pub strict_concatenate: bool,
+    /// `SubtypeContext.erase_instances` (subtypes.py:508): erase the left
+    /// Instance *after* mapping it to the supertype (subtypes.py:1151-1155),
+    /// so per-arg checks compare erased args against the right args. Only
+    /// `covers_at_runtime` and `map_instance_to_supertype`-level
+    /// `is_proper_subtype(..., erase_instances=True)` callers set it.
+    pub erase_instances: bool,
 }
 
 impl SubtypeContext {
@@ -131,6 +137,7 @@ impl SubtypeContext {
             strict_optional,
             ignore_pos_arg_names,
             strict_concatenate,
+            erase_instances: false,
         }
     }
 }
@@ -2100,8 +2107,22 @@ fn visit_instance_nominal(
 
     // Map left to right's type. Fast path: left.type == right.type (no
     // substitution needed). Slow path calls map_instance_to_supertype
-    // to walk the bases blobs and substitute TypeVars.
-    let mapped_args: Vec<Type> = if left_ref == right_ref {
+    // to walk the bases blobs and substitute TypeVars; it returns None
+    // when an unsupported Type variant is in the tree (e.g. UnpackType,
+    // ParamSpec), in which case Python falls through.
+    let mapped_args: Vec<Type> = if ctx.erase_instances {
+        // Python (subtypes.py:1151-1155) erases the *mapped* instance
+        // via `erase_type`, which replaces every arg with
+        // `AnyType(TypeOfAny.special_form)` for the supertype's own
+        // type_vars (erasetype.py:251-253). The per-arg checks below
+        // then compare erased args against the (already erased) right
+        // args, so relocatable subclass mappings that carry concrete
+        // base args still cover. TVT-bearing classes defer earlier, so
+        // a 1:1 Any per snapshot type var is the full erase.
+        (0..right_snap.type_vars_with_variance.len())
+            .map(|_| any_type_of(ANY_SPECIAL_FORM))
+            .collect()
+    } else if left_ref == right_ref {
         left_args.to_vec()
     } else if right_snap.type_vars_with_variance.is_empty() {
         // right has no type vars: map_instance_to_supertype returns
@@ -2111,7 +2132,6 @@ fn visit_instance_nominal(
         // Generic substitution path: map_instance_to_supertype walks
         // class_derivation_paths over the snapshot's bases blobs,
         // substituting TypeVars via expand_type_by_instance. Returns
-
         // None when an unsupported Type variant is in the tree (e.g.
         // UnpackType, ParamSpec), in which case Python falls through.
         map_instance_to_supertype(left_ref, left_args, right_ref, resolver)?
