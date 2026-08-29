@@ -1922,6 +1922,24 @@ directly to `main`.
   `mypy/test/testtypes.py` (gate-off vs gate-on differential plus
   direct seam calls), plus pure fold unit tests in
   `lookup_definer.rs`.
+- `rust_check_operator` code 1 (issue #1131) — the
+  `check_op_reversible` STEP 2a ordering seam now returns the
+  reverse-first variant code. Previously it deferred (`None`) whenever
+  the elif chain would evaluate `covers_at_runtime` (checkexpr.py
+  ~6093, mypy #19006): the non-instance path (either operand not an
+  `Instance`) and the differing-definers path (behind the
+  `alt_promote` gate). Both reduce to
+  `covers_at_runtime(right, left)` (item=right, supertype=left), so
+  they ride the already parity-tested `covers_at_runtime_inner` port
+  in `covers.rs`; a `Some(true)` covers verdict implies exactly the
+  reverse-first `variants_raw` Python would build. Rust defers
+  (`None`) where the covers port or the definer/snapshot lookups are
+  undecided (tuple-shaped operands, alias targets, missing snapshots,
+  a `None` same-type result on shortcut ops). Gated by
+  `_native_checkexpr_active` + `_native_checkexpr_resolver` (existing
+  wiring, no build.py change); parity via the testcheck differential
+  and 15 unit tests in `checkoperator.rs` (no Python suite: the seam
+  has no direct-construction test shape).
 - `rust_infer_operator_assignment_method` (issue #1079) — mirrors
   `infer_operator_assignment_method` + `_find_inplace_method`
   (checker.py:11498-11520), the pure `(True, "__i<rest>")` vs

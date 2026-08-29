@@ -1088,9 +1088,9 @@ def _try_native_operator_plan(
 ) -> int | None:
     """Decide check_op_reversible's STEP 2a variant order via the Rust kernel.
 
-    Returns 0 (shortcut single), 2 (normal order), or None to defer to the
-    pure-Python chain. Rust never returns the code-1 (reverse-first) branch
-    since it needs covers_at_runtime, which is not portable.
+    Returns 0 (shortcut single), 1 (reverse-first), 2 (normal order), or
+    None to defer to the pure-Python chain. Code 1 rides the parity-tested
+    covers_at_runtime port (#1131).
     """
     if (
         _CHECKEXPR_HAS_TYPE_KERNEL
@@ -5985,6 +5985,14 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
             variants_raw = [
                 (op_name, left_op, left_type, right_expr),
                 (rev_op_name, right_op, right_type, left_expr),
+            ]
+        elif plan == 1:
+            # Rust decided the reverse-first elif below: every gate it
+            # evaluated is a parity-tested port, so the variants list it
+            # implies is identical to the one Python would build.
+            variants_raw = [
+                (rev_op_name, right_op, right_type, left_expr),
+                (op_name, left_op, left_type, right_expr),
             ]
         elif op_name in operators.op_methods_that_shortcut and is_same_type(left_type, right_type):
             # When we do "A() + A()", for example, Python will only call the __add__ method,
