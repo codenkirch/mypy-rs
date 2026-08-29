@@ -85,8 +85,17 @@ def _needs_python(typ: Type, *, definition_gate: bool = True, meta_gate: bool = 
     """True if `typ` nests a node a kernel round-trip cannot carry.
 
     Callers that re-stamp dropped ``definition`` links after the round-trip
-    via ``_resync_definitions`` pass ``definition_gate=False``; callers
-    without a re-stamp path (env values, remove_trivial) keep the gate.
+    via ``_resync_definitions`` pass ``definition_gate=False``: the
+    instance-args precheck of ``expand_type_by_instance`` and
+    ``freshen_all_functions_type_vars``. The other expand-family gates
+    (``expand_type`` and ``expand_type_by_instance``'s top-level check)
+    keep the flag on: their decoded trees re-enter error reporting as
+    plugin contexts, where nested wire-decoded types carry no locations
+    (functools partial, #1220 scope note). Callers without a re-stamp
+    path (env values, remove_trivial) also keep the gate.
+    freshen_function_type_vars also keeps the gate (#1220): its decoded
+    result re-enters error reporting as a plugin context, where nested
+    wire-decoded types carry no locations.
     Callers whose decoded result is a partial list that cannot be
     re-unified with an enclosing variables slot (remove_trivial) pass
     ``meta_gate=True``: a decoded fresh (meta) type var is a distinct
@@ -103,7 +112,7 @@ def _needs_python(typ: Type, *, definition_gate: bool = True, meta_gate: bool = 
             continue
         visited.add(id(p))
         if isinstance(p, CallableType):
-            if p.definition is not None:
+            if definition_gate and p.definition is not None:
                 return True
             stack.append(p.ret_type)
             stack.extend(p.arg_types)
@@ -348,7 +357,7 @@ def expand_type(typ: Type, env: Mapping[TypeVarId, Type]) -> Type:
         _HAS_TYPE_KERNEL
         and _native_expand_type_active
         and _native_expand_type_resolver is not None
-        and not _needs_python(typ, definition_gate=False)
+        and not _needs_python(typ)
         and not _env_substitutes_unsafe(typ, env)
     ):
         try:
@@ -601,8 +610,11 @@ def expand_type_by_instance(typ: Type, instance: Instance) -> Type:
             _HAS_TYPE_KERNEL
             and _native_expand_type_active
             and _native_expand_type_resolver is not None
-            and not _needs_python(typ, definition_gate=False)
-            and not any(_needs_python(a, definition_gate=False) for a in instance.args)
+            and not _needs_python(typ)
+            and not any(
+                _needs_python(a, definition_gate=False)
+                for a in instance.args
+            )
         ):
             try:
                 result = _type_kernel.rust_expand_type_by_instance(
@@ -696,18 +708,27 @@ F = TypeVar("F", bound=FunctionLike)
 
 
 def freshen_function_type_vars(callee: F) -> F:
-    """Substitute fresh type variables for generic function type variables."""
+    """Substitute fresh type variables for generic function type variables.
+
+    The definition gate stays ON for this seam (#1220): its result is handed
+    to plugin FunctionContext hooks as ``ctx.default_return_type`` and
+    re-enters error reporting via ``extract_callable_type(...,
+    ctx=ctx.default_return_type)`` -> ``analyze_member_access(context=...)``.
+    A wire-decoded result carries no nested locations, so a locally-built
+    error loses its line number (functools.partial path, "int" not callable).
+    Keep deferring on any definition until positions below the root are
+    re-established.
+    """
     if isinstance(callee, CallableType):
         if not callee.is_generic():
             return callee
         # Stage 3c type-kernel seam (mirrors expand_type's strangler-fig
-        # contract): Rust returns None on deferred cases (ParamSpec vars,
-        # unresolvable TypeInfos); `canonicalize_fresh_vars` re-unifies ids.
+        # contract); see the docstring for the #1220 definition-gate scope.
         if (
             _HAS_TYPE_KERNEL
             and _native_expand_type_active
             and _native_expand_type_resolver is not None
-            and not _needs_python(callee, definition_gate=False)
+            and not _needs_python(callee)
         ):
             try:
                 result = _type_kernel.rust_freshen_function_type_vars(

@@ -4443,6 +4443,139 @@ class NativeExpandTypeFreezeIdentitySuite(Suite):
 
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeExpandTypeDefinitionGateSuite(Suite):
+    """Parity for the `definition_gate` flag in expandtype._needs_python (#1220).
+
+    The CallableType arm of `mypy.expandtype._needs_python` checked
+    `p.definition is not None` unconditionally, so callers passing
+    `definition_gate=False` over-deferred to Python whenever the type
+    nested a callable carrying a `definition` node, even though the
+    wire-decoded result is repaired via `_resync_definitions`. The twin
+    `mypy.typeops._needs_python` already mirrors
+    `if definition_gate and p.definition is not None`.
+
+    Scope note (#1220): the relaxation survives only where it is provably
+    safe. The instance-args precheck of `expand_type_by_instance` and
+    `freshen_all_functions_type_vars` pass `definition_gate=False`
+    (definitions re-stamped via `_resync_definitions`; unpairable shapes
+    defer to the pure-Python body). The `expand_type` and
+    `expand_type_by_instance` top-level gates keep the flag on: their
+    decoded trees re-enter error reporting as plugin contexts, and nested
+    wire-decoded types carry no locations, so relaxing them loses error
+    line numbers (functools partial regressions
+    `check-functools.test::testFunctoolsPartial*` against #1219's fixup).
+
+    Locks: with `definition_gate=False` a definition-bearing callable must
+    not defer (predicate differential + direct freshen_all seam decision),
+    while `definition_gate=True` keeps the defer; the freshen_all path
+    must agree gate off vs gate on and re-stamp the same live definition
+    node.
+    """
+
+    def setUp(self) -> None:
+        from mypy.expandtype import (
+            _set_native_expand_type_active,
+            _set_native_expand_type_resolver,
+            _set_native_expand_type_typeinfo_map,
+        )
+        from mypy.nodes import ARG_POS, FuncDef
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        self.fx = TypeFixture()
+        self._set_active = _set_native_expand_type_active
+        self._set_resolver = _set_native_expand_type_resolver
+        self._set_map = _set_native_expand_type_typeinfo_map
+        type_infos = []
+        for name in dir(self.fx):
+            if not name.endswith("i"):
+                continue
+            value = getattr(self.fx, name)
+            if _is_type_info(value):
+                type_infos.append(value)
+        self._type_infos = type_infos
+        self._resolver = _type_kernel.build_native_resolver(type_infos, [])
+        self._set_resolver(self._resolver)
+        self._set_map({info.fullname: info for info in type_infos})
+        set_wire_typeinfo_map({info.fullname: info for info in type_infos})
+        self._set_active(True)
+
+        fx = self.fx
+        defn = FuncDef("f")
+        self._callee = CallableType(
+            [fx.t],
+            [ARG_POS],
+            [None],
+            fx.t,
+            fx.function,
+            name="f",
+            variables=[fx.t],
+            definition=defn,
+        )
+        self._defn = defn
+
+    def tearDown(self) -> None:
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        self._set_active(False)
+        self._set_resolver(None)
+        self._set_map(None)
+        set_wire_typeinfo_map(None)
+
+    def _with_gate(self, active: bool, fn: Callable[[], T]) -> T:
+        self._set_active(active)
+        try:
+            return fn()
+        finally:
+            self._set_active(True)
+
+    def test_definition_gate_false_stops_deferring(self) -> None:
+        from mypy.expandtype import _needs_python
+
+        assert _needs_python(self._callee), "gate=True must defer on definition"
+        assert not _needs_python(
+            self._callee, definition_gate=False
+        ), "gate=False must not defer on a re-stamped callable"
+        # A nested definition-carrying callable must also pass relaxed.
+        nested = UnionType([self._callee, self.fx.b])
+        assert not _needs_python(nested, definition_gate=False)
+
+    def test_freshen_all_definition_restamped(self) -> None:
+        # The surviving relaxation in production: freshen_all passes
+        # definition_gate=False and re-stamps the dropped definition from
+        # the pre-seam type; gate off vs gate on must agree.
+        from mypy.expandtype import freshen_all_functions_type_vars
+
+        def run() -> Type:
+            return freshen_all_functions_type_vars(self._callee)
+
+        off = self._with_gate(False, lambda: str(run()))
+        on_result = self._with_gate(True, run)
+        assert_equal(
+            str(on_result),
+            off,
+            "freshen_all parity on definition-carrying callable",
+        )
+        on_proper = get_proper_type(on_result)
+        assert isinstance(on_proper, CallableType)
+        assert on_proper.definition is self._defn
+
+    def test_seam_engages_with_definition(self) -> None:
+        # Direct seam call through the surviving freshen_all relaxation: the
+        # kernel decides on the wire shape alone (definitions are dropped in
+        # transit), so a definition-bearing generic callable must engage.
+        from mypy.expandtype import _serialize_type
+
+        call = _type_kernel.rust_freshen_all_functions_type_vars(
+            TypeVarId.next_raw_id,
+            _serialize_type(self._callee),
+            state.strict_optional,
+        )
+        assert call is not None, "Rust freshen_all deferred on definition-carrying callable"
+        _next_raw_id, changed, _serialized = call
+        assert changed, "Rust freshen_all reported no change for a generic callable"
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeExpandTypeEmptyEnvSuite(Suite):
     """Parity for the Rust `expand_type` empty-env fast path.
 
