@@ -112,7 +112,9 @@ def _needs_python(typ: Type) -> bool:
     Mirrors `mypy.expandtype._needs_python`: named callables lose their
     FuncDef/Decorator definition node (breaking error formatting that names
     the function), and recursive TypeAliasType would loop while decoding.
-    Both must defer to the pure-Python path.
+    Both must defer to the pure-Python path. Fresh meta-vars round-trip
+    fine and need no branch: wire-decode seams re-unify split occurrences
+    via canonicalize_fresh_vars (#1198).
     """
     stack: list[Type] = [typ]
     visited: set[int] = set()

@@ -870,6 +870,28 @@ including:
   `meta_level` mutation) would miss it. Fresh-var-bearing decoded trees
   stay out of the shared decode caches (an in-place freeze on a cached
   tree would leak across callers).
+- maptype decode fresh-var repair (issue #1198) — extends the #1180
+  whole-tree seam repair to the map seams: `_native_map_instance_to_supertype`
+  and the `_native_map_step_frontier` per-member decode loop now run
+  `canonicalize_fresh_vars(_reported)` after `fixup_wire_type`, because
+  the wire round-trip splits re-occurrences of one fresh (meta_level > 0)
+  id into distinct equal-id objects. Fresh vars reach these seams via
+  constraint template mapping (`ConstraintVisitor.visit_instance`, 276 of
+  6,003 self-check map-seam calls carry 280 fresh occurrences), so both
+  gate walks stay free of a meta branch: gating would convert 276 native
+  mappings into Python fallbacks, repair avoids that. The single seam
+  keeps fresh-bearing trees out of `_map_supertype_decode_cache`: the
+  re-unified tree shares one object per fresh id, so an in-place freeze
+  on the cached result would leak into later callers of the identical
+  blob (mirroring #1180); the frontier step has no cache and
+  canonicalizes too, while its fresh-bearing members still defer
+  per-member via the sentinel flag. typeops wire seams
+  (`type_object_type_from_function`, `map_type_from_supertype`) carry 0
+  fresh occurrences in the cold self-check, so only their `_needs_python`
+  whole-tree walk got a docstring recording (#1198 found no new branch).
+  Covered by `NativeMapFreshVarRepairSuite` in `mypy/test/testtypes.py`
+  (gate-off vs gate-on parity plus freshness identity, no-cache-insert,
+  cache-hit-copy, and frontier per-member checks). No Rust change.
 - `expand_type_by_instance` recursive arms (subtypes.rs, behind the
   `rust_is_subtype` seam) — mirrors `expandtype.py`'s ExpandTypeVisitor:
   five new arms (CallableType, Overloaded, TupleType, TypeType,
