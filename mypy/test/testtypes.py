@@ -3700,6 +3700,68 @@ class NativeSubtypesDeferralSuite(Suite):
         )
         assert rusted is True
 
+    def test_subtype_erased_union_item(self) -> None:
+        # Issue #1185: the Python shell gate (subtypes.py:842-844) filters
+        # only a TOP-LEVEL ErasedType operand, so a nested ErasedType union
+        # item reaches the Rust kernel. Before the fix, the right-union
+
+        # recursion landed the Erased item in the Instance-vs-non-Instance
+        # tail and answered Some(false), making the whole union check
+        # wrongly False; the fast-path fix (right in {Any, Unbound, Erased})
+
+        # answers Some(true), matching Python.
+        from mypy.subtypes import _serialize_type, is_subtype
+
+        u = UnionType([self.fx.b, ErasedType()], False)
+        self._set_gate(False)
+        expected = is_subtype(self.fx.a, u)
+        assert expected
+        self._set_gate(True)
+        assert is_subtype(self.fx.a, u) is expected
+        rusted = _type_kernel.rust_is_subtype(
+            _serialize_type(self.fx.a),
+            _serialize_type(u),
+            False,
+            False,
+            False,
+            False,
+            False,
+            True,
+            False,
+            False,
+            self.resolver,
+        )
+        assert rusted is True
+
+    def test_valid_inferred_erased_leaf(self) -> None:
+        # Issue #1185: is_valid_inferred_type serializes its operand
+        # wholesale, so an ErasedType leaf rides the wire into the Rust
+        # invalid_inferred_types_query. Before the fix the query defaulted
+
+        # ErasedType to valid (True); Python (checker.py, the
+        # _invalid_inferred_types visitor) treats ErasedType as invalid,
+        # so the native arm now mirrors that.
+        from mypy.checker import (
+            _serialize_type_for_checker,
+            _set_native_checker_stmts_active,
+            is_valid_inferred_type,
+        )
+
+        options = Options()
+        t = ErasedType()
+        try:
+            _set_native_checker_stmts_active(False)
+            expected = is_valid_inferred_type(t, options)
+            assert expected is False
+            _set_native_checker_stmts_active(True)
+            assert is_valid_inferred_type(t, options) is expected
+            rusted = _type_kernel.rust_is_valid_inferred_type(
+                _serialize_type_for_checker(t), False, False, False
+            )
+            assert rusted is False
+        finally:
+            _set_native_checker_stmts_active(False)
+
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeVariadicTupleRightSuite(Suite):
@@ -14016,6 +14078,31 @@ class NativeMeetDeferralSuite(Suite):
         self.assertEqual(
             {str(t) for t in variants}, {str(self.fx.a), str(self.fx.b)}
         )
+
+    def test_is_overlapping_erased_operand(self) -> None:
+        # Python treats Unbound/Erased/Deleted operands as overlapping (meet.py:568);
+        # the overlap shim serializes Erased unfiltered, so the wire tag-122 leaf
+        # reaches step 1. Pre-#1185 the native tie check answered False instead.
+        erased = ErasedType()
+        for pair in ((self.fx.a, erased), (erased, self.fx.a)):
+            off = self._overlap(False, pair[0], pair[1])
+            on = self._overlap(True, pair[0], pair[1])
+            self.assertEqual(on, off)
+            self.assertTrue(on, f"overlap must be True: {pair}")
+
+    def test_is_overlapping_erased_seam_engages(self) -> None:
+        from mypy.join import _serialize_type
+
+        r = _type_kernel.rust_is_overlapping_types(
+            _serialize_type(self.fx.a),
+            _serialize_type(ErasedType()),
+            False,
+            False,
+            True,
+            self.resolver,
+        )
+        assert r is not None, "rust_is_overlapping_types deferred on an Erased operand"
+        self.assertTrue(r)
 
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
