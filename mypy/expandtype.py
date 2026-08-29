@@ -85,8 +85,14 @@ def _needs_python(typ: Type, *, definition_gate: bool = True, meta_gate: bool = 
     """True if `typ` nests a node a kernel round-trip cannot carry.
 
     Callers that re-stamp dropped ``definition`` links after the round-trip
-    via ``_resync_definitions`` pass ``definition_gate=False``; callers
-    without a re-stamp path (env values, remove_trivial) keep the gate.
+    via ``_resync_definitions`` pass ``definition_gate=False``: the
+    instance-args precheck of ``expand_type_by_instance`` and
+    ``freshen_all_functions_type_vars``. The other expand-family gates
+    (``expand_type`` and ``expand_type_by_instance``'s top-level check)
+    keep the flag on: their decoded trees re-enter error reporting as
+    plugin contexts, where nested wire-decoded types carry no locations
+    (functools partial, #1220 scope note). Callers without a re-stamp
+    path (env values, remove_trivial) also keep the gate.
     freshen_function_type_vars also keeps the gate (#1220): its decoded
     result re-enters error reporting as a plugin context, where nested
     wire-decoded types carry no locations.
@@ -351,7 +357,7 @@ def expand_type(typ: Type, env: Mapping[TypeVarId, Type]) -> Type:
         _HAS_TYPE_KERNEL
         and _native_expand_type_active
         and _native_expand_type_resolver is not None
-        and not _needs_python(typ, definition_gate=False)
+        and not _needs_python(typ)
         and not _env_substitutes_unsafe(typ, env)
     ):
         try:
@@ -604,8 +610,11 @@ def expand_type_by_instance(typ: Type, instance: Instance) -> Type:
             _HAS_TYPE_KERNEL
             and _native_expand_type_active
             and _native_expand_type_resolver is not None
-            and not _needs_python(typ, definition_gate=False)
-            and not any(_needs_python(a, definition_gate=False) for a in instance.args)
+            and not _needs_python(typ)
+            and not any(
+                _needs_python(a, definition_gate=False)
+                for a in instance.args
+            )
         ):
             try:
                 result = _type_kernel.rust_expand_type_by_instance(
