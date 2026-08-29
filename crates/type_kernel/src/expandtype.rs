@@ -1576,13 +1576,26 @@ mod tests {
     }
 
     #[test]
-    fn expand_alias_entry_unmatched_tvar_inside_args_defers() {
+    fn expand_alias_entry_unmatched_tvar_expands_via_relink() {
         // `expand_type(X[T], {})` leaves T unmatched inside the alias args;
-        // the leftover-TypeVar identity guard still fires (res_tvar_head
-        // shape), independent of alias_ok.
+        // with relink_ok the FFI entry returns the expansion and the Python
+        // shim relinks the decoded TypeVar onto the live original
+        // (`wirefixup.resync_var_identities`, NativeExpandTypeEmptyEnvSuite).
         let typ = alias_type("foo.Alias", vec![tvar(0)]);
         let env: HashMap<EnvKey, Type> = HashMap::new();
-        assert!(expand_with_env(&typ, &env, false, true).is_none());
+        match expand_with_env(&typ, &env, false, true) {
+            Some(bytes) => match decode_type(&bytes).unwrap() {
+                Type::TypeAliasType { args, type_ref } => {
+                    assert_eq!(type_ref, "foo.Alias");
+                    assert!(matches!(args.as_slice(), [Type::TypeVarType { .. }]));
+                }
+                other => panic!("expected TypeAliasType, got {:?}", other),
+            },
+            None => panic!("relink entry must not defer on a leftover tvar"),
+        }
+        // The old relink-less wrapper (infer_variance / expand_variants
+        // callers) keeps the identity defer.
+        assert!(expand_type_with_env(&typ, &env, false).is_none());
     }
 
     #[test]
