@@ -48,11 +48,7 @@ import re
 import subprocess
 import sys
 
-STAT_ROWS = (
-    "parse_time",
-    "semanal_time",
-    "type_check_time",
-)
+STAT_ROWS = ("parse_time", "semanal_time", "type_check_time")
 
 STAT_RE = re.compile(r"^(\w+):\s+([\d.]+)\s*$", re.MULTILINE)
 

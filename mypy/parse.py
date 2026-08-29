@@ -4,10 +4,9 @@ import re
 
 from librt.internal import ReadBuffer
 
-from mypy import errorcodes as codes
+from mypy import errorcodes as codes, message_registry
 from mypy.cache import read_int
 from mypy.errors import Errors
-from mypy import message_registry
 from mypy.nodes import (
     AssertStmt,
     Block,
@@ -120,7 +119,9 @@ def load_from_raw(
     if ignore_whole_module:
         imports = []
     elif not imports_only:
-        defs, imports, skipped_lines = truncate_after_failing_toplevel_assert(defs, imports, options)
+        defs, imports, skipped_lines = truncate_after_failing_toplevel_assert(
+            defs, imports, options
+        )
         skipped_lines.update(collect_skipped_lines(defs, options))
 
     tree = MypyFile(defs, imports)

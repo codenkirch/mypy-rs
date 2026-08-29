@@ -25,6 +25,7 @@ from __future__ import annotations
 from typing import Any
 
 from librt.internal import ReadBuffer
+
 from mypy.nodes import FakeInfo
 from mypy.types import (
     AnyType,
@@ -74,15 +75,15 @@ def set_wire_typeinfo_map(typeinfo_map: dict[str, Any] | None) -> None:
         # rechecks): cached decodes from the previous map must not
         # survive, they would resolve into stale TypeInfo objects.
         from mypy.checker import _clear_checker_deser_cache
-        from mypy.erasetype import _clear_erase_decode_cache
         from mypy.checkexpr import _clear_argtypes_plan_cache
-        from mypy.expandtype import _clear_expand_decode_cache
         from mypy.checkmember import _clear_deser_cache
+        from mypy.erasetype import _clear_erase_decode_cache
+        from mypy.expandtype import _clear_expand_decode_cache
+        from mypy.maptype import _clear_map_supertype_decode_cache
         from mypy.meet import _clear_narrow_decode_cache
+        from mypy.subtypes import _clear_subtype_decode_cache
         from mypy.typeops import _clear_typeops_decode_cache
         from mypy.typevars import _clear_typevars_decode_cache
-        from mypy.maptype import _clear_map_supertype_decode_cache
-        from mypy.subtypes import _clear_subtype_decode_cache
 
         _clear_deser_cache()
         _clear_checker_deser_cache()
@@ -221,9 +222,7 @@ class _FreshVarCanonicalizer(TypeTranslator):
         super().__init__()
         self._var_by_id: dict[tuple[int, int, str], TypeVarLikeType] = {}
 
-    def _canonical(
-        self, t: TypeVarLikeType, key: tuple[int, int, str]
-    ) -> TypeVarLikeType:
+    def _canonical(self, t: TypeVarLikeType, key: tuple[int, int, str]) -> TypeVarLikeType:
         existing = self._var_by_id.get(key)
         if existing is None:
             self._var_by_id[key] = t
@@ -262,9 +261,7 @@ class _FreshVarCanonicalizer(TypeTranslator):
         type_guard = t.type_guard.accept(self) if t.type_guard is not None else None
         type_is = t.type_is.accept(self) if t.type_is is not None else None
         return result.copy_modified(
-            variables=variables,  # type: ignore[arg-type]
-            type_guard=type_guard,
-            type_is=type_is,
+            variables=variables, type_guard=type_guard, type_is=type_is  # type: ignore[arg-type]
         )
 
 

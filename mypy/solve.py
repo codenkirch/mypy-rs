@@ -588,9 +588,7 @@ def solve_one(lowers: Iterable[Type], uppers: Iterable[Type]) -> Type | None:
                     if blob is not None:
                         source_any = decode_source_any(_ReadBuffer(bytes(blob)))
                         if source_any is not None:
-                            return AnyType(
-                                TypeOfAny.from_another_any, source_any=source_any
-                            )
+                            return AnyType(TypeOfAny.from_another_any, source_any=source_any)
 
     bottom: Type | None = None
     top: Type | None = None
@@ -705,9 +703,7 @@ def _serialize_type_payload(tp: Type) -> bytes:
 def is_trivial_bound(tp: ProperType, allow_tuple: bool = False) -> bool:
     if _HAS_TYPE_KERNEL and _native_solve_active:
         try:
-            result = _type_kernel.rust_is_trivial_bound(
-                _serialize_type_payload(tp), allow_tuple
-            )
+            result = _type_kernel.rust_is_trivial_bound(_serialize_type_payload(tp), allow_tuple)
             if result is not None:
                 return result
         except (AssertionError, NotImplementedError):
@@ -740,7 +736,9 @@ def find_linear(c: Constraint) -> tuple[bool, TypeVarId | None]:
                     target = get_proper_type(c.target)
                     if isinstance(target, TupleType) and len(target.items) == 1:
                         item = target.items[0]
-                        if isinstance(item, UnpackType) and isinstance(item.type, TypeVarTupleType):
+                        if isinstance(item, UnpackType) and isinstance(
+                            item.type, TypeVarTupleType
+                        ):
                             return True, item.type.id
             # Rust's negative answer does not expand `TypeAliasType` targets
             # (Python's `get_proper_type` does), so a `False` here is not
@@ -916,7 +914,6 @@ def skip_reverse_union_constraints(cs: list[Constraint]) -> list[Constraint]:
                 result: list[Constraint] = []
                 for _ in range(count):
                     from mypy.cache import read_int
-
                     from mypy.wirefixup import fixup_wire_type
 
                     origin = read_type(data)

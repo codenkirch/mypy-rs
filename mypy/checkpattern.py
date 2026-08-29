@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from typing import Final, Iterator, NamedTuple, cast
+from collections.abc import Iterator
+from typing import Final, NamedTuple
 
 from mypy import message_registry
 from mypy.checker_shared import TypeCheckerSharedApi, TypeRange
@@ -87,6 +88,7 @@ def _serialize_type(t: Type) -> bytes:
     t.write(buf)
     return buf.getvalue()
 
+
 # Branch tags returned by rust_classify_class_pattern_ranges (issue #987).
 _CLASS_PATTERN_FAIL: Final = 0
 _CLASS_PATTERN_TYPE_OBJ: Final = 1
@@ -106,6 +108,7 @@ def _deserialize_type_list(result: list[bytes] | list[list[int]]) -> list[Type] 
             return None
         out.append(t)
     return out
+
 
 self_match_type_names: Final = [
     "builtins.bool",
@@ -468,10 +471,7 @@ class PatternChecker(PatternVisitor[PatternType]):
             if resolver is not None:
                 try:
                     result = _type_kernel.rust_contract_starred_pattern_types(
-                        [_serialize_type(t) for t in types],
-                        star_pos,
-                        num_patterns,
-                        resolver,
+                        [_serialize_type(t) for t in types], star_pos, num_patterns, resolver
                     )
                     if result is not None:
                         decoded = _deserialize_type_list([bytes(b) for b in result])
@@ -881,19 +881,14 @@ class PatternChecker(PatternVisitor[PatternType]):
                 # (FunctionLike with is_type_obj()).
                 assert isinstance(p_item, FunctionLike)
                 out.append(
-                    TypeRange(
-                        fill_typevars_with_any(p_item.type_object()),
-                        is_upper_bound=False,
-                    )
+                    TypeRange(fill_typevars_with_any(p_item.type_object()), is_upper_bound=False)
                 )
             elif tag == _CLASS_PATTERN_CALLABLE_VAR:
                 fallback = self.chk.named_type("builtins.function")
                 any_type = AnyType(TypeOfAny.unannotated)
                 out.append(
                     TypeRange(
-                        callable_with_ellipsis(
-                            any_type, ret_type=any_type, fallback=fallback
-                        ),
+                        callable_with_ellipsis(any_type, ret_type=any_type, fallback=fallback),
                         is_upper_bound=False,
                     )
                 )
@@ -926,10 +921,7 @@ class PatternChecker(PatternVisitor[PatternType]):
                 try:
                     union = UnionType.make_union(self.self_match_types)
                     result = _type_kernel.rust_should_self_match(
-                        _serialize_type(typ),
-                        has_match_args,
-                        _serialize_type(union),
-                        resolver,
+                        _serialize_type(typ), has_match_args, _serialize_type(union), resolver
                     )
                     if result is not None:
                         return result

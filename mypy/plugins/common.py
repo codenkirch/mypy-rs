@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, NamedTuple
 from collections.abc import Callable as _Cb
+from typing import TYPE_CHECKING, NamedTuple
 
 from mypy.argmap import map_actuals_to_formals
 from mypy.modules_state import modules_state

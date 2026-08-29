@@ -5,9 +5,9 @@ Calls mypy.parse.parse() with eager=True directly on the real source corpus
 isolates parser + AST materialization throughput, the part the Rust migration
 actually touches.
 """
+
 from __future__ import annotations
 
-import os
 import sys
 import time
 from pathlib import Path
@@ -61,8 +61,10 @@ def run_once(corpus: list[tuple[str, bytes]], native: bool) -> tuple[float, int]
             err_count += 1
             # Don't spam; just count
             if err_count <= 3:
-                print(f"  [{ 'native' if native else 'python' }] {path}: {type(e).__name__}: {e}",
-                      file=sys.stderr)
+                print(
+                    f"  [{ 'native' if native else 'python' }] {path}: {type(e).__name__}: {e}",
+                    file=sys.stderr,
+                )
     elapsed = time.perf_counter() - t0
     return elapsed, err_count
 

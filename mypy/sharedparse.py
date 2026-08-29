@@ -6,8 +6,8 @@ from typing import Final
 
 try:
     from type_kernel import (
-        rust_special_function_elide_names as _rust_special_function_elide_names,
         rust_argument_elide_name as _rust_argument_elide_name,
+        rust_special_function_elide_names as _rust_special_function_elide_names,
     )
 
     _SHAREDPARSE_HAS_KERNEL = True

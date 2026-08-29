@@ -30,9 +30,9 @@ from __future__ import annotations
 import argparse
 import os
 import sys
-from collections import Counter
+from collections.abc import Callable
 from types import ModuleType
-from typing import Any, Callable
+from typing import Any
 
 # rust_* classifier seams whose None is the decided negative, not a deferral
 # (e.g. "not a TypeVar declaration"); counting them as fallbacks understates

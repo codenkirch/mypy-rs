@@ -25,10 +25,13 @@ from mypy.options import Options
 from mypy.types import MYPYC_NATIVE_INT_NAMES, Instance, ProperType
 
 try:
-    from type_kernel import rust_calculate_class_abstract_status as _rust_calculate_class_abstract_status
-    from type_kernel import rust_check_protocol_status as _rust_check_protocol_status
-    from type_kernel import rust_calculate_class_vars as _rust_calculate_class_vars
-    from type_kernel import rust_add_type_promotion as _rust_add_type_promotion
+    from type_kernel import (
+        rust_add_type_promotion as _rust_add_type_promotion,
+        rust_calculate_class_abstract_status as _rust_calculate_class_abstract_status,
+        rust_calculate_class_vars as _rust_calculate_class_vars,
+        rust_check_protocol_status as _rust_check_protocol_status,
+    )
+
     _HAS_RUST_CLASSPROP = True
 except ImportError:
     _rust_calculate_class_abstract_status = None  # type: ignore[assignment]

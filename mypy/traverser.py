@@ -110,38 +110,25 @@ from mypy.visitor import NodeVisitor
 
 # Rust traverses the serialized tree; falls back to pure-Python on error.
 try:
-    from type_kernel import rust_has_return_statement as _rust_has_return_statement
-    from type_kernel import rust_has_str_expression as _rust_has_str_expression
-    from type_kernel import rust_has_yield_expression as _rust_has_yield_expression
     from type_kernel import (
-        rust_has_yield_from_expression as _rust_has_yield_from_expression,
-    )
-    from type_kernel import rust_has_await_expression as _rust_has_await_expression
-    from type_kernel import (
-        rust_count_return_statements as _rust_count_return_statements,
-    )
-    from type_kernel import (
-        rust_count_yield_expressions as _rust_count_yield_expressions,
-    )
-    from type_kernel import (
-        rust_count_yield_from_expressions as _rust_count_yield_from_expressions,
-    )
-    from type_kernel import (
+        rust_count_all_returns as _rust_count_all_returns,
         rust_count_name_and_member_expressions as _rust_count_name_and_member_exprs,
-    )
-    from type_kernel import (
-        rust_count_return_statements_and_flags as _rust_count_returns_and_flags,
-    )
-    from type_kernel import rust_count_all_returns as _rust_count_all_returns
-    from type_kernel import rust_has_yield_return as _rust_has_yield_return
-    from type_kernel import rust_has_complex_slice as _rust_has_complex_slice
-    from type_kernel import (
         rust_count_non_extension_handlers as _rust_count_non_extension_handlers,
-    )
-    from type_kernel import rust_is_global_expr as _rust_is_global_expr
-    from type_kernel import (
         rust_count_non_literal_handlers as _rust_count_non_literal_handlers,
+        rust_count_return_statements as _rust_count_return_statements,
+        rust_count_return_statements_and_flags as _rust_count_returns_and_flags,
+        rust_count_yield_expressions as _rust_count_yield_expressions,
+        rust_count_yield_from_expressions as _rust_count_yield_from_expressions,
+        rust_has_await_expression as _rust_has_await_expression,
+        rust_has_complex_slice as _rust_has_complex_slice,
+        rust_has_return_statement as _rust_has_return_statement,
+        rust_has_str_expression as _rust_has_str_expression,
+        rust_has_yield_expression as _rust_has_yield_expression,
+        rust_has_yield_from_expression as _rust_has_yield_from_expression,
+        rust_has_yield_return as _rust_has_yield_return,
+        rust_is_global_expr as _rust_is_global_expr,
     )
+
     from mypy.astwire import serialize_node as _ast_serialize_node
     from mypy.cache import WriteBuffer as _AstWriteBuffer
 
@@ -1089,9 +1076,7 @@ def all_name_and_member_expressions(
 ) -> tuple[list[NameExpr], list[MemberExpr]]:
     if _TRAVERSER_HAS_KERNEL:
         try:
-            rust_names, rust_members = _rust_count_name_and_member_exprs(
-                _serialize_ast_node(node)
-            )
+            rust_names, rust_members = _rust_count_name_and_member_exprs(_serialize_ast_node(node))
             if rust_names == 0 and rust_members == 0:
                 return ([], [])
         except (AssertionError, NotImplementedError, RecursionError):
@@ -1339,15 +1324,11 @@ class ReturnAndFlagsCollector(FuncCollectorBase):
         self.return_statements.append((stmt, self.in_finally))
 
 
-def all_return_statements_and_flags(
-    node: Node,
-) -> list[tuple[ReturnStmt, bool]]:
+def all_return_statements_and_flags(node: Node) -> list[tuple[ReturnStmt, bool]]:
     """Collect (ReturnStmt, in_finally) pairs."""
     if _TRAVERSER_HAS_KERNEL:
         try:
-            total, in_finally = _rust_count_returns_and_flags(
-                _serialize_ast_node(node)
-            )
+            total, in_finally = _rust_count_returns_and_flags(_serialize_ast_node(node))
             if total == 0:
                 return []
         except (AssertionError, NotImplementedError, RecursionError):
@@ -1435,9 +1416,7 @@ def find_non_extension_handlers(node: Node) -> list[FuncDef]:
     """Find methods (FuncDef) not wrapped in a Decorator."""
     if _TRAVERSER_HAS_KERNEL:
         try:
-            if _rust_count_non_extension_handlers(
-                _serialize_ast_node(node)
-            ) == 0:
+            if _rust_count_non_extension_handlers(_serialize_ast_node(node)) == 0:
                 return []
         except (AssertionError, NotImplementedError, RecursionError):
             pass
@@ -1497,9 +1476,7 @@ def find_non_literal_handlers(node: Node) -> list[FuncDef]:
     """Find methods whose body is not all-literal expressions."""
     if _TRAVERSER_HAS_KERNEL:
         try:
-            if _rust_count_non_literal_handlers(
-                _serialize_ast_node(node)
-            ) == 0:
+            if _rust_count_non_literal_handlers(_serialize_ast_node(node)) == 0:
                 return []
         except (AssertionError, NotImplementedError, RecursionError):
             pass

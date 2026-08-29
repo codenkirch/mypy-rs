@@ -37,9 +37,9 @@ try:
         rust_hash_digest_bytes as _rust_hash_digest_bytes,
         rust_hash_path_stem as _rust_hash_path_stem,
         rust_is_dunder as _rust_is_dunder,
-        rust_is_sunder as _rust_is_sunder,
         rust_is_stub_package_file as _rust_is_stub_package_file,
         rust_is_sub_path_normabs as _rust_is_sub_path_normabs,
+        rust_is_sunder as _rust_is_sunder,
         rust_module_prefix as _rust_module_prefix,
         rust_plural_s as _rust_plural_s,
         rust_short_type as _rust_short_type,
@@ -458,7 +458,9 @@ def correct_relative_import(
     cur_mod_id: str, relative: int, target: str, is_cur_package_init_file: bool
 ) -> tuple[str, bool]:
     if _HAS_RUST_UTILS:
-        result = _rust_correct_relative_import(cur_mod_id, relative, target, is_cur_package_init_file)
+        result = _rust_correct_relative_import(
+            cur_mod_id, relative, target, is_cur_package_init_file
+        )
         if result is not None:
             return (result[0], bool(result[1]))
     if relative == 0:

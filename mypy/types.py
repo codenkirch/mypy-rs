@@ -20,7 +20,6 @@ from typing import (
 from typing_extensions import Self
 
 from librt.internal import (
-    WriteBuffer,
     read_int as read_int_bare,
     read_str as read_str_bare,
     write_int as write_int_bare,
@@ -168,14 +167,7 @@ def _wire_cache_enabled() -> bool:
 import os as _os
 
 _serialize_stats_on: bool = bool(_os.environ.get("MYPY_SERIALIZE_STATS"))
-_serialize_stats = {
-    "calls": 0,
-    "hits": 0,
-    "builtin": 0,
-    "writes": 0,
-    "tvar": 0,
-    "bytes": 0,
-}
+_serialize_stats = {"calls": 0, "hits": 0, "builtin": 0, "writes": 0, "tvar": 0, "bytes": 0}
 
 
 def _clear_serialize_stats() -> None:
@@ -2602,8 +2594,7 @@ class CallableType(FunctionLike):
                 # Verify no star/kwarg args are present (Rust gate only handles clean
                 # positional cases; otherwise fall through to Python).
                 if not any(
-                    k in (ARG_STAR, ARG_STAR2, ARG_NAMED, ARG_NAMED_OPT)
-                    for k in self.arg_kinds
+                    k in (ARG_STAR, ARG_STAR2, ARG_NAMED, ARG_NAMED_OPT) for k in self.arg_kinds
                 ):
                     return [
                         FormalArgument(n, p, self.arg_types[i], r)
@@ -4816,7 +4807,9 @@ def _native_callable_formal_arguments(t: Type) -> list[tuple[str | None, int | N
         return None
 
 
-def _native_callable_argument_by_name(t: Type, name: str | None) -> tuple[str | None, int | None, bool] | None:
+def _native_callable_argument_by_name(
+    t: Type, name: str | None
+) -> tuple[str | None, int | None, bool] | None:
     if not (_VISITOR_HAS_TYPE_KERNEL and _native_visitor_active):
         return None
     try:
@@ -4829,7 +4822,9 @@ def _native_callable_argument_by_name(t: Type, name: str | None) -> tuple[str | 
         return None
 
 
-def _native_callable_argument_by_position(t: Type, position: int | None) -> tuple[str | None, int | None, bool] | None:
+def _native_callable_argument_by_position(
+    t: Type, position: int | None
+) -> tuple[str | None, int | None, bool] | None:
     if not (_VISITOR_HAS_TYPE_KERNEL and _native_visitor_active):
         return None
     try:
@@ -4856,7 +4851,7 @@ def _native_copy_modified(t: Type, changes: dict[str, Any]) -> Type | None:
     if len(changes) != 1:
         return None
     try:
-        (field, value), = changes.items()
+        ((field, value),) = changes.items()
     except ValueError:
         return None
     # The in-flight guard stops recursion: `_serialize_type_for_visitor`
@@ -4868,9 +4863,7 @@ def _native_copy_modified(t: Type, changes: dict[str, Any]) -> Type | None:
         value_bytes = _serialize_copy_modified_value(field, value)
         if value_bytes is None:
             return None
-        result = _rust_copy_modified(
-            _serialize_type_for_visitor(t), field, value_bytes
-        )
+        result = _rust_copy_modified(_serialize_type_for_visitor(t), field, value_bytes)
     except (AssertionError, NotImplementedError, ValueError, TypeError):
         return None
     finally:

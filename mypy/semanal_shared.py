@@ -54,10 +54,10 @@ from mypy.types import (
 
 try:
     from type_kernel import (
-        rust_set_callable_name as _rust_set_callable_name,
-        rust_has_placeholder as _rust_has_placeholder,
         rust_calculate_tuple_fallback as _rust_calculate_tuple_fallback,
         rust_find_dataclass_transform_spec as _rust_find_dataclass_transform_spec,
+        rust_has_placeholder as _rust_has_placeholder,
+        rust_set_callable_name as _rust_set_callable_name,
     )
 
     _SEMANAL_SHARED_HAS_KERNEL = True
