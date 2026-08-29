@@ -2143,3 +2143,18 @@ directly to `main`.
   `NativeFindSelfTypeSuite` (parity through a resolver-backed
   `setUp`, defer proofs for the resolver-less and missing-snapshot
   paths).
+- `expand_aliases_depth` recursive-alias cut (issue #1149) — the alias
+  expansion inside the subtype kernel now carries an active-path stack
+  (`type ActiveAlias = (String, Vec<Type>)`, keyed by alias type_ref
+  plus args identity). Re-entering an alias already on the active path
+  returns the node unexpanded (the cut), matching what Python's lazy
+  `get_proper_type` keeps at the same position; the stack pops on every
+  decided path, so sibling occurrences with identical or differing args
+  still expand. Defers on cut nodes so engine-level comparisons defer
+  to Python, preserving parity. Cold self-check audit:
+  present-but-deferred 6320 -> 5811 (-8.0%); `builtins._ClassInfo`
+  414 -> 0. Covered by four Rust unit tests in `subtypes.rs`
+  (self-recursive union cut, re-entry consistency, sibling
+  same-alias-different-args expansion, pop-then-expand) plus
+  `test_recursive_alias_gate_parity_no_wrong_verdict` in
+  `NativeSubtypesDeferralSuite` (mypy/test/testtypes.py).
