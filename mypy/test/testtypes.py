@@ -4449,11 +4449,12 @@ class NativeExpandTypeEmptyEnvSuite(Suite):
     `expand_type(typ, {})` performs no substitution. The seam used to bail
     on ANY empty env (expandtype.rs returned None inside rust_expand_type),
     forcing a pure-Python rebuild even for typevar-free types. Now an empty
-    env is wire-portable: `expand_type_with_env` rebuilds the tree and only
-    defers when a leftover TypeVar would break the caller's object-identity
-    expectations (the `result_has_typevar` guard). This suite locks the
-    differential: a typevar-free type must engage natively, a typevar-bearing
-    type must keep deferring (identity), and gate-on == gate-off for both.
+    env is wire-portable: `expand_type_with_env` rebuilds the tree and
+    returns leftover TypeVars instead of deferring; the shim re-links the
+    decoded vars to the live originals (`resync_var_identities`), so the
+    caller keeps object identity. This suite locks the differential: a
+    typevar-free type must engage natively and gate-on == gate-off for
+    both typevar-free and typevar-bearing input.
     """
 
     def setUp(self) -> None:
@@ -4524,10 +4525,10 @@ class NativeExpandTypeEmptyEnvSuite(Suite):
         # G[A] (no typevars): native rebuild must equal Python rebuild.
         self._assert_par(self.fx.ga)
 
-    def test_typevar_still_defers_for_identity(self) -> None:
-        # G[T] with an empty env leaves T unmatched. Python keeps the
-        # original T object; a wire clone would break identity, so the seam
-        # must return None and defer, while gate-on still equals gate-off.
+    def test_typevar_result_relinks_identity(self) -> None:
+        # G[T] with an empty env leaves T unmatched. The seam returns the
+        # expansion with the leftover T; the shim re-links every decoded T
+        # occurrence to the live original (identity parity, gate-on == off).
         from mypy.expandtype import _serialize_env, _serialize_type
 
         result = _type_kernel.rust_expand_type(
@@ -4536,8 +4537,15 @@ class NativeExpandTypeEmptyEnvSuite(Suite):
             _serialize_env({}),
             state.strict_optional,
         )
-        assert result is None, "empty-env typevar-bearing expand_type must defer for identity"
-        self._assert_par(self.fx.gt)
+        assert (
+            result is not None
+        ), "empty-env typevar-bearing expand_type must return the leftover-tvar result"
+        off = self._with_gate(False, lambda: self._expand(self.fx.gt))
+        on = self._with_gate(True, lambda: self._expand(self.fx.gt))
+        assert_equal(str(on), str(off), "expand_type(empty env) parity")
+        assert isinstance(on, Instance), str(on)  # type: ignore[misc]
+        assert isinstance(off, Instance), str(off)  # type: ignore[misc]
+        assert on.args[0] is off.args[0] is self.fx.t, "decoded TypeVar must relink to original"
 
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
