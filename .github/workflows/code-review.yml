@@ -7,7 +7,6 @@ name: AI Code Review
 on:
   pull_request:
     branches: [main]
-  workflow_dispatch: {}
 
 permissions:
   contents: read
@@ -25,6 +24,9 @@ jobs:
       github.event.pull_request.head.repo.full_name == github.repository
     runs-on: [self-hosted, macOS, ARM64, VidiomTM]
     timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
     steps:
       - name: Checkout PR head
         uses: actions/checkout@v4
@@ -55,7 +57,11 @@ jobs:
                           .replace("|", "\\|").replace("<", "&lt;")
                           .replace(">", "&gt;"))
 
-          result = json.load(open("ocr-result.json"))
+          try:
+              with open("ocr-result.json") as f:
+                  result = json.load(f)
+          except (OSError, json.JSONDecodeError) as exc:
+              result = {"status": f"unreadable output: {exc}", "comments": []}
           sha = os.environ["PR_SHA"][:10]
           pr = os.environ["PR_NUMBER"]
           comments = result.get("comments") or []
@@ -76,7 +82,7 @@ jobs:
                   suggestion = (c.get("suggestion_code") or "").strip()
                   if not suggestion or "````" in suggestion:
                       continue  # cannot fence safely; findings table already carries the message
-                  loc = f"{c.get('path', '?')}:{c.get('start_line', '?')}"
+                  loc = esc(f"{c.get('path', '?')}:{c.get('start_line', '?')}")
                   body += (f"\n\n<details><summary><code>{loc}</code></summary>\n\n"
                            f"````\n{suggestion}\n````\n</details>")
           with open("ocr-body.md", "w") as f:
