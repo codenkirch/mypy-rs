@@ -649,6 +649,8 @@ pub(crate) fn rust_restrict_subtype_away(
 
 /// `TypeOfAny.special_form` (mypy/type_visitor.py / types.py:2682).
 const TYPE_OF_ANY_SPECIAL_FORM: i64 = 6;
+/// `TypeOfAny.from_another_any` == 7 (types.py:237).
+const TYPE_OF_ANY_FROM_ANOTHER_ANY: i64 = 7;
 
 /// `mypy.join.join_type_list` (join.py:1508-1529): fold-join over a
 /// list, pairing each item with the accumulator through the setops join
@@ -748,8 +750,12 @@ fn join_one_pair(
             if l_ref == r_ref {
                 return Some(left.clone());
             }
-            let result = crate::setops::visit_instance_join(left, right, ctx, resolver)?;
-            return instance_join_result_to_type(&result, left, right);
+            // Undecided prejoin results fall through to the core routing:
+            // the args-less shapes its port declines (e.g. the
+            // promote-aware common-ancestor join) are the core's job.
+            if let Some(result) = crate::setops::visit_instance_join(left, right, ctx, resolver) {
+                return instance_join_result_to_type(&result, left, right);
+            }
         }
     }
     let joined = crate::setops::join_types(left, right, ctx, resolver);
@@ -812,7 +818,102 @@ fn join_one_pair(
             })
         }
         Some(crate::setops::SetOpResult::Encoded(bytes)) => decode_type(&bytes),
-        None => None,
+        None => join_instance_pair_via_core(left, right, ctx, resolver),
+    }
+}
+
+/// Route an unresolved pair through the full InstanceJoiner core
+/// (`setops::join_instances_core`): its `(t, s)` result naming is the
+/// OPPOSITE of `visit_instance_join`'s; `map_core_result` re-orients.
+fn join_instance_pair_via_core(
+    left: &Type,
+    right: &Type,
+    ctx: &SubtypeContext,
+    resolver: &TypeResolver,
+) -> Option<Type> {
+    let mut seen: crate::setops::SeenInstances = Vec::new();
+    crate::setops::join_instances_core(left, right, ctx, resolver, &mut seen)
+        .and_then(|res| map_core_result(res, left, right))
+}
+
+/// Map a core SetOpResult to a concrete Type, or None to defer the pair
+/// to the Python fold.
+fn map_core_result(res: crate::setops::SetOpResult, left: &Type, right: &Type) -> Option<Type> {
+    match res {
+        crate::setops::SetOpResult::SameS => Some(right.clone()),
+        crate::setops::SetOpResult::SameT => Some(left.clone()),
+        crate::setops::SetOpResult::Object => Some(Type::Instance {
+            type_ref: "builtins.object".to_string(),
+            args: vec![],
+            last_known_value: None,
+            extra_attrs: None,
+        }),
+        crate::setops::SetOpResult::Ancestor(fullname) => Some(Type::Instance {
+            type_ref: fullname,
+            args: vec![],
+            last_known_value: None,
+            extra_attrs: None,
+        }),
+        crate::setops::SetOpResult::Encoded(bytes) => decode_type(&bytes),
+        crate::setops::SetOpResult::SameTypeWithArgs {
+            type_ref,
+            arg_discs,
+        } => {
+            let (Type::Instance { args: l_args, .. }, Type::Instance { args: r_args, .. }) =
+                (left, right)
+            else {
+                return None;
+            };
+            if arg_discs.len() != l_args.len() || arg_discs.len() != r_args.len() {
+                return None;
+            }
+            let final_args: Option<Vec<Type>> = arg_discs
+                .iter()
+                .enumerate()
+                .map(|(i, &d)| -> Option<Type> {
+                    match d {
+                        0 => Some(r_args[i].clone()), // core s = second arg
+                        1 => Some(l_args[i].clone()), // core t = first arg
+                        4 => {
+                            // The shim picks the AnyType side (t first) as
+                            // the `source` of a fresh from_another_any Any.
+                            // Defer when neither side is a plain AnyType.
+                            let src = if matches!(l_args[i], Type::AnyType { .. }) {
+                                &l_args[i]
+                            } else if matches!(r_args[i], Type::AnyType { .. }) {
+                                &r_args[i]
+                            } else {
+                                return None;
+                            };
+                            Some(Type::AnyType {
+                                type_of_any: TYPE_OF_ANY_FROM_ANOTHER_ANY,
+                                source_any: Some(Box::new(src.clone())),
+                                missing_import_name: None,
+                            })
+                        }
+                        _ => None,
+                    }
+                })
+                .collect();
+            let final_args = final_args?;
+            Some(Type::Instance {
+                type_ref,
+                args: final_args,
+                last_known_value: None,
+                extra_attrs: None,
+            })
+        }
+        crate::setops::SetOpResult::Bottom => Some(Type::UnionType {
+            items: vec![left.clone(), right.clone()],
+            uses_pep604_syntax: false,
+            can_be_true: true,
+            can_be_false: true,
+        }),
+        crate::setops::SetOpResult::Any => Some(Type::AnyType {
+            type_of_any: TYPE_OF_ANY_SPECIAL_FORM,
+            source_any: None,
+            missing_import_name: None,
+        }),
     }
 }
 
@@ -2575,6 +2676,136 @@ mod tests {
         let a = make_instance("builtins.int", vec![]);
         let b = make_instance("mymod.NotFound", vec![]);
         assert_eq!(join_type_list_inner(&[a, b], true, &r), None);
+    }
+
+    #[test]
+    fn test_join_one_pair_lkv_routes_via_core() {
+        // Instance-with-lkv pair: prejoin defers, join_one_pair retries
+        // via the core, dropping the lkv. Core SameT = FIRST arg, SameS
+        // = SECOND arg (opposite of visit_instance_join): pins it.
+        let mut r = TypeResolver::new();
+        let mut snap = TypeInfoSnapshot {
+            fullname: "builtins.int".to_string(),
+            name: "int".to_string(),
+            ..Default::default()
+        };
+        snap.mro.push("builtins.int".to_string());
+        r.insert("builtins.int".to_string(), snap);
+        let plain = make_instance("builtins.int", vec![]);
+        let lkv = Type::Instance {
+            type_ref: "builtins.int".to_string(),
+            args: vec![],
+            last_known_value: Some(Box::new(Type::LiteralType {
+                fallback: Box::new(plain.clone()),
+                value: wire::LiteralValue::Int(1),
+            })),
+            extra_attrs: None,
+        };
+        let ctx = SubtypeContext::new(false, false, false, false, false, true);
+        assert_eq!(join_one_pair(&lkv, &plain, &ctx, &r), Some(plain.clone()));
+        assert_eq!(join_one_pair(&plain, &lkv, &ctx, &r), Some(plain));
+    }
+
+    #[test]
+    fn test_join_type_list_same_ref_args_via_core() {
+        // Same class with identical args rides the core's
+        // visit_instance_with_args arm (not covered by the prejoin);
+        // Box snapshot: one covariant TypeVarType, object upper bound.
+        let mut r = TypeResolver::new();
+        let mut wbuf = WriteBuffer::new();
+        wire::write_type(&mut wbuf, &make_instance("builtins.object", vec![])).unwrap();
+        let object_blob = wbuf.into_bytes();
+        let mut int_snap = TypeInfoSnapshot {
+            fullname: "builtins.int".to_string(),
+            name: "int".to_string(),
+            ..Default::default()
+        };
+        int_snap.mro.push("builtins.int".to_string());
+        int_snap.mro.push("builtins.object".to_string());
+        int_snap.has_base.insert("builtins.int".to_string());
+        int_snap.has_base.insert("builtins.object".to_string());
+        r.insert("builtins.int".to_string(), int_snap);
+        let mut obj_snap = TypeInfoSnapshot {
+            fullname: "builtins.object".to_string(),
+            name: "object".to_string(),
+            ..Default::default()
+        };
+        obj_snap.mro.push("builtins.object".to_string());
+        obj_snap.has_base.insert("builtins.object".to_string());
+        r.insert("builtins.object".to_string(), obj_snap);
+        let mut box_snap = TypeInfoSnapshot {
+            fullname: "mymod.Box".to_string(),
+            name: "Box".to_string(),
+            type_vars_with_variance: vec![("T".to_string(), 1, 0)], // COVARIANT, TypeVarType
+            ..Default::default()
+        };
+        box_snap.mro.push("mymod.Box".to_string());
+        box_snap.mro.push("builtins.object".to_string());
+        box_snap.has_base.insert("mymod.Box".to_string());
+        box_snap.has_base.insert("builtins.object".to_string());
+        box_snap.type_var_upper_bounds = vec![object_blob.clone()];
+        r.insert("mymod.Box".to_string(), box_snap);
+        let boxed = make_instance("mymod.Box", vec![make_instance("builtins.int", vec![])]);
+        assert_eq!(
+            join_type_list_inner(&[boxed.clone(), boxed], true, &r),
+            Some(make_instance(
+                "mymod.Box",
+                vec![make_instance("builtins.int", vec![])]
+            ))
+        );
+    }
+
+    #[test]
+    fn test_join_type_list_arg_join_to_object_via_core() {
+        // Box[int] and Box[str]: the argwise fold joins int with str to
+        // their common ancestor (object), mirroring Python's same-type
+        // combine (join.py:241-290).
+        let mut wbuf = WriteBuffer::new();
+        wire::write_type(&mut wbuf, &make_instance("builtins.object", vec![])).unwrap();
+        let object_blob = wbuf.into_bytes();
+        let mut r = TypeResolver::new();
+        for fullname in [
+            "builtins.int",
+            "builtins.str",
+            "builtins.object",
+            "mymod.Box",
+        ] {
+            let name = fullname.rsplit('.').next().unwrap();
+            let mut s = TypeInfoSnapshot {
+                fullname: fullname.to_string(),
+                name: name.to_string(),
+                ..Default::default()
+            };
+            s.mro.push(fullname.to_string());
+            s.mro.push("builtins.object".to_string());
+            s.has_base.insert(fullname.to_string());
+            s.has_base.insert("builtins.object".to_string());
+            if fullname != "builtins.object" {
+                s.bases = vec![object_blob.clone()];
+            }
+            if fullname == "mymod.Box" {
+                // One covariant TypeVarType with an object upper
+                // bound, so visit_instance_with_args folds the args
+                // (Python semantics: class Box[T] with its upper bound).
+                s.type_vars_with_variance = vec![("T".to_string(), 1, 0)];
+                s.type_var_upper_bounds = vec![object_blob.clone()];
+            }
+            r.insert(fullname.to_string(), s);
+        }
+        assert_eq!(
+            join_type_list_inner(
+                &[
+                    make_instance("mymod.Box", vec![make_instance("builtins.int", vec![])]),
+                    make_instance("mymod.Box", vec![make_instance("builtins.str", vec![])]),
+                ],
+                true,
+                &r
+            ),
+            Some(make_instance(
+                "mymod.Box",
+                vec![make_instance("builtins.object", vec![])]
+            ))
+        );
     }
 
     // -- restrict_subtype_away --

@@ -774,6 +774,18 @@ including:
   differential of the full join suites in `mypy/test/testtypes.py`
   (`NativeJoinTypesSuite`, `NativeJoinTypeListSuite`), plus Rust unit
   tests (`test_join_type_list_*` in `checker_helpers.rs`).
+- `join_type_list` defer round 2 (issue #1266) — undecided Instance
+  pairs the setops kernel declines (`join_types` -> None) now route
+  through `setops::join_instances_core` for a decision instead of
+  deferring the whole fold (`join_one_pair` retry, core result
+  re-oriented by `map_core_result` to match the shim's `(t, s)`
+  naming). `join.py` hoists the n<=1 early returns ahead of the native
+  gate; `join_instances_core` / `SeenInstances` widened to
+  `pub(crate)`. Cold self-check audit (stripped): whole-call events
+  74, native 18 -> 21 (28%), lkv wall 39 unchanged. Remaining walls:
+  the lkv bucket (by design), pairs the core itself declines (9),
+  concrete-mapping defers in `join_one_pair` (non-plain-Any
+  arg_disc-4).
 - `rust_solve_generic_call` (issue #826) — ported the generic-call solve
   entry (`solve_constraints` + `infer_constraints_full_inner` +
   `apply_generic_arguments`) behind the `_native_checkexpr_active` gate

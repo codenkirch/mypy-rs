@@ -4920,7 +4920,7 @@ pub(crate) fn rust_meet_types(
 /// `((t_ref, t_args_bytes), (s_ref, s_args_bytes))` pairs mirroring
 /// Python's `list[(Instance, Instance)]`. Args-less operands encode to
 /// empty arg bytes.
-type SeenInstances = Vec<((String, Vec<u8>), (String, Vec<u8>))>;
+pub(crate) type SeenInstances = Vec<((String, Vec<u8>), (String, Vec<u8>))>;
 
 /// `InstanceJoiner.join_instances` (join.py:208-303), full Rust port
 /// behind a new seam with a real recursion guard.
@@ -4970,7 +4970,7 @@ type SeenInstances = Vec<((String, Vec<u8>), (String, Vec<u8>))>;
 /// key (conservative: walks a cyclic pair one extra level before the
 /// guard fires). Each recursion level truncates back to its entry
 /// mark on return (Python pops after every `join_instances`).
-fn join_instances_core(
+pub(crate) fn join_instances_core(
     t: &Type,
     s: &Type,
     ctx: &SubtypeContext,

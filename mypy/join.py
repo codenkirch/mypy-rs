@@ -1506,6 +1506,13 @@ def object_or_any_from_type(typ: ProperType) -> ProperType:
 
 
 def join_type_list(types: Sequence[Type]) -> Type:
+    # The fold below makes no join decision for lists of length <= 1:
+    # empty is UninhabitedType (needed for empty tuples), a single item
+    # is itself. Check before the native gate to skip the FFI boundary.
+    if not types:
+        return UninhabitedType()
+    if len(types) == 1:
+        return types[0]
     if _HAS_TYPE_KERNEL and _native_join_active and _native_join_resolver is not None:
         try:
             blobs = [_serialize_type(t) for t in types]
@@ -1525,10 +1532,6 @@ def join_type_list(types: Sequence[Type]) -> Type:
                     return decoded
         except (AssertionError, NotImplementedError, ValueError, AttributeError):
             pass
-    if not types:
-        # This is a little arbitrary but reasonable. Any empty tuple should be compatible
-        # with all variable length tuples, and this makes it possible.
-        return UninhabitedType()
     joined = types[0]
     for t in types[1:]:
         joined = join_types(joined, t)
