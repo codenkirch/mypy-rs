@@ -284,6 +284,7 @@ class TestNativeParserBinaryFormat(unittest.TestCase):
                 + [END_TAG, LIST_GEN, 22, nodes.STR_EXPR]
                 + [LITERAL_STR, int_enc(5)]
                 + list(b"hello")
+                + [0]  # corrupted flag (unescaped surrogate escapes present)
                 + locs(1, 6, 1, 13)
                 + [END_TAG]
                 # arg_kinds: [ARG_POS]

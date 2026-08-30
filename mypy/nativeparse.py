@@ -1364,7 +1364,12 @@ def read_expression(state: State, data: ReadBuffer) -> Expression:
         expect_end_tag(data)
         return ce
     elif tag == nodes.STR_EXPR:
-        se = StrExpr(read_str(data))
+        value = read_str(data)
+        if read_bool(data):
+            # Broken surrogate escapes: re-evaluate the raw token(s), which
+            # the serializer writes space-joined for implicit concatenation.
+            value = literal_eval_str_token(read_str(data))
+        se = StrExpr(value)
         read_loc(data, se)
         expect_end_tag(data)
         return se
@@ -1451,7 +1456,10 @@ def read_expression(state: State, data: ReadBuffer) -> Expression:
                 for i in range(n):
                     fitems.append(read_fstring_item(state, data))
             else:
-                s = StrExpr(read_str(data))
+                value = read_str(data)
+                if read_bool(data):
+                    value = literal_eval_str_token(read_str(data))
+                s = StrExpr(value)
                 read_loc(data, s)
                 fitems.append(s)
         expr = build_fstring_join(data, fitems)
@@ -1547,7 +1555,10 @@ def read_expression(state: State, data: ReadBuffer) -> Expression:
                     format_spec = None
                 titems.append((e, s, conv, format_spec))
             else:
-                s = StrExpr(read_str(data))
+                value = read_str(data)
+                if read_bool(data):
+                    value = decode_string_segment(read_str(data))
+                s = StrExpr(value)
                 read_loc(data, s)
                 titems.append(s)
         expr = TemplateStrExpr(titems)
@@ -1696,10 +1707,126 @@ def collapse_consecutive_str_items(items: list[Expression]) -> list[Expression]:
     return new_items
 
 
+def _hex_digits(raw: str, start: int, count: int) -> str | None:
+    part = raw[start : start + count]
+    if len(part) == count and all(c in "0123456789abcdefABCDEF" for c in part):
+        return part
+    return None
+
+
+def decode_string_segment(raw: str) -> str:
+    """Decode a raw f-string/t-string literal segment like CPython does.
+
+    Doubled braces always collapse. Backslash escapes follow normal string
+    rules; the serializer only flags segments of non-raw strings. Invalid
+    escapes keep their backslash, as CPython does.
+    """
+    out: list[str] = []
+    simple = {
+        "a": "\a",
+        "b": "\b",
+        "f": "\f",
+        "n": "\n",
+        "r": "\r",
+        "t": "\t",
+        "v": "\v",
+    }
+    i = 0
+    n = len(raw)
+    while i < n:
+        ch = raw[i]
+        if ch == "{":
+            # Only a doubled brace can appear in a valid segment.
+            out.append("{")
+            i += 2 if i + 1 < n and raw[i + 1] == "{" else 1
+            continue
+        if ch == "}":
+            out.append("}")
+            i += 2 if i + 1 < n and raw[i + 1] == "}" else 1
+            continue
+        if ch != "\\":
+            out.append(ch)
+            i += 1
+            continue
+        if i + 1 >= n:
+            out.append("\\")  # trailing backslash is preserved
+            break
+        nx = raw[i + 1]
+        if nx == "\n":
+            i += 2  # line continuation
+            continue
+        if nx in simple:
+            out.append(simple[nx])
+            i += 2
+            continue
+        if nx in ("\\", "'", '"'):
+            out.append(nx)
+            i += 2
+            continue
+        if nx in "01234567":
+            j = i + 1
+            while j < min(i + 4, n) and raw[j] in "01234567":
+                j += 1
+            out.append(chr(int(raw[i + 1 : j], 8)))
+            i = j
+            continue
+        if nx == "x":
+            digits = _hex_digits(raw, i + 2, 2)
+            if digits is not None:
+                out.append(chr(int(digits, 16)))
+                i += 4
+                continue
+        if nx == "u":
+            digits = _hex_digits(raw, i + 2, 4)
+            if digits is not None:
+                out.append(chr(int(digits, 16)))
+                i += 6
+                continue
+        if nx == "U":
+            digits = _hex_digits(raw, i + 2, 8)
+            if digits is not None:
+                try:
+                    out.append(chr(int(digits, 16)))
+                except ValueError:  # out-of-range scalar, CPython errors here
+                    out.append(raw[i : i + 10])
+                i += 10
+                continue
+        if nx == "N" and raw.startswith("\\N", i):
+            import unicodedata  # lazy: only reached on the repair path
+
+            end = raw.find("}", i + 3)
+            if end != -1:
+                try:
+                    out.append(unicodedata.lookup(raw[i + 3 : end]))
+                    i = end + 1
+                    continue
+                except KeyError:
+                    pass  # unknown name, fall through to invalid-escape rule
+        out.append("\\")
+        i += 1  # invalid escape: CPython keeps the backslash and warns
+    return "".join(out)
+
+
+def literal_eval_str_token(raw: str) -> str:
+    """Re-evaluate raw string token(s), prefix and quotes included.
+
+    Implicitly concatenated parts arrive space-joined from the serializer, so
+    evaluating them together gives the concatenated value.
+    """
+    import ast  # lazy: only reached on the rare broken-surrogate repair path
+
+    value = ast.literal_eval(raw)
+    assert isinstance(value, str), raw
+    return value
+
+
 def read_fstring_item(state: State, data: ReadBuffer) -> Expression:
     t = read_tag(data)
     if t == LITERAL_STR:
-        str_expr = StrExpr(read_str_bare(data))
+        value = read_str_bare(data)
+        if read_bool(data):
+            value = decode_string_segment(read_str(data))
+        str_expr = StrExpr(value)
         read_loc(data, str_expr)
         return str_expr
     elif t == nodes.FSTRING_INTERPOLATION:

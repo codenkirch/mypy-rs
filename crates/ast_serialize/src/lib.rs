@@ -1290,8 +1290,28 @@ fn serialize_expr(serializer: &mut Serializer<'_>, expression: &ast::Expr) -> Py
         }
         ast::Expr::StringLiteral(string) => {
             let loc = serializer.loc(expression);
+            // Ruff decodes lone surrogate escapes to U+FFFD, losing the exact
+            // value. When a part has one, also write the raw source tokens;
+            // the Python reader re-evaluates them with CPython semantics.
+            let raw_tokens: Vec<&str> = string
+                .value
+                .as_slice()
+                .iter()
+                .map(|part| {
+                    let range = part.range;
+                    &serializer.source[range.start().to_usize()..range.end().to_usize()]
+                })
+                .collect();
+            let corrupted = string.value.as_slice().iter().enumerate().any(|(i, part)| {
+                !part.flags.prefix().is_raw() && has_surrogate_escape(raw_tokens[i])
+            });
             serializer.writer.tag(STR_EXPR);
             serializer.writer.string(string.value.to_str());
+            serializer.writer.bool(corrupted);
+            if corrupted {
+                let raw = raw_tokens.join(" ");
+                serializer.writer.string(&raw);
+            }
             serializer.writer.loc(&loc);
             serializer.writer.tag(END_TAG);
             Ok(())
@@ -1387,14 +1407,23 @@ fn serialize_f_string_expr(
     for part in f_string.value.as_slice() {
         match part {
             ast::FStringPart::Literal(literal) => {
+                // Same lone-surrogate repair as plain string literals: the
+                // value is lossy when the token has such an escape.
+                let range = literal.range;
+                let raw = &serializer.source[range.start().to_usize()..range.end().to_usize()];
+                let corrupted = !literal.flags.prefix().is_raw() && has_surrogate_escape(raw);
                 let loc = serializer.loc(literal);
                 serializer.writer.bool(false);
                 serializer.writer.string(literal.as_str());
+                serializer.writer.bool(corrupted);
+                if corrupted {
+                    serializer.writer.string(raw);
+                }
                 serializer.writer.loc(&loc);
             }
             ast::FStringPart::FString(part) => {
                 serializer.writer.bool(true);
-                serialize_f_string_items(serializer, &part.elements)?;
+                serialize_f_string_items(serializer, &part.elements, part.flags.prefix().is_raw())?;
             }
         }
     }
@@ -1414,7 +1443,7 @@ fn serialize_f_string_expr(
 ///     expr; str (source); bool has_conv; [str conv]; bool has_format_spec;
 ///     [fstring_items]
 ///   else:
-///     str; loc
+///     str; bool corrupted; [str raw]
 /// loc; END_TAG
 /// ```
 /// Matches `fastparse.visit_TemplateStr`, which uses the same item shape as
@@ -1436,6 +1465,7 @@ fn serialize_t_string_expr(
         .sum();
     serializer.writer.int(nparts as i64);
     for tstring in t_string.value.as_slice() {
+        let is_raw = tstring.flags.prefix().is_raw();
         for element in tstring.elements.iter() {
             match element {
                 ast::InterpolatedStringElement::Interpolation(interpolation) => {
@@ -1454,14 +1484,22 @@ fn serialize_t_string_expr(
 
                     serializer.writer.bool(interpolation.format_spec.is_some());
                     if let Some(format_spec) = &interpolation.format_spec {
-                        serialize_f_string_items(serializer, &format_spec.elements)?;
+                        serialize_f_string_items(serializer, &format_spec.elements, is_raw)?;
                         let loc = serializer.loc(&**format_spec);
                         serializer.writer.loc(&loc);
                     }
                 }
                 ast::InterpolatedStringElement::Literal(literal) => {
+                    let range = literal.range;
+                    let raw = &serializer.source[range.start().to_usize()
+                        ..range.end().to_usize()];
+                    let corrupted = !is_raw && has_surrogate_escape(raw);
                     serializer.writer.bool(false);
                     serializer.writer.string(&literal.value);
+                    serializer.writer.bool(corrupted);
+                    if corrupted {
+                        serializer.writer.string(raw);
+                    }
                     serializer.writer.loc(&serializer.loc(literal));
                 }
             }
@@ -1472,9 +1510,47 @@ fn serialize_t_string_expr(
     Ok(())
 }
 
+/// True when a raw token has a `\u`/`\U` escape for a lone UTF-16 surrogate.
+/// Ruff maps those to U+FFFD, so the decoded value is lossy; the wire carries
+/// the raw token for the Python reader to re-decode (over-matches are safe).
+fn has_surrogate_escape(raw: &str) -> bool {
+    let bytes = raw.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != b'\\' {
+            i += 1;
+            continue;
+        }
+        let hex_len = match bytes.get(i + 1) {
+            Some(b'u') => 4,
+            Some(b'U') => 8,
+            _ => {
+                i += 2;
+                continue;
+            }
+        };
+        let start = i + 2;
+        if let Some(hex) = bytes.get(start..start + hex_len) {
+            if hex.iter().all(u8::is_ascii_hexdigit) {
+                let value = u32::from_str_radix(
+                    std::str::from_utf8(hex).expect("ascii hex digits are utf-8"),
+                    16,
+                )
+                .expect("valid hex digits");
+                if (0xd800..=0xdfff).contains(&value) {
+                    return true;
+                }
+            }
+        }
+        i += 2;
+    }
+    false
+}
+
 fn serialize_f_string_items(
     serializer: &mut Serializer<'_>,
     elements: &ast::InterpolatedStringElements,
+    is_raw: bool,
 ) -> PyResult<()> {
     let extra_debug_literals = elements
         .iter()
@@ -1492,17 +1568,27 @@ fn serialize_f_string_items(
     for element in elements {
         match element {
             ast::InterpolatedStringElement::Literal(literal) => {
+                let range = literal.range;
+                let raw =
+                    &serializer.source[range.start().to_usize()..range.end().to_usize()];
+                let corrupted = !is_raw && has_surrogate_escape(raw);
                 let loc = serializer.loc(literal);
                 serializer.writer.string(&literal.value);
+                serializer.writer.bool(corrupted);
+                if corrupted {
+                    serializer.writer.string(raw);
+                }
                 serializer.writer.loc(&loc);
             }
             ast::InterpolatedStringElement::Interpolation(interpolation) => {
                 if let Some(debug_text) = &interpolation.debug_text {
                     let loc = serializer.loc(interpolation);
+                    // Debug text is raw source spelling, never escape-decoded.
                     serializer.writer.string(debug_text.as_str());
+                    serializer.writer.bool(false);
                     serializer.writer.loc(&loc);
                 }
-                serialize_f_string_interpolation(serializer, interpolation)?;
+                serialize_f_string_interpolation(serializer, interpolation, is_raw)?;
             }
         }
     }
@@ -1512,6 +1598,7 @@ fn serialize_f_string_items(
 fn serialize_f_string_interpolation(
     serializer: &mut Serializer<'_>,
     interpolation: &ast::InterpolatedElement,
+    is_raw: bool,
 ) -> PyResult<()> {
     serializer.writer.tag(FSTRING_INTERPOLATION);
     serialize_expr(serializer, &interpolation.expression)?;
@@ -1530,7 +1617,7 @@ fn serialize_f_string_interpolation(
 
     serializer.writer.bool(interpolation.format_spec.is_some());
     if let Some(format_spec) = &interpolation.format_spec {
-        serialize_f_string_items(serializer, &format_spec.elements)?;
+        serialize_f_string_items(serializer, &format_spec.elements, is_raw)?;
         let loc = serializer.loc(&**format_spec);
         serializer.writer.loc(&loc);
     }
