@@ -5396,7 +5396,6 @@ class DataclassTransformSpec:
         # Specified outside of PEP 681:
         # frozen_default was added to CPythonin
         # https://github.com/python/cpython/pull/99958 citing
-
         # positive discussion in typing-sig
         frozen_default: bool | None = None,
     ) -> None:

@@ -292,11 +292,9 @@ def narrow_declared_type(declared: Type, narrowed: Type) -> Type:
                 # This (ugly) special-casing is needed to support checking
                 # branches like this:
                 # x: Union[float, complex]
-
                 # if isinstance(x, int):
                 #     ...
                 # And assignments like this:
-
                 # x: float | None
                 # y: int | None
                 # x = y

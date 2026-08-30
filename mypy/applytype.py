@@ -242,10 +242,7 @@ class _TypeVarMetaFixer(mypy.type_visitor.TypeQuery[list[Any]]):
 
 
 def _native_get_target_type(
-    tvar: TypeVarLikeType,
-    type: Type,
-    p_type: ProperType,
-    skip_unsatisfied: bool,
+    tvar: TypeVarLikeType, type: Type, p_type: ProperType, skip_unsatisfied: bool
 ) -> tuple[int, int] | None:
     """Rust decision head for get_target_type (applytype.py:244-296).
 
@@ -467,10 +464,7 @@ def apply_generic_arguments(
                             definition=callable.definition,
                         )
                     if _native_applytype_typeinfo_map is not None:
-                        from mypy.wirefixup import (
-                            check_no_fake_info,
-                            fixup_wire_type,
-                        )
+                        from mypy.wirefixup import check_no_fake_info, fixup_wire_type
 
                         fixed = fixup_wire_type(decoded)
                         if fixed is not None:

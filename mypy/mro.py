@@ -112,9 +112,7 @@ def _rust_or_python_mro(
     return linearize_hierarchy(info, obj_type)
 
 
-def _fullnames_to_typeinfos(
-    fullnames: list[str], info: TypeInfo
-) -> list[TypeInfo] | None:
+def _fullnames_to_typeinfos(fullnames: list[str], info: TypeInfo) -> list[TypeInfo] | None:
     """Convert a Rust-returned fullname list back to live TypeInfo objects.
 
     Returns None if any fullname is absent from the installed map, so the

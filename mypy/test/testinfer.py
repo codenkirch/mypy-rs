@@ -318,8 +318,7 @@ class ClassifyCallParitySuite(Suite):
     def test_overloaded(self) -> None:
         fixture = TypeFixture()
         self.assert_classify(
-            Overloaded([fixture.callable(fixture.a), fixture.callable(fixture.b)]),
-            CALL_OVERLOADED,
+            Overloaded([fixture.callable(fixture.a), fixture.callable(fixture.b)]), CALL_OVERLOADED
         )
 
     def test_any(self) -> None:
@@ -328,9 +327,7 @@ class ClassifyCallParitySuite(Suite):
 
     def test_union(self) -> None:
         fixture = TypeFixture()
-        self.assert_classify(
-            UnionType.make_union([fixture.a, fixture.b]), CALL_UNION
-        )
+        self.assert_classify(UnionType.make_union([fixture.a, fixture.b]), CALL_UNION)
 
     def test_instance(self) -> None:
         fixture = TypeFixture()
@@ -356,10 +353,7 @@ class ClassifyCallParitySuite(Suite):
         self.assert_classify(fixture.t, CALL_OTHER)
 
     def assert_classify(self, callee: Type, expected: int) -> None:
-        from mypy.checkexpr import (
-            _native_checkexpr_active,
-            _set_native_checkexpr_active,
-        )
+        from mypy.checkexpr import _native_checkexpr_active, _set_native_checkexpr_active
 
         saved_active = _native_checkexpr_active
         try:
@@ -468,11 +462,7 @@ class NormalizeCallableParitySuite(Suite):
     def test_unpacked_kwargs_typeddict(self) -> None:
         fixture = TypeFixture()
         td = TypedDictType(
-            {"x": fixture.a, "y": fixture.b},
-            {"x"},
-            set(),
-            fixture.a,
-            is_closed=True,
+            {"x": fixture.a, "y": fixture.b}, {"x"}, set(), fixture.a, is_closed=True
         )
         callee = CallableType(
             [fixture.a, td],
@@ -488,11 +478,7 @@ class NormalizeCallableParitySuite(Suite):
     def test_var_args_plain_tuple(self) -> None:
         fixture = TypeFixture()
         callee = CallableType(
-            [UnpackType(fixture.std_tuple)],
-            [ARG_STAR],
-            [None],
-            fixture.b,
-            fixture.function,
+            [UnpackType(fixture.std_tuple)], [ARG_STAR], [None], fixture.b, fixture.function
         )
         self.assert_normalize(callee)
 
@@ -502,19 +488,12 @@ class NormalizeCallableParitySuite(Suite):
         # with_normalized_var_args leaves unchanged.
         nested = UnpackType(fixture.lsta)
         callee = CallableType(
-            [UnpackType(nested)],
-            [ARG_STAR],
-            [None],
-            fixture.b,
-            fixture.function,
+            [UnpackType(nested)], [ARG_STAR], [None], fixture.b, fixture.function
         )
         self.assert_normalize(callee)
 
     def assert_normalize(self, callee: CallableType) -> None:
-        from mypy.checkexpr import (
-            _native_checkexpr_active,
-            _set_native_checkexpr_active,
-        )
+        from mypy.checkexpr import _native_checkexpr_active, _set_native_checkexpr_active
 
         saved_active = _native_checkexpr_active
         try:
@@ -571,32 +550,22 @@ class MapFormalsToActualsParitySuite(Suite):
         assert_equal(actual, expected)
 
     def test_pos_to_pos_reverse(self) -> None:
-        self.assert_reverse_parity(
-            [ARG_POS], [None], [ARG_POS], ["x"]
-        )
+        self.assert_reverse_parity([ARG_POS], [None], [ARG_POS], ["x"])
 
     def test_pos_to_star_formal_reverse(self) -> None:
-        self.assert_reverse_parity(
-            [ARG_POS, ARG_POS], [None, None], [ARG_STAR], [None]
-        )
+        self.assert_reverse_parity([ARG_POS, ARG_POS], [None, None], [ARG_STAR], [None])
 
     def test_pos_overflow_reverse(self) -> None:
-        self.assert_reverse_parity(
-            [ARG_POS, ARG_POS], [None, None], [ARG_POS], ["x"]
-        )
+        self.assert_reverse_parity([ARG_POS, ARG_POS], [None, None], [ARG_POS], ["x"])
 
     def test_pos_into_star2_reverse(self) -> None:
         self.assert_reverse_parity([ARG_POS], [None], [ARG_STAR2], [None])
 
     def test_named_to_named_reverse(self) -> None:
-        self.assert_reverse_parity(
-            [ARG_NAMED], ["x"], [ARG_POS], ["x"]
-        )
+        self.assert_reverse_parity([ARG_NAMED], ["x"], [ARG_POS], ["x"])
 
     def test_named_to_star2_reverse(self) -> None:
-        self.assert_reverse_parity(
-            [ARG_NAMED], ["z"], [ARG_POS, ARG_STAR2], ["x", None]
-        )
+        self.assert_reverse_parity([ARG_NAMED], ["z"], [ARG_POS, ARG_STAR2], ["x", None])
 
     def test_named_not_found_reverse(self) -> None:
         self.assert_reverse_parity([ARG_NAMED], ["z"], [ARG_POS], ["x"])
@@ -647,11 +616,7 @@ class MapActualsToFormalsStarParitySuite(Suite):
 
         def run() -> list[list[int]]:
             return map_actuals_to_formals(
-                actual_kinds,
-                actual_names,
-                formal_kinds,
-                formal_names,
-                lambda i: actual_types[i],
+                actual_kinds, actual_names, formal_kinds, formal_names, lambda i: actual_types[i]
             )
 
         saved_active = _native_argmap_active
@@ -674,29 +639,19 @@ class MapActualsToFormalsStarParitySuite(Suite):
     def test_star_iterable_while(self) -> None:
         fixture = TypeFixture()
         lst = fixture.lsta  # list[A]
-        self.assert_star_parity(
-            [ARG_STAR], [None], [ARG_POS, ARG_STAR], ["x", None], [lst]
-        )
+        self.assert_star_parity([ARG_STAR], [None], [ARG_POS, ARG_STAR], ["x", None], [lst])
 
     def test_star2_typeddict_routes(self) -> None:
         fixture = TypeFixture()
         td = TypedDictType(
-            {"x": fixture.a, "y": fixture.b},
-            {"x"},
-            set(),
-            fixture.a,
-            is_closed=True,
+            {"x": fixture.a, "y": fixture.b}, {"x"}, set(), fixture.a, is_closed=True
         )
-        self.assert_star_parity(
-            [ARG_STAR2], [None], [ARG_POS, ARG_STAR2], ["x", None], [td]
-        )
+        self.assert_star_parity([ARG_STAR2], [None], [ARG_POS, ARG_STAR2], ["x", None], [td])
 
     def test_star2_non_typeddict_ambiguous(self) -> None:
         fixture = TypeFixture()
         lst = fixture.lsta
-        self.assert_star_parity(
-            [ARG_STAR2], [None], [ARG_POS, ARG_POS], ["x", "y"], [lst]
-        )
+        self.assert_star_parity([ARG_STAR2], [None], [ARG_POS, ARG_POS], ["x", "y"], [lst])
 
 
 @skipUnless(
@@ -731,11 +686,7 @@ class ExpandActualTypeParitySuite(Suite):
             for actual_type, actual_kind, formal_name, formal_kind, allow_unpack in calls:
                 out.append(
                     mapper.expand_actual_type(
-                        actual_type,
-                        actual_kind,
-                        formal_name,
-                        formal_kind,
-                        allow_unpack,
+                        actual_type, actual_kind, formal_name, formal_kind, allow_unpack
                     )
                 )
             return out, mapper.tuple_index, mapper.kwargs_used
@@ -759,10 +710,7 @@ class ExpandActualTypeParitySuite(Suite):
         fixture = TypeFixture()
         tup = TupleType([fixture.a, fixture.b], fixture.std_tuple, line=1, column=1)
         self.assert_expand_parity(
-            [
-                (tup, ARG_STAR, None, ARG_POS, False),
-                (tup, ARG_STAR, None, ARG_POS, False),
-            ]
+            [(tup, ARG_STAR, None, ARG_POS, False), (tup, ARG_STAR, None, ARG_POS, False)]
         )
 
     def test_tuple_star_wrap_after_exhaustion(self) -> None:
@@ -785,28 +733,17 @@ class ExpandActualTypeParitySuite(Suite):
     def test_star2_typeddict_named_key(self) -> None:
         fixture = TypeFixture()
         td = TypedDictType(
-            {"x": fixture.a, "y": fixture.b},
-            {"x"},
-            set(),
-            fixture.a,
-            is_closed=True,
+            {"x": fixture.a, "y": fixture.b}, {"x"}, set(), fixture.a, is_closed=True
         )
         self.assert_expand_parity([(td, ARG_STAR2, "x", ARG_POS, False)])
 
     def test_star2_typeddict_two_keys(self) -> None:
         fixture = TypeFixture()
         td = TypedDictType(
-            {"x": fixture.a, "y": fixture.b},
-            {"x"},
-            set(),
-            fixture.a,
-            is_closed=True,
+            {"x": fixture.a, "y": fixture.b}, {"x"}, set(), fixture.a, is_closed=True
         )
         self.assert_expand_parity(
-            [
-                (td, ARG_STAR2, "x", ARG_POS, False),
-                (td, ARG_STAR2, "y", ARG_POS, False),
-            ]
+            [(td, ARG_STAR2, "x", ARG_POS, False), (td, ARG_STAR2, "y", ARG_POS, False)]
         )
 
     def test_star2_typeddict_star2_formal(self) -> None:
@@ -814,11 +751,7 @@ class ExpandActualTypeParitySuite(Suite):
         # run Python (Rust defers), so parity must hold.
         fixture = TypeFixture()
         td = TypedDictType(
-            {"x": fixture.a, "y": fixture.b},
-            {"x"},
-            set(),
-            fixture.a,
-            is_closed=True,
+            {"x": fixture.a, "y": fixture.b}, {"x"}, set(), fixture.a, is_closed=True
         )
         self.assert_expand_parity([(td, ARG_STAR2, None, ARG_STAR2, False)])
 
@@ -826,11 +759,7 @@ class ExpandActualTypeParitySuite(Suite):
         # Name not among keys: arbitrary pop path, Python runs both.
         fixture = TypeFixture()
         td = TypedDictType(
-            {"x": fixture.a, "y": fixture.b},
-            {"x"},
-            set(),
-            fixture.a,
-            is_closed=True,
+            {"x": fixture.a, "y": fixture.b}, {"x"}, set(), fixture.a, is_closed=True
         )
         self.assert_expand_parity([(td, ARG_STAR2, "z", ARG_POS, False)])
 
@@ -1472,9 +1401,7 @@ class CheckExprScalarQueryParitySuite(Suite):
 
     def test_uninhabited_in_union(self) -> None:
         fixture = TypeFixture()
-        self.assert_agrees(
-            UnionType.make_union([fixture.a, fixture.a_uninhabited])
-        )
+        self.assert_agrees(UnionType.make_union([fixture.a, fixture.a_uninhabited]))
 
     def test_bare_never_in_union(self) -> None:
         fixture = TypeFixture()

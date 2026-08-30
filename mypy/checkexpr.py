@@ -577,16 +577,14 @@ def _get_rust_resolve() -> Any:
     if _rust_resolve_plugin_hook is None:
         try:
             import type_kernel as _tk
+
             _rust_resolve_plugin_hook = _tk.rust_resolve_plugin_hook
         except ImportError:
             _rust_resolve_plugin_hook = False  # Sentinel: type_kernel not available
     return _rust_resolve_plugin_hook
 
 
-def _try_native_plugin_hook(
-    callable_name: str,
-    hook_method_name: str,
-) -> Any:
+def _try_native_plugin_hook(callable_name: str, hook_method_name: str) -> Any:
     """Try to resolve a plugin hook via the Rust resolver.
 
     When the native kernel is active and builtin-only plugins are present,
@@ -611,12 +609,7 @@ def _try_native_plugin_hook(
         return None
 
     try:
-        result = resolve(
-            _native_plugin_hook_registry,
-            callable_name,
-            plugins,
-            hook_method_name,
-        )
+        result = resolve(_native_plugin_hook_registry, callable_name, plugins, hook_method_name)
         return result  # PyObject or None
     except Exception:
         # On any FFI error, fall back to Python.
@@ -719,7 +712,9 @@ def _deserialize_optional_type_list(raw: bytes) -> list[Type | None] | None:
 # bytes -> decoded argtypes-plan cache.  The native argtypes-plan path
 # returns one wire blob per formal; ~91% repeat across calls, so
 # memoizing decode+fixup cuts the largest fixup caller.
-_argtypes_plan_cache: dict[bytes, tuple[int, list[Type], list[ArgKind], list[Type], list[ArgKind]] | None] = {}
+_argtypes_plan_cache: dict[
+    bytes, tuple[int, list[Type], list[ArgKind], list[Type], list[ArgKind]] | None
+] = {}
 
 
 def _clear_argtypes_plan_cache() -> None:
@@ -919,9 +914,7 @@ def _try_native_check_boolean_op(
     return result
 
 
-def _try_native_conditional_expr_join(
-    if_bytes: bytes, else_bytes: bytes
-) -> bytes | None:
+def _try_native_conditional_expr_join(if_bytes: bytes, else_bytes: bytes) -> bytes | None:
     """Compute the join-type of a conditional expression via the Rust kernel.
 
     Given serialized `if_expr` and `else_expr` types, returns the
@@ -934,18 +927,12 @@ def _try_native_conditional_expr_join(
     ):
         return None
     try:
-        return _rust_conditional_expr_join(
-            if_bytes, else_bytes, _native_checkexpr_resolver
-        )
+        return _rust_conditional_expr_join(if_bytes, else_bytes, _native_checkexpr_resolver)
     except (AssertionError, NotImplementedError, ValueError):
         return None
 
 
-def _try_native_container_type(
-    tag: str,
-    items: list[Type],
-    n_keys: int = 0,
-) -> Type | None:
+def _try_native_container_type(tag: str, items: list[Type], n_keys: int = 0) -> Type | None:
     """Compute the container type for a list/set/dict literal via the Rust kernel.
 
     Given a tag ("list", "set", "dict") and the item types, returns
@@ -1036,10 +1023,7 @@ def _try_native_check_callable_call(
         return None
 
 
-def _try_native_tuple_context_matches(
-    elements_tags: list[int],
-    ctx: TupleType,
-) -> bool | None:
+def _try_native_tuple_context_matches(elements_tags: list[int], ctx: TupleType) -> bool | None:
     """Check whether a tuple expression's items match a TupleType context.
 
     Returns True/False if the Rust kernel decided, or None to defer.
@@ -1053,10 +1037,7 @@ def _try_native_tuple_context_matches(
         return None
 
 
-def _try_native_build_tuple_type(
-    items: list[Type],
-    seen_unpack: bool,
-) -> Type | None:
+def _try_native_build_tuple_type(items: list[Type], seen_unpack: bool) -> Type | None:
     """Build the final TupleType node for a tuple expression.
 
     Given the item types and whether an unpack was seen, returns the
@@ -1089,9 +1070,7 @@ def _try_native_analyze_cond_branch(
     if not (_CHECKEXPR_HAS_TYPE_KERNEL and _native_checkexpr_active):
         return None
     try:
-        return _rust_analyze_cond_branch(
-            _native_checkexpr_resolver, branch_bytes, known_bytes
-        )
+        return _rust_analyze_cond_branch(_native_checkexpr_resolver, branch_bytes, known_bytes)
     except (AssertionError, NotImplementedError, ValueError):
         return None
 
@@ -1330,9 +1309,7 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
         self._literal_true: Instance | None = None
         self._literal_false: Instance | None = None
 
-    def _try_native_plugin_hook(
-        self, callable_name: str, hook_method_name: str
-    ) -> Any:
+    def _try_native_plugin_hook(self, callable_name: str, hook_method_name: str) -> Any:
         """Delegate to module-level _try_native_plugin_hook."""
         return _try_native_plugin_hook(callable_name, hook_method_name)
 
@@ -1508,9 +1485,7 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
                 target_bytes: bytes | None = None
                 node = getattr(base, "node", None)
                 if isinstance(node, TypeAlias):
-                    target_bytes = _serialize_type_for_checkexpr(
-                        get_proper_type(node.target)
-                    )
+                    target_bytes = _serialize_type_for_checkexpr(get_proper_type(node.target))
                 return _rust_refers_to_typeddict(base, target_bytes)
             except (AssertionError, NotImplementedError, ValueError):
                 pass
@@ -2501,9 +2476,7 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
                         callable_name, "get_function_signature_hook"
                     )
                     if function_sig_hook is None:
-                        function_sig_hook = self.plugin.get_function_signature_hook(
-                            callable_name
-                        )
+                        function_sig_hook = self.plugin.get_function_signature_hook(callable_name)
                     if function_sig_hook:
                         return self.apply_function_signature_hook(
                             callee, args, arg_kinds, context, arg_names, function_sig_hook
@@ -3182,9 +3155,7 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
                 (
                     object_type is None
                     and (
-                        self._try_native_plugin_hook(
-                            callable_name, "get_function_hook"
-                        )
+                        self._try_native_plugin_hook(callable_name, "get_function_hook")
                         or self.plugin.get_function_hook(callable_name)
                     )
                 )
@@ -3364,9 +3335,7 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
                         continue
                     arg_context[ai] = callee.arg_types[fi]
         else:
-            arg_context = [
-                callee.arg_types[fi] if fi >= 0 else None for fi in indices
-            ]
+            arg_context = [callee.arg_types[fi] if fi >= 0 else None for fi in indices]
 
         res = []
         for arg, ctx in zip(args, arg_context):
@@ -3550,9 +3519,7 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
                     )
                     if raw is not None:
                         decoded = _deserialize_optional_type_list(bytes(raw))
-                        if decoded is not None and len(decoded) == len(
-                            callee_type.variables
-                        ):
+                        if decoded is not None and len(decoded) == len(callee_type.variables):
                             inferred_args = decoded
                 except (AssertionError, NotImplementedError, ValueError, TypeError):
                     pass  # Defer to Python.
@@ -3752,9 +3719,7 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
             and _native_checkexpr_resolver is not None
         ):
             try:
-                formal_bytes = [
-                    _serialize_type_for_checkexpr(t) for t in callee.arg_types
-                ]
+                formal_bytes = [_serialize_type_for_checkexpr(t) for t in callee.arg_types]
                 actual_bytes = [_serialize_type_for_checkexpr(t) for t in arg_types]
                 lambda_flags = [isinstance(a, LambdaExpr) for a in args]
                 res = _rust_get_arg_infer_passes(
@@ -3967,9 +3932,7 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
                     elif kind == 3:  # ERR_TOO_MANY_TD
                         actual_type = get_proper_type(actual_types[index])
                         assert isinstance(actual_type, TypedDictType)
-                        self.msg.too_many_arguments_from_typed_dict(
-                            callee, actual_type, context
-                        )
+                        self.msg.too_many_arguments_from_typed_dict(callee, actual_type, context)
                     elif kind == 4:  # ERR_TOO_FEW_POSITIONAL
                         self.msg.too_few_arguments(callee, context, actual_names)
                     elif kind == 5:  # ERR_MISSING_NAMED
@@ -4197,12 +4160,14 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
                         assert len(actual_types) == len(actuals) == len(actual_kinds)
                         assert len(callee_arg_types) == len(actual_types)
                         assert len(callee_arg_types) == len(callee_arg_kinds)
-                        for actual, actual_type, actual_kind, callee_arg_type, callee_arg_kind in zip(
-                            actuals,
-                            actual_types,
-                            actual_kinds,
-                            callee_arg_types,
-                            callee_arg_kinds,
+                        for (
+                            actual,
+                            actual_type,
+                            actual_kind,
+                            callee_arg_type,
+                            callee_arg_kind,
+                        ) in zip(
+                            actuals, actual_types, actual_kinds, callee_arg_types, callee_arg_kinds
                         ):
                             # Check that a *arg is valid as varargs.
                             expanded_actual = mapper.expand_actual_type(
@@ -6486,9 +6451,7 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
                             self.chk.fail(message_registry.TUPLE_INDEX_OUT_OF_RANGE, e)
                             if any(isinstance(t, UnpackType) for t in left_type.items):
                                 min_len = self.min_tuple_length(left_type)
-                                self.chk.note(
-                                    f"Variadic tuple can have length {min_len}", e
-                                )
+                                self.chk.note(f"Variadic tuple can have length {min_len}", e)
                             return AnyType(TypeOfAny.from_error)
                     return make_simplified_union(out)
                 else:
@@ -6609,8 +6572,11 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
         return left.length() - 1
 
     def visit_tuple_index_helper(self, left: TupleType, n: int) -> Type | None:
-        if (_CHECKEXPR_HAS_TYPE_KERNEL and _native_checkexpr_active
-                and find_unpack_in_list(left.items) is None):
+        if (
+            _CHECKEXPR_HAS_TYPE_KERNEL
+            and _native_checkexpr_active
+            and find_unpack_in_list(left.items) is None
+        ):
             # Only take the Rust path for fixed (non-variadic) tuples.
             # Rust's variadic index result (middle + suffix unions) does
             # not yet match Python (see #486: `args[1]` on
@@ -6622,7 +6588,7 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
                 pf_bytes = _serialize_type_for_checkexpr(left.partial_fallback)
                 min_length = self.min_tuple_length(left)
                 result = _rust_visit_tuple_index_helper(
-                    items_bytes, pf_bytes, n, left.line, left.column, min_length,
+                    items_bytes, pf_bytes, n, left.line, left.column, min_length
                 )
                 if result is not None:
                     decoded = _deserialize_type_from_checkexpr(bytes(result))
@@ -6678,8 +6644,11 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
         )
 
     def visit_tuple_slice_helper(self, left_type: TupleType, slic: SliceExpr) -> Type:
-        if (_CHECKEXPR_HAS_TYPE_KERNEL and _native_checkexpr_active
-                and left_type.partial_fallback.type.fullname == "builtins.tuple"):
+        if (
+            _CHECKEXPR_HAS_TYPE_KERNEL
+            and _native_checkexpr_active
+            and left_type.partial_fallback.type.fullname == "builtins.tuple"
+        ):
             # Rust's tuple_slice output uses the tuple's own partial_fallback
             # as result fallback, while Python's TupleType.slice defaults to
             # self.named_type("builtins.tuple"). For plain builtins.tuple
@@ -6719,8 +6688,13 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
                         ok = False
                 if ok:
                     result = _rust_visit_tuple_slice_helper(
-                        items_bytes, pf_bytes, begin_val, end_val, stride_val,
-                        left_type.line, left_type.column,
+                        items_bytes,
+                        pf_bytes,
+                        begin_val,
+                        end_val,
+                        stride_val,
+                        left_type.line,
+                        left_type.column,
                     )
                     if result is not None:
                         decoded = _deserialize_type_from_checkexpr(bytes(result))
@@ -7292,9 +7266,7 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
                 values_set.add(typ)
 
         # Try the native kernel join + node construction.
-        rust_result = _try_native_container_type(
-            container_fullname.split(".")[-1], values
-        )
+        rust_result = _try_native_container_type(container_fullname.split(".")[-1], values)
         if rust_result is not None:
             return rust_result
 
@@ -8234,7 +8206,10 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
                     if alt_bytes is not None:
                         alternative = _deserialize_type_from_checkexpr(alt_bytes)
                         if alternative is not None:
-                            if not isinstance(alternative, Instance) or alternative.type.fullname != "builtins.object":
+                            if (
+                                not isinstance(alternative, Instance)
+                                or alternative.type.fullname != "builtins.object"
+                            ):
                                 res = alternative
                                 return res
                 except Exception:
@@ -8489,8 +8464,7 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
                 skag_never_ok = is_subtype(
                     proper,
                     self.chk.named_generic_type(
-                        "_typeshed.SupportsKeysAndGetItem",
-                        [UninhabitedType(), UninhabitedType()],
+                        "_typeshed.SupportsKeysAndGetItem", [UninhabitedType(), UninhabitedType()]
                     ),
                 )
                 result = _rust_is_valid_keyword_var_arg(
@@ -8862,7 +8836,6 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
             # NOTE: Will never need to lookup type vars in this scope because
             #       SemanticAnalyzer.try_parse_as_type_expression() will have
             #       already recognized any type var referenced in a NameExpr.
-
             #       String annotations (which may also reference type vars)
             #       can't be resolved in the TypeChecker pass anyway.
             TypeVarLikeScope(),  # empty scope
@@ -9003,7 +8976,10 @@ def is_duplicate_mapping(
         try:
             type_bytes = [_serialize_type_for_checkexpr(actual_types[m]) for m in mapping]
             result = _rust_is_duplicate_mapping(
-                mapping, type_bytes, [int(k.value) for k in actual_kinds], _native_checkexpr_resolver
+                mapping,
+                type_bytes,
+                [int(k.value) for k in actual_kinds],
+                _native_checkexpr_resolver,
             )
             if result is not None:
                 return result
@@ -9014,7 +8990,6 @@ def is_duplicate_mapping(
         # Multiple actuals can map to the same formal if they both come from
         # varargs (*args and **kwargs); in this case at runtime it is possible
         # that here are no duplicates. We need to allow this, as the convention
-
         # f(..., *args, **kwargs) is common enough.
         and not (
             len(mapping) == 2
@@ -9372,12 +9347,8 @@ def merge_typevars_in_callables_by_name(
             res = None
         if res is not None:
             next_raw_id, callables_bytes, typevars_bytes = res
-            native_output = [
-                _deserialize_type_from_checkexpr(bytes(b)) for b in callables_bytes
-            ]
-            native_variables = [
-                _deserialize_type_from_checkexpr(bytes(b)) for b in typevars_bytes
-            ]
+            native_output = [_deserialize_type_from_checkexpr(bytes(b)) for b in callables_bytes]
+            native_variables = [_deserialize_type_from_checkexpr(bytes(b)) for b in typevars_bytes]
             if all(isinstance(c, CallableType) for c in native_output) and all(
                 isinstance(v, TypeVarType) for v in native_variables
             ):

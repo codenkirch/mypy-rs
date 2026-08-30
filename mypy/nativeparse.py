@@ -2110,10 +2110,7 @@ def deserialize_imports(
 
 
 def _read_and_set_import_metadata(
-    data: ReadBuffer,
-    stmt: Import | ImportFrom | ImportAll,
-    *,
-    dependency_discovery: bool = False,
+    data: ReadBuffer, stmt: Import | ImportFrom | ImportAll, *, dependency_discovery: bool = False
 ) -> None:
     read_loc(data, stmt)
 

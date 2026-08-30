@@ -136,6 +136,7 @@ def _serialize_type_for_messages(t: Type) -> bytes:
     t.write(buf)
     return buf.getvalue()
 
+
 TYPES_FOR_UNIMPORTED_HINTS: Final = {
     "typing.Any",
     "typing.Callable",
@@ -1539,9 +1540,7 @@ class MessageBuilder:
         target = self.override_target(name, name_in_super, supertype)
         if _HAS_TYPE_KERNEL and _native_messages_active:
             try:
-                error_msg = _type_kernel.rust_signature_incompatible_with_supertype(
-                    name, target
-                )
+                error_msg = _type_kernel.rust_signature_incompatible_with_supertype(name, target)
                 error = self.fail(error_msg, context, code=codes.OVERRIDE)
             except (AssertionError, NotImplementedError, ValueError):
                 error = self.fail(
@@ -3279,11 +3278,7 @@ def format_type(
     modification of the formatted string is required, callers should use
     format_type_bare.
     """
-    if (
-        _HAS_TYPE_KERNEL
-        and _native_messages_active
-        and _native_messages_resolver is not None
-    ):
+    if _HAS_TYPE_KERNEL and _native_messages_active and _native_messages_resolver is not None:
         try:
             result = _type_kernel.rust_format_type(
                 _serialize_type_for_messages(typ),
@@ -3313,11 +3308,7 @@ def format_type_bare(
     instead.  (The caller may want to use quote_type_string after
     processing has happened, to maintain consistent quoting in messages.)
     """
-    if (
-        _HAS_TYPE_KERNEL
-        and _native_messages_active
-        and _native_messages_resolver is not None
-    ):
+    if _HAS_TYPE_KERNEL and _native_messages_active and _native_messages_resolver is not None:
         try:
             result = _type_kernel.rust_format_type_bare(
                 _serialize_type_for_messages(typ),
@@ -3345,18 +3336,11 @@ def format_type_distinctly(*types: Type, options: Options, bare: bool = False) -
     be quoted; callers who need to do post-processing of the strings before
     quoting them (such as prepending * or **) should use this.
     """
-    if (
-        _HAS_TYPE_KERNEL
-        and _native_messages_active
-        and _native_messages_resolver is not None
-    ):
+    if _HAS_TYPE_KERNEL and _native_messages_active and _native_messages_resolver is not None:
         try:
             type_bytes_list = [_serialize_type_for_messages(t) for t in types]
             result = _type_kernel.rust_format_type_distinctly(
-                type_bytes_list,
-                _native_messages_resolver,
-                bare,
-                options.use_star_unpack(),
+                type_bytes_list, _native_messages_resolver, bare, options.use_star_unpack()
             )
             if result is not None:
                 return tuple(result)

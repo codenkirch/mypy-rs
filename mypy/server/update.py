@@ -197,6 +197,7 @@ def _set_native_update_active(active: bool) -> None:
     global _native_update_active
     _native_update_active = active
 
+
 MAX_ITER: Final = 1000
 
 # These are modules beyond stdlib that have some special meaning for mypy.
@@ -590,6 +591,7 @@ def ensure_trees_loaded(
 # - New AST for the changed module (None if module was deleted)
 # - Remaining changed modules that are not processed yet as (module id, path)
 
+
 #   tuples (non-empty if the original changed module imported other new
 #   modules)
 class NormalUpdate(NamedTuple):
@@ -844,9 +846,7 @@ def get_sources(
     # Python still does its own fscache.isfile check for safety.
     if _HAS_NATIVE_UPDATE and _native_update_active:
         try:
-            filtered = [
-                (id, path) for id, path in changed_modules if fscache.isfile(path)
-            ]
+            filtered = [(id, path) for id, path in changed_modules if fscache.isfile(path)]
             result = _rust_get_sources(filtered, followed)
             if result is not None:
                 return list(result)

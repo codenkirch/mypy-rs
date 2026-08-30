@@ -785,9 +785,7 @@ def _try_native_generator_return_type_helpers(
     return dec
 
 
-def _try_native_is_generator_return_type(
-    typ: Type, is_coroutine: bool
-) -> bool | None:
+def _try_native_is_generator_return_type(typ: Type, is_coroutine: bool) -> bool | None:
     """Native fast path for is_generator_return_type (#434)."""
     if not (
         _CHECKER_HAS_TYPE_KERNEL
@@ -816,9 +814,7 @@ def _try_native_is_async_generator_return_type(typ: Type) -> bool | None:
         return None
     try:
         return _rust_is_async_generator_return_type(
-            _serialize_type_for_checker(typ),
-            state.strict_optional,
-            _native_checker_resolver,
+            _serialize_type_for_checker(typ), state.strict_optional, _native_checker_resolver
         )
     except (AssertionError, NotImplementedError, ValueError):
         return None
@@ -845,11 +841,11 @@ def _try_native_get_coroutine_return_type(return_type: Type) -> Type | None:
 def _try_native_type_requires_usage(typ: Type) -> tuple[str, ErrorCode] | None:
     """Native fast path for type_requires_usage (parity-only).
 
-Returns the note/code for the typing.Coroutine (UNUSED_COROUTINE) and
-    __await__ (UNUSED_AWAITABLE) branches, or None to defer to the
-    pure-Python implementation. The awaitable branch resolves
-    `proper_type.type.get("__await__")` through the resolver's member
-    snapshots, so it engages only when the checker resolver is installed.
+    Returns the note/code for the typing.Coroutine (UNUSED_COROUTINE) and
+        __await__ (UNUSED_AWAITABLE) branches, or None to defer to the
+        pure-Python implementation. The awaitable branch resolves
+        `proper_type.type.get("__await__")` through the resolver's member
+        snapshots, so it engages only when the checker resolver is installed.
     """
     if not (
         _CHECKER_HAS_TYPE_KERNEL
@@ -932,9 +928,7 @@ def _try_native_try_handler_union(typ: Type) -> list[bytes] | None:
     ):
         return None
     try:
-        return _rust_try_handler_union(
-            _serialize_type_for_checker(typ), state.strict_optional
-        )
+        return _rust_try_handler_union(_serialize_type_for_checker(typ), state.strict_optional)
     except (AssertionError, NotImplementedError, ValueError):
         return None
 
@@ -981,10 +975,7 @@ def _try_native_except_handler_tests(
 
 
 def _try_native_is_valid_inferred_type(
-    typ: Type,
-    is_lvalue_final: bool,
-    is_lvalue_member: bool,
-    allow_redefinition: bool,
+    typ: Type, is_lvalue_final: bool, is_lvalue_member: bool, allow_redefinition: bool
 ) -> bool | None:
     """Native fast path for is_valid_inferred_type (#445).
 
@@ -997,10 +988,7 @@ def _try_native_is_valid_inferred_type(
         return None
     try:
         return _rust_is_valid_inferred_type(
-            _serialize_type_for_checker(typ),
-            is_lvalue_final,
-            is_lvalue_member,
-            allow_redefinition,
+            _serialize_type_for_checker(typ), is_lvalue_final, is_lvalue_member, allow_redefinition
         )
     except (AssertionError, NotImplementedError, ValueError):
         return None
@@ -1185,6 +1173,7 @@ NATIVE_GETATTR_METHOD_MODULE_GETATTRIBUTE = 0
 NATIVE_GETATTR_METHOD_MODULE = 1
 NATIVE_GETATTR_METHOD_CLASS = 2
 NATIVE_GETATTR_METHOD_PASS = 3
+
 
 class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
     """Mypy type checker.
@@ -1639,9 +1628,7 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
             if else_body:
                 self.accept(else_body)
 
-
     # Definitions
-
 
     def visit_overloaded_func_def(self, defn: OverloadedFuncDef) -> None:
         # We always process overload as part of the top-level to infer various
@@ -1906,7 +1893,9 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
                         continue
 
                     if overload_can_never_match(sig1, sig2):
-                        self.msg.overloaded_signature_will_never_match(i + 1, i + j + 2, item2.func)
+                        self.msg.overloaded_signature_will_never_match(
+                            i + 1, i + j + 2, item2.func
+                        )
                     elif not is_descriptor_get:
                         # Note: we force mypy to check overload signatures in strict-optional mode
                         # so we don't incorrectly report errors when a user tries typing an overload
@@ -2314,9 +2303,7 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
                 if tag == NATIVE_FUNC_DEF_OVERRIDE_FUNC_OVER_FUNC:
                     old_type = self.function_type(defn.original_def)  # type: ignore[arg-type]
                     if not is_same_type(new_type, old_type):
-                        self.msg.incompatible_conditional_function_def(
-                            defn, old_type, new_type
-                        )
+                        self.msg.incompatible_conditional_function_def(defn, old_type, new_type)
                     return
                 if tag == NATIVE_FUNC_DEF_OVERRIDE_ORIG_TYPE_NONE:
                     return
@@ -3423,14 +3410,10 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
             and _rust_check_explicit_override_decorator is not None
         ):
             try:
-                if _rust_check_explicit_override_decorator(
-                    defn, found_method_base_classes
-                ):
+                if _rust_check_explicit_override_decorator(defn, found_method_base_classes):
                     assert found_method_base_classes
                     self.msg.explicit_override_decorator_missing(
-                        defn.name,
-                        found_method_base_classes[0].fullname,
-                        context or defn,
+                        defn.name, found_method_base_classes[0].fullname, context or defn
                     )
                     return
             except (AssertionError, NotImplementedError, ValueError, TypeError):
@@ -4090,15 +4073,10 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
         # Native type_kernel seam: classify the three arms in Rust
         # (checker_functions.rs); self.fail/note stay here. None
         # falls through to the pure-Python body.
-        if (
-            _CHECKER_HAS_TYPE_KERNEL
-            and _native_checker_active
-            and _rust_classify_enum is not None
-        ):
+        if _CHECKER_HAS_TYPE_KERNEL and _native_checker_active and _rust_classify_enum is not None:
             try:
                 result = _rust_classify_enum(
-                    defn.info, self.is_stub, self.tree.fullname,
-                    list(ENUM_BASES),
+                    defn.info, self.is_stub, self.tree.fullname, list(ENUM_BASES)
                 )
             except (AssertionError, NotImplementedError, ValueError, TypeError):
                 result = None
@@ -4107,10 +4085,7 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
                 if tag & NATIVE_ENUM_CHECK_MEMBERS_OVERRIDE:
                     sym = defn.info.names["__members__"]
                     assert sym.node is not None
-                    self.fail(
-                        message_registry.ENUM_MEMBERS_ATTR_WILL_BE_OVERRIDDEN,
-                        sym.node,
-                    )
+                    self.fail(message_registry.ENUM_MEMBERS_ATTR_WILL_BE_OVERRIDDEN, sym.node)
                 base_name_set = set(base_names)
                 for base in defn.info.mro[1:-1]:
                     if base.fullname in base_name_set:
@@ -4233,7 +4208,7 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
                 if violating_idx >= 0:
                     offending_enum = bases[enum_base_idx]
                     self.fail(
-                        f'No non-enum mixin classes are allowed after '
+                        f"No non-enum mixin classes are allowed after "
                         f'"{offending_enum.str_with_options(self.options)}"',
                         defn,
                     )
@@ -4573,9 +4548,7 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
                 rvalue_name="imported name",
             )
 
-
     # Statements
-
 
     def visit_block(self, b: Block) -> None:
         if b.is_unreachable:
@@ -5043,9 +5016,7 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
             if gate_tags is not None:
                 if gate_tags[0] == NATIVE_ALL_SUPERS_GATE_SKIP:
                     return
-                base_skips = [
-                    tag == NATIVE_ALL_SUPERS_BASE_SKIP for tag in gate_tags[1]
-                ]
+                base_skips = [tag == NATIVE_ALL_SUPERS_BASE_SKIP for tag in gate_tags[1]]
         # Check if we are a class variable with at least one base class
         if (
             isinstance(lvalue_node, Var)
@@ -5251,9 +5222,7 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
             and _rust_classify_classvar_super is not None
         ):
             try:
-                tag = _rust_classify_classvar_super(
-                    base_node, bool(node.is_classvar)
-                )
+                tag = _rust_classify_classvar_super(base_node, bool(node.is_classvar))
             except (AssertionError, NotImplementedError, ValueError, TypeError):
                 tag = None
             if tag is not None:
@@ -5261,15 +5230,11 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
                     return True
                 if tag == NATIVE_CLASSVAR_SUPER_INSTANCE_VAR:
                     self.fail(
-                        message_registry.CANNOT_OVERRIDE_INSTANCE_VAR.format(base.name),
-                        node,
+                        message_registry.CANNOT_OVERRIDE_INSTANCE_VAR.format(base.name), node
                     )
                     return False
                 if tag == NATIVE_CLASSVAR_SUPER_CLASS_VAR:
-                    self.fail(
-                        message_registry.CANNOT_OVERRIDE_CLASS_VAR.format(base.name),
-                        node,
-                    )
+                    self.fail(message_registry.CANNOT_OVERRIDE_CLASS_VAR.format(base.name), node)
                     return False
         if not isinstance(base_node, Var):
             return True
@@ -6034,9 +5999,7 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
         ):
             try:
                 tag = _rust_classify_check_lvalue(
-                    lvalue,
-                    self.options.allow_redefinition,
-                    self.is_definition(lvalue),
+                    lvalue, self.options.allow_redefinition, self.is_definition(lvalue)
                 )
             except (AssertionError, NotImplementedError, ValueError, TypeError):
                 tag = None
@@ -6074,8 +6037,7 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
                 elif tag == NATIVE_LVALUE_TUPLE_LIST:
                     assert isinstance(lvalue, (TupleExpr, ListExpr))
                     types = [
-                        self.check_lvalue(sub_expr)[0]
-                        or
+                        self.check_lvalue(sub_expr)[0] or
                         # This type will be used as a context for further inference of rvalue,
                         # we put Uninhabited if there is no information available from lvalue.
                         UninhabitedType(ambiguous=True)
@@ -6481,14 +6443,14 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
             and _native_checker_active
             and _rust_classify_simple_assignment is not None
         ):
-            proper_lvalue = (
-                get_proper_type(lvalue_type) if lvalue_type is not None else None
-            )
+            proper_lvalue = get_proper_type(lvalue_type) if lvalue_type is not None else None
             try:
                 tag = _rust_classify_simple_assignment(
-                    _serialize_type_for_checker(proper_lvalue)
-                    if proper_lvalue is not None
-                    else None,
+                    (
+                        _serialize_type_for_checker(proper_lvalue)
+                        if proper_lvalue is not None
+                        else None
+                    ),
                     self.is_stub,
                     isinstance(rvalue, EllipsisExpr),
                     inferred is not None,
@@ -6846,9 +6808,7 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
                 and _rust_classify_return_stmt_variant is not None
             ):
                 try:
-                    vtag = _rust_classify_return_stmt_variant(
-                        defn.is_generator, defn.is_coroutine
-                    )
+                    vtag = _rust_classify_return_stmt_variant(defn.is_generator, defn.is_coroutine)
                 except (AssertionError, NotImplementedError, ValueError, TypeError):
                     vtag = None
             if vtag == NATIVE_RETURN_VARIANT_GENERATOR:
@@ -7028,8 +6988,7 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
                     and not self.current_node_deferred
                     and not is_proper_subtype(AnyType(TypeOfAny.special_form), return_type)
                     and not (
-                        defn.name in BINARY_MAGIC_METHODS
-                        and is_literal_not_implemented(s.expr)
+                        defn.name in BINARY_MAGIC_METHODS and is_literal_not_implemented(s.expr)
                     )
                     and not (
                         isinstance(return_type, Instance)
@@ -7062,11 +7021,7 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
         else:
             # Empty returns are valid in Generators with Any typed returns, but not in
             # coroutines.
-            if (
-                defn.is_generator
-                and not defn.is_coroutine
-                and isinstance(return_type, AnyType)
-            ):
+            if defn.is_generator and not defn.is_coroutine and isinstance(return_type, AnyType):
                 return
 
             if isinstance(return_type, (NoneType, AnyType)):
@@ -7709,7 +7664,9 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
                 )
                 dec_type_bytes = (
                     # accept() is annotated Type but can return None at runtime
-                    _serialize_type_for_checker(dec_type) if dec_type is not None else None  # type: ignore[redundant-expr]
+                    _serialize_type_for_checker(dec_type)
+                    if dec_type is not None
+                    else None  # type: ignore[redundant-expr]
                 )
                 res = _rust_check_for_untyped_decorator(
                     self.options.disallow_untyped_decorators,
@@ -9770,7 +9727,6 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
             yes_type, no_type = self.refine_instance_type_with_len(typ, neg_ops[op], size)
             return no_type, yes_type
 
-
     # Helpers
 
     @overload
@@ -9937,9 +9893,7 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
         For example, named_type('builtins.object') produces the 'object' type.
         """
         if name == "builtins.str":
-            instance_cache.str_type = self._validated_named_type(
-                instance_cache.str_type, name
-            )
+            instance_cache.str_type = self._validated_named_type(instance_cache.str_type, name)
             return instance_cache.str_type
         if name == "builtins.function":
             instance_cache.function_type = self._validated_named_type(
@@ -9947,14 +9901,10 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
             )
             return instance_cache.function_type
         if name == "builtins.int":
-            instance_cache.int_type = self._validated_named_type(
-                instance_cache.int_type, name
-            )
+            instance_cache.int_type = self._validated_named_type(instance_cache.int_type, name)
             return instance_cache.int_type
         if name == "builtins.bool":
-            instance_cache.bool_type = self._validated_named_type(
-                instance_cache.bool_type, name
-            )
+            instance_cache.bool_type = self._validated_named_type(instance_cache.bool_type, name)
             return instance_cache.bool_type
         if name == "builtins.object":
             instance_cache.object_type = self._validated_named_type(
@@ -10843,7 +10793,11 @@ def conditional_types(
     # defers (returns None) when it can't decide. None/empty ranges are
     # trivial returns, cheaper in Python — skip serialize for those.
     if proposed_type_ranges is not None and proposed_type_ranges:
-        if _CHECKER_HAS_TYPE_KERNEL and _native_checker_active and _native_checker_resolver is not None:
+        if (
+            _CHECKER_HAS_TYPE_KERNEL
+            and _native_checker_active
+            and _native_checker_resolver is not None
+        ):
             try:
                 raw = _rust_conditional_types(
                     _serialize_type_for_checker(current_type),
@@ -11144,16 +11098,19 @@ def and_conditional_maps(m1: TypeMap, m2: TypeMap, *, use_meet: bool = False) ->
         and _rust_and_conditional_maps is not None
     ):
         try:
-            if not any(t is None for t in m1.values()) and not any(
-                t is None for t in m2.values()
-            ):
+            if not any(t is None for t in m1.values()) and not any(t is None for t in m2.values()):
                 keys1 = [hash(literal_hash(e)) for e in m1]
                 vals1 = [_serialize_type_for_checker(t) for t in m1.values()]
                 keys2 = [hash(literal_hash(e)) for e in m2]
                 vals2 = [_serialize_type_for_checker(t) for t in m2.values()]
                 result = _rust_and_conditional_maps(
-                    keys1, vals1, keys2, vals2, use_meet,
-                    state.strict_optional, _native_checker_resolver,
+                    keys1,
+                    vals1,
+                    keys2,
+                    vals2,
+                    use_meet,
+                    state.strict_optional,
+                    _native_checker_resolver,
                 )
                 if result is not None:
                     out_keys, out_vals = result
@@ -11223,16 +11180,19 @@ def or_conditional_maps(m1: TypeMap, m2: TypeMap, *, coalesce_any: bool = False)
         and _rust_or_conditional_maps is not None
     ):
         try:
-            if not any(t is None for t in m1.values()) and not any(
-                t is None for t in m2.values()
-            ):
+            if not any(t is None for t in m1.values()) and not any(t is None for t in m2.values()):
                 keys1 = [hash(literal_hash(e)) for e in m1]
                 vals1 = [_serialize_type_for_checker(t) for t in m1.values()]
                 keys2 = [hash(literal_hash(e)) for e in m2]
                 vals2 = [_serialize_type_for_checker(t) for t in m2.values()]
                 result = _rust_or_conditional_maps(
-                    keys1, vals1, keys2, vals2, coalesce_any,
-                    state.strict_optional, _native_checker_resolver,
+                    keys1,
+                    vals1,
+                    keys2,
+                    vals2,
+                    coalesce_any,
+                    state.strict_optional,
+                    _native_checker_resolver,
                 )
                 if result is not None:
                     out_keys, out_vals = result
@@ -11338,7 +11298,11 @@ def reduce_and_conditional_type_maps(ms: list[TypeMap], *, use_meet: bool) -> Ty
 
 
 def has_custom_eq_checks(t: Type) -> bool:
-    if _CHECKER_HAS_TYPE_KERNEL and _native_checker_active and _native_checker_resolver is not None:
+    if (
+        _CHECKER_HAS_TYPE_KERNEL
+        and _native_checker_active
+        and _native_checker_resolver is not None
+    ):
         try:
             result = _rust_has_custom_eq_checks(
                 _serialize_type_for_checker(t), _native_checker_resolver

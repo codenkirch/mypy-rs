@@ -516,9 +516,7 @@ def apply_hooks_to_class(
                 # when the registry proves no DefaultPlugin hook matches.
                 from mypy.checkexpr import plugin_hook_known_absent
 
-                if not plugin_hook_known_absent(
-                    "get_class_decorator_hook_2", decorator_name
-                ):
+                if not plugin_hook_known_absent("get_class_decorator_hook_2", decorator_name):
                     hook = self.plugin.get_class_decorator_hook_2(decorator_name)
             # Special case: if the decorator is itself decorated with
             # typing.dataclass_transform, apply the hook for the dataclasses plugin

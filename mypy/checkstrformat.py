@@ -222,7 +222,7 @@ def _parse_placeholder_format_python(
     grouping: str | None = None
     remaining = format_spec
     if fill_align:
-        remaining = remaining[len(fill_align):]
+        remaining = remaining[len(fill_align) :]
     if sign:
         remaining = remaining[1:]
     if alternate:
@@ -230,7 +230,7 @@ def _parse_placeholder_format_python(
     if zero_pad:
         remaining = remaining[1:]
     if width:
-        remaining = remaining[len(width):]
+        remaining = remaining[len(width) :]
     if remaining and remaining[0] in "_,[":
         grouping = remaining[0]
     return (fill, align, sign, alternate, zero_pad, width, grouping, precision, conv_type)
@@ -346,17 +346,11 @@ def parse_format_value(
             return None
         elif err_code == 3:
             msg.fail(
-                "Invalid conversion specifier in format string",
-                ctx,
-                code=codes.STRING_FORMATTING,
+                "Invalid conversion specifier in format string", ctx, code=codes.STRING_FORMATTING
             )
             return None
         elif err_code == 4:
-            msg.fail(
-                "Conversion value must not contain { or }",
-                ctx,
-                code=codes.STRING_FORMATTING,
-            )
+            msg.fail("Conversion value must not contain { or }", ctx, code=codes.STRING_FORMATTING)
             return None
         elif err_code == 5:
             msg.fail(
@@ -366,12 +360,8 @@ def parse_format_value(
             )
             return None
         return [
-            ConversionSpecifier.from_fields(
-                whole, sp, key, ct, fl, w, pr, fs, nss, conv, field
-            )
-            for (
-                whole, sp, key, ct, fl, w, pr, fs, nss, conv, field
-            ) in raw_specs
+            ConversionSpecifier.from_fields(whole, sp, key, ct, fl, w, pr, fs, nss, conv, field)
+            for (whole, sp, key, ct, fl, w, pr, fs, nss, conv, field) in raw_specs
         ]
 
     top_targets = find_non_escaped_targets(format_value, ctx, msg)
@@ -908,8 +898,7 @@ class StringFormatterChecker:
     ) -> bool | None:
         if _HAS_TYPE_KERNEL_STRFORMAT and _native_strformat_active:
             spec_infos = [
-                (spec.has_key(), spec.conv_type, spec.width, spec.precision)
-                for spec in specifiers
+                (spec.has_key(), spec.conv_type, spec.width, spec.precision) for spec in specifiers
             ]
             result = _rust_analyze_conversion_specifiers(spec_infos)  # type: ignore[misc]
             if result is None:

@@ -1324,9 +1324,7 @@ def define_options(
     )
     # --native-resolver enables the native module resolver (experimental)
     add_invertible_flag(
-        "--native-resolver",
-        default=False,
-        help="Enable Rust-backed module resolution",
+        "--native-resolver", default=False, help="Enable Rust-backed module resolution"
     )
     # --native-type-kernel routes erase_type/is_subtype/join/meet through
     # the type_kernel Rust extension. Default on after Stage 3c parity;

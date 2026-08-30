@@ -351,11 +351,7 @@ def tuple_fallback(typ: TupleType) -> Instance:
     info = typ.partial_fallback.type
     if info.fullname != "builtins.tuple":
         return typ.partial_fallback
-    if (
-        _HAS_TYPE_KERNEL
-        and _native_typeops_active
-        and _native_typeops_resolver is not None
-    ):
+    if _HAS_TYPE_KERNEL and _native_typeops_active and _native_typeops_resolver is not None:
         try:
             result = _type_kernel.rust_tuple_fallback(
                 _serialize_type(typ), _native_typeops_resolver
@@ -429,9 +425,7 @@ def _type_object_type_rust_head(
         # construct a universal callable as the prototype.
         any_type = AnyType(TypeOfAny.special_form)
         if instance_cache.function_type is None:
-            function_typeinfo = lookup_stdlib_typeinfo(
-                "builtins.function", modules_state.modules
-            )
+            function_typeinfo = lookup_stdlib_typeinfo("builtins.function", modules_state.modules)
             instance_cache.function_type = Instance(function_typeinfo, [])
         sig = CallableType(
             arg_types=[any_type, any_type],
@@ -667,16 +661,14 @@ def type_object_type_from_function(
                     if fixed is not None:
                         if isinstance(fixed, CallableType):
                             return fixed.copy_modified(
-                                special_sig=special_sig_seam,
-                                instance_type=default_ret_seam,
+                                special_sig=special_sig_seam, instance_type=default_ret_seam
                             )
                         ov_items = []
                         for item in fixed.items:
                             assert isinstance(item, CallableType)
                             ov_items.append(
                                 item.copy_modified(
-                                    special_sig=special_sig_seam,
-                                    instance_type=default_ret_seam,
+                                    special_sig=special_sig_seam, instance_type=default_ret_seam
                                 )
                             )
                         return Overloaded(ov_items)
@@ -755,9 +747,7 @@ def class_callable(
     # instance_type MUST stay the live fill_typevars(info) result.
     if _HAS_TYPE_KERNEL and _native_typeops_active:
         init_ret_type = get_proper_type(init_type.ret_type)
-        orig_self_proper = (
-            get_proper_type(orig_self_type) if orig_self_type is not None else None
-        )
+        orig_self_proper = get_proper_type(orig_self_type) if orig_self_type is not None else None
         explicit_type = init_ret_type if is_new else orig_self_proper
         default_ret_type = fill_typevars(info)
         from mypy.subtypes import is_equivalent, is_subtype
@@ -844,7 +834,6 @@ def class_callable(
         # We used to only use the explicit return type of __new__() when it was a subtype
         # of the current class. As a result, we may now have a situation like this:
         #     class C:
-
         #         def __new__(cls) -> C: ...
         #     class D(C): ...
         # So we need to ignore the explicit annotation when creating constructor type for D.
@@ -1043,11 +1032,7 @@ def bind_self(
     # defers (None) on variables / star-args / empty args, so the typevar
 
     # path below is untouched.
-    if (
-        not func.variables
-        and _HAS_TYPE_KERNEL
-        and _native_typeops_active
-    ):
+    if not func.variables and _HAS_TYPE_KERNEL and _native_typeops_active:
         try:
             result = _type_kernel.rust_bind_self(_serialize_type(func))
             if result is not None:
@@ -1665,9 +1650,7 @@ def function_type(func: FuncBase, fallback: Instance) -> FunctionLike:
                 if decoded is not None and isinstance(decoded, CallableType):
                     # callable_type arm: Python passes fdef.line/column and
                     # definition=fdef for FuncDef (error-message naming).
-                    definition: SymbolNode | None = (
-                        func if isinstance(func, FuncDef) else None
-                    )
+                    definition: SymbolNode | None = func if isinstance(func, FuncDef) else None
                     return decoded.copy_modified(
                         line=func.line,
                         column=func.column,
@@ -1679,9 +1662,7 @@ def function_type(func: FuncBase, fallback: Instance) -> FunctionLike:
                     # Broken overload: rebuild the inner dummy with the
                     # overload's line; Python builds it with no name, so do
                     # not copy func.name here.
-                    item = decoded.items[0].copy_modified(
-                        line=func.line, implicit=False
-                    )
+                    item = decoded.items[0].copy_modified(line=func.line, implicit=False)
                     return Overloaded([item])
         except (AssertionError, NotImplementedError, ValueError):
             pass
@@ -1879,11 +1860,7 @@ def is_singleton_identity_type(typ: ProperType) -> bool:
 
     Note that this is not true of certain LiteralType, such as Literal[100001] or Literal["string"]
     """
-    if (
-        _HAS_TYPE_KERNEL
-        and _native_typeops_active
-        and _native_typeops_resolver is not None
-    ):
+    if _HAS_TYPE_KERNEL and _native_typeops_active and _native_typeops_resolver is not None:
         try:
             result = _type_kernel.rust_is_singleton_identity_type(
                 _serialize_type(typ), _native_typeops_resolver
@@ -1914,11 +1891,7 @@ def is_singleton_equality_type(typ: ProperType) -> bool:
     Returns True if every value of this type compares equal to every other value of this type,
     as judged by the `==` operator.
     """
-    if (
-        _HAS_TYPE_KERNEL
-        and _native_typeops_active
-        and _native_typeops_resolver is not None
-    ):
+    if _HAS_TYPE_KERNEL and _native_typeops_active and _native_typeops_resolver is not None:
         try:
             result = _type_kernel.rust_is_singleton_equality_type(
                 _serialize_type(typ), _native_typeops_resolver
@@ -1960,7 +1933,10 @@ def try_expanding_sum_type_to_union(typ: Type, target_fullname: str | None) -> T
             # when the input carries mutated truthiness.
             if not _has_mutated_truthiness(typ):
                 result = _type_kernel.rust_try_expanding_sum_type_to_union(
-                    _serialize_type(typ), target_fullname, state.strict_optional, _native_typeops_resolver
+                    _serialize_type(typ),
+                    target_fullname,
+                    state.strict_optional,
+                    _native_typeops_resolver,
                 )
                 if result is not None:
                     decoded = _deserialize_type(bytes(result))
@@ -2062,11 +2038,7 @@ def coerce_to_literal(typ: Type) -> Type:
 
     # native path never uses a stale snapshot. Defers when the live info map
     # is unavailable, or on a TypeAliasType (no wire target).
-    if (
-        _HAS_TYPE_KERNEL
-        and _native_typeops_active
-        and _native_typeops_resolver is not None
-    ):
+    if _HAS_TYPE_KERNEL and _native_typeops_active and _native_typeops_resolver is not None:
         try:
             result = _type_kernel.rust_coerce_to_literal(
                 _serialize_type(typ), _native_typeops_resolver
@@ -2267,11 +2239,7 @@ def try_getting_instance_fallback(typ: Type) -> Instance | None:
         return None
     if cls is TypeGuardedType:
         typ = cast(TypeGuardedType, typ).type_guard
-    if (
-        _HAS_TYPE_KERNEL
-        and _native_typeops_active
-        and _native_typeops_resolver is not None
-    ):
+    if _HAS_TYPE_KERNEL and _native_typeops_active and _native_typeops_resolver is not None:
         try:
             # Issue #1101 decided-None protocol: (True, blob) is the
             # fallback Instance bytes, (True, None) means the

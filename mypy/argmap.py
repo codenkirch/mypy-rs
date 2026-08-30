@@ -123,9 +123,7 @@ def map_actuals_to_formals(
                     _serialize_actual_type(actual_arg_type(ai)) if k.is_star() else None
                     for ai, k in enumerate(actual_kinds)
                 ]
-                result = _rust_map_actuals_to_formals_with_types(
-                    kinds, names, fk, fn, type_blobs
-                )
+                result = _rust_map_actuals_to_formals_with_types(kinds, names, fk, fn, type_blobs)
             else:
                 result = _rust_map_actuals_to_formals(kinds, names, fk, fn)
             if result is not None:

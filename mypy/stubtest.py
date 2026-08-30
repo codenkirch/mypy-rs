@@ -317,9 +317,7 @@ def _verify_exported_names(
         # Pass in MISSING instead of the stub and runtime objects, as the line numbers
         # aren't very
         # relevant here, and it makes for a prettier error message
-
         # This means this error will be ignored when using `--ignore-missing-stub`, which is
-
         # desirable in at least the `names_in_runtime_not_stub` case
         stub_object=MISSING,
         runtime_object=MISSING,
