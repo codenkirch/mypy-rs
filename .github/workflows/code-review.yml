@@ -39,11 +39,17 @@ jobs:
         env:
           PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
-          ocr review --from origin/main \
+          # a CLI crash still yields a review-body reason + failing check via
+          # the poster step, instead of skipping it silently
+          if ocr review --from origin/main \
             --to "$PR_HEAD_SHA" \
             --format json --audience agent \
-            > ocr-result.json
-
+            > ocr-result.json; then
+            exit 0
+          else
+            st=$?
+            printf '{"status": "ocr CLI failed with exit code %s at %s", "comments": []}' "$st" "$(date -u +%FT%TZ)" > ocr-result.json
+          fi
       - name: Post review and gate
         env:
           GH_TOKEN: ${{ github.token }}
