@@ -65,9 +65,7 @@ def make_resolver(
     daemon (``fine_grained_incremental``) exclusion.
     """
     assert fscache._rust is not None  # gate-checked by _native_gate_active
-    stdlib_list = [
-        (name, lo, hi) for name, (lo, hi) in stdlib_versions.items()
-    ]
+    stdlib_list = [(name, lo, hi) for name, (lo, hi) in stdlib_versions.items()]
     return module_resolver.NativeResolver(
         fscache._rust,
         options.namespace_packages,
@@ -84,11 +82,7 @@ def make_resolver(
 
 
 def resolve_module(
-    resolver: module_resolver.NativeResolver,
-    id: str,
-    *,
-    use_typeshed: bool,
-    options: Options,
+    resolver: module_resolver.NativeResolver, id: str, *, use_typeshed: bool, options: Options
 ) -> tuple[str | ModuleNotFoundReason, bool]:
     """Resolve a module id using a long-lived ``NativeResolver``.
 
@@ -109,8 +103,7 @@ def resolve_module(
 
 
 def resolve_modules(
-    resolver: module_resolver.NativeResolver,
-    ids_with_follow: list[tuple[str, bool]],
+    resolver: module_resolver.NativeResolver, ids_with_follow: list[tuple[str, bool]]
 ) -> list[tuple[str | ModuleNotFoundReason, bool]]:
     """Resolve a batch of module ids in one PyO3 call.
 
@@ -217,10 +210,7 @@ def compute_dep_records(
     """
     import_records = [_import_to_record(imp) for imp in file.imports]
     records, error = resolver.compute_dep_records(
-        file.fullname,
-        file.path,
-        import_records,
-        known_modules,
+        file.fullname, file.path, import_records, known_modules
     )
     if error is not None:
         # Report the blocking relative-import error, mirroring

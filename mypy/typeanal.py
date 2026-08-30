@@ -589,9 +589,7 @@ class TypeAnalyser(SyntheticTypeVisitor[Type], TypeAnalyzerPluginInterface):
             return True
         return False
 
-    def _native_visit_unbound_front(
-        self, t: UnboundType, defining_literal: bool
-    ) -> Type | None:
+    def _native_visit_unbound_front(self, t: UnboundType, defining_literal: bool) -> Type | None:
         """Classify the visit_unbound_type_nonoptional branch front in Rust.
 
         Ports the dispatch hub of typeanal.py:310-482. Rust receives only
@@ -680,11 +678,15 @@ class TypeAnalyser(SyntheticTypeVisitor[Type], TypeAnalyzerPluginInterface):
             )
             if tag is None:
                 return None
-            if node_kind in (
-                _UNBOUND_FRONT_KIND_PARAM_SPEC,
-                _UNBOUND_FRONT_KIND_TYPE_VAR,
-                _UNBOUND_FRONT_KIND_TYPE_VAR_TUPLE,
-            ) and placeholder_in_tvar_params:
+            if (
+                node_kind
+                in (
+                    _UNBOUND_FRONT_KIND_PARAM_SPEC,
+                    _UNBOUND_FRONT_KIND_TYPE_VAR,
+                    _UNBOUND_FRONT_KIND_TYPE_VAR_TUPLE,
+                )
+                and placeholder_in_tvar_params
+            ):
                 # The body applies this deferral before the param-spec /
                 # typevar arms, which is exactly where these tags live.
                 self.api.defer()
@@ -760,15 +762,11 @@ class TypeAnalyser(SyntheticTypeVisitor[Type], TypeAnalyzerPluginInterface):
             self.fail(f'ParamSpec "{name}" is unbound', t, code=codes.VALID_TYPE)
             return AnyType(TypeOfAny.from_error)
         if tag == _UNBOUND_FRONT_TAG_PSPEC_ARGS_COMPONENT:
-            self.fail(
-                f'ParamSpec "{t.name}" used with arguments', t, code=codes.VALID_TYPE
-            )
+            self.fail(f'ParamSpec "{t.name}" used with arguments', t, code=codes.VALID_TYPE)
             self.fail("ParamSpec components are not allowed here", t, code=codes.VALID_TYPE)
             return AnyType(TypeOfAny.from_error)
         if tag == _UNBOUND_FRONT_TAG_PSPEC_ARGS:
-            self.fail(
-                f'ParamSpec "{t.name}" used with arguments', t, code=codes.VALID_TYPE
-            )
+            self.fail(f'ParamSpec "{t.name}" used with arguments', t, code=codes.VALID_TYPE)
             assert isinstance(tvar_def, ParamSpecType)
             return ParamSpecType(
                 tvar_def.name,
@@ -797,9 +795,7 @@ class TypeAnalyser(SyntheticTypeVisitor[Type], TypeAnalyzerPluginInterface):
             )
         if tag == _UNBOUND_FRONT_TAG_TVAR_ALIAS_NOT_DECLARED:
             if self.python_3_12_type_alias:
-                msg = message_registry.TYPE_PARAMETERS_SHOULD_BE_DECLARED.format(
-                    f'"{t.name}"'
-                )
+                msg = message_registry.TYPE_PARAMETERS_SHOULD_BE_DECLARED.format(f'"{t.name}"')
             else:
                 msg = f'Type variable "{t.name}" is not included in type_params'
             self.fail(msg, t, code=codes.VALID_TYPE)
@@ -816,9 +812,7 @@ class TypeAnalyser(SyntheticTypeVisitor[Type], TypeAnalyzerPluginInterface):
             return AnyType(TypeOfAny.from_error)
         if tag == _UNBOUND_FRONT_TAG_TVAR_ARGS:
             assert isinstance(tvar_def, TypeVarType)
-            self.fail(
-                f'Type variable "{t.name}" used with arguments', t, code=codes.VALID_TYPE
-            )
+            self.fail(f'Type variable "{t.name}" used with arguments', t, code=codes.VALID_TYPE)
             return tvar_def.copy_modified(line=t.line, column=t.column)
         if tag == _UNBOUND_FRONT_TAG_TVAR_OK:
             assert isinstance(tvar_def, TypeVarType)
@@ -841,9 +835,7 @@ class TypeAnalyser(SyntheticTypeVisitor[Type], TypeAnalyzerPluginInterface):
             return t
         if tag == _UNBOUND_FRONT_TAG_TVARTUPLE_NOT_DECLARED:
             if self.python_3_12_type_alias:
-                msg = message_registry.TYPE_PARAMETERS_SHOULD_BE_DECLARED.format(
-                    f'"{t.name}"'
-                )
+                msg = message_registry.TYPE_PARAMETERS_SHOULD_BE_DECLARED.format(f'"{t.name}"')
             else:
                 msg = f'TypeVarTuple "{t.name}" is not included in type_params'
             self.fail(msg, t, code=codes.VALID_TYPE)
@@ -853,17 +845,13 @@ class TypeAnalyser(SyntheticTypeVisitor[Type], TypeAnalyzerPluginInterface):
             return AnyType(TypeOfAny.from_error)
         if tag == _UNBOUND_FRONT_TAG_TVARTUPLE_NESTING:
             self.fail(
-                f'TypeVarTuple "{t.name}" is only valid with an unpack',
-                t,
-                code=codes.VALID_TYPE,
+                f'TypeVarTuple "{t.name}" is only valid with an unpack', t, code=codes.VALID_TYPE
             )
             return AnyType(TypeOfAny.from_error)
         if tag == _UNBOUND_FRONT_TAG_TVARTUPLE_ARGS:
             assert isinstance(tvar_def, TypeVarTupleType)
             assert isinstance(node, TypeVarTupleExpr)
-            self.fail(
-                f'Type variable "{t.name}" used with arguments', t, code=codes.VALID_TYPE
-            )
+            self.fail(f'Type variable "{t.name}" used with arguments', t, code=codes.VALID_TYPE)
             return TypeVarTupleType(
                 tvar_def.name,
                 tvar_def.fullname,
@@ -984,9 +972,7 @@ class TypeAnalyser(SyntheticTypeVisitor[Type], TypeAnalyzerPluginInterface):
             # The Tuple branch needs the `builtins.tuple` symbol lookup and
             # the EllipsisType arity check, which stay Python-owned.
             sym = self.api.lookup_fully_qualified_or_none("builtins.tuple")
-            tuple_missing_or_placeholder = bool(
-                not sym or isinstance(sym.node, PlaceholderNode)
-            )
+            tuple_missing_or_placeholder = bool(not sym or isinstance(sym.node, PlaceholderNode))
             tuple_ellipsis_form = bool(
                 len(t.args) == 2
                 and isinstance(t.args[1], EllipsisType)
@@ -1002,11 +988,7 @@ class TypeAnalyser(SyntheticTypeVisitor[Type], TypeAnalyzerPluginInterface):
                 fullname,
                 len(t.args),
                 t.empty_tuple_index,
-                getattr(
-                    self,
-                    "allow_typed_dict_special_forms",
-                    False,
-                ),
+                getattr(self, "allow_typed_dict_special_forms", False),
                 tuple_missing_or_placeholder,
                 tuple_ellipsis_form,
                 fullname not in FINAL_TYPE_NAMES,
@@ -1394,9 +1376,7 @@ class TypeAnalyser(SyntheticTypeVisitor[Type], TypeAnalyzerPluginInterface):
             )
         if tag == _UNBOUND_SPECIAL_TAG_REQUIRED_BAD_CTX:
             self.fail(
-                "Required[] can be only used in a TypedDict definition",
-                t,
-                code=codes.VALID_TYPE,
+                "Required[] can be only used in a TypedDict definition", t, code=codes.VALID_TYPE
             )
             return AnyType(TypeOfAny.from_error)
         if tag == _UNBOUND_SPECIAL_TAG_REQUIRED_ARG_ERR:
@@ -1424,15 +1404,11 @@ class TypeAnalyser(SyntheticTypeVisitor[Type], TypeAnalyzerPluginInterface):
             )
         if tag == _UNBOUND_SPECIAL_TAG_READONLY_BAD_CTX:
             self.fail(
-                "ReadOnly[] can be only used in a TypedDict definition",
-                t,
-                code=codes.VALID_TYPE,
+                "ReadOnly[] can be only used in a TypedDict definition", t, code=codes.VALID_TYPE
             )
             return AnyType(TypeOfAny.from_error)
         if tag == _UNBOUND_SPECIAL_TAG_READONLY_ARG_ERR:
-            self.fail(
-                '"ReadOnly[]" must have exactly one type argument', t, code=codes.VALID_TYPE
-            )
+            self.fail('"ReadOnly[]" must have exactly one type argument', t, code=codes.VALID_TYPE)
             return AnyType(TypeOfAny.from_error)
         if tag == _UNBOUND_SPECIAL_TAG_READONLY_DEFER:
             return ReadOnlyType(self.anal_type(t.args[0], allow_typed_dict_special_forms=True))
@@ -2009,9 +1985,7 @@ class TypeAnalyser(SyntheticTypeVisitor[Type], TypeAnalyzerPluginInterface):
     def anal_type_guard_arg(self, t: UnboundType, fullname: str) -> Type | None:
         tag = self._native_type_guard_arg_tag(fullname, len(t.args), is_typeis=False)
         if tag == _TYPE_GUARD_TAG_FAIL:
-            self.fail(
-                "TypeGuard must have exactly one type argument", t, code=codes.VALID_TYPE
-            )
+            self.fail("TypeGuard must have exactly one type argument", t, code=codes.VALID_TYPE)
             return AnyType(TypeOfAny.from_error)
         if tag == _TYPE_GUARD_TAG_RECURSE:
             return self.anal_type(t.args[0])
@@ -2146,9 +2120,7 @@ class TypeAnalyser(SyntheticTypeVisitor[Type], TypeAnalyzerPluginInterface):
             self.note("Suggestion: Is there a spurious trailing comma?", t, code=codes.SYNTAX)
         else:
             self.note(
-                "Suggestion: Use Tuple[T1, ..., Tn] instead of (T1, ..., Tn)",
-                t,
-                code=codes.SYNTAX,
+                "Suggestion: Use Tuple[T1, ..., Tn] instead of (T1, ..., Tn)", t, code=codes.SYNTAX
             )
         return AnyType(TypeOfAny.from_error)
 
@@ -2265,9 +2237,7 @@ class TypeAnalyser(SyntheticTypeVisitor[Type], TypeAnalyzerPluginInterface):
             return None
         try:
             tag = _rust_classify_raw_expression_type(
-                self.report_invalid_types,
-                t.base_type_name,
-                t.note is None,
+                self.report_invalid_types, t.base_type_name, t.note is None
             )
         except (AssertionError, NotImplementedError):
             return None
@@ -2517,10 +2487,7 @@ class TypeAnalyser(SyntheticTypeVisitor[Type], TypeAnalyzerPluginInterface):
         arg0_is_ellipsis = arg_count == 2 and isinstance(t.args[0], EllipsisType)
         try:
             return _rust_classify_analyze_callable_type(
-                arg_count,
-                arg0_is_type_list,
-                arg0_is_ellipsis,
-                self.options.disallow_any_generics,
+                arg_count, arg0_is_type_list, arg0_is_ellipsis, self.options.disallow_any_generics
             )
         except (AssertionError, NotImplementedError):
             return None
@@ -2560,14 +2527,10 @@ class TypeAnalyser(SyntheticTypeVisitor[Type], TypeAnalyzerPluginInterface):
                 # We usually do this in visit_callable_type(), but this is early.
                 variables = []
                 for name, tvar_expr in self.find_type_var_likes(callable_args):
-                    variables.append(
-                        self.tvar_scope.bind_new(name, tvar_expr, self.fail_func, t)
-                    )
+                    variables.append(self.tvar_scope.bind_new(name, tvar_expr, self.fail_func, t))
                 maybe_ret = self.analyze_callable_args_for_paramspec(
                     callable_args, ret_type, fallback
-                ) or self.analyze_callable_args_for_concatenate(
-                    callable_args, ret_type, fallback
-                )
+                ) or self.analyze_callable_args_for_concatenate(callable_args, ret_type, fallback)
                 if isinstance(maybe_ret, CallableType):
                     maybe_ret = maybe_ret.copy_modified(variables=variables)
             if maybe_ret is None:
@@ -2719,8 +2682,20 @@ class TypeAnalyser(SyntheticTypeVisitor[Type], TypeAnalyzerPluginInterface):
                     orig_fb = arg.original_str_fallback
         if orig_str_not_none:
             tag = _rust_classify_literal_param(
-                is_proper, is_unbound_pre, is_union_pre, True,
-                False, 0, False, True, "", False, False, False, True, False,
+                is_proper,
+                is_unbound_pre,
+                is_union_pre,
+                True,
+                False,
+                0,
+                False,
+                True,
+                "",
+                False,
+                False,
+                False,
+                True,
+                False,
             )
             if tag == _LITERAL_PARAM_TAG_STR:
                 assert orig_str is not None and orig_fb is not None
@@ -2760,10 +2735,20 @@ class TypeAnalyser(SyntheticTypeVisitor[Type], TypeAnalyzerPluginInterface):
             last_known_value_is_none = True
         is_union_post = isinstance(arg, UnionType)
         tag = _rust_classify_literal_param(
-            False, False, False, False,
-            is_any, type_of_any, is_raw_expr, literal_value_is_none,
-            simple_name, is_none_type, is_literal, is_instance,
-            last_known_value_is_none, is_union_post,
+            False,
+            False,
+            False,
+            False,
+            is_any,
+            type_of_any,
+            is_raw_expr,
+            literal_value_is_none,
+            simple_name,
+            is_none_type,
+            is_literal,
+            is_instance,
+            last_known_value_is_none,
+            is_union_post,
         )
         return self._apply_literal_param_tag(tag, idx, arg, ctx)
 
@@ -2773,7 +2758,8 @@ class TypeAnalyser(SyntheticTypeVisitor[Type], TypeAnalyzerPluginInterface):
         if tag == _LITERAL_PARAM_TAG_ANY_FAIL:
             self.fail(
                 f'Parameter {idx} of Literal[...] cannot be of type "Any"',
-                ctx, code=codes.VALID_TYPE,
+                ctx,
+                code=codes.VALID_TYPE,
             )
             return None
         if tag == _LITERAL_PARAM_TAG_ANY_SILENT:
@@ -2783,13 +2769,15 @@ class TypeAnalyser(SyntheticTypeVisitor[Type], TypeAnalyzerPluginInterface):
             name = arg.simple_name()
             self.fail(
                 f'Parameter {idx} of Literal[...] cannot be of type "{name}"',
-                ctx, code=codes.VALID_TYPE,
+                ctx,
+                code=codes.VALID_TYPE,
             )
             return None
         if tag == _LITERAL_PARAM_TAG_RAW_ARBITRARY:
             self.fail(
                 "Invalid type: Literal[...] cannot contain arbitrary expressions",
-                ctx, code=codes.VALID_TYPE,
+                ctx,
+                code=codes.VALID_TYPE,
             )
             return None
         if tag == _LITERAL_PARAM_TAG_RAW_VALUE:
@@ -2798,12 +2786,7 @@ class TypeAnalyser(SyntheticTypeVisitor[Type], TypeAnalyzerPluginInterface):
             assert isinstance(fallback, Instance)
             literal_value = arg.literal_value
             assert literal_value is not None
-            return [
-                LiteralType(
-                    literal_value, fallback,
-                    line=arg.line, column=arg.column,
-                )
-            ]
+            return [LiteralType(literal_value, fallback, line=arg.line, column=arg.column)]
         if tag == _LITERAL_PARAM_TAG_NONE_OR_LITERAL:
             return [arg]
         if tag == _LITERAL_PARAM_TAG_INSTANCE_LKV:
@@ -2819,10 +2802,7 @@ class TypeAnalyser(SyntheticTypeVisitor[Type], TypeAnalyzerPluginInterface):
                 out.extend(union_result)
             return out
         # _LITERAL_PARAM_TAG_INVALID
-        self.fail(
-            f"Parameter {idx} of Literal[...] is invalid",
-            ctx, code=codes.VALID_TYPE,
-        )
+        self.fail(f"Parameter {idx} of Literal[...] is invalid", ctx, code=codes.VALID_TYPE)
         return None
 
     def _python_analyze_literal_param(
@@ -3342,10 +3322,7 @@ def instantiate_type_alias(
             if result == 0:
                 # non-generic alias, no args, no_args: eager expansion.
                 assert isinstance(node.target, Instance)  # type: ignore[misc]
-                return (
-                    Instance(node.target.type, [], line=ctx.line, column=ctx.column),
-                    False,
-                )
+                return (Instance(node.target.type, [], line=ctx.line, column=ctx.column), False)
             if result == 1:
                 # non-generic alias with args targeting a bare generic.
                 assert isinstance(node.target, Instance)  # type: ignore[misc]
@@ -3986,7 +3963,9 @@ def native_analyze_type(
         return None
     try:
         payload = _serialize_typeanal_type(t)
-        result = _rust_type_analyze(payload, allow_tuple_literal, allow_param_spec_literals, allow_unpack)
+        result = _rust_type_analyze(
+            payload, allow_tuple_literal, allow_param_spec_literals, allow_unpack
+        )
         if result is not None:
             decoded = _typeanal_decode(result)
             if decoded is not None:
@@ -4087,9 +4066,7 @@ class _WirePositionStamper(TrivialSyntheticTypeTranslator):
         result = get_proper_type(super().visit_callable_type(t))
         if not isinstance(result, CallableType):
             return self._fix(result)
-        result.variables = tuple(
-            cast(TypeVarLikeType, v.accept(self)) for v in result.variables
-        )
+        result.variables = tuple(cast(TypeVarLikeType, v.accept(self)) for v in result.variables)
         if result.type_guard is not None:
             result.type_guard = result.type_guard.accept(self)
         if result.type_is is not None:
@@ -4151,8 +4128,7 @@ def has_explicit_any(t: Type) -> bool:
         try:
             if _native_typeanal_resolver is not None:
                 result = _rust_has_explicit_any_live(
-                    _native_typeanal_resolver,
-                    _serialize_typeanal_type(t),
+                    _native_typeanal_resolver, _serialize_typeanal_type(t)
                 )
             else:
                 result = _rust_has_explicit_any(_serialize_typeanal_type(t))
@@ -4185,8 +4161,7 @@ def has_any_from_unimported_type(t: Type) -> bool:
         try:
             if _native_typeanal_resolver is not None:
                 result = _rust_has_any_from_unimported_type_live(
-                    _native_typeanal_resolver,
-                    _serialize_typeanal_type(t),
+                    _native_typeanal_resolver, _serialize_typeanal_type(t)
                 )
             else:
                 result = _rust_has_any_from_unimported_type(_serialize_typeanal_type(t))
@@ -4217,8 +4192,7 @@ def collect_all_inner_types(t: Type) -> list[Type]:
         try:
             if _native_typeanal_resolver is not None:
                 result = _rust_collect_all_inner_types_live(
-                    _native_typeanal_resolver,
-                    _serialize_typeanal_type(t),
+                    _native_typeanal_resolver, _serialize_typeanal_type(t)
                 )
             else:
                 result = _rust_collect_all_inner_types(_serialize_typeanal_type(t))
@@ -4257,8 +4231,7 @@ def make_optional_type(t: Type) -> Type:
         try:
             if _native_typeanal_resolver is not None:
                 result = _rust_make_optional_type_live(
-                    _native_typeanal_resolver,
-                    _serialize_typeanal_type(t),
+                    _native_typeanal_resolver, _serialize_typeanal_type(t)
                 )
             else:
                 result = _rust_make_optional_type(_serialize_typeanal_type(t))
@@ -4395,8 +4368,7 @@ def unknown_unpack(t: Type) -> bool:
         try:
             if _native_typeanal_resolver is not None:
                 result = _rust_unknown_unpack_live(
-                    _native_typeanal_resolver,
-                    _serialize_typeanal_type(t),
+                    _native_typeanal_resolver, _serialize_typeanal_type(t)
                 )
             else:
                 result = _rust_unknown_unpack(_serialize_typeanal_type(t))

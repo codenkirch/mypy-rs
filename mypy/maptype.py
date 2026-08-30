@@ -40,10 +40,7 @@ def _clear_map_supertype_decode_cache() -> None:
 
 try:
     import type_kernel as _type_kernel
-    from librt.internal import (
-        ReadBuffer as _ReadBuffer,
-        WriteBuffer as _WriteBuffer,
-    )
+    from librt.internal import ReadBuffer as _ReadBuffer, WriteBuffer as _WriteBuffer
 
     _HAS_TYPE_KERNEL = True
 except ImportError:
@@ -122,9 +119,7 @@ def _needs_python(typ: Type) -> bool:
     return False
 
 
-def _native_map_instance_to_supertype(
-    instance: Instance, superclass: TypeInfo
-) -> Instance | None:
+def _native_map_instance_to_supertype(instance: Instance, superclass: TypeInfo) -> Instance | None:
     """Try the Rust map_instance_to_supertype path; None defers to Python."""
     if not (
         _HAS_TYPE_KERNEL
@@ -153,10 +148,7 @@ def _native_map_instance_to_supertype(
             fixed.column = instance.column
             return fixed
         decoded = read_type(_ReadBuffer(raw))
-        from mypy.wirefixup import (
-            canonicalize_fresh_vars_reported,
-            fixup_wire_type,
-        )
+        from mypy.wirefixup import canonicalize_fresh_vars_reported, fixup_wire_type
 
         fixed = fixup_wire_type(decoded)
         # The wire round-trip splits fresh meta-var occurrences of one id
@@ -249,9 +241,7 @@ def _native_map_step_frontier(
         buf = _WriteBuffer()
         write_type_list(buf, supported)
         result = _type_kernel.rust_map_instance_to_supertypes(
-            _native_map_resolver,
-            buf.getvalue(),
-            supertype.fullname,
+            _native_map_resolver, buf.getvalue(), supertype.fullname
         )
         if result is None:
             return None

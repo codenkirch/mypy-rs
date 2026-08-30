@@ -338,11 +338,9 @@ def snapshot_definition(node: SymbolNode | None, common: SymbolSnapshot) -> Symb
             # Note that the structure of type variables is a part of the external interface,
             # since creating instances might fail, for example:
             #     T = TypeVar('T', bound=int)
-
             #     class C(Generic[T]):
             #         ...
             #     x: C[str] <- this is invalid, and needs to be re-checked if `T` changes.
-
             # An alternative would be to create both deps: <...> -> C, and <...> -> <C>,
             # but this currently seems a bit ad hoc.
             tuple(snapshot_type(tdef) for tdef in node.defn.type_vars),

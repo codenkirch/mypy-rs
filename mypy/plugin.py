@@ -445,6 +445,7 @@ class FunctionSigContext(NamedTuple):
 # a special signature.
 #
 
+
 # A no-op callback would just return the inferred return type, but a useful
 # callback at least sometimes can infer a more precise type.
 class FunctionContext(NamedTuple):
@@ -471,6 +472,7 @@ class FunctionContext(NamedTuple):
 # method.  Note that argument types aren't available yet.  If you need them,
 # you have to use a method hook instead.
 
+
 # TODO: document ProperType in the plugin changelog/update issue.
 class MethodSigContext(NamedTuple):
     type: ProperType  # Base object type for method call
@@ -483,6 +485,7 @@ class MethodSigContext(NamedTuple):
 # A context for a method hook that infers the return type of a method with a
 # special signature.
 #
+
 
 # This is very similar to FunctionContext (only differences are documented).
 class MethodContext(NamedTuple):

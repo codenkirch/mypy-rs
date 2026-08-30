@@ -26,18 +26,10 @@ from __future__ import annotations
 
 from typing import Any
 
-from librt.internal import (
-    write_int as write_int_bare,
-)
+from librt.internal import write_int as write_int_bare
 
 from mypy import nodes
-from mypy.cache import (
-    END_TAG,
-    LIST_GEN,
-    LITERAL_NONE,
-    WriteBuffer,
-    write_tag,
-)
+from mypy.cache import END_TAG, LIST_GEN, LITERAL_NONE, WriteBuffer, write_tag
 
 # Build the tag lookup: class name -> tag value.
 # Maps from the Python class to its wire tag constant.
@@ -147,16 +139,19 @@ def _register_node_tags() -> None:
     }
     # Patterns.
     from mypy import patterns as p
-    tag_map.update({
-        nodes.AS_PATTERN: p.AsPattern,
-        nodes.OR_PATTERN: p.OrPattern,
-        nodes.VALUE_PATTERN: p.ValuePattern,
-        nodes.SINGLETON_PATTERN: p.SingletonPattern,
-        nodes.SEQUENCE_PATTERN: p.SequencePattern,
-        nodes.STARRED_PATTERN: p.StarredPattern,
-        nodes.MAPPING_PATTERN: p.MappingPattern,
-        nodes.CLASS_PATTERN: p.ClassPattern,
-    })
+
+    tag_map.update(
+        {
+            nodes.AS_PATTERN: p.AsPattern,
+            nodes.OR_PATTERN: p.OrPattern,
+            nodes.VALUE_PATTERN: p.ValuePattern,
+            nodes.SINGLETON_PATTERN: p.SingletonPattern,
+            nodes.SEQUENCE_PATTERN: p.SequencePattern,
+            nodes.STARRED_PATTERN: p.StarredPattern,
+            nodes.MAPPING_PATTERN: p.MappingPattern,
+            nodes.CLASS_PATTERN: p.ClassPattern,
+        }
+    )
     for tag, cls in tag_map.items():
         _NODE_TAGS[cls] = tag
 
@@ -175,10 +170,10 @@ def _get_all_slots(cls: type) -> list[str]:
     if cached is not None:
         return cached
     result: list[str] = []
-    skip = {object, nodes.Context, nodes.Node, nodes.Statement,
-            nodes.Expression}
+    skip = {object, nodes.Context, nodes.Node, nodes.Statement, nodes.Expression}
     try:
         from mypy.patterns import Pattern
+
         skip.add(Pattern)
     except ImportError:
         pass
@@ -275,8 +270,7 @@ def serialize_node(node: nodes.Node | None, buf: WriteBuffer) -> None:
                     else:
                         first = value[0]
                         if isinstance(first, nodes.Node) or first is None:
-                            if all((isinstance(i, nodes.Node) or i is None)
-                                   for i in value):
+                            if all((isinstance(i, nodes.Node) or i is None) for i in value):
                                 child_fields.append(value)
                             else:
                                 child_fields.append(None)

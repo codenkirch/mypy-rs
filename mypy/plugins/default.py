@@ -162,11 +162,7 @@ DEFAULT_HOOK_FULLNAMES_BY_KIND: Final[dict[str, frozenset[str]]] = {
         }
     ),
     "get_method_signature_hook": frozenset(
-        {
-            "typing.Mapping.get",
-            "_ctypes.Array.__setitem__",
-            SINGLEDISPATCH_CALLABLE_CALL_METHOD,
-        }
+        {"typing.Mapping.get", "_ctypes.Array.__setitem__", SINGLEDISPATCH_CALLABLE_CALL_METHOD}
         | TD_SETDEFAULT_NAMES
         | TD_POP_NAMES
         | TD_UPDATE_METHOD_NAMES
@@ -190,12 +186,7 @@ DEFAULT_HOOK_FULLNAMES_BY_KIND: Final[dict[str, frozenset[str]]] = {
         | TD_DELITEM_NAMES
     ),
     "get_attribute_hook": frozenset(
-        {
-            "_ctypes.Array.value",
-            "_ctypes.Array.raw",
-        }
-        | ENUM_NAME_ACCESS
-        | ENUM_VALUE_ACCESS
+        {"_ctypes.Array.value", "_ctypes.Array.raw"} | ENUM_NAME_ACCESS | ENUM_VALUE_ACCESS
     ),
     "get_class_decorator_hook": frozenset(
         dataclass_makers

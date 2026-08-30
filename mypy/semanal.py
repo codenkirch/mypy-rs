@@ -1229,9 +1229,9 @@ class SemanticAnalyzer(
                     "builtins.dict", [str_type, AnyType(TypeOfAny.special_form)]
                 )
                 if inst is None:
-                    assert not self.final_iteration, (
-                        "Cannot find builtins.dict to add __annotations__"
-                    )
+                    assert (
+                        not self.final_iteration
+                    ), "Cannot find builtins.dict to add __annotations__"
                     self.defer()
                     return
                 typ = inst
@@ -1614,9 +1614,7 @@ class SemanticAnalyzer(
                     new_arg_types = typ.arg_types[:-1] + [AnyType(TypeOfAny.from_error)]
                     return typ.copy_modified(arg_types=new_arg_types)
                 assert tag == _NATIVE_UNPACK_KW_OK
-                p_last_type = get_proper_type(
-                    cast(UnpackType, typ.arg_types[-1]).type
-                )
+                p_last_type = get_proper_type(cast(UnpackType, typ.arg_types[-1]).type)
                 new_arg_types = typ.arg_types[:-1] + [p_last_type]
                 return typ.copy_modified(arg_types=new_arg_types, unpack_kwargs=True)
         if not typ.arg_kinds or typ.arg_kinds[-1] is not ArgKind.ARG_STAR2:
@@ -1666,10 +1664,7 @@ class SemanticAnalyzer(
                     func.is_static = True
                 if set_is_class:
                     func.is_class = True
-                if tag in (
-                    _NATIVE_METH_SIG_ANY_SELF_REPLACE,
-                    _NATIVE_METH_SIG_ANY_SELF_TRIVIAL,
-                ):
+                if tag in (_NATIVE_METH_SIG_ANY_SELF_REPLACE, _NATIVE_METH_SIG_ANY_SELF_TRIVIAL):
                     if tag == _NATIVE_METH_SIG_ANY_SELF_REPLACE:
                         assert self.type is not None and self.type.self_type is not None
                         leading_type: Type = self.type.self_type
@@ -2577,9 +2572,9 @@ class SemanticAnalyzer(
             if self.is_defined_type_param(p.name):
                 self.fail(f'"{p.name}" already defined as a type parameter', context)
             else:
-                assert self.add_symbol(p.name, tv, context, no_progress=True, type_param=True), (
-                    "Type parameter should not be discarded"
-                )
+                assert self.add_symbol(
+                    p.name, tv, context, no_progress=True, type_param=True
+                ), "Type parameter should not be discarded"
 
         return tvs
 
@@ -7546,9 +7541,7 @@ class SemanticAnalyzer(
         ):
             try:
                 tag = _rust_classify_fixed_args(
-                    len(expr.args),
-                    [k.value for k in expr.arg_kinds],
-                    numargs,
+                    len(expr.args), [k.value for k in expr.arg_kinds], numargs
                 )
             except (AssertionError, NotImplementedError, ValueError, TypeError):
                 tag = None
@@ -7560,8 +7553,7 @@ class SemanticAnalyzer(
                     return False
                 if tag == NATIVE_FIXED_ARGS_WRONG_KINDS:
                     self.fail(
-                        f'"{name}" must be called with {numargs} positional argument{s}',
-                        expr,
+                        f'"{name}" must be called with {numargs} positional argument{s}', expr
                     )
                     return False
         if len(expr.args) != numargs:
@@ -7589,12 +7581,7 @@ class SemanticAnalyzer(
         if _SEMANAL_VISITOR_HAS_KERNEL and _native_semanal_visitor_active:
             try:
                 classification, sym = _rust_classify_member_resolution(
-                    expr,
-                    MemberExpr,
-                    RefExpr,
-                    MypyFile,
-                    TypeInfo,
-                    TypeAlias,
+                    expr, MemberExpr, RefExpr, MypyFile, TypeInfo, TypeAlias
                 )
                 if classification is not None:
                     state = (classification, sym)
@@ -9180,9 +9167,9 @@ class SemanticAnalyzer(
                             names = self.globals
                         else:
                             names_candidate = self.locals[-1 - i]
-                            assert names_candidate is not None, (
-                                "Escaping comprehension from invalid scope"
-                            )
+                            assert (
+                                names_candidate is not None
+                            ), "Escaping comprehension from invalid scope"
                             names = names_candidate
                         break
                 else:

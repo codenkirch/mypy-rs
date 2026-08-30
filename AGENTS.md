@@ -2426,4 +2426,3 @@ including:
 The default branch on this fork is `main` (not `master`). Always target
 `main` as the PR base. Branch from `main` before committing — do not commit
 directly to `main`.
-

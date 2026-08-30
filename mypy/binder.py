@@ -41,6 +41,7 @@ from mypy.typevars import fill_typevars_with_any
 
 try:
     from type_kernel import rust_get_declaration as _rust_get_declaration
+
     _HAS_RUST_BINDER = True
 except ImportError:
     _rust_get_declaration = None  # type: ignore[assignment]

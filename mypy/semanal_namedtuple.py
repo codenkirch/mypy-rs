@@ -73,9 +73,8 @@ from mypy.types import (
 from mypy.util import get_unique_redefinition_name
 
 try:
-    from type_kernel import (
-        rust_check_namedtuple_field_name as _rust_check_namedtuple_field_name,
-    )
+    from type_kernel import rust_check_namedtuple_field_name as _rust_check_namedtuple_field_name
+
     _HAS_RUST_NAMEDTUPLE = True
 except ImportError:
     _rust_check_namedtuple_field_name = None  # type: ignore[assignment]

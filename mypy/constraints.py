@@ -951,12 +951,7 @@ def _infer_constraints(
     if _native_constraints_active and _HAS_TYPE_KERNEL:
         try:
             res = _try_native_constraint_builder(
-                template,
-                actual,
-                direction,
-                skip_neg_op,
-                erase_types,
-                type_state.infer_polymorphic,
+                template, actual, direction, skip_neg_op, erase_types, type_state.infer_polymorphic
             )
             if res is not None:
                 return res
@@ -1559,11 +1554,9 @@ class ConstraintBuilderVisitor(TypeVisitor[list[Constraint]]):
                 # We avoid infinite recursion for structural subtypes by checking
                 # whether this type already appeared in the inference chain.
                 # This is a conservative way to break the inference cycles.
-
                 # It never produces any "false" constraints but gives up soon
                 # on purely structural inference cycles, see #3829.
                 # Note that we use is_protocol_implementation instead of is_subtype
-
                 # because some type may be considered a subtype of a protocol
                 # due to _promote, but still not implement the protocol.
                 not any(template == t for t in reversed(template.type.inferring))
@@ -1722,7 +1715,6 @@ class ConstraintBuilderVisitor(TypeVisitor[list[Constraint]]):
                     # Technically, the correct inferred type for application of e.g.
                     # Callable[..., T] -> Callable[..., T] (with literal ellipsis), to a generic
                     # like U -> U, should be Callable[..., Any], but if U is a self-type, we can
-
                     # allow it to leak, to be later bound to self. A bunch of existing code
                     # depends on this old behaviour.
                     and not (

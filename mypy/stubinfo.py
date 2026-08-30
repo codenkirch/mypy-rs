@@ -309,7 +309,6 @@ non_bundled_packages_flat: dict[str, str] = {
     # Stub packages that are not from typeshed
     # Since these can be installed automatically via --install-types, we have a high
     # trust bar
-
     # for additions here
     "pandas": "pandas-stubs",  # https://github.com/pandas-dev/pandas-stubs
     "lxml": "lxml-stubs",  # https://github.com/lxml/lxml-stubs

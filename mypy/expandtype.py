@@ -611,10 +611,7 @@ def expand_type_by_instance(typ: Type, instance: Instance) -> Type:
             and _native_expand_type_active
             and _native_expand_type_resolver is not None
             and not _needs_python(typ)
-            and not any(
-                _needs_python(a, definition_gate=False)
-                for a in instance.args
-            )
+            and not any(_needs_python(a, definition_gate=False) for a in instance.args)
         ):
             try:
                 result = _type_kernel.rust_expand_type_by_instance(

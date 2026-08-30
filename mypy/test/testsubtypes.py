@@ -419,9 +419,7 @@ class NativeSubtypeSuite(Suite):
         from mypy.nodes import Block, ClassDef, SymbolTable, TypeInfo
         from mypy.types import AnyType, TypeOfAny, TypeVarId, TypeVarType
 
-        def make_class(
-            name: str, *, bases: list[Instance], typevars: list[str]
-        ) -> TypeInfo:
+        def make_class(name: str, *, bases: list[Instance], typevars: list[str]) -> TypeInfo:
             defn = ClassDef(name, Block([]), None, [])
             defn.fullname = name
             defn.type_vars = [
@@ -464,11 +462,7 @@ class NativeSubtypeSuite(Suite):
             AnyType(TypeOfAny.from_omitted_generics),
             variance=INVARIANT,
         )
-        gsi = make_class(
-            "ns.GS",
-            bases=[Instance(gi, [s_tvar])],
-            typevars=["T", "S"],
-        )
+        gsi = make_class("ns.GS", bases=[Instance(gi, [s_tvar])], typevars=["T", "S"])
         gsab = Instance(gsi, [self.fx.a, self.fx.b])
         gb = Instance(gi, [self.fx.b])
         ga = Instance(gi, [self.fx.a])
@@ -663,19 +657,14 @@ class NativeSubtypeGapSuite(Suite):
         right = Instance(self.fx.ai, [callable_arg])
         result_rust = is_subtype(left, right)
         # Pure-Python control (deactivate Rust):
-        from mypy.subtypes import (
-            _set_native_subtype_active,
-            _set_native_subtype_resolver,
-        )
+        from mypy.subtypes import _set_native_subtype_active, _set_native_subtype_resolver
 
         _set_native_subtype_active(False)
         _set_native_subtype_resolver(None)
         result_python = is_subtype(left, right)
         _set_native_subtype_active(True)
         _set_native_subtype_resolver(self.resolver)
-        assert result_rust == result_python, (
-            f"Rust ({result_rust}) != Python ({result_python})"
-        )
+        assert result_rust == result_python, f"Rust ({result_rust}) != Python ({result_python})"
 
     def test_nominal_with_nested_instance_args(self) -> None:
         # Regression guard: nested Instance args with TypeVars must
