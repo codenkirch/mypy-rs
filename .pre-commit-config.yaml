@@ -35,6 +35,7 @@ repos:
         args: [
           -ignore=property "debug_build" is not defined,
           -ignore=property "allow_failure" is not defined,
+          -ignore=label "VidiomTM" is unknown,
           -ignore=SC2(046|086),
         ]
         additional_dependencies:

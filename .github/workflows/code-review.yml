@@ -1,0 +1,46 @@
+name: AI Code Review
+
+# OpenCodeReview reviews every PR targeting main. `ocr` is pre-installed on
+# the self-hosted runner (config lives runner-side). Findings are posted
+# as a PR review and the check fails when they exist, so they gate merge.
+
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch: {} # runner-health probe; the review job only runs for pull_request events
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: code-review-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  ocr-review:
+    if: >
+      vars.ENABLE_AI_CODE_REVIEW == 'true' &&
+      github.event_name == 'pull_request'
+    runs-on: [self-hosted, macOS, ARM64, VidiomTM]
+    timeout-minutes: 60
+    steps:
+      - name: Checkout PR head
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+
+      - name: Review PR diff with OpenCodeReview
+        run: |
+          ocr review --from origin/main \
+            --to ${{ github.event.pull_request.head.sha }} \
+            --format json --audience agent \
+            > ocr-result.json
+
+      - name: Post review and gate on findings
+        run: python3 .github/workflows/ocr_post.py ocr-result.json
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_SHA: ${{ github.event.pull_request.head.sha }}
