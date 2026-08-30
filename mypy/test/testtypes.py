@@ -3047,6 +3047,168 @@ class NativeJoinTypesSuite(Suite):
 
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeJoinTypeListSuite(Suite):
+    """Parity suite for the Rust `join_type_list` fold port
+    (join.py:1508-1529, checker_helpers.rs `join_type_list_inner`).
+
+    With the native join gate on, `join_type_list` serializes the list
+    and folds it pairwise through `rust_join_type_list` (one setops pair
+    join per accumulator step); arg-bearing Instance-Instance pairs the
+    prejoin cannot decide route through the `join_instances_core`
+    engine. The whole call defers (`None`) for lists whose items carry
+    a last_known_value, `fallback_to_any` classes, or identity-unsafe
+    items; the Python shim then re-runs the identical pure fold.
+    Length <= 1 lists never cross the FFI boundary (Python early return
+    before the gate). Every test asserts the gate-off vs gate-on
+    results are identical, and a direct seam call proves Rust
+    engagement for the decided cases and deferral for the guarded ones.
+    """
+
+    def setUp(self) -> None:
+        from mypy.join import (
+            _set_native_join_active,
+            _set_native_join_resolver,
+            _set_native_join_typeinfo_map,
+        )
+        from mypy.subtypes import _set_native_subtype_active, _set_native_subtype_resolver
+
+        self.fx = TypeFixture()
+        type_infos = self._collect_type_infos()
+        self.resolver = _type_kernel.build_native_resolver(type_infos, [])
+        typeinfo_map = {info.fullname: info for info in type_infos}
+        _set_native_subtype_active(True)
+        _set_native_subtype_resolver(self.resolver)
+        _set_native_join_active(True)
+        _set_native_join_resolver(self.resolver)
+        _set_native_join_typeinfo_map(typeinfo_map)
+
+    def tearDown(self) -> None:
+        from mypy.join import (
+            _set_native_join_active,
+            _set_native_join_resolver,
+            _set_native_join_typeinfo_map,
+        )
+        from mypy.subtypes import _set_native_subtype_active, _set_native_subtype_resolver
+
+        _set_native_subtype_active(False)
+        _set_native_subtype_resolver(None)
+        _set_native_join_active(False)
+        _set_native_join_resolver(None)
+        _set_native_join_typeinfo_map(None)
+
+    def _collect_type_infos(self) -> list[TypeInfo]:
+        infos = []
+        for name in dir(self.fx):
+            if not name.endswith("i"):
+                continue
+            value = getattr(self.fx, name)
+            if _is_type_info(value):
+                infos.append(value)
+        return infos
+
+    def _with_gate(self, active: bool, fn: Callable[[], T]) -> T:
+        import mypy.join
+
+        old = mypy.join._native_join_active
+        mypy.join._set_native_join_active(active)
+        try:
+            return fn()
+        finally:
+            mypy.join._set_native_join_active(old)
+
+    def _assert_parity(self, types: list[Type]) -> object:
+        from mypy.join import join_type_list
+
+        off = self._with_gate(False, lambda: join_type_list(list(types)))
+        on = self._with_gate(True, lambda: join_type_list(list(types)))
+        assert_equal(on, off)
+        return on
+
+    def _seam_result(self, types: list[Type]) -> object:
+        from mypy.join import _serialize_type
+
+        blobs = [_serialize_type(t) for t in types]
+        return _type_kernel.rust_join_type_list(blobs, True, self.resolver)
+
+    def test_empty_list_uninhabited(self) -> None:
+        # join.py:1509-1517: length <= 1 lists never cross the gate.
+        from mypy.join import join_type_list
+
+        on = self._assert_parity([])
+        assert isinstance(on, UninhabitedType)
+        assert join_type_list([self.fx.a]) == self.fx.a
+
+    def test_duplicate_same_instances(self) -> None:
+        # [A, A] -> A (the args-less prejoin's same-ref arm).
+        assert self._assert_parity([self.fx.a, self.fx.a]) == self.fx.a
+        assert self._seam_result([self.fx.a, self.fx.a]) is not None
+
+    def test_subtype_dominated(self) -> None:
+        # [B, A] -> A (B <: A, the supertype wins the fold).
+        assert self._assert_parity([self.fx.b, self.fx.a]) == self.fx.a
+
+    def test_unrelated_instances_join_to_object(self) -> None:
+        # [A, D] -> object: the prejoin defers on the unrelated pair and
+        # the fold routes through the join_instances_core nominal arm.
+        assert self._assert_parity([self.fx.a, self.fx.d]) == self.fx.o
+        assert self._seam_result([self.fx.a, self.fx.d]) is not None
+
+    def test_covariant_same_class_args(self) -> None:
+        # [G[A], G[B]] -> G[A]: the arg-bearing pair routes through
+        # visit_instance_with_args (covariant argwise fold).
+        assert self._assert_parity([self.fx.ga, self.fx.gb]) == self.fx.ga
+        assert self._seam_result([self.fx.ga, self.fx.gb]) is not None
+
+    def test_any_absorbs(self) -> None:
+        # [Any, A] -> Any (the setops Any short-circuit in the fold).
+        assert self._assert_parity([self.fx.anyt, self.fx.a]) == self.fx.anyt
+        assert self._seam_result([self.fx.anyt, self.fx.a]) is not None
+
+    def test_lkv_list_defers(self) -> None:
+        # A literal-carrying Instance is a whole-list guard: the seam
+        # must return None and both gates fall back to the pure-Python
+        # fold (which drops the LKVs), so parity holds by re-running.
+        from mypy.types import LiteralType
+
+        lit_a = Instance(self.fx.ai, [], last_known_value=LiteralType(1, self.fx.a))
+        lit_b = Instance(self.fx.ai, [], last_known_value=LiteralType(2, self.fx.a))
+        assert self._seam_result([lit_a, lit_b]) is None
+        self._assert_parity([lit_a, lit_b])
+
+    def test_fallback_to_any_list_defers(self) -> None:
+        # A fallback_to_any class (stub / unknown base) absorbs into
+        # Any in Python but the wire kernel cannot reproduce that, so
+        # the whole list defers to the pure-Python fold.
+        from mypy.join import _serialize_type
+        from mypy.nodes import MDEF, SymbolTableNode, Var as VarNode
+
+        dyn_i = self.fx.make_type_info("mod.DynStub")
+        dyn_i.fallback_to_any = True
+        dyn_i.names["x"] = SymbolTableNode(MDEF, VarNode("x", AnyType(TypeOfAny.explicit)))
+        infos = self._collect_type_infos() + [dyn_i]
+        resolver = _type_kernel.build_native_resolver(infos, [])
+        dyn = Instance(dyn_i, [])
+        types = [dyn, self.fx.a]
+        blobs = [_serialize_type(t) for t in types]
+        assert _type_kernel.rust_join_type_list(blobs, True, resolver) is None
+
+    def test_missing_snapshot_list_defers(self) -> None:
+        # An item whose TypeInfo is absent from the resolver: the pair
+        # cannot decide, the whole call defers to the Python fold.
+        from mypy.join import _serialize_type
+
+        missing = self.fx.make_type_info("mod.Missing")
+        types: list[Type] = [Instance(missing, []), self.fx.a]
+        blobs = [_serialize_type(t) for t in types]
+        assert _type_kernel.rust_join_type_list(blobs, True, self.resolver) is None
+
+    def test_three_way_fold(self) -> None:
+        # A longer list exercises the accumulator chain, not just one
+        # pair: [B, A, A] -> A.
+        assert self._assert_parity([self.fx.b, self.fx.a, self.fx.a]) == self.fx.a
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeMatchGenericCallablesSuite(Suite):
     """Parity suite for the Rust `match_generic_callables` id-renumbering
     port (join.py:1152-1180, freshen.rs).
