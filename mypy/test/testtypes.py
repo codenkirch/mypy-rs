@@ -9850,7 +9850,8 @@ class NativeUnboundBranchFrontSuite(Suite):
     tag; the Python shim applies the side effects (defer /
     record_incomplete_ref / fail) and rebuilds the result object. Branches
     Rust cannot classify from facts alone (plugin hook, non-front node
-    kinds, unbound non-alias TypeVarExpr) defer to the pure-Python body.
+    kinds, and the unbound-TypeVarExpr fail tail, which re-analyzes args
+    and emits messages) defer to the pure-Python body.
 
     Toggling the typeanal gate off (pure Python) and on (Rust seam) must
     produce identical (str(result), captured fail/note messages, defer and
@@ -10275,6 +10276,28 @@ class NativeUnboundBranchFrontSuite(Suite):
         t = UnboundType("mod.T", [UnboundType("int")])
         self._assert_par(t, {"mod.T": self._tvar_expr_sym()}, bound_tvar=True)
         self._assert_engages(node_kind=3, tvar_def_exists=True, has_args=True)
+
+    def test_typevar_unbound_tvar_allowed(self) -> None:
+        # Unbound tvar in an allowed context -> raw t via the without-info
+        # back's Option 2 (typeanal.py:1731-1736), now decided in Rust.
+        t = UnboundType("mod.T")
+        self._assert_par(t, {"mod.T": self._tvar_expr_sym()}, allow_unbound_tvars=True)
+        self._assert_engages(node_kind=3, allow_unbound_tvars=True, tname="mod.T")
+
+    def test_typevar_unbound_allow_defining_literal(self) -> None:
+        # defining_literal skips the alias guard; the unbound back still
+        # returns t under allow_unbound_tvars.
+        t = UnboundType("mod.T")
+        self._assert_par(t, {"mod.T": self._tvar_expr_sym()}, allow_unbound_tvars=True)
+        self._assert_engages(
+            node_kind=3, allow_unbound_tvars=True, defining_literal=True, tname="mod.T"
+        )
+
+    def test_typevar_unbound_fail_tail_defers(self) -> None:
+        # Unbound tvar, not allowed -> the without-info fail tail (arg
+        # re-analysis + "is unbound" message); Rust defers to that body.
+        t = UnboundType("mod.T")
+        self._assert_par(t, {"mod.T": self._tvar_expr_sym()})
 
     def test_tvt_alias_not_declared(self) -> None:
         # Generic alias using Ts that is not in type_params -> error.
