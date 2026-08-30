@@ -51,7 +51,9 @@ type PrintfSpecTuple = (
 
 /// Parse one printf specifier starting at `pos` (bytes[pos] == '%').
 /// Returns (whole_seq, start_pos, key, conv_type, flags, width, precision, end).
+/// `start_pos` is a char offset (Python parity); `end` is a byte offset.
 fn parse_one_printf_spec(
+    format_str: &str,
     bytes: &[u8],
     pos: usize,
 ) -> (
@@ -137,18 +139,19 @@ fn parse_one_printf_spec(
         idx += 1;
     }
 
-    // Optional type: .? (any single char)
+    // Optional type: .? (any single char, possibly multi-byte)
     let conv_type = if idx < n {
-        let ch = char::from(bytes[idx]);
-        idx += 1;
-        ch.to_string()
+        let c = format_str[idx..].chars().next().unwrap();
+        idx += c.len_utf8();
+        c.to_string()
     } else {
         String::new()
     };
 
-    let whole_seq = String::from_utf8_lossy(&bytes[start..idx]).into_owned();
+    let whole_seq = format_str[start..idx].to_string();
+    let start_char = format_str[..start].chars().count();
     (
-        whole_seq, start, key, conv_type, flags, width, precision, idx,
+        whole_seq, start_char, key, conv_type, flags, width, precision, idx,
     )
 }
 
@@ -166,7 +169,8 @@ pub fn rust_parse_conversion_specifiers(format_str: &str) -> Vec<PrintfSpecTuple
     let mut pos = 0;
     while pos < n {
         if bytes[pos] == b'%' {
-            let (whole, sp, key, ct, fl, w, pr, end) = parse_one_printf_spec(bytes, pos);
+            let (whole, sp, key, ct, fl, w, pr, end) =
+                parse_one_printf_spec(format_str, bytes, pos);
             result.push((whole, sp, key, ct, fl, w, pr));
             pos = end;
         } else {
@@ -186,47 +190,47 @@ const ERR_KEY_HAS_BRACE: i32 = 4;
 const ERR_NESTING_TOO_DEEP: i32 = 5;
 
 /// Find non-escaped format targets in a str.format() format string.
-///
-/// Returns `(error_code, targets)` where error_code is 0 on success.
-/// `targets` is a list of `(target_string, start_pos)` tuples.
-/// On error, `targets` is empty.
+/// Returns `(error_code, targets)`: `(0, [(target, start_pos), ...])` on
+/// success, `(code, [])` on error; positions are char offsets (Python parity).
 #[pyfunction]
 pub fn rust_find_non_escaped_targets(format_value: &str) -> (i32, Vec<(String, usize)>) {
-    let bytes = format_value.as_bytes();
-    let n = bytes.len();
+    // Walks characters, never bytes: the Python regex `.` matches any char
+    // (including multi-byte fill chars), and consumers index char offsets.
+    let chars: Vec<char> = format_value.chars().collect();
+    let n = chars.len();
     let mut result: Vec<(String, usize)> = Vec::new();
     let mut next_spec = String::new();
     let mut pos = 0;
     let mut nesting = 0i32;
 
     while pos < n {
-        let c = bytes[pos];
+        let c = chars[pos];
         if nesting == 0 {
-            if c == b'{' {
-                if pos < n - 1 && bytes[pos + 1] == b'{' {
+            if c == '{' {
+                if pos < n - 1 && chars[pos + 1] == '{' {
                     pos += 1;
                 } else {
                     nesting = 1;
                 }
             }
-            if c == b'}' {
-                if pos < n - 1 && bytes[pos + 1] == b'}' {
+            if c == '}' {
+                if pos < n - 1 && chars[pos + 1] == '}' {
                     pos += 1;
                 } else {
                     return (ERR_UNEXPECTED_CLOSE, Vec::new());
                 }
             }
         } else {
-            if c == b'{' {
+            if c == '{' {
                 nesting += 1;
             }
-            if c == b'}' {
+            if c == '}' {
                 nesting -= 1;
             }
             if nesting > 0 {
-                next_spec.push(c as char);
+                next_spec.push(c);
             } else {
-                let start = pos - next_spec.len();
+                let start = pos - next_spec.chars().count();
                 result.push((next_spec.clone(), start));
                 next_spec.clear();
             }
@@ -281,12 +285,18 @@ fn parse_field(bytes: &[u8], mut idx: usize, n: usize) -> (String, Option<String
 }
 
 /// Parse conversion: ![^:]? (optional '!' + one non-':' char).
-fn parse_conversion(bytes: &[u8], mut idx: usize, n: usize) -> (Option<String>, usize) {
+/// The conversion char may be multi-byte; idx advances by its full length.
+fn parse_conversion(
+    target: &str,
+    bytes: &[u8],
+    mut idx: usize,
+    n: usize,
+) -> (Option<String>, usize) {
     if idx < n && bytes[idx] == b'!' {
         if idx + 1 < n && bytes[idx + 1] != b':' {
-            let ch = char::from(bytes[idx + 1]);
-            idx += 2;
-            (Some(format!("!{}", ch)), idx)
+            let c = target[idx + 1..].chars().next().unwrap();
+            idx += 1 + c.len_utf8();
+            (Some(format!("!{}", c)), idx)
         } else {
             (None, idx)
         }
@@ -304,18 +314,28 @@ fn match_new_format_builtin(target: &str) -> Option<NewFormatSpec> {
     let (key_str, field, after_field) = parse_field(bytes, idx, n);
     idx = after_field;
 
-    let (conversion, after_conv) = parse_conversion(bytes, idx, n);
+    let (conversion, after_conv) = parse_conversion(target, bytes, idx, n);
     idx = after_conv;
 
     if idx < n && bytes[idx] == b':' {
         let spec_start = idx;
         idx += 1;
 
-        // fill_align: .?[<>=^]? (optional, greedy: tries 2 chars then 1)
-        if idx + 1 < n && matches!(bytes[idx + 1], b'<' | b'>' | b'=' | b'^') {
-            idx += 2;
-        } else if idx < n && matches!(bytes[idx], b'<' | b'>' | b'=' | b'^') {
-            idx += 1;
+        // fill_align: .?[<>=^]? (optional, greedy: tries 2 chars then 1).
+        // The regex `.` matches any char, so the fill may be multi-byte;
+        // advance by whole chars (utf-8 parity with the Python regex).
+        {
+            let ci = idx;
+            let first = target[ci..].chars().next();
+            if let Some(f) = first {
+                let flen = f.len_utf8();
+                let second = target[ci + flen..].chars().next();
+                if second.is_some_and(|c| matches!(c, '<' | '>' | '=' | '^')) {
+                    idx = ci + flen + second.unwrap().len_utf8();
+                } else if matches!(f, '<' | '>' | '=' | '^') {
+                    idx = ci + flen;
+                }
+            }
         }
 
         // flags: [+\- ]?#?0? (optional)
@@ -355,11 +375,11 @@ fn match_new_format_builtin(target: &str) -> Option<NewFormatSpec> {
             String::new()
         };
 
-        // type: .? (optional, any single char)
+        // type: .? (optional, single char, possibly multi-byte)
         let conv_type = if idx < n {
-            let ch = char::from(bytes[idx]);
-            idx += 1;
-            ch.to_string()
+            let c = target[idx..].chars().next().unwrap();
+            idx += c.len_utf8();
+            c.to_string()
         } else {
             String::new()
         };
@@ -407,7 +427,7 @@ fn match_new_format_custom(target: &str) -> Option<NewFormatSpec> {
     let (key_str, field, after_field) = parse_field(bytes, idx, n);
     idx = after_field;
 
-    let (conversion, after_conv) = parse_conversion(bytes, idx, n);
+    let (conversion, after_conv) = parse_conversion(target, bytes, idx, n);
     idx = after_conv;
 
     let format_spec = if idx < n && bytes[idx] == b':' {
@@ -561,18 +581,23 @@ fn parse_placeholder_format_inner(spec: &str) -> Option<PlaceholderSpecTuple> {
     // The input is the format_spec WITHOUT the leading colon, i.e. the part
     // after ':' in the placeholder. This is what FORMAT_RE_NEW's format_spec
     // group captures (minus the leading ':').
-    let bytes = spec.as_bytes();
-    let n = bytes.len();
+
+    // The Python regex matches *characters* (`.` matches any char, including
+    // multi-byte fill chars), so this walks chars, never raw bytes (utf-8
+    // parity invariant).
+    let chars: Vec<char> = spec.chars().collect();
+    let n = chars.len();
+    let is_align = |c: char| matches!(c, '<' | '>' | '=' | '^');
     let mut idx = 0;
 
     // fill_align: .?[<>=^]? (greedy: tries 2 chars then 1)
-    let (fill, align) = if idx + 1 < n && matches!(bytes[idx + 1], b'<' | b'>' | b'=' | b'^') {
-        let f = Some(char::from(bytes[idx]).to_string());
-        let a = Some(char::from(bytes[idx + 1]).to_string());
+    let (fill, align) = if idx + 1 < n && is_align(chars[idx + 1]) {
+        let f = Some(chars[idx].to_string());
+        let a = Some(chars[idx + 1].to_string());
         idx += 2;
         (f, a)
-    } else if idx < n && matches!(bytes[idx], b'<' | b'>' | b'=' | b'^') {
-        let a = Some(char::from(bytes[idx]).to_string());
+    } else if idx < n && is_align(chars[idx]) {
+        let a = Some(chars[idx].to_string());
         idx += 1;
         (None, a)
     } else {
@@ -580,8 +605,8 @@ fn parse_placeholder_format_inner(spec: &str) -> Option<PlaceholderSpecTuple> {
     };
 
     // sign: [+\- ]?
-    let sign = if idx < n && matches!(bytes[idx], b'+' | b'-' | b' ') {
-        let s = Some(char::from(bytes[idx]).to_string());
+    let sign = if idx < n && matches!(chars[idx], '+' | '-' | ' ') {
+        let s = Some(chars[idx].to_string());
         idx += 1;
         s
     } else {
@@ -589,7 +614,7 @@ fn parse_placeholder_format_inner(spec: &str) -> Option<PlaceholderSpecTuple> {
     };
 
     // alternate: #?
-    let alternate = if idx < n && bytes[idx] == b'#' {
+    let alternate = if idx < n && chars[idx] == '#' {
         idx += 1;
         true
     } else {
@@ -597,7 +622,7 @@ fn parse_placeholder_format_inner(spec: &str) -> Option<PlaceholderSpecTuple> {
     };
 
     // zero_pad: 0?
-    let zero_pad = if idx < n && bytes[idx] == b'0' {
+    let zero_pad = if idx < n && chars[idx] == '0' {
         idx += 1;
         true
     } else {
@@ -606,14 +631,14 @@ fn parse_placeholder_format_inner(spec: &str) -> Option<PlaceholderSpecTuple> {
 
     // width: \d+? (greedy, optional)
     let width_start = idx;
-    while idx < n && bytes[idx].is_ascii_digit() {
+    while idx < n && chars[idx].is_ascii_digit() {
         idx += 1;
     }
-    let width = String::from_utf8_lossy(&bytes[width_start..idx]).into_owned();
+    let width: String = chars[width_start..idx].iter().collect();
 
     // grouping: [_,]? (optional)
-    let grouping = if idx < n && matches!(bytes[idx], b'_' | b',') {
-        let g = Some(char::from(bytes[idx]).to_string());
+    let grouping = if idx < n && matches!(chars[idx], '_' | ',') {
+        let g = Some(chars[idx].to_string());
         idx += 1;
         g
     } else {
@@ -621,22 +646,22 @@ fn parse_placeholder_format_inner(spec: &str) -> Option<PlaceholderSpecTuple> {
     };
 
     // precision: \.\d+? (optional, includes the dot)
-    let precision = if idx < n && bytes[idx] == b'.' {
+    let precision = if idx < n && chars[idx] == '.' {
         let p_start = idx;
         idx += 1;
-        while idx < n && bytes[idx].is_ascii_digit() {
+        while idx < n && chars[idx].is_ascii_digit() {
             idx += 1;
         }
-        String::from_utf8_lossy(&bytes[p_start..idx]).into_owned()
+        chars[p_start..idx].iter().collect()
     } else {
         String::new()
     };
 
-    // conv_type: .? (optional, single char)
+    // conv_type: .? (optional, single char, possibly multi-byte)
     let conv_type = if idx < n {
-        let ch = char::from(bytes[idx]);
+        let c = chars[idx];
         idx += 1;
-        ch.to_string()
+        c.to_string()
     } else {
         String::new()
     };
@@ -763,6 +788,81 @@ mod tests {
     fn test_find_targets_unmatched_open() {
         let (err, _) = rust_find_non_escaped_targets("{");
         assert_eq!(err, ERR_UNMATCHED_OPEN);
+    }
+
+    // multibyte format strings: positions must be char offsets and target
+    // contents must survive intact (mypy-rs issue #1248).
+    #[test]
+    fn test_find_targets_multibyte_char_offsets() {
+        let (err, targets) = rust_find_non_escaped_targets("ā{}");
+        assert_eq!(err, 0);
+        assert_eq!(targets, vec![("".to_string(), 2)]);
+    }
+
+    #[test]
+    fn test_find_targets_multibyte_target_content() {
+        let (err, targets) = rust_find_non_escaped_targets("x{ā}");
+        assert_eq!(err, 0);
+        assert_eq!(targets, vec![("ā".to_string(), 2)]);
+    }
+
+    #[test]
+    fn test_parse_format_value_multibyte() {
+        let (err, specs) = rust_parse_format_value("ā{}, {b}😀");
+        assert_eq!(err, 0);
+        assert_eq!(specs.len(), 2);
+        assert_eq!(specs[0].1, 2);
+        assert_eq!(specs[1].1, 6);
+    }
+
+    #[test]
+    fn test_parse_format_value_multibyte_key() {
+        let (err, specs) = rust_parse_format_value("ā{名:x}");
+        assert_eq!(err, 0);
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].0, "名:x");
+        assert_eq!(specs[0].2, Some("名".to_string()));
+        assert_eq!(specs[0].1, 2);
+    }
+
+    #[test]
+    fn test_parse_printf_multibyte_prefix() {
+        let specs = rust_parse_conversion_specifiers("ā{}%s");
+        assert_eq!(specs[0].1, 3); // char offset of '%'
+    }
+
+    #[test]
+    fn test_parse_printf_multibyte_conv_type() {
+        let specs = rust_parse_conversion_specifiers("%ā");
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].3, "ā");
+        assert_eq!(specs[0].0, "%ā");
+    }
+
+    #[test]
+    fn test_placeholder_multibyte_fill() {
+        let spec = rust_parse_placeholder_format("ā<10d");
+        assert!(spec.is_some());
+        let (fill, align, _, _, _, width, _, _, conv_type) = spec.unwrap();
+        assert_eq!(fill, Some("ā".to_string()));
+        assert_eq!(align, Some("<".to_string()));
+        assert_eq!(width, "10");
+        assert_eq!(conv_type, "d");
+    }
+
+    #[test]
+    fn test_placeholder_multibyte_conv_type() {
+        let spec = rust_parse_placeholder_format("10.3ā");
+        assert!(spec.is_some());
+        let (_, _, _, _, _, _, _, _, conv_type) = spec.unwrap();
+        assert_eq!(conv_type, "ā");
+    }
+
+    #[test]
+    fn test_conversion_multibyte() {
+        let (err, specs) = rust_parse_format_value("{!名}");
+        assert_eq!(err, 0);
+        assert_eq!(specs[0].9, Some("!名".to_string()));
     }
 
     #[test]
