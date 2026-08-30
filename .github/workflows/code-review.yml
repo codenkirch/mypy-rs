@@ -1,13 +1,13 @@
 name: AI Code Review
 
-# OpenCodeReview reviews every PR targeting main. `ocr` is pre-installed on
-# the self-hosted runner (config lives runner-side). Findings are posted
-# as a PR review and the check fails when they exist, so they gate merge.
+# OpenCodeReview reviews every PR targeting main using the preinstalled `ocr`
+# CLI on the self-hosted runner; findings are posted as a PR review and the
+# check fails on any finding or failed review. No PR file is ever executed.
 
 on:
   pull_request:
     branches: [main]
-  workflow_dispatch: {} # runner-health probe; the review job only runs for pull_request events
+  workflow_dispatch: {}
 
 permissions:
   contents: read
@@ -15,13 +15,14 @@ permissions:
 
 concurrency:
   group: code-review-${{ github.event.pull_request.number || github.run_id }}
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 jobs:
   ocr-review:
     if: >
       vars.ENABLE_AI_CODE_REVIEW == 'true' &&
-      github.event_name == 'pull_request'
+      github.event_name == 'pull_request' &&
+      github.event.pull_request.head.repo.full_name == github.repository
     runs-on: [self-hosted, macOS, ARM64, VidiomTM]
     timeout-minutes: 60
     steps:
@@ -32,15 +33,57 @@ jobs:
           fetch-depth: 0
 
       - name: Review PR diff with OpenCodeReview
+        env:
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
           ocr review --from origin/main \
-            --to ${{ github.event.pull_request.head.sha }} \
+            --to "$PR_HEAD_SHA" \
             --format json --audience agent \
             > ocr-result.json
 
-      - name: Post review and gate on findings
-        run: python3 .github/workflows/ocr_post.py ocr-result.json
+      - name: Post review and gate
         env:
           GH_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           PR_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          python3 - <<'PY'
+          import json, os, subprocess, sys
+
+          def esc(text: str) -> str:
+              return (text.replace("\\", "\\\\")
+                          .replace("|", "\\|").replace("<", "&lt;")
+                          .replace(">", "&gt;"))
+
+          result = json.load(open("ocr-result.json"))
+          sha = os.environ["PR_SHA"][:10]
+          pr = os.environ["PR_NUMBER"]
+          comments = result.get("comments") or []
+          if result.get("status") != "success":
+              body = f"OpenCodeReview @ {sha}: run status `{result.get('status')}`"
+          elif not comments:
+              body = f"OpenCodeReview @ {sha}: clean, no findings"
+          else:
+              rows = ["| severity | location | finding |", "|---|---|---|"]
+              for c in comments:
+                  loc = esc(c.get("path", "?"))
+                  if c.get("start_line"):
+                      loc += esc(f":{c.get('start_line')}")
+                  finding = esc(c.get("content", ""))
+                  rows.append(f"| {c.get('severity', '?')} | `{loc}` | {finding} |")
+              body = f"OpenCodeReview @ {sha}: {len(comments)} finding(s)\n\n" + "\n".join(rows)
+              for c in comments:
+                  suggestion = (c.get("suggestion_code") or "").strip()
+                  if not suggestion or "````" in suggestion:
+                      continue  # cannot fence safely; findings table already carries the message
+                  loc = f"{c.get('path', '?')}:{c.get('start_line', '?')}"
+                  body += (f"\n\n<details><summary><code>{loc}</code></summary>\n\n"
+                           f"````\n{suggestion}\n````\n</details>")
+          with open("ocr-body.md", "w") as f:
+              f.write(body)
+          subprocess.run(["gh", "pr", "review", pr, "--comment",
+                          "--body-file", "ocr-body.md"], check=True)
+          if result.get("status") != "success":
+              sys.exit(1)  # a failed review must not pass the gate either
+          sys.exit(1 if comments else 0)
+          PY
