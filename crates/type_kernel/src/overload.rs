@@ -150,7 +150,15 @@ pub fn rust_check_overload_call(
             }) if !is_type_obj(fallback, *from_concatenate) => {
                 decoded_targets.push(t.unwrap());
             }
-            _ => return None, // non-conforming target -> defer whole call
+            Some(Type::CallableType { .. }) => {
+                return None; // type-object target -> defer whole call
+            }
+            Some(_) => {
+                return None; // non-conforming target -> defer whole call
+            }
+            None => {
+                return None;
+            }
         }
     }
 
@@ -321,23 +329,91 @@ fn evaluate_plain_target(
         let Some(formal_type) = target_arg_types.get(fi) else {
             return MatchDecision::Undecided;
         };
+        // Python's check_arg applies get_proper_type to both operands
+        // before the per-pair subtype gate; expand a resolvable top-level
+        // alias into its frozen target snapshot.
+        let alias_formal_hold = match formal_type {
+            Type::TypeAliasType { .. } => {
+                match checkexpr_functions::get_proper_or_expand(
+                    formal_type,
+                    resolver.alias_resolver(),
+                ) {
+                    Some(t) => Some(t),
+                    None => {
+                        return MatchDecision::Undecided;
+                    }
+                }
+            }
+            _ => None,
+        };
+        // Python's get_proper_type on a UnionType maps each item through
+        // get_proper_type; expand resolvable alias items inside a union
+        // formal so the engine's union-right arm decides natively.
+        let formal_base: &Type = alias_formal_hold.as_ref().map_or(formal_type, |t| t);
+        let formal_union_hold: Option<Type> = match formal_base {
+            Type::UnionType {
+                items,
+                uses_pep604_syntax,
+                can_be_true,
+                can_be_false,
+            } => {
+                if items
+                    .iter()
+                    .any(|it| matches!(it, Type::TypeAliasType { .. }))
+                {
+                    let expanded: Option<Vec<Type>> = items
+                        .iter()
+                        .map(|it| {
+                            checkexpr_functions::get_proper_or_expand(it, resolver.alias_resolver())
+                        })
+                        .collect();
+                    expanded.map(|new_items| Type::UnionType {
+                        items: new_items,
+                        uses_pep604_syntax: *uses_pep604_syntax,
+                        can_be_true: *can_be_true,
+                        can_be_false: *can_be_false,
+                    })
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        };
         for &ai in mapped_indices {
             let Some(actual) = arg_types.get(ai as usize) else {
                 return MatchDecision::Undecided;
             };
 
-            // Belt-and-suspenders: AnyType or UnionType actual.
-            if matches!(actual, Type::AnyType { .. } | Type::UnionType { .. }) {
+            // UnionType actual: the shim's real_union gate filters real
+            // unions upstream, so a residual one defers. AnyType is not
+            // gated: is_subtype decides Any-left faithfully.
+            if matches!(actual, Type::UnionType { .. }) {
                 return MatchDecision::Undecided;
             }
+            let alias_actual_hold = match actual {
+                Type::TypeAliasType { .. } => {
+                    match checkexpr_functions::get_proper_or_expand(
+                        actual,
+                        resolver.alias_resolver(),
+                    ) {
+                        Some(t) => Some(t),
+                        None => {
+                            return MatchDecision::Undecided;
+                        }
+                    }
+                }
+                _ => None,
+            };
+            let actual_use: &Type = alias_actual_hold.as_ref().map_or(actual, |t| t);
+            let formal_use: &Type = formal_union_hold.as_ref().unwrap_or(formal_base);
 
-            match subtypes::is_subtype(actual, formal_type, ctx, resolver_ref) {
+            match subtypes::is_subtype(actual_use, formal_use, ctx, resolver_ref) {
                 Some(true) => {}
                 Some(false) => {
                     // A subtype-`false` may be overturned by context
                     // re-analysis (literal refinement, TypedDict checks,
                     // typevar instantiation); defer if any flip applies.
-                    if pair_flip_possible(actual, formal_type) {
+                    if pair_flip_reason(actual_use, formal_use).is_some() {
                         return MatchDecision::Undecided;
                     }
                     return MatchDecision::No;
@@ -471,32 +547,32 @@ fn literal_fallback_ref(fallback: &Type) -> Option<&str> {
     }
 }
 
-/// Whether Python's per-target acceptance could accept a target despite a
-/// subtype-`false` (actual, formal) pair, because the formal's context
-/// re-analysis can flip the verdict. Any `true` defers the whole call.
-fn pair_flip_possible(actual: &Type, formal: &Type) -> bool {
+/// Why a subtype-`false` pair could still flip: `Some(reason)` defers.
+fn pair_flip_reason(actual: &Type, formal: &Type) -> Option<&'static str> {
     match formal {
         // Literal families: only a same-value-class actual (or a typevar
         // passthrough) can re-refine into the literal's fallback family.
         Type::LiteralType { fallback, .. } => match literal_fallback_ref(fallback) {
-            Some(fref) => literal_flip_possible(actual, fref),
-            None => true, // odd fallback: defer rather than reject
+            Some(fref) => literal_flip_possible(actual, fref).then_some("literal"),
+            // Odd fallback: defer rather than reject.
+            None => Some("literal_odd_fallback"),
         },
         Type::Instance {
             last_known_value: Some(lkv),
             ..
         } => match lkv.as_ref() {
             Type::LiteralType { fallback, .. } => match literal_fallback_ref(fallback) {
-                Some(fref) => literal_flip_possible(actual, fref),
-                None => true,
+                Some(fref) => literal_flip_possible(actual, fref).then_some("lkv_literal"),
+                None => Some("lkv_odd_fallback"),
             },
-            _ => true,
+            _ => Some("lkv_other"),
         },
-        Type::TypeVarType { .. } | Type::TypedDictType { .. } => true,
+        Type::TypeVarType { .. } => Some("formal_tvar"),
+        Type::TypedDictType { .. } => Some("formal_typeddict"),
         // Position-matched nesting: refinement can also happen on the
         // leaves of a composite actual (tuple/dict/list literals), so
         // walk matching formal components when the actual mirrors them.
-        Type::UnionType { items, .. } => items.iter().any(|i| pair_flip_possible(actual, i)),
+        Type::UnionType { items, .. } => items.iter().find_map(|i| pair_flip_reason(actual, i)),
         Type::Instance {
             last_known_value: None,
             args: formal_args,
@@ -506,15 +582,12 @@ fn pair_flip_possible(actual: &Type, formal: &Type) -> bool {
                 args: actual_args,
                 last_known_value: None,
                 ..
-            } => {
-                actual_args.len() == formal_args.len()
-                    && actual_args
-                        .iter()
-                        .zip(formal_args)
-                        .any(|(a, f)| pair_flip_possible(a, f))
-            }
-            Type::TypeVarType { .. } => true,
-            _ => false,
+            } if actual_args.len() == formal_args.len() => formal_args
+                .iter()
+                .zip(actual_args)
+                .find_map(|(f, a)| pair_flip_reason(a, f)),
+            Type::TypeVarType { .. } => Some("actual_tvar"),
+            _ => None,
         },
         Type::TupleType {
             items: formal_items,
@@ -523,17 +596,14 @@ fn pair_flip_possible(actual: &Type, formal: &Type) -> bool {
             Type::TupleType {
                 items: actual_items,
                 ..
-            } => {
-                actual_items.len() == formal_items.len()
-                    && actual_items
-                        .iter()
-                        .zip(formal_items)
-                        .any(|(a, f)| pair_flip_possible(a, f))
-            }
-            Type::TypeVarType { .. } => true,
-            _ => false,
+            } if actual_items.len() == formal_items.len() => formal_items
+                .iter()
+                .zip(actual_items)
+                .find_map(|(f, a)| pair_flip_reason(a, f)),
+            Type::TypeVarType { .. } => Some("actual_tvar"),
+            _ => None,
         },
-        _ => false,
+        _ => None,
     }
 }
 
@@ -637,6 +707,11 @@ fn has_variadic_arg(t: &Type) -> bool {
 mod pair_flip_tests {
     use super::*;
     use crate::wire::LiteralValue;
+
+    // Guard shape of `pair_flip_reason`: any decided reason defers.
+    fn pair_flip_possible(actual: &Type, formal: &Type) -> bool {
+        pair_flip_reason(actual, formal).is_some()
+    }
 
     fn instance(fullname: &str) -> Type {
         Type::Instance {
