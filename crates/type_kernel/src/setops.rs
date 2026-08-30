@@ -3525,11 +3525,21 @@ fn reconstruct_instance_from_args(
         match disc {
             0 => args.push(s_args.get(i)?.clone()),
             1 => args.push(t_args.get(i)?.clone()),
-            4 => args.push(Type::AnyType {
-                type_of_any: 4, // from_another_any
-                source_any: None,
-                missing_import_name: None,
-            }),
+            4 => {
+                // TypeOfAny.from_another_any (types.py:311); AnyType
+                // requires a source for that member (types.py:1412), so
+                // pick the AnyType side like the shim (join.py:283-295).
+                let src = if matches!(t_args.get(i), Some(Type::AnyType { .. })) {
+                    t_args.get(i)?
+                } else {
+                    s_args.get(i)?
+                };
+                args.push(Type::AnyType {
+                    type_of_any: 7,
+                    source_any: Some(Box::new(src.clone())),
+                    missing_import_name: None,
+                })
+            }
             _ => return None,
         }
     }
@@ -4270,7 +4280,8 @@ fn visit_instance_with_args(
                 sa
             };
             joined_args.push(Type::AnyType {
-                type_of_any: 4, // from_another_any
+                // TypeOfAny.from_another_any (types.py:311).
+                type_of_any: 7,
                 source_any: Some(Box::new(src.clone())),
                 missing_import_name: None,
             });
@@ -9651,5 +9662,60 @@ mod tests {
         let s = instance("a.A", vec![instance("builtins.int", vec![])]);
         let t = instance("a.Missing", vec![instance("builtins.int", vec![])]);
         assert_eq!(join_diff(&s, &t, &r), None);
+    }
+
+    fn encode_type(typ: &Type) -> Option<Vec<u8>> {
+        let mut wbuf = WriteBuffer::new();
+        wire::write_type(&mut wbuf, typ).ok()?;
+        Some(wbuf.into_bytes())
+    }
+
+    #[test]
+    fn test_reconstruct_disc4_arg_wire_roundtrip_from_another_any() {
+        // The disc-4 arm builds the arg Any raw (write_int on
+        // type_of_any), so it must decode as TypeOfAny.from_another_any
+        // == 7 (types.py:311), matching join.py:283-295. AnyType
+        // requires a source for that member (types.py:1412), so the
+        // arm must pick the AnyType side as source_any.
+        let any = Type::AnyType {
+            type_of_any: 6,
+            source_any: None,
+            missing_import_name: None,
+        };
+        let s = instance("a.A", vec![any.clone()]);
+        let t = instance("a.A", vec![instance("builtins.str", vec![])]);
+        let out = reconstruct_instance_from_args(&s, &t, "a.A", &[4]).unwrap();
+        match &out {
+            Type::Instance { args, .. } => match &args[0] {
+                Type::AnyType {
+                    type_of_any,
+                    source_any,
+                    ..
+                } => {
+                    assert_eq!(*type_of_any, 7);
+                    assert_eq!(source_any.as_deref(), Some(&any));
+                }
+                other => panic!("expected AnyType arg, got {other}"),
+            },
+            other => panic!("expected Instance, got {other}"),
+        }
+        let bytes = encode_type(&out).unwrap();
+        match decode_type(&bytes).unwrap() {
+            Type::Instance { args, .. } => match &args[0] {
+                Type::AnyType {
+                    type_of_any,
+                    source_any,
+                    ..
+                } => {
+                    assert_eq!(*type_of_any, 7);
+                    assert!(matches!(
+                        source_any.as_deref(),
+                        Some(Type::AnyType { type_of_any: 6, .. })
+                    ));
+                }
+                other => panic!("expected AnyType arg, got {other}"),
+            },
+            other => panic!("expected Instance, got {other}"),
+        }
     }
 }

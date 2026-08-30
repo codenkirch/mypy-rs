@@ -31149,6 +31149,20 @@ class NativeJoinInstancesSuite(Suite):
         disc = result[0]
         assert disc in (0, 1), f"expected SameS/SameT for A vs A, got disc {disc}"
 
+    def test_encoded_instance_any_arg_is_from_another_any(self) -> None:
+        # Multi-variance join where one arg hits the AnyType arm (disc
+        # 4) and another triggers a real join (H[Any, A] vs H[B, B]):
+        # the encoded wire Instance must round-trip from_another_any (#1269).
+        joiner_inst = Instance(self.fx.hi, [self.fx.anyt, self.fx.a])
+        other_inst = Instance(self.fx.hi, [self.fx.b, self.fx.b])
+        for args in [(joiner_inst, other_inst), (other_inst, joiner_inst)]:
+            got = self._native_result(*args)
+            ref = self._reference_result(*args)
+            assert_equal(got, ref)
+            assert isinstance(got, Instance)
+            assert isinstance(got.args[0], AnyType)  # type: ignore[misc]
+            assert got.args[0].type_of_any == TypeOfAny.from_another_any
+
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeTypeRequiresUsageSuite(Suite):
