@@ -104,10 +104,10 @@ fn encode_type(typ: &Type) -> Option<Vec<u8>> {
 
 /// Construct the `AnyType(special_form)` replacement that Python's
 /// `erase_typevars` uses when `ids_to_erase` is None or matches.
-/// `TypeOfAny.special_form` == 12 in the wire format (types.py enum).
+/// `TypeOfAny.special_form` == 6 (types.py:309); the wire writes it raw.
 pub(crate) fn make_any() -> Type {
     Type::AnyType {
-        type_of_any: 12,
+        type_of_any: 6,
         source_any: None,
         missing_import_name: None,
     }
@@ -812,12 +812,12 @@ mod tests {
             namespace: ns.to_string(),
             values: vec![],
             upper_bound: Box::new(Type::AnyType {
-                type_of_any: 12,
+                type_of_any: 6,
                 source_any: None,
                 missing_import_name: None,
             }),
             default: Box::new(Type::AnyType {
-                type_of_any: 12,
+                type_of_any: 6,
                 source_any: None,
                 missing_import_name: None,
             }),
@@ -928,12 +928,12 @@ mod tests {
             raw_id,
             namespace: "ns".to_string(),
             upper_bound: Box::new(Type::AnyType {
-                type_of_any: 12,
+                type_of_any: 6,
                 source_any: None,
                 missing_import_name: None,
             }),
             default: Box::new(Type::AnyType {
-                type_of_any: 12,
+                type_of_any: 6,
                 source_any: None,
                 missing_import_name: None,
             }),
@@ -989,5 +989,17 @@ mod tests {
         let none = Type::NoneType;
         let result = erase_typevars_inner(&none, None, &make_any());
         assert!(matches!(result, Some(Type::NoneType)));
+    }
+
+    #[test]
+    fn test_make_any_wire_roundtrip_special_form() {
+        // The replacement Any crosses the wire raw (write_int on
+        // type_of_any), so it must decode as TypeOfAny.special_form == 6,
+        // matching AnyType(TypeOfAny.special_form) in erasetype.py:327-336.
+        let bytes = encode_type(&make_any()).unwrap();
+        match decode_type(&bytes).unwrap() {
+            Type::AnyType { type_of_any, .. } => assert_eq!(type_of_any, 6),
+            other => panic!("expected AnyType, got {other}"),
+        }
     }
 }
