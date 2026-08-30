@@ -41,7 +41,8 @@ jobs:
         run: |
           # a CLI crash still yields a review-body reason + failing check via
           # the poster step, instead of skipping it silently
-          if ocr review --from origin/main \
+          BASE=$(git merge-base origin/main "$PR_HEAD_SHA")
+          if ocr review --from "$BASE" \
             --to "$PR_HEAD_SHA" \
             --format json --audience agent \
             > ocr-result.json; then
@@ -59,12 +60,14 @@ jobs:
           python3 - <<'PY'
           import json, os, subprocess, sys
 
-          def esc(text: str) -> str:
-              text = text.replace("\n", " ")
+          def esc_base(text: str) -> str:
               return (text.replace("\\", "\\\\")
                           .replace("`", "\\`")
                           .replace("|", "\\|").replace("<", "&lt;")
                           .replace(">", "&gt;"))
+
+          def esc(text: str) -> str:
+              return esc_base(text.replace("\n", " "))
 
           try:
               with open("ocr-result.json") as f:
@@ -90,8 +93,11 @@ jobs:
               body = f"OpenCodeReview @ {sha}: {len(comments)} finding(s)\n\n" + "\n".join(rows)
               for c in comments:
                   suggestion = (c.get("suggestion_code") or "").strip()
-                  if not suggestion or "````" in suggestion:
-                      continue  # cannot fence safely; findings table already carries the message
+                  if not suggestion:
+                      continue  # no patch to show; findings table already carries the message
+                  # escaped before fencing: backticks cannot break the fence and raw
+                  # markdown/HTML from a finding stays inert
+                  suggestion = esc_base(suggestion)
                   loc = esc(f"{c.get('path', '?')}:{c.get('start_line', '?')}")
                   body += (f"\n\n<details><summary><code>{loc}</code></summary>\n\n"
                            f"````\n{suggestion}\n````\n</details>")
@@ -108,4 +114,4 @@ jobs:
 
       - name: Clean workspace
         if: always()
-        run: rm -f ocr-result.json ocr-body.md
+        run: rm -rf "${GITHUB_WORKSPACE:?}" && mkdir -p "$GITHUB_WORKSPACE"
