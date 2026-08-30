@@ -17,11 +17,9 @@ stub mirrors the ``#[pymethods]`` surface defined in
 
 from __future__ import annotations
 
-from typing import Optional
-
 __all__ = ["FsCache", "NativeResolver"]
 
-_StdlibVersionEntry = tuple[str, tuple[int, int], Optional[tuple[int, int]]]
+_StdlibVersionEntry = tuple[str, tuple[int, int], tuple[int, int] | None]
 
 class FsCache:
     def __init__(self) -> None: ...
@@ -57,16 +55,16 @@ class NativeResolver:
     def flush(self) -> None: ...
     def resolve(
         self, id: str, use_typeshed: bool, follow_untyped_imports: bool
-    ) -> tuple[int, Optional[str], bool]: ...
+    ) -> tuple[int, str | None, bool]: ...
     def resolve_many(
         self, ids_with_follow: list[tuple[str, bool]]
-    ) -> list[tuple[int, Optional[str], bool]]: ...
+    ) -> list[tuple[int, str | None, bool]]: ...
     def compute_dep_records(
         self,
         file_id: str,
         file_path: str,
         imports: list[
-            tuple[int, str, int, list[tuple[str, Optional[str]]], int, bool, bool, bool, bool]
+            tuple[int, str, int, list[tuple[str, str | None]], int, bool, bool, bool, bool]
         ],
         known_modules: set[str],
-    ) -> tuple[list[tuple[int, str, int]], Optional[tuple[int, str]]]: ...
+    ) -> tuple[list[tuple[int, str, int]], tuple[int, str] | None]: ...

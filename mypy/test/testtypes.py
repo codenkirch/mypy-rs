@@ -15631,9 +15631,7 @@ class NativeTraverserSuite(Suite):
     def test_has_return_statement_nested_in_cast(self) -> None:
         # cast() wraps the return expr in a CastExpr — previously
         # invisible to the Rust seeker.
-        tree = self._parse(
-            "from typing import cast\n" "def f() -> int:\n" "    return cast(int, 42)\n"
-        )
+        tree = self._parse("from typing import cast\ndef f() -> int:\n    return cast(int, 42)\n")
         fdef = self._find_func(tree, "f")
         assert has_return_statement(fdef) is True
 
@@ -15691,7 +15689,7 @@ class NativeTraverserSuite(Suite):
         assert has_yield_expression(fdef) is False
 
     def test_has_yield_expression_nested_func_skipped(self) -> None:
-        tree = self._parse("def f():\n" "    def g():\n" "        yield 1\n" "    return 2\n")
+        tree = self._parse("def f():\n    def g():\n        yield 1\n    return 2\n")
         fdef = self._find_func(tree, "f")
         assert has_yield_expression(fdef) is False
 
@@ -15716,13 +15714,13 @@ class NativeTraverserSuite(Suite):
         assert has_await_expression(fdef) is False
 
     def test_all_return_statements_count(self) -> None:
-        tree = self._parse("def f():\n" "    return 1\n" "    return 2\n" "    return\n")
+        tree = self._parse("def f():\n    return 1\n    return 2\n    return\n")
         fdef = self._find_func(tree, "f")
         returns = all_return_statements(fdef)
         assert len(returns) == 3
 
     def test_all_return_statements_skips_nested(self) -> None:
-        tree = self._parse("def f():\n" "    return 1\n" "    def g():\n" "        return 2\n")
+        tree = self._parse("def f():\n    return 1\n    def g():\n        return 2\n")
         fdef = self._find_func(tree, "f")
         returns = all_return_statements(fdef)
         assert len(returns) == 1
@@ -15734,33 +15732,33 @@ class NativeTraverserSuite(Suite):
         assert len(returns) == 0
 
     def test_all_yield_expressions_count(self) -> None:
-        tree = self._parse("def f():\n" "    yield 1\n" "    yield 2\n")
+        tree = self._parse("def f():\n    yield 1\n    yield 2\n")
         fdef = self._find_func(tree, "f")
         yields = all_yield_expressions(fdef)
         assert len(yields) == 2
 
     def test_all_yield_expressions_in_assignment(self) -> None:
-        tree = self._parse("def f():\n" "    x = yield 1\n")
+        tree = self._parse("def f():\n    x = yield 1\n")
         fdef = self._find_func(tree, "f")
         yields = all_yield_expressions(fdef)
         assert len(yields) == 1
         assert yields[0][1] is True  # in_assignment
 
     def test_all_yield_expressions_not_in_assignment(self) -> None:
-        tree = self._parse("def f():\n" "    yield 1\n")
+        tree = self._parse("def f():\n    yield 1\n")
         fdef = self._find_func(tree, "f")
         yields = all_yield_expressions(fdef)
         assert len(yields) == 1
         assert yields[0][1] is False
 
     def test_all_yield_from_expressions_count(self) -> None:
-        tree = self._parse("def f():\n" "    yield from range(10)\n" "    yield from g()\n")
+        tree = self._parse("def f():\n    yield from range(10)\n    yield from g()\n")
         fdef = self._find_func(tree, "f")
         yields = all_yield_from_expressions(fdef)
         assert len(yields) == 2
 
     def test_all_yield_from_expressions_in_assignment(self) -> None:
-        tree = self._parse("def f():\n" "    x = yield from g()\n")
+        tree = self._parse("def f():\n    x = yield from g()\n")
         fdef = self._find_func(tree, "f")
         yields = all_yield_from_expressions(fdef)
         assert len(yields) == 1
@@ -15792,7 +15790,7 @@ class NativeTraverserSuite(Suite):
         from mypy.cache import WriteBuffer
 
         tree = self._parse(
-            "def f():\n" "    return 1\n" "    return 2\n" "    def g():\n" "        return 3\n"
+            "def f():\n    return 1\n    return 2\n    def g():\n        return 3\n"
         )
         fdef = self._find_func(tree, "f")
         buf = WriteBuffer()
@@ -15808,7 +15806,7 @@ class NativeTraverserSuite(Suite):
         from mypy.cache import WriteBuffer
 
         tree = self._parse(
-            "def f():\n" "    yield 1\n" "    x = yield 2\n" "    def g():\n" "        yield 3\n"
+            "def f():\n    yield 1\n    x = yield 2\n    def g():\n        yield 3\n"
         )
         fdef = self._find_func(tree, "f")
         buf = WriteBuffer()
@@ -15854,7 +15852,7 @@ class NativeTraverserSuite(Suite):
     # --- Issue #541: remaining seeker parity tests ---
 
     def test_all_return_statements_and_flags_no_finally(self) -> None:
-        tree = self._parse("def f():\n" "    return 1\n" "    return 2\n")
+        tree = self._parse("def f():\n    return 1\n    return 2\n")
         fdef = self._find_func(tree, "f")
         results = all_return_statements_and_flags(fdef)
         assert len(results) == 2
@@ -15862,7 +15860,7 @@ class NativeTraverserSuite(Suite):
 
     def test_all_return_statements_and_flags_in_finally(self) -> None:
         tree = self._parse(
-            "def f():\n" "    try:\n" "        return 1\n" "    finally:\n" "        return 2\n"
+            "def f():\n    try:\n        return 1\n    finally:\n        return 2\n"
         )
         fdef = self._find_func(tree, "f")
         results = all_return_statements_and_flags(fdef)
@@ -15877,7 +15875,7 @@ class NativeTraverserSuite(Suite):
         assert len(results) == 0
 
     def test_count_returns_includes_nested(self) -> None:
-        tree = self._parse("def f():\n" "    return 1\n" "    def g():\n" "        return 2\n")
+        tree = self._parse("def f():\n    return 1\n    def g():\n        return 2\n")
         fdef = self._find_func(tree, "f")
         # count_returns includes nested function returns (unlike
         # all_return_statements which skips nested funcs).
@@ -15925,19 +15923,17 @@ class NativeTraverserSuite(Suite):
         assert funcs[0].name == "f"
 
     def test_find_non_extension_handlers_empty(self) -> None:
-        tree = self._parse(
-            "class C:\n" "    @property\n" "    def g(self):\n" "        return 2\n"
-        )
+        tree = self._parse("class C:\n    @property\n    def g(self):\n        return 2\n")
         funcs = find_non_extension_handlers(tree)
         assert len(funcs) == 0
 
     def test_is_global_expr_true(self) -> None:
-        tree = self._parse("def f():\n" "    global x\n" "    x = 1\n")
+        tree = self._parse("def f():\n    global x\n    x = 1\n")
         fdef = self._find_func(tree, "f")
         assert is_global_expr(fdef) is True
 
     def test_is_global_expr_false(self) -> None:
-        tree = self._parse("def f():\n" "    x = 1\n")
+        tree = self._parse("def f():\n    x = 1\n")
         fdef = self._find_func(tree, "f")
         assert is_global_expr(fdef) is False
 
@@ -15956,7 +15952,7 @@ class NativeTraverserSuite(Suite):
         assert funcs[0].name == "nonlit"
 
     def test_find_non_literal_handlers_pass_only(self) -> None:
-        tree = self._parse("class C:\n" "    def p(self):\n" "        pass\n")
+        tree = self._parse("class C:\n    def p(self):\n        pass\n")
         funcs = find_non_literal_handlers(tree)
         # pass-only body is a literal handler.
         assert len(funcs) == 0
@@ -15968,7 +15964,7 @@ class NativeTraverserSuite(Suite):
         from mypy.cache import WriteBuffer
 
         tree = self._parse(
-            "def f():\n" "    try:\n" "        return 1\n" "    finally:\n" "        return 2\n"
+            "def f():\n    try:\n        return 1\n    finally:\n        return 2\n"
         )
         fdef = self._find_func(tree, "f")
         buf = WriteBuffer()
@@ -15986,7 +15982,7 @@ class NativeTraverserSuite(Suite):
         from mypy.astwire import serialize_node
         from mypy.cache import WriteBuffer
 
-        tree = self._parse("def f():\n" "    return 1\n" "    def g():\n" "        return 2\n")
+        tree = self._parse("def f():\n    return 1\n    def g():\n        return 2\n")
         fdef = self._find_func(tree, "f")
         buf = WriteBuffer()
         serialize_node(fdef, buf)
@@ -16041,7 +16037,7 @@ class NativeTraverserSuite(Suite):
         from mypy.astwire import serialize_node
         from mypy.cache import WriteBuffer
 
-        tree = self._parse("def f():\n" "    global x\n" "    x = 1\n")
+        tree = self._parse("def f():\n    global x\n    x = 1\n")
         fdef = self._find_func(tree, "f")
         buf = WriteBuffer()
         serialize_node(fdef, buf)
@@ -30655,9 +30651,9 @@ class NativeTypeRequiresUsageSuite(Suite):
         from mypy.checker import _serialize_type_for_checker
 
         result = _type_kernel.rust_type_requires_usage(_serialize_type_for_checker(typ), resolver)
-        assert result == expected_code, (
-            f"rust_type_requires_usage({typ}) = {result!r}, " f"expected {expected_code!r}"
-        )
+        assert (
+            result == expected_code
+        ), f"rust_type_requires_usage({typ}) = {result!r}, expected {expected_code!r}"
 
     def test_awaitable_class_returns_awaitable_note(self) -> None:
         # Instance with __await__ in names -> UNUSED_AWAITABLE.
@@ -35799,7 +35795,7 @@ class NativeAnalyzeCallableTypeSuite(Suite):
         on = self._with_gate(True, lambda: self._call_invalid(on_ta, t))
         assert_equal(
             on[1],
-            ['Please use "Callable[[<parameters>], <return type>]"' ' or "Callable"'],
+            ['Please use "Callable[[<parameters>], <return type>]" or "Callable"'],
             "allow_any_generics message",
         )
 
