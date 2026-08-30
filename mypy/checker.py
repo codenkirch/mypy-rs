@@ -7665,8 +7665,8 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
                 dec_type_bytes = (
                     # accept() is annotated Type but can return None at runtime
                     _serialize_type_for_checker(dec_type)
-                    if dec_type is not None
-                    else None  # type: ignore[redundant-expr]
+                    if dec_type is not None  # type: ignore[redundant-expr]
+                    else None
                 )
                 res = _rust_check_for_untyped_decorator(
                     self.options.disallow_untyped_decorators,
