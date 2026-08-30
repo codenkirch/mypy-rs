@@ -26,6 +26,25 @@ use crate::wire::{read_type, write_type, LiteralValue, ReadBuffer, Type, WriteBu
 /// `TypeOfAny.special_form` == 6. Special forms are not real Any types.
 const TYPE_OF_ANY_SPECIAL_FORM: i64 = 6;
 
+/// `TypeOfAny.from_another_any` == 7. The source is the Any operand.
+const TYPE_OF_ANY_FROM_ANOTHER_ANY: i64 = 7;
+
+/// Same-type-with-args join disc 4: the joined arg is
+/// `AnyType(from_another_any, <Any side>)`, t-preferred
+/// (join.py:131-135, :282-295, :335-338); s verbatim when t is not Any.
+fn joined_arg_any(src_s: &Type, src_t: &Type) -> Type {
+    let src = if matches!(src_t, Type::AnyType { .. }) {
+        src_t.clone()
+    } else {
+        src_s.clone()
+    };
+    Type::AnyType {
+        type_of_any: TYPE_OF_ANY_FROM_ANOTHER_ANY,
+        source_any: Some(Box::new(src)),
+        missing_import_name: None,
+    }
+}
+
 /// `TypeOfAny.unannotated` == 1.
 const TYPE_OF_ANY_UNANNOTATED: i64 = 1;
 
@@ -1856,29 +1875,19 @@ fn conditional_join_inner(
             if arg_discs.len() != if_args.len() || arg_discs.len() != else_args.len() {
                 return None;
             }
-            let final_args: Vec<Type> = arg_discs
+            let final_args: Option<Vec<Type>> = arg_discs
                 .iter()
                 .enumerate()
                 .map(|(i, &d)| match d {
-                    0 => if_args[i].clone(),
-                    1 => else_args[i].clone(),
-                    _ => {
-                        // Disc 4: joined arg is Any. Pure join body is
-                        // AnyType(7, Any side); Python picks the t (else)
-                        // side preferentially (join.py:335-338).
-                        let src = if matches!(else_args[i], Type::AnyType { .. }) {
-                            else_args[i].clone()
-                        } else {
-                            if_args[i].clone()
-                        };
-                        Type::AnyType {
-                            type_of_any: 7,
-                            source_any: Some(Box::new(src)),
-                            missing_import_name: None,
-                        }
-                    }
+                    0 => Some(if_args[i].clone()),
+                    1 => Some(else_args[i].clone()),
+                    // Disc 4: joined arg is Any (from_another_any, Any
+                    // side); other discs defer. See `joined_arg_any`.
+                    4 => Some(joined_arg_any(&if_args[i], &else_args[i])),
+                    _ => None,
                 })
                 .collect();
+            let final_args = final_args?;
             encode_type(&Type::Instance {
                 type_ref,
                 args: final_args,
@@ -2128,29 +2137,19 @@ fn join_one_pair(
             if arg_discs.len() != l_args.len() || arg_discs.len() != r_args.len() {
                 return None;
             }
-            let final_args: Vec<Type> = arg_discs
+            let final_args: Option<Vec<Type>> = arg_discs
                 .iter()
                 .enumerate()
                 .map(|(i, &d)| match d {
-                    0 => l_args[i].clone(),
-                    1 => r_args[i].clone(),
-                    _ => {
-                        // Disc 4: joined arg is Any. Pure join body is
-                        // AnyType(7, Any side); Python picks the t (right)
-                        // side preferentially (join.py:335-338).
-                        let src = if matches!(r_args[i], Type::AnyType { .. }) {
-                            r_args[i].clone()
-                        } else {
-                            l_args[i].clone()
-                        };
-                        Type::AnyType {
-                            type_of_any: 7,
-                            source_any: Some(Box::new(src)),
-                            missing_import_name: None,
-                        }
-                    }
+                    0 => Some(l_args[i].clone()),
+                    1 => Some(r_args[i].clone()),
+                    // Disc 4: joined arg is Any (from_another_any, Any
+                    // side); other discs defer. See `joined_arg_any`.
+                    4 => Some(joined_arg_any(&l_args[i], &r_args[i])),
+                    _ => None,
                 })
                 .collect();
+            let final_args = final_args?;
             Some(Type::Instance {
                 type_ref,
                 args: final_args,

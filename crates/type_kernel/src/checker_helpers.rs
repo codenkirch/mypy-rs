@@ -797,29 +797,31 @@ fn join_one_pair(
             if arg_discs.len() != l_args.len() || arg_discs.len() != r_args.len() {
                 return None;
             }
-            let final_args: Vec<Type> = arg_discs
+            let final_args: Option<Vec<Type>> = arg_discs
                 .iter()
                 .enumerate()
                 .map(|(i, &d)| match d {
-                    0 => l_args[i].clone(),
-                    1 => r_args[i].clone(),
-                    // Disc 4: AnyType arg. Pure join body is AnyType(7, Any side)
-                    // (join.py:335-338, shim join.py:283-295); Python picks the
-                    // t (right) side preferentially. Disc 4 only in this arm.
-                    _ => {
+                    0 => Some(l_args[i].clone()),
+                    1 => Some(r_args[i].clone()),
+                    // Disc 4: AnyType arg -> AnyType(7, Any side)
+                    // (join.py:335-338, shim join.py:283-295); t-preferred,
+                    // s verbatim when t is not Any. Other discs defer.
+                    4 => {
                         let src = if matches!(r_args[i], Type::AnyType { .. }) {
                             r_args[i].clone()
                         } else {
                             l_args[i].clone()
                         };
-                        Type::AnyType {
-                            type_of_any: 7,
+                        Some(Type::AnyType {
+                            type_of_any: TYPE_OF_ANY_FROM_ANOTHER_ANY,
                             source_any: Some(Box::new(src)),
                             missing_import_name: None,
-                        }
+                        })
                     }
+                    _ => None,
                 })
                 .collect();
+            let final_args = final_args?;
             Some(Type::Instance {
                 type_ref,
                 args: final_args,
