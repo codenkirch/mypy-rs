@@ -1405,7 +1405,7 @@ fn get_method_definer(_py: Python<'_>, info: &PyAny, name: &str) -> Option<Optio
 /// `state.state.strict_optional`); defaults to `true` (the production
 /// default) on any read failure. Conservative: a wrong strict_optional
 /// could change an expand decision.
-fn live_strict_optional(py: Python<'_>) -> bool {
+pub(crate) fn live_strict_optional(py: Python<'_>) -> bool {
     py.import("mypy.state")
         .and_then(|m| m.getattr("state"))
         .and_then(|s| s.getattr("strict_optional"))
