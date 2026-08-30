@@ -33,6 +33,7 @@ jobs:
         with:
           ref: ${{ github.event.pull_request.head.sha }}
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Review PR diff with OpenCodeReview
         env:
@@ -55,6 +56,7 @@ jobs:
           def esc(text: str) -> str:
               text = text.replace("\n", " ")
               return (text.replace("\\", "\\\\")
+                          .replace("`", "\\`")
                           .replace("|", "\\|").replace("<", "&lt;")
                           .replace(">", "&gt;"))
 
@@ -87,6 +89,8 @@ jobs:
                   loc = esc(f"{c.get('path', '?')}:{c.get('start_line', '?')}")
                   body += (f"\n\n<details><summary><code>{loc}</code></summary>\n\n"
                            f"````\n{suggestion}\n````\n</details>")
+          if len(body) > 60000:
+              body = body[:60000] + "\n\n(OpenCodeReview: body truncated; rerun on smaller commits)"
           with open("ocr-body.md", "w") as f:
               f.write(body)
           subprocess.run(["gh", "pr", "review", pr, "--comment",
