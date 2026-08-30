@@ -27,7 +27,10 @@
 //! `tvar_scope.get_binding` lookup and the "typevar params contain a
 //! placeholder -> api.defer()" pre-check stay Python-side; the shim passes
 //! them back as facts and re-applies the pre-check deferral only when Rust
-//! actually decides a front branch.
+//! actually decides a front branch. An unbound, non-alias TypeVarExpr
+//! decides natively under `allow_unbound_tvars` (the without-info back
+//! returns the raw type); its fail tail (arg re-analysis + messages)
+//! defers.
 
 use pyo3::prelude::*;
 
@@ -77,6 +80,10 @@ const TAG_TVT_UNBOUND: i64 = 24; // 456 fail + Any(from_error)
 const TAG_TVT_NESTING: i64 = 25; // 460-465 fail + Any(from_error)
 const TAG_TVT_ARGS: i64 = 26; // 467-470 fail + TypeVarTupleType
 const TAG_TVT_OK: i64 = 27; // 473-482 TypeVarTupleType
+
+// Unbound non-alias TypeVarExpr under allow_unbound_tvars, mirroring the
+// PSPEC/TVT arms; decided from the already-passed allow_unbound_tvars fact.
+const TAG_TVAR_UNBOUND: i64 = 28; // 1731-1736 (without-info back) return t
 
 /// `visit_unbound_type_nonoptional` front classifier. Mirrors the branch
 /// order of typeanal.py:310-482 exactly and returns the terminal branch
@@ -221,8 +228,12 @@ pub(crate) fn rust_classify_unbound_front(
             if tvar_def_exists {
                 return Ok(Some(if has_args { TAG_TVAR_ARGS } else { TAG_TVAR_OK }));
             }
-            // No binding and not a defining-alias error: falls to the back
-            // (special unbound types / the without_info tail), so defer.
+            // No binding and not a defining-alias error: the body's
+            // without-info back returns the raw type under
+            // allow_unbound_tvars; the fail tail still defers.
+            if allow_unbound_tvars {
+                return Ok(Some(TAG_TVAR_UNBOUND));
+            }
             Ok(None)
         }
         // TypeVarTupleExpr (typeanal.py:433-482).
@@ -523,9 +534,40 @@ mod tests {
     }
 
     #[test]
-    fn typevar_unbound_plain_defers() {
-        // No binding, not a defining-alias error -> back of the method.
+    fn typevar_unbound_fail_tail_defers() {
+        // No binding, not allowed: the body's without-info tail re-analyzes
+        // args and emits fail/notes, so Rust defers (typeanal.py:1769-1839).
         assert_eq!(classify(&Facts::new(NODE_KIND_TYPE_VAR)), None);
+    }
+
+    #[test]
+    fn typevar_unbound_allow_returns_t() {
+        // Unbound tvar in an allowed context -> raw t via the without-info
+        // back's Option 2 (typeanal.py:1731-1736).
+        let mut f = Facts::new(NODE_KIND_TYPE_VAR);
+        f.allow_unbound_tvars = true;
+        assert_eq!(classify(&f), Some(TAG_TVAR_UNBOUND));
+    }
+
+    #[test]
+    fn typevar_unbound_allow_defining_literal() {
+        // defining_literal skips the alias guard; the unbound back still
+        // returns t under allow_unbound_tvars.
+        let mut f = Facts::new(NODE_KIND_TYPE_VAR);
+        f.allow_unbound_tvars = true;
+        f.defining_literal = true;
+        assert_eq!(classify(&f), Some(TAG_TVAR_UNBOUND));
+    }
+
+    #[test]
+    fn typevar_alias_error_beats_unbound_allow() {
+        // The alias-guard error fires even when allow_unbound_tvars is set,
+        // because the body checks the alias arm first (typeanal.py:412-428).
+        let mut f = Facts::new(NODE_KIND_TYPE_VAR);
+        f.allow_unbound_tvars = true;
+        f.defining_alias = true;
+        f.alias_type_params_names = Some(vec!["X".to_string()]);
+        assert_eq!(classify(&f), Some(TAG_TVAR_ALIAS_NOT_DECLARED));
     }
 
     // --- TypeVarTupleExpr ---

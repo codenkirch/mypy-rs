@@ -817,6 +817,11 @@ class TypeAnalyser(SyntheticTypeVisitor[Type], TypeAnalyzerPluginInterface):
         if tag == _UNBOUND_FRONT_TAG_TVAR_OK:
             assert isinstance(tvar_def, TypeVarType)
             return tvar_def.copy_modified(line=t.line, column=t.column)
+        if tag == _UNBOUND_FRONT_TAG_TVAR_UNBOUND:
+            # Unbound, non-alias TypeVarExpr under allow_unbound_tvars: the
+            # body's without-info back returns the raw type unmodified
+            # (typeanal.py:1731-1736). The fail tail keeps the None defer.
+            return t
         if tag == _UNBOUND_FRONT_TAG_TVARTUPLE_ALIAS_NOT_DECLARED:
             self.fail(
                 f'Type variable "{t.name}" is not included in type_params',
@@ -3806,6 +3811,10 @@ _UNBOUND_FRONT_TAG_TVARTUPLE_UNBOUND = 24
 _UNBOUND_FRONT_TAG_TVARTUPLE_NESTING = 25
 _UNBOUND_FRONT_TAG_TVARTUPLE_ARGS = 26
 _UNBOUND_FRONT_TAG_TVARTUPLE_OK = 27
+# An unbound, non-alias TypeVarExpr under allow_unbound_tvars: the body
+# routes it to analyze_unbound_type_without_type_info, whose Option 2
+# returns the raw type (typeanal.py:1731-1736).
+_UNBOUND_FRONT_TAG_TVAR_UNBOUND = 28
 
 # Node-kind tags for the resolved `sym.node`, computed by the shim:
 # -1 sym is None, 0 node is None, 1 PlaceholderNode, 2 ParamSpecExpr,

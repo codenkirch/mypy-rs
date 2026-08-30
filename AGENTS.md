@@ -660,8 +660,11 @@ including:
   branch tag; the Python shim applies the side effects (defer /
   `record_incomplete_ref` / `fail`) and rebuilds the result object. The
   plugin hook path, non-front node kinds (Var, TypeAlias, TypeInfo, ...),
-  and unbound non-alias `TypeVarExpr` defer (`None`) to the pure-Python
-  body; `tvar_scope.get_binding` and the "a typevar param is a
+  and the unbound non-alias `TypeVarExpr` fail tail (arg re-analysis +
+  messages) defer (`None`) to the pure-Python body; an unbound non-alias
+  `TypeVarExpr` under `allow_unbound_tvars` decides natively (new tag,
+  issue #1265: the without-info back's Option 2 returns the raw type).
+  `tvar_scope.get_binding` and the "a typevar param is a
   `PlaceholderType` → `api.defer()`" pre-check stay Python-side (the
   shim re-flags the pre-check as a fact and re-applies the deferral on a
   decided tag). Gated by `_set_native_typeanal_active` (wired from
