@@ -1603,8 +1603,11 @@ fn serialize_f_string_interpolation(
     serializer.writer.tag(FSTRING_INTERPOLATION);
     serialize_expr(serializer, &interpolation.expression)?;
 
+    // CPython defaults the !r conversion for the debug form only when no
+    // format spec is applied (with a spec it formats str(expr)).
     let conversion = if interpolation.debug_text.is_some()
         && interpolation.conversion == ast::ConversionFlag::None
+        && interpolation.format_spec.is_none()
     {
         Some('r')
     } else {
