@@ -15592,6 +15592,20 @@ class NativeWireFixupSuite(Suite):
         assert_equal(actual, expected)
         assert actual is True
 
+    def test_erase_typevars_replacement_any_is_special_form(self) -> None:
+        # Native erase_typevars replaces an erased TypeVar with a wire Any;
+        # its type_of_any must decode as TypeOfAny.special_form (#1262).
+        from mypy.erasetype import _set_native_erase_typevars_active, erase_typevars
+
+        _set_native_erase_typevars_active(False)
+        expected = erase_typevars(self.fx.t)
+        _set_native_erase_typevars_active(True)
+        actual = erase_typevars(self.fx.t)
+        self._assert_no_fake_info(actual)
+        assert_equal(actual, expected)
+        assert isinstance(actual, AnyType)  # type: ignore[misc]
+        assert actual.type_of_any == TypeOfAny.special_form
+
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeTypeanalAliasQuerySuite(Suite):
