@@ -22553,26 +22553,36 @@ class NativeConstraintsDeferralSuite(Suite):
         t.write(buf)
         return buf.getvalue()
 
-    def _rust(self, template: Type, actual: Type, direction: int = SUBTYPE_OF) -> Any:
+    def _rust(
+        self,
+        template: Type,
+        actual: Type,
+        direction: int = SUBTYPE_OF,
+        erase_types: bool = False,
+    ) -> Any:
         return _type_kernel.rust_infer_constraints_full(
             self.resolver,
             self._bytes_of(template),
             self._bytes_of(actual),
             direction,
             False,
-            False,
+            erase_types,
             strict_optional_flag(),
             True,
         )
 
-    def _assert_engages(self, template: Type, actual: Type, direction: int = SUBTYPE_OF) -> None:
-        raw = self._rust(template, actual, direction)
+    def _assert_engages(
+        self, template: Type, actual: Type, direction: int = SUBTYPE_OF, erase_types: bool = False
+    ) -> None:
+        raw = self._rust(template, actual, direction, erase_types)
         assert (
             raw is not None
         ), f"Rust seam must engage for template={template!r} actual={actual!r}"
 
-    def _assert_defers(self, template: Type, actual: Type, direction: int = SUBTYPE_OF) -> None:
-        raw = self._rust(template, actual, direction)
+    def _assert_defers(
+        self, template: Type, actual: Type, direction: int = SUBTYPE_OF, erase_types: bool = False
+    ) -> None:
+        raw = self._rust(template, actual, direction, erase_types)
         assert raw is None, f"Rust seam must defer for template={template!r} actual={actual!r}"
 
     # --- alias operands expand natively through the resolver ---
@@ -22687,6 +22697,51 @@ class NativeConstraintsDeferralSuite(Suite):
         self._rebuild_with_aliases([])
         template = self._list(self.fx.t)
         actual = self._list(TypeAliasType(alias, []))
+        self._assert_par(template, actual)
+        self._assert_defers(template, actual)
+
+    # --- type[...] template vs a type-object callable (issue #1260) ---
+
+    def _type_of(self, item: Type) -> Type:
+        return TypeType.make_normalized(item)
+
+    def test_type_type_vs_type_object_callable(self) -> None:
+        # type[list[T]] vs a type-object callable (fallback builtins.type):
+        # get_instance_type() stands in the proper ret_type, erase_typevars
+        # applies per the erase_types flag, then recursion emits the constraint.
+        template = self._type_of(self._list(self.fx.t))
+        actual = self.fx.callable_type(self._list(self.fx.a))
+        self._assert_par(template, actual)
+        self._assert_engages(template, actual, erase_types=True)
+
+    def test_type_type_vs_ctor_typevar_ret_erases_by_flag(self) -> None:
+        # Same shape with a typevar-bearing ret_type: erase_types=True erases
+        # the ctor typevars; False (the typeops.py bind_self callers) preserves
+        # them. Both engage; the serialized constraints differ by the flag.
+        template = self._type_of(self._list(self.fx.t))
+        actual = self.fx.callable_type(self._list(self.fx.t))
+        self._assert_par(template, actual)
+        raw_true = self._rust(template, actual, erase_types=True)
+        raw_false = self._rust(template, actual, erase_types=False)
+        assert raw_true is not None and raw_false is not None
+        assert raw_true != raw_false, "the erase flag must change the constraint bytes"
+
+    def test_type_type_vs_plain_callable_recurse_ret(self) -> None:
+        # Non-type-object callable (fallback builtins.function): recursion
+        # against the raw ret_type, no erase (constraints.py:2040).
+        template = self._type_of(self._list(self.fx.t))
+        actual = self.fx.callable(self._list(self.fx.a))
+        self._assert_par(template, actual)
+        self._assert_engages(template, actual)
+
+    def test_type_type_vs_ctor_alias_ret_defers(self) -> None:
+        # is_type_obj=True, no instance_type, alias ret without a snapshot:
+        # the proper-type expansion cannot proceed, so the whole call
+        # defers; Python produces the same constraints through the fallback.
+        alias = self._alias(self.fx.a, "mod.MissingCtor")
+        self._rebuild_with_aliases([])
+        template = self._type_of(self._list(self.fx.t))
+        actual = self.fx.callable_type(TypeAliasType(alias, []))
         self._assert_par(template, actual)
         self._assert_defers(template, actual)
 

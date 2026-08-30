@@ -134,18 +134,6 @@ fn infer_constraints_inner(template: &Type, actual: &Type, direction: i64) -> Op
     }
 }
 
-// Deferred-site markers. Every site only propagates None ("last defer
-// wins"); the reason label names the unsupported shape for audits.
-#[allow(dead_code)]
-fn defer_site<T>(_reason: &'static str) -> Option<T> {
-    None
-}
-
-#[allow(dead_code)]
-fn defer_take<T>(v: Option<T>, _reason: &'static str) -> Option<T> {
-    v
-}
-
 // ---------------------------------------------------------------------------
 
 /// PyO3 entry point for the full `ConstraintBuilderVisitor` port.
@@ -169,9 +157,9 @@ pub(crate) fn rust_infer_constraints_full(
     infer_polymorphic: bool,
 ) -> Option<Vec<Vec<u8>>> {
     let mut tb = ReadBuffer::new(template_bytes);
-    let template = defer_take(read_type(&mut tb, None).ok(), "decode-template")?;
+    let template = (read_type(&mut tb, None).ok())?;
     let mut ab = ReadBuffer::new(actual_bytes);
-    let actual = defer_take(read_type(&mut ab, None).ok(), "decode-actual")?;
+    let actual = (read_type(&mut ab, None).ok())?;
     let constraints = infer_constraints_full_inner(
         &template,
         &actual,
@@ -186,7 +174,7 @@ pub(crate) fn rust_infer_constraints_full(
     let mut out = Vec::with_capacity(constraints.len());
     for c in constraints {
         let mut b = WriteBuffer::new();
-        defer_take(c.write(&mut b).ok(), "write-constraint")?;
+        (c.write(&mut b).ok())?;
         out.push(b.into_bytes());
     }
     Some(out)
@@ -286,8 +274,8 @@ fn infer_constraints_dispatch(
     // mirrors Python's `orig_template` (constraints.py:818): branch b
     // recurses against it raw, skipping the unwrap/normalize (897).
     let orig = template;
-    let t = defer_take(get_proper_or_expand(template, aliases), "alias-expand-miss")?;
-    let a = defer_take(get_proper_or_expand(actual, aliases), "alias-expand-miss")?;
+    let t = get_proper_or_expand(template, aliases)?;
+    let a = get_proper_or_expand(actual, aliases)?;
     // constraints.py:825-828: "Type inference shouldn't be affected by
     // whether union types have been simplified" — normalize each union
     // operand (keep_erased=True).
@@ -297,7 +285,7 @@ fn infer_constraints_dispatch(
     // cannot decode (tag 122): any constraint we emit against them fails
     // the shim's decode and wastes the native call.
     if (normalized_t && type_contains_erased(&t)) || (normalized_a && type_contains_erased(&a)) {
-        return defer_site("union-erased-item");
+        return None;
     }
     // Ignore suggestion-engine Any types before any constraint is emitted:
     // constraints.py:835 runs before the TypeVar branch, so a recursive
@@ -314,12 +302,12 @@ fn infer_constraints_dispatch(
     }
     // constraints.py:843-847: `type[A | B]` is represented internally as
     // `type[A] | type[B]`; unwrap both sides when both are type[...]-ish.
-    let t_is_tt = defer_take(is_type_type_dispatch(&t, aliases), "tt/unwrap defers")?;
-    let a_is_tt = defer_take(is_type_type_dispatch(&a, aliases), "tt/unwrap defers")?;
+    let t_is_tt = is_type_type_dispatch(&t, aliases)?;
+    let a_is_tt = is_type_type_dispatch(&a, aliases)?;
     let type_type_unwrapped = t_is_tt && a_is_tt;
     let (t, a) = if type_type_unwrapped {
-        let ut = defer_take(unwrap_type_type_dispatch(&t, aliases), "tt/unwrap defers")?;
-        let ua = defer_take(unwrap_type_type_dispatch(&a, aliases), "tt/unwrap defers")?;
+        let ut = unwrap_type_type_dispatch(&t, aliases)?;
+        let ua = unwrap_type_type_dispatch(&a, aliases)?;
         (ut, ua)
     } else {
         (t, a)
@@ -354,10 +342,7 @@ fn infer_constraints_dispatch(
                 _ => false,
             };
             if !template_union_has_tvar {
-                defer_take(
-                    get_proper_or_expand(upper_bound, aliases),
-                    "alias-expand-miss",
-                )?
+                get_proper_or_expand(upper_bound, aliases)?
             } else {
                 a.clone()
             }
@@ -397,23 +382,17 @@ fn infer_constraints_dispatch(
             // subtype of, inferring eagerly.
             let mut options: Vec<Option<Vec<Constraint>>> = Vec::with_capacity(items.len());
             for item in items {
-                let inner = defer_take(
-                    infer_constraints_if_possible_inner(
-                        &t,
-                        item,
-                        direction,
-                        resolver,
-                        aliases,
-                        strict_optional,
-                    ),
-                    "if-possible-gate",
+                let inner = infer_constraints_if_possible_inner(
+                    &t,
+                    item,
+                    direction,
+                    resolver,
+                    aliases,
+                    strict_optional,
                 )?;
                 options.push(inner);
             }
-            return defer_take(
-                run_any_constraints(options, true, strict_optional, resolver),
-                "any-constraints",
-            );
+            return run_any_constraints(options, true, strict_optional, resolver);
         }
     } else {
         if let Type::UnionType { items, .. } = &a {
@@ -422,10 +401,7 @@ fn infer_constraints_dispatch(
             let mut res = Vec::new();
             for item in items {
                 let item = if type_type_unwrapped {
-                    defer_take(
-                        make_normalized_type_type(item.clone(), false),
-                        "tt/unwrap defers",
-                    )?
+                    make_normalized_type_type(item.clone(), false)?
                 } else {
                     item.clone()
                 };
@@ -452,28 +428,22 @@ fn infer_constraints_dispatch(
             let eager = matches!(a, Type::AnyType { .. });
             let mut options: Vec<Option<Vec<Constraint>>> = Vec::with_capacity(items.len());
             for item in items {
-                let inner = defer_take(
-                    infer_constraints_if_possible_inner(
-                        item,
-                        &a,
-                        direction,
-                        resolver,
-                        aliases,
-                        strict_optional,
-                    ),
-                    "if-possible-gate",
+                let inner = infer_constraints_if_possible_inner(
+                    item,
+                    &a,
+                    direction,
+                    resolver,
+                    aliases,
+                    strict_optional,
                 )?;
                 options.push(inner);
             }
-            let result = defer_take(
-                run_any_constraints(options, eager, strict_optional, resolver),
-                "any-constraints",
-            )?;
+            let result = run_any_constraints(options, eager, strict_optional, resolver)?;
             if !result.is_empty() {
                 return Some(result);
             }
-            let t_rec = defer_take(has_recursive_types_inner(&t), "recursive-union-fallback")?;
-            let a_rec = defer_take(has_recursive_types_inner(&a), "recursive-union-fallback")?;
+            let t_rec = has_recursive_types_inner(&t)?;
+            let a_rec = has_recursive_types_inner(&a)?;
             if t_rec && !a_rec {
                 return handle_recursive_union_inner(
                     &t,
@@ -531,14 +501,12 @@ fn infer_constraints_dispatch(
         }
         // The top-level get_proper_or_expand guarantees a non-alias template
         // here; an unresolvable alias already deferred at the top.
-        Type::TypeAliasType { .. } => defer_site("template-alias"),
+        Type::TypeAliasType { .. } => None,
         // Union templates/actuals were consumed by the branches above for
         // both directions; unreachable safety fallback.
         Type::UnionType { .. } => Some(vec![]),
         // Unsupported template shapes: defer to Python.
-        Type::TypeVarTupleType { .. } | Type::UnpackType { .. } | Type::Parameters(..) => {
-            defer_site("template-tvt-unpack-params")
-        }
+        Type::TypeVarTupleType { .. } | Type::UnpackType { .. } | Type::Parameters(..) => None,
         Type::ErasedType => Some(vec![]),
     }
 }
@@ -567,15 +535,9 @@ fn normalize_union_operands(
         };
         let mut expanded = Vec::with_capacity(items.len());
         for item in items {
-            expanded.push(defer_take(
-                get_proper_or_expand(item, aliases),
-                "union-normalize-fail",
-            )?);
+            expanded.push(get_proper_or_expand(item, aliases)?);
         }
-        let simplified = defer_take(
-            make_simplified_union(&expanded, &ctx, resolver, true, true),
-            "union-normalize-fail",
-        )?;
+        let simplified = make_simplified_union(&expanded, &ctx, resolver, true, true)?;
         Some((simplified, true))
     };
     let (t, normalized_t) = normalize(t)?;
@@ -650,41 +612,23 @@ fn infer_constraints_if_possible_inner(
     // all flags False except strict_optional.
     let ctx = SubtypeContext::new(false, false, false, false, false, strict_optional);
     if direction == SUBTYPE_OF {
-        let erased = defer_take(
-            erase_typevars_inner(template, None, &any_repl),
-            "if-possible-gate",
-        )?;
-        let gate = defer_take(
-            is_subtype(&erased, actual, &ctx, resolver),
-            "if-possible-gate",
-        )?;
+        let erased = erase_typevars_inner(template, None, &any_repl)?;
+        let gate = is_subtype(&erased, actual, &ctx, resolver)?;
         if !gate {
             return Some(None);
         }
     }
     if direction == SUPERTYPE_OF {
-        let erased = defer_take(
-            erase_typevars_inner(template, None, &any_repl),
-            "if-possible-gate",
-        )?;
-        let gate = defer_take(
-            is_subtype(actual, &erased, &ctx, resolver),
-            "if-possible-gate",
-        )?;
+        let erased = erase_typevars_inner(template, None, &any_repl)?;
+        let gate = is_subtype(actual, &erased, &ctx, resolver)?;
         if !gate {
             return Some(None);
         }
         // constraints.py:994-1001: not caught by the gate above because
         // erase_typevars turns the type var itself into Any.
         if let Type::TypeVarType { upper_bound, .. } = template {
-            let erased_ub = defer_take(
-                erase_typevars_inner(upper_bound, None, &any_repl),
-                "if-possible-gate",
-            )?;
-            let ub_gate = defer_take(
-                is_subtype(actual, &erased_ub, &ctx, resolver),
-                "if-possible-gate",
-            )?;
+            let erased_ub = erase_typevars_inner(upper_bound, None, &any_repl)?;
+            let ub_gate = is_subtype(actual, &erased_ub, &ctx, resolver)?;
             if !ub_gate {
                 return Some(None);
             }
@@ -816,18 +760,15 @@ fn visit_instance_native(
 ) -> Option<Vec<Constraint>> {
     let template_args = match template {
         Type::Instance { args, .. } => args,
-        _ => return defer_site("inst-not-instance"),
+        _ => return None,
     };
-    let template_snap = defer_take(
-        resolver.get(defer_take(get_type_ref(template), "inst-tref")?),
-        "inst-snap-template",
-    )?;
+    let template_snap = resolver.get(get_type_ref(template)?)?;
     let mut actual = original_actual;
     // Callable actuals: only defer if the template is a protocol. The
     // dominant non-protocol-vs-callable case uses the callable's fallback.
     if matches!(actual, Type::CallableType { .. }) {
         if template_snap.is_protocol {
-            return defer_site("inst-callable-vs-protocol");
+            return None;
         }
         if let Type::CallableType { fallback, .. } = actual {
             actual = fallback;
@@ -835,41 +776,38 @@ fn visit_instance_native(
     }
     // Overloaded actual: no fallback in the dense wire transport, defer.
     if matches!(actual, Type::Overloaded { .. }) {
-        return defer_site("inst-overloaded-actual");
+        return None;
     }
     // TypedDict actuals, Protocol-typed actuals: defer.
     if let Type::TypedDictType { .. } = actual {
-        return defer_site("inst-typeddict-actual");
+        return None;
     }
     if matches!(actual, Type::LiteralType { .. }) {
         // constraints.py:1423: LiteralType unwraps to its fallback and takes
         // the nominal-Instance path; not ported this round.
-        return defer_site("inst-literaltype-actual");
+        return None;
     }
     if matches!(actual, Type::TypeType { .. }) {
         // constraints.py:1400-1417: a protocol template extends the protocol
         // via members/its metaclass (deferred); any other template leaves
         // `actual` a TypeType and falls through the tail to `return []`.
         if template_snap.is_protocol {
-            return defer_site("inst-typetype-protocol");
+            return None;
         }
         return Some(vec![]);
     }
     if let Type::Instance { type_ref, args, .. } = actual {
-        let a_snap = defer_take(resolver.get(type_ref), "inst-snap-actual")?;
+        let a_snap = resolver.get(type_ref)?;
         // SUBTYPE_OF direction: template is a base of actual (fast path).
         if direction == SUBTYPE_OF && template_snap.has_base(type_ref) {
             if template_snap.has_type_var_tuple_type || a_snap.has_type_var_tuple_type {
-                return defer_site("inst-tvt-subtype");
+                return None;
             }
-            let mapped = defer_take(
-                map_instance_to_supertype(
-                    get_type_ref(template)?,
-                    template_args,
-                    type_ref,
-                    resolver,
-                ),
-                "inst-map-miss",
+            let mapped = map_instance_to_supertype(
+                get_type_ref(template)?,
+                template_args,
+                type_ref,
+                resolver,
             )?;
             let mut res = Vec::new();
             for (tvar, mapped_arg, inst_arg) in zip3(tvars_of(a_snap), &mapped, args) {
@@ -898,7 +836,7 @@ fn visit_instance_native(
                         }
                     }
                     // ParamSpecType (kind 1): defer (needs Parameters slicing).
-                    1 => return defer_site("inst-param-spec-tvar"),
+                    1 => return None,
                     // TypeVarTupleType (kind 2): covariant-ish single direction.
                     2 => {
                         res.extend(push_inner(
@@ -918,13 +856,10 @@ fn visit_instance_native(
         // SUPERTYPE_OF direction: actual is a base of template.
         if direction == SUPERTYPE_OF && a_snap.has_base(get_type_ref(template)?) {
             if template_snap.has_type_var_tuple_type || a_snap.has_type_var_tuple_type {
-                return defer_site("inst-tvt-supertype");
+                return None;
             }
             let template_ref = get_type_ref(template)?;
-            let mapped = defer_take(
-                map_instance_to_supertype(type_ref, args, template_ref, resolver),
-                "inst-map-miss",
-            )?;
+            let mapped = map_instance_to_supertype(type_ref, args, template_ref, resolver)?;
             let mut res = Vec::new();
             for (tvar, template_arg, mapped_arg) in
                 zip3(tvars_of(template_snap), template_args, &mapped)
@@ -952,7 +887,7 @@ fn visit_instance_native(
                             )?);
                         }
                     }
-                    1 => return defer_site("inst-param-spec-tvar"),
+                    1 => return None,
                     2 => {
                         res.extend(push_inner(
                             template_arg.clone(),
@@ -976,15 +911,32 @@ fn visit_instance_native(
             }
             return Some(res);
         }
-        // Structural-protocol branches: need `find_member` + `is_protocol_implementation`,
-        // not snapshot-able, so defer.
+        // Structural-protocol branch (constraints.py:1540-1581): the
+        // SUPERTYPE_OF arm with a non-protocol instance is decided in
+        // Rust; protocol-left and other actual kinds still defer.
         if template_snap.is_protocol || a_snap.is_protocol {
-            let reason = match (template_snap.is_protocol, a_snap.is_protocol) {
-                (true, true) => "inst-protocol-both",
-                (true, false) => "inst-protocol-template",
-                _ => "inst-protocol-actual",
-            };
-            return defer_site(reason);
+            if template_snap.is_protocol && !a_snap.is_protocol {
+                if direction == SUPERTYPE_OF {
+                    return visit_instance_protocol_supertype_native(
+                        template,
+                        actual,
+                        original_actual,
+                        direction,
+                        resolver,
+                        aliases,
+                        strict_optional,
+                    );
+                }
+                if direction == SUBTYPE_OF {
+                    // Python: both nominal branches miss, the SUPERTYPE_OF
+                    // structural arm does not fire, and the tail's elif
+                    // chain matches no Instance arm, so `return []`.
+                    return Some(vec![]);
+                }
+            }
+            // Protocol-template / protocol-actual pairs beyond the ported
+            // arms are Python-side (the structural protocol tail).
+            return None;
         }
         // Fall through to the tail (actual is a non-protocol instance).
     }
@@ -998,10 +950,248 @@ fn visit_instance_native(
     )
 }
 
-/// Port of the tail of `visit_instance` (constraints.py:1156-1205),
-/// reached after the nominal branches. `actual` here is the possibly-rewritten
-/// (fallback-unwrapped) actual; if it is no longer an Instance, we did not
-/// fall through from the nominal block above.
+thread_local! {
+    /// Per-protocol-class inferring mirror (constraints.py `template.type.
+    /// inferring`): a template already on the stack suppresses the
+    /// structural protocol arm (`any(template == t for t in
+    /// reversed(...))`, verified by structural equality, and the
+    /// type_ref inside the Instance keeps entries of different protocol
+    /// classes apart).
+    static PROTOCOL_INFERRING: RefCell<Vec<Type>> = const { RefCell::new(Vec::new()) };
+}
+
+/// RAII guard mirroring `template.type.inferring.append/pop` around the
+/// member loop (constraints.py:1553-1571).
+struct ProtocolInferringPush;
+
+impl ProtocolInferringPush {
+    fn new(template: &Type) -> Self {
+        PROTOCOL_INFERRING.with(|s| s.borrow_mut().push(template.clone()));
+        Self
+    }
+}
+
+impl Drop for ProtocolInferringPush {
+    fn drop(&mut self) {
+        PROTOCOL_INFERRING.with(|s| s.borrow_mut().pop());
+    }
+}
+
+/// The SUPERTYPE_OF structural-protocol arm of `visit_instance`
+/// (constraints.py:1540-1573): `template` is a protocol Instance, `actual`
+/// is a non-protocol Instance, and both nominal branches missed. Decided
+/// when `is_protocol_implementation(actual, erased(template),
+/// skip=["__call__"])` succeeds (Rust engine, parity-tested) and the
+/// member loop is `find_member`-based, which the parity-tested
+/// `get_protocol_member_inner` covers for the shapes this path reaches.
+fn visit_instance_protocol_supertype_native(
+    template: &Type,
+    actual: &Type,
+    original_actual: &Type,
+    direction: i64,
+    resolver: &TypeResolver,
+    aliases: &crate::aliases::TypeAliasResolver,
+    strict_optional: bool,
+) -> Option<Vec<Constraint>> {
+    // The engine and the member loop both need the live TypeInfo map for
+    // the dependency record + member-flag reads (subtypes.py:1885,
+    // :2025-2055); without it, defer straight to the pure-Python body.
+    if !resolver.has_live_info_map() {
+        return None;
+    }
+    // Inferring guard (constraints.py:1549).
+    let already_on_stack = PROTOCOL_INFERRING.with(|s| s.borrow().contains(template));
+    if already_on_stack {
+        // Python falls out of the instance block with an empty `res`,
+        // reaches the tail, which returns [] for an Instance actual.
+        return Some(vec![]);
+    }
+    // erased = erase_typevars(template) (constraints.py:1422).
+    let erased = erase_typevars_inner(template, None, &crate::erase_typevars::make_any())?;
+    let skip = vec!["__call__".to_string()];
+    let ctx = SubtypeContext::default();
+    let verdict = pyo3::Python::with_gil(|py| {
+        crate::protocols::is_protocol_implementation_inner(
+            py, actual, &erased, &skip, &ctx, resolver,
+        )
+    });
+    match verdict {
+        Some(false) => {
+            // Python: the arm's `and` chain fails, control falls out of
+            // the instance block; the tail then returns [] for an
+            // Instance actual (constraints.py:1583-1641).
+            visit_instance_tail_native(
+                template,
+                actual,
+                direction,
+                resolver,
+                aliases,
+                strict_optional,
+            )
+        }
+        Some(true) => {
+            let _guard = ProtocolInferringPush::new(template);
+            // Python passes `(instance, template, original_actual,
+            // template)` — subtype is the original actual, protocol is
+            // the template itself.
+            let res = pyo3::Python::with_gil(|py| {
+                infer_constraints_from_protocol_members_native(
+                    py,
+                    actual,
+                    template,
+                    original_actual,
+                    template,
+                    false,
+                    direction,
+                    resolver,
+                    aliases,
+                    strict_optional,
+                    None,
+                )
+            })?;
+            Some(res)
+        }
+        None => None,
+    }
+}
+
+/// Port of `infer_constraints_from_protocol_members` (constraints.py:
+/// 1643-1682). For every protocol member, fetch the member type on the
+/// instance side (`find_member(member, instance, subtype,
+/// class_obj=class_obj)`) and on the template side (`find_member(member,
+/// template, subtype)`), then infer constraints recursively; settable
+/// members also emit opposite-direction constraints.
+///
+/// Member fetches ride the parity-tested `get_protocol_member_inner`
+/// (the same fetch `is_protocol_implementation`'s member loop performs).
+/// Two `find_member` divergences are known and mirrored:
+///   * `__call__` on a metaclass instance: `get_protocol_member` answers
+///     None where `find_member` finds the metaclass `__call__`, but the
+///     constraints loop skips metaclass `__call__` members either way
+///     (constraints.py:1676) — the inst-side fetch matches Python's
+///     outcome.
+///   * `__call__` on a metaclass TEMPLATE side would produce a spurious
+///     `continue`; unreachable for protocol templates, and the rare
+///     scaler-shape defers to Python instead.
+///
+/// A fetch `Defer` (property, plugin hook, not-ready var, ...) bubbles up
+/// as a whole-call deferral, so Python re-runs the exact original loop.
+#[allow(clippy::too_many_arguments)]
+fn infer_constraints_from_protocol_members_native(
+    py: Python<'_>,
+    instance: &Type,
+    template: &Type,
+    subtype: &Type,
+    protocol: &Type,
+    class_obj: bool,
+    direction: i64,
+    resolver: &TypeResolver,
+    aliases: &crate::aliases::TypeAliasResolver,
+    strict_optional: bool,
+    protocol_snap: Option<&crate::typeinfo::TypeInfoSnapshot>,
+) -> Option<Vec<Constraint>> {
+    use crate::checker_helpers::{get_protocol_member_inner, GetProtocolMemberResult};
+
+    let protocol_ref = get_type_ref(protocol)?;
+    let protocol_snap = match protocol_snap {
+        // Engine already resolved the protocol snapshot.
+        Some(s) => s,
+        None => resolver.get(protocol_ref)?,
+    };
+    let mut res: Vec<Constraint> = Vec::new();
+    for member in &protocol_snap.protocol_members {
+        // `__call__` on a metaclass template would diverge (see doc).
+        if member == "__call__"
+            && (protocol_snap.fullname == "builtins.type"
+                || protocol_snap.fullname == "abc.ABCMeta")
+        {
+            return None;
+        }
+        let inst = match get_protocol_member_inner(
+            py, instance, subtype, member, class_obj, false, resolver,
+        ) {
+            Some(GetProtocolMemberResult::Found(t)) => Some(t),
+            Some(GetProtocolMemberResult::NoneVal) => None,
+            // Defer / no-answer: fall back to the pure-Python loop.
+            _ => return None,
+        };
+        let temp = match get_protocol_member_inner(
+            py, template, subtype, member, false, false, resolver,
+        ) {
+            Some(GetProtocolMemberResult::Found(t)) => Some(t),
+            Some(GetProtocolMemberResult::NoneVal) => None,
+            _ => return None,
+        };
+        let (inst, temp) = match (inst, temp) {
+            (Some(i), Some(t)) => (i, t),
+            // Either side missing:
+            (Some(_), None) | (None, Some(_)) | (None, None) => {
+                if member == "__call__" {
+                    continue;
+                }
+                // See #11020: a missing (non-__call__) member produces no
+                // constraints at all — decided.
+                return Some(vec![]);
+            }
+        };
+        if class_obj {
+            // constraints.py:1667-1674. `is_subtype(inst, erase_typevars(
+            // temp), ignore_pos_arg_names=True)`; skipping is decided.
+            let erased_temp =
+                erase_typevars_inner(&temp, None, &crate::erase_typevars::make_any())?;
+            let ctx = SubtypeContext::with_callable_flags(
+                false,
+                false,
+                false,
+                false,
+                false,
+                strict_optional,
+                true,
+                false,
+            );
+            match is_subtype(&inst, &erased_temp, &ctx, resolver) {
+                Some(true) => {}
+                Some(false) => continue,
+                None => return None,
+            }
+        }
+        res.extend(push_inner(
+            temp.clone(),
+            inst.clone(),
+            direction,
+            resolver,
+            aliases,
+            strict_optional,
+        )?);
+        // Settable members are invariant: add opposite-direction
+        // constraints (constraints.py:1679-1681).
+        let protocol_info = resolver.live_typeinfo(py, protocol_ref)?;
+        if protocol_info.is_none() {
+            return None;
+        }
+        let flags = crate::member_flags::get_member_flags_inner_pub(
+            py,
+            protocol_info,
+            member,
+            false,
+            None,
+            strict_optional,
+            resolver,
+        )?;
+        if flags.contains(&crate::member_flags::IS_SETTABLE) {
+            res.extend(push_inner(
+                temp,
+                inst,
+                neg_op(direction),
+                resolver,
+                aliases,
+                strict_optional,
+            )?);
+        }
+    }
+    Some(res)
+}
+
 fn visit_instance_tail_native(
     template: &Type,
     actual: &Type,
@@ -1012,7 +1202,7 @@ fn visit_instance_tail_native(
 ) -> Option<Vec<Constraint>> {
     let template_args = match template {
         Type::Instance { args, .. } => args,
-        _ => return defer_site("tail-not-instance"),
+        _ => return None,
     };
     if let Type::AnyType { .. } = actual {
         return infer_against_any_native(
@@ -1028,7 +1218,7 @@ fn visit_instance_tail_native(
         let template_ref = get_type_ref(template)?;
         if direction == SUPERTYPE_OF && TUPLE_LIKE_INSTANCE_NAMES.contains(&template_ref) {
             if template_args.is_empty() {
-                return defer_site("tail-tuplelike-noargs");
+                return None;
             }
             let mut res = Vec::new();
             for item in items {
@@ -1041,10 +1231,7 @@ fn visit_instance_tail_native(
                             args.first().cloned()
                         }
                         Type::TypeAliasType { .. } => {
-                            let expanded = defer_take(
-                                get_proper_or_expand(typ, aliases),
-                                "tail-unpack-alias-miss",
-                            )?;
+                            let expanded = get_proper_or_expand(typ, aliases)?;
                             match expanded {
                                 Type::TypeVarTupleType { .. } => None,
                                 Type::Instance { args, .. }
@@ -1052,10 +1239,10 @@ fn visit_instance_tail_native(
                                 {
                                     args.first().cloned()
                                 }
-                                _ => return defer_site("tail-unpack-alias-shape"),
+                                _ => return None,
                             }
                         }
-                        _ => return defer_site("tail-unpack-shape"),
+                        _ => return None,
                     },
                     other => Some(other.clone()),
                 };
@@ -1080,30 +1267,24 @@ fn visit_instance_tail_native(
         }
         // constraints.py:1626-1644: constrain the template against the
         // tuple's fallback instance.
-        let fallback = defer_take(
-            crate::typeops::tuple_fallback(actual, resolver),
-            "tail-tuple-fallback",
-        )?;
+        let fallback = crate::typeops::tuple_fallback(actual, resolver)?;
         let any_repl = Type::AnyType {
             type_of_any: 6, // TypeOfAny.special_form
             source_any: None,
             missing_import_name: None,
         };
-        let erased = defer_take(
-            erase_typevars_inner(template, None, &any_repl),
-            "tail-tuple-erase",
-        )?;
+        let erased = erase_typevars_inner(template, None, &any_repl)?;
         if !matches!(erased, Type::Instance { .. }) {
             // Python asserts the erased template is a bare Instance
             // (constraints.py:1628-1629); anything else is out of contract.
-            return defer_site("tail-tuple-erase-shape");
+            return None;
         }
         let tail_tref = get_type_ref(template)?;
-        let tail_snap = defer_take(resolver.get(tail_tref), "tail-tuple-snap")?;
+        let tail_snap = (resolver.get(tail_tref))?;
         if tail_snap.is_protocol {
             // Protocol special-case (constraints.py:1630-1643) needs
             // protocol members; not ported this round.
-            return defer_site("tail-tuple-protocol");
+            return None;
         }
         return push_inner(
             template.clone(),
@@ -1154,7 +1335,7 @@ fn visit_instance_tail_native(
     }
     // TypeVarTupleType actual raises NotImplementedError in Python.
     if matches!(actual, Type::TypeVarTupleType { .. }) {
-        return defer_site("tail-tvt-actual");
+        return None;
     }
     Some(vec![])
 }
@@ -1177,14 +1358,13 @@ fn visit_tuple_native(
 ) -> Option<Vec<Constraint>> {
     let template_items = match template {
         Type::TupleType { items, .. } => items,
-        _ => return defer_site("tuple-not-tuple"),
+        _ => return None,
     };
     let unpack_index = find_unpack_in_list_inner(template_items);
     let is_varlength = match actual {
-        Type::Instance { type_ref, .. } => defer_take(
-            resolver.get(type_ref).map(|s| s.has_base("builtins.tuple")),
-            "tuple-snap-actual",
-        )?,
+        Type::Instance { type_ref, .. } => resolver
+            .get(type_ref)
+            .map(|s| s.has_base("builtins.tuple"))?,
         _ => false,
     };
     if !(matches!(actual, Type::TupleType { .. }) || is_varlength) {
@@ -1212,29 +1392,23 @@ fn visit_tuple_native(
             // resolver; an unresolvable alias (missing snapshot) defers.
             let unmapped_inner = match unpack_type {
                 Type::UnpackType { typ } => match typ.as_ref() {
-                    Type::TypeAliasType { .. } => defer_take(
-                        get_proper_or_expand(typ, aliases),
-                        "tuple-unpack-alias-miss",
-                    )?,
+                    Type::TypeAliasType { .. } => get_proper_or_expand(typ, aliases)?,
                     other => other.clone(),
                 },
-                _ => return defer_site("tuple-unpack-shape"),
+                _ => return None,
             };
             let actual_args = match actual {
                 Type::Instance { args, .. } => args,
-                _ => return defer_site("tuple-actual-shape"),
+                _ => return None,
             };
-            let mapped = defer_take(
-                map_instance_to_supertype(
-                    get_type_ref(actual)?,
-                    actual_args,
-                    "builtins.tuple",
-                    resolver,
-                ),
-                "tuple-map-miss",
+            let mapped = map_instance_to_supertype(
+                get_type_ref(actual)?,
+                actual_args,
+                "builtins.tuple",
+                resolver,
             )?;
             if mapped.len() != 1 {
-                return defer_site("tuple-map-len");
+                return None;
             }
             let mapped_instance = Type::Instance {
                 type_ref: "builtins.tuple".to_string(),
@@ -1260,7 +1434,7 @@ fn visit_tuple_native(
                         strict_optional,
                     )?);
                 }
-                _ => return defer_site("tuple-unmapped-shape"),
+                _ => return None,
             }
             // Constrain the non-unpack template items against the mapped arg:
             // `ti <: X` for every `ti` in Tuple[T, *Ts, S] <: tuple[X, ...].
@@ -1292,7 +1466,7 @@ fn visit_tuple_native(
                 strict_optional,
             )?);
         } else {
-            return defer_site("tuple-unpack-nontuple");
+            return None;
         }
         // Only the fallback-vs-fallback constraint is appended here: the
         // per-item loop is skipped because actual_items/template_items stay
@@ -1342,7 +1516,7 @@ fn visit_tuple_native(
     let a_unpack = &a_items[a_unpack_index as usize];
     let a_unpacked = match a_unpack {
         Type::UnpackType { typ } => typ.as_ref(),
-        _ => return defer_site("tuple-ainternal-shape"),
+        _ => return None,
     };
     if a_items.len() + 1 > t_items.len() {
         // Actual and template lengths are incompatible: no per-item
@@ -1363,14 +1537,11 @@ fn visit_tuple_native(
     // an alias through the resolver; a non-tuple target still runs the tail.
     let a_unpacked: Option<Vec<Type>> = match a_unpacked {
         Type::Instance { type_ref, args, .. } if type_ref == "builtins.tuple" => Some(args.clone()),
-        Type::TypeAliasType { .. } => match defer_take(
-            get_proper_or_expand(a_unpacked, aliases),
-            "tuple-amid-alias-miss",
-        )? {
+        Type::TypeAliasType { .. } => match get_proper_or_expand(a_unpacked, aliases)? {
             Type::Instance { type_ref, args, .. } if type_ref == "builtins.tuple" => Some(args),
             _ => None,
         },
-        Type::TupleType { .. } => return defer_site("tuple-amid-tupletype"),
+        Type::TupleType { .. } => return None,
         _ => None,
     };
     let a_prefix_len = a_unpack_index as usize;
@@ -1386,7 +1557,7 @@ fn visit_tuple_native(
     if let Some(a_mid_args) = a_unpacked {
         // Tuple[T, S, U] <: tuple[X, *tuple[Y, ...], Z]: T <: X, S <: Y,
         // U <: Z.
-        let mid_arg = defer_take(a_mid_args.first().cloned(), "tuple-amid-empty")?;
+        let mid_arg = a_mid_args.first().cloned()?;
         for tm in t_middle {
             res.extend(push_inner(
                 tm,
@@ -1446,8 +1617,8 @@ fn visit_tuple_tail_native(
         {
             let is_named = match (t_fb.as_ref(), a_fb.as_ref()) {
                 (Type::Instance { type_ref: t_tr, .. }, Type::Instance { type_ref: a_tr, .. }) => {
-                    let t_snap = defer_take(resolver.get(t_tr), "tuple-named-snap")?;
-                    let a_snap = defer_take(resolver.get(a_tr), "tuple-named-snap")?;
+                    let t_snap = resolver.get(t_tr)?;
+                    let a_snap = resolver.get(a_tr)?;
                     t_snap.is_named_tuple && a_snap.is_named_tuple
                 }
                 _ => false,
@@ -1524,7 +1695,7 @@ fn simple_unpack_native(
 ) -> Option<Vec<Constraint>> {
     let template_unpack = find_unpack_in_list_inner(template_args);
     if template_unpack < 0 {
-        return defer_site("su-no-unpack");
+        return None;
     }
     let template_prefix = template_unpack as usize;
     let template_suffix = template_args.len() - template_prefix - 1;
@@ -1542,7 +1713,7 @@ fn simple_unpack_native(
             let t_unpack_item = &template_args[template_unpack as usize];
             let inner = match t_unpack_item {
                 Type::UnpackType { typ } => typ.as_ref(),
-                _ => return defer_site("su-unpack-shape"),
+                _ => return None,
             };
             return match inner {
                 Type::TypeVarTupleType { .. } => Some(vec![Constraint {
@@ -1591,11 +1762,11 @@ fn simple_unpack_native(
         t_unpack = Some(&template_args[template_unpack as usize]);
         let inner = match t_unpack.unwrap() {
             Type::UnpackType { typ } => typ.as_ref(),
-            _ => return defer_site("su-tunpack-shape"),
+            _ => return None,
         };
         match inner {
             Type::Instance { type_ref, args, .. } if type_ref == "builtins.tuple" => {
-                let inner_arg = defer_take(args.first().cloned(), "su-inner-empty")?;
+                let inner_arg = args.first().cloned()?;
                 // Homogeneous case *tuple[T, ...] <: [X, Y, Z, ...].
                 res.extend(constrain_homogeneous_middle(
                     &middle,
@@ -1618,7 +1789,7 @@ fn simple_unpack_native(
                     target,
                 });
             }
-            _ => return defer_site("su-inner-unknown"),
+            _ => return None,
         }
         return Some(res);
     }
@@ -1667,7 +1838,7 @@ fn simple_unpack_native(
         };
         match inner {
             Type::Instance { type_ref, args, .. } if type_ref == "builtins.tuple" => {
-                let inner_arg = defer_take(args.first().cloned(), "su-inner-empty2")?;
+                let inner_arg = args.first().cloned()?;
                 // Homogeneous case *tuple[T, ...] <: [X, Y, Z, ...].
                 res.extend(constrain_homogeneous_middle(
                     &middle,
@@ -1699,7 +1870,7 @@ fn simple_unpack_native(
         let actual_unpack_type = &actual_args[actual_unpack as usize];
         let a_unpacked = match actual_unpack_type {
             Type::UnpackType { typ } => typ.as_ref(),
-            _ => return defer_site("su-aunpack-shape"),
+            _ => return None,
         };
         // Only a *tuple[A, ...] actual unpack produces constraints.
         // TypeVarTuple actual unpack yields nothing (constraints.py:2137)
@@ -1717,7 +1888,7 @@ fn simple_unpack_native(
         let t_unpack_item = &template_args[template_unpack as usize];
         let t_inner = match t_unpack_item {
             Type::UnpackType { typ } => typ.as_ref(),
-            _ => return defer_site("su-tunpack-shape2"),
+            _ => return None,
         };
         let t_inner_args: Option<Vec<Type>> = match t_inner {
             Type::Instance { type_ref, args, .. } if type_ref == "builtins.tuple" => {
@@ -1741,7 +1912,7 @@ fn simple_unpack_native(
                 )?);
             } else {
                 // Empty tuple args: Python would IndexError on args[0]; defer.
-                return defer_site("su-empty-args");
+                return None;
             }
         }
     }
@@ -1825,7 +1996,7 @@ fn visit_typeddict_native(
 ) -> Option<Vec<Constraint>> {
     let t_items = match template {
         Type::TypedDictType { items, .. } => items,
-        _ => return defer_site("td-not-td"),
+        _ => return None,
     };
     match actual {
         Type::TypedDictType { items: a_items, .. } => {
@@ -1878,7 +2049,7 @@ fn visit_type_type_native(
 ) -> Option<Vec<Constraint>> {
     let template_item = match template {
         Type::TypeType { item, .. } => item.as_ref(),
-        _ => return defer_site("tt-not-tt"),
+        _ => return None,
     };
     // Python erasetype.py:331 erase_typevars replacement is
     // `AnyType(TypeOfAny.special_form)`; ensure this isn't confused with
@@ -1894,24 +2065,19 @@ fn visit_type_type_native(
             ret_type,
             ..
         } => {
-            let Some(is_tobj) = crate::callable_compat::is_type_obj(actual, resolver) else {
-                return defer_site("tt-actual-callable");
-            };
             // constraints.py:2048-2053: is_type_obj -> get_instance_type();
             // else infer against the raw ret_type (no get_proper_type).
+            let is_tobj = crate::callable_compat::is_type_obj(actual, resolver)?;
             let mut target = if is_tobj {
                 match instance_type {
                     Some(t) => (**t).clone(),
-                    None => defer_take(get_proper_or_expand(ret_type, aliases), "tt-alias-expand")?,
+                    None => (get_proper_or_expand(ret_type, aliases))?,
                 }
             } else {
                 (**ret_type).clone()
             };
             if is_tobj && erase_types {
-                target = defer_take(
-                    erase_typevars_inner(&target, None, &any_sp),
-                    "tt-erase-instance-type",
-                )?;
+                target = erase_typevars_inner(&target, None, &any_sp)?;
             }
             push_inner(
                 template_item.clone(),
@@ -1925,33 +2091,26 @@ fn visit_type_type_native(
         Type::Overloaded { items } => {
             // constraints.py:2054-2060; Overloaded.is_type_obj is
             // items[0].is_type_obj() (types.py:2993).
-            let Some(first) = items.first() else {
-                return defer_site("tt-actual-overloaded");
-            };
+            let first = items.first()?;
             let Some(Type::CallableType {
                 instance_type,
                 ret_type,
                 ..
             }) = Some(first)
             else {
-                return defer_site("tt-actual-overloaded");
+                return None;
             };
-            let Some(is_tobj) = crate::callable_compat::is_type_obj(first, resolver) else {
-                return defer_site("tt-actual-overloaded");
-            };
+            let is_tobj = crate::callable_compat::is_type_obj(first, resolver)?;
             let mut target = if is_tobj {
                 match instance_type {
                     Some(t) => (**t).clone(),
-                    None => defer_take(get_proper_or_expand(ret_type, aliases), "tt-alias-expand")?,
+                    None => (get_proper_or_expand(ret_type, aliases))?,
                 }
             } else {
                 (**ret_type).clone()
             };
             if is_tobj && erase_types {
-                target = defer_take(
-                    erase_typevars_inner(&target, None, &any_sp),
-                    "tt-erase-instance-type",
-                )?;
+                target = erase_typevars_inner(&target, None, &any_sp)?;
             }
             push_inner(
                 template_item.clone(),
@@ -2037,7 +2196,7 @@ fn visit_callable_native(
                     Type::ParamSpecType { .. } | Type::TypeVarTupleType { .. }
                 )
             }) {
-                return defer_site("callable-param-spec-vars");
+                return None;
             }
             // UnpackType formals use the star-unpack branch
             // (constraints.py:376-458): defer.
@@ -2045,23 +2204,17 @@ fn visit_callable_native(
                 .iter()
                 .any(|t| matches!(t, Type::UnpackType { .. }))
             {
-                return defer_site("callable-unpack-formals");
+                return None;
             }
             (arg_types, arg_kinds, ret_type)
         }
-        _ => return defer_site("callable-not-callable"),
+        _ => return None,
     };
     let (formal_types, formal_kinds, ret_type) = callee;
-    // Only the AnyType actual branch is portable.
+    // Only the AnyType actual branch is portable; every other actual shape
+    // (callable, overloaded, typetype, instance) defers to Python.
     if !matches!(actual, Type::AnyType { .. }) {
-        let reason = match actual {
-            Type::CallableType { .. } => "cb-actual-callable",
-            Type::Overloaded { .. } => "cb-actual-overloaded",
-            Type::TypeType { .. } => "cb-actual-typetype",
-            Type::Instance { .. } => "cb-actual-instance",
-            _ => "cb-actual-other",
-        };
-        return defer_site(reason);
+        return None;
     }
     // Build the derived Any: type_of_any=from_another_any, source_any=actual
     // (constraints.py:1480-1481). Mirrors AnyType(TypeOfAny.from_another_any,
@@ -2086,7 +2239,7 @@ fn visit_callable_native(
             strict_optional,
         )?);
     } else {
-        let ps = defer_take(param_spec.clone(), "callable-internal-paramspec")?;
+        let ps = param_spec.clone()?;
         // Build Parameters([any, any], [ARG_STAR, ARG_STAR2], [None, None])
         // with imprecise_arg_kinds=True (constraints.py:1485-1491).
         let target = Type::Parameters(crate::wire::Parameters {
@@ -2271,11 +2424,11 @@ fn callable_vs_callable_native(
 ) -> Option<Vec<Constraint>> {
     let templ = match crate::checkcall::normalize_callable(template) {
         Ok(t) => t,
-        Err(_) => return defer_site("cb-normalize-template"),
+        Err(_) => return None,
     };
     let cact = match crate::checkcall::normalize_callable(actual) {
         Ok(t) => t,
-        Err(_) => return defer_site("cb-normalize-actual"),
+        Err(_) => return None,
     };
     let Type::CallableType {
         arg_types: t_args,
@@ -2288,7 +2441,7 @@ fn callable_vs_callable_native(
         ..
     } = &templ
     else {
-        return defer_site("cb-norm-shape");
+        return None;
     };
     let Type::CallableType {
         arg_types: a_args,
@@ -2302,13 +2455,13 @@ fn callable_vs_callable_native(
         ..
     } = &cact
     else {
-        return defer_site("cb-norm-shape");
+        return None;
     };
 
     // Polymorphic / skip_neg_op gates (constraints.py:1674-1681,
     // 1732-1736) fire only when cactual has variables.
     if !a_vars.is_empty() && !skip_neg_op {
-        return defer_site("cb-actual-generic");
+        return None;
     }
 
     // Ret constraint with the type_guard / type_is arms
@@ -2379,7 +2532,7 @@ fn callable_vs_callable_native(
     // Compare prefixes as well (constraints.py:1743-1754).
     let mut cbase = match crate::checkcall::callable_base(&cact) {
         Ok(b) => b,
-        Err(_) => return defer_site("cb-norm-shape"),
+        Err(_) => return None,
     };
     cbase.arg_types.truncate(prefix_len);
     cbase.arg_kinds.truncate(prefix_len);
@@ -2527,17 +2680,17 @@ fn visit_overloaded_native(
 ) -> Option<Vec<Constraint>> {
     let items = match template {
         Type::Overloaded { items } => items,
-        _ => return defer_site("over-not-over"),
+        _ => return None,
     };
     // find_matching_overload_items needs is_callable_compatible: defer.
     if matches!(actual, Type::CallableType { .. }) {
-        return defer_site("over-callable-actual");
+        return None;
     }
     let mut res = Vec::new();
     for t in items {
         // Each item is asserted to be a CallableType (wire.rs:1002).
         if !matches!(t, Type::CallableType { .. }) {
-            return defer_site("over-item-not-callable");
+            return None;
         }
         res.extend(push_inner(
             t.clone(),
@@ -2560,7 +2713,7 @@ fn infer_against_any_native(
     aliases: &crate::aliases::TypeAliasResolver,
     strict_optional: bool,
 ) -> Option<Vec<Constraint>> {
-    let flat = defer_take(flatten_nested_tuples_inner(items, true), "any-flatten-miss")?;
+    let flat = flatten_nested_tuples_inner(items, true)?;
     let mut res = Vec::new();
     for t in flat {
         match t {
@@ -2572,7 +2725,7 @@ fn infer_against_any_native(
                         target: any_type.clone(),
                     });
                 }
-                _ => return defer_site("any-unpack-shape"),
+                _ => return None,
             },
             other => {
                 res.extend(push_inner(
@@ -4376,5 +4529,156 @@ mod tests {
             panic!("param-spec target not Parameters");
         };
         assert!(target.variables.is_empty());
+    }
+
+    // ---- visit_type_type_native: type[T] vs a type-object callable ----
+
+    fn tt_template(item: Type) -> Type {
+        Type::TypeType {
+            item: Box::new(item),
+            is_type_form: true,
+        }
+    }
+
+    fn ctor_meta_resolver() -> TypeResolver {
+        // builtin_resolver plus a snapshot whose has_base contains
+        // builtins.type, so crate::callable_compat::is_type_obj decides
+        // Some(true) for a callable with that fallback.
+        let mut r = builtin_resolver();
+        let mut meta = nominal_snap_n("mod.Ctor", 0);
+        meta.has_base.insert("builtins.type".to_string());
+        r.insert("mod.Ctor".to_string(), meta);
+        r
+    }
+
+    fn ctor_callable(fallback_ref: &str, ret: Type, instance_type: Option<Type>) -> Type {
+        Type::CallableType {
+            fallback: Box::new(Type::Instance {
+                type_ref: fallback_ref.to_string(),
+                args: Vec::new(),
+                last_known_value: None,
+                extra_attrs: None,
+            }),
+            instance_type: instance_type.map(Box::new),
+            is_ellipsis_args: false,
+            implicit: false,
+            is_bound: false,
+            from_concatenate: false,
+            imprecise_arg_kinds: false,
+            unpack_kwargs: false,
+            from_type_type: false,
+            arg_types: Vec::new(),
+            arg_kinds: Vec::new(),
+            arg_names: Vec::new(),
+            ret_type: Box::new(ret),
+            name: None,
+            variables: Vec::new(),
+            type_guard: None,
+            type_is: None,
+        }
+    }
+
+    fn tt_constraints(
+        resolver: &TypeResolver,
+        aliases: &crate::aliases::TypeAliasResolver,
+        template: &Type,
+        actual: &Type,
+        erase_types: bool,
+    ) -> Option<Vec<Constraint>> {
+        visit_type_type_native(
+            template,
+            actual,
+            SUBTYPE_OF,
+            resolver,
+            aliases,
+            true,
+            erase_types,
+        )
+    }
+
+    #[test]
+    fn test_tt_actual_type_object_ctor_erases_per_flag() {
+        // echoes constraints.py visit_type_type (2033-2040);
+        // both flag settings are observable in the emitted constraint.
+        let resolver = ctor_meta_resolver();
+        let aliases = crate::aliases::TypeAliasResolver::new();
+        let template = tt_template(type_var(1, "T"));
+        let actual = ctor_callable(
+            "mod.Ctor",
+            instance_int(),
+            Some(generic_list(type_var(2, "U"))),
+        );
+        let erased = tt_constraints(&resolver, &aliases, &template, &actual, true)
+            .expect("type-object ctor arm must engage");
+        assert_eq!(erased.len(), 1);
+        assert_eq!(erased[0].op, SUBTYPE_OF);
+        assert_eq!(erased[0].origin_type_var, type_var(1, "T"));
+        assert!(
+            matches!(&erased[0].target, Type::Instance { args, .. }
+                if matches!(args[0], Type::AnyType { .. })),
+            "erase_types=true must erase the ctor typevar, got {:?}",
+            erased[0].target
+        );
+        let preserved = tt_constraints(&resolver, &aliases, &template, &actual, false)
+            .expect("erase_types=false arm must engage too");
+        assert_eq!(preserved.len(), 1);
+        assert!(
+            matches!(&preserved[0].target, Type::Instance { args, .. }
+                if matches!(&args[0], Type::TypeVarType { name, .. } if name == "U")),
+            "erase_types=false must preserve the ctor typevar, got {:?}",
+            preserved[0].target
+        );
+    }
+
+    #[test]
+    fn test_tt_actual_type_object_no_instance_type_uses_ret() {
+        // get_instance_type historic fallback: instance_type None -> the
+        // proper ret_type stands in (types.py get_instance_type), then the
+        // erase flag applies.
+        let resolver = ctor_meta_resolver();
+        let aliases = crate::aliases::TypeAliasResolver::new();
+        let template = tt_template(type_var(1, "T"));
+        let actual = ctor_callable("mod.Ctor", instance_int(), None);
+        let res = tt_constraints(&resolver, &aliases, &template, &actual, true)
+            .expect("ret-type fallback arm must engage");
+        assert_eq!(res.len(), 1);
+        assert_eq!(res[0].target, instance_int());
+    }
+
+    #[test]
+    fn test_tt_actual_non_type_object_recurse_raw_ret() {
+        // is_type_obj() false (fallback builtins.object): recursion against
+        // the raw ret_type with no erase (constraints.py:2040).
+        let resolver = builtin_resolver();
+        let aliases = crate::aliases::TypeAliasResolver::new();
+        let template = tt_template(type_var(1, "T"));
+        let actual = ctor_callable("builtins.object", instance_str(), None);
+        let res = tt_constraints(&resolver, &aliases, &template, &actual, true)
+            .expect("non-type-object arm must engage");
+        assert_eq!(res.len(), 1);
+        assert_eq!(res[0].target, instance_str());
+    }
+
+    #[test]
+    fn test_tt_actual_unsnapshotted_fallback_defers() {
+        // A fallback Instance missing from the resolver leaves is_type_obj
+        // undecided (callable_compat::is_type_obj -> None): the whole arm
+        // defers and Python re-runs -- the pre-port behavior.
+        let resolver = builtin_resolver();
+        let aliases = crate::aliases::TypeAliasResolver::new();
+        let template = tt_template(type_var(1, "T"));
+        let actual = ctor_callable("mod.Missing", instance_int(), None);
+        assert!(tt_constraints(&resolver, &aliases, &template, &actual, true).is_none());
+    }
+
+    #[test]
+    fn test_tt_actual_type_object_alias_ret_defers() {
+        // is_type_obj true, instance_type None, ret is an alias with no
+        // snapshot: get_proper_type cannot expand -> defer (tt-inst-ret).
+        let resolver = ctor_meta_resolver();
+        let aliases = crate::aliases::TypeAliasResolver::new();
+        let template = tt_template(type_var(1, "T"));
+        let actual = ctor_callable("mod.Ctor", alias_type("mod.Missing"), None);
+        assert!(tt_constraints(&resolver, &aliases, &template, &actual, true).is_none());
     }
 }
