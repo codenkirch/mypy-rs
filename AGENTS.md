@@ -2421,6 +2421,51 @@ including:
   `s_bound_sub` defers can shift into the inst/inst and cc/cc engine
   buckets on later audits.
 
+- constraints defer round 3 (issue #1260): three ports in the
+  `infer_constraints` engine plus wire plumbing. (1) Alias upper bounds:
+  `applytype.rs`'s bound check now expands a `TypeAliasType` upper bound
+  through the alias snapshot (also feeds `gt-alias`), so `class C[X:
+  Alias[T]]` infers natively. (2) Protocol template arms: ported
+  constraints.py's SUPERTYPE_OF structural-protocol dispatch
+  (`visit_instance_protocol_supertype_native` +
+  `infer_constraints_from_protocol_members_native` in `constraints.rs`),
+  with the `inferring` recursion guard mirrored as a Rust RAII stack
+  (`ProtocolInferringPush`), so an Instance-vs-protocol-template call
+  decides through the parity-tested `is_protocol_implementation` engine
+  plus `get_protocol_member_inner`; protocol-left shapes still defer
+  (the `assuming` guard is engine-local). Measured: whichever side is
+  the protocol decides natively, `inst-protocol-template` 2491 -> 0.
+  (3) `type[T]` template vs a type-object callable: threaded
+  `erase_types` through `infer_constraints_full_inner` ->
+  `infer_constraints_dispatch` -> `visit_type_type_native` (FFI
+  `rust_infer_constraints_full` gains an `erase_types` flag; Python
+  `mypy/constraints.py:159` passes it; `suitable_item`-style overload
+  callers keep `False`), and `visit_type_type_native` now takes a
+  `CallableType` actual with `is_type_obj()` true (wire `instance_type`
+  or proper `ret_type`, `erase_typevars_inner` under the flag, recurse).
+  Rebasing over #1261 (issue #1259), which independently ported the same
+  type-object arms, resolved in favor of #1261's variant: the merged
+  `visit_type_type_native` decides Overloaded type-object actuals too
+  (mine deferred) and erases with `AnyType(TypeOfAny.special_form)`
+  (mine used the unmodeled `make_any()` variant); this PR's `erase_types`
+  threading and alias-`ret_type` expansion are what both arms ride.
+  The sgc-audit numbers below were measured pre-rebase, on a tree
+  without #1261's overlapping ports: `tt-actual-callable` 458 -> 0,
+  `infcon-defer` 454 -> 302, RESULT_OK 10,840 -> 10,992 of 11,420
+  (+3.6%, ~96% of rust_solve_generic_call engine calls now native).
+  Audit instrumentation (`audit_probe.rs`, sgc/defer logging) was
+  stripped before landing; post-rebase gates re-verified green (cargo
+  tests 2399, parity and self-check counts in the PR description).
+  Covered by 5 new Rust
+  unit tests in `constraints.rs` (`test_tt_actual_*`) plus the
+  reworked `NativeConstraintsDeferralSuite` defer tests in
+  `mypy/test/testtypes.py` (now parity-checked under both
+  `erase_types` values). Remaining top buckets:
+  `inst-protocol-both` 242 (protocol-vs-protocol structural join),
+  `union-normalize-fail` 97 (ambiguous), `inst-callable-vs-protocol`
+  76, `ap-target` 74 / `apply-defer` 77 (applytypes tail),
+  `gt-bound-fail` 59 (needs a subtype-callback channel).
+
 ## Pull Requests
 
 The default branch on this fork is `main` (not `master`). Always target

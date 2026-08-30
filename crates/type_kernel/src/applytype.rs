@@ -314,7 +314,12 @@ fn get_target_type(
                 } else {
                     upper_bound.as_ref().clone()
                 };
-                match is_subtype(type_arg, &bound, &subtype_ctx(), resolver.resolver()) {
+                // The bound can be a TypeAliasType (issue #1260); expand it
+                // through the alias snapshot. `type_arg` needs no expansion:
+                // the prelude's `get_proper_type` deferred on alias args.
+                let aliases = resolver.alias_resolver();
+                let s_bound = crate::checkexpr_functions::get_proper_or_expand(&bound, aliases)?;
+                match is_subtype(type_arg, &s_bound, &subtype_ctx(), resolver.resolver()) {
                     Some(true) => Some(Some(type_arg.clone())),
                     Some(false) => {
                         if skip_unsatisfied {
@@ -324,7 +329,7 @@ fn get_target_type(
                             None
                         }
                     }
-                    None => None, // can't decide: defer.
+                    None => None,
                 }
             } else {
                 // applytype.py:52-73: value constraint check.
@@ -378,7 +383,9 @@ fn get_target_type_with_values(
         match is_subtype(type_arg, value, &subtype_ctx(), resolver.resolver()) {
             Some(true) => matching.push(value.clone()),
             Some(false) => {}
-            None => return None, // can't decide: defer.
+            None => {
+                return None; // can't decide: defer.
+            }
         }
     }
     if !matching.is_empty() {
