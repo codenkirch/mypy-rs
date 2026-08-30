@@ -58,6 +58,78 @@ Discovered during the wave, not yet fixed:
   `typeanal.py:2853`, `checkexpr.py:8886`, `stats.py:489`. Fix is ~5
   literals + a round-trip test.
 
+## In flight: #1266 (join_type_list round 2) — resume here
+
+Written 2026-08-30 21:35 during the audit phase; design settled, port not
+started. Issue #1266 assigned to @Jonathangadeaharder.
+
+- **Setup**: worktree `/Users/jonathangadeaharder/projects/coding-utils/
+  mypy-rs-i1266`, branch `perf/1266` at `f76d216bd`, two modified files
+  (audit instrumentation only, no port code yet). The worktree venv MUST
+  be py3.13: `uv sync --python 3.13`. A bare `uv run` with the default
+  interpreter pulls 3.14, the cpython-313 `.so`s fail to load in build
+  workers, and the run dies with `ValueError: invalid bool value` /
+  `Worker 0 disconnected` (cost ~15 min to diagnose).
+- **Instrumented build**: `/private/tmp/mypy-rs-local-tk-i1266/`
+  (type_kernel `.so` with `MYPY_TK_JTL_AUDIT` logging, built 21:16 from
+  the worktree). Audit invocation:
+  `PYTHONPATH=/private/tmp/mypy-rs-local-ast:/private/tmp/mypy-rs-local-resolver:/private/tmp/mypy-rs-local-tk-i1266 MYPY_TK_JTL_AUDIT=1 uv run python -m mypy --config-file mypy_self_check.ini mypy mypyc misc script` (stderr → log).
+- **VERIFIED audit numbers** (cold self-check 357 files / 0 issues,
+  2026-08-30 21:30): 2,715 seam entries; 1,759 native (64.8%); 955
+  defers (35.2%): `single-unsafe` (n==1 non-round-trippable singleton)
+  889, `lkv` (any item carries `last_known_value`) 46 calls, `pair`
+  (`join_one_pair` defer mid-fold) 20, `fta` 0, `pyexc` 0. Top
+  single-unsafe tags: `tv|T` 333, `union|n2` 158, `params` 93, dict
+  tvs `_KT`/`_VT` 74, `erased` 25, arged Instances ~70. Top pair
+  shapes: `type`-fb callables 6+4=10, Instance pairs 10. The earlier
+  pre-compaction audit read 2,605 calls / 942 defers — same
+  composition; use the fresh 2,715/955 numbers going forward.
+  Survey11 recorded 904 fallbacks @ 64% (same pool, older basis).
+- **Settled design** (both parts are behavior-preserving vs the
+  pure-Python body, which for n==0 returns `UninhabitedType()` and for
+  n==1 returns `types[0]` verbatim without calling `join_types`):
+  1. Shim early path for n<=1 at the top of `join_type_list` in
+     `mypy/join.py`, BEFORE the native gate and serialization: n==0 →
+     `UninhabitedType()`, n==1 → `return types[0]` (live object, no
+     wire round-trip). Kills all 889 n==1 defers and skips 2,629
+     serializations. The Rust kernel's identity-safe passthrough stays
+     as parity for the kernel API but stops being exercised from
+     production.
+  2. `join_type_list_inner`: when `join_one_pair` defers mid-fold,
+     route the pair through `join_instances_core` (the #824
+     `join_instances` engine: handles lkv fresh-Instance joins and
+     nominal Instance joins) before returning `None`. Also expected to
+     decide the 46 lkv calls (its same-type args-less arm handles LKV).
+     Callable/fb-type pairs (10 of the 20 pair defers) remain deferred
+     — record as residual. Post-port expectation: ~10-20 defers on
+     2,715 entries (>=99% native); measure with the same audit env and
+     update this section's numbers in the PR body.
+- **TEMP AUDIT instrumentation is live in TWO files and MUST be
+  stripped before commit**: `mypy/join.py` `join_type_list` (two hunks,
+  `# TEMP AUDIT #1266`, ~lines 1510-1541) and
+  `crates/type_kernel/src/checker_helpers.rs` `join_type_list_inner`
+  (`=== TEMP AUDIT #1266 ===` blocks incl. `jtl_log`/`jtl_tag`, ~lines
+  678-800). After stripping: rebuild (worktree `cargo rustc
+  --manifest-path <worktree>/crates/type_kernel/Cargo.toml -p
+  mypy-type-kernel --features extension-module --lib --crate-type
+  cdylib --release -- -C link-arg=-undefined
+  -C link-arg=dynamic_lookup`; cargo from the worktree root — a plain
+  `cargo rustc` in another checkout builds the wrong tree silently).
+- **Remaining sequence**: strip instrumentation → implement the two
+  design parts → cargo test → testtypes + testcheck parity (-n4) →
+  self-check clean → measure post-port numbers → commit (`perf:
+  ...` conventional) → push `perf/1266` → PR to `main` → pr-gate +
+  parity green → runner-403 fallback OCR (`runners/_shared/
+  ocr-review-pr.sh`) → merge `--squash --admin` → refresh shared `.so`
+  set (`/private/tmp/mypy-rs-local-typekernel|resolver|ast`) → update
+  this file's numbers + close #1266.
+- Shared-`.so` hygiene: `/private/tmp/mypy-rs-local-typekernel/` was
+  accidentally overwritten with the instrumented build on 2026-08-30
+  ~21:22 and restored to the `f76d216bd` baseline (5645616-byte dylib
+  from the main checkout's `target/release`) + re-codesigned. If another
+  agent's parity run fails an END_TAG/bool assert, suspect a clobbered
+  shared `.so` first.
+
 ## Older session record
 
 See `git log` and the closed issue stream (#896..#1242) for the earlier
@@ -102,8 +174,8 @@ and stashes are pre-existing — leave them.
 5. Next-wave queue from survey11 (file issues with these numbers, then
    dispatch ~2):
    - **classify_unbound_front 1,095 @ 89%** (round 1).
-   - **join_type_list 904 @ 64%** (round 2; defers on LKV items,
-     fallback_to_any items, undecided pairs — audit-first).
+   - **join_type_list 904 @ 64%** (round 2; now in flight as #1266,
+     see "In flight: #1266" above — audit done, port next).
    - Then: analyze_unbound_without_info 466 @ 72%,
      expand_type_by_instance 445 @ 56% (#1113 buckets structural —
      check the precedent first), callables_compatible 498 @ 1% (low
