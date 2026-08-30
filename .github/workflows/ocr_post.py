@@ -15,8 +15,6 @@ def build_body(result: dict, sha: str) -> str:
     comments = result.get("comments") or []
     if result.get("status") != "success":
         return f"OpenCodeReview @ {sha}: run status `{result.get('status')}`"
-
-    lines: list[str] = []
     if not comments:
         return f"OpenCodeReview @ {sha}: clean, no findings"
     lines = [
@@ -27,7 +25,7 @@ def build_body(result: dict, sha: str) -> str:
         loc = c.get("path", "?")
         if c.get("start_line"):
             loc += ':' + str(c.get('start_line'))
-        finding = c.get("content", "").replace("\n", " ")
+        finding = c.get("content", "").replace("\n", " ").replace("|", "\\|")
         lines.append(f"| {c.get('severity', '?')} | `{loc}` | {finding} |")
     lines.append("")
     for c in comments:
@@ -52,6 +50,8 @@ def main() -> int:
         ["gh", "pr", "review", pr, "--comment", "--body-file", "ocr-body.md"],
         check=True,
     )
+    if result.get("status") != "success":
+        return 1  # a failed review must not pass the gate either
     return 1 if result.get("comments") else 0
 
 
