@@ -376,6 +376,11 @@ Current correctness status:
   integer fields currently emitted by the Rust serializer.
 - Matches the current mypy cache/node tag constants for this branch.
 - Raises a normal `UnicodeDecodeError` for invalid UTF-8 byte input.
+- Bytes-literal escape leniency matches CPython, not stricter lint-style
+  guidance: out-of-range octal escapes (e.g. `\476`) truncate mod 256 with a
+  CPython `SyntaxWarning`, invalid escapes such as `\8`/`\q`/`\uXXXX` pass
+  through as raw characters, and invalid `\x` escapes are errors in both
+  parsers (verified against CPython 3.12-3.14; see #1247).
 - Passes the Rust unit test for the trivial binary AST contract.
 - When built as a local extension and placed ahead of the installed wheel on
   `PYTHONPATH`, passes `TestNativeParserBinaryFormat`.
