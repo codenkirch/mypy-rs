@@ -17540,6 +17540,91 @@ class NativeOverloadCallSuite(Suite):
         empty = CallableType([], [], [], self.fx.a, self.fx.function)
         assert self._call([empty], [self.fx.b]) is None
 
+    # --- alias operands (#1254): Python applies get_proper_type on both
+    # sides before the per-pair check, so the seam expands a resolvable
+    # top-level TypeAliasType instead of deferring.
+
+    def _rebuild_resolver_with_aliases(self, aliases: list[TypeAlias]) -> None:
+        self.resolver = _type_kernel.build_native_resolver(
+            self._collect_type_infos(), aliases
+        )
+
+    def _alias(self, target: Type, fullname: str) -> tuple[TypeAlias, TypeAliasType]:
+        from mypy.nodes import TypeAlias as _TypeAlias
+
+        mod, _, name = fullname.rpartition(".")
+        alias_node = _TypeAlias(target, fullname, mod, -1, -1)
+        return alias_node, TypeAliasType(alias_node, [])
+
+    def test_alias_formal_expands_natively(self) -> None:
+        # mod.P = A; the formal P expands to A, so a B actual matches
+        # (B is a subtype of A) natively where the raw alias deferred.
+        alias_node, formal = self._alias(self.fx.a, "mod.P")
+        self._rebuild_resolver_with_aliases([alias_node])
+        target = self.fx.callable(formal, self.fx.str_type)
+        assert self._call([target], [self.fx.b]) == 0
+        # A missing snapshot keeps deferring (parity with the shim's
+        # get_proper_type fallback: no alias target on the wire).
+        unseeded, _ = self._alias(self.fx.a, "mod.Unseeded")
+        target = self.fx.callable(
+            TypeAliasType(unseeded, []), self.fx.str_type
+        )
+        assert self._call([target], [self.fx.b]) is None
+
+    def test_alias_formal_rejects_then_next_matches(self) -> None:
+        # A formal alias expanding to a non-supertype still rejects the
+        # target (decided No, not a defer) and the first-match order
+        # steps forward.
+        alias_node, formal_a = self._alias(self.fx.a, "mod.P")
+        self._rebuild_resolver_with_aliases([alias_node])
+        take_str = self.fx.callable(self.fx.str_type, self.fx.str_type)
+        take_alias = self.fx.callable(formal_a, formal_a)
+        assert self._call([take_str, take_alias], [self.fx.b]) == 1
+
+    def test_alias_actual_expands_natively(self) -> None:
+        # mod.Q = B; the actual Q expands to B, and B is a subtype of A.
+        alias_node, actual = self._alias(self.fx.b, "mod.Q")
+        self._rebuild_resolver_with_aliases([alias_node])
+        target = self.fx.callable(self.fx.a, self.fx.str_type)
+        assert self._call([target], [actual]) == 0
+
+    def test_special_form_any_actual_matches_natively(self) -> None:
+        # AnyType(TypeOfAny.special_form) passes the shim's has_any_type
+        # gate by design, and is_subtype decides Any-left True at the
+        # default context, so the seam must not defer on it.
+        any_actual = AnyType(TypeOfAny.special_form)
+        target = self.fx.callable(self.fx.a, self.fx.str_type)
+        assert self._call([target], [any_actual]) == 0
+
+    def test_real_any_actual_still_defers_is_unreachable_but_any_union_formal(self) -> None:
+        # The has_any_type gate filters real Anys upstream; a union
+        # formal (alias expanding to a union) still defers when the
+        # kernel cannot decide some item.
+        alias_node, formal = self._alias(
+            UnionType([self.fx.a, self.fx.function]), "mod.U"
+        )
+        self._rebuild_resolver_with_aliases([alias_node])
+        target = self.fx.callable(formal, self.fx.str_type)
+        # b <: a is decided per item; b <: function is decided False, so
+        # the union-right arm answers True natively.
+        assert self._call([target], [self.fx.b]) == 0
+
+    def test_union_formal_alias_item_expands_natively(self) -> None:
+        # A union formal whose items carry a raw TypeAliasType expands
+        # the resolvable item like Python's get_proper_type on a union
+        # (types.py:5057-5100); the b actual then matches natively.
+        alias_node, _ = self._alias(self.fx.a, "mod.P")
+        alias_type = TypeAliasType(alias_node, [])
+        self._rebuild_resolver_with_aliases([alias_node])
+        formal = UnionType([alias_type, self.fx.function])
+        target = self.fx.callable(formal, self.fx.str_type)
+        assert self._call([target], [self.fx.b]) == 0
+        # An unresolvable alias item keeps the whole call deferring.
+        unseeded, _ = self._alias(self.fx.a, "mod.Unseeded")
+        formal = UnionType([TypeAliasType(unseeded, []), self.fx.function])
+        target = self.fx.callable(formal, self.fx.str_type)
+        assert self._call([target], [self.fx.b]) is None
+
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeServerDepsSuite(Suite):
