@@ -1,28 +1,45 @@
 # Handoff: strangler-fig Rust migration loop (seam-deferral reduction)
 
-*Written 2026-08-28. Goal: "migrate all python code to rust, really all" —
-pursued as the established measure → file → dispatch-2-agents → process-PRs
-→ gate loop. This file is the resume point.*
+*Written 2026-08-28, refreshed 2026-08-30. Goal: "migrate all python code
+to rust, really all" — pursued as the established measure → file →
+dispatch-2-agents → process-PRs → gate loop. This file is the resume point.*
 
 ## Where main stands
 
-- `main` = `f90ed2a77` (`perf(checkmember): skip type-obj callables,
-  partials in M20 gate (#1120)`), local ff'd to origin.
-- Gates on clean main: parity `10850 passed, 72 skipped, 7 xfailed`
-  (`TEST_NATIVE_TYPE_KERNEL=1 TEST_NATIVE_PARSER=1 TEST_NATIVE_RESOLVER=1
-  .venv/bin/python -m pytest mypy/test/testtypes.py mypy/test/testcheck.py
-  -n4 -q`), self-check `Success: no issues found in 344 source files`.
-- Shared `.so` in `/private/tmp/mypy-rs-local-typekernel/` was rebuilt and
-  codesigned at `43c3e2644`; **rebuild + codesign from `f90ed2a77` before
-  the next survey** (procedure under "The loop", step 4).
-- Last full survey (`cd9abd4e5`): **6,381,797 seam calls, 97.6% native**.
-  Since then: IAMA dispatch 88% → 92% (#1119), member_access 68% → 89%
-  (#1120), is_subtype defers 22,419 → 20,680 (#1118).
+- `main` = `960094ecd` (`perf(type_kernel): decide Instance>callable and
+  callable>protocol __call__ arms (#1256)`), local ff'd to origin.
+- Gates on clean main: parity suites green with the three shared dirs on
+  PYTHONPATH + `TEST_NATIVE_TYPE_KERNEL=1`, self-check 0 errors, cargo
+  test 2391 passed / 11 ignored.
+- Shared `.so` set rebuilt + codesigned at `960094ecd`
+  (`/private/tmp/mypy-rs-local-typekernel|resolver|ast`); rebuild before
+  the next survey (procedure under "The loop").
+- Last survey (survey10, `960094ecd`): 5,184,797 seam calls; top
+  absolute-fallback pools: is_subtype 1,494 @ 95%,
+  check_overload_call 1,459 @ 89% (was 1,724 @ 87% pre-wave),
+  infer_constraints_full 1,368 @ 94%, analyze_member_access 1,333 @ 89%,
+  solve_generic_call 1,140 @ 87%, classify_unbound_front 1,094 @ 89%,
+  analyze_instance_member_dispatch 933 @ 99%, join_type_list 893 @ 69%.
+- Runner/OCR note: the repo's ephemeral runner cannot re-register (403,
+  admin-blocked; #1249 open). OCR gates stay `pending` forever; use the
+  local fallback `runners/_shared/ocr-review-pr.sh` and merge
+  `--squash --admin` after pr-gate + parity are green.
 
-## This session's merges (in order)
+## Recent merges (since 2026-08-30 refresh)
 
 | PR | Issue | What | Numbers |
 |----|-------|------|---------|
+| #1250 | #1247 | docs: bytes-literal escape leniency matches CPython | docs only; runner-blocked OCR bypassed via fallback script |
+| #1252 | #1251 | ci: squash-gate treats `skipped` + "No supported files changed" + no comments as clean | unblocks doc-only PRs; ocr-review CI jobs stay queued (runner 403) |
+| #1253 | #1248 | fix(type_kernel): str.format char-vs-byte offsets + multibyte parity | 9 unit tests; testtypes 2904, testcheck 8198, self-check clean, mypyc run-strings 25 passed |
+| #1257 | #1254 | perf: expand alias operands in rust_check_overload_call | 13,260 calls 87% -> 89% (1,724 -> 1,459 fallbacks); ol.alias*/union_item_none defers gone |
+| #1256 | #1255 | perf: Instance>callable and callable>protocol __call__ arms in rust_is_subtype | seam-level 95% (flat on self-check corpus; wins land in testdata parity suites) |
+
+## Older session record
+
+See `git log` and the closed issue stream (#896..#1242) for the earlier
+waves; the loop protocol below is unchanged.
+
 | #1110 | — | survey script: protocol-test-callee → CLASSIFIER_NEGATIVE_SEAMS | chore |
 | #1116 | #1108 | descriptor-head guards decided in Rust | biggest bucket (29.9k @ 2%) |
 | #1118 | #1111 | protocol-right Instance arm natively (assuming guard, dep record, member-flag arbitration) | is_subtype defers 22,419 → 20,680; fixed mro_has miss pre-check + dropped IS_CLASSVAR |
