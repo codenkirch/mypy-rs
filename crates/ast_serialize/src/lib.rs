@@ -505,6 +505,14 @@ fn parse_errors_to_py(
     // double-parse cost is negligible.
     let cpython_error = cpython_syntax_error(py, source).ok();
 
+    // CPython's ast.parse always stops at the first syntax error, so the
+    // Python path reports exactly one; emit more and we diverge from parity.
+    let errors = if cpython_error.is_some() && !errors.is_empty() {
+        &errors[..1]
+    } else {
+        errors
+    };
+
     let mut result = Vec::with_capacity(errors.len());
     for error in errors {
         let ruff_offset = error.location.start().to_usize();
@@ -522,7 +530,7 @@ fn parse_errors_to_py(
                 let column = cpe
                     .offset
                     .unwrap_or((source[ruff_line_start..ruff_offset].chars().count() + 1) as i64);
-                (line, column, cpe.message.clone())
+                (line, column, standardize_message(&cpe.message))
             }
             None => {
                 // Fallback: translate via the TypedDict special-case, else
@@ -580,6 +588,29 @@ fn cpython_syntax_error(py: Python<'_>, source: &str) -> PyResult<CpythonSyntaxE
         }
         Err(err) => Err(err),
     }
+}
+
+/// Capitalize the first word of the message, matching fastparse.py's
+/// `re.sub(r"^(\s*\w)", upper, message)` standardization so native and
+/// Python parser paths produce byte-identical error strings.
+fn standardize_message(message: &str) -> String {
+    let mut chars = message.char_indices();
+    for (idx, ch) in chars.by_ref() {
+        if ch.is_whitespace() {
+            continue;
+        }
+        if ch.is_alphabetic() {
+            let mut out = String::with_capacity(message.len());
+            out.push_str(&message[..idx]);
+            for up in ch.to_uppercase() {
+                out.push(up);
+            }
+            out.push_str(&message[idx + ch.len_utf8()..]);
+            return out;
+        }
+        break;
+    }
+    message.to_owned()
 }
 
 fn translate_parse_error_message(message: &str, source_line: &str) -> String {
@@ -3547,13 +3578,21 @@ fn dotted_name(expression: &ast::Expr) -> Option<String> {
 }
 
 fn escaped_bytes(bytes: impl IntoIterator<Item = u8>) -> String {
+    // Must match the Python path exactly: BytesExpr.value is
+    // `bytes_to_human_readable_repr(val)` = repr(b)[2:-1], whose bytes
+    // repr escapes a quote only when its quote wrapper forces it.
+    let bytes_copy: Vec<u8> = bytes.into_iter().collect();
+    let outer_double = bytes_copy.contains(&b'\'') && !bytes_copy.contains(&b'"');
     let mut value = String::new();
-    for byte in bytes {
+    for byte in bytes_copy {
         match byte {
             b'\r' => value.push_str("\\r"),
             b'\n' => value.push_str("\\n"),
             b'\t' => value.push_str("\\t"),
-            b'\'' => value.push_str("\\'"),
+            b'\'' if !outer_double => value.push_str("\\'"),
+            b'\'' => value.push('\''),
+            b'"' if outer_double => value.push_str("\\\""),
+            b'"' => value.push('"'),
             b'\\' => value.push_str("\\\\"),
             0x20..=0x7e => value.push(char::from(byte)),
             _ => value.push_str(&format!("\\x{byte:02x}")),
