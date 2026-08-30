@@ -22632,6 +22632,51 @@ class NativeConstraintsDeferralSuite(Suite):
         self._assert_par(template, actual)
         self._assert_engages(template, actual)
 
+    # --- type-object/callable and tuple-fallback arms (issue #1259 round 3)
+
+    def test_type_object_callable_actual_engages(self) -> None:
+        # constraints.py:2046-2053: `type[List[T]]` vs a type-object callable
+        # constrains List[T] against the callable's ret_type (the
+        # unconstrained builder instance_type falls back to it).
+        template = TypeType.make_normalized(Instance(self.fx.std_listi, [self.fx.t]))
+        actual = CallableType([], [], [], self.fx.lstb, self.fx.type_type)
+        self._assert_par(template, actual, SUPERTYPE_OF)
+        self._assert_engages(template, actual, SUPERTYPE_OF)
+
+    def test_type_object_overloaded_actual_engages(self) -> None:
+        # Same as above via the Overloaded arm: items[0].get_instance_type()
+        # (constraints.py:2054-2060).
+        template = TypeType.make_normalized(Instance(self.fx.std_listi, [self.fx.t]))
+        items = [
+            CallableType([], [], [], self.fx.lstb, self.fx.type_type),
+            CallableType([], [], [], self.fx.lsta, self.fx.type_type),
+        ]
+        actual = Overloaded(items)
+        self._assert_par(template, actual, SUPERTYPE_OF)
+        self._assert_engages(template, actual, SUPERTYPE_OF)
+
+    def test_namedtuple_tuple_fallback_engages(self) -> None:
+        # constraints.py:1626-1654 tail: a namedtuple-shaped TupleType actual
+        # constrains the generic template against its partial_fallback
+        # instance through the nominal SUPERTYPE_OF arm.
+        template = Instance(self.fx.hi, [self.fx.t, self.fx.b])
+        actual = TupleType(
+            [self.fx.a, self.fx.b],
+            Instance(self.fx.hi, [self.fx.a, self.fx.b]),
+            implicit=True,
+        )
+        self._assert_par(template, actual, SUPERTYPE_OF)
+        self._assert_engages(template, actual, SUPERTYPE_OF)
+
+    def test_typetype_actual_engages_on_nominal_template(self) -> None:
+        # constraints.py:1400-1417 tail: a non-protocol template with a
+        # type[...] actual falls out to `return []` on both sides
+        # (previously a defer).
+        template = self._list(self.fx.t)
+        actual = TypeType.make_normalized(self.fx.a)
+        self._assert_par(template, actual, SUPERTYPE_OF)
+        self._assert_engages(template, actual, SUPERTYPE_OF)
+
     # --- unresolvable alias defers to Python ---
 
     def test_missing_snapshot_defers(self) -> None:
