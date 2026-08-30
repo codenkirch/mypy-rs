@@ -1443,7 +1443,7 @@ pub(crate) fn narrow_rec(
 
 /// Materialize a `SetOpResult` from `meet_types` for `narrow_declared_type`.
 /// `meet_types` emits SameS/SameT/Bottom/Any only. Any-typed result picks
-/// `TypeOfAny.special_form` (3), matching meet.py's `meet_types` fallback
+/// `TypeOfAny.special_form` (6), matching meet.py's `meet_types` fallback
 /// (`AnyType(TypeOfAny.special_form)`).
 fn materialize_meet_result(
     r: crate::setops::SetOpResult,
@@ -1457,7 +1457,9 @@ fn materialize_meet_result(
         SetOpResult::SameT => Some(narrowed.clone()),
         SetOpResult::Bottom => Some(Type::UninhabitedType { ambiguous: false }),
         SetOpResult::Any => Some(Type::AnyType {
-            type_of_any: 3, // TypeOfAny.special_form
+            // TypeOfAny.special_form (types.py:309), matching meet.py's
+            // meet_types fallback AnyType(TypeOfAny.special_form).
+            type_of_any: 6,
             source_any: None,
             missing_import_name: None,
         }),
@@ -2081,5 +2083,23 @@ mod tests {
             narrow_rec(&alias, &any_type(), true, Some(&aliases), &r),
             Some(any_type())
         );
+    }
+
+    #[test]
+    fn materialize_meet_any_is_special_form() {
+        // meet.py's meet_types fallback is AnyType(TypeOfAny.special_form)
+        // (types.py:309), not unannotated (0).
+        let r = TypeResolver::new();
+        let out = materialize_meet_result(
+            crate::setops::SetOpResult::Any,
+            &instance("builtins.int"),
+            &instance("builtins.str"),
+            &r,
+        )
+        .unwrap();
+        match out {
+            Type::AnyType { type_of_any, .. } => assert_eq!(type_of_any, 6),
+            other => panic!("expected AnyType, got {other:?}"),
+        }
     }
 }

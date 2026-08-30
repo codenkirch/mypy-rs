@@ -28,7 +28,9 @@ fn meet_result_to_type(r: SetOpResult, s: &Type, t: &Type) -> Option<Type> {
         SetOpResult::SameT => Some(t.clone()),
         SetOpResult::Bottom => Some(Type::UninhabitedType { ambiguous: true }),
         SetOpResult::Any => Some(Type::AnyType {
-            type_of_any: 3,
+            // TypeOfAny.special_form (types.py:309); the Python meet
+            // mirror builds AnyType(TypeOfAny.special_form).
+            type_of_any: 6,
             source_any: None,
             missing_import_name: None,
         }),
@@ -68,7 +70,8 @@ fn meet_result_to_type(r: SetOpResult, s: &Type, t: &Type) -> Option<Type> {
 }
 
 /// Reconstruct per-arg types from discriminators. 0=left (s), 1=right (t),
-/// 4=AnyType(from_another_any). Mirrors `setops.rs` (SameTypeWithArgs arm).
+/// 4=AnyType(special_form) (types.py:309). Mirrors `setops.rs`
+/// (SameTypeWithArgs arm).
 fn reconstruct_args_from_discs(arg_discs: &[i8], s_args: &[Type], t_args: &[Type]) -> Vec<Type> {
     arg_discs
         .iter()
@@ -77,7 +80,7 @@ fn reconstruct_args_from_discs(arg_discs: &[i8], s_args: &[Type], t_args: &[Type
             0 => s_args[i].clone(),
             1 => t_args[i].clone(),
             4 => Type::AnyType {
-                type_of_any: 3,
+                type_of_any: 6,
                 source_any: None,
                 missing_import_name: None,
             },
@@ -336,4 +339,54 @@ pub(crate) fn rust_or_conditional_maps(
     }
 
     Ok(Some((out_keys, out_vals)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn any() -> Type {
+        Type::AnyType {
+            type_of_any: 1,
+            source_any: None,
+            missing_import_name: None,
+        }
+    }
+
+    fn inst() -> Type {
+        Type::Instance {
+            type_ref: "builtins.int".to_string(),
+            args: vec![],
+            last_known_value: None,
+            extra_attrs: None,
+        }
+    }
+
+    #[test]
+    fn meet_result_any_is_special_form() {
+        // meet.py mirror: Any-typed meet result is
+        // AnyType(TypeOfAny.special_form), not unannotated (types.py:309).
+        let r = meet_result_to_type(SetOpResult::Any, &inst(), &inst()).unwrap();
+        match r {
+            Type::AnyType {
+                type_of_any,
+                source_any,
+                missing_import_name,
+            } => {
+                assert_eq!(type_of_any, 6);
+                assert!(source_any.is_none());
+                assert!(missing_import_name.is_none());
+            }
+            other => panic!("expected AnyType, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reconstruct_disc4_is_special_form() {
+        let out = reconstruct_args_from_discs(&[4], &[any()], &[any()]);
+        match &out[0] {
+            Type::AnyType { type_of_any, .. } => assert_eq!(*type_of_any, 6),
+            other => panic!("expected AnyType, got {other:?}"),
+        }
+    }
 }
