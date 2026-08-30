@@ -5,7 +5,7 @@ name: AI Code Review
 # check fails on any finding or failed review. No PR file is ever executed.
 
 on:
-  pull_request:
+  pull_request_target:
     branches: [main]
 
 permissions:
@@ -41,7 +41,15 @@ jobs:
         run: |
           # a CLI crash still yields a review-body reason + failing check via
           # the poster step, instead of skipping it silently
-          BASE=$(git merge-base origin/main "$PR_HEAD_SHA")
+          if ! command -v ocr > /dev/null 2>&1; then
+            printf '{"status": "ocr binary not found on runner", "comments": []}' > ocr-result.json
+            exit 0
+          fi
+          echo "ocr version: $(ocr --version 2>&1)"
+          if ! BASE=$(git merge-base origin/main "$PR_HEAD_SHA") || [ -z "$BASE" ]; then
+            printf '{"status": "git merge-base failed", "comments": []}' > ocr-result.json
+            exit 0
+          fi
           if ocr review --from "$BASE" \
             --to "$PR_HEAD_SHA" \
             --format json --audience agent \
@@ -67,7 +75,8 @@ jobs:
                           .replace(">", "&gt;"))
 
           def esc(text: str) -> str:
-              return esc_base(text.replace("\n", " "))
+              # <br> added after escaping so multi-line findings render as breaks
+              return esc_base(text).replace("\n", "<br>")
 
           try:
               with open("ocr-result.json") as f:
@@ -93,11 +102,10 @@ jobs:
               body = f"OpenCodeReview @ {sha}: {len(comments)} finding(s)\n\n" + "\n".join(rows)
               for c in comments:
                   suggestion = (c.get("suggestion_code") or "").strip()
-                  if not suggestion:
-                      continue  # no patch to show; findings table already carries the message
-                  # escaped before fencing: backticks cannot break the fence and raw
-                  # markdown/HTML from a finding stays inert
-                  suggestion = esc_base(suggestion)
+                  # inside the 4-backtick fence raw markdown/HTML stays inert, so
+                  # the suggestion is posted unescaped for copy-pasting
+                  if not suggestion or "````" in suggestion:
+                      continue  # cannot fence safely; findings table already carries the message
                   loc = esc(f"{c.get('path', '?')}:{c.get('start_line', '?')}")
                   body += (f"\n\n<details><summary><code>{loc}</code></summary>\n\n"
                            f"````\n{suggestion}\n````\n</details>")
@@ -114,4 +122,4 @@ jobs:
 
       - name: Clean workspace
         if: always()
-        run: rm -rf "${GITHUB_WORKSPACE:?}" && mkdir -p "$GITHUB_WORKSPACE"
+        run: git clean -ffdx
