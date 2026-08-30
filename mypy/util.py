@@ -1175,18 +1175,22 @@ def hash_path_stem(s: str) -> int:
         if c == ord("."):
             end = i
         i -= 1
-    # Calculate hash
+    # Calculate hash. Integer ops mirror the Rust port (u64 wrapping) so the
+    # fallback and the native path place cache files in the same shard even
+    # when hv * 33 overflows 64 bits.
     hv: i64 = 123
     i = end
     while i >= 0:
         c = i64(ord(s[i]))
-        hv = (hv * 33) ^ c
+        hv = ((hv * 33) & 0xFFFFFFFFFFFFFFFF) ^ c
         i -= 1
     # Murmur3 finalizer for better bit avalanche (improves shard uniformity)
-    hv = (hv ^ (hv >> 32)) & 0xFFFFFFFF
+    hv ^= hv >> 32
     hv ^= hv >> 16
-    hv = (hv * 0x85EBCA6B) & 0xFFFFFFFF
+    hv = (hv * 0x85EBCA6B) & 0xFFFFFFFFFFFFFFFF
     hv ^= hv >> 13
-    hv = (hv * 0xC2B2AE35) & 0xFFFFFFFF
+    hv = (hv * 0xC2B2AE35) & 0xFFFFFFFFFFFFFFFF
     hv ^= hv >> 16
-    return int(hv)
+    # Cast the u64 bit pattern to i64 like the Rust port (same shard index
+    # either way, but the raw value stays comparable across interpreters).
+    return hv - (1 << 64) if hv >= (1 << 63) else int(hv)
