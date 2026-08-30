@@ -943,9 +943,22 @@ pub(crate) fn is_subtype(
                 let has_call =
                     right_snap.is_some_and(|s| s.protocol_members.iter().any(|m| m == "__call__"));
                 if has_call {
-                    // Protocol with __call__: needs find_member +
-                    // is_protocol_implementation. Defer.
-                    return None;
+                    // subtypes.py:1389-1398: a callable implements a protocol
+                    // with a __call__ member when the fetched member accepts
+                    // this callable and the remaining members agree (#1255).
+                    match callable_protocol_call_check(
+                        left,
+                        left_fallback.as_ref(),
+                        right,
+                        right_ref,
+                        right_snap,
+                        ctx,
+                        resolver,
+                    ) {
+                        CallCheck::Decide(b) => return Some(b),
+                        CallCheck::Defer => return None,
+                        CallCheck::FallThrough => {}
+                    }
                 }
                 // Protocol without __call__: Python checks
                 // is_protocol_implementation(class_obj) only when
@@ -1499,6 +1512,19 @@ fn visit_instance_noninstance_right(
                         // `find_member` returns None -> Python's `return False`.
                         return Some(false);
                     }
+                }
+            }
+            // Live fetch extension (issue #1255, subtypes.py:1235-1240): the
+            // negative pre-check did not fire, so `__call__` may exist; fetch
+            // via find_member(name, left, left, is_operator=True) and recurse.
+            if resolver.has_live_info_map() {
+                let fetch = pyo3::Python::with_gil(|py| {
+                    crate::checker_helpers::get_protocol_member_inner(
+                        py, left, left, "__call__", false, false, resolver,
+                    )
+                });
+                if let Some(crate::checker_helpers::GetProtocolMemberResult::Found(call)) = fetch {
+                    return is_subtype(&call, right, ctx, resolver);
                 }
             }
         }
@@ -2112,6 +2138,107 @@ fn protocol_right_decision(
             .ok()?;
         crate::protocols::is_protocol_implementation_inner(py, left, right, &[], ctx, resolver)
     })
+}
+
+/// What `callable_protocol_call_check` decided for its caller.
+enum CallCheck {
+    /// Node decided; return this verdict.
+    Decide(bool),
+    /// Python falls through to the is_type_obj / fallback tail
+    /// (subtypes.py:1399-1405); continue with the ported arms.
+    FallThrough,
+    /// Rust cannot decide this path; defer the whole call.
+    Defer,
+}
+
+/// subtypes.py:1389-1398 (visit_callable_type, protocol Instance right with
+/// "__call__" in protocol_members): the fetched `__call__` member of the
+/// protocol must be a supertype of this callable, then either the protocol
+/// has only that member or `is_protocol_implementation(left.fallback,
+/// right, skip=["__call__"])` runs. When the call check fails, Python falls
+/// through to the tail arms, so `FallThrough` maps callers onward.
+///
+/// The fetch rides the resolver-backed `get_protocol_member_inner` port,
+/// which mirrors `find_member(member, right, right, is_operator=True)` for
+/// the decidable shapes. `NoneVal` defers (never `false`): it conflates the
+/// metaclass-precise wrapper-only special case with a genuine miss, and
+/// `typeshed` `builtins.type` defines `__call__`, so a `false` here would
+/// flip `call:builtins.type > inst:builtins.type`.
+fn callable_protocol_call_check(
+    left: &Type,
+    left_fallback: &Type,
+    right: &Type,
+    right_ref: &str,
+    right_snap: Option<&crate::typeinfo::TypeInfoSnapshot>,
+    ctx: &SubtypeContext,
+    resolver: &TypeResolver,
+) -> CallCheck {
+    // Without a live TypeInfo map the member fetch and the implementation
+    // loop cannot run (also keeps cargo tests interpreter-free).
+    if !resolver.has_live_info_map() {
+        return CallCheck::Defer;
+    }
+    let call = match pyo3::Python::with_gil(|py| {
+        crate::checker_helpers::get_protocol_member_inner(
+            py, right, right, "__call__", false, false, resolver,
+        )
+    }) {
+        Some(crate::checker_helpers::GetProtocolMemberResult::Found(t)) => t,
+        // NoneVal (metaclass-precise / genuine miss) and Defer defer, and
+        // an inner step failure defers the whole call.
+        _ => return CallCheck::Defer,
+    };
+    match is_subtype(left, &call, ctx, resolver) {
+        Some(true) => {}
+        Some(false) => return CallCheck::FallThrough,
+        None => return CallCheck::Defer,
+    }
+    let only_call = right_snap.is_some_and(|s| s.protocol_members.len() == 1);
+    if only_call {
+        return CallCheck::Decide(true);
+    }
+    // is_protocol_implementation(left.fallback, right, skip=["__call__"]):
+    // Python's default entry, so a fresh context (all flags False,
+    // strict_optional from live state), not the caller's.
+    let verdict = pyo3::Python::with_gil(|py| {
+        let Type::Instance {
+            type_ref: fallback_ref,
+            ..
+        } = left_fallback
+        else {
+            return None;
+        };
+        let left_info = resolver.live_typeinfo(py, fallback_ref)?;
+        let right_info = resolver.live_typeinfo(py, right_ref)?;
+        let type_state = py
+            .import("mypy.typestate")
+            .ok()?
+            .getattr("type_state")
+            .ok()?;
+        type_state
+            .call_method1("record_protocol_subtype_check", (left_info, right_info))
+            .ok()?;
+        let fresh = SubtypeContext {
+            proper_subtype: false,
+            strict_optional: crate::checker_helpers::live_strict_optional(py),
+            ..Default::default()
+        };
+        crate::protocols::is_protocol_implementation_inner(
+            py,
+            left_fallback,
+            right,
+            &["__call__".to_string()],
+            &fresh,
+            resolver,
+        )
+    });
+    match verdict {
+        Some(true) => CallCheck::Decide(true),
+        Some(false) => CallCheck::FallThrough,
+        // The Python body re-runs everything from scratch, so a deferred
+        // tail defers the whole call.
+        None => CallCheck::Defer,
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5449,6 +5576,33 @@ mod tests {
         let item = callable_type(vec![], Type::NoneType, None);
         let left = Type::Overloaded { items: vec![item] };
         let right = instance("mod.CallProto", vec![]);
+        assert_eq!(is_subtype(&left, &right, &ctx_nominal(), &r), None);
+    }
+
+    #[test]
+    fn callable_protocol_call_right_defers_without_live_map() {
+        // Issue #1255: the call-check port engages only under a live
+        // TypeInfo map; a snapshot-only resolver defers, as before.
+        let mut proto = snap("mod.CallProto", "CallProto");
+        proto.is_protocol = true;
+        proto.protocol_members = vec!["__call__".to_string()];
+        let r = make_resolver(vec![snap("builtins.function", "function"), proto]);
+        let left = callable_type(vec![], Type::NoneType, None);
+        let right = instance("mod.CallProto", vec![]);
+        assert_eq!(is_subtype(&left, &right, &ctx_nominal(), &r), None);
+    }
+
+    #[test]
+    fn callable_protocol_call_right_nocall_defers_protocol_impl() {
+        // Protocol right without __call__: the is_type_obj arm decides
+        // False, then the fallback recursion re-enters the protocol-right
+        // arm, which needs a live map -> defer (None).
+        let mut proto = snap("mod.IterableProto", "IterableProto");
+        proto.is_protocol = true;
+        proto.protocol_members = vec!["__iter__".to_string()];
+        let r = make_resolver(vec![snap("builtins.function", "function"), proto]);
+        let left = callable_type(vec![], Type::NoneType, None);
+        let right = instance("mod.IterableProto", vec![]);
         assert_eq!(is_subtype(&left, &right, &ctx_nominal(), &r), None);
     }
 

@@ -3853,6 +3853,205 @@ class NativeSubtypesDeferralSuite(Suite):
 
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeInstanceCallSubtypeSuite(Suite):
+    """Issue #1255: the two remaining is_subtype defer arms now decide.
+
+    P2: Instance-left > FunctionLike-right via find_member("__call__",
+    left, left) (subtypes.py:1235-1240). P3: CallableType-left >
+    protocol Instance-right with "__call__" in protocol_members
+    (subtypes.py:1389-1398). Both fetch the member through the live
+    TypeInfo map, so a live-map resolver decides natively and a
+    snapshot-only resolver still defers.
+    """
+
+    def setUp(self) -> None:
+        from mypy.subtypes import _set_native_subtype_active, _set_native_subtype_resolver
+
+        self.fx = TypeFixture()
+        self.resolver = _type_kernel.build_native_resolver(self._type_infos(), [])
+        _set_native_subtype_resolver(self.resolver)
+        _set_native_subtype_active(True)
+
+    def tearDown(self) -> None:
+        from mypy.subtypes import _set_native_subtype_active, _set_native_subtype_resolver
+
+        _set_native_subtype_active(False)
+        _set_native_subtype_resolver(None)
+
+    def _type_infos(self) -> list[TypeInfo]:
+        infos = []
+        for name in dir(self.fx):
+            if not name.endswith("i"):
+                continue
+            value = getattr(self.fx, name)
+            if _is_type_info(value):
+                infos.append(value)
+        return infos
+
+    def _set_gate(self, active: bool) -> None:
+        from mypy.subtypes import _set_native_subtype_active
+
+        _set_native_subtype_active(active)
+
+    def _add_call_method(self, info: TypeInfo, ret: Type) -> None:
+        from mypy.nodes import Block, FuncDef
+        from mypy.types import CallableType
+
+        signature = CallableType([], [], [], ret, self.fx.function)
+        func_def = FuncDef("__call__", [], Block([]))
+        func_def.type = signature
+        # find_node_type maps the receiver onto method.info; a bare FuncDef
+        # carries the FUNC_NO_INFO placeholder, so bind it to the class.
+        func_def.info = info
+        info.names["__call__"] = SymbolTableNode(MDEF, func_def)
+
+    def _rebuild_with(self, infos: list[TypeInfo], live: bool) -> Any:
+        from mypy.subtypes import _set_native_subtype_resolver
+
+        all_infos = self._type_infos() + infos
+        self.resolver = _type_kernel.build_native_resolver(all_infos, [])
+        if live:
+            self.resolver.set_live_typeinfo_map({info.fullname: info for info in all_infos})
+        _set_native_subtype_resolver(self.resolver)
+        return self.resolver
+
+    def _seam(self, left: Any, right: Any, resolver: Any) -> Any:
+        from mypy.subtypes import _serialize_type
+
+        return _type_kernel.rust_is_subtype(
+            _serialize_type(left),
+            _serialize_type(right),
+            False,
+            False,
+            False,
+            False,
+            False,
+            True,
+            False,
+            False,
+            resolver,
+        )
+
+    def test_instance_call_right_member_engages(self) -> None:
+        # P2: Caller defines __call__ -> A; Caller <: () -> A. The live
+        # fetch finds the member and recurses; both gates answer True and
+        # the seam decides natively (no longer None).
+        from mypy.subtypes import is_subtype
+        from mypy.types import Instance
+
+        info = self.fx.make_type_info("mod.Caller")
+        info.mro = [info, self.fx.oi]
+        self._add_call_method(info, self.fx.a)
+        inst = Instance(info, [])
+        right = self.fx.callable(self.fx.a)
+        resolver = self._rebuild_with([info], live=True)
+        self._set_gate(False)
+        expected = is_subtype(inst, right)
+        self._set_gate(True)
+        assert is_subtype(inst, right) is expected
+        assert expected, "Caller with __call__ -> A must be a subtype of () -> A"
+        assert self._seam(inst, right, resolver) is True
+
+    def test_instance_call_right_member_not_subtype(self) -> None:
+        # P2 decides False: __call__ -> A is not a subtype of () -> bool.
+        from mypy.subtypes import is_subtype
+        from mypy.types import Instance
+
+        info = self.fx.make_type_info("mod.Caller2")
+        info.mro = [info, self.fx.oi]
+        self._add_call_method(info, self.fx.a)
+        inst = Instance(info, [])
+        right = self.fx.callable(self.fx.bool_type)
+        resolver = self._rebuild_with([info], live=True)
+        self._set_gate(False)
+        expected = is_subtype(inst, right)
+        self._set_gate(True)
+        assert is_subtype(inst, right) is expected
+        assert not expected
+        assert self._seam(inst, right, resolver) is False
+
+    def test_instance_call_right_no_live_map_defers(self) -> None:
+        # P2 with a snapshot-only resolver: the negative pre-check does
+        # not fire (the class defines __call__), the live fetch is
+        # unavailable, so the seam defers and Python answers.
+        from mypy.subtypes import is_subtype
+        from mypy.types import Instance
+
+        info = self.fx.make_type_info("mod.Caller3")
+        info.mro = [info, self.fx.oi]
+        self._add_call_method(info, self.fx.a)
+        inst = Instance(info, [])
+        right = self.fx.callable(self.fx.a)
+        resolver = self._rebuild_with([info], live=False)
+        self._set_gate(False)
+        expected = is_subtype(inst, right)
+        self._set_gate(True)
+        assert is_subtype(inst, right) is expected
+        assert expected
+        assert self._seam(inst, right, resolver) is None
+
+    def test_callable_left_protocol_call_single_member(self) -> None:
+        # P3 shortcut: protocol with exactly one member __call__, and the
+        # callable matches it -> True decided natively.
+        from mypy.subtypes import is_subtype
+        from mypy.types import Instance
+
+        pinfo = self.fx.make_type_info("mod.CallProto")
+        pinfo.mro = [pinfo, self.fx.oi]
+        pinfo.is_protocol = True
+        self._add_call_method(pinfo, self.fx.a)
+        inst = Instance(pinfo, [])
+        left = self.fx.callable(self.fx.a)
+        resolver = self._rebuild_with([pinfo], live=True)
+        self._set_gate(False)
+        expected = is_subtype(left, inst)
+        self._set_gate(True)
+        assert is_subtype(left, inst) is expected
+        assert expected, "() -> A implements the single-member __call__ protocol"
+        assert self._seam(left, inst, resolver) is True
+
+    def test_callable_left_protocol_call_not_subtype(self) -> None:
+        # P3 with a mismatching callable: the call check fails, Python falls
+        # through to the is_type_obj/fallback tail; the fallback recursion
+        # (Instance builtins.function vs protocol) decides False natively.
+        from mypy.subtypes import is_subtype
+        from mypy.types import Instance
+
+        pinfo = self.fx.make_type_info("mod.CallProto2")
+        pinfo.mro = [pinfo, self.fx.oi]
+        pinfo.is_protocol = True
+        self._add_call_method(pinfo, self.fx.bool_type)
+        inst = Instance(pinfo, [])
+        left = self.fx.callable(self.fx.a)
+        resolver = self._rebuild_with([pinfo], live=True)
+        self._set_gate(False)
+        expected = is_subtype(left, inst)
+        self._set_gate(True)
+        assert is_subtype(left, inst) is expected
+        assert not expected
+        assert self._seam(left, inst, resolver) is False
+
+    def test_callable_left_protocol_call_no_live_map_defers(self) -> None:
+        # P3 with a snapshot-only resolver: the call-check port defers.
+        from mypy.subtypes import is_subtype
+        from mypy.types import Instance
+
+        pinfo = self.fx.make_type_info("mod.CallProto3")
+        pinfo.mro = [pinfo, self.fx.oi]
+        pinfo.is_protocol = True
+        self._add_call_method(pinfo, self.fx.a)
+        inst = Instance(pinfo, [])
+        left = self.fx.callable(self.fx.a)
+        resolver = self._rebuild_with([pinfo], live=False)
+        self._set_gate(False)
+        expected = is_subtype(left, inst)
+        self._set_gate(True)
+        assert is_subtype(left, inst) is expected
+        assert expected
+        assert self._seam(left, inst, resolver) is None
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeVariadicTupleRightSuite(Suite):
     """Parity suite for the Rust TypeVarTupleType-right subtype port.
 
@@ -10231,12 +10430,9 @@ class NativeTryAnalyzeSpecialUnboundSuite(Suite):
                     "builtins.int": SymbolTableNode(MDEF, int_info),
                     "builtins.str": SymbolTableNode(MDEF, fx.str_type_info),
                     "builtins.bool": SymbolTableNode(MDEF, fx.bool_type_info),
-                    # Short names too: `anal_type` resolves type args like
-                    # `int` through `lookup_qualified(name)`, and the fixture
-                    # has no module scope for the `int`/`str` short names to
-                    # fall back to. Keying only the builtin fullnames above
-                    # would leave every `UnboundType("int")` argument an
-                    # unresolvable Any, hiding the golden-path values.
+                    # Short names too: anal_type resolves short names via
+                    # lookup_qualified with no module scope, so key them or
+                    # UnboundType("int") stays an unresolvable Any.
                     "int": SymbolTableNode(MDEF, int_info),
                     "str": SymbolTableNode(MDEF, fx.str_type_info),
                 }
