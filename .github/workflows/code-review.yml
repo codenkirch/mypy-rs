@@ -13,7 +13,7 @@ permissions:
   pull-requests: write
 
 concurrency:
-  group: code-review-${{ github.event.pull_request.number || github.run_id }}
+  group: code-review-${{ github.event.pull_request.number }}
   cancel-in-progress: true
 
 jobs:
@@ -53,6 +53,7 @@ jobs:
           import json, os, subprocess, sys
 
           def esc(text: str) -> str:
+              text = text.replace("\n", " ")
               return (text.replace("\\", "\\\\")
                           .replace("|", "\\|").replace("<", "&lt;")
                           .replace(">", "&gt;"))
@@ -76,7 +77,8 @@ jobs:
                   if c.get("start_line"):
                       loc += esc(f":{c.get('start_line')}")
                   finding = esc(c.get("content", ""))
-                  rows.append(f"| {c.get('severity', '?')} | `{loc}` | {finding} |")
+                  severity = esc(c.get("severity", "?"))
+                  rows.append(f"| {severity} | `{loc}` | {finding} |")
               body = f"OpenCodeReview @ {sha}: {len(comments)} finding(s)\n\n" + "\n".join(rows)
               for c in comments:
                   suggestion = (c.get("suggestion_code") or "").strip()
@@ -93,3 +95,7 @@ jobs:
               sys.exit(1)  # a failed review must not pass the gate either
           sys.exit(1 if comments else 0)
           PY
+
+      - name: Clean workspace
+        if: always()
+        run: rm -f ocr-result.json ocr-body.md
