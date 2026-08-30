@@ -86,10 +86,17 @@ jobs:
           sha = os.environ["PR_SHA"][:10]
           pr = os.environ["PR_NUMBER"]
           comments = result.get("comments") or []
-          if result.get("status") != "success":
+          # a skipped run with no findings is the doc-only-diff case: ocr
+          # saw no files with supported extensions and reviewed nothing.
+          # That is a clean result, not a failed review.
+          no_supported = "No supported files changed" in str(result.get("message", ""))
+          skipped_clean = (result.get("status") == "skipped"
+                           and no_supported and not comments)
+          if result.get("status") != "success" and not skipped_clean:
               body = f"OpenCodeReview @ {sha}: run status `{result.get('status')}`"
           elif not comments:
-              body = f"OpenCodeReview @ {sha}: clean, no findings"
+              body = (f"OpenCodeReview @ {sha}: nothing to review (no supported files changed)"
+                      if skipped_clean else f"OpenCodeReview @ {sha}: clean, no findings")
           else:
               rows = ["| severity | location | finding |", "|---|---|---|"]
               for c in comments:
@@ -119,7 +126,7 @@ jobs:
               f.write(body)
           subprocess.run(["gh", "pr", "review", pr, "--comment",
                           "--body-file", "ocr-body.md"], check=True)
-          if result.get("status") != "success":
+          if result.get("status") != "success" and not skipped_clean:
               sys.exit(1)  # a failed review must not pass the gate either
           sys.exit(1 if comments else 0)
           PY
