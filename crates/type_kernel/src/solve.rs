@@ -605,6 +605,8 @@ fn add_secondary_constraints(
         strict_optional,
         false,
         false,
+        // Python `infer_constraints` wrapper default (constraints.py:802).
+        true,
     )
     .ok_or(())?;
     for c in sub {
@@ -621,6 +623,8 @@ fn add_secondary_constraints(
         strict_optional,
         false,
         false,
+        // Python `infer_constraints` wrapper default (constraints.py:802).
+        true,
     )
     .ok_or(())?;
     for c in sup {
@@ -1676,6 +1680,8 @@ pub(crate) fn rust_infer_function_type_arguments(
                 strict_optional,
                 false,
                 false,
+                // Python `infer_constraints` wrapper default (constraints.py:802).
+                true,
             )?);
         }
     }

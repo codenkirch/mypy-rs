@@ -863,6 +863,8 @@ pub fn rust_solve_generic_call(
                 strict_optional,
                 false,
                 false,
+                // Python `infer_constraints` wrapper default (constraints.py:802).
+                true,
             ) {
                 Some(c) => c,
                 None => {

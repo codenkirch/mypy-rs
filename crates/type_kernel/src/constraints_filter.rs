@@ -330,6 +330,8 @@ pub(crate) fn rust_infer_directed_arg_constraints(
         strict_optional,
         false,
         false,
+        // Python `infer_constraints` wrapper default (constraints.py:802).
+        true,
     )?;
 
     let mut output = WriteBuffer::new();
