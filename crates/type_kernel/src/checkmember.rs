@@ -827,6 +827,14 @@ fn collect_tvar_keys(typ: &Type, keys: &mut Vec<BindTVarKey>) {
 /// Narrowed survivor gate (issue #1277): a tvar leftover in the expanded tree
 /// rides through only when it is a `variables` entry or an occurrence among
 /// the mapped receiver's args; anything else, or an UnpackType, defers.
+///
+/// A receiver-arg residual must additionally be bound (`meta_level == 0`):
+/// Python returns the caller's fresh (meta_level > 0) unification variable
+/// object itself, and downstream solve-freshening fuses var identities that
+/// live in one object; the wire round-trip can re-share identity only inside
+/// one decoded tree, never across seams, so a bare fresh var decoded from the
+/// IAMA tail arrives as a doppelganger and the callee solve collapses the
+/// inference target to `Never` (issue #1286). Defer those to Python.
 fn survivors_allowed(typ: &Type, ids: &[BindTVarKey], recv: &[BindTVarKey]) -> bool {
     let ok = match typ {
         Type::TypeVarType {
@@ -836,7 +844,7 @@ fn survivors_allowed(typ: &Type, ids: &[BindTVarKey], recv: &[BindTVarKey]) -> b
             ..
         } => {
             key_in(ids, *raw_id, *meta_level, namespace)
-                || key_in(recv, *raw_id, *meta_level, namespace)
+                || (key_in(recv, *raw_id, *meta_level, namespace) && *meta_level == 0)
         }
         Type::ParamSpecType {
             raw_id, namespace, ..
@@ -1152,10 +1160,12 @@ fn freeze_children<F: FnMut(&mut Type)>(typ: &mut Type, f: &mut F) {
 /// mutation freezes all occurrences. The wire round-trip breaks sharing, so
 /// the tail rewrites by id: collect the ids of every callable's `variables`,
 /// then set `meta_level = 0` on the matching occurrences. Leftover tvars
-/// ride through only when they occur in the mapped receiver's args (the
-/// caller-tvar substitution class the cold corpus showed); the narrowed
-/// survivor gate (#1277) defers everything else, whose decoded round-trip
-/// broke downstream inference in 28 testcheck defenses.
+/// ride through only when they are bound (`meta_level == 0`) occurrences in
+/// the mapped receiver's args (the caller-tvar substitution class the cold
+/// corpus showed); the narrowed survivor gate (#1277) defers everything
+/// else, whose decoded round-trip broke downstream inference in 28 testcheck
+/// defenses, and a bare fresh var decoded from the tail cannot be re-linked
+/// to the caller's live unification variable across seams (#1286).
 #[allow(clippy::too_many_arguments)]
 fn static_member_tail(
     instance: &Type,
@@ -1221,8 +1231,8 @@ fn static_member_tail(
         strict_optional,
     )?;
     // checkmember.py:503 `freeze_all_type_vars(member_type)`. First the
-    // narrowed survivor gate (#1277): receiver-arg tvars ride through, any
-    // other leftover defers.
+    // narrowed survivor gate (#1277): bound receiver-arg tvars ride through,
+    // any other leftover defers (fresh riders cannot cross seams, #1286).
     let mut recv_keys: Vec<BindTVarKey> = Vec::new();
     if let Type::Instance { args, .. } = &mapped_instance {
         for a in args {
@@ -5030,18 +5040,18 @@ mod tests {
     }
 
     #[test]
-    fn test_static_member_tail_leaves_receiver_arg_tvar_untouched() {
-        // A caller tvar among the receiver's args rides through (759 of 689
-        // defers in the cold corpus): Python's freeze only rewrites
-        // `variables` entries, so it keeps its original meta level.
+    fn test_static_member_tail_leaves_bound_receiver_arg_tvar_untouched() {
+        // A caller tvar among the receiver's args rides through when it is
+        // bound (meta_level == 0): Python's freeze only rewrites `variables`
+        // entries, so it keeps its original meta level (#1277).
         let resolver = snap_resolver();
         let mut sig = make_callable(vec![], false);
         if let Type::CallableType { ret_type, .. } = &mut sig {
-            **ret_type = make_meta_tvar(7, "__main__.B@3", 1);
+            **ret_type = make_meta_tvar(7, "__main__.B@3", 0);
         }
         let inst = Type::Instance {
             type_ref: "builtins.int".to_string(),
-            args: vec![make_meta_tvar(7, "__main__.B@3", 1)],
+            args: vec![make_meta_tvar(7, "__main__.B@3", 0)],
             last_known_value: None,
             extra_attrs: None,
         };
@@ -5061,12 +5071,45 @@ mod tests {
                     raw_id, meta_level, ..
                 } => {
                     assert_eq!(raw_id, 7);
-                    assert_eq!(meta_level, 1);
+                    assert_eq!(meta_level, 0);
                 }
                 other => panic!("expected TypeVarType ret, got {other:?}"),
             },
             other => panic!("expected frozen callable, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_static_member_tail_defers_meta1_receiver_arg_tvar() {
+        // A caller's fresh (meta_level > 0) unification variable must NOT
+        // ride through the decoded IAMA tail even when it is among the
+        // receiver's args: the wire round-trip arrives here as a doppelganger
+        // with no object-identity link to anything Python-side, and the
+        // solve's freshening fuses identities that live in one object, so
+        // the declared-var association breaks and the target collapses to
+        // `Never` (issue #1286). Defer to the pure-Python body.
+        let resolver = snap_resolver();
+        let mut sig = make_callable(vec![], false);
+        if let Type::CallableType { ret_type, .. } = &mut sig {
+            **ret_type = make_meta_tvar(7, "__main__.B@3", 1);
+        }
+        let inst = Type::Instance {
+            type_ref: "builtins.int".to_string(),
+            args: vec![make_meta_tvar(7, "__main__.B@3", 1)],
+            last_known_value: None,
+            extra_attrs: None,
+        };
+        assert!(static_member_tail(
+            &inst,
+            &sig,
+            "builtins.int",
+            false,
+            &resolver,
+            false,
+            false,
+            None,
+        )
+        .is_none());
     }
 
     #[test]
