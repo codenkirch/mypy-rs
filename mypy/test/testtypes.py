@@ -3147,15 +3147,15 @@ class NativeJoinTypeListSuite(Suite):
         def forbid(*args: object) -> object:
             raise RuntimeError("length <= 1 lists must never cross the FFI")
 
-        original = getattr(_type_kernel, "rust_join_type_list")
-        setattr(_type_kernel, "rust_join_type_list", forbid)
+        original = _type_kernel.rust_join_type_list
+        _type_kernel.rust_join_type_list = forbid
         try:
             empty = join_type_list([])
             assert isinstance(get_proper_type(empty), UninhabitedType)
             item = self.fx.a
             assert join_type_list([item]) is item
         finally:
-            setattr(_type_kernel, "rust_join_type_list", original)
+            _type_kernel.rust_join_type_list = original
 
     def test_duplicate_same_instances(self) -> None:
         # [A, A] -> A (the args-less prejoin's same-ref arm).
@@ -17959,9 +17959,7 @@ class NativeOverloadCallSuite(Suite):
     # top-level TypeAliasType instead of deferring.
 
     def _rebuild_resolver_with_aliases(self, aliases: list[TypeAlias]) -> None:
-        self.resolver = _type_kernel.build_native_resolver(
-            self._collect_type_infos(), aliases
-        )
+        self.resolver = _type_kernel.build_native_resolver(self._collect_type_infos(), aliases)
 
     def _alias(self, target: Type, fullname: str) -> tuple[TypeAlias, TypeAliasType]:
         from mypy.nodes import TypeAlias as _TypeAlias
@@ -17980,9 +17978,7 @@ class NativeOverloadCallSuite(Suite):
         # A missing snapshot keeps deferring (parity with the shim's
         # get_proper_type fallback: no alias target on the wire).
         unseeded, _ = self._alias(self.fx.a, "mod.Unseeded")
-        target = self.fx.callable(
-            TypeAliasType(unseeded, []), self.fx.str_type
-        )
+        target = self.fx.callable(TypeAliasType(unseeded, []), self.fx.str_type)
         assert self._call([target], [self.fx.b]) is None
 
     def test_alias_formal_rejects_then_next_matches(self) -> None:
@@ -18014,9 +18010,7 @@ class NativeOverloadCallSuite(Suite):
         # The has_any_type gate filters real Anys upstream; a union
         # formal (alias expanding to a union) still defers when the
         # kernel cannot decide some item.
-        alias_node, formal = self._alias(
-            UnionType([self.fx.a, self.fx.function]), "mod.U"
-        )
+        alias_node, formal = self._alias(UnionType([self.fx.a, self.fx.function]), "mod.U")
         self._rebuild_resolver_with_aliases([alias_node])
         target = self.fx.callable(formal, self.fx.str_type)
         # b <: a is decided per item; b <: function is decided False, so
@@ -22772,11 +22766,7 @@ class NativeConstraintsDeferralSuite(Suite):
         return buf.getvalue()
 
     def _rust(
-        self,
-        template: Type,
-        actual: Type,
-        direction: int = SUBTYPE_OF,
-        erase_types: bool = False,
+        self, template: Type, actual: Type, direction: int = SUBTYPE_OF, erase_types: bool = False
     ) -> Any:
         return _type_kernel.rust_infer_constraints_full(
             self.resolver,
@@ -22889,9 +22879,7 @@ class NativeConstraintsDeferralSuite(Suite):
         # instance through the nominal SUPERTYPE_OF arm.
         template = Instance(self.fx.hi, [self.fx.t, self.fx.b])
         actual = TupleType(
-            [self.fx.a, self.fx.b],
-            Instance(self.fx.hi, [self.fx.a, self.fx.b]),
-            implicit=True,
+            [self.fx.a, self.fx.b], Instance(self.fx.hi, [self.fx.a, self.fx.b]), implicit=True
         )
         self._assert_par(template, actual, SUPERTYPE_OF)
         self._assert_engages(template, actual, SUPERTYPE_OF)
@@ -28566,6 +28554,178 @@ class NativeSubtypesCallableSuite(Suite):
         )
         off, on = self._par(left, right)
         assert (off, on) == (True, True)
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeCallableUnifyPreludeSuite(Suite):
+    """Parity for the `is_callable_compatible` prelude the shim runs ahead of
+    `rust_callables_compatible` (issue #1279).
+
+    The kernel has no constraint solver, so a generic `left` deferred
+    wholesale (453 of 503 cold self-check calls). The shim now normalizes
+    both operands, applies the implicit + type-object gates, and unifies a
+    generic left via `unify_generic_callable`; the unified left is serialized
+    with `variables` dropped (the kernel gates on them, its body never reads
+    them). The early shim answers (type-object mismatch, unify failure) must
+    match what the Python engine returns for the same operands, and every
+    crossed pair must agree gate-off vs gate-on.
+    """
+
+    def setUp(self) -> None:
+        from mypy.subtypes import _set_native_subtype_active, _set_native_subtype_resolver
+
+        self.fx = TypeFixture(INVARIANT)
+        type_infos = self._collect_type_infos()
+        self.resolver = _type_kernel.build_native_resolver(type_infos, [])
+        _set_native_subtype_active(True)
+        _set_native_subtype_resolver(self.resolver)
+
+    def tearDown(self) -> None:
+        from mypy.subtypes import _set_native_subtype_active, _set_native_subtype_resolver
+
+        _set_native_subtype_active(False)
+        _set_native_subtype_resolver(None)
+
+    def _collect_type_infos(self) -> list[TypeInfo]:
+        infos = []
+        for name in dir(self.fx):
+            if not name.endswith("i"):
+                continue
+            value = getattr(self.fx, name)
+            if _is_type_info(value):
+                infos.append(value)
+        return infos
+
+    def _generic(self, arg: Type, ret: Type) -> CallableType:
+        # A generic callable over the fixture's single type variable: (T) -> T
+        # shaped according to the caller's arg/ret.
+        return self.fx.callable(arg, ret).copy_modified(variables=[self.fx.t])
+
+    def _par(self, left: Type, right: Type) -> tuple[bool, bool]:
+        from mypy.subtypes import _set_native_subtype_active, _set_native_subtype_resolver
+
+        _set_native_subtype_active(False)
+        _set_native_subtype_resolver(None)
+        off = is_subtype(left, right)
+        _set_native_subtype_active(True)
+        _set_native_subtype_resolver(self.resolver)
+        on = is_subtype(left, right)
+        return off, on
+
+    def _par_proper(self, left: Type, right: Type) -> tuple[bool, bool]:
+        from mypy.subtypes import (
+            _set_native_subtype_active,
+            _set_native_subtype_resolver,
+            is_proper_subtype,
+        )
+
+        _set_native_subtype_active(False)
+        _set_native_subtype_resolver(None)
+        off = is_proper_subtype(left, right)
+        _set_native_subtype_active(True)
+        _set_native_subtype_resolver(self.resolver)
+        on = is_proper_subtype(left, right)
+        return off, on
+
+    def test_generic_left_unifiable(self) -> None:
+        # (T) -> T <: (object) -> object: T solves to object, then the
+        # unified-left decision goes natively -> (True, True).
+        left = self._generic(self.fx.t, self.fx.t)
+        right = self.fx.callable(self.fx.o, self.fx.o)
+        off, on = self._par(left, right)
+        assert (off, on) == (True, True)
+
+    def test_generic_left_unify_failure(self) -> None:
+        # T must satisfy T >= object (arg) and T <= None (ret): unsolvable,
+        # so `unify_generic_callable` returns None and the shim answers
+        # False without crossing the seam.
+        left = self._generic(self.fx.t, self.fx.t)
+        right = self.fx.callable(self.fx.o, self.fx.nonet)
+        off, on = self._par(left, right)
+        assert (off, on) == (False, False)
+
+    def test_generic_left_native_body_mismatch(self) -> None:
+        # Unifiable left whose post-unify body still fails: (x: T) -> T vs
+        # (y: object) -> object unifies, but the arg names mismatch, so
+        # `are_parameters_compatible` must answer False natively.
+        left = CallableType(
+            [self.fx.t], [ARG_POS], ["x"], self.fx.t, self.fx.function, variables=[self.fx.t]
+        )
+        right = CallableType([self.fx.o], [ARG_POS], ["y"], self.fx.o, self.fx.function)
+        off, on = self._par(left, right)
+        assert (off, on) == (False, False)
+
+    def test_generic_left_same_signature(self) -> None:
+        # Identical generic callables: unify solves T = T, body compares
+        # equal -> (True, True).
+        left = self._generic(self.fx.t, self.fx.t)
+        right = self._generic(self.fx.t, self.fx.t)
+        off, on = self._par(left, right)
+        assert (off, on) == (True, True)
+
+    def test_generic_left_proper_subtype_dimension(self) -> None:
+        # Same unifiable pair through the proper-subtype visitor: the seam
+        # carries is_proper_subtype=True and must agree with Python.
+        left = self._generic(self.fx.t, self.fx.t)
+        right = self.fx.callable(self.fx.o, self.fx.o)
+        off, on = self._par_proper(left, right)
+        assert (off, on) == (True, True)
+
+    def test_gradual_right_unifies_with_generic_left(self) -> None:
+        # (T) -> T vs (*Any, **Any) -> object: the trivial-right shortcut in
+        # `are_parameters_compatible` answers True without needing unified
+        # args; unification must not turn this into a False.
+        left = self._generic(self.fx.t, self.fx.t)
+        right = CallableType(
+            [AnyType(TypeOfAny.special_form), AnyType(TypeOfAny.special_form)],
+            [ARG_STAR, ARG_STAR2],
+            [None, None],
+            self.fx.o,
+            self.fx.function,
+        )
+        off, on = self._par(left, right)
+        assert (off, on) == (True, True)
+
+    def test_seam_engagement(self) -> None:
+        # The unifiable generic pair must actually cross
+        # rust_callables_compatible under the gate, and the unify-failure
+        # pair must not (the shim answers before the seam).
+        import contextlib
+
+        import type_kernel as tk_mod
+
+        def counting_ctx():
+            calls: list[object] = []
+
+            @contextlib.contextmanager
+            def ctx() -> Iterator[list[object]]:
+                orig = tk_mod.rust_callables_compatible
+
+                def counting(*args: object, **kwargs: object) -> object:
+                    calls.append(args)
+                    return orig(*args, **kwargs)
+
+                tk_mod.rust_callables_compatible = counting
+                try:
+                    yield calls
+                finally:
+                    tk_mod.rust_callables_compatible = orig
+
+            return ctx()
+
+        left = self._generic(self.fx.t, self.fx.t)
+        ok_right = self.fx.callable(self.fx.o, self.fx.o)
+        fail_right = self.fx.callable(self.fx.o, self.fx.nonet)
+
+        with counting_ctx() as calls:
+            on = is_subtype(left, ok_right)
+        assert on is True
+        assert len(calls) == 1, f"expected 1 seam call, got {len(calls)}"
+
+        with counting_ctx() as calls:
+            on = is_subtype(left, fail_right)
+        assert on is False
+        assert calls == [], f"expected no seam calls, got {len(calls)}"
 
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
