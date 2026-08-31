@@ -3147,15 +3147,15 @@ class NativeJoinTypeListSuite(Suite):
         def forbid(*args: object) -> object:
             raise RuntimeError("length <= 1 lists must never cross the FFI")
 
-        original = _type_kernel.rust_join_type_list
-        _type_kernel.rust_join_type_list = forbid
+        original = getattr(_type_kernel, "rust_join_type_list")
+        setattr(_type_kernel, "rust_join_type_list", forbid)
         try:
             empty = join_type_list([])
             assert isinstance(get_proper_type(empty), UninhabitedType)
             item = self.fx.a
             assert join_type_list([item]) is item
         finally:
-            _type_kernel.rust_join_type_list = original
+            setattr(_type_kernel, "rust_join_type_list", original)
 
     def test_duplicate_same_instances(self) -> None:
         # [A, A] -> A (the args-less prejoin's same-ref arm).
@@ -28694,22 +28694,23 @@ class NativeCallableUnifyPreludeSuite(Suite):
 
         import type_kernel as tk_mod
 
-        def counting_ctx():
+        def counting_ctx() -> contextlib.AbstractContextManager[list[object]]:
             calls: list[object] = []
 
             @contextlib.contextmanager
             def ctx() -> Iterator[list[object]]:
-                orig = tk_mod.rust_callables_compatible
+                orig = getattr(tk_mod, "rust_callables_compatible")
 
                 def counting(*args: object, **kwargs: object) -> object:
                     calls.append(args)
-                    return orig(*args, **kwargs)
+                    fn = cast(Callable[..., object], orig)
+                    return fn(*args, **kwargs)
 
-                tk_mod.rust_callables_compatible = counting
+                setattr(tk_mod, "rust_callables_compatible", counting)
                 try:
                     yield calls
                 finally:
-                    tk_mod.rust_callables_compatible = orig
+                    setattr(tk_mod, "rust_callables_compatible", orig)
 
             return ctx()
 
