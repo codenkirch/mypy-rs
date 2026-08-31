@@ -173,20 +173,64 @@ pub(crate) fn expand_for_target<'py>(
 // shallow_erase_type_for_equality (erasetype.py:418-429)
 // ---------------------------------------------------------------------------
 
-/// `mypy.erasetype.shallow_erase_type_for_equality` (erasetype.py:418-429):
+/// `TypeOfAny.special_form` = 6 (types.py:297).
+const TYPE_OF_ANY_SPECIAL_FORM: i64 = 6;
+
+fn any_special_form() -> Type {
+    Type::AnyType {
+        type_of_any: TYPE_OF_ANY_SPECIAL_FORM,
+        source_any: None,
+        missing_import_name: None,
+    }
+}
+
+/// `mypy.erasetype.shallow_erase_type_for_equality` (erasetype.py:493-508):
 /// unions map item-wise and rebuild with `make_union`; an `Instance` with
-/// args defers (erasing type vars to the right `AnyType` is not portable);
-/// everything else is identity. Mirrors `checker_stmts::shallow_erase_for_equality`.
-fn shallow_erase_for_equality(t: &Type) -> Option<Type> {
+/// args erases one arg per `defn.type_vars` slot (`erased_vars`,
+/// typevartuples.py:28-35): a TypeVarTuple slot becomes
+/// `UnpackType(tuple_fallback[Any])`, everything else
+/// `AnyType(special_form)`; the fresh Instance drops
+/// `last_known_value`. The slot count drives the result, not
+/// `len(args)` (a variadic class absorbs several args into its TVT).
+/// Everything else is identity.
+fn shallow_erase_for_equality(t: &Type, resolver: &TypeResolver) -> Option<Type> {
     match t {
         Type::UnionType { items, .. } => {
             let mut out = Vec::with_capacity(items.len());
             for item in items {
-                out.push(shallow_erase_for_equality(item)?);
+                out.push(shallow_erase_for_equality(item, resolver)?);
             }
             Some(union_make_union(out))
         }
-        Type::Instance { args, .. } if !args.is_empty() => None,
+        Type::Instance { type_ref, args, .. } if !args.is_empty() => {
+            let snap = resolver.get(type_ref)?;
+            let mut args = Vec::with_capacity(snap.type_vars_with_variance.len());
+            for (_, _, kind) in &snap.type_vars_with_variance {
+                if *kind == 2 {
+                    // TypeVarTuple slot: valid erasure is *tuple[Any, ...].
+                    let bytes = snap.type_var_tuple_fallback.as_ref()?;
+                    let mut fallback = decode_type(bytes)?;
+                    match &mut fallback {
+                        Type::Instance { args: fargs, .. } => {
+                            fargs.clear();
+                            fargs.push(any_special_form());
+                        }
+                        _ => return None,
+                    }
+                    args.push(Type::UnpackType {
+                        typ: Box::new(fallback),
+                    });
+                } else {
+                    args.push(any_special_form());
+                }
+            }
+            Some(Type::Instance {
+                type_ref: type_ref.clone(),
+                args,
+                last_known_value: None,
+                extra_attrs: None,
+            })
+        }
         _ => Some(t.clone()),
     }
 }
@@ -406,9 +450,9 @@ pub(crate) fn conditional_types_inner(
     }
 
     // from_equality: erase generic args so values with different generics
-    // can compare equal (checker.py:9399-9402).
+    // can compare equal (checker.py:10909-10914).
     let proposed = if from_equality {
-        shallow_erase_for_equality(&proposed)?
+        shallow_erase_for_equality(&proposed, resolver)?
     } else {
         proposed
     };
@@ -524,4 +568,225 @@ pub(crate) fn rust_conditional_types(
         None => None,
     };
     Some((yes_blob, no_blob))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::typeinfo::TypeInfoSnapshot;
+
+    // ------------------------------------------------------------------
+    // helpers
+    // ------------------------------------------------------------------
+
+    fn serialize(t: &Type) -> Vec<u8> {
+        let mut buf = WriteBuffer::new();
+        wire::write_type(&mut buf, t).unwrap();
+        buf.into_bytes()
+    }
+
+    fn tuple_fallback_bytes() -> Vec<u8> {
+        // `builtins.tuple[Any, ...]`: the TypeVarTupleType.tuple_fallback
+        // Instance with its single arg replaced by Any (typevartuples.py:33).
+        serialize(&Type::Instance {
+            type_ref: "builtins.tuple".to_string(),
+            args: vec![Type::UninhabitedType { ambiguous: false }],
+            last_known_value: None,
+            extra_attrs: None,
+        })
+    }
+
+    fn insert_snapshot(resolver: &mut TypeResolver, fullname: &str, slots: &[(&str, i64)]) {
+        let mut s = TypeInfoSnapshot {
+            fullname: fullname.to_string(),
+            name: fullname.to_string(),
+            ..Default::default()
+        };
+        for (name, kind) in slots {
+            s.type_vars_with_variance.push((name.to_string(), 0, *kind));
+        }
+        if slots.iter().any(|&(_, kind)| kind == 2) {
+            s.type_var_tuple_fallback = Some(tuple_fallback_bytes());
+        }
+        resolver.insert(fullname.to_string(), s);
+    }
+
+    fn instance(type_ref: &str, args: Vec<Type>) -> Type {
+        Type::Instance {
+            type_ref: type_ref.to_string(),
+            args,
+            last_known_value: None,
+            extra_attrs: None,
+        }
+    }
+
+    fn any_of(kind: i64) -> Type {
+        Type::AnyType {
+            type_of_any: kind,
+            source_any: None,
+            missing_import_name: None,
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // shallow_erase_for_equality
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn erase_eq_generic_class_single_slot() {
+        // list[int] -> list[Any] (AnyType(TypeOfAny.special_form)).
+        let mut r = TypeResolver::new();
+        insert_snapshot(&mut r, "builtins.list", &[("T", 0)]);
+        let out = shallow_erase_for_equality(
+            &instance("builtins.list", vec![instance("builtins.int", vec![])]),
+            &r,
+        )
+        .unwrap();
+        match out {
+            Type::Instance { type_ref, args, .. } => {
+                assert_eq!(type_ref, "builtins.list");
+                assert_eq!(args.len(), 1);
+                match &args[0] {
+                    Type::AnyType { type_of_any, .. } => assert_eq!(*type_of_any, 6),
+                    other => panic!("expected AnyType(special_form), got {other:?}"),
+                }
+            }
+            other => panic!("expected Instance, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn erase_eq_variadic_slot_becomes_unpack_tuple_any() {
+        // class C[*Ts, U]; C[int, str, bool] has 3 args but 2 slots, so the
+        // erased instance carries exactly 2 args: [Unpack(tuple[Any]), Any].
+        let mut r = TypeResolver::new();
+        insert_snapshot(&mut r, "mod.C", &[("Ts", 2), ("U", 0)]);
+        let three_args = vec![
+            instance("builtins.int", vec![]),
+            instance("builtins.str", vec![]),
+            instance("builtins.bool", vec![]),
+        ];
+        let out = shallow_erase_for_equality(&instance("mod.C", three_args), &r).unwrap();
+        match out {
+            Type::Instance { args, .. } => {
+                assert_eq!(args.len(), 2, "slot count, not len(args)");
+                match &args[0] {
+                    Type::UnpackType { typ } => match &**typ {
+                        Type::Instance {
+                            type_ref,
+                            args: fargs,
+                            ..
+                        } => {
+                            assert_eq!(type_ref, "builtins.tuple");
+                            assert_eq!(fargs.len(), 1);
+                            match &fargs[0] {
+                                Type::AnyType { type_of_any, .. } => {
+                                    assert_eq!(*type_of_any, 6)
+                                }
+                                other => panic!("expected AnyType, got {other:?}"),
+                            }
+                        }
+                        other => panic!("expected tuple fallback Instance, got {other:?}"),
+                    },
+                    other => panic!("expected UnpackType, got {other:?}"),
+                }
+                assert!(matches!(args[1], Type::AnyType { type_of_any: 6, .. }));
+            }
+            other => panic!("expected Instance, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn erase_eq_paramspec_slot_erases_to_any() {
+        // erased_vars treats ParamSpec like a plain TypeVar: AnyType.
+        let mut r = TypeResolver::new();
+        insert_snapshot(&mut r, "mod.P", &[("P", 1)]);
+        let out = shallow_erase_for_equality(&instance("mod.P", vec![any_of(0)]), &r).unwrap();
+        match out {
+            Type::Instance { args, .. } => {
+                assert_eq!(args.len(), 1);
+                assert!(matches!(args[0], Type::AnyType { type_of_any: 6, .. }));
+            }
+            other => panic!("expected Instance, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn erase_eq_union_erases_item_wise() {
+        // list[int] | set[str] -> list[Any] | set[Any], union rebuilt.
+        let mut r = TypeResolver::new();
+        insert_snapshot(&mut r, "builtins.list", &[("T", 0)]);
+        insert_snapshot(&mut r, "builtins.set", &[("T", 0)]);
+        let union = Type::UnionType {
+            items: vec![
+                instance("builtins.list", vec![instance("builtins.int", vec![])]),
+                instance("builtins.set", vec![instance("builtins.str", vec![])]),
+            ],
+            uses_pep604_syntax: false,
+            can_be_true: true,
+            can_be_false: true,
+        };
+        let out = shallow_erase_for_equality(&union, &r).unwrap();
+        match out {
+            Type::UnionType { items, .. } => {
+                assert_eq!(items.len(), 2);
+                for item in &items {
+                    match item {
+                        Type::Instance { args, .. } => {
+                            assert_eq!(args.len(), 1);
+                            assert!(matches!(args[0], Type::AnyType { type_of_any: 6, .. }));
+                        }
+                        other => panic!("expected Instance, got {other:?}"),
+                    }
+                }
+            }
+            other => panic!("expected UnionType, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn erase_eq_empty_args_and_non_instance_identity() {
+        // Empty-args instances and other shapes pass through unchanged
+        // (erasetype.py:498-499, 508).
+        let r = TypeResolver::new();
+        let bare = instance("builtins.int", vec![]);
+        let out = shallow_erase_for_equality(&bare, &r).unwrap();
+        match out {
+            Type::Instance { type_ref, args, .. } => {
+                assert_eq!(type_ref, "builtins.int");
+                assert!(args.is_empty());
+            }
+            other => panic!("expected Instance, got {other:?}"),
+        }
+        let uninst = any_of(1);
+        let out = shallow_erase_for_equality(&uninst, &r).unwrap();
+        assert!(matches!(out, Type::AnyType { type_of_any: 1, .. }));
+    }
+
+    #[test]
+    fn erase_eq_missing_snapshot_defers() {
+        // A generic instance without a snapshot defers (None), so the
+        // whole conditional_types call falls back to Python.
+        let r = TypeResolver::new();
+        let out = shallow_erase_for_equality(
+            &instance("mod.Unsnapshotted", vec![instance("builtins.int", vec![])]),
+            &r,
+        );
+        assert!(out.is_none());
+    }
+
+    #[test]
+    fn erase_eq_variadic_missing_fallback_defers() {
+        // A TVT slot whose tuple_fallback blob is unreadable defers.
+        let mut r = TypeResolver::new();
+        let mut s = TypeInfoSnapshot {
+            fullname: "mod.C".to_string(),
+            name: "C".to_string(),
+            ..Default::default()
+        };
+        s.type_vars_with_variance.push(("Ts".to_string(), 0, 2));
+        r.insert("mod.C".to_string(), s);
+        let out = shallow_erase_for_equality(&instance("mod.C", vec![any_of(0)]), &r);
+        assert!(out.is_none());
+    }
 }

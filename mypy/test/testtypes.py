@@ -25821,6 +25821,14 @@ class NativeConditionalTypesSuite(Suite):
         self.newtype_info.is_newtype = True
         self.newtype_info.bases = [Instance(self.int_info, [])]
         type_infos.append(self.newtype_info)
+        # A generic class (single TypeVar) and a variadic class (TypeVar +
+        # TypeVarTuple) for the from_equality erasure tests.
+        self.box_info = self.fx.make_type_info("mod.Box", mro=[self.fx.oi], typevars=["T"])
+        type_infos.append(self.box_info)
+        self.variad_info = self.fx.make_type_info(
+            "mod.Variad", mro=[self.fx.oi], typevars=["T", "Ts"], typevar_tuple_index=1
+        )
+        type_infos.append(self.variad_info)
         # Three aliases (mod.MA -> A, mod.MB -> B, mod.MAny -> Any) for the
         # current/target alias narrowing tests below.
         self.inst_alias = TypeAlias(self.fx.a, "mod.MA", "mod", -1, -1)
@@ -26028,14 +26036,55 @@ class NativeConditionalTypesSuite(Suite):
         assert_equal((str(yes), str(no)), ("None", "Never"))
 
     def test_from_equality(self) -> None:
-        # from_equality erases generic args before overlap: a generic
-        # container proposed with args defers (shallow erase), so the whole
-        # call falls back to Python and the parity check still holds.
+        # from_equality erases generic args before overlap; the Rust path
+        # now decides the erase itself (erased_vars port), so a generic
+        # proposed type engages natively instead of deferring.
         current = self.fx.str_type
         ranges = [TypeRange(self.fx.b, False)]
-        # The Rust path defers on the generic-args-erase, so this exercises
-        # the deferral path through the gate.
         self._assert_par(current, ranges, None)
+
+    def test_from_equality_generic_engages(self) -> None:
+        # A generic proposed type: the erase-eq port rewrites list[int] to
+        # list[Any] natively, so the seam returns a decision.
+        from mypy.checker import _serialize_type_for_checker, _serialize_type_ranges
+
+        current = self.fx.str_type
+        ranges = [TypeRange(Instance(self.box_info, [self.fx.o]), False)]
+        self._assert_par(current, ranges, None)
+        result = _type_kernel.rust_conditional_types(
+            _serialize_type_for_checker(current),
+            _serialize_type_ranges(ranges),
+            None,
+            True,
+            True,
+            state.strict_optional,
+            self.resolver,
+        )
+        assert result is not None, "Rust conditional_types did not engage (generic erase)"
+
+    def test_from_equality_variadic_slot_count(self) -> None:
+        # A variadic proposed type: the erased instance carries one arg per
+        # defn.type_vars slot (2), not per arg (3), with the TVT slot
+        # becoming Unpack(tuple[Any]) (typevartuples.py:28-35).
+        from mypy.checker import _serialize_type_for_checker, _serialize_type_ranges
+        from mypy.checker import conditional_types
+
+        current = self.fx.str_type
+        three = [self.fx.o, self.fx.o, self.fx.o]
+        ranges = [TypeRange(Instance(self.variad_info, three), False)]
+        self._assert_par(current, ranges, None)
+        yes, no = self._with_gate(True, lambda: conditional_types(current, ranges, None))
+        assert_equal(str(yes), "Never", "str is never mod.Variad[Any, *tuple[Any, ...]]")
+        result = _type_kernel.rust_conditional_types(
+            _serialize_type_for_checker(current),
+            _serialize_type_ranges(ranges),
+            None,
+            True,
+            True,
+            state.strict_optional,
+            self.resolver,
+        )
+        assert result is not None, "Rust conditional_types did not engage (variadic erase)"
 
     def test_current_alias_narrows_like_target(self) -> None:
         # cur-alias: current is a TypeAliasType (mod.MA -> A). The port expands
