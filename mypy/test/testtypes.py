@@ -12,17 +12,18 @@ from typing import Any, TypeVar, cast
 from unittest import TestCase, skipIf, skipUnless
 
 from mypy.erasetype import _set_native_erase_active, erase_type, remove_instance_last_known_values
+from mypy.test.helpers import _env_gate
 
 # Mirror testcheck.py: flip the type-kernel gate from the env var so the
 # unit tests exercise the Rust path when TEST_NATIVE_TYPE_KERNEL is set.
 # Unset exercises the default (Python) path; =1 exercises the Rust path.
-_set_native_erase_active(bool(os.environ.get("TEST_NATIVE_TYPE_KERNEL")))
+_set_native_erase_active(_env_gate("TEST_NATIVE_TYPE_KERNEL"))
 from mypy.mro import _set_native_mro_active
 
-_set_native_mro_active(bool(os.environ.get("TEST_NATIVE_TYPE_KERNEL")))
+_set_native_mro_active(_env_gate("TEST_NATIVE_TYPE_KERNEL"))
 from mypy.checkstrformat import _set_native_strformat_active
 
-_set_native_strformat_active(bool(os.environ.get("TEST_NATIVE_TYPE_KERNEL")))
+_set_native_strformat_active(_env_gate("TEST_NATIVE_TYPE_KERNEL"))
 T = TypeVar("T")
 from mypy.constraints import SUBTYPE_OF, SUPERTYPE_OF
 from mypy.indirection import TypeIndirectionVisitor
@@ -91,7 +92,7 @@ from mypy.subtypes import (
     is_same_type,
     is_subtype,
 )
-from mypy.test.helpers import Suite, assert_equal, assert_type, skip
+from mypy.test.helpers import Suite, _env_gate, assert_equal, assert_type, skip
 from mypy.test.typefixture import InterfaceTypeFixture, TypeFixture
 from mypy.traverser import (
     all_name_and_member_expressions,
@@ -1641,10 +1642,10 @@ except ImportError:
     _WriteBuffer = None  # type: ignore[assignment,misc]
     _HAS_TYPE_KERNEL_WIRE = False
 
-_NATIVE_WIRE_ENABLED = bool(os.environ.get("TEST_NATIVE_TYPE_KERNEL")) and _HAS_TYPE_KERNEL_WIRE
+_NATIVE_WIRE_ENABLED = _env_gate("TEST_NATIVE_TYPE_KERNEL") and _HAS_TYPE_KERNEL_WIRE
 
 _NATIVE_SEMANAL_LOOKUP_ENABLED = (
-    bool(os.environ.get("TEST_NATIVE_TYPE_KERNEL")) and _HAS_TYPE_KERNEL_WIRE
+    _env_gate("TEST_NATIVE_TYPE_KERNEL") and _HAS_TYPE_KERNEL_WIRE
 )
 
 
@@ -3147,15 +3148,15 @@ class NativeJoinTypeListSuite(Suite):
         def forbid(*args: object) -> object:
             raise RuntimeError("length <= 1 lists must never cross the FFI")
 
-        original = getattr(_type_kernel, "rust_join_type_list")
-        setattr(_type_kernel, "rust_join_type_list", forbid)
+        original = _type_kernel.rust_join_type_list
+        _type_kernel.rust_join_type_list = forbid
         try:
             empty = join_type_list([])
             assert isinstance(get_proper_type(empty), UninhabitedType)
             item = self.fx.a
             assert join_type_list([item]) is item
         finally:
-            setattr(_type_kernel, "rust_join_type_list", original)
+            _type_kernel.rust_join_type_list = original
 
     def test_duplicate_same_instances(self) -> None:
         # [A, A] -> A (the args-less prejoin's same-ref arm).
@@ -28895,18 +28896,18 @@ class NativeCallableUnifyPreludeSuite(Suite):
 
             @contextlib.contextmanager
             def ctx() -> Iterator[list[object]]:
-                orig = getattr(tk_mod, "rust_callables_compatible")
+                orig = tk_mod.rust_callables_compatible
 
                 def counting(*args: object, **kwargs: object) -> object:
                     calls.append(args)
                     fn = cast(Callable[..., object], orig)
                     return fn(*args, **kwargs)
 
-                setattr(tk_mod, "rust_callables_compatible", counting)
+                tk_mod.rust_callables_compatible = counting
                 try:
                     yield calls
                 finally:
-                    setattr(tk_mod, "rust_callables_compatible", orig)
+                    tk_mod.rust_callables_compatible = orig
 
             return ctx()
 

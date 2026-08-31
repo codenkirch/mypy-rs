@@ -22,6 +22,7 @@ from mypy.options import Options
 from mypy.stubtest import parse_options, test_stubs
 from mypy.test.config import test_temp_dir
 from mypy.test.data import root_dir
+from mypy.test.helpers import _env_gate
 
 
 @contextlib.contextmanager
@@ -171,9 +172,9 @@ class Flag(Enum):
 
 def build_helper(source: str) -> build.BuildResult:
     options = Options()
-    options.native_parser = bool(os.environ.get("TEST_NATIVE_PARSER"))
-    options.native_resolver = bool(os.environ.get("TEST_NATIVE_RESOLVER"))
-    options.native_type_kernel = bool(os.environ.get("TEST_NATIVE_TYPE_KERNEL"))
+    options.native_parser = _env_gate("TEST_NATIVE_PARSER")
+    options.native_resolver = _env_gate("TEST_NATIVE_RESOLVER")
+    options.native_type_kernel = _env_gate("TEST_NATIVE_TYPE_KERNEL")
     return build.build(
         sources=[BuildSource("main.pyi", None, textwrap.dedent(source))],
         options=options,

@@ -15,7 +15,7 @@ from mypy.modules_state import modules_state
 from mypy.options import Options
 from mypy.test.config import test_temp_dir
 from mypy.test.data import DataDrivenTestCase, DataSuite
-from mypy.test.helpers import assert_string_arrays_equal
+from mypy.test.helpers import _env_gate, assert_string_arrays_equal
 
 
 class TypeExportSuite(DataSuite):
@@ -33,9 +33,9 @@ class TypeExportSuite(DataSuite):
             options.allow_empty_bodies = True
             options.fixed_format_cache = True
             options.sqlite_cache = False
-            options.native_parser = bool(os.environ.get("TEST_NATIVE_PARSER"))
-            options.native_resolver = bool(os.environ.get("TEST_NATIVE_RESOLVER"))
-            options.native_type_kernel = bool(os.environ.get("TEST_NATIVE_TYPE_KERNEL"))
+            options.native_parser = _env_gate("TEST_NATIVE_PARSER")
+            options.native_resolver = _env_gate("TEST_NATIVE_RESOLVER")
+            options.native_type_kernel = _env_gate("TEST_NATIVE_TYPE_KERNEL")
             fnam = os.path.join(self.base_path, "main.py")
             with open(fnam, "w") as f:
                 f.write(src)

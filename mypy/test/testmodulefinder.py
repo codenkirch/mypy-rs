@@ -5,13 +5,13 @@ import os
 from mypy.modulefinder import FindModuleCache, ModuleNotFoundReason, SearchPaths
 from mypy.options import Options
 from mypy.test.config import package_path
-from mypy.test.helpers import Suite, assert_equal
+from mypy.test.helpers import Suite, _env_gate, assert_equal
 
 data_path = os.path.relpath(os.path.join(package_path, "modulefinder"))
 
 # When set, dispatch FindModuleCache.find_module through the in-tree Rust
 # extension so the existing fixtures become a parity differential.
-_NATIVE_RESOLVER = bool(os.environ.get("TEST_NATIVE_RESOLVER"))
+_NATIVE_RESOLVER = _env_gate("TEST_NATIVE_RESOLVER")
 
 
 class ModuleFinderSuite(Suite):
