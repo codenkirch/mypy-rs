@@ -370,8 +370,9 @@ fn overlap_impl(
             )
         });
     }
-    if typed_dict_mapping_pair(&left, &right, res)? || typed_dict_mapping_pair(&right, &left, res)?
-    {
+    let tdp = typed_dict_mapping_pair(&left, &right, res)?;
+    let tdp2 = typed_dict_mapping_pair(&right, &left, res)?;
+    if tdp || tdp2 {
         let overlapping_inner = &|a: &Type, b: &Type| -> Option<bool> {
             overlap_impl(
                 a,
@@ -1031,7 +1032,14 @@ fn _type_object_overlap(
                 type_ref: item_ref, ..
             } => {
                 let snap = res.get(item_ref)?;
+                // Tri-state metaclass fullname: Some("") = Python None
+                // (no metaclass); fall through to the has_base check,
+                // matching meet.py:626-630.
                 if let Some(meta) = &snap.metaclass_fullname {
+                    if meta.is_empty() {
+                        let right_snap = res.get(r_ref)?;
+                        return Some(right_snap.has_base("builtins.type"));
+                    }
                     let meta_inst = Type::Instance {
                         type_ref: meta.clone(),
                         args: vec![],
@@ -1498,7 +1506,7 @@ pub(crate) fn narrow_rec(
         // meet.py:315-316: fall to meet_types(original, original).
         let ctx = SubtypeContext::new(false, false, false, false, false, strict_optional);
         let r = meet_types(declared, narrowed, &ctx, res)?;
-        return materialize_meet_result(r, declared, narrowed, res);
+        return materialize_meet_result(r, declared, narrowed, strict_optional, res);
     }
 
     // meet.py:318-320: declared (TupleType, TypeType, LiteralType) -> meet.
@@ -1507,7 +1515,7 @@ pub(crate) fn narrow_rec(
     {
         let ctx = SubtypeContext::new(false, false, false, false, false, strict_optional);
         let r = meet_types(declared, narrowed, &ctx, res)?;
-        return materialize_meet_result(r, declared, narrowed, res);
+        return materialize_meet_result(r, declared, narrowed, strict_optional, res);
     }
 
     // meet.py:322-329: declared TypedDictType + narrowed `builtins.dict`
@@ -1540,13 +1548,21 @@ fn materialize_meet_result(
     r: crate::setops::SetOpResult,
     declared: &Type,
     narrowed: &Type,
+    strict_optional: bool,
     _res: &TypeResolver,
 ) -> Option<Type> {
     use crate::setops::SetOpResult;
     match r {
         SetOpResult::SameS => Some(declared.clone()),
         SetOpResult::SameT => Some(narrowed.clone()),
-        SetOpResult::Bottom => Some(Type::UninhabitedType { ambiguous: false }),
+        // Bottom encodes Python's TypeMeetVisitor.default: UninhabitedType
+        // under strict optional, NoneType otherwise (meet.py:1541-1548).
+        // The top-level meet_types shim already branches on the flag.
+        SetOpResult::Bottom => Some(if strict_optional {
+            Type::UninhabitedType { ambiguous: false }
+        } else {
+            Type::NoneType
+        }),
         SetOpResult::Any => Some(Type::AnyType {
             // TypeOfAny.special_form (types.py:309), matching meet.py's
             // meet_types fallback AnyType(TypeOfAny.special_form).
@@ -2185,6 +2201,7 @@ mod tests {
             crate::setops::SetOpResult::Any,
             &instance("builtins.int"),
             &instance("builtins.str"),
+            true,
             &r,
         )
         .unwrap();

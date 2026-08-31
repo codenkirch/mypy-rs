@@ -100,40 +100,57 @@ fn mro_constructor_definer(
 }
 
 /// The visit_type_type Instance-item decision head
-/// (subtypes.py:1816-1832). Decides the constructor path when the chosen
-/// `__init__`/`__new__` method is `builtins.object`'s `__init__`
-/// (`ret_type` None; universal callable with ret Any on a fallback_to_any
-/// tie). Everything else needs live `function_type` / `class_callable`
-/// bytes and defers (`None`).
+/// (subtypes.py:1816-1832). Primary path: the per-class ctor blob
+/// (`ctor_types` in the resolver) is Python's own `type_object_type`
+/// answer, expanded by `item` and compared by ret. Without a blob, the
+/// snapshot-only object-tie fast path decides the object-defined subset
+/// and everything else defers (`None`) to the Python fallback.
 fn type_object_ret_decision(
     item_type_ref: &str,
+    item: &Type,
     right_ret: &Type,
     left_item: &Type,
     ctx: &SubtypeContext,
     resolver: &TypeResolver,
 ) -> Option<bool> {
-    let item_snap = resolver.get(item_type_ref)?;
+    // Blob path (primary when present): the per-class ctor bytes are
+    // Python's own `type_object_type(info)` answer, so they cover every
+    // arm the snapshot walk defers (user-defined ctors, __new__ races).
+    if let Some(ctor_bytes) = resolver.ctor(item_type_ref) {
+        return ctor_blob_decision(ctor_bytes, item, right_ret, left_item, ctx, resolver);
+    }
+    let item_snap = match resolver.get(item_type_ref) {
+        Some(s) => s,
+        None => {
+            return None;
+        }
+    };
     let init = mro_constructor_definer(item_snap, "__init__", resolver);
     let new = mro_constructor_definer(item_snap, "__new__", resolver);
     // Python: a missing or invalid __init__, or (when __new__ exists) an
     // invalid __new__, makes type_object_type return the
-    // invalid-class-definition Any, which falls through to the unsound
-    // tail. A missing __new__ is replaced by __init__ (an MRO tie).
+    // invalid-class-definition Any; a missing __new__ becomes a tie.
     let init = match init {
         MroCtorDefiner::Definer(def) => Some(def),
         MroCtorDefiner::Invalid | MroCtorDefiner::Missing => None,
-        MroCtorDefiner::Defer => return None,
+        MroCtorDefiner::Defer => {
+            return None;
+        }
     };
     let Some(init_definer) = init else {
-        return is_subtype(left_item, right_ret, ctx, resolver);
+        let d = is_subtype(left_item, right_ret, ctx, resolver);
+        return d;
     };
     let new = match new {
         MroCtorDefiner::Definer(def) => Some(def),
         MroCtorDefiner::Invalid => {
-            return is_subtype(left_item, right_ret, ctx, resolver);
+            let d = is_subtype(left_item, right_ret, ctx, resolver);
+            return d;
         }
         MroCtorDefiner::Missing => None,
-        MroCtorDefiner::Defer => return None,
+        MroCtorDefiner::Defer => {
+            return None;
+        }
     };
     let init_idx = item_snap.mro.iter().position(|m| m == &init_definer);
     let Some(init_idx) = init_idx else {
@@ -160,24 +177,102 @@ fn type_object_ret_decision(
         if init_idx == new_idx && item_snap.fallback_to_any {
             return Some(true);
         }
-        // Python keeps going: the method is object.__init__ and
-        // type_object_type_from_function replaces a non-__new__ ret with
-        // fill_typevars(info). expand_type_by_instance(constructor, item)
-        // maps those class tvars onto item's args, so the compared ret is
-        // structurally `item` itself for a plain non-generic class with
-        // this type_ref. Generic classes (TVT/ParamSpec/unpack shapes)
-        // defer; the unsound tail is not reachable from this arm.
+        // Python keeps going: type_object_type_from_function replaces a
+        // non-__new__ ret with fill_typevars(info), so the compared ret
+        // is structurally `item`; generic shapes defer.
         if let Type::Instance { type_ref, args, .. } = left_item {
             if *type_ref == item_type_ref
                 && args.is_empty()
                 && item_snap.type_vars_with_variance.is_empty()
             {
-                return is_subtype(left_item, right_ret, ctx, resolver);
+                let d = is_subtype(left_item, right_ret, ctx, resolver);
+                return d;
             }
         }
         return None;
     }
     None
+}
+
+/// Build-time gate for the ctor blob map: `true` when
+/// `type_object_ret_decision` cannot decide this class from the snapshot
+/// alone (user-defined ctor, `__new__` MRO race, object-tie with class
+/// type vars). Decidable shapes (missing/invalid ctor, plain object tie)
+/// skip the blob so the map holds only what the engine would defer.
+/// Over-computation is harmless: a present blob only replaces a defer.
+pub(crate) fn ctor_blob_needed(snap: &TypeInfoSnapshot, resolver: &TypeResolver) -> bool {
+    let init = match mro_constructor_definer(snap, "__init__", resolver) {
+        MroCtorDefiner::Definer(def) => def,
+        // Any arm the engine answers via the unsound tail or the plain
+        // object-tie fast path needs no blob.
+        MroCtorDefiner::Invalid | MroCtorDefiner::Missing => return false,
+        MroCtorDefiner::Defer => return true,
+    };
+    let new = match mro_constructor_definer(snap, "__new__", resolver) {
+        MroCtorDefiner::Definer(def) => Some(def),
+        // Python copies init_method when __new__ is absent or invalid;
+        // both resolve to the init arm (tie) or the unsound tail.
+        MroCtorDefiner::Invalid | MroCtorDefiner::Missing => None,
+        MroCtorDefiner::Defer => return true,
+    };
+    let Some(init_idx) = snap.mro.iter().position(|m| m == &init) else {
+        return true;
+    };
+    if let Some(new_def) = &new {
+        let Some(new_idx) = snap.mro.iter().position(|m| m == new_def) else {
+            return true;
+        };
+        if init_idx > new_idx {
+            // __new__ wins the MRO race (typeshed int/str, user classes).
+            return true;
+        }
+    }
+    if init == "builtins.object" {
+        // Tie at object: ret collapses to a structurally-equal item only
+        // for non-generic classes; the generic shapes defer.
+        return snap.fallback_to_any || !snap.type_vars_with_variance.is_empty();
+    }
+    true
+}
+
+/// The visit_type_type ctor-arm decision from the per-class ctor blob
+/// (Python `type_object_type(item.type)` bytes). Python semantic owner:
+/// the blob is expanded by `item` and only the ret type(s) are compared,
+/// matching subtypes.py:1822-1830. A non-FunctionLike blob (the
+/// invalid-class-definition Any) falls through to the unsound tail.
+fn ctor_blob_decision(
+    ctor_bytes: &[u8],
+    item: &Type,
+    right_ret: &Type,
+    left_item: &Type,
+    ctx: &SubtypeContext,
+    resolver: &TypeResolver,
+) -> Option<bool> {
+    let mut buf = ReadBuffer::new(ctor_bytes);
+    let ctor = wire::read_type(&mut buf, None).ok()?;
+    let expanded = crate::expandtype::expand_type_by_instance_core(
+        &ctor,
+        item,
+        resolver,
+        ctx.strict_optional,
+    )?;
+    match &expanded {
+        Type::CallableType { ret_type, .. } => is_subtype(ret_type, right_ret, ctx, resolver),
+        Type::Overloaded { items } => {
+            for c in items {
+                if let Type::CallableType { ret_type, .. } = c {
+                    match is_subtype(ret_type, right_ret, ctx, resolver) {
+                        Some(true) => continue,
+                        other => return other,
+                    }
+                }
+                return None;
+            }
+            Some(true)
+        }
+        // invalid-class-definition Any: Python's unsound tail.
+        _ => is_subtype(left_item, right_ret, ctx, resolver),
+    }
 }
 
 fn any_type_of(type_of_any: i64) -> Type {
@@ -818,13 +913,9 @@ pub(crate) fn is_subtype(
             } else {
                 item_ref = left_item.as_ref();
             }
-            // subtypes.py:1256-1268: an Instance item compares through the
-            // constructor (`type_object_type(item.type)` after expansion).
-            // The wire snapshot carries no method type bytes, so only the
-            // object-defined subset is decidable: when the chosen method is
-            // object's `__init__`, the constructor's `ret_type` is None
-            // (or Any for a fallback_to_any tie, the universal callable).
-            // A user-defined or semanal-incomplete constructor defers.
+            // subtypes.py:1256-1268: an Instance item compares through
+            // the constructor; only object's __init__ subset is decidable
+            // (ret None or the universal-Any tie); a real ctor defers.
             if let Type::Instance {
                 type_ref: item_type_ref,
                 ..
@@ -832,6 +923,7 @@ pub(crate) fn is_subtype(
             {
                 return type_object_ret_decision(
                     item_type_ref,
+                    item_ref,
                     right_ret,
                     left_item,
                     ctx,
@@ -871,20 +963,16 @@ pub(crate) fn is_subtype(
             else {
                 return Some(false);
             };
-            // metaclass check (subtypes.py:1253-1254): the item's metaclass
-            // must be a subtype of right; the snapshot carries it only
-            // for classes with an explicit or inherited metaclass.
-
-            // An absent one defers: Python's live `metaclass_type` is
-            // context-sensitive (the overlap path falls back to
-            // `right.has_base("builtins.type")`).
-
-            // A decided False here broke `issubclass(x, cls)` on plain
-            // classes (issue #1121).
+            // metaclass check (subtypes.py:1850-1851). Snapshot tri-state:
+            // `Some("")` = Python None -> False, `None` = defer (issue
+            // #1121: decided-False on plain classes).
             let item_snap = resolver.get(item_ref)?;
             let Some(meta_fullname) = &item_snap.metaclass_fullname else {
                 return None;
             };
+            if meta_fullname.is_empty() {
+                return Some(false);
+            }
             let meta_snap = resolver.get(meta_fullname);
             if meta_snap.is_some_and(|s| !s.type_vars_with_variance.is_empty()) {
                 return None;
