@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextlib
 import difflib
+import importlib
 import os
 import pathlib
 import re
@@ -383,6 +384,41 @@ def assert_type(typ: type, value: object) -> None:
         raise AssertionError(f"Invalid type {typename(type(value))}, expected {typename(typ)}")
 
 
+_NATIVE_ENV_MODULE_PROBES = {
+    "TEST_NATIVE_PARSER": ("ast_serialize", "parse"),
+    "TEST_NATIVE_RESOLVER": ("module_resolver", "NativeResolver"),
+    "TEST_NATIVE_TYPE_KERNEL": ("type_kernel", "erase_type"),
+}
+
+
+def _ensure_native_modules_available() -> None:
+    """Fail loudly when a native seam is requested but cannot load.
+
+    Env-gated parity runs are meaningless when the extension imports
+    under the wrong interpreter (e.g. uv building a 3.14 venv beside a
+    cpython-313 `.so`): every seam falls back to pure Python and the
+    suite passes without exercising the native path (#1285).
+    """
+    import warnings
+
+    for env, (module, probe) in _NATIVE_ENV_MODULE_PROBES.items():
+        if not os.environ.get(env):
+            continue
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                mod = importlib.import_module(module)
+        except (ImportError, AttributeError) as inner_exc:
+            raise SystemExit(
+                f"{env} is set but the `{module}` extension cannot load: {inner_exc}"
+            ) from inner_exc
+        if not hasattr(mod, probe):
+            raise SystemExit(
+                f"{env} is set but `{module}` loaded without `{probe}` "
+                "(check the interpreter build is cpython-313)"
+            )
+
+
 def parse_options(
     program_text: str, testcase: DataDrivenTestCase, incremental_step: int
 ) -> Options:
@@ -414,6 +450,7 @@ def parse_options(
     options.native_parser = bool(os.environ.get("TEST_NATIVE_PARSER"))
     options.native_resolver = bool(os.environ.get("TEST_NATIVE_RESOLVER"))
     options.native_type_kernel = bool(os.environ.get("TEST_NATIVE_TYPE_KERNEL"))
+    _ensure_native_modules_available()
 
     # Allow custom python version to override testfile_pyversion.
     if all(flag.split("=")[0] != "--python-version" for flag in flag_list):
