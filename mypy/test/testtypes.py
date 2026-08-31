@@ -47253,6 +47253,29 @@ class NativeFindSelfTypeSuite(Suite):
         result = _type_kernel.rust_find_self_type(t, lookup)
         assert result is None, f"tvar-tuple alias answered {result}"
 
+    def test_seam_resolverless_alias_nested_chain(self) -> None:
+        # A[T] = B[T], B[S] = list[S], use site A[Self] expands to
+        # list[Self] -> True (nested alias args resolve via the outer
+        # subst, InstantiateAliasVisitor semantics).
+        alias_b = TypeAlias(
+            Instance(self.fx.std_listi, [self.fx.t]),
+            "mod.B",
+            "mod",
+            1,
+            1,
+            alias_tvars=[self.fx.t],
+        )
+        alias_a = TypeAlias(
+            TypeAliasType(alias_b, [self.fx.t]),
+            "mod.A",
+            "mod",
+            1,
+            1,
+            alias_tvars=[self.fx.t],
+        )
+        t = TypeAliasType(alias_a, [UnboundType("Self")])
+        self._assert_seam(t, {"Self": "typing.Self"}, True)
+
     def test_seam_live_alias_target_self(self) -> None:
         lookup = self._lookup({"Self": "typing.Self"})
         t = TypeAliasType(self.alias_self, [])

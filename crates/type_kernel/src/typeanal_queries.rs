@@ -1116,6 +1116,40 @@ fn self_type_visit_alias(
     Ok(false)
 }
 
+/// Substitute-substitution chain resolution for the live alias expansion
+/// (OCR finding, issue #1311): a nested alias's arg is an occurrence in
+/// the OUTER expansion context, so before it becomes the inner map's
+/// value it must be resolved through the outer subst, mirroring
+/// InstantiateAliasVisitor eagerly rewriting nested alias args under the
+/// outer variable map (e.g. `A[T] = B[T]`, `B[S] = list[S]`, use site
+/// `A[Self]` -> `list[Self]`). Acyclic chains are bounded by
+/// `subst.len()`; a cycle defers (parity-safe).
+fn resolve_subst_chain(
+    py: Python<'_>,
+    arg: &PyAny,
+    subst: &[(Py<PyAny>, Py<PyAny>)],
+) -> Result<Py<PyAny>, DeferError> {
+    let mut cur = arg.into_py(py);
+    let mut steps = 0;
+    while steps <= subst.len() {
+        steps += 1;
+        let mut matched: Option<Py<PyAny>> = None;
+        if let Ok(id) = cur.as_ref(py).getattr("id") {
+            for (key, val) in subst {
+                if key.as_ref(py).eq(id).map_err(|_| DeferError)? {
+                    matched = Some(val.clone());
+                    break;
+                }
+            }
+        }
+        match matched {
+            Some(v) => cur = v,
+            None => return Ok(cur),
+        }
+    }
+    Err(DeferError)
+}
+
 /// No-snapshot live alias expansion for the pre-first-SCC semanal window
 /// (issue #1308): mirrors `BoolTypeQuery.visit_type_alias_type`
 /// (type_visitor.py:599-617) plus `TypeAliasType._expand_once`
@@ -1187,7 +1221,7 @@ fn self_type_visit_alias_live(
     for (tv, arg) in tvars.iter().zip(args.iter()) {
         let id = tv.as_ref(py).getattr("id").map_err(|_| DeferError)?;
         let id = id.into_py(py);
-        inner.push((id, arg.clone()));
+        inner.push((id, resolve_subst_chain(py, arg.as_ref(py), &outer)?));
     }
     ctx.subst = inner;
     let out = find_self_type_inner(py, target, ctx);
@@ -1196,7 +1230,7 @@ fn self_type_visit_alias_live(
     if !res && py312 && !args.is_empty() {
         // Weird edge case (type_visitor.py:610-615): visit the node's own
         // arguments when the expansion found nothing, new-style only.
-        return self_type_any_seq(py, obj.getattr("args").map_err(|_| DeferError)?, ctx);
+        return self_type_any_seq(py, args_seq, ctx);
     }
     Ok(res)
 }
