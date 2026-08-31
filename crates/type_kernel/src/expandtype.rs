@@ -51,12 +51,13 @@ thread_local! {
     static INSTANTIATE: Cell<bool> = const { Cell::new(false) };
 }
 
-/// RAII: installs the alias map for one `rust_expand_type` call, clears
-/// it on drop (panic-safe).
-struct FlatAliasGuard;
+/// RAII: installs the alias map for one kernel call, clears it on drop
+/// (panic-safe). Also installed by the member-access / protocol-member
+/// FFI entries, whose expand tails reach the alias-expanding union arm.
+pub(crate) struct FlatAliasGuard;
 
 impl FlatAliasGuard {
-    fn install(resolver: &NativeTypeResolver) -> Self {
+    pub(crate) fn install(resolver: &NativeTypeResolver) -> Self {
         let map = resolver.alias_resolver().shared();
         FLAT_ALIASES.with(|c| *c.borrow_mut() = Some(map));
         FlatAliasGuard
@@ -376,7 +377,12 @@ fn expand_type_by_instance_inner(
     if !alias_ok && result_contains_typealias(typ) {
         return None;
     }
-    let snap = resolver.get(type_ref)?;
+    let snap = match resolver.get(type_ref) {
+        Some(s) => s,
+        None => {
+            return None;
+        }
+    };
     // Python fast path (expandtype.py:298-299) returns `typ` unchanged
     // when the instance has no args and no TVT.
     if args.is_empty() && !snap.has_type_var_tuple_type {
@@ -418,7 +424,12 @@ fn expand_type_by_instance_inner(
             return None;
         }
         let tvt_raw_id = raw_ids[prefix];
-        let tvt_fallback = decode_type(snap.type_var_tuple_fallback.as_ref()?)?;
+        let tvt_fallback = match snap.type_var_tuple_fallback.as_deref().map(decode_type) {
+            Some(Some(f)) => f,
+            _ => {
+                return None;
+            }
+        };
         // Bind tvar.id: TupleType(args_middle, tvar.tuple_fallback)
         // (expandtype.py:390-391).
         env.insert(
@@ -627,7 +638,12 @@ pub(crate) fn expand_type_inner(
             }
             let flat = match flatten_union_expanding_aliases(&expanded) {
                 Some(flat) => flat,
-                None => flatten_nested_unions(&expanded)?,
+                None => match flatten_nested_unions(&expanded) {
+                    Some(f) => f,
+                    None => {
+                        return None;
+                    }
+                },
             };
             let simplified = union_make_union(remove_trivial(&flat, strict_optional));
             Some(simplified)
@@ -1023,7 +1039,12 @@ fn expand_unpack(tvt: &Type, env: &HashMap<EnvKey, Type>) -> Option<Vec<Type>> {
         // TypeVarTupleType wire has no meta_level yet; env meta is 0.
         let key = (*raw_id, 0, namespace.clone());
         // Unmatched TypeVarTuple: defer to Python.
-        env.get(&key)?
+        match env.get(&key) {
+            Some(r) => r,
+            None => {
+                return None;
+            }
+        }
     } else {
         return None;
     };
@@ -1049,7 +1070,9 @@ fn expand_unpack(tvt: &Type, env: &HashMap<EnvKey, Type>) -> Option<Vec<Type>> {
             // *tuple[Any, ...] using the TypeVarTuple's tuple_fallback.
             let fallback = match tvt {
                 Type::TypeVarTupleType { tuple_fallback, .. } => tuple_fallback.as_ref(),
-                _ => return None,
+                _ => {
+                    return None;
+                }
             };
             let new_fallback = if let Type::Instance {
                 type_ref,
@@ -1071,7 +1094,9 @@ fn expand_unpack(tvt: &Type, env: &HashMap<EnvKey, Type>) -> Option<Vec<Type>> {
                 typ: Box::new(new_fallback),
             }])
         }
-        _ => None, // invalid replacement: defer to Python
+        _ => {
+            None // invalid replacement: defer to Python
+        }
     }
 }
 

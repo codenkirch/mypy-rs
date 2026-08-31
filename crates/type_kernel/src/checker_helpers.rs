@@ -163,27 +163,28 @@ fn live_plugin_registry_absent(py: Python<'_>) -> bool {
         .unwrap_or(false)
 }
 
-/// Does a live plugin hook `fullname`? Mirrors `ChainedPlugin._find_hook`
-/// over `_native_plugin_hook_plugins`; a hit defers to Python, an
-/// all-None miss is the parity answer (None when the snapshot is missing).
+/// Does the attribute hook at `fullname` resolve on the live checker?
+/// find_member has two tails: without a checker (unit fixtures and other
+/// pre-checking contexts) `find_member_simple` never consults hooks, so
+/// the answer is no-hit; with a checker the checkmember tail calls
+/// `chk.plugin.get_attribute_hook(fullname)` on the same object, so Rust
+/// resolves through the live plugin to keep parity. None defers.
 fn plugin_get_attribute_hook_hits(py: Python<'_>, fullname: &str) -> Option<bool> {
-    let plugins = py
-        .import("mypy.checkexpr")
+    let checker = py
+        .import("mypy.checker_state")
         .ok()?
-        .getattr("_native_plugin_hook_plugins")
+        .getattr("checker_state")
+        .ok()?
+        .getattr("type_checker")
         .ok()?;
-    if plugins.is_none() {
-        return None;
+    if checker.is_none() {
+        return Some(false);
     }
-    for item in plugins.iter().ok()? {
-        let plugin = item.ok()?;
-        let hook_fn = plugin.getattr("get_attribute_hook").ok()?;
-        let hook = hook_fn.call1((fullname,)).ok()?;
-        if !hook.is_none() {
-            return Some(true);
-        }
-    }
-    Some(false)
+    let plugin = checker.getattr("plugin").ok()?;
+    let hook = plugin
+        .call_method1("get_attribute_hook", (fullname,))
+        .ok()?;
+    Some(!hook.is_none())
 }
 
 /// `get_proper_type` for the wire format. Expands `TypeAliasType` by
@@ -1166,7 +1167,16 @@ pub(crate) fn get_protocol_member_inner(
             // find_member miss path: `info.get(name)` found nothing. The
             // decidable arms (accessor scan + fallback_to_any -> AnyType,
             // plain miss -> None) run in Rust; anything else defers.
-            return member_miss_decision(py, info, member, snap);
+            return member_miss_decision(
+                py,
+                info,
+                member,
+                snap,
+                resolver,
+                left,
+                self_type,
+                live_strict_optional(py),
+            );
         }
     };
     let sym_info: &PyAny = sym_info.as_ref(py);
@@ -1180,7 +1190,16 @@ pub(crate) fn get_protocol_member_inner(
     if node_ref.is_none() {
         // A present symbol with an unfilled `node` takes the same miss
         // path in Python (`if not node:` in find_member).
-        return member_miss_decision(py, info, member, snap);
+        return member_miss_decision(
+            py,
+            info,
+            member,
+            snap,
+            resolver,
+            left,
+            self_type,
+            live_strict_optional(py),
+        );
     }
     let class_name = node_ref.get_type().name().unwrap_or("").to_string();
     match class_name.as_str() {
@@ -1430,32 +1449,89 @@ pub(crate) fn get_protocol_member_inner(
 /// The find_member miss path (subtypes.py:2072-2089) for a protocol
 /// member absent from the receiver's MRO: the `__getattribute__` /
 /// `__getattr__` accessor scan, then the `fallback_to_any` AnyType arm,
-/// then the plain miss.
-///
-/// Python runs this when `info.get(name)` finds nothing or the found
-/// symbol's `node` is None. The `extra_attrs` attr-hit arm is unreachable
-/// here (the whole Instance-left path defers when `extra_attrs` is
-/// present) and the `meta_fallback_to_any` arm needs `class_obj` (also
-/// deferred upstream), so only the two decidable arms remain.
-///
-/// Returns `None` (defer) when any MRO accessor lookup is unreadable —
-/// a wrong "no accessor" answer would skip the getattr member type.
+/// then the plain miss. A non-object FuncBase accessor resolves like
+/// analyze_var's accessor arm (checkmember.py:1312-1362): bind via
+/// member_method_inner, then collapse a Callable result to `ret_type`.
+/// Decorator accessors, hook hits, and unreadable facts defer.
+#[allow(clippy::too_many_arguments)]
 fn member_miss_decision(
     py: Python<'_>,
     info: &PyAny,
     member: &str,
     snap: &crate::typeinfo::TypeInfoSnapshot,
+    resolver: &TypeResolver,
+    left: &Type,
+    self_type: &Type,
+    strict_optional: bool,
 ) -> Option<GetProtocolMemberResult> {
     if !matches!(member, "__getattr__" | "__setattr__" | "__getattribute__") {
         for method_name in ["__getattribute__", "__getattr__"] {
-            if let Some(definer) = get_method_definer(py, info, method_name)? {
-                if definer != "builtins.object" {
-                    // An accessor is defined on a non-object class: the
-                    // member type comes from find_node_type on the
-                    // accessor (its ret_type) -> defer.
+            let Some((definer_fullname, method_node)) = get_method_definer(py, info, method_name)?
+            else {
+                continue;
+            };
+            if definer_fullname == "builtins.object" {
+                continue;
+            }
+            let method_node: &PyAny = method_node.as_ref(py);
+            let class_name = match method_node.get_type().name() {
+                Ok(n) => n.to_string(),
+                Err(_) => {
+                    return Some(GetProtocolMemberResult::Defer);
+                }
+            };
+            if class_name == "Decorator" {
+                // Decorator accessor routes through analyze_var(defn.var)
+                // (property flags / hooks); keep the #1099 deferral.
+                return Some(GetProtocolMemberResult::Defer);
+            }
+            let node_type_obj = match method_node.getattr("type") {
+                Ok(t) => t,
+                Err(_) => {
+                    return Some(GetProtocolMemberResult::Defer);
+                }
+            };
+            if node_type_obj.is_none() {
+                return Some(GetProtocolMemberResult::Defer);
+            }
+            let signature = match serialize_type_to_bytes(py, node_type_obj) {
+                Some(bytes) => match decode_type(&bytes) {
+                    Some(t) => t,
+                    None => {
+                        return Some(GetProtocolMemberResult::Defer);
+                    }
+                },
+                None => {
+                    return Some(GetProtocolMemberResult::Defer);
+                }
+            };
+            let bound = match crate::checkmember::member_method_inner(
+                left,
+                &signature,
+                &definer_fullname,
+                self_type,
+                method_name,
+                resolver,
+                strict_optional,
+                false, // accessors are instance methods
+                true,  // suppress_self_fail (find_member context)
+            ) {
+                Some(t) => t,
+                None => {
+                    return Some(GetProtocolMemberResult::Defer);
+                }
+            };
+            match plugin_get_attribute_hook_hits(py, &format!("{definer_fullname}.{member}")) {
+                Some(false) => {}
+                _ => {
                     return Some(GetProtocolMemberResult::Defer);
                 }
             }
+            let result = match bound {
+                Type::CallableType { ret_type, .. } => *ret_type,
+                t => t,
+            };
+            return Some(GetProtocolMemberResult::Found(result));
         }
     }
     if snap.fallback_to_any {
@@ -1469,11 +1545,15 @@ fn member_miss_decision(
 }
 
 /// Mirror `TypeInfo.get_method` (nodes.py:4167) returning the defining
-/// class's fullname: `Some(Some(fullname))` when a FuncBase / Decorator
-/// method is found on class `fullname`, `Some(None)` when the walk found
-/// a non-function node (get_method stops and returns None) or nothing,
-/// `None` on any read failure (defer).
-fn get_method_definer(_py: Python<'_>, info: &PyAny, name: &str) -> Option<Option<String>> {
+/// class's fullname and the method node: `Some(Some((fullname, node)))`
+/// when a FuncBase / Decorator method is found on class `fullname`,
+/// `Some(None)` when the walk found a non-function node (get_method stops
+/// and returns None) or nothing, `None` on any read failure (defer).
+fn get_method_definer(
+    py: Python<'_>,
+    info: &PyAny,
+    name: &str,
+) -> Option<Option<(String, Py<PyAny>)>> {
     let mro = info.getattr("mro").ok()?;
     let mro_list = mro.downcast::<PyList>().ok()?;
     for cls in mro_list.iter() {
@@ -1512,7 +1592,7 @@ fn get_method_definer(_py: Python<'_>, info: &PyAny, name: &str) -> Option<Optio
         if class_name == "FuncDef" || class_name == "OverloadedFuncDef" || class_name == "Decorator"
         {
             let fullname = get_opt_str_attr(cls, "fullname")?;
-            return Some(Some(fullname));
+            return Some(Some((fullname, node.to_object(py))));
         }
         // Found-but-non-function node stops the walk with None.
         return Some(None);
@@ -1704,9 +1784,20 @@ pub(crate) fn rust_get_protocol_member(
     is_lvalue: bool,
     resolver: &mut NativeTypeResolver,
 ) -> Option<Vec<u8>> {
-    let original_left = decode_type(original_left_bytes)?;
-    let left = decode_type(left_bytes)?;
-    match get_protocol_member_inner(
+    let _flat_alias_guard = crate::expandtype::FlatAliasGuard::install(resolver);
+    let original_left = match decode_type(original_left_bytes) {
+        Some(t) => t,
+        None => {
+            return None;
+        }
+    };
+    let left = match decode_type(left_bytes) {
+        Some(t) => t,
+        None => {
+            return None;
+        }
+    };
+    let inner = match get_protocol_member_inner(
         py,
         &left,
         &original_left,
@@ -1718,7 +1809,8 @@ pub(crate) fn rust_get_protocol_member(
         GetProtocolMemberResult::NoneVal => Some(Vec::new()),
         GetProtocolMemberResult::Found(t) => encode_type(&t),
         GetProtocolMemberResult::Defer => None,
-    }
+    };
+    inner
 }
 
 // ---------------------------------------------------------------------------
@@ -1742,6 +1834,7 @@ pub(crate) fn find_member_call_is_plain_callable(
     instance: &Type,
     resolver: &NativeTypeResolver,
 ) -> Option<bool> {
+    let _flat_alias_guard = crate::expandtype::FlatAliasGuard::install(resolver);
     let Type::Instance {
         type_ref,
         extra_attrs,
@@ -2412,6 +2505,93 @@ mod tests {
             let res =
                 get_protocol_member_inner(py, &left, &left, "__call__", false, false, r.resolver());
             assert!(res.is_none());
+        });
+    }
+
+    // member_miss_decision wiring: duck-typed stubs mirroring the
+    // get_method_definer read surface (mro / names / fullname / node).
+
+    fn mock_snapshot(fullname: &str) -> TypeInfoSnapshot {
+        TypeInfoSnapshot {
+            fullname: fullname.to_string(),
+            name: fullname.rsplit('.').next().unwrap_or(fullname).to_string(),
+            mro: vec![fullname.to_string()],
+            ..Default::default()
+        }
+    }
+
+    fn stub_info(py: Python<'_>, code: &str, key: &str) -> Py<PyAny> {
+        let locals = pyo3::types::PyDict::new(py);
+        py.run(code, None, Some(locals)).expect("stub exec failed");
+        locals
+            .get_item(key)
+            .unwrap()
+            .expect("stub must define key")
+            .to_object(py)
+    }
+
+    fn flat_info(py: Python<'_>) -> Py<PyAny> {
+        // Accessor-free class: every scan step walks a names dict and
+        // finds nothing, so the loop falls to the fallback / miss tail.
+        let code = r#"
+class Cls:
+    def __init__(self):
+        self.fullname = "mymod.Foo"
+        self.names = {}
+info = Cls()
+info.mro = [Cls()]
+"#;
+        stub_info(py, code, "info")
+    }
+
+    #[test]
+    fn test_miss_decision_plain_miss() {
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|py| {
+            let info = flat_info(py);
+            let r = TypeResolver::new();
+            let snap = mock_snapshot("mymod.Foo");
+            let left = make_instance("mymod.Foo", vec![]);
+            let res =
+                member_miss_decision(py, info.as_ref(py), "attr", &snap, &r, &left, &left, true);
+            assert!(matches!(res, Some(GetProtocolMemberResult::NoneVal)));
+        });
+    }
+
+    #[test]
+    fn test_miss_decision_fallback_to_any() {
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|py| {
+            let info = flat_info(py);
+            let mut snap = mock_snapshot("mymod.Foo");
+            snap.fallback_to_any = true;
+            let r = TypeResolver::new();
+            let left = make_instance("mymod.Foo", vec![]);
+            let res =
+                member_miss_decision(py, info.as_ref(py), "attr", &snap, &r, &left, &left, true);
+            assert!(matches!(res, Some(GetProtocolMemberResult::Found(_))));
+        });
+    }
+
+    #[test]
+    fn test_miss_decision_special_member_skips_scan() {
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|py| {
+            // member in the scanned-never set: no accessor walk at all.
+            let info = flat_info(py);
+            let r = TypeResolver::new();
+            let left = make_instance("mymod.Foo", vec![]);
+            let res = member_miss_decision(
+                py,
+                info.as_ref(py),
+                "__getattr__",
+                &mock_snapshot("mymod.Foo"),
+                &r,
+                &left,
+                &left,
+                true,
+            );
+            assert!(matches!(res, Some(GetProtocolMemberResult::NoneVal)));
         });
     }
 

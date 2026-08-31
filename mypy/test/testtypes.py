@@ -6122,8 +6122,8 @@ class NativeMapInstanceToSupertypesSuite(Suite):
 
     def test_per_member_deferral_sentinel(self) -> None:
         # Per-member deferral sentinel: Rust returns a parallel flags Vec
-        # (true = mapped, false = re-run in Python); Variadic G[Ts] defers,
-        # G[A] maps. Flags are [False, True].
+        # (true = mapped, false = re-run in Python). Variadic G[Ts] defers
+        # (variadic-frames defer at the derivation path); flags [False, True].
         import type_kernel as _tk
 
         from mypy.maptype import _WriteBuffer  # type: ignore[attr-defined]
@@ -6136,7 +6136,7 @@ class NativeMapInstanceToSupertypesSuite(Suite):
         buf = _WriteBuffer()
         write_type_list(buf, members)
         result = _tk.rust_map_instance_to_supertypes(
-            self._resolver, buf.getvalue(), self.fx.oi.fullname
+            self._resolver, buf.getvalue(), self.fx.gi.fullname
         )
         assert result is not None, "Rust rust_map_instance_to_supertypes did not engage"
         encoded_results, flags = result
@@ -27770,6 +27770,18 @@ class NativeUntypedDecoratorSuite(Suite):
     def test_parity_none_decorator(self) -> None:
         self._assert_par(True, self._typed_callable(), None, False)
 
+    def test_seam_alias_decorator_leaf(self) -> None:
+        # A top-level alias expands via the real get_proper_type and
+        # re-classifies; the alias itself must not defer the seam.
+        untyped_alias = self.fx.non_rec_alias(self._untyped_callable())
+        typed_alias = self.fx.non_rec_alias(self._typed_callable())
+        assert self._seam(True, self._typed_callable(), untyped_alias, False) is True
+        assert self._seam(True, self._typed_callable(), typed_alias, False) is False
+
+    def test_parity_alias_decorator_leaf(self) -> None:
+        alias = self.fx.non_rec_alias(self._untyped_callable())
+        self._assert_par(True, self._typed_callable(), alias, False)
+
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeExplicitOverrideDecoratorSuite(Suite):
@@ -46708,6 +46720,10 @@ class NativeProtocolMemberMissSuite(Suite):
     ) -> TypeInfo:
         info = self.fx.make_type_info(fullname)
         info.mro = [info, *mro_bases, self.fx.oi]
+        # The resolver snapshot serializes `info.bases`; real TypeInfos
+        # carry them, and the accessor arm's map_instance_to_supertype
+        # needs the derivation path.
+        info.bases = list(mro_bases)
         if protocol:
             info.is_protocol = True
         if fallback_to_any:
@@ -46795,15 +46811,31 @@ class NativeProtocolMemberMissSuite(Suite):
         assert raw is not None and len(raw) > 0, f"expected found bytes, got {raw!r}"
         self._restore()
 
-    def test_getattr_accessor_defers_parity(self) -> None:
-        """`__getattr__` defined on a non-object class defers; the Python
-        tail (accessor ret type) answers identically both ways."""
+    def test_getattr_accessor_decides_parity(self) -> None:
+        """`__getattr__` on a non-object class is decided by the accessor
+        arm: bind the definer's signature, collapse Callable -> ret_type
+        (the checkmember.py:1312 accessor shape)."""
         i = self._class("mod.HasGetattr", [], {"__getattr__": self.fx.a})
         self._build_resolver()
         off, on = self._parity(Instance(i, []), "f")
-        assert str(off) == str(on), f"accessor mismatch: off={off!r} on={on!r}"
+        assert str(off) == str(on) == "A", f"accessor mismatch: off={off!r} on={on!r}"
         raw = self._raw(Instance(i, []), "f")
-        assert raw is None, f"accessor must defer, got {raw!r}"
+        assert raw is not None and len(raw) > 0, f"expected found bytes, got {raw!r}"
+        self._restore()
+
+    def test_getattr_accessor_on_base_decides_parity(self) -> None:
+        """A receiver lacking the member inherits a non-object
+        `__getattr__` from its base: the miss-path scan finds the definer
+        via the MRO walk and decides on the subclass receiver."""
+        b = self._class("mod.GetattrBase", [], {"__getattr__": self.fx.str_type})
+        i = self._class("mod.GetattrDerived", [b], None)
+        self._build_resolver()
+        off, on = self._parity(Instance(i, []), "f")
+        assert (
+            str(off) == str(on) == "builtins.str"
+        ), f"base accessor mismatch: off={off!r} on={on!r}"
+        raw = self._raw(Instance(i, []), "f")
+        assert raw is not None and len(raw) > 0, f"expected found bytes, got {raw!r}"
         self._restore()
 
     def test_node_none_miss_parity(self) -> None:
@@ -46820,14 +46852,14 @@ class NativeProtocolMemberMissSuite(Suite):
     def test_member_on_base_class_continues_walk(self) -> None:
         """The member lives on a base class: the MRO walk must find it
         (a `KeyError` on the first base must not truncate the walk);
-        the same-class guard then defers to Python."""
+        with the derivation path in the snapshot the seam decides."""
         b = self._class("mod.BaseWithF", [], {"f": self.fx.a})
         i = self._class("mod.DerivedNoF", [b], None)
         self._build_resolver()
         off, on = self._parity(Instance(i, []), "f")
         assert str(off) == str(on), f"base-member mismatch: off={off!r} on={on!r}"
         raw = self._raw(Instance(i, []), "f")
-        assert raw is None, f"base-defined member must defer, got {raw!r}"
+        assert raw is not None and len(raw) > 0, f"expected found bytes, got {raw!r}"
         self._restore()
 
     def _loop_call(self, left: Instance, right: Instance) -> bool | None:
@@ -46853,17 +46885,17 @@ class NativeProtocolMemberMissSuite(Suite):
         finally:
             _set_native_subtype_active(False)
 
-    def test_impl_member_on_base_loop_defers_not_false(self) -> None:
-        """Implementation loop: an impl whose member lives on a base must
-        not be rejected by the `mro_has` pre-check (it defers instead)."""
+    def test_impl_member_on_base_loop_decides_true(self) -> None:
+        """Implementation loop: an impl whose member lives on a base
+        resolves natively (map fast path + snapshot bases); with both
+        member types compatible the loop decides True, never False."""
         b = self._class("mod.LoopBase", [], {"f": self.fx.a})
         p = self._class("mod.LoopProto", [], {"f": self.fx.a}, protocol=True)
         i = self._class("mod.LoopDerived", [b], None)
         self._build_resolver()
-        # The member resolves on the base class, which the same-class
-        # guard defers: the loop must defer, never decide False.
         result = self._loop_call(Instance(i, []), Instance(p, []))
-        assert result is None, f"expected deferral, got {result!r}"
+        assert result is not False, f"member on base must not be rejected, got {result!r}"
+        assert result is True
         self._restore()
 
     def test_missing_member_loop_decides_false(self) -> None:

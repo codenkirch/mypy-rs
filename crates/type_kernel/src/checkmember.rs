@@ -1179,7 +1179,9 @@ fn static_member_tail(
 ) -> Option<Type> {
     let (left_ref, left_args) = match instance {
         Type::Instance { type_ref, args, .. } => (type_ref.as_str(), args.as_slice()),
-        _ => return None,
+        _ => {
+            return None;
+        }
     };
     // `map_instance_to_supertype` walks map_derivation_path and returns
     // None for a non-base receiver, deferring to Python exactly as the
@@ -1224,12 +1226,17 @@ fn static_member_tail(
     // checkmember.py:451 `expand_type_by_instance(signature, typ)`. Expand
     // the unbound callable first (binding would defer the expand). The free-result
     // variant mirrors Python (`freeze_all_type_vars` on return).
-    let mut expanded = crate::expandtype::expand_type_by_instance_free(
+    let mut expanded = match crate::expandtype::expand_type_by_instance_free(
         signature,
         &mapped_instance,
         resolver,
         strict_optional,
-    )?;
+    ) {
+        Some(t) => t,
+        None => {
+            return None;
+        }
+    };
     // checkmember.py:503 `freeze_all_type_vars(member_type)`. First the
     // narrowed survivor gate (#1277): bound receiver-arg tvars ride through,
     // any other leftover defers (fresh riders cannot cross seams, #1286).
@@ -1265,8 +1272,19 @@ pub(crate) fn rust_analyze_instance_member_access(
     strict_optional: bool,
     is_trivial_self: bool,
 ) -> Option<Vec<u8>> {
-    let instance = decode_type(instance_bytes)?;
-    let signature = decode_type(signature_bytes)?;
+    let _flat_alias_guard = crate::expandtype::FlatAliasGuard::install(resolver);
+    let instance = match decode_type(instance_bytes) {
+        Some(t) => t,
+        None => {
+            return None;
+        }
+    };
+    let signature = match decode_type(signature_bytes) {
+        Some(t) => t,
+        None => {
+            return None;
+        }
+    };
     let result = static_member_tail(
         &instance,
         &signature,
@@ -1276,8 +1294,11 @@ pub(crate) fn rust_analyze_instance_member_access(
         is_trivial_self,
         false,
         None,
-    )?;
-    encode_type(&result)
+    );
+    match result {
+        Some(t) => encode_type(&t),
+        None => None,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1696,18 +1717,33 @@ pub(crate) fn member_method_inner(
     // typeops.py:1062-1108) and expands afterwards; the plans below gate
     // the solve outcome on the expand tail and defer unbuildable items.
     let bind_plans: Vec<ItemBindPlan> = match &filtered {
-        Type::CallableType { .. } => vec![plan_item_bind(&filtered)?],
+        Type::CallableType { .. } => {
+            let plan = match plan_item_bind(&filtered) {
+                Some(p) => p,
+                None => {
+                    return None;
+                }
+            };
+            vec![plan]
+        }
         Type::Overloaded { items } => {
             if items.is_empty() {
                 return None;
             }
             let mut plans = Vec::with_capacity(items.len());
             for it in items {
-                plans.push(plan_item_bind(it)?);
+                plans.push(match plan_item_bind(it) {
+                    Some(p) => p,
+                    None => {
+                        return None;
+                    }
+                });
             }
             plans
         }
-        _ => return None,
+        _ => {
+            return None;
+        }
     };
     // A bare-Self plan injects the receiver wholesale, while Python solves
     // against the receiver first; when the receiver itself carries type
@@ -1750,12 +1786,22 @@ pub(crate) fn member_method_inner(
                         return None;
                     }
                 };
-                new_items.push(bind_self_fast_inner(&item)?);
+                new_items.push(match bind_self_fast_inner(&item) {
+                    Some(b) => b,
+                    None => {
+                        return None;
+                    }
+                });
             }
             new_items
         }
         item @ Type::CallableType { .. } => {
-            let plan = bind_plans.into_iter().next()?;
+            let plan = match bind_plans.into_iter().next() {
+                Some(p) => p,
+                None => {
+                    return None;
+                }
+            };
             let mut item = item;
             subst_tvar_keys(&mut item, &plan.bare, self_type);
             remove_self_vars(&mut item, &plan.self_vars);
@@ -1765,9 +1811,16 @@ pub(crate) fn member_method_inner(
                     return None;
                 }
             };
-            vec![bind_self_fast_inner(&item)?]
+            vec![match bind_self_fast_inner(&item) {
+                Some(b) => b,
+                None => {
+                    return None;
+                }
+            }]
         }
-        _ => return None,
+        _ => {
+            return None;
+        }
     };
     if bound_items.len() == 1 && !matches!(filtered, Type::Overloaded { .. }) {
         return bound_items.into_iter().next();
@@ -1788,6 +1841,7 @@ pub(crate) fn rust_analyze_member_method(
     strict_optional: bool,
     is_class: bool,
 ) -> Option<Vec<u8>> {
+    let _flat_alias_guard = crate::expandtype::FlatAliasGuard::install(resolver);
     let instance = decode_type(instance_bytes)?;
     let signature = decode_type(signature_bytes)?;
     let self_type = decode_type(self_type_bytes)?;
@@ -2147,6 +2201,7 @@ pub(crate) fn rust_analyze_instance_member_dispatch(
     start_raw_id: i64,
     strict_optional: bool,
 ) -> Option<(i64, bool, Vec<u8>)> {
+    let _flat_alias_guard = crate::expandtype::FlatAliasGuard::install(resolver);
     let instance = match decode_type(instance_bytes) {
         Some(t) => t,
         None => {

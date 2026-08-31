@@ -9763,6 +9763,7 @@ mod tests {
         // considered (join.py:447-450) and materialized in the sub-join's
         // operand order (s_inst, candidate), not dropped or inverted.
         let generic = |s: &mut TypeInfoSnapshot| {
+            s.type_vars = vec!["T".to_string()];
             s.type_vars_with_variance = vec![("T".to_string(), 0, 0)];
             s.type_var_upper_bounds =
                 vec![encode_type(&instance("builtins.object", vec![])).unwrap()];
@@ -9819,6 +9820,7 @@ mod tests {
         // SameTypeWithArgs sub-join (the join.py:283-295 Any-arg arm,
         // disc 4); it must be considered and materialize instead.
         let generic = |s: &mut TypeInfoSnapshot| {
+            s.type_vars = vec!["T".to_string()];
             s.type_vars_with_variance = vec![("T".to_string(), 0, 0)];
             s.type_var_upper_bounds =
                 vec![encode_type(&instance("builtins.object", vec![])).unwrap()];
