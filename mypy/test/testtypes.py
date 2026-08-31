@@ -4199,6 +4199,24 @@ class NativeSubtypesDeferralSuite(Suite):
             _set_native_checker_active(False)
             _set_native_checker_resolver(None)
 
+    def test_is_typeddict_none_resolver_defers(self) -> None:
+        # Issue #1312 review: a daemon recheck clears the checker resolver
+        # while the gate stays active; passing None into the seam raised
+        # TypeError instead of deferring. The gate now checks the resolver.
+        from mypy.checker import (
+            _set_native_checker_active,
+            _set_native_checker_resolver,
+            is_typeddict_type_context,
+        )
+
+        try:
+            _set_native_checker_active(True)
+            _set_native_checker_resolver(None)
+            assert is_typeddict_type_context(self.fx.a) is False
+        finally:
+            _set_native_checker_active(False)
+            _set_native_checker_resolver(None)
+
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeInstanceCallSubtypeSuite(Suite):

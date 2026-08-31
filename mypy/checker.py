@@ -12559,7 +12559,11 @@ def combine_equality_value_info(infos: Iterable[EqualityValueInfo]) -> EqualityV
 
 
 def is_typeddict_type_context(lvalue_type: Type) -> bool:
-    if _CHECKER_HAS_TYPE_KERNEL and _native_checker_active:
+    if (
+        _CHECKER_HAS_TYPE_KERNEL
+        and _native_checker_active
+        and _native_checker_resolver is not None
+    ):
         try:
             type_bytes = _serialize_type_for_checker(lvalue_type)
             result = _rust_is_typeddict_type_context(
