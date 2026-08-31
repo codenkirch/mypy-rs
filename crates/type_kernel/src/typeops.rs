@@ -1644,7 +1644,7 @@ fn map_type_from_supertype_inner(
     };
     // allow_free=true (the typeobj composite) returns leftover TypeVars like
     // Python's expand_type_by_instance; the composite's Python tail re-links
-    // their identities via wirefixup. The standalone seam keeps the core.
+    // their identities via wirefixup.
     if allow_free {
         crate::expandtype::expand_type_by_instance_free(
             typ,
@@ -1653,7 +1653,10 @@ fn map_type_from_supertype_inner(
             strict_optional,
         )
     } else {
-        crate::expandtype::expand_type_by_instance_core(
+        // #1309: the relink variant (#1215/#1224 contract) lets leftover
+        // TypeVars and surviving aliases ride through; the Python shim
+        // re-links identities and defers on anything unmatchable.
+        crate::expandtype::expand_type_by_instance_relink(
             typ,
             &inst,
             resolver.resolver(),

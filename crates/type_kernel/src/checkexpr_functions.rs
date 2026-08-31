@@ -1626,25 +1626,35 @@ fn is_typed_callable_live(types_mod: &PyModule, c: &PyAny, depth: u32) -> Option
 /// `mypy.checker.is_typeddict_type_context` — whether the type is a
 /// TypedDictType (used as a type context for TypedDict construction).
 ///
-/// Mirrors `is_typeddict_type_context` (checker.py:9978-9988). Defers
-/// on alias.
+/// Mirrors `is_typeddict_type_context` (checker.py). Expands
+/// TypeAliasType via the alias resolver like `rust_is_type_type_context`;
+/// defers only when the alias snapshot is missing or its chain cycles.
 #[pyfunction]
 #[allow(clippy::needless_pass_by_value)]
-pub(crate) fn rust_is_typeddict_type_context(type_bytes: &[u8]) -> PyResult<Option<bool>> {
+pub(crate) fn rust_is_typeddict_type_context(
+    resolver: &NativeTypeResolver,
+    type_bytes: &[u8],
+) -> PyResult<Option<bool>> {
     let typ = match decode_type(type_bytes) {
         Some(t) => t,
         None => return Ok(None),
     };
-    Ok(is_typeddict_type_context_inner(&typ))
+    Ok(is_typeddict_type_context_inner(
+        &typ,
+        resolver.alias_resolver(),
+    ))
 }
 
-pub(crate) fn is_typeddict_type_context_inner(typ: &Type) -> Option<bool> {
-    let proper = get_proper_or_none(typ)?;
+pub(crate) fn is_typeddict_type_context_inner(
+    typ: &Type,
+    aliases: &crate::aliases::TypeAliasResolver,
+) -> Option<bool> {
+    let proper = expand_alias_shape(typ, aliases)?;
     match proper {
         Type::TypedDictType { .. } => Some(true),
         Type::UnionType { items, .. } => {
             for t in items {
-                match is_typeddict_type_context_inner(t) {
+                match is_typeddict_type_context_inner(&t, aliases) {
                     Some(true) => return Some(true),
                     None => return None,
                     Some(false) => {}
@@ -3229,6 +3239,10 @@ mod tests {
         }
     }
 
+    fn empty_alias_lookup() -> crate::aliases::TypeAliasResolver {
+        crate::aliases::TypeAliasResolver::new()
+    }
+
     fn make_any(type_of_any: i64) -> Type {
         Type::AnyType {
             type_of_any,
@@ -4704,15 +4718,55 @@ mod tests {
             readonly_keys: Default::default(),
             is_closed: false,
         };
-        assert_eq!(is_typeddict_type_context_inner(&t), Some(true));
+        assert_eq!(
+            is_typeddict_type_context_inner(&t, &empty_alias_lookup()),
+            Some(true)
+        );
     }
 
     #[test]
     fn test_is_typeddict_type_context_false() {
         assert_eq!(
-            is_typeddict_type_context_inner(&make_instance("int", vec![])),
+            is_typeddict_type_context_inner(&make_instance("int", vec![]), &empty_alias_lookup()),
             Some(false)
         );
+    }
+
+    #[test]
+    fn test_is_typeddict_type_context_alias_expands() {
+        // Issue #1309: mod.AliasTD = TypedDictType(...) answers true once
+        // the alias expands via the resolver snapshot.
+        let target = Type::TypedDictType {
+            fallback: Box::new(make_instance("TD", vec![])),
+            items: vec![],
+            required_keys: Default::default(),
+            readonly_keys: Default::default(),
+            is_closed: false,
+        };
+        let aliases = alias_resolver_with_targets(&[("mod.AliasTD", target)]);
+        assert_eq!(
+            is_typeddict_type_context_inner(&make_type_alias("mod.AliasTD"), &aliases),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn test_is_typeddict_type_context_union_alias_item() {
+        // Union[int, AliasTD] with the alias target being a TypedDictType:
+        // the union walk recurses through the alias item and answers true.
+        let target = Type::TypedDictType {
+            fallback: Box::new(make_instance("TD", vec![])),
+            items: vec![],
+            required_keys: Default::default(),
+            readonly_keys: Default::default(),
+            is_closed: false,
+        };
+        let aliases = alias_resolver_with_targets(&[("mod.AliasTD", target)]);
+        let u = make_union(vec![
+            make_instance("int", vec![]),
+            make_type_alias("mod.AliasTD"),
+        ]);
+        assert_eq!(is_typeddict_type_context_inner(&u, &aliases), Some(true));
     }
 
     #[test]
@@ -7323,8 +7377,7 @@ pub(crate) fn classify_check_boolean_op(
 
     // Tail: restricted_left_type = false_only/true_only(expanded_left);
     // result_is_left = not expanded.can_be_true (and) / not can_be_false (or).
-    // Mirrors Python's flag-decidable steps 1-2; the union Uninhabited
-    // verdict is precomputed Python-side and passed in (issue #1161).
+    // Union Uninhabited verdict is precomputed Python-side (issue #1161).
     let restricted_uninhabited: bool = if op_is_and {
         if !can_be_false {
             // false_only: UninhabitedType under strict_optional, else NoneType.

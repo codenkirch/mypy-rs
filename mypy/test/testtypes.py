@@ -4120,6 +4120,103 @@ class NativeSubtypesDeferralSuite(Suite):
             set_wire_typeinfo_map(None)
             _set_native_subtype_resolver(self.resolver)
 
+    def test_is_typeddict_alias_context_native(self) -> None:
+        """Issue #1309 (itdc): an alias to a TypedDictType decides natively.
+
+        is_typeddict_type_context serializes its operand wholesale, so a
+        TypeAliasType operand rides the wire into the kernel, which now
+        expands it via the alias resolver instead of deferring.
+        """
+        from mypy.checker import (
+            _serialize_type_for_checker,
+            _set_native_checker_active,
+            _set_native_checker_resolver,
+            is_typeddict_type_context,
+        )
+        from mypy.nodes import TypeAlias
+        from mypy.types import UnionType
+
+        td = TypedDictType({"x": self.fx.o}, {"x"}, set(), self.fx.a)
+        alias = TypeAlias(self.fx.a, "mod.AliasTD", "mod", -1, -1)
+        alias.target = td
+        self._rebuild_with_aliases([alias])
+        t = TypeAliasType(alias, [])
+        union = UnionType([self.fx.a, t], False)
+        try:
+            _set_native_checker_resolver(self.resolver)
+            _set_native_checker_active(False)
+            expected = is_typeddict_type_context(t)
+            assert expected is True
+            expected_union = is_typeddict_type_context(union)
+            assert expected_union is True
+            _set_native_checker_active(True)
+            assert is_typeddict_type_context(t) is expected
+            assert is_typeddict_type_context(union) is expected_union
+            # The direct seam call proves the alias path is native now
+            # (non-None), not deferring back to Python.
+            rusted = _type_kernel.rust_is_typeddict_type_context(
+                self.resolver, _serialize_type_for_checker(t)
+            )
+            assert rusted is True
+        finally:
+            _set_native_checker_active(False)
+            _set_native_checker_resolver(None)
+
+    def test_is_typeddict_alias_missing_snapshot_defers(self) -> None:
+        # Alias not registered in the checker resolver: the seam defers
+        # (None) and the pure-Python fallback answers, so gate-on equals
+        # gate-off for both the alias and its union-wrapped form.
+        from mypy.checker import (
+            _serialize_type_for_checker,
+            _set_native_checker_active,
+            _set_native_checker_resolver,
+            is_typeddict_type_context,
+        )
+        from mypy.nodes import TypeAlias
+        from mypy.types import UnionType
+
+        td = TypedDictType({"x": self.fx.o}, {"x"}, set(), self.fx.a)
+        alias = TypeAlias(self.fx.a, "mod.AliasTD2", "mod", -1, -1)
+        alias.target = td
+        t = TypeAliasType(alias, [])
+        union = UnionType([self.fx.a, t], False)
+        bare_resolver = self._build_resolver([])
+        try:
+            _set_native_checker_resolver(bare_resolver)
+            _set_native_checker_active(False)
+            expected = is_typeddict_type_context(t)
+            assert expected is True
+            expected_union = is_typeddict_type_context(union)
+            assert expected_union is True
+            _set_native_checker_active(True)
+            assert is_typeddict_type_context(t) is expected
+            assert is_typeddict_type_context(union) is expected_union
+            rusted = _type_kernel.rust_is_typeddict_type_context(
+                bare_resolver, _serialize_type_for_checker(t)
+            )
+            assert rusted is None, "missing snapshot must defer"
+        finally:
+            _set_native_checker_active(False)
+            _set_native_checker_resolver(None)
+
+    def test_is_typeddict_none_resolver_defers(self) -> None:
+        # Issue #1312 review: a daemon recheck clears the checker resolver
+        # while the gate stays active; passing None into the seam raised
+        # TypeError instead of deferring. The gate now checks the resolver.
+        from mypy.checker import (
+            _set_native_checker_active,
+            _set_native_checker_resolver,
+            is_typeddict_type_context,
+        )
+
+        try:
+            _set_native_checker_active(True)
+            _set_native_checker_resolver(None)
+            assert is_typeddict_type_context(self.fx.a) is False
+        finally:
+            _set_native_checker_active(False)
+            _set_native_checker_resolver(None)
+
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeInstanceCallSubtypeSuite(Suite):
@@ -5747,6 +5844,8 @@ class NativeMapTypeFromSupertypeSuite(Suite):
             value = getattr(self.fx, name)
             if _is_type_info(value):
                 type_infos.append(value)
+        self._type_infos = type_infos
+        self._live_map = {info.fullname: info for info in type_infos}
         self._resolver = _type_kernel.build_native_resolver(type_infos, [])
         set_wire_typeinfo_map({info.fullname: info for info in type_infos})
         _set_native_typeops_active(True)
@@ -5854,6 +5953,61 @@ class NativeMapTypeFromSupertypeSuite(Suite):
         )
         assert result is not None, "Rust map_type_from_supertype did not engage"
         assert isinstance(bytes(result), bytes)
+
+    def test_leftover_tvar_relinks_identity(self) -> None:
+        # Issue #1309 (mfs standalone, the #1215/#1224 relink variant): a
+        # type in the super frame carries a tvar the env cannot match
+        # (G[T] via a tvar-free B -> A step); the shim re-links identities.
+        from mypy.typeops import _serialize_type
+
+        typ = Instance(self.fx.gi, [self.fx.t])
+        result = _type_kernel.rust_map_type_from_supertype(
+            self._resolver, self.fx.bi, self.fx.ai, _serialize_type(typ), True
+        )
+        assert (
+            result is not None
+        ), "leftover-tvar map_type_from_supertype must return the expansion"
+        off = self._with_gate(False, lambda: self._map(typ, self.fx.bi, self.fx.ai))
+        on = self._with_gate(True, lambda: self._map(typ, self.fx.bi, self.fx.ai))
+        assert_equal(str(on), str(off), "map_type_from_supertype parity (leftover tvar)")
+        assert isinstance(on, Instance), str(on)  # type: ignore[misc]
+        assert isinstance(off, Instance), str(off)  # type: ignore[misc]
+        assert on.args[0] is off.args[0] is self.fx.t, "decoded TypeVar must relink to original"
+
+    def test_alias_typ_object_parity_and_engagement(self) -> None:
+        # Issue #1309 (mfs): mod.A = List[T] rides through the seam unchanged
+        # (visit_type_alias_type semantics); gate on/off agree, the direct
+        # seam call returns bytes, and the alias re-links to the live node.
+        from mypy.nodes import TypeAlias
+        from mypy.typeops import (
+            _serialize_type,
+            _set_native_typeops_resolver,
+            map_type_from_supertype,
+        )
+        from mypy.wirefixup import set_wire_alias_map, set_wire_typeinfo_map
+
+        alias = TypeAlias(Instance(self.fx.std_listi, [self.fx.t]), "mod.A", "mod", -1, -1)
+        typ = TypeAliasType(alias, [])
+        resolver = _type_kernel.build_native_resolver(self._type_infos, [alias])
+        try:
+            set_wire_alias_map({alias.fullname: alias})
+            set_wire_typeinfo_map(self._live_map)
+            _set_native_typeops_resolver(resolver)
+            result = _type_kernel.rust_map_type_from_supertype(
+                resolver, self.fx.bi, self.fx.ai, _serialize_type(typ), True
+            )
+            assert result is not None, "alias-typ map_type_from_supertype must ride through"
+            off = self._with_gate(
+                False, lambda: map_type_from_supertype(typ, self.fx.bi, self.fx.ai)
+            )
+            on = self._with_gate(True, lambda: map_type_from_supertype(typ, self.fx.bi, self.fx.ai))
+            assert_equal(str(on), str(off), "map_type_from_supertype parity (alias)")
+            assert isinstance(on, TypeAliasType), "decoded type must be the alias"
+            assert on.alias is alias, "decoded alias must re-link to the live TypeAlias node"
+        finally:
+            _set_native_typeops_resolver(self._resolver)
+            set_wire_typeinfo_map(self._live_map)
+            set_wire_alias_map(None)
 
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")

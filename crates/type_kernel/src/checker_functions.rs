@@ -4693,8 +4693,10 @@ fn classify_simple_assignment(
     }
     // Python evaluates is_typeddict_type_context(lvalue_type) only when
     // try_fallback holds and the lvalue type is present; an alias target
-    // the resolver cannot expand defers the whole classification.
-    if !crate::checkexpr_functions::is_typeddict_type_context_inner(lvalue.unwrap())? {
+    // the resolver cannot expand defers the whole classification. The
+    // empty resolver preserves the pre-#1309 alias-deferral contract.
+    let aliases = crate::aliases::TypeAliasResolver::new();
+    if !crate::checkexpr_functions::is_typeddict_type_context_inner(lvalue.unwrap(), &aliases)? {
         if has_inferred && !inferred_is_argument {
             return Some(SIMPLE_ASSIGNMENT_FALLBACK_NO_PREFERRED);
         }
