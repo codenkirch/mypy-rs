@@ -391,6 +391,24 @@ _NATIVE_ENV_MODULE_PROBES = {
 }
 
 
+def _env_gate(name: str) -> bool:
+    """Decode a TEST_NATIVE_* gate value; false-y spellings turn the gate off.
+
+    A bare ``bool(os.environ.get(name))`` reads "0" as True, so a gate-off
+    run set the option and silently stayed native (#1287). Unknown values
+    fail loudly instead of decoding as "on".
+    """
+    val = os.environ.get(name)
+    if val is None or val == "":
+        return False
+    lowered = val.lower()
+    if lowered in ("0", "false", "no", "off"):
+        return False
+    if lowered in ("1", "true", "yes", "on"):
+        return True
+    raise SystemExit(f"{name} must be 0/1 (got {val!r})")
+
+
 def _ensure_native_modules_available() -> None:
     """Fail loudly when a native seam is requested but cannot load.
 
@@ -402,7 +420,7 @@ def _ensure_native_modules_available() -> None:
     import warnings
 
     for env, (module, probe) in _NATIVE_ENV_MODULE_PROBES.items():
-        if not os.environ.get(env):
+        if not _env_gate(env):
             continue
         try:
             with warnings.catch_warnings():
@@ -447,9 +465,9 @@ def parse_options(
 
     # Native parser/resolver/type-kernel are opt-in via env vars so test
     # runs use pure-Python unless the compiled/parity paths are exercised.
-    options.native_parser = bool(os.environ.get("TEST_NATIVE_PARSER"))
-    options.native_resolver = bool(os.environ.get("TEST_NATIVE_RESOLVER"))
-    options.native_type_kernel = bool(os.environ.get("TEST_NATIVE_TYPE_KERNEL"))
+    options.native_parser = _env_gate("TEST_NATIVE_PARSER")
+    options.native_resolver = _env_gate("TEST_NATIVE_RESOLVER")
+    options.native_type_kernel = _env_gate("TEST_NATIVE_TYPE_KERNEL")
     _ensure_native_modules_available()
 
     # Allow custom python version to override testfile_pyversion.

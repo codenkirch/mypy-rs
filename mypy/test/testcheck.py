@@ -15,6 +15,7 @@ from mypy.modulefinder import BuildSource, FindModuleCache, SearchPaths
 from mypy.test.config import test_data_prefix, test_temp_dir
 from mypy.test.data import DataDrivenTestCase, DataSuite, FileOperation, module_from_path
 from mypy.test.helpers import (
+    _env_gate,
     assert_module_equivalence,
     assert_string_arrays_equal,
     assert_target_equivalence,
@@ -137,8 +138,8 @@ class TypeCheckSuite(DataSuite):
         options = parse_options(original_program_text, testcase, incremental_step)
         options.use_builtins_fixtures = True
         options.show_traceback = True
-        options.native_parser = bool(os.environ.get("TEST_NATIVE_PARSER"))
-        options.native_resolver = bool(os.environ.get("TEST_NATIVE_RESOLVER"))
+        options.native_parser = _env_gate("TEST_NATIVE_PARSER")
+        options.native_resolver = _env_gate("TEST_NATIVE_RESOLVER")
         options.reveal_verbose_types = not testcase.name.endswith("_no_verbose_reveal")
 
         if options.num_workers:

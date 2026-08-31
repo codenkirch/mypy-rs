@@ -1,11 +1,10 @@
 from __future__ import annotations
 
-import os
 from unittest import skipUnless
 
 from mypy.nodes import CONTRAVARIANT, COVARIANT, INVARIANT, TypeInfo
 from mypy.subtypes import is_subtype
-from mypy.test.helpers import Suite
+from mypy.test.helpers import Suite, _env_gate
 from mypy.test.typefixture import InterfaceTypeFixture, TypeFixture
 from mypy.types import Instance, TupleType, Type, UninhabitedType, UnpackType
 
@@ -20,7 +19,7 @@ except ImportError:
     _type_kernel = None  # type: ignore[assignment]
     _HAS_TYPE_KERNEL = False
 
-_NATIVE_WIRE_ENABLED = bool(os.environ.get("TEST_NATIVE_TYPE_KERNEL")) and _HAS_TYPE_KERNEL
+_NATIVE_WIRE_ENABLED = _env_gate("TEST_NATIVE_TYPE_KERNEL") and _HAS_TYPE_KERNEL
 
 
 class SubtypingSuite(Suite):
