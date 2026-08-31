@@ -12,7 +12,7 @@
 use std::collections::HashSet;
 
 use pyo3::prelude::*;
-use pyo3::types::{PyBytes, PyFrozenSet, PyList, PyString, PyTuple, PyType};
+use pyo3::types::{PyBytes, PyFrozenSet, PyList, PyModule, PyString, PyTuple, PyType};
 
 use crate::operators::is_operator_method_name;
 use crate::setops::is_type_obj_callable;
@@ -1427,50 +1427,197 @@ pub(crate) fn is_string_literal_inner(typ: &Type) -> Option<bool> {
 }
 
 // ---------------------------------------------------------------------------
-// is_untyped_decorator (simplified: only CallableType/Overloaded check)
+// is_untyped_decorator (live-object walk over Instance `__call__`)
 // ---------------------------------------------------------------------------
 
-/// `mypy.checker.is_untyped_decorator` — whether a decorator type is
-/// untyped (all Any, or no type).
+/// Bounded descent depth for the live `is_untyped_decorator` walk. The
+/// shapes it recurses into (Overloaded items, an Instance's `__call__`
+/// method's func/var types) are effectively leaves, so the cap only guards
+/// a pathological recursive decorator structure. Beyond the cap the seam
+/// defers and the Python body re-runs (which would recurse identically).
+const UNTYPED_DECORATOR_LIVE_DEPTH_CAP: u32 = 50;
+
+/// `mypy.checker.is_untyped_decorator` (checker.py:12067-12097) as a
+/// live-PyO3-object seam (the `rust_is_final_enum_value` shape). The wire
+/// version deferred on every Instance (the `__call__` lookup needs the live
+/// `TypeInfo`), which also dragged the `rust_check_for_untyped_decorator`
+/// conjunction to 64% native.
 ///
-/// Mirrors `is_untyped_decorator` (checker.py:9623-9647). Simplified:
-/// does not handle Instance with `__call__` method (needs TypeInfo lookup).
-/// Defers on alias.
+/// Mirrors the Python body: `get_proper_type` on a top-level alias (via the
+/// real Python function), then the CallableType / Overloaded / Instance
+/// dispatch. The Instance arm runs a real `TypeInfo.get_method("__call__")`
+/// and recurses on the method's live types. Returns `None` (defer to the
+/// Python body) on any unreadable attribute, an undecodable
+/// `type_of_any`, or an alias nested inside a callable's arg/ret types
+/// (Python's `get_proper_types` would expand it from the live alias node).
 #[pyfunction]
-#[allow(clippy::needless_pass_by_value)]
-pub(crate) fn rust_is_untyped_decorator(type_bytes: &[u8]) -> PyResult<Option<bool>> {
-    let typ = match decode_type(type_bytes) {
-        Some(t) => t,
-        None => return Ok(None),
-    };
-    Ok(is_untyped_decorator_inner(&typ))
+#[pyo3(signature = (typ))]
+pub(crate) fn rust_is_untyped_decorator(
+    py: Python<'_>,
+    typ: Option<&PyAny>,
+) -> PyResult<Option<bool>> {
+    if typ.is_none() {
+        // is_untyped_decorator(None) is True (get_proper_type(None) is falsy).
+        return Ok(Some(true));
+    }
+    Ok(is_untyped_decorator_live(py, typ.unwrap()))
 }
 
-pub(crate) fn is_untyped_decorator_inner(typ: &Type) -> Option<bool> {
-    let proper = get_proper_or_none(typ)?;
-    match proper {
-        Type::CallableType { .. } => {
-            // not is_typed_callable(typ)
-            match is_typed_callable_inner(proper)? {
-                true => Some(false),
-                false => Some(true),
-            }
-        }
-        Type::Overloaded { items } => {
-            // any(is_untyped_decorator(item) for item in typ.items)
-            for t in items {
-                match is_untyped_decorator_inner(t) {
-                    Some(true) => return Some(true),
-                    None => return None,
-                    Some(false) => {}
-                }
-            }
-            Some(false)
-        }
-        // Instance case needs TypeInfo lookup (__call__ method); defer.
-        Type::Instance { .. } => None,
-        _ => Some(true),
+/// Shared walk body. `typ` is the live `Type` object; the top-level
+/// alias/TypeGuardedType normalization mirrors Python's
+/// `get_proper_type(typ)` and is also what the Overloaded item recursion
+/// re-enters through (each item rides the same normalization).
+pub(crate) fn is_untyped_decorator_live(py: Python<'_>, typ: &PyAny) -> Option<bool> {
+    let types_mod = py.import("mypy.types").ok()?;
+    let alias_cls: &PyType = types_mod.getattr("TypeAliasType").ok()?.downcast().ok()?;
+    let guarded_cls: &PyType = types_mod.getattr("TypeGuardedType").ok()?.downcast().ok()?;
+    // Python's get_proper_type is identity outside these two kinds.
+    let proper: &PyAny = if typ.is_instance(alias_cls).ok()? || typ.is_instance(guarded_cls).ok()? {
+        types_mod
+            .getattr("get_proper_type")
+            .ok()?
+            .call1((typ,))
+            .ok()?
+    } else {
+        typ
+    };
+    walk_untyped_decorator_proper(py, types_mod, proper, 0)
+}
+
+/// The post-`get_proper_type` dispatch of `is_untyped_decorator`. `not typ`
+/// is True for a falsy type (None from an alias expansion).
+fn walk_untyped_decorator_proper(
+    py: Python<'_>,
+    types_mod: &PyModule,
+    proper: &PyAny,
+    depth: u32,
+) -> Option<bool> {
+    if depth > UNTYPED_DECORATOR_LIVE_DEPTH_CAP {
+        return None;
     }
+    if proper.is_none() {
+        return Some(true);
+    }
+    let callable_cls: &PyType = types_mod.getattr("CallableType").ok()?.downcast().ok()?;
+    if proper.is_instance(callable_cls).ok()? {
+        return Some(!is_typed_callable_live(types_mod, proper, depth)?);
+    }
+    let overloaded_cls: &PyType = types_mod.getattr("Overloaded").ok()?.downcast().ok()?;
+    if proper.is_instance(overloaded_cls).ok()? {
+        return overloaded_untyped_fold(py, proper, depth);
+    }
+    let instance_cls: &PyType = types_mod.getattr("Instance").ok()?.downcast().ok()?;
+    if proper.is_instance(instance_cls).ok()? {
+        return instance_untyped_decorator_walk(py, types_mod, proper, depth);
+    }
+    // AnyType, NoneType, UninhabitedType, ...: the Python tail returns True.
+    Some(true)
+}
+
+/// `any(is_untyped_decorator(item) for item in typ.items)` over the live
+/// item list. An item defer (unreadable fact / nested alias) defers the
+/// whole call, mirroring the Python `any` that would re-run the body.
+fn overloaded_untyped_fold(py: Python<'_>, typ: &PyAny, depth: u32) -> Option<bool> {
+    if depth > UNTYPED_DECORATOR_LIVE_DEPTH_CAP {
+        return None;
+    }
+    let items: &PyList = typ.getattr("items").ok()?.downcast().ok()?;
+    for item in items.iter() {
+        match is_untyped_decorator_live(py, item)? {
+            true => return Some(true),
+            false => {}
+        }
+    }
+    Some(false)
+}
+
+/// The Instance arm of `is_untyped_decorator`: the `__call__` lookup and
+/// its three sub-arms (Decorator head, Overloaded method type, plain
+/// method type). A `get_method` miss is `Some(false)`.
+fn instance_untyped_decorator_walk(
+    py: Python<'_>,
+    types_mod: &PyModule,
+    typ: &PyAny,
+    depth: u32,
+) -> Option<bool> {
+    if depth > UNTYPED_DECORATOR_LIVE_DEPTH_CAP {
+        return None;
+    }
+    let info = typ.getattr("type").ok()?;
+    let method = info.call_method1("get_method", ("__call__",)).ok()?;
+    if method.is_none() {
+        return Some(false);
+    }
+    let nodes_mod = py.import("mypy.nodes").ok()?;
+    let decorator_cls: &PyType = nodes_mod.getattr("Decorator").ok()?.downcast().ok()?;
+    if method.is_instance(decorator_cls).ok()? {
+        // is_untyped_decorator(method.func.type) or is_untyped_decorator(
+        //     method.var.type); is_untyped_decorator(None) is True, so a
+        // None func.type short-circuits the `or`.
+        let func_type = method.getattr("func").ok()?.getattr("type").ok()?;
+        if func_type.is_none() {
+            return Some(true);
+        }
+        if is_untyped_decorator_live(py, func_type)? {
+            return Some(true);
+        }
+        let var_type = method.getattr("var").ok()?.getattr("type").ok()?;
+        if var_type.is_none() {
+            return Some(true);
+        }
+        return is_untyped_decorator_live(py, var_type);
+    }
+    let method_type = method.getattr("type").ok()?;
+    if method_type.is_none() {
+        // not is_typed_callable(None)
+        return Some(true);
+    }
+    let overloaded_cls: &PyType = types_mod.getattr("Overloaded").ok()?.downcast().ok()?;
+    if method_type.is_instance(overloaded_cls).ok()? {
+        return overloaded_untyped_fold(py, method_type, depth + 1);
+    }
+    let callable_cls: &PyType = types_mod.getattr("CallableType").ok()?.downcast().ok()?;
+    if !method_type.is_instance(callable_cls).ok()? {
+        // is_typed_callable is False outside CallableType.
+        return Some(true);
+    }
+    Some(!is_typed_callable_live(types_mod, method_type, depth + 1)?)
+}
+
+/// The `is_typed_callable` fold of `is_untyped_decorator`, over a live
+/// proper `CallableType` (the isinstance check is the caller's, mirroring
+/// the Python order). A non-unannotated-Any arg/ret or a non-Any type
+/// answers typed; an alias/guard leaf defers (Python's `get_proper_types`
+/// expands it from the live alias node).
+fn is_typed_callable_live(types_mod: &PyModule, c: &PyAny, depth: u32) -> Option<bool> {
+    if depth > UNTYPED_DECORATOR_LIVE_DEPTH_CAP {
+        return None;
+    }
+    let args: &PyList = c.getattr("arg_types").ok()?.downcast().ok()?;
+    let ret = c.getattr("ret_type").ok()?;
+    let any_cls: &PyType = types_mod.getattr("AnyType").ok()?.downcast().ok()?;
+    let alias_cls: &PyType = types_mod.getattr("TypeAliasType").ok()?.downcast().ok()?;
+    let guarded_cls: &PyType = types_mod.getattr("TypeGuardedType").ok()?.downcast().ok()?;
+    let unannotated = types_mod
+        .getattr("TypeOfAny")
+        .ok()?
+        .getattr("unannotated")
+        .ok()?;
+    for t in args.iter().chain(std::iter::once(ret)) {
+        if t.is_instance(any_cls).ok()? {
+            let toa = t.getattr("type_of_any").ok()?;
+            let is_unannotated = toa.eq(unannotated).ok()?;
+            if is_unannotated {
+                continue;
+            }
+            return Some(true);
+        }
+        if t.is_instance(alias_cls).ok()? || t.is_instance(guarded_cls).ok()? {
+            return None;
+        }
+        return Some(true);
+    }
+    Some(false)
 }
 
 // ---------------------------------------------------------------------------

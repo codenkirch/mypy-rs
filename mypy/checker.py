@@ -7662,16 +7662,13 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
                 func_type_bytes = (
                     _serialize_type_for_checker(func.type) if func.type is not None else None
                 )
-                dec_type_bytes = (
-                    # accept() is annotated Type but can return None at runtime
-                    _serialize_type_for_checker(dec_type)
-                    if dec_type is not None  # type: ignore[redundant-expr]
-                    else None
-                )
+                # The decorator side walks the live object: an Instance's
+                # __call__ needs the real TypeInfo.get_method; None means
+                # is_untyped_decorator(None) == True.
                 res = _rust_check_for_untyped_decorator(
                     self.options.disallow_untyped_decorators,
                     func_type_bytes,
-                    dec_type_bytes,
+                    dec_type,
                     bool(self.current_node_deferred),
                 )
             except (AssertionError, NotImplementedError, ValueError, TypeError):
@@ -12073,11 +12070,13 @@ def is_typed_callable(c: Type | None) -> bool:
 def is_untyped_decorator(typ: Type | None) -> bool:
     if typ is not None and _CHECKER_HAS_TYPE_KERNEL and _native_checker_active:
         try:
-            type_bytes = _serialize_type_for_checker(typ)
-            result = _rust_is_untyped_decorator(type_bytes)
+            # Live-PyO3 seam: the Instance arm needs the real
+            # TypeInfo.get_method("__call__"), so the walker takes the
+            # object itself. None defers to the pure-Python body below.
+            result = _rust_is_untyped_decorator(typ)
             if result is not None:
                 return result
-        except (AssertionError, NotImplementedError):
+        except (AssertionError, NotImplementedError, ValueError, TypeError):
             pass
     typ = get_proper_type(typ)
     if not typ:
