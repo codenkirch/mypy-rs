@@ -46,6 +46,7 @@ use crate::subtypes::{
     is_subtype, map_instance_to_supertype, SubtypeContext, CONTRAVARIANT, COVARIANT, INVARIANT,
     VARIANCE_NOT_READY,
 };
+use crate::visitor::has_type_vars_inner;
 
 /// `TypeOfAny.special_form` == 6 (types.py:309). The join/meet shims
 /// build AnyType(special_form) for a whole-result disc 4
@@ -4136,17 +4137,13 @@ pub(crate) fn visit_instance_join(
         return None;
     }
 
-    // join.py:282-290: dispatch mirrors Python's join_instances.
-    // Python uses is_proper_subtype(t, s, ignore_type_params=True) to
-    // decide direction. proper_subtype=True bypasses the
+    // join.py:403 dispatch (args are empty here): Python decides
+    // direction via is_proper_subtype(t, s, ignore_type_params=True);
+    // proper_subtype bypasses the fallback_to_any short-circuit.
 
-    // fallback_to_any short-circuit (subtypes.py:493), which would
-    // wrongly make D <: E when D has fallback_to_any. An
-    // ignore_type_params=True context is used because join_instances
-
-    // ignores type params at this stage (args are empty here anyway).
     let proper_ctx = SubtypeContext {
         proper_subtype: true,
+        ignore_type_params: true,
         ..*ctx
     };
     let t_is_subtype = is_subtype(t, s, &proper_ctx, resolver)?;
@@ -4696,18 +4693,19 @@ fn join_diff_instances_with_args(
     if t_ref == "builtins.object" || s_ref == "builtins.object" {
         return Some(SetOpResult::Object);
     }
-    // join.py:367 dispatch: `t.type.bases and is_proper_subtype(t, s,
-    // ignore_type_params=True)`. The args are ignored, so compare
-    // args-less Instances (mirroring the args-less branch above).
+    // join.py:403 dispatch: Python decides direction with
+    // is_proper_subtype(t, s, ignore_type_params=True) on the FULL
+    // instances (args-less mapping defers on tvar base blobs).
     let t_snap = resolver.get(t_ref)?;
     let proper_ctx = SubtypeContext {
         proper_subtype: true,
+        ignore_type_params: true,
         ..*ctx
     };
-    let t_argsless = mk_wire_instance(t_ref, Vec::new());
-    let s_argsless = mk_wire_instance(s_ref, Vec::new());
+    let t_full = mk_wire_instance(t_ref, t_args.to_vec());
+    let s_full = mk_wire_instance(s_ref, s_args.to_vec());
     let t_lt_s = if !t_snap.bases.is_empty() {
-        is_subtype(&t_argsless, &s_argsless, &proper_ctx, resolver)?
+        is_subtype(&t_full, &s_full, &proper_ctx, resolver)?
     } else {
         false
     };
@@ -4718,8 +4716,6 @@ fn join_diff_instances_with_args(
     } else {
         via_supertype_arg_type(s_ref, s_args, t_ref, t_args, ctx, resolver, seen)?
     };
-    let t_full = mk_wire_instance(t_ref, t_args.to_vec());
-    let s_full = mk_wire_instance(s_ref, s_args.to_vec());
     if result == t_full {
         Some(SetOpResult::SameT)
     } else if result == s_full {
@@ -4784,29 +4780,36 @@ fn via_supertype_arg_type(
     // base_types (join.py:441-456): t's bases + s's protocol bases
     // where t <: base. Map t onto each, recurse, pick the best.
     let mut best: Option<Type> = None;
-    let mut consider = |candidate: &Type| -> Option<()> {
-        let mark = seen.len();
-        let res = join_instances_core(candidate, &s_inst, ctx, resolver, seen);
-        // Python's InstanceJoiner pops (t, s) off seen_instances when a
-        // join_instances call returns; restore that stack discipline so
-        // sibling candidates do not see each other's guard entries.
-        seen.truncate(mark);
-        let res = res?;
-        // Trust only simple sub-results: Encoded/SameTypeWithArgs/
-        // Ancestor reconstructions' MRO tie-break cannot be guaranteed
-        // to match Python (tuple/Sequence mixtures), so defer those.
-        if !matches!(
-            res,
-            SetOpResult::SameS | SetOpResult::SameT | SetOpResult::Object
-        ) {
-            return None;
-        }
-        let res_type = materialize_join(candidate, &s_inst, res, resolver)?;
+    let mut consider = |candidate: &Type, res: SetOpResult| -> Option<()> {
+        // join_instances_core(candidate, s_inst) names its operands
+        // (t=candidate, s=s_inst); materialize_join maps SameS to the
+        // first param and SameT to the second, so order (s_inst, candidate).
+        let res_type = materialize_join(&s_inst, candidate, res, resolver)?;
         if best.is_none() || is_better_join(&res_type, best.as_ref().unwrap(), resolver) {
             best = Some(res_type);
         }
         Some(())
     };
+
+    /// Guard for the base walk: the Rust `map_instance_to_supertype`
+    /// ports `maptype.py`'s plain expand step but not the
+    /// `builtins.tuple` special case in
+    /// `map_instance_to_direct_supertypes` (maptype.py:78-92), which
+    /// expands the class's `tuple_type` and takes `tuple_fallback` when
+    /// it has type vars (why `mypy/maptype.py` gates every
+    /// `builtins.tuple` supertype mapping to Python). Without it a
+    /// generic tuple subclass (e.g. a generic NamedTuple) would map to
+    /// `tuple[Any, ...]` and join away its element type
+    /// (testGenericNamedTupleJoin). Returns `true` when the map would
+    /// diverge for base `builtins.tuple`; `false` otherwise; `None`
+    /// (defer) on an unreadable `tuple_type`.
+    fn tuple_map_diverges(t_ref: &str, resolver: &TypeResolver) -> Option<bool> {
+        let snap = resolver.get(t_ref)?;
+        let Some(tt) = &snap.tuple_type else {
+            return Some(false);
+        };
+        Some(has_type_vars_inner(&decode_type(tt)?))
+    }
 
     for base_blob in &t_snap.bases {
         let base = decode_type(base_blob)?;
@@ -4817,9 +4820,12 @@ fn via_supertype_arg_type(
             // Non-Instance base (e.g. ParamSpec): defer.
             return None;
         };
+        if base_ref == "builtins.tuple" && tuple_map_diverges(t_ref, resolver)? {
+            return None;
+        }
         let mapped_args = map_instance_to_supertype(t_ref, t_args, base_ref, resolver)?;
         let mapped = mk_wire_instance(base_ref, mapped_args);
-        consider(&mapped)?;
+        join_and_consider(&mapped, &s_inst, ctx, resolver, seen, &mut consider)?;
     }
     if let Some(ss) = &s_snap {
         for base_blob in &ss.bases {
@@ -4832,9 +4838,12 @@ fn via_supertype_arg_type(
             };
             if let Some(b_snap) = resolver.get(base_ref) {
                 if b_snap.is_protocol && is_subtype(&t_inst, &base, ctx, resolver)? {
+                    if base_ref == "builtins.tuple" && tuple_map_diverges(t_ref, resolver)? {
+                        return None;
+                    }
                     let mapped_args = map_instance_to_supertype(t_ref, t_args, base_ref, resolver)?;
                     let mapped = mk_wire_instance(base_ref, mapped_args);
-                    consider(&mapped)?;
+                    join_and_consider(&mapped, &s_inst, ctx, resolver, seen, &mut consider)?;
                 }
             }
         }
@@ -4843,10 +4852,29 @@ fn via_supertype_arg_type(
     for pb in &t_snap.promote_bytes {
         let p = decode_type(pb)?;
         if let Type::Instance { .. } = &p {
-            consider(&p)?;
+            join_and_consider(&p, &s_inst, ctx, resolver, seen, &mut consider)?;
         }
     }
     best
+}
+
+/// Sub-join step of the via-supertype base walk: recurse into
+/// `join_instances_core(candidate, s_inst)` with the seen-guard
+/// discipline (Python's InstanceJoiner pops (t, s) when a join returns,
+/// so siblings must not see each other's entries), then hand the
+/// result to `consider`; a None sub-join defers the whole walk.
+fn join_and_consider(
+    candidate: &Type,
+    s_inst: &Type,
+    ctx: &SubtypeContext,
+    resolver: &TypeResolver,
+    seen: &mut SeenInstances,
+    consider: &mut dyn FnMut(&Type, SetOpResult) -> Option<()>,
+) -> Option<()> {
+    let mark = seen.len();
+    let res = join_instances_core(candidate, s_inst, ctx, resolver, seen);
+    seen.truncate(mark);
+    res.and_then(|r| consider(candidate, r))
 }
 
 /// MRO length for `is_better` (join.py:804+). Returns 0 if the
@@ -9726,6 +9754,177 @@ mod tests {
         assert_eq!(join_diff(&s, &t, &r), None);
     }
 
+    #[test]
+    fn via_supertype_subjoin_sameside_result_is_considered() {
+        // Regression for #1314: a sub-join SameS/SameT result must be
+        // considered (join.py:447-450) and materialized in the sub-join's
+        // operand order (s_inst, candidate), not dropped or inverted.
+        let generic = |s: &mut TypeInfoSnapshot| {
+            s.type_vars_with_variance = vec![("T".to_string(), 0, 0)];
+            s.type_var_upper_bounds =
+                vec![encode_type(&instance("builtins.object", vec![])).unwrap()];
+        };
+        let mut b = snap("a.B", "B");
+        generic(&mut b);
+        let mut m = snap("a.M", "M");
+        generic(&mut m);
+        m.bases = vec![encode_type(&instance(
+            "a.B",
+            vec![type_var(1, "a.M", instance("builtins.object", vec![]))],
+        ))
+        .unwrap()];
+        m.mro = vec![
+            "a.M".to_string(),
+            "a.B".to_string(),
+            "builtins.object".to_string(),
+        ];
+        m.has_base = ["a.M", "a.B", "builtins.object"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        let mut c = snap("a.C", "C");
+        generic(&mut c);
+        c.bases = vec![encode_type(&instance(
+            "a.M",
+            vec![type_var(1, "a.C", instance("builtins.object", vec![]))],
+        ))
+        .unwrap()];
+        c.mro = vec![
+            "a.C".to_string(),
+            "a.M".to_string(),
+            "a.B".to_string(),
+            "builtins.object".to_string(),
+        ];
+        c.has_base = ["a.C", "a.M", "a.B", "builtins.object"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        let r = make_resolver(vec![b, m, c]);
+        let int_ty = instance("builtins.int", vec![]);
+        let t = instance("a.C", vec![int_ty.clone()]);
+        let s = instance("a.B", vec![int_ty]);
+        let mut seen: SeenInstances = Vec::new();
+        assert_eq!(
+            join_instances_core(&t, &s, &ctx(true), &r, &mut seen),
+            Some(SetOpResult::SameS)
+        );
+    }
+
+    #[test]
+    fn via_supertype_subjoin_sametypewithargs_result_is_considered() {
+        // Regression for #1314: the old consider whitelist dropped a
+        // SameTypeWithArgs sub-join (the join.py:283-295 Any-arg arm,
+        // disc 4); it must be considered and materialize instead.
+        let generic = |s: &mut TypeInfoSnapshot| {
+            s.type_vars_with_variance = vec![("T".to_string(), 0, 0)];
+            s.type_var_upper_bounds =
+                vec![encode_type(&instance("builtins.object", vec![])).unwrap()];
+        };
+        let mut b = snap("a.B", "B");
+        generic(&mut b);
+        let mut t = snap("a.T", "T");
+        generic(&mut t);
+        t.bases = vec![encode_type(&instance(
+            "a.B",
+            vec![type_var(1, "a.T", instance("builtins.object", vec![]))],
+        ))
+        .unwrap()];
+        t.mro = vec![
+            "a.T".to_string(),
+            "a.B".to_string(),
+            "builtins.object".to_string(),
+        ];
+        t.has_base = ["a.T", "a.B", "builtins.object"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        let obj = snap("builtins.object", "object");
+        let r = make_resolver(vec![obj, b, t]);
+        let any = Type::AnyType {
+            type_of_any: TYPE_OF_ANY_SPECIAL_FORM,
+            source_any: None,
+            missing_import_name: None,
+        };
+        let join_t = instance("a.T", vec![instance("builtins.int", vec![])]);
+        let s = instance("a.B", vec![any.clone()]);
+        let mut seen: SeenInstances = Vec::new();
+        let result = join_instances_core(&join_t, &s, &ctx(true), &r, &mut seen);
+        let Some(SetOpResult::Encoded(bytes)) = result else {
+            panic!("expected Encoded, got {result:?}");
+        };
+        // The encoded result is Instance(a.B, [Any(from_another_any,
+        // source=the original special-form Any)]), neither operand.
+        let mut rbuf = ReadBuffer::new(&bytes);
+        let decoded = wire::read_type(&mut rbuf, None).expect("decode failed");
+        let expected = Type::Instance {
+            type_ref: "a.B".to_string(),
+            args: vec![Type::AnyType {
+                type_of_any: TYPE_OF_ANY_FROM_ANOTHER_ANY,
+                source_any: Some(Box::new(any)),
+                missing_import_name: None,
+            }],
+            last_known_value: None,
+            extra_attrs: None,
+        };
+        assert_eq!(decoded, expected);
+    }
+
+    /// Regression for #1317 (testGenericNamedTupleJoin): the
+    /// via-supertype base walk must defer when it maps a class whose
+    /// `tuple_type` carries type vars onto `builtins.tuple` (the
+    /// Rust map lacks maptype.py's tuple_fallback special case, so
+    /// the sub-join would collapse the element type to
+    /// tuple[Any, ...]; Python produces tuple[int, ...]).
+    #[test]
+    fn via_supertype_generic_tuple_type_base_defers() {
+        let mut nt = snap("a.NT", "NT");
+        nt.is_named_tuple = true;
+        nt.type_vars_with_variance = vec![("T".to_string(), 1, 0)];
+        nt.type_var_upper_bounds = vec![encode_type(&instance("builtins.object", vec![])).unwrap()];
+        nt.tuple_type = Some(
+            encode_type(&Type::TupleType {
+                items: vec![type_var(1, "a.NT", instance("builtins.object", vec![]))],
+                partial_fallback: Box::new(instance("builtins.tuple", vec![])),
+                implicit: false,
+            })
+            .unwrap(),
+        );
+        nt.bases = vec![encode_type(&instance(
+            "builtins.tuple",
+            vec![Type::UnpackType {
+                typ: Box::new(Type::TupleType {
+                    items: vec![Type::AnyType {
+                        type_of_any: TYPE_OF_ANY_SPECIAL_FORM,
+                        source_any: None,
+                        missing_import_name: None,
+                    }],
+                    partial_fallback: Box::new(instance("builtins.tuple", vec![])),
+                    implicit: false,
+                }),
+            }],
+        ))
+        .unwrap()];
+        let mut tuple_snap = snap("builtins.tuple", "tuple");
+        tuple_snap.has_type_var_tuple_type = true;
+        tuple_snap.type_var_tuple_prefix = Some(0);
+        tuple_snap.type_var_tuple_suffix = Some(0);
+        let obj = snap("builtins.object", "object");
+        let int_snap = snap("builtins.int", "int");
+        let r = make_resolver(vec![obj, int_snap, tuple_snap, nt]);
+        let nt_i = instance("a.NT", vec![instance("builtins.int", vec![])]);
+        let tuple_i = instance(
+            "builtins.tuple",
+            vec![Type::UnpackType {
+                typ: Box::new(Type::TupleType {
+                    items: vec![instance("builtins.int", vec![])],
+                    partial_fallback: Box::new(instance("builtins.tuple", vec![])),
+                    implicit: false,
+                }),
+            }],
+        );
+        assert_eq!(join_diff(&tuple_i, &nt_i, &r), None);
+    }
+
     fn encode_type(typ: &Type) -> Option<Vec<u8>> {
         let mut wbuf = WriteBuffer::new();
         wire::write_type(&mut wbuf, typ).ok()?;
@@ -9736,9 +9935,7 @@ mod tests {
     fn test_reconstruct_disc4_arg_wire_roundtrip_from_another_any() {
         // The disc-4 arm builds the arg Any raw (write_int on
         // type_of_any), so it must decode as TypeOfAny.from_another_any
-        // == 7 (types.py:311), matching join.py:283-295. AnyType
-        // requires a source for that member (types.py:1412), so the
-        // arm must pick the AnyType side as source_any.
+        // == 7 with source_any set (types.py:311, :1412, join.py:283-295).
         let any = Type::AnyType {
             type_of_any: TYPE_OF_ANY_SPECIAL_FORM,
             source_any: None,
