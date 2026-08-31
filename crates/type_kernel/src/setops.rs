@@ -58,6 +58,22 @@ const TYPE_OF_ANY_SPECIAL_FORM: i64 = 6;
 /// (join.py:131-135, :282-295, pure body join.py:335-338).
 const TYPE_OF_ANY_FROM_ANOTHER_ANY: i64 = 7;
 
+/// Reconstruct the disc-4 sink Any: `AnyType(TypeOfAny.from_another_any,
+/// source_any=<the Any operand>)`. One shared shape for the join / meet /
+/// solve SetOpResult reconstruct paths and the disc-4 arms classification
+/// (issues #1272, #1274, #1280). The arg-reconstruction sites pass None;
+/// the solve Any-absorption sink preserves the source Any's value.
+pub(crate) fn reconstruct_any_from_another(
+    source: &Type,
+    missing_import_name: Option<String>,
+) -> Type {
+    Type::AnyType {
+        type_of_any: TYPE_OF_ANY_FROM_ANOTHER_ANY,
+        source_any: Some(Box::new(source.clone())),
+        missing_import_name,
+    }
+}
+
 /// Discriminator for `trivial_join` / `trivial_meet` / `join_types`
 /// results.
 ///
@@ -881,18 +897,14 @@ fn reconstruct_args_from_discs(arg_discs: &[i8], s_args: &[Type], t_args: &[Type
         .map(|(i, d)| match d {
             0 => s_args[i].clone(),
             1 => t_args[i].clone(),
-            4 => {
-                let src = if matches!(t_args[i], Type::AnyType { .. }) {
-                    t_args[i].clone()
+            4 => reconstruct_any_from_another(
+                if matches!(t_args[i], Type::AnyType { .. }) {
+                    &t_args[i]
                 } else {
-                    s_args[i].clone()
-                };
-                Type::AnyType {
-                    type_of_any: TYPE_OF_ANY_FROM_ANOTHER_ANY,
-                    source_any: Some(Box::new(src)),
-                    missing_import_name: None,
-                }
-            }
+                    &s_args[i]
+                },
+                None,
+            ),
             _ => s_args[i].clone(),
         })
         .collect()
@@ -3562,11 +3574,7 @@ fn reconstruct_instance_from_args(
                 } else {
                     s_args.get(i)?
                 };
-                args.push(Type::AnyType {
-                    type_of_any: TYPE_OF_ANY_FROM_ANOTHER_ANY,
-                    source_any: Some(Box::new(src.clone())),
-                    missing_import_name: None,
-                })
+                args.push(reconstruct_any_from_another(src, None))
             }
             _ => return None,
         }
@@ -4305,12 +4313,7 @@ fn visit_instance_with_args(
             } else {
                 sa
             };
-            joined_args.push(Type::AnyType {
-                // TypeOfAny.from_another_any (types.py:311).
-                type_of_any: TYPE_OF_ANY_FROM_ANOTHER_ANY,
-                source_any: Some(Box::new(src.clone())),
-                missing_import_name: None,
-            });
+            joined_args.push(reconstruct_any_from_another(src, None));
             continue;
         }
 

@@ -15,7 +15,7 @@
 use pyo3::prelude::*;
 
 use crate::checkmember::{decode_type, encode_type};
-use crate::setops::{make_simplified_union, meet_types, SetOpResult};
+use crate::setops::{make_simplified_union, meet_types, reconstruct_any_from_another, SetOpResult};
 use crate::subtypes::SubtypeContext;
 use crate::typeinfo::NativeTypeResolver;
 use crate::wire::Type;
@@ -24,11 +24,6 @@ use crate::wire::Type;
 /// (types.py:309); the join/meet shims build AnyType(special_form) for
 /// a whole-result disc 4 (join.py:241, meet.py:194).
 const TYPE_OF_ANY_SPECIAL_FORM: i64 = 6;
-
-/// `TypeOfAny.from_another_any` == 7. The source is the Any operand
-/// (types.py:311); the join body builds this for a per-arg disc 4
-/// (join.py:131-135, :282-295, pure body join.py:335-338).
-const TYPE_OF_ANY_FROM_ANOTHER_ANY: i64 = 7;
 
 /// Convert a `SetOpResult` from `meet_types` back into a concrete `Type`.
 /// Mirrors the inline conversion in `setops.rs` (around line 672).
@@ -87,18 +82,14 @@ fn reconstruct_args_from_discs(arg_discs: &[i8], s_args: &[Type], t_args: &[Type
         .map(|(i, d)| match d {
             0 => s_args[i].clone(),
             1 => t_args[i].clone(),
-            4 => {
-                let src = if matches!(t_args[i], Type::AnyType { .. }) {
-                    t_args[i].clone()
+            4 => reconstruct_any_from_another(
+                if matches!(t_args[i], Type::AnyType { .. }) {
+                    &t_args[i]
                 } else {
-                    s_args[i].clone()
-                };
-                Type::AnyType {
-                    type_of_any: TYPE_OF_ANY_FROM_ANOTHER_ANY,
-                    source_any: Some(Box::new(src)),
-                    missing_import_name: None,
-                }
-            }
+                    &s_args[i]
+                },
+                None,
+            ),
             _ => s_args[i].clone(),
         })
         .collect()
@@ -354,6 +345,8 @@ pub(crate) fn rust_or_conditional_maps(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const TYPE_OF_ANY_FROM_ANOTHER_ANY: i64 = 7;
 
     fn any() -> Type {
         Type::AnyType {

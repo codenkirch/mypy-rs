@@ -15,7 +15,7 @@ use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyFrozenSet, PyList, PyModule, PyString, PyTuple, PyType};
 
 use crate::operators::is_operator_method_name;
-use crate::setops::is_type_obj_callable;
+use crate::setops::{is_type_obj_callable, reconstruct_any_from_another};
 use crate::typeinfo::{NativeTypeResolver, TypeResolver};
 use crate::wire::{read_type, write_type, LiteralValue, ReadBuffer, Type, WriteBuffer};
 
@@ -26,23 +26,16 @@ use crate::wire::{read_type, write_type, LiteralValue, ReadBuffer, Type, WriteBu
 /// `TypeOfAny.special_form` == 6. Special forms are not real Any types.
 const TYPE_OF_ANY_SPECIAL_FORM: i64 = 6;
 
-/// `TypeOfAny.from_another_any` == 7. The source is the Any operand.
-const TYPE_OF_ANY_FROM_ANOTHER_ANY: i64 = 7;
-
 /// Same-type-with-args join disc 4: the joined arg is
 /// `AnyType(from_another_any, <Any side>)`, t-preferred
 /// (join.py:131-135, :282-295, :335-338); s verbatim when t is not Any.
 fn joined_arg_any(src_s: &Type, src_t: &Type) -> Type {
     let src = if matches!(src_t, Type::AnyType { .. }) {
-        src_t.clone()
+        src_t
     } else {
-        src_s.clone()
+        src_s
     };
-    Type::AnyType {
-        type_of_any: TYPE_OF_ANY_FROM_ANOTHER_ANY,
-        source_any: Some(Box::new(src)),
-        missing_import_name: None,
-    }
+    reconstruct_any_from_another(src, None)
 }
 
 /// `TypeOfAny.unannotated` == 1.

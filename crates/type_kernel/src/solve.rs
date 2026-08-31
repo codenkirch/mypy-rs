@@ -15,7 +15,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use pyo3::prelude::*;
 
 use crate::constraints::Constraint;
-use crate::setops::{self, SetOpResult};
+use crate::setops::{self, reconstruct_any_from_another, SetOpResult};
 use crate::subtypes::{self, SubtypeContext};
 use crate::typeinfo::NativeTypeResolver;
 use crate::wire::{self, ReadBuffer, Type, WriteBuffer};
@@ -136,11 +136,7 @@ pub(crate) fn solve_one_inner(
             } => missing_import_name.clone(),
             _ => None,
         };
-        let any = Type::AnyType {
-            type_of_any: 7, // TypeOfAny.from_another_any
-            source_any: Some(Box::new(source)),
-            missing_import_name,
-        };
+        let any = reconstruct_any_from_another(&source, missing_import_name);
         return Some((3, encode_type(&any)));
     }
 

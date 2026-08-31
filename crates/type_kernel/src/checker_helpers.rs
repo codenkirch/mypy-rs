@@ -42,6 +42,7 @@
 use pyo3::prelude::*;
 use pyo3::types::PyList;
 
+use crate::setops::reconstruct_any_from_another;
 use crate::subtypes::SubtypeContext;
 use crate::typeinfo::{serialize_type_to_bytes, NativeTypeResolver, TypeResolver};
 use crate::visitor::has_type_vars_inner;
@@ -664,8 +665,6 @@ pub(crate) fn rust_restrict_subtype_away(
 
 /// `TypeOfAny.special_form` (mypy/type_visitor.py / types.py:2682).
 const TYPE_OF_ANY_SPECIAL_FORM: i64 = 6;
-/// `TypeOfAny.from_another_any` == 7 (types.py:237).
-const TYPE_OF_ANY_FROM_ANOTHER_ANY: i64 = 7;
 
 /// `mypy.join.join_type_list` (join.py:1508-1529): fold-join over a
 /// list, pairing each item with the accumulator through the setops join
@@ -821,18 +820,14 @@ fn join_one_pair(
                     // Disc 4: AnyType arg -> AnyType(7, Any side)
                     // (join.py:335-338, shim join.py:283-295); t-preferred,
                     // s verbatim when t is not Any. Other discs defer.
-                    4 => {
-                        let src = if matches!(r_args[i], Type::AnyType { .. }) {
-                            r_args[i].clone()
+                    4 => Some(reconstruct_any_from_another(
+                        if matches!(r_args[i], Type::AnyType { .. }) {
+                            &r_args[i]
                         } else {
-                            l_args[i].clone()
-                        };
-                        Some(Type::AnyType {
-                            type_of_any: TYPE_OF_ANY_FROM_ANOTHER_ANY,
-                            source_any: Some(Box::new(src)),
-                            missing_import_name: None,
-                        })
-                    }
+                            &l_args[i]
+                        },
+                        None,
+                    )),
                     _ => None,
                 })
                 .collect();
@@ -912,11 +907,7 @@ fn map_core_result(res: crate::setops::SetOpResult, left: &Type, right: &Type) -
                             } else {
                                 return None;
                             };
-                            Some(Type::AnyType {
-                                type_of_any: TYPE_OF_ANY_FROM_ANOTHER_ANY,
-                                source_any: Some(Box::new(src.clone())),
-                                missing_import_name: None,
-                            })
+                            Some(reconstruct_any_from_another(src, None))
                         }
                         _ => None,
                     }
@@ -1833,6 +1824,8 @@ mod tests {
     use super::*;
     use crate::aliases::TypeAliasResolver;
     use crate::typeinfo::{TypeInfoSnapshot, TypeResolver};
+
+    const TYPE_OF_ANY_FROM_ANOTHER_ANY: i64 = 7;
 
     fn make_instance(type_ref: &str, args: Vec<Type>) -> Type {
         Type::Instance {
