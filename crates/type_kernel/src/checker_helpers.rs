@@ -3211,9 +3211,9 @@ mod tests {
                             ..
                         },
                     ) => {
-                        assert_eq!(*toa0, 7);
+                        assert_eq!(*toa0, TYPE_OF_ANY_FROM_ANOTHER_ANY);
                         assert_eq!(src0.as_ref().unwrap().as_ref(), &any_left);
-                        assert_eq!(*toa1, 7);
+                        assert_eq!(*toa1, TYPE_OF_ANY_FROM_ANOTHER_ANY);
                         assert_eq!(src1.as_ref().unwrap().as_ref(), &any_right);
                     }
                     other => panic!("expected AnyType args, got {other:?}"),
