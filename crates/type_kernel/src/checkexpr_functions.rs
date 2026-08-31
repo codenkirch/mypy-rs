@@ -1626,7 +1626,7 @@ fn is_typed_callable_live(types_mod: &PyModule, c: &PyAny, depth: u32) -> Option
 /// `mypy.checker.is_typeddict_type_context` — whether the type is a
 /// TypedDictType (used as a type context for TypedDict construction).
 ///
-/// Mirrors `is_typeddict_type_context` (checker.py:9978-9988). Expands
+/// Mirrors `is_typeddict_type_context` (checker.py). Expands
 /// TypeAliasType via the alias resolver like `rust_is_type_type_context`;
 /// defers only when the alias snapshot is missing or its chain cycles.
 #[pyfunction]
