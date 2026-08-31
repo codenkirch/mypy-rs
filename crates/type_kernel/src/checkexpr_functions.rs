@@ -1523,9 +1523,8 @@ fn overloaded_untyped_fold(py: Python<'_>, typ: &PyAny, depth: u32) -> Option<bo
     }
     let items: &PyList = typ.getattr("items").ok()?.downcast().ok()?;
     for item in items.iter() {
-        match is_untyped_decorator_live(py, item)? {
-            true => return Some(true),
-            false => {}
+        if is_untyped_decorator_live(py, item)? {
+            return Some(true);
         }
     }
     Some(false)
