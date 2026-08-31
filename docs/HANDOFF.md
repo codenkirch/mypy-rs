@@ -1,6 +1,6 @@
 # Handoff: strangler-fig Rust migration loop (seam-deferral reduction)
 
-*Written 2026-08-28, refreshed 2026-08-31 (post-survey12, #1274
+*Written 2026-08-28, refreshed 2026-08-31 (post-survey13, #1284 + #1286
 merged). Goal:
 "migrate all python code to rust, really all" — pursued as the
 established measure -> file -> dispatch-2-agents -> process-PRs -> gate
@@ -8,39 +8,42 @@ loop. This file is the resume point.*
 
 ## Where main stands
 
-- `main` = `c4dabfa83` (`fix(type_kernel): correct type_of_any
-  literals at join/meet/solve Any sinks (#1271) (#1274)`), local ff'd
-  to origin.
-- Gates on clean main: self-check clean (survey12 run: 345 files 0
-  issues); cargo test green (2,416 passed on the #1274 pre-merge runs).
-- Shared `.so` set rebuilt + codesigned at `c4dabfa83` content
-  (`/private/tmp/mypy-rs-local-typekernel|resolver|ast`; type_kernel
-  built from the #1274 branch tip, byte-identical tree). Rebuild before
-  the next survey (procedure under "The loop").
-- Last survey (survey12, worktree at the #1274 tip): 5,131,412 seam
-  calls, 3,349 fallbacks (0.07% defer) — survey11 was 5,131 (0.1%), so
-  the wave cut fallbacks ~35%. Residual <97% pools by absolute
-  fallbacks (calls x (1 - native%)):
-  is_subtype 29,637 @ 95% (~1,482; flat by design, #1256 precedent),
-  analyze_member_access 12,015 @ 89% (1,322),
-  check_overload_call 13,125 @ 95% (656),
-  analyze_instance_member_access 689 @ 17% (572),
-  callables_compatible 503 @ 1% (498),
-  expand_type_by_instance 1,010 @ 56% (444),
-  type_object_type_from_function 1,797 @ 84% (288),
-  is_overlapping_types 2,834 @ 90% (283),
-  are_parameters_compatible 459 @ 44% (257),
-  infer_function_type_arguments 518 @ 55% (233).
+- `main` = `6d5b0c473` (`perf(type_kernel): narrow IAMA freeze
+  survivor gate (17% -> 92% native) (#1286)`), local ff'd to origin.
+- Gates on clean main: self-check clean (survey13 sanity run: 200
+  files 0 issues; testtypes 2955 passed / 3 skipped); cargo test
+  green.
+- Shared `.so` set rebuilt + codesigned at `6d5b0c473` content
+  (`/private/tmp/mypy-rs-local-typekernel|resolver|ast`). Rebuild
+  before the next survey (procedure under "The loop").
+- Last survey (survey13, main checkout at `6d5b0c473`): 5,134,951 seam
+  calls, 1,299 fallbacks (0.03% defer) — survey12 was 5,131,412 / 3,349
+  (0.07%), so the wave cut fallbacks ~61%. Residual <98% pools by
+  absolute fallbacks (calls x (1 - native%)):
+  is_subtype 29,502 @ 95% (~1,475; #1276 filed),
+  analyze_member_access 12,030 @ 89% (1,323; #1288 filed),
+  is_valid_inferred_type 17,913 @ 96% (716),
+  check_overload_call 13,132 @ 95% (656),
+  replace_meta_vars 21,410 @ 97% (642),
+  narrow_declared_type 29,127 @ 98% (582),
+  expand_type_by_instance 995 @ 55% (448; #1289 filed),
+  conditional_types 9,617 @ 96% (385),
+  find_self_type 35,426 @ 99% (354),
+  and_conditional_maps 8,143 @ 96% (326).
   is_subtype_batch's 211% line is a kernel-boundary counting artifact;
   discount it (see survey caveat below).
-- Wave wins (survey11 -> survey12): classify_unbound_front 1,095
-  defers @ 89% -> 9,960 @ 100% (0 defers, #1267); join_type_list
-  904 @ 64% -> 74 @ 28% (~53 defers; basis changed with the #1270
-  core-routing, see "In flight: #1266"); infer_constraints_full 213
-  @ 99% held; solve_generic_call 245 @ 97% held.
-- Post-survey12 win: analyze_unbound_without_info 574 @ 19% (466
-  defer buckets tail:Var 310 / tail:FuncLike 119 / tvar_rejected 22 /
-  tail:MypyFile 14 / type_type_any 1) -> 570 @ 100% (0 defers, #1278).
+- Wave wins (survey12 -> survey13): callables_compatible 503 @ 1%
+  (498 defers) -> 489 calls @ 91% (shakeout of the SubtypeVisitor
+  normalization bootstrap, #1283); analyze_unbound_without_info 574
+  @ 19% -> 570 @ 100% (0 defers, #1284); re-survey
+  analyze_instance_member_access: freeze-survivor gate narrowed,
+  dispatch seam 93,270 @ 100%, residual access 335 calls @ 34% (#1286;
+  pristine-share widening rejected post-merge as an incorrectness
+  risk, see #1286 PR body). analyze_unbound_type_without_type_info
+  reached 100%.
+- In flight: wave13 agents dispatched on #1288 (member-access residual
+  audit-port) and #1289 (expand_type_by_instance residual
+  audit-port); resume points in the session log.
 - Runner/OCR note: the repo's ephemeral runner cannot re-register (403,
   admin-blocked; #1249 open). OCR gates stay `queued` forever; use the
   local fallback (`ocr review --from <merge-base> --to <head> --format
@@ -50,22 +53,23 @@ loop. This file is the resume point.*
   review` needs ~6-8 min for a 7-file range and dies silently when its
   parent shell is reaped; resume recovers in-place.
 
-## Recent merges (since 2026-08-31 refresh)
+## Recent merges (since survey12 refresh)
 
 | PR | Issue | What | Numbers |
 |----|-------|------|---------|
-| #1267 | #1265 | unbound-tvar front decided natively under allow_unbound_tvars | classify_unbound_front 1,095 defers @ 89% -> 0 (9,960 @ 100%) |
-| #1268 | #1262 | erase_typevars make_any emits TypeOfAny.special_form (6), not the bogus 12 | ~5 literals + round-trip test; #1262 closed |
-| #1270 | #1266 | join_type_list defers route through the InstanceJoiner core (round 1) | join_type_list basis rebuilt; pair/lkv defers now join_instances_core |
-| #1272 | #1269 | join disc-4 arm emits TypeOfAny.from_another_any (7) | first 7-at-sink fix |
-| #1274 | #1271 | all remaining reachable Any-reconstruction sinks emit correct type_of_any (6/7+source); solve.rs expand_actual_arg fallbacks 5 | survey12: 5,131 fallbacks -> 3,349 (0.07%); two local OCR rounds (16 findings: 11 fixed, 5 acknowledged) |
+| #1283 | #1279 | callables_compatible via is_callable_compat kernel | 503 @ 1% -> 489 calls @ 91% |
+| #1284 | #1278 | analyze_unbound_without_info tail table decided natively | 574 @ 19% -> 570 @ 100% (0 defers) |
+| #1286 | #1277 | IAMA freeze-survivor gate narrowed to meta_level == 0 | dispatch seam 93,270 @ 100%; access residual 335 @ 34% |
 
 Discovered during the wave, not yet fixed:
 
-- (none — #1262 was fixed by #1268; the #1274 OCR rounds' residual
-  is the disc-4 helper quadruplication across setops/condmaps/
-  checker_helpers/checkexpr_functions, acknowledged in the PR body,
-  unfiled)
+- #1287 (filed): TEST_NATIVE_* parity-off env vars don't disable all
+  seams while a type-kernel `.so` is importable; gate-off differential
+  runs silently stay native. Sibling env trap #1285 is open too.
+- #1280 (filed): disc-4 AnyType-reconstruction helper duplicated
+  across setops/condmaps/checker_helpers/checkexpr (was the #1274
+  acknowledged cleanup; now tracked).
+- join_type_list round 3 walls remain at 74 @ 28% (#1281 filed).
 
 ## Closed: #1266 (join_type_list round 2) history and residual walls
 
@@ -177,31 +181,31 @@ and stashes are pre-existing — leave them.
 
 ## Open backlog (next waves; dispatch max ~2 port agents)
 
-1. **is_subtype tail (~1,482 defers @ 95%)** — the largest remaining
-   bucket. The protoR defers are dominated by
-   `get_protocol_member_inner` deferrals (extra_attrs, base-class
-   members behind the same-class guard, descriptors). Unfiled — file
-   an issue with these numbers before dispatching.
-2. **#1115** — build-side decode lifecycle; bigger slice crossing
+1. **#1276 (filed)** — is_subtype protoR residual (~1,475 @ 95%),
+   get_protocol_member_inner deferrals dominate. Largest bucket.
+2. **#1288 (filed, IN FLIGHT with wave13)** — analyze_member_access
+   residual audit-port (1,323 @ 89%). The CallableType/Overloaded tail
+   still belongs to #342 mega-port long-term; this round is audit +
+   decidable-leaf ports only.
+3. **#1289 (filed, IN FLIGHT with wave13)** — expand_type_by_instance
+   residual audit-port (448 @ 55%); check #1113 precedent before
+   chasing structural walls.
+4. **#1115** — build-side decode lifecycle; bigger slice crossing
    semanal/worker build paths; needs careful daemon/cache parity assessment.
-3. **#342** — analyze_class_attribute_access mega-port (owns the
-   member_access CallableType/Overloaded tail; also the natural home
-   for the analyze_member_access 1,322 @ 89% residual — audit-first).
-4. Next-wave queue from survey12 (file issues with these numbers, then
-   dispatch ~2):
-   - **analyze_instance_member_access 689 @ 17%** (572 defers).
-   - **callables_compatible 503 @ 1%** (498 defers; low volume but
-     near-total defer).
-   - Then: expand_type_by_instance 1,010 @ 56% (#1113 buckets
-     structural — check the precedent first),
-     infer_function_type_arguments 518 @ 55%,
-     are_parameters_compatible 459 @ 44%,
-     type_object_type_from_function 1,797 @ 84%,
-     is_overlapping_types 2,834 @ 90%.
-   - Also: the #1274 residual disc-4 helper convergence (pub(crate)
-     helper across setops/condmaps/checker_helpers/checkexpr) — good
-     small cleanup PR, not a port.
-5. After the above, re-survey.
+5. **#342** — analyze_class_attribute_access mega-port (owns the
+   member_access CallableType/Overloaded tail; audit-first).
+6. Next-wave queue from survey13 (file issues with these numbers,
+   then dispatch ~2):
+   - is_valid_inferred_type 17,913 @ 96% (716).
+   - check_overload_call 13,132 @ 95% (656).
+   - Then: replace_meta_vars 21,410 @ 97% (642),
+     narrow_declared_type 29,127 @ 98% (582),
+     conditional_types 9,617 @ 96% (385),
+     are_parameters_compatible 459 @ 44% (survey12; re-measure),
+     type_object_type_from_function 1,798 @ 84% (287),
+     is_overlapping_types 2,835 @ 90% (283),
+     infer_function_type_arguments 519 @ 55% (233).
+   - Also: #1280 disc-4 helper convergence (cleanup PR, not a port).
 
 ## The loop (how to continue)
 
