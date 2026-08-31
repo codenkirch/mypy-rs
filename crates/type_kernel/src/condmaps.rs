@@ -397,7 +397,11 @@ mod tests {
         // t (right) preferred (join.py:131-135, :282-295, :335-338).
         let s_inst = inst();
         let t_any = any();
-        let out = reconstruct_args_from_discs(&[4], &[s_inst.clone()], &[t_any.clone()]);
+        let out = reconstruct_args_from_discs(
+            &[4],
+            std::slice::from_ref(&s_inst),
+            std::slice::from_ref(&t_any),
+        );
         match &out[0] {
             Type::AnyType {
                 type_of_any,
@@ -411,7 +415,11 @@ mod tests {
         }
         // Non-Any t and s sides: source is the s operand verbatim
         // (join.py:285-294 wraps s when t is not Any).
-        let out = reconstruct_args_from_discs(&[4], &[s_inst.clone()], &[s_inst.clone()]);
+        let out = reconstruct_args_from_discs(
+            &[4],
+            std::slice::from_ref(&s_inst),
+            std::slice::from_ref(&s_inst),
+        );
         match &out[0] {
             Type::AnyType {
                 type_of_any,

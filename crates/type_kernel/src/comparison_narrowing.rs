@@ -281,9 +281,11 @@ mod tests {
     fn test_type_object_not_narrowable() {
         // callable with a builtins.type fallback = a type object.
         let mut resolver = TypeResolver::new();
-        let mut snap = TypeInfoSnapshot::default();
-        snap.fullname = "builtins.type".to_string();
-        snap.name = "type".to_string();
+        let mut snap = TypeInfoSnapshot {
+            fullname: "builtins.type".to_string(),
+            name: "type".to_string(),
+            ..Default::default()
+        };
         snap.has_base.insert("builtins.type".to_string());
         resolver.insert("builtins.type".to_string(), snap);
         let types = vec![callable(instance("builtins.object"), "builtins.type")];
@@ -298,9 +300,11 @@ mod tests {
         // A plain function (fallback builtins.function) is not a type
         // object, so the operand stays narrowable.
         let mut resolver = TypeResolver::new();
-        let mut snap = TypeInfoSnapshot::default();
-        snap.fullname = "builtins.function".to_string();
-        snap.name = "function".to_string();
+        let snap = TypeInfoSnapshot {
+            fullname: "builtins.function".to_string(),
+            name: "function".to_string(),
+            ..Default::default()
+        };
         resolver.insert("builtins.function".to_string(), snap);
         let types = vec![callable(instance("builtins.object"), "builtins.function")];
         assert_eq!(
@@ -313,9 +317,11 @@ mod tests {
     fn test_typeobj_uninhabited_ret_narrowable() {
         // is_type_obj() is False when ret_type is UninhabitedType.
         let mut resolver = TypeResolver::new();
-        let mut snap = TypeInfoSnapshot::default();
-        snap.fullname = "builtins.type".to_string();
-        snap.name = "type".to_string();
+        let mut snap = TypeInfoSnapshot {
+            fullname: "builtins.type".to_string(),
+            name: "type".to_string(),
+            ..Default::default()
+        };
         snap.has_base.insert("builtins.type".to_string());
         resolver.insert("builtins.type".to_string(), snap);
         let types = vec![callable(
@@ -349,9 +355,11 @@ mod tests {
     fn test_overloaded_typeobj_not_narrowable() {
         // Overloaded.is_type_obj() = items[0].is_type_obj().
         let mut resolver = TypeResolver::new();
-        let mut snap = TypeInfoSnapshot::default();
-        snap.fullname = "builtins.type".to_string();
-        snap.name = "type".to_string();
+        let mut snap = TypeInfoSnapshot {
+            fullname: "builtins.type".to_string(),
+            name: "type".to_string(),
+            ..Default::default()
+        };
         snap.has_base.insert("builtins.type".to_string());
         resolver.insert("builtins.type".to_string(), snap);
         let types = vec![Type::Overloaded {
@@ -439,9 +447,11 @@ mod tests {
         // Expanding to a type-object callable with a builtins.type fallback
         // is not narrowable.
         let mut resolver = TypeResolver::new();
-        let mut snap = TypeInfoSnapshot::default();
-        snap.fullname = "builtins.type".to_string();
-        snap.name = "type".to_string();
+        let mut snap = TypeInfoSnapshot {
+            fullname: "builtins.type".to_string(),
+            name: "type".to_string(),
+            ..Default::default()
+        };
         snap.has_base.insert("builtins.type".to_string());
         resolver.insert("builtins.type".to_string(), snap);
         let aliases = alias_resolver(
@@ -536,7 +546,7 @@ mod tests {
     #[test]
     fn test_wire_round_trip() {
         // The #[pyfunction] path decodes wire bytes before classifying.
-        let types = vec![instance("builtins.int"), instance("builtins.str")];
+        let types = [instance("builtins.int"), instance("builtins.str")];
         let wires: Vec<Vec<u8>> = types
             .iter()
             .map(|t| crate::checkmember::encode_type(t).unwrap())

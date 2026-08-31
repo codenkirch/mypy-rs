@@ -432,19 +432,31 @@ pub(crate) fn rust_has_custom_eq_checks(
 /// else `t`.
 ///
 /// Returns `Some(Type)` (result type) or `None` (defer to Python).
+///
+/// Alias operands: Python's get_proper_type (subtypes.py:2996) and the
+/// covers_at_runtime internal get_proper_type both expand a top-level
+/// alias before decisions; the pass-through result stays the original t.
 pub(crate) fn restrict_subtype_away_inner(
     t: &Type,
     s: &Type,
     consider_runtime_isinstance: bool,
     strict_optional: bool,
     resolver: &TypeResolver,
+    aliases: &crate::aliases::TypeAliasResolver,
 ) -> Option<Type> {
-    let p_t = get_proper_or_none(t)?;
+    let p_t_owned;
+    let p_t: &Type = match t {
+        Type::TypeAliasType { .. } => {
+            p_t_owned = crate::checkexpr_functions::get_proper_or_expand(t, aliases)?;
+            &p_t_owned
+        }
+        _ => t,
+    };
 
     match p_t {
         Type::UnionType { items, .. } => {
             // try_restrict_literal_union first.
-            let restricted = try_restrict_literal_union(t, s, strict_optional, resolver);
+            let restricted = try_restrict_literal_union(p_t, s, strict_optional, resolver);
             let new_items: Vec<Type> = if let Some(remaining_blobs) = restricted {
                 let mut decoded = Vec::with_capacity(remaining_blobs.len());
                 for blob in &remaining_blobs {
@@ -464,6 +476,7 @@ pub(crate) fn restrict_subtype_away_inner(
                         consider_runtime_isinstance,
                         strict_optional,
                         resolver,
+                        aliases,
                     )?;
                     result.push(restricted_item);
                 }
@@ -483,6 +496,7 @@ pub(crate) fn restrict_subtype_away_inner(
                 consider_runtime_isinstance,
                 strict_optional,
                 resolver,
+                aliases,
             )?;
             // copy_modified(upper_bound=restricted). The wire format
             // stores all TypeVarType fields; we clone and swap the
@@ -516,11 +530,11 @@ pub(crate) fn restrict_subtype_away_inner(
         }
         _ => {
             if consider_runtime_isinstance {
-                // Route through the newer covers_at_runtime module: it adds
-                // tuple-operand deferrals that fix a latent parity bug
-                // (old Rust answered Some(false) where Python answers True).
+                // Python passes the raw t into covers_at_runtime, which
+                // get_proper_types both operands internally
+                // (subtypes.py:3041-3042); decisions run on the expanded form.
                 match crate::covers_at_runtime::covers_at_runtime_inner(
-                    t,
+                    p_t,
                     s,
                     strict_optional,
                     resolver,
@@ -528,7 +542,7 @@ pub(crate) fn restrict_subtype_away_inner(
                     Some(true) => Some(Type::UninhabitedType { ambiguous: false }),
                     // covers_at_runtime returns Some(false) only when every
                     // modeled check is confident (subtypes.py covers steps
-                    // 1-6), so the Python result is `t`.
+                    // 1-6), so the Python result is the ORIGINAL t.
                     Some(false) => Some(t.clone()),
                     None => None,
                 }
@@ -541,7 +555,7 @@ pub(crate) fn restrict_subtype_away_inner(
                     true,
                     strict_optional,
                 );
-                match crate::subtypes::is_subtype(t, s, &ctx, resolver) {
+                match crate::subtypes::is_subtype(p_t, s, &ctx, resolver) {
                     Some(true) => return Some(Type::UninhabitedType { ambiguous: false }),
                     None => return None,
                     Some(false) => {}
@@ -639,6 +653,7 @@ pub(crate) fn rust_restrict_subtype_away(
         consider_runtime_isinstance,
         strict_optional,
         resolver.resolver(),
+        resolver.alias_resolver(),
     )?;
     encode_type(&result)
 }
@@ -1816,6 +1831,7 @@ pub(crate) fn find_member_call_is_plain_callable(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::aliases::TypeAliasResolver;
     use crate::typeinfo::{TypeInfoSnapshot, TypeResolver};
 
     fn make_instance(type_ref: &str, args: Vec<Type>) -> Type {
@@ -2829,7 +2845,7 @@ mod tests {
         let s = make_instance("builtins.str", vec![]);
         // No snapshot for either; covers_at_runtime defers on missing
         // snapshot -> restrict_subtype_away returns None.
-        let result = restrict_subtype_away_inner(&t, &s, true, true, &r);
+        let result = restrict_subtype_away_inner(&t, &s, true, true, &r, &TypeAliasResolver::new());
         assert_eq!(result, None);
     }
 
@@ -2847,7 +2863,7 @@ mod tests {
         // (the Any-right short-circuit only fires for non-proper). So the
 
         // whole restrict_subtype_away defers to Python.
-        let result = restrict_subtype_away_inner(&t, &s, true, true, &r);
+        let result = restrict_subtype_away_inner(&t, &s, true, true, &r, &TypeAliasResolver::new());
         assert_eq!(result, None);
     }
 
@@ -2874,7 +2890,8 @@ mod tests {
         insert_plain_class(&mut r, "builtins.str");
         let t = make_instance("builtins.int", vec![]);
         let s = make_instance("builtins.str", vec![]);
-        let result = restrict_subtype_away_inner(&t, &s, false, true, &r);
+        let result =
+            restrict_subtype_away_inner(&t, &s, false, true, &r, &TypeAliasResolver::new());
         assert_eq!(result, Some(t));
     }
 
@@ -2893,7 +2910,8 @@ mod tests {
         r.insert("builtins.object".to_string(), r_snap);
         let t = make_instance("builtins.int", vec![]);
         let s = make_instance("builtins.object", vec![]);
-        let result = restrict_subtype_away_inner(&t, &s, false, true, &r);
+        let result =
+            restrict_subtype_away_inner(&t, &s, false, true, &r, &TypeAliasResolver::new());
         assert_eq!(result, Some(Type::UninhabitedType { ambiguous: false }));
     }
 
@@ -2905,7 +2923,8 @@ mod tests {
         insert_plain_class(&mut r, "builtins.int");
         let t = make_instance("builtins.int", vec![]);
         let s = make_instance("mymod.NotFound", vec![]);
-        let result = restrict_subtype_away_inner(&t, &s, false, true, &r);
+        let result =
+            restrict_subtype_away_inner(&t, &s, false, true, &r, &TypeAliasResolver::new());
         assert_eq!(result, None);
     }
 
@@ -2933,7 +2952,8 @@ mod tests {
                 missing_import_name: None,
             }],
         );
-        let result = restrict_subtype_away_inner(&t, &s, false, true, &r);
+        let result =
+            restrict_subtype_away_inner(&t, &s, false, true, &r, &TypeAliasResolver::new());
         assert_eq!(result, None);
     }
 
@@ -2953,7 +2973,8 @@ mod tests {
             can_be_true: true,
             can_be_false: true,
         };
-        let result = restrict_subtype_away_inner(&union, &str_t, false, true, &r);
+        let result =
+            restrict_subtype_away_inner(&union, &str_t, false, true, &r, &TypeAliasResolver::new());
         // int survives (not a proper subtype of str), str is restricted
         // away (it is equal to s, the "left is right" proper subtype fast
         // path returns True), so the union folds to a single int.
@@ -2984,7 +3005,8 @@ mod tests {
             can_be_false: true,
         };
         let s = make_instance("mymod.Proto", vec![]);
-        let result = restrict_subtype_away_inner(&union, &s, false, true, &r);
+        let result =
+            restrict_subtype_away_inner(&union, &s, false, true, &r, &TypeAliasResolver::new());
         assert_eq!(result, None);
     }
 

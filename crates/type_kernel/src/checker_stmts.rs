@@ -823,6 +823,7 @@ fn narrow_type_by_identity_equality_inner(
         strict_optional,
         res,
         native,
+        native.alias_resolver(),
         py,
     )
 }
