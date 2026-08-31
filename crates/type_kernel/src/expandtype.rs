@@ -1920,7 +1920,10 @@ mod tests {
             Type::Instance { type_ref, args, .. } => {
                 assert_eq!(type_ref, "builtins.list");
                 match args.as_slice() {
-                    [Type::TypeAliasType { args: alias_args, type_ref }] => {
+                    [Type::TypeAliasType {
+                        args: alias_args,
+                        type_ref,
+                    }] => {
                         // The tvar env key is (0, meta 0, "foo.Box"), so the
                         // written alias arg expands from T to int in Rust.
                         assert_eq!(type_ref, "testmod.X");
