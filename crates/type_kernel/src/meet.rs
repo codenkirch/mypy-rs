@@ -1185,15 +1185,36 @@ pub(crate) fn rust_is_overlapping_types(
 /// `mypy.types.UnionType.relevant_items` including NoneType under strict
 /// optional (narrow_declared_type keeps `None` items when strict_optional
 /// is on; meet.rs's `relevant_items` always strips them).
-fn relevant_items_with_none(items: &[Type], strict_optional: bool) -> Option<Vec<Type>> {
+///
+/// Under strict_optional Python returns items unchanged (types.py:3784),
+/// so alias items need no expansion there. In the non-strict filter (3787)
+/// a top-level alias item expands via the resolver; none keeps the defer.
+fn relevant_items_with_none(
+    items: &[Type],
+    strict_optional: bool,
+    aliases: Option<&crate::aliases::TypeAliasResolver>,
+) -> Option<Vec<Type>> {
     if strict_optional {
-        for item in items {
-            get_proper(item)?;
-        }
-        Some(items.to_vec())
-    } else {
-        relevant_items(items)
+        return Some(items.to_vec());
     }
+    let mut out = Vec::new();
+    for item in items {
+        let proper_owned;
+        let proper = match aliases {
+            Some(a) => {
+                proper_owned = crate::checkexpr_functions::get_proper_or_expand(item, a)?;
+                &proper_owned
+            }
+            None => match item {
+                Type::TypeAliasType { .. } => return None,
+                t => t,
+            },
+        };
+        if !matches!(proper, Type::NoneType) {
+            out.push(item.clone());
+        }
+    }
+    Some(out)
 }
 
 /// `mypy.meet.narrow_declared_type` (meet.py:216-348), Rust subset.
@@ -1236,10 +1257,29 @@ pub(crate) fn narrow_rec(
     // meet.py:225-244: declared UnionType -> cross-product of the
     // overlapping/subtype items, simplified.
     if let Type::UnionType { items, .. } = declared_p {
-        let declared_items = relevant_items_with_none(items, strict_optional)?;
+        let declared_items = relevant_items_with_none(items, strict_optional, aliases)?;
+        // The cross-product gates (overlap/is_subtype) are alias-transparent
+        // in Python; expand alias items so the kernel decisions engage.
+        // Recursion re-expands at the head, so expanded inputs stay parity.
+        let declared_items = match aliases {
+            Some(a) => declared_items
+                .iter()
+                .map(|t| crate::checkexpr_functions::get_proper_or_expand(t, a))
+                .collect::<Option<Vec<_>>>()?,
+            None => declared_items,
+        };
         let narrowed_items = match narrowed_p {
-            Type::UnionType { items, .. } => relevant_items_with_none(items, strict_optional)?,
+            Type::UnionType { items, .. } => {
+                relevant_items_with_none(items, strict_optional, aliases)?
+            }
             _ => vec![narrowed_p.clone()],
+        };
+        let narrowed_items = match aliases {
+            Some(a) => narrowed_items
+                .iter()
+                .map(|t| crate::checkexpr_functions::get_proper_or_expand(t, a))
+                .collect::<Option<Vec<_>>>()?,
+            None => narrowed_items,
         };
         let mut results = Vec::new();
         for d in &declared_items {
@@ -1270,7 +1310,7 @@ pub(crate) fn narrow_rec(
         let Type::UnionType { items, .. } = narrowed_p else {
             return None;
         };
-        let relevant = relevant_items_with_none(items, strict_optional)?;
+        let relevant = relevant_items_with_none(items, strict_optional, aliases)?;
         let mut results = Vec::new();
         for x in &relevant {
             results.push(narrow_rec(declared, x, strict_optional, aliases, res)?);
@@ -1343,7 +1383,7 @@ pub(crate) fn narrow_rec(
 
     // meet.py:277-280: narrowed UnionType -> per-item.
     if let Type::UnionType { items, .. } = narrowed_p {
-        let relevant = relevant_items_with_none(items, strict_optional)?;
+        let relevant = relevant_items_with_none(items, strict_optional, aliases)?;
         let mut results = Vec::new();
         for x in &relevant {
             results.push(narrow_rec(declared, x, strict_optional, aliases, res)?);

@@ -1191,7 +1191,7 @@ mod tests {
             &[int.clone(), int.clone()],
             &[ARG_STAR, ARG_STAR2]
         ));
-        assert!(!is_trivial_suffix(&[int.clone()], &[ARG_STAR]));
+        assert!(!is_trivial_suffix(std::slice::from_ref(&int), &[ARG_STAR]));
         assert!(!is_trivial_suffix(&[], &[]));
         assert!(is_trivial_suffix(
             &[int.clone(), any_type(), any_type()],

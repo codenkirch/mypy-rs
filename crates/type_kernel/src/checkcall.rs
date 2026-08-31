@@ -2203,7 +2203,7 @@ mod tests {
         pyo3::Python::with_gil(|py| {
             rust_solve_generic_call(
                 py,
-                &resolver,
+                resolver,
                 &cb.into_bytes(),
                 arg_blobs,
                 formal_to_actual,

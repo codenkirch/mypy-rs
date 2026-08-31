@@ -15035,6 +15035,22 @@ class NativeMeetDeferralSuite(Suite):
         variants = [item for item in fixed if item is not None]
         self.assertEqual({str(t) for t in variants}, {str(self.fx.a), str(self.fx.b)})
 
+    def test_narrow_union_with_alias_item_seam_engages(self) -> None:
+        # Pre-port, relevant_items_with_none deferred when the declared
+        # union carried a TypeAliasType item (ndt ri-decl). The strict
+        # branch now returns items unchanged, as Python's relevant_items.
+        from mypy.join import _deserialize_type, _serialize_type
+
+        alias = TypeAliasType(self.inst_alias, [])
+        declared = UnionType([alias, self.fx.b])
+        r = _type_kernel.rust_narrow_declared_type(
+            _serialize_type(declared), _serialize_type(self.fx.a), True, self.resolver
+        )
+        assert r is not None, "rust_narrow_declared_type deferred on a union with an alias item"
+        decoded = _deserialize_type(bytes(r))
+        assert decoded is not None
+        self.assertEqual(str(decoded), "A")
+
     def test_is_overlapping_erased_operand(self) -> None:
         # Python treats Unbound/Erased/Deleted operands as overlapping (meet.py:568);
         # the overlap shim serializes Erased unfiltered, so the wire tag-122 leaf
@@ -25420,8 +25436,24 @@ class NativeConditionalTypesSuite(Suite):
         self.newtype_info.is_newtype = True
         self.newtype_info.bases = [Instance(self.int_info, [])]
         type_infos.append(self.newtype_info)
+        # Three aliases (mod.MA -> A, mod.MB -> B, mod.MAny -> Any) for the
+        # current/target alias narrowing tests below.
+        self.inst_alias = TypeAlias(self.fx.a, "mod.MA", "mod", -1, -1)
+        self.b_alias = TypeAlias(self.fx.b, "mod.MB", "mod", -1, -1)
+        self.any_alias = TypeAlias(self.fx.anyt, "mod.MAny", "mod", -1, -1)
         set_wire_typeinfo_map({info.fullname: info for info in type_infos})
-        self.resolver = _type_kernel.build_native_resolver(type_infos, [])
+        from mypy.wirefixup import set_wire_alias_map
+
+        set_wire_alias_map(
+            {
+                self.inst_alias.fullname: self.inst_alias,
+                self.b_alias.fullname: self.b_alias,
+                self.any_alias.fullname: self.any_alias,
+            }
+        )
+        self.resolver = _type_kernel.build_native_resolver(
+            type_infos, [self.inst_alias, self.b_alias, self.any_alias]
+        )
         self._live_map = {info.fullname: info for info in type_infos}
         self.resolver.set_live_typeinfo_map(dict(self._live_map))
         _set_native_checker_active(True)
@@ -25429,11 +25461,12 @@ class NativeConditionalTypesSuite(Suite):
 
     def tearDown(self) -> None:
         from mypy.checker import _set_native_checker_active, _set_native_checker_resolver
-        from mypy.wirefixup import set_wire_typeinfo_map
+        from mypy.wirefixup import set_wire_alias_map, set_wire_typeinfo_map
 
         _set_native_checker_active(False)
         _set_native_checker_resolver(None)
         set_wire_typeinfo_map(None)
+        set_wire_alias_map(None)
 
     def _with_gate(self, active: bool, fn: Callable[[], T]) -> T:
         from mypy.checker import _set_native_checker_active
@@ -25618,6 +25651,58 @@ class NativeConditionalTypesSuite(Suite):
         # The Rust path defers on the generic-args-erase, so this exercises
         # the deferral path through the gate.
         self._assert_par(current, ranges, None)
+
+    def test_current_alias_narrows_like_target(self) -> None:
+        # cur-alias: current is a TypeAliasType (mod.MA -> A). The port expands
+        # it once via get_proper_or_expand and reuses the proper type for the
+        # Any check, union factorization, and the avoid-widening tail.
+        from mypy.checker import conditional_types
+
+        alias = TypeAliasType(self.inst_alias, [])
+        ranges = [TypeRange(Instance(self.int_info, []), False)]
+        self._assert_par(alias, ranges, None)
+        yes, no = self._with_gate(True, lambda: conditional_types(alias, ranges, None))
+        assert_equal((str(yes), str(no)), ("Never", "None"))
+        self._assert_engages(alias, ranges, None)
+
+    def test_union_current_with_alias_item(self) -> None:
+        # cur-alias2: a union current whose first item is a TypeAliasType
+        # factorizes through the same expanded current as the plain-union
+        # case (Union[A, B] vs C).
+        from mypy.checker import conditional_types
+
+        current = UnionType([TypeAliasType(self.inst_alias, []), self.fx.b])
+        ranges = [TypeRange(self.fx.c, False)]
+        self._assert_par(current, ranges, None)
+        yes, no = self._with_gate(True, lambda: conditional_types(current, ranges, None))
+        assert_equal((str(yes), str(no)), ("C", "A"))
+        self._assert_engages(current, ranges, None)
+
+    def test_target_alias_range(self) -> None:
+        # tgt0-alias: the range item is a TypeAliasType (mod.MB -> B). The
+        # port expands the target via the alias snapshot, mirroring Python's
+        # get_proper_type on ranges[0].item.
+        from mypy.checker import conditional_types
+
+        current = self.fx.a
+        ranges = [TypeRange(TypeAliasType(self.b_alias, []), False)]
+        self._assert_par(current, ranges, None)
+        yes, no = self._with_gate(True, lambda: conditional_types(current, ranges, None))
+        assert_equal((str(yes), str(no)), ("B", "A"))
+        self._assert_engages(current, ranges, None)
+
+    def test_alias_to_any_current(self) -> None:
+        # An alias to Any must expand before the Any-current check, so the
+        # alias case matches plain Any: yes = proposed, no = Any.
+        from mypy.checker import conditional_types
+
+        any_alias = self.any_alias
+        current = TypeAliasType(any_alias, [])
+        ranges = [TypeRange(self.fx.a, False)]
+        self._assert_par(current, ranges, None)
+        yes, no = self._with_gate(True, lambda: conditional_types(current, ranges, None))
+        assert_equal((str(yes), str(no)), ("A", "Any"))
+        self._assert_engages(current, ranges, None)
 
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")

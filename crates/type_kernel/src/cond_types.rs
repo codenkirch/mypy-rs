@@ -14,6 +14,7 @@
 use pyo3::prelude::*;
 
 use crate::checker_helpers::restrict_subtype_away_inner;
+use crate::checkexpr_functions::get_proper_or_expand;
 use crate::meet::overlap;
 use crate::setops::{make_simplified_union, union_make_union};
 use crate::subtypes::{is_subtype, SubtypeContext};
@@ -62,15 +63,6 @@ fn decode_ranges(bytes: &[u8]) -> Option<Vec<WireRange>> {
         });
     }
     Some(ranges)
-}
-
-/// `get_proper_type` for the wire format. A `TypeAliasType` has no target
-/// on the wire, so it defers (returns `None`); everything else is proper.
-fn get_proper_or_none(typ: &Type) -> Option<&Type> {
-    match typ {
-        Type::TypeAliasType { .. } => None,
-        _ => Some(typ),
-    }
 }
 
 /// `UnionType.make_union` with the constructor's nested-union flattening
@@ -247,6 +239,7 @@ pub(crate) fn conditional_types_inner(
     strict_optional: bool,
     resolver: &TypeResolver,
     native: &NativeTypeResolver,
+    aliases: &crate::aliases::TypeAliasResolver,
     py: Python<'_>,
 ) -> Option<(Option<Type>, Option<Type>)> {
     let ranges = match ranges {
@@ -264,7 +257,11 @@ pub(crate) fn conditional_types_inner(
     // so it must be owned here.
     let mut current = current.clone();
     if ranges.len() == 1 {
-        let target = get_proper_or_none(&ranges[0].item)?;
+        // target = get_proper_type(proposed_type_ranges[0].item)
+        // (checker.py:10843-10844): expand an alias range item through the
+        // alias snapshot.
+        let target_owned = get_proper_or_expand(&ranges[0].item, aliases)?;
+        let target = &target_owned;
         if let Type::LiteralType {
             fallback,
             value: LiteralValue::Bool(_),
@@ -291,9 +288,10 @@ pub(crate) fn conditional_types_inner(
         }
     }
 
-    // Factorize over unions (checker.py:9342-9360): each item recurses with
-    // default=item and both sides are simplified.
-    let p_current = get_proper_or_none(&current)?;
+    // Factorize over unions (checker.py:10854-10872): each item recurses
+    // with default=item and both sides are simplified.
+    let current_proper = get_proper_or_expand(&current, aliases)?;
+    let p_current = &current_proper;
     if let Type::UnionType { items, .. } = p_current {
         let mut yes_items = Vec::with_capacity(items.len());
         let mut no_items = Vec::with_capacity(items.len());
@@ -307,6 +305,7 @@ pub(crate) fn conditional_types_inner(
                 strict_optional,
                 resolver,
                 native,
+                aliases,
                 py,
             )?;
             // `default` is always `Some(union_item)` here (never None), so
@@ -316,40 +315,57 @@ pub(crate) fn conditional_types_inner(
             no_items.push(no_type?);
         }
         let ctx = SubtypeContext::new(false, false, false, true, true, strict_optional);
+        // Python's make_simplified_union is alias-transparent: dedup runs
+        // on the expanded form (typeops.py step 2 + final get_proper_type).
+        // Pre-expand the outputs; multi-item results are str-parity.
+        let yes_items = yes_items
+            .iter()
+            .map(|t| get_proper_or_expand(t, aliases))
+            .collect::<Option<Vec<_>>>()?;
+        let no_items = no_items
+            .iter()
+            .map(|t| get_proper_or_expand(t, aliases))
+            .collect::<Option<Vec<_>>>()?;
         let yes = make_simplified_union(&yes_items, &ctx, resolver, true, false)?;
         let no = make_simplified_union(&no_items, &ctx, resolver, true, false)?;
         return Some((Some(yes), Some(no)));
     }
 
-    // proposed = make_simplified_union of the range items, then NewType
-    // unwrap, then flattened make_union (checker.py:9362-9371).
-    let proposed_items: Vec<Type> = ranges.iter().map(|r| r.item.clone()).collect();
+    // proposed = make_simplified_union of the range items, then per-item
+    // NewType unwrap, then proper expansion (checker.py:10874-10883). Range
+    // items expand first, as Python's make_simplified_union does for dedup.
+    let proposed_items: Vec<Type> = ranges
+        .iter()
+        .map(|r| get_proper_or_expand(&r.item, aliases))
+        .collect::<Option<Vec<_>>>()?;
     let ctx = SubtypeContext::new(false, false, false, true, true, strict_optional);
     let proposed = make_simplified_union(&proposed_items, &ctx, resolver, true, false)?;
-    let proposed_proper = get_proper_or_none(&proposed).cloned();
-    let mut items = match proposed_proper {
-        Some(Type::UnionType { items, .. }) => items,
+    let mut items = match &proposed {
+        Type::UnionType { items, .. } => items.clone(),
         _ => vec![proposed.clone()],
     };
     for item in &mut items {
-        *item = unwrap_newtype(item, resolver)?;
+        let proper = get_proper_or_expand(item, aliases)?;
+        *item = unwrap_newtype(&proper, resolver)?;
     }
-    let proposed = make_union(&items);
+    let proposed = get_proper_or_expand(&make_union(&items), aliases)?;
 
-    // Any current keeps the else-branch as current (checker.py:9373-9374).
-    if matches!(get_proper_or_none(&current)?, Type::AnyType { .. }) {
+    // Any current keeps the else-branch as current (checker.py:10885-10886).
+    if matches!(p_current, Type::AnyType { .. }) {
         return Some((Some(proposed), Some(current)));
     }
-    // Any proposed: no narrowing, else keeps default (checker.py:9375-9379).
-    if matches!(get_proper_or_none(&proposed)?, Type::AnyType { .. }) {
+    // Any proposed: no narrowing, else keeps default (checker.py:10887-10891).
+    if matches!(proposed, Type::AnyType { .. }) {
         return Some((Some(proposed), default.cloned()));
     }
 
     if !ranges.iter().any(|r| r.is_upper_bound) {
         // Concrete proper subtype (checker.py:9381-9383): proposed covers
-        // current, so the if-branch keeps default and the else is unreachable.
+        // current, so the if-branch keeps default and the else is
+        // unreachable. Python's is_proper_subtype expands both operands,
+        // so the decision runs on the expanded current.
         let proper_ctx = SubtypeContext::new(false, false, false, true, true, strict_optional);
-        match is_subtype(&current, &proposed, &proper_ctx, resolver) {
+        match is_subtype(p_current, &proposed, &proper_ctx, resolver) {
             Some(true) => {
                 return Some((
                     default.cloned(),
@@ -359,17 +375,17 @@ pub(crate) fn conditional_types_inner(
             None => return None,
             Some(false) => {}
         }
-        // Structural subtypes (checker.py:9386-9397): a Callable or protocol
-        // target that `current` is a non-proper subtype of needs
-        // restrict_subtype_away to rule out the unequal-but-overlapping value.
-        let structural = match get_proper_or_none(&proposed) {
-            Some(Type::CallableType { .. }) => true,
-            Some(Type::Instance { type_ref, .. }) => resolver.get(type_ref)?.is_protocol,
+        // Structural subtypes (checker.py:10898-10909): a Callable or
+        // protocol target that `current` is a non-proper subtype of needs
+        // restrict_subtype_away; `proposed` is already the proper form.
+        let structural = match &proposed {
+            Type::CallableType { .. } => true,
+            Type::Instance { type_ref, .. } => resolver.get(type_ref)?.is_protocol,
             _ => false,
         };
         if structural {
             let pctx = SubtypeContext::new(false, false, false, true, false, strict_optional);
-            match is_subtype(&current, &proposed, &pctx, resolver) {
+            match is_subtype(p_current, &proposed, &pctx, resolver) {
                 // Rust is_subtype only proves the structural-subtype side
                 // (Some(true)); anything else can diverge from Python, so
                 // defer and let the pure-Python path decide.
@@ -380,6 +396,7 @@ pub(crate) fn conditional_types_inner(
                         consider_runtime_isinstance,
                         strict_optional,
                         resolver,
+                        aliases,
                     )?;
                     return Some((default.cloned(), Some(restricted)));
                 }
@@ -400,7 +417,9 @@ pub(crate) fn conditional_types_inner(
     // if-branch is unreachable. A Rust `None` means "cannot decide", so
     // defer the whole call rather than assume overlap.
     match overlap(
-        &current,
+        // Python's is_overlapping_types expands alias operands internally,
+        // so the decision must run on the expanded current.
+        p_current,
         &proposed,
         strict_optional,
         true,
@@ -423,8 +442,8 @@ pub(crate) fn conditional_types_inner(
     let precise_items: Vec<Type> = ranges
         .iter()
         .filter(|r| !r.is_upper_bound)
-        .map(|r| r.item.clone())
-        .collect();
+        .map(|r| get_proper_or_expand(&r.item, aliases))
+        .collect::<Option<Vec<_>>>()?;
     let precise_type = make_union(&precise_items);
     let remaining = restrict_subtype_away_inner(
         &current,
@@ -432,11 +451,14 @@ pub(crate) fn conditional_types_inner(
         consider_runtime_isinstance,
         strict_optional,
         resolver,
+        aliases,
     )?;
 
-    // Avoid widening (checker.py:9419-9420).
+    // Avoid widening (checker.py:10930-10932): Python checks
+    // is_proper_subtype(p_current_type, proposed_type), the proper form of
+    // current, so alias currents expand here too.
     let proper_ctx = SubtypeContext::new(false, false, false, true, true, strict_optional);
-    let proposed = match is_subtype(&current, &proposed, &proper_ctx, resolver) {
+    let proposed = match is_subtype(&current_proper, &proposed, &proper_ctx, resolver) {
         Some(true) => default.cloned().unwrap_or(current),
         None => return None,
         Some(false) => proposed,
@@ -490,6 +512,7 @@ pub(crate) fn rust_conditional_types(
         strict_optional,
         resolver.resolver(),
         resolver,
+        resolver.alias_resolver(),
         py,
     )?;
     let yes_blob = match yes {

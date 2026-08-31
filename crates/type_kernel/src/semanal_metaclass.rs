@@ -309,6 +309,7 @@ pub(crate) fn rust_classify_recalculate_metaclass(defn: &PyAny) -> PyResult<Opti
 mod tests {
     use super::*;
 
+    #[allow(clippy::too_many_arguments)]
     fn classify_declared(
         mc_name: Option<&str>,
         sym_missing: bool,
