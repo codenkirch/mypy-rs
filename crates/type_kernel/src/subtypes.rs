@@ -147,9 +147,7 @@ fn type_object_ret_decision(
         }
         None => (None, Some(init_idx)),
     };
-    let Some(new_idx) = new_idx else {
-        return None;
-    };
+    let new_idx = new_idx?;
     if init_idx > new_idx {
         // __new__ wins the MRO race. object.__new__ carries a Self-typed
         // ret that only the live expansion can decide; everything else
