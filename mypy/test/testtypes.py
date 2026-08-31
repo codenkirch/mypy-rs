@@ -9821,12 +9821,15 @@ class NativeUnboundWithoutTypeInfoSuite(Suite):
     The classification front (which unbound non-TypeInfo symbol a type
     expression refers to) runs in Rust: an Any-typed Var alias, the
     `type` special form under allow_type_any, an allowed unbound type
-    variable, and an enum member inside Literal[...]. The Python shim
-    rebuilds the result object from the live node; every error path
-    (raw enum value, invalid reference) defers to the pure-Python body.
-    Toggling the typeanal gate off (pure Python) and on (Rust) must
-    produce identical `str(result)` on both engaged and deferred paths,
-    and a direct seam call proves the Rust classifier engages.
+    variable, and an enum member inside Literal[...], plus the full
+    message-tail family (variable / function / module not valid as a
+    type, rejected unbound type variables with the PEP 695 variant, raw
+    enum values, and `TypeType[Any]` under allow_type_any).
+    The Python shim rebuilds the result objects from the live node and
+    applies every fail/note side effect keyed by the Rust tag. Both gates
+    must produce identical `str(result)` AND identical captured
+    fail/note message lists on engaged paths, and a direct seam call
+    proves the Rust classifier engages on each family.
     """
 
     def setUp(self) -> None:
@@ -9855,8 +9858,12 @@ class NativeUnboundWithoutTypeInfoSuite(Suite):
         ta.allow_type_any = allow_type_any
         ta.allow_unbound_tvars = allow_unbound_tvars
         ta.allow_param_spec_literals = False
-        ta.fail = lambda *a, **k: None  # type: ignore[method-assign]
-        ta.note = lambda *a, **k: None  # type: ignore[method-assign]
+        messages: list[str] = []
+        ta.messages = messages  # type: ignore[attr-defined]
+        ta.fail = lambda msg, *a, **k: messages.append(msg)  # type: ignore[method-assign]
+        ta.note = lambda msg, *a, **k: messages.append(  # type: ignore[method-assign]
+            "note: " + msg
+        )
         return ta
 
     def _var_sym(
@@ -9886,9 +9893,12 @@ class NativeUnboundWithoutTypeInfoSuite(Suite):
         *,
         allow_type_any: bool = False,
         allow_unbound_tvars: bool = False,
-    ) -> Type:
+    ) -> tuple[Type, list[str]]:
         ta = self._analyser(allow_type_any=allow_type_any, allow_unbound_tvars=allow_unbound_tvars)
-        return cast("Type", ta.analyze_unbound_type_without_type_info(t, sym, defining_literal))
+        result = cast(
+            "Type", ta.analyze_unbound_type_without_type_info(t, sym, defining_literal)
+        )
+        return result, ta.messages
 
     def _assert_par(
         self,
@@ -9920,7 +9930,14 @@ class NativeUnboundWithoutTypeInfoSuite(Suite):
             ),
         )
         assert_equal(
-            str(on), str(off), f"analyze_unbound_type_without_type_info parity {sym.fullname}"
+            str(on[0]),
+            str(off[0]),
+            f"analyze_unbound_type_without_type_info parity {sym.fullname}",
+        )
+        assert_equal(
+            on[1],
+            off[1],
+            f"analyze_unbound_type_without_type_info messages parity {sym.fullname}",
         )
 
     def _assert_engages(
@@ -9934,6 +9951,9 @@ class NativeUnboundWithoutTypeInfoSuite(Suite):
         allow_unbound_tvars: bool = False,
         is_enum_member: bool = False,
         defining_literal: bool = False,
+        is_new_style: bool = False,
+        tail_kind: int = 0,
+        name: str = "mod.x",
     ) -> None:
         from mypy.typeanal import _rust_analyze_unbound_without_info  # type: ignore[attr-defined]
 
@@ -9946,6 +9966,9 @@ class NativeUnboundWithoutTypeInfoSuite(Suite):
             allow_unbound_tvars,
             is_enum_member,
             defining_literal,
+            is_new_style,
+            tail_kind,
+            name,
         )
         assert result is not None, "Rust analyze_unbound_type_without_type_info did not engage"
 
@@ -10019,6 +10042,99 @@ class NativeUnboundWithoutTypeInfoSuite(Suite):
         v.type = self.fx.o
         sym = SymbolTableNode(MDEF, v)
         self._assert_par(t, sym, False)
+
+    def test_typed_object_var_message(self) -> None:
+        # A Var with a non-Any type -> 'Variable "..." is not valid as a
+        # type' + the variables-vs-type-aliases note.
+        t = UnboundType("mod.x")
+        sym = self._var_sym(None, self.fx.o)
+        self._assert_par(t, sym, False)
+        self._assert_engages(tail_kind=0)
+
+    def test_funcdef_message_callback_note(self) -> None:
+        # A function as a type -> 'Function "..." is not valid as a type'
+        # + the Callable/callback-protocol note.
+        from mypy.nodes import FuncDef
+
+        t = UnboundType("mod.f")
+        fd = FuncDef("f")
+        fd._fullname = "mod.f"
+        sym = SymbolTableNode(MDEF, fd)
+        self._assert_par(t, sym, False)
+        self._assert_engages(tail_kind=1, name="mod.f")
+
+    def test_funcdef_any_note(self) -> None:
+        # builtins.any -> the 'Perhaps you meant "typing.Any"' note.
+        from mypy.nodes import FuncDef
+
+        t = UnboundType("builtins.any")
+        fd = FuncDef("any")
+        fd._fullname = "builtins.any"
+        sym = SymbolTableNode(MDEF, fd)
+        self._assert_par(t, sym, False)
+        self._assert_engages(tail_kind=1, name="builtins.any")
+
+    def test_funcdef_callable_note(self) -> None:
+        # builtins.callable -> the 'Perhaps you meant "typing.Callable"' note.
+        from mypy.nodes import FuncDef
+
+        t = UnboundType("builtins.callable")
+        fd = FuncDef("callable")
+        fd._fullname = "builtins.callable"
+        sym = SymbolTableNode(MDEF, fd)
+        self._assert_par(t, sym, False)
+        self._assert_engages(tail_kind=1, name="builtins.callable")
+
+    def test_module_message(self) -> None:
+        # A module reference -> 'Module "..." is not valid as a type' +
+        # the protocol-structure note.
+        from mypy.nodes import MypyFile
+
+        t = UnboundType("mod")
+        tree = MypyFile([], [], False, {})
+        tree._fullname = "mod"
+        sym = SymbolTableNode(MDEF, tree)
+        self._assert_par(t, sym, False)
+        self._assert_engages(tail_kind=2, name=tree.fullname)
+
+    def test_rejected_unbound_tvar_messages(self) -> None:
+        # A classic unbound type variable when not allowed -> 'Type
+        # variable "..." is unbound' plus the two bind hints.
+        t = UnboundType("m.T")
+        from mypy.nodes import TypeVarExpr
+
+        tv = TypeVarExpr("T", "m.T", [], self.fx.o, AnyType(TypeOfAny.from_omitted_generics))
+        sym = SymbolTableNode(MDEF, tv)
+        self._assert_par(t, sym, False)
+        self._assert_engages(unbound_tvar=True, name="m.T", tail_kind=3)
+
+    def test_pep695_tvar_name_not_defined(self) -> None:
+        # A PEP 695 type parameter outside its scope -> 'Name "T" is not
+        # defined' with the short name and NAME_DEFINED.
+        t = UnboundType("m.T")
+        from mypy.nodes import TypeVarExpr
+
+        tv = TypeVarExpr(
+            "T",
+            "m.T",
+            [],
+            self.fx.o,
+            AnyType(TypeOfAny.from_omitted_generics),
+            is_new_style=True,
+        )
+        sym = SymbolTableNode(MDEF, tv)
+        self._assert_par(t, sym, False)
+        self._assert_engages(
+            unbound_tvar=True, is_new_style=True, name="m.T", tail_kind=3
+        )
+
+    def test_type_type_any_special_form(self) -> None:
+        # `Var` typed TypeType[Any] under allow_type_any ->
+        # AnyType(from_another_any, source_any=...).
+        t = UnboundType("mod.x")
+        sym = self._var_sym(None, TypeType(AnyType(TypeOfAny.from_error)))
+        self._assert_par(t, sym, False, allow_type_any=True)
+        self._assert_engages(allow_type_any=True, is_type_type_any=True)
 
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")

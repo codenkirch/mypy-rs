@@ -1663,8 +1663,8 @@ class TypeAnalyser(SyntheticTypeVisitor[Type], TypeAnalyzerPluginInterface):
         This is something unusual. We try our best to find out what it is.
         """
         # Native seam: Rust applies the ordered classification table over the
-        # raw node facts below; Python rebuilds the result objects and
-        # keeps the message tail. None (defer) falls back to Python.
+        # raw node facts below, including the message-tail family; Python
+        # rebuilds results and emits fail/note side effects. None defers.
         if _TYPEANAL_HAS_KERNEL and _native_typeanal_active:
             try:
                 node = sym.node
@@ -1672,41 +1672,184 @@ class TypeAnalyser(SyntheticTypeVisitor[Type], TypeAnalyzerPluginInterface):
                 if isinstance(node, Var):
                     var_typ = get_proper_type(node.type)
                 is_var_any = isinstance(var_typ, AnyType)
-                result = _rust_analyze_unbound_without_info(
-                    is_var_any,
-                    self.allow_type_any,
+                is_type_instance = (
                     not is_var_any
                     and isinstance(var_typ, Instance)
-                    and var_typ.type.fullname == "builtins.type",
+                    and var_typ.type.fullname == "builtins.type"
+                )
+                is_type_type_any = (
                     not is_var_any
                     and isinstance(var_typ, TypeType)
-                    and isinstance(var_typ.item, AnyType),
-                    isinstance(node, (TypeVarExpr, TypeVarTupleExpr))
-                    and self.tvar_scope.get_binding(sym) is None,
-                    self.allow_unbound_tvars,
+                    and isinstance(var_typ.item, AnyType)
+                )
+                is_unbound_tvar = isinstance(
+                    node, (TypeVarExpr, TypeVarTupleExpr)
+                ) and self.tvar_scope.get_binding(sym) is None
+                is_new_style = False
+                if is_unbound_tvar and isinstance(node, (TypeVarExpr, TypeVarTupleExpr)):
+                    is_new_style = node.is_new_style
+                is_enum_member = (
                     isinstance(node, Var)
                     and node.info is not VAR_NO_INFO
                     and node.info.is_enum
-                    and node.name in node.info.enum_members,
-                    defining_literal,
+                    and node.name in node.info.enum_members
                 )
-                if result == 1 and isinstance(var_typ, AnyType):
-                    return AnyType(
-                        TypeOfAny.from_unimported_type,
-                        missing_import_name=var_typ.missing_import_name,
-                    )
-                if result == 2:
-                    return AnyType(TypeOfAny.special_form)
-                if result == 3:
+                # Tail message kind, mirroring the body's elif chain.
+                if isinstance(node, Var):
+                    tail_kind = 0
+                elif isinstance(node, (SYMBOL_FUNCBASE_TYPES, Decorator)):
+                    tail_kind = 1
+                elif isinstance(node, MypyFile):
+                    tail_kind = 2
+                else:
+                    tail_kind = 3
+                name = sym.fullname
+                if name is None and sym.node is not None:
+                    name = sym.node.name
+                if name is None:
+                    # The pure body asserts on an unresolvable node here;
+                    # skip the seam so the fallback re-raises identically.
+                    raise NotImplementedError
+                result = _rust_analyze_unbound_without_info(
+                    is_var_any,
+                    self.allow_type_any,
+                    is_type_instance,
+                    is_type_type_any,
+                    is_unbound_tvar,
+                    self.allow_unbound_tvars,
+                    is_enum_member,
+                    defining_literal,
+                    is_new_style,
+                    tail_kind,
+                    name,
+                )
+                if result is not None:
+                    tag, note_tags = result
+                    if tag == 1 and isinstance(var_typ, AnyType):
+                        return AnyType(
+                            TypeOfAny.from_unimported_type,
+                            missing_import_name=var_typ.missing_import_name,
+                        )
+                    if tag == 2:
+                        return AnyType(TypeOfAny.special_form)
+                    if tag == 5:
+                        assert isinstance(var_typ, TypeType)
+                        assert isinstance(var_typ.item, AnyType)
+                        return AnyType(
+                            TypeOfAny.from_another_any, source_any=var_typ.item
+                        )
+                    if tag == 3:
+                        return t
+                    if tag == 4:
+                        assert isinstance(node, Var)
+                        return LiteralType(
+                            value=node.name,
+                            fallback=Instance(
+                                node.info, [], line=t.line, column=t.column
+                            ),
+                            line=t.line,
+                            column=t.column,
+                        )
+                    if tag == 8:
+                        assert isinstance(node, Var)
+                        msg = message_registry.INVALID_TYPE_RAW_ENUM_VALUE.format(
+                            node.info.name, node.name
+                        )
+                        self.fail(msg.value, t, code=msg.code)
+                        return AnyType(TypeOfAny.from_error)
+                    # Tags 6/7 and 9-12: the message tail. The args
+                    # re-analysis stays Python-side; emission mirrors the
+                    # pure body, gated on defining_literal.
+                    t = t.copy_modified(args=self.anal_array(t.args))
+                    if not defining_literal:
+                        error_code = codes.VALID_TYPE
+                        if tag == 6:
+                            short = name.split(".")[-1]
+                            self.fail(
+                                f'Type variable "{name}" is unbound',
+                                t,
+                                code=error_code,
+                            )
+                            self.note(
+                                f'(Hint: Use "Generic[{short}]" or '
+                                f'"Protocol[{short}]" base class to bind '
+                                f'"{short}" inside a class)',
+                                t,
+                                code=error_code,
+                            )
+                            self.note(
+                                f'(Hint: Use "{short}" in function '
+                                f'signature to bind "{short}" inside a '
+                                f"function)",
+                                t,
+                                code=error_code,
+                            )
+                        elif tag == 7:
+                            self.fail(
+                                f'Name "{name.split(".")[-1]}" is not defined',
+                                t,
+                                code=codes.NAME_DEFINED,
+                            )
+                        elif tag == 9:
+                            self.fail(
+                                f'Variable "{name}" is not valid as a type',
+                                t,
+                                code=error_code,
+                            )
+                            self.note(
+                                "See https://mypy.readthedocs.io/en/"
+                                "stable/common_issues.html"
+                                "#variables-vs-type-aliases",
+                                t,
+                                code=error_code,
+                            )
+                        elif tag == 10:
+                            self.fail(
+                                f'Function "{name}" is not valid as a type',
+                                t,
+                                code=error_code,
+                            )
+                            for note_tag in note_tags:
+                                if note_tag == 1:
+                                    self.note(
+                                        'Perhaps you meant "typing.Any" '
+                                        'instead of "any"?',
+                                        t,
+                                        code=error_code,
+                                    )
+                                elif note_tag == 2:
+                                    self.note(
+                                        'Perhaps you meant "typing.Callable" '
+                                        'instead of "callable"?',
+                                        t,
+                                        code=error_code,
+                                    )
+                                else:
+                                    self.note(
+                                        "Perhaps you need \"Callable[...]\" "
+                                        "or a callback protocol?",
+                                        t,
+                                        code=error_code,
+                                    )
+                        elif tag == 11:
+                            self.fail(
+                                f'Module "{name}" is not valid as a type',
+                                t,
+                                code=error_code,
+                            )
+                            self.note(
+                                "Perhaps you meant to use a protocol "
+                                "matching the module structure?",
+                                t,
+                                code=error_code,
+                            )
+                        else:
+                            self.fail(
+                                f'Cannot interpret reference "{name}" as a type',
+                                t,
+                                code=error_code,
+                            )
                     return t
-                if result == 4:
-                    assert isinstance(node, Var)
-                    return LiteralType(
-                        value=node.name,
-                        fallback=Instance(node.info, [], line=t.line, column=t.column),
-                        line=t.line,
-                        column=t.column,
-                    )
             except (AssertionError, NotImplementedError):
                 pass
         name = sym.fullname
@@ -3924,10 +4067,9 @@ _CALLABLE_TAG_PARAMSPEC = 3
 _CALLABLE_TAG_INVALID_DISALLOW = 4
 _CALLABLE_TAG_INVALID_ALLOW = 5
 
-# Branch tags for `analyze_type_with_type_info` (issue #721).
-# Mirrored in crates/type_kernel/src/typeanal_info.rs; Python applies the
-# side effect + result construction for the two inline tags, the rest
-# re-run the original body.
+# Branch tags for `analyze_type_with_type_info` (issue #721). Mirrored in
+# crates/type_kernel/src/typeanal_info.rs; Python applies the side effect +
+# result construction for the two inline tags, the rest re-run the body.
 _TYPE_WITH_INFO_TAG_TUPLE = 1
 _TYPE_WITH_INFO_TAG_VEC = 2
 _TYPE_WITH_INFO_TAG_TUPLE_TAIL = 3
