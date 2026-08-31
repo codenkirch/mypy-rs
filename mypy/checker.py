@@ -12562,7 +12562,9 @@ def is_typeddict_type_context(lvalue_type: Type) -> bool:
     if _CHECKER_HAS_TYPE_KERNEL and _native_checker_active:
         try:
             type_bytes = _serialize_type_for_checker(lvalue_type)
-            result = _rust_is_typeddict_type_context(type_bytes)
+            result = _rust_is_typeddict_type_context(
+                _native_checker_resolver, type_bytes
+            )
             if result is not None:
                 return result
         except (AssertionError, NotImplementedError):

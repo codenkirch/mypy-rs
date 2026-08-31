@@ -38,7 +38,6 @@ from mypy.nodes import (
     Var,
 )
 from mypy.state import state
-from mypy.typestate import type_state
 from mypy.types import (
     ELLIPSIS_TYPE_NAMES,
     NOT_IMPLEMENTED_TYPE_NAMES,
@@ -79,6 +78,7 @@ from mypy.types import (
     instance_cache,
     remove_dups,
 )
+from mypy.typestate import type_state
 from mypy.typetraverser import TypeTraverserVisitor
 from mypy.typevars import fill_typevars
 
@@ -844,12 +844,9 @@ def class_callable(
     if (
         is_new
         and explicit_type is not None
-        # We used to only use the explicit return type of __new__() when it was a subtype
-        # of the current class. As a result, we may now have a situation like this:
-        #     class C:
-        #         def __new__(cls) -> C: ...
-        #     class D(C): ...
-        # So we need to ignore the explicit annotation when creating constructor type for D.
+        # Legacy quirk: an explicit __new__ return of a non-subclass C is
+        # ignored when building the constructor type for a subclass D(C),
+        # so keep D's default (fill_typevars) return instead.
         and (
             isinstance(explicit_type, AnyType)
             and explicit_type.type_of_any != TypeOfAny.unannotated
@@ -893,9 +890,8 @@ def map_type_from_supertype(typ: Type, sub_info: TypeInfo, super_info: TypeInfo)
     Now S in the context of D would be mapped to E[T] in the context of C.
     """
     # Native composite seam (#492 family): the whole body below is one Rust
-    # call, deferred when `typ` cannot cross the wire (recursive aliases)
-    # or the resolver is unavailable. #1207 relaxes the definition gate and
-    # re-stamps the dropped links via ``_resync_definitions``.
+    # call, deferred when `typ` cannot cross the wire. #1207 relaxes the
+    # definition gate; the shim re-stamps the dropped definition links.
     if (
         _HAS_TYPE_KERNEL
         and _native_typeops_active
@@ -911,23 +907,41 @@ def map_type_from_supertype(typ: Type, sub_info: TypeInfo, super_info: TypeInfo)
                 state.strict_optional,
             )
             if result is not None:
-                decoded = _deserialize_type(bytes(result))
+                # Relink contract (#1309, mirroring expand_type_by_instance):
+                # the seam returns leftover TypeVars and surviving aliases;
+                # the shim re-links them and defers on anything unmatchable.
+                from mypy.types import instance_cache
+                from mypy.wirefixup import (
+                    canonicalize_fresh_vars,
+                    fixup_wire_type,
+                    resync_var_identities,
+                )
+
+                decoded = _read_type(_ReadBuffer(bytes(result)))
+                instance_cache.int_type = None
+                instance_cache.str_type = None
+                instance_cache.bool_type = None
+                instance_cache.object_type = None
+                instance_cache.function_type = None
                 fixed = None
                 if decoded is not None:
-                    # The wire format does not carry line/column; decoded
-                    # types default to line -1. Preserve the input type's
-                    # location so derived contexts report errors at the
-                    # call site instead of a phantom line 0/-1 (mirrors the
-                    # expand_type_by_instance seam).
-                    if isinstance(decoded, ProperType):
-                        decoded.line = typ.line
-                        decoded.column = typ.column
-                        if isinstance(decoded, CallableType):
-                            decoded.fallback.line = decoded.line
-                    # The wire also drops CallableType.definition; the
-                    # pure-Python expansion preserves it, so re-stamp
-                    # positionally. A pairing divergence (None) defers.
-                    fixed = _resync_wire_definitions(typ, decoded)
+                    fixed = fixup_wire_type(decoded, resolve_aliases=True)
+                    if fixed is not None:
+                        fixed = canonicalize_fresh_vars(fixed)
+                        if isinstance(fixed, ProperType):
+                            fixed.line = typ.line
+                            fixed.column = typ.column
+                            if isinstance(fixed, CallableType):
+                                fixed.fallback.line = fixed.line
+                        inst_type_env = fill_typevars(sub_info)
+                        if isinstance(inst_type_env, TupleType):
+                            inst_type_env = tuple_fallback(inst_type_env)
+                        env_values = inst_type_env.args
+                        relinked = resync_var_identities(typ, fixed, env_values)
+                        if relinked is None:
+                            fixed = None
+                        else:
+                            fixed = _resync_wire_definitions(typ, relinked)
                 if fixed is not None:
                     return fixed
         except (AssertionError, NotImplementedError, ValueError):
