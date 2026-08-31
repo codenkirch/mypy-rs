@@ -4540,12 +4540,13 @@ class NativeExpandTypeByInstanceSuite(Suite):
         self._set_active(True)
 
     def tearDown(self) -> None:
-        from mypy.wirefixup import set_wire_typeinfo_map
+        from mypy.wirefixup import set_wire_alias_map, set_wire_typeinfo_map
 
         self._set_active(False)
         self._set_resolver(None)
         self._set_map(None)
         set_wire_typeinfo_map(None)
+        set_wire_alias_map(None)
 
     def _register(self, info: TypeInfo) -> None:
         from mypy.wirefixup import set_wire_typeinfo_map
@@ -4632,6 +4633,85 @@ class NativeExpandTypeByInstanceSuite(Suite):
         off = str(self._with_gate(False, lambda: self._expand(typ, instance)))
         on = str(self._with_gate(True, lambda: self._expand(typ, instance)))
         assert_equal(on, off, "empty-middle variadic parity")
+
+    # --- alias round-trip (#1289): the relink entry accepts alias-bearing
+    # input; the FFI seams resolve the per-build alias snapshots ---
+
+    def _install_alias(self) -> tuple[TypeAlias, TypeInfo, TypeVarLikeType]:
+        # Bag[T] with a class-bound tvar (id namespace "Bag", mirroring
+        # the production contract that binder ids carry the declaring
+        # class fullname), plus the generic alias A = list[T].
+        from mypy.wirefixup import set_wire_alias_map
+
+        info = self.fx.make_type_info("Bag", mro=[self.fx.oi], typevars=["T"])
+        binder = info.defn.type_vars[0]
+        binder.id = TypeVarId(1, namespace="Bag")
+        alias = TypeAlias(Instance(self.fx.std_listi, [binder]), "mod.A", "mod", -1, -1)
+        self._resolver = _type_kernel.build_native_resolver(
+            [info, *self._type_infos], [alias]
+        )
+        self._set_resolver(self._resolver)
+        set_wire_alias_map({alias.fullname: alias})
+        return alias, info, binder
+
+    def test_alias_instance_arg_expands_natively(self) -> None:
+        # list[A[T]] against Bag[int]: the alias-bearing input takes the
+        # relink entry, the arg aliases substitute natively, and the
+        # surviving alias node re-links through the alias map.
+        from mypy.expandtype import _serialize_type
+
+        alias, info, binder = self._install_alias()
+        typ = Instance(self.fx.std_listi, [TypeAliasType(alias, [binder])])
+        instance = Instance(info, [self.fx.a])
+        result = _type_kernel.rust_expand_type_by_instance(
+            self._resolver,
+            _serialize_type(typ),
+            _serialize_type(instance),
+            state.strict_optional,
+        )
+        assert result is not None, "alias-bearing by_instance expansion deferred"
+        self._assert_par(typ, instance)
+        on = self._expand(typ, instance)
+        assert isinstance(on, Instance), str(on)  # type: ignore[misc]
+        # args[0] is the re-linked alias node itself; get_proper_type here
+        # would expand it and defeat the re-link assertion.
+        assert isinstance(on.args[0], TypeAliasType), str(on)
+        alias_arg = on.args[0]
+        assert alias_arg.alias is alias, "decoded alias node not re-linked"
+        assert alias_arg.args == [self.fx.a]
+
+    def test_alias_union_item_flattens_natively(self) -> None:
+        # Union[A[T], B] against Bag[int]: the FFI entry installs the
+        # alias map for the union flatten (issue #1203 path), so the
+        # seam engages instead of deferring the whole call.
+        from mypy.expandtype import _serialize_type
+
+        alias, info, binder = self._install_alias()
+        typ = UnionType([TypeAliasType(alias, [binder]), self.fx.b])
+        instance = Instance(info, [self.fx.a])
+        result = _type_kernel.rust_expand_type_by_instance(
+            self._resolver,
+            _serialize_type(typ),
+            _serialize_type(instance),
+            state.strict_optional,
+        )
+        assert result is not None, "alias union item by_instance deferred"
+        self._assert_par(typ, instance)
+
+    def test_missing_alias_map_defers_to_python(self) -> None:
+        # Without a wire alias map the fixup cannot re-link the decoded
+        # alias; the shim falls back to the pure-Python body and both
+        # gates still agree.
+        from mypy.wirefixup import set_wire_alias_map
+
+        alias, info, binder = self._install_alias()
+        typ = Instance(self.fx.std_listi, [TypeAliasType(alias, [binder])])
+        instance = Instance(info, [self.fx.a])
+        set_wire_alias_map(None)
+        try:
+            self._assert_par(typ, instance)
+        finally:
+            set_wire_alias_map({alias.fullname: alias})
 
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")

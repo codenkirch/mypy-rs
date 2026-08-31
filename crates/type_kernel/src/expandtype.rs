@@ -271,6 +271,7 @@ pub(crate) fn rust_expand_type_by_instance(
     instance_bytes: &[u8],
     strict_optional: bool,
 ) -> Option<Vec<u8>> {
+    let _flat_alias_guard = FlatAliasGuard::install(resolver);
     let typ = decode_type(type_bytes)?;
     let instance = decode_type(instance_bytes)?;
     let expanded =
@@ -311,17 +312,16 @@ pub(crate) fn expand_type_by_instance_core(
     )
 }
 
-/// FFI-only variant of `expand_type_by_instance_core` with the
-/// identity-repair contract: leftover TypeVars are returned and the
-/// Python shim relinks them (`wirefixup.resync_var_identities`). Internal
-/// Rust callers keep the core's leftover-TypeVar exclusion.
+/// FFI-only variant with the identity-repair contract: leftover TypeVars
+/// are returned and the Python shim relinks them. Aliases ride through
+/// (#1289, the #1224 pattern): survivors re-link via resolve_aliases fixup.
 pub(crate) fn expand_type_by_instance_relink(
     typ: &Type,
     instance: &Type,
     resolver: &TypeResolver,
     strict_optional: bool,
 ) -> Option<Type> {
-    expand_type_by_instance_inner(typ, instance, resolver, strict_optional, false, true, false)
+    expand_type_by_instance_inner(typ, instance, resolver, strict_optional, false, true, true)
 }
 
 /// Free-result variant of `expand_type_by_instance_core`: leftover TypeVars
@@ -1881,12 +1881,131 @@ mod tests {
 
     #[test]
     fn union_arm_defers_on_alias_without_alias_map() {
-        // TLS unset (e.g. expand_type_by_instance callers): an alias item
+        // TLS unset (non-FFI callers without the guard): an alias item
         // keeps the pre-1203 defer.
         let typ = union(vec![
             alias_type("testmod.A", vec![]),
             instance("builtins.int", vec![]),
         ]);
         assert!(expand_type_inner(&typ, &HashMap::new(), false).is_none());
+    }
+
+    // --- expand_type_by_instance relink entry alias round-trip (#1289) ---
+
+    fn class_tvar(raw_id: i64, namespace_str: &str) -> Type {
+        // A class typevar: its env key carries the declaring class fullname
+        // as namespace (expandtype.py:554 / by_instance_inner env_ns).
+        let mut t = tvar(raw_id);
+        if let Type::TypeVarType { namespace, .. } = &mut t {
+            *namespace = namespace_str.to_string();
+        }
+        t
+    }
+
+    #[test]
+    fn ebi_relink_expands_alias_input_natively() {
+        // List[X[T]] applied to Box[int]: the alias arg expands in Rust and
+        // the surviving alias node carries type_ref for the shim's
+        // resolve_aliases fixup. The old alias-input gate is gone.
+        let mut resolver = TypeResolver::new();
+        resolver.insert("foo.Box".to_string(), snap_with_tvar("foo.Box", 0));
+        let typ = instance(
+            "builtins.list",
+            vec![alias_type("testmod.X", vec![class_tvar(0, "foo.Box")])],
+        );
+        let inst = instance("foo.Box", vec![instance("builtins.int", vec![])]);
+        let out = expand_type_by_instance_relink(&typ, &inst, &resolver, false)
+            .expect("alias-bearing by-instance expansion must not defer");
+        match out {
+            Type::Instance { type_ref, args, .. } => {
+                assert_eq!(type_ref, "builtins.list");
+                match args.as_slice() {
+                    [Type::TypeAliasType {
+                        args: alias_args,
+                        type_ref,
+                    }] => {
+                        // The tvar env key is (0, meta 0, "foo.Box"), so the
+                        // written alias arg expands from T to int in Rust.
+                        assert_eq!(type_ref, "testmod.X");
+                        assert!(matches!(
+                            alias_args.as_slice(),
+                            [Type::Instance { type_ref, .. }] if type_ref == "builtins.int"
+                        ));
+                    }
+                    other => panic!("expected [X[int]] alias arg, got {:?}", other),
+                }
+            }
+            other => panic!("expected Instance, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn ebi_core_still_defers_on_alias_input() {
+        // Internal callers (core/free variants) keep the old contract: an
+        // alias-bearing input defers because they have no resolve_aliases
+        // fixup on their Python side.
+        let mut resolver = TypeResolver::new();
+        resolver.insert("foo.Box".to_string(), snap_with_tvar("foo.Box", 0));
+        let typ = instance(
+            "builtins.list",
+            vec![alias_type("testmod.X", vec![class_tvar(0, "foo.Box")])],
+        );
+        let inst = instance("foo.Box", vec![instance("builtins.int", vec![])]);
+        assert!(expand_type_by_instance_core(&typ, &inst, &resolver, false).is_none());
+    }
+
+    #[test]
+    fn ebi_relink_flattens_alias_union_item() {
+        // union[X[T], int] with X = list[T], applied to Box[int]: the FFI
+        // entry installs FLAT_ALIASES, so the union flatten resolves the
+        // chain (issue #1203 path) instead of deferring the whole call.
+        let mut resolver = TypeResolver::new();
+        resolver.insert("foo.Box".to_string(), snap_with_tvar("foo.Box", 0));
+        let mut map = HashMap::new();
+        map.insert(
+            "testmod.X".to_string(),
+            alias_snapshot(
+                "testmod.X",
+                &instance("builtins.list", vec![instance("builtins.int", vec![])]),
+            ),
+        );
+        let typ = union(vec![
+            alias_type("testmod.X", vec![class_tvar(0, "foo.Box")]),
+            instance("builtins.bytes", vec![]),
+        ]);
+        let inst = instance("foo.Box", vec![instance("builtins.int", vec![])]);
+        with_alias_map(map, || {
+            let out = expand_type_by_instance_relink(&typ, &inst, &resolver, false)
+                .expect("alias union item must flatten, not defer");
+            match out {
+                Type::UnionType { items, .. } => {
+                    assert_eq!(items.len(), 2);
+                    assert!(matches!(items[0], Type::TypeAliasType { .. }));
+                }
+                other => panic!("expected UnionType, got {:?}", other),
+            }
+        });
+    }
+
+    #[test]
+    fn ebi_relink_defers_on_alias_chain_cycle() {
+        // A -> B -> A: the chain walk defers (parity-safe), the whole
+        // relink call falls back to Python.
+        let mut resolver = TypeResolver::new();
+        resolver.insert("foo.Box".to_string(), snap_with_tvar("foo.Box", 0));
+        let mut map = HashMap::new();
+        map.insert(
+            "testmod.A".to_string(),
+            alias_snapshot("testmod.A", &alias_type("testmod.B", vec![])),
+        );
+        map.insert(
+            "testmod.B".to_string(),
+            alias_snapshot("testmod.B", &alias_type("testmod.A", vec![])),
+        );
+        let typ = union(vec![alias_type("testmod.A", vec![])]);
+        let inst = instance("foo.Box", vec![instance("builtins.int", vec![])]);
+        with_alias_map(map, || {
+            assert!(expand_type_by_instance_relink(&typ, &inst, &resolver, false).is_none());
+        });
     }
 }
