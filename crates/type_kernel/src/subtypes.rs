@@ -2146,6 +2146,14 @@ pub(crate) fn map_instance_to_supertype(
     if left_ref == right_ref {
         return Some(left_args.to_vec());
     }
+    // Fast path: a typevars-empty superclass maps to no args regardless
+    // of the derivation path (maptype.py:19-21), matching Python before
+    // its native seam; a non-generic definer accessor rides this.
+    if let Some(right_snap) = resolver.get(right_ref) {
+        if right_snap.type_vars.is_empty() {
+            return Some(vec![]);
+        }
+    }
     // Walk class_derivation_paths via the snapshot's bases blobs.
     // Each base is a serialized Instance; decode and recurse.
     map_derivation_path(left_ref, left_args, right_ref, resolver)
@@ -4535,6 +4543,7 @@ mod tests {
         // but left has no bases blobs (snapshot not populated). The
         // map_instance_to_supertype walker returns None, falling through.
         let mut base = snap("a.Gen", "Gen");
+        base.type_vars = vec!["T".to_string()];
         base.type_vars_with_variance = vec![("T".to_string(), COVARIANT, 0)];
         let mut derived = snap("a.Sub", "Sub");
         derived.has_base.insert("a.Gen".to_string());
@@ -6326,6 +6335,7 @@ mod tests {
         // to the supertype); the other pairs in the same batch still get
         // their answers instead of the whole batch failing.
         let mut gen = snap("a.Gen", "Gen");
+        gen.type_vars = vec!["T".to_string()];
         gen.type_vars_with_variance = vec![("T".to_string(), COVARIANT, 0)];
         let mut derived = snap("a.Sub", "Sub");
         derived.has_base.insert("a.Gen".to_string());

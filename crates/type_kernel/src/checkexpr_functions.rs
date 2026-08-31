@@ -1493,7 +1493,7 @@ fn walk_untyped_decorator_proper(
     }
     let callable_cls: &PyType = types_mod.getattr("CallableType").ok()?.downcast().ok()?;
     if proper.is_instance(callable_cls).ok()? {
-        return Some(!is_typed_callable_live(types_mod, proper, depth)?);
+        return Some(!is_typed_callable_live(py, types_mod, proper, depth)?);
     }
     let overloaded_cls: &PyType = types_mod.getattr("Overloaded").ok()?.downcast().ok()?;
     if proper.is_instance(overloaded_cls).ok()? {
@@ -1573,15 +1573,27 @@ fn instance_untyped_decorator_walk(
         // is_typed_callable is False outside CallableType.
         return Some(true);
     }
-    Some(!is_typed_callable_live(types_mod, method_type, depth + 1)?)
+    Some(!is_typed_callable_live(
+        py,
+        types_mod,
+        method_type,
+        depth + 1,
+    )?)
 }
 
 /// The `is_typed_callable` fold of `is_untyped_decorator`, over a live
 /// proper `CallableType` (the isinstance check is the caller's, mirroring
 /// the Python order). A non-unannotated-Any arg/ret or a non-Any type
-/// answers typed; an alias/guard leaf defers (Python's `get_proper_types`
-/// expands it from the live alias node).
-fn is_typed_callable_live(types_mod: &PyModule, c: &PyAny, depth: u32) -> Option<bool> {
+/// answers typed; an alias/guard leaf expands through the real
+/// `get_proper_type` (mirroring `is_untyped_decorator_live`'s top-level
+/// path and Python's `get_proper_types` element expansion), only deferring
+/// when the expansion still carries a lazy wrapper.
+fn is_typed_callable_live(
+    py: Python<'_>,
+    types_mod: &PyModule,
+    c: &PyAny,
+    depth: u32,
+) -> Option<bool> {
     if depth > UNTYPED_DECORATOR_LIVE_DEPTH_CAP {
         return None;
     }
@@ -1596,19 +1608,63 @@ fn is_typed_callable_live(types_mod: &PyModule, c: &PyAny, depth: u32) -> Option
         .getattr("unannotated")
         .ok()?;
     for t in args.iter().chain(std::iter::once(ret)) {
-        if t.is_instance(any_cls).ok()? {
-            let toa = t.getattr("type_of_any").ok()?;
-            let is_unannotated = toa.eq(unannotated).ok()?;
-            if is_unannotated {
-                continue;
+        match classify_untyped_leaf(
+            py,
+            types_mod,
+            any_cls,
+            alias_cls,
+            guarded_cls,
+            unannotated,
+            t,
+        ) {
+            Some(true) => continue,
+            Some(false) => return Some(true),
+            None => {
+                return None;
             }
-            return Some(true);
         }
-        if t.is_instance(alias_cls).ok()? || t.is_instance(guarded_cls).ok()? {
-            return None;
-        }
-        return Some(true);
     }
+    Some(false)
+}
+
+/// One leaf of the `is_typed_callable` fold: `Some(true)` = unannotated
+/// Any (keep scanning), `Some(false)` = typed (short-circuit), `None` =
+/// defer. An alias/guard wrapper expands through the real
+/// `get_proper_type`; a lazy wrapper surviving the expansion (guarded
+/// alias chains) defers.
+#[allow(clippy::too_many_arguments)]
+fn classify_untyped_leaf(
+    _py: Python<'_>,
+    types_mod: &PyModule,
+    any_cls: &PyType,
+    alias_cls: &PyType,
+    guarded_cls: &PyType,
+    unannotated: &PyAny,
+    t: &PyAny,
+) -> Option<bool> {
+    // One get_proper_type call unwraps the full top-level alias chain;
+    // loop against the (defensive) guarded-of-guarded shapes, capped at
+    // a small bound.
+    let mut cur: &PyAny = t;
+    for _ in 0..8 {
+        if !(cur.is_instance(alias_cls).ok()? || cur.is_instance(guarded_cls).ok()?) {
+            break;
+        }
+        let expanded = types_mod
+            .getattr("get_proper_type")
+            .ok()?
+            .call1((cur,))
+            .ok()?;
+        cur = expanded;
+    }
+    if cur.is_instance(alias_cls).ok()? || cur.is_instance(guarded_cls).ok()? {
+        return None;
+    }
+    if cur.is_instance(any_cls).ok()? {
+        let toa = cur.getattr("type_of_any").ok()?;
+        return toa.eq(unannotated).ok();
+    }
+    // Any other shape: not an unannotated Any, so the fold is typed.
     Some(false)
 }
 

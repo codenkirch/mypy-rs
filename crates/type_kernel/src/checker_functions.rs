@@ -1435,12 +1435,16 @@ pub(crate) fn rust_check_for_untyped_decorator(
         None => Some(false),
         Some(bytes) => match crate::checkmember::decode_type(bytes) {
             Some(t) => crate::checkexpr_functions::is_typed_callable_inner(&t),
-            None => return Ok(None),
+            None => {
+                return Ok(None);
+            }
         },
     };
     match func_is_typed {
         Some(false) => return Ok(Some(false)),
-        None => return Ok(None),
+        None => {
+            return Ok(None);
+        }
         Some(true) => {}
     }
     // This inline chain must stay in lock-step with the test-only fold
