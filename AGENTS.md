@@ -599,17 +599,20 @@ including:
   `mypy/test/testtypes.py` (gate-off vs gate-on differential plus direct
   seam calls), plus Rust unit tests for the name predicates in
   `checker_functions.rs`.
-- `rust_check_for_untyped_decorator` (issue #942) — mirrors
-  `TypeChecker.check_for_untyped_decorator` (checker.py:6955-6964): the
-  bool gate `disallow_untyped_decorators and is_typed_callable(func.type)
-  and is_untyped_decorator(dec_type) and not current_node_deferred`. Rust
-  folds the two wire-format type sub-predicates (reusing the existing
-  `is_typed_callable` / `is_untyped_decorator` ports in
-  `checkexpr_functions.rs`) with the two scalar flags, short-circuiting in
-  Python order; the Python shim emits `typed_function_untyped_decorator`
-  when the result is True and keeps the pure-Python body as the fallback.
-  Defers (`None`) on an undecodable blob or a deferred sub-predicate (an
-  Instance decorator whose `__call__` needs live TypeInfo). Gated by
+- `rust_check_for_untyped_decorator` (issue #942, reworked in #1296) —
+  mirrors `TypeChecker.check_for_untyped_decorator`
+  (checker.py:6955-6964): the bool gate `disallow_untyped_decorators and
+  is_typed_callable(func.type) and is_untyped_decorator(dec_type) and not
+  current_node_deferred`. Rust folds the wire-format `is_typed_callable`
+  port for the func side with the two scalar flags, and walks the
+  decorator side as a live PyO3 object (`rust_is_untyped_decorator`,
+  below): an Instance decorator no longer defers, the seam runs the real
+  `TypeInfo.get_method("__call__")`. Short-circuit order mirrors Python,
+  so an untyped func skips the decorator walk. The Python shim emits
+  `typed_function_untyped_decorator` when the result is True and keeps
+  the pure-Python body as the fallback. Defers (`None`) on an
+  undecodable func blob, an alias nested inside the decorator's
+  callable, or an unreadable fact in the live walk. Gated by
   `_native_checker_active` (wired from `mypy/build.py`; the Python shim
   mirrors `rust_classify_final_super` gating) and covered by
   `NativeUntypedDecoratorSuite` in `mypy/test/testtypes.py` (gate-off vs
@@ -1712,6 +1715,31 @@ including:
   `NativeTypeopsDeferralSuite` in `mypy/test/testtypes.py` (rewritten
   seam tests + `test_instance_fallback_decided_none_protocol`) plus
   kernel unit tests in `typeops.rs`.
+- `rust_simple_literal_type` decided-None protocol (issue #1295) — the
+  typeops `simple_literal_type` seam (shim `mypy/typeops.py:1166`) now
+  speaks the #1101 `(decided, blob)` protocol: `(true, bytes)` for the
+  fallback Instance of a literal, `(true, None)` for a decided
+  not-a-literal (previously the Rust `None` made the Python shim re-run
+  its body on every call — 233 calls @ 0% native on the cold
+  self-check), `(false, None)` defers (undecodable blob / unencodable
+  fallback). The shim returns early on `decided`; a decoded non-Instance
+  falls through defensively. Covered by
+  `test_simple_literal_decided_none_protocol` /
+  `test_simple_literal_instance_with_lkv` in `NativeTypeopsDeferralSuite`
+  (`mypy/test/testtypes.py`).
+- `rust_is_untyped_decorator` live walker (issue #1296) — the wire
+  version (220 calls @ 15% native) deferred on every Instance because
+  the `__call__` lookup needs the live `TypeInfo`; it is now a
+  live-PyO3-object seam (`rust_is_final_enum_value` shape, zero wire
+  bytes for the subject): `get_proper_type` on a top-level alias via the
+  real Python function, then the Callable/Overloaded/Instance dispatch,
+  with the Instance arm running the real `TypeInfo.get_method("__call__")`
+  and recursing through Decorator-head / Overloaded / plain-method
+  types. Defers (`None`) on an unreadable attribute, a depth-cap
+  overflow (50), or an alias nested inside a callable's arg/ret types.
+  Feeds `rust_check_for_untyped_decorator` (issue #942, above), which
+  now passes the decorator side live and skips the walk when the func
+  side is untyped.
 - `rust_analyze_member_method` subclass-receiver guard narrowing (issue
   #1184) — hoists `has_vars` (a CallableType with non-empty
   `variables`, or any Overloaded item carrying variables) to the seam

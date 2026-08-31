@@ -1185,11 +1185,18 @@ def simple_literal_type(t: ProperType | None) -> Instance | None:
         and t is not None
     ):
         try:
-            result = _type_kernel.rust_simple_literal_type(_serialize_type(t))
-            if result is not None:
+            # (decided, value) wire answer (issue #1101 protocol, #1295): a
+            # decided not-a-literal answer skips the body below; only an
+            # exception (undecodable blob / stale extension) falls through.
+            decided, result = _type_kernel.rust_simple_literal_type(_serialize_type(t))
+            if decided:
+                if result is None:
+                    return None
                 decoded = _deserialize_type(bytes(result))
                 if isinstance(decoded, Instance):
                     return decoded
+                # Unreachable: the fallback of a wire literal is always an
+                # Instance blob; fall through defensively.
         except (AssertionError, NotImplementedError):
             pass
     if isinstance(t, Instance) and t.last_known_value is not None:

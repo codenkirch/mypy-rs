@@ -6988,6 +6988,39 @@ class NativeTypeopsDeferralSuite(Suite):
         for t in (none_t, any_t, uni, union, ttype):
             assert try_getting_instance_fallback(t) is None
 
+    def test_simple_literal_decided_none_protocol(self) -> None:
+        # Issue #1295: non-literal proper types are DECIDED not-a-literal
+        # ((True, None), #1101 protocol), so the shim skips its body; only
+        # an undecodable blob answers (False, None).
+        from mypy.typeops import _serialize_type, simple_literal_type
+        from mypy.types import AnyType, TypeOfAny
+
+        for t in (self.str_inst, self.enum_inst, AnyType(TypeOfAny.explicit)):
+            r = _type_kernel.rust_simple_literal_type(_serialize_type(t))
+            decided, blob = r
+            assert decided and blob is None, f"undecided pair for {t!r}: {r!r}"
+            assert simple_literal_type(t) is None
+
+    def test_simple_literal_instance_with_lkv(self) -> None:
+        # An Instance with a literal last_known_value decides (True, blob);
+        # the public path decodes it back to the fallback Instance with
+        # gate-off/on parity.
+        from mypy.typeops import _serialize_type, simple_literal_type
+        from mypy.types import LiteralType
+
+        inst = Instance(self.fx.str_type_info, [], last_known_value=LiteralType("x", self.str_inst))
+        off = self._with_gate(False, lambda: simple_literal_type(inst))
+        on = self._with_gate(True, lambda: simple_literal_type(inst))
+        assert off is not None
+        assert_equal(str(on), str(off), "simple_literal_type lkv parity")
+        assert_equal(str(on), str(self.str_inst))
+        r = _type_kernel.rust_simple_literal_type(_serialize_type(inst))
+        decided, blob = r
+        # Direct-seam engagement proof: the lkv Instance decides as
+        # (True, Some). Blob decode defers here (the fixture map lacks
+        # builtin refs); the public parity above covers the decoded value.
+        assert decided and blob is not None, f"undecided pair: {r!r}"
+
     def test_missing_snapshot_defers_to_python(self) -> None:
         # An alias NOT registered in the resolver cannot be expanded, so the
         # Rust seam must defer and Python computes. Parity must still hold.
@@ -26866,10 +26899,12 @@ class NativeUntypedDecoratorSuite(Suite):
     `TypeChecker.check_for_untyped_decorator` (checker.py:6955-6964) is the
     bool gate `disallow_untyped_decorators and is_typed_callable(func.type)
     and is_untyped_decorator(dec_type) and not current_node_deferred`. The
-    Rust fold (checker_functions.rs) computes the two type sub-predicates on
-    the wire format and combines them with the two scalar flags; the Python
-    shim emits `typed_function_untyped_decorator` when it returns True and
-    keeps the pure-Python body as the fallback.
+    Rust fold (checker_functions.rs) computes the func sub-predicate on the
+    wire format and walks the decorator side as a live PyO3 object
+    (checkexpr_functions.rs: the Instance arm runs the real
+    `TypeInfo.get_method("__call__")`); the Python shim emits
+    `typed_function_untyped_decorator` when it returns True and keeps the
+    pure-Python body as the fallback.
 
     Direct seam calls prove engagement and short-circuit ordering; the
     gate-off vs gate-on differential drives the real TypeChecker method and
@@ -26910,8 +26945,10 @@ class NativeUntypedDecoratorSuite(Suite):
     def _seam(
         self, disallow: bool, func_type: Type | None, dec_type: Type | None, deferred: bool
     ) -> bool | None:
+        # The decorator side rides the live object (the Instance arm needs
+        # the real TypeInfo.get_method lookup).
         return _type_kernel.rust_check_for_untyped_decorator(
-            disallow, self._serialize(func_type), self._serialize(dec_type), deferred
+            disallow, self._serialize(func_type), dec_type, deferred
         )
 
     def _run(
@@ -26972,10 +27009,87 @@ class NativeUntypedDecoratorSuite(Suite):
         assert self._seam(True, None, None, False) is False
         assert self._seam(True, self._typed_callable(), None, False) is True
 
-    def test_seam_instance_decorator_defers(self) -> None:
-        # is_untyped_decorator on an Instance needs the live `__call__` lookup,
-        # so the Rust seam must defer (None); the Python shim falls back.
-        assert self._seam(True, self._typed_callable(), self.fx.a, False) is None
+    def _instance_with_call(self, method: FuncBase | Decorator) -> Instance:
+        from mypy.nodes import MDEF, SymbolTableNode
+
+        info = self._fixture_info()
+        info.names["__call__"] = SymbolTableNode(MDEF, method)  # type: ignore[arg-type]
+        return Instance(info, [])
+
+    def _fixture_info(self) -> TypeInfo:
+        from mypy.nodes import Block, ClassDef, SymbolTable
+
+        defn = ClassDef("Callable", Block([]), None, [])
+        defn.fullname = "mod.HasCall"
+        info = TypeInfo(SymbolTable(), defn, "mod")
+        defn.info = info
+        # `get_method` walks `info.mro`; seed it with the class itself so
+        # the symbol-table entry is discoverable.
+        info.mro.append(info)
+        return info
+
+    def _method_fdef(self, typ: Type | None) -> FuncDef:
+        fdef = FuncDef("__call__")
+        fdef.type = typ  # type: ignore[assignment]
+        return fdef
+
+    def _decorator_method(self, func_type: Type | None, var_type: Type | None) -> Decorator:
+        from mypy.nodes import GDEF, SymbolTableNode, Var
+
+        info = self._fixture_info()
+        func = self._method_fdef(func_type)
+        var = Var("__call__")
+        var.type = var_type
+        dec = Decorator(func, [], var)
+        info.names["__call__"] = SymbolTableNode(GDEF, dec)
+        return dec
+
+    def test_seam_instance_without_call(self) -> None:
+        # The walker decides: a class without __call__ is a typed decorator
+        # (is_untyped_decorator answers False), so the seam returns Some.
+        assert self._seam(True, self._typed_callable(), self.fx.a, False) is False
+
+    def test_seam_instance_untyped_call(self) -> None:
+        dec = self._instance_with_call(self._method_fdef(self._untyped_callable()))
+        assert self._seam(True, self._typed_callable(), dec, False) is True
+
+    def test_seam_instance_typed_call(self) -> None:
+        dec = self._instance_with_call(self._method_fdef(self._typed_callable()))
+        assert self._seam(True, self._typed_callable(), dec, False) is False
+
+    def test_seam_instance_decorator_head(self) -> None:
+        # Decorator head: untyped func.type decides True before var.type.
+        dec = self._decorator_method(self._untyped_callable(), self._typed_callable())
+        assert self._seam(True, self._typed_callable(), self._instance_with_call(dec), False) is True
+        # Typed func.type defers to var.type; a None var.type is untyped.
+        dec = self._decorator_method(self._typed_callable(), None)
+        assert self._seam(True, self._typed_callable(), self._instance_with_call(dec), False) is True
+        # None func.type is untyped on both paths (is_untyped_decorator(
+        # None) is True), regardless of var.type.
+        dec = self._decorator_method(None, self._typed_callable())
+        assert self._seam(True, self._typed_callable(), self._instance_with_call(dec), False) is True
+
+    def test_parity_decorator_none_func_type(self) -> None:
+        # Python returns True at the func.type arm (is_untyped_decorator(
+        # None) is True, `or` short-circuit); the walker must not fall
+        # through to a typed var.type and answer False.
+        dec = self._decorator_method(None, self._typed_callable())
+        self._assert_par(True, self._typed_callable(), self._instance_with_call(dec), False)
+
+    def test_seam_instance_overloaded_call(self) -> None:
+        from mypy.types import Overloaded
+
+        items = [self._untyped_callable(), self._typed_callable()]
+        dec = self._instance_with_call(self._method_fdef(Overloaded(items)))
+        assert self._seam(True, self._typed_callable(), dec, False) is True
+
+    def test_seam_direct_walker_arms(self) -> None:
+        # The standalone is_untyped_decorator seam on the same shapes.
+        assert _type_kernel.rust_is_untyped_decorator(self._untyped_callable()) is True
+        assert _type_kernel.rust_is_untyped_decorator(self._typed_callable()) is False
+        assert _type_kernel.rust_is_untyped_decorator(self.fx.a) is False
+        inst = self._instance_with_call(self._method_fdef(self._untyped_callable()))
+        assert _type_kernel.rust_is_untyped_decorator(inst) is True
 
     def test_parity_all_false(self) -> None:
         self._assert_par(False, None, None, False)
@@ -26994,6 +27108,14 @@ class NativeUntypedDecoratorSuite(Suite):
 
     def test_parity_instance_decorator(self) -> None:
         self._assert_par(True, self._typed_callable(), self.fx.a, False)
+
+    def test_parity_instance_untyped_call(self) -> None:
+        dec = self._instance_with_call(self._method_fdef(self._untyped_callable()))
+        self._assert_par(True, self._typed_callable(), dec, False)
+
+    def test_parity_instance_typed_call(self) -> None:
+        dec = self._instance_with_call(self._method_fdef(self._typed_callable()))
+        self._assert_par(True, self._typed_callable(), dec, False)
 
     def test_parity_none_decorator(self) -> None:
         self._assert_par(True, self._typed_callable(), None, False)

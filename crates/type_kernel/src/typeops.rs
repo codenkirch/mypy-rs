@@ -601,13 +601,24 @@ fn expand_alias_items(
     Some(out)
 }
 
-/// `#[pyfunction]` entry for `simple_literal_type`. Returns encoded fallback
-/// Instance bytes, or `None`.
+/// `#[pyfunction]` entry for `simple_literal_type`. Returns a
+/// `(decided, value)` wire answer (issue #1101 protocol, issue #1295): the
+/// function is total over well-formed wire input, so a genuine no-result
+/// (`t` not a simple literal) is a `(true, None)` decided answer, not a
+/// deferral. `(false, None)` defers on an undecodable blob or an
+/// unencodable fallback so the Python shim re-runs its body.
 #[pyfunction]
-pub(crate) fn rust_simple_literal_type(t_bytes: &[u8]) -> Option<Vec<u8>> {
-    let t = decode_type(t_bytes)?;
-    let fallback = simple_literal_type(&t)?;
-    encode_type(&fallback)
+pub(crate) fn rust_simple_literal_type(t_bytes: &[u8]) -> (bool, Option<Vec<u8>>) {
+    let Some(t) = decode_type(t_bytes) else {
+        return (false, None);
+    };
+    match simple_literal_type(&t) {
+        Some(fallback) => match encode_type(&fallback) {
+            Some(bytes) => (true, Some(bytes)),
+            None => (false, None),
+        },
+        None => (true, None),
+    }
 }
 
 /// `#[pyfunction]` entry for `is_simple_literal`. Returns `Some(true)`/

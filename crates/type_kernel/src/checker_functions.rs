@@ -1385,14 +1385,10 @@ pub(crate) fn rust_is_writable_attribute(py: Python<'_>, node: &PyAny) -> PyResu
     Ok(Some(is_writable_attribute_inner(false, false, false, None)))
 }
 
-/// `TypeChecker.check_for_untyped_decorator` (checker.py:6955-6964): the
-/// bool conjunction `disallow_untyped_decorators and is_typed_callable(func.type)
-/// and is_untyped_decorator(dec_type) and not current_node_deferred`, reduced to
-/// a pure decision over resolved facts. `func_is_typed` / `dec_is_untyped` are
-/// `Option<bool>` where `None` means the sub-predicate deferred (e.g. an
-/// instance decorator whose `__call__` needs live TypeInfo, or an alias).
-/// Short-circuit order mirrors the Python body, so a `false` disallow flag or
-/// an untruthy sub-predicate answers `Some(false)` without touching the rest.
+/// Test-only decision fold of `check_for_untyped_decorator`
+/// (checker.py:6955-6964). The seam inlines the same short-circuit
+/// order; kept for the pure decision-table tests below.
+#[cfg(test)]
 fn check_untyped_decorator(
     disallow: bool,
     func_is_typed: Option<bool>,
@@ -1414,20 +1410,26 @@ fn check_untyped_decorator(
 }
 
 /// `#[pyfunction]` entry for `TypeChecker.check_for_untyped_decorator`
-/// (mypy/checker.py:6955-6964). The two type sub-predicates are computed on
-/// the wire format via the existing `is_typed_callable` /
-/// `is_untyped_decorator` ports; the scalar flags (`disallow_untyped_decorators`
-/// and `current_node_deferred`) arrive as plain bools. Returns `Some(bool)` for
-/// every decidable conjunction, or `None` to defer (an undecodable type blob or
-/// a deferred sub-predicate, which mirrors the Python `try/except` shim).
+/// (mypy/checker.py:6955-6964). The func side rides the wire-format
+/// `is_typed_callable` port; the decorator side walks the live object via
+/// `is_untyped_decorator_live`. Short-circuit order mirrors the Python
+/// body: a `false` disallow flag or an untyped func skips the decorator
+/// walk entirely. Returns `Some(bool)` for every decidable conjunction, or
+/// `None` to defer (an undecodable type blob, a deferred sub-predicate, or
+/// an unreadable fact in the live walk — mirroring the Python `try/except`
+/// shim).
 #[pyfunction]
-#[pyo3(signature = (disallow_untyped_decorators, func_type_bytes, dec_type_bytes, current_node_deferred))]
+#[pyo3(signature = (disallow_untyped_decorators, func_type_bytes, dec_type, current_node_deferred))]
 pub(crate) fn rust_check_for_untyped_decorator(
+    py: Python<'_>,
     disallow_untyped_decorators: bool,
     func_type_bytes: Option<&[u8]>,
-    dec_type_bytes: Option<&[u8]>,
+    dec_type: Option<&PyAny>,
     current_node_deferred: bool,
 ) -> PyResult<Option<bool>> {
+    if !disallow_untyped_decorators {
+        return Ok(Some(false));
+    }
     let func_is_typed = match func_type_bytes {
         // `is_typed_callable(None)` is False (get_proper_type(None) is falsy).
         None => Some(false),
@@ -1436,20 +1438,25 @@ pub(crate) fn rust_check_for_untyped_decorator(
             None => return Ok(None),
         },
     };
-    let dec_is_untyped = match dec_type_bytes {
+    match func_is_typed {
+        Some(false) => return Ok(Some(false)),
+        None => return Ok(None),
+        Some(true) => {}
+    }
+    // This inline chain must stay in lock-step with the test-only fold
+    // `check_untyped_decorator`; end-to-end parity rides on
+    // NativeUntypedDecoratorSuite in mypy/test/testtypes.py.
+    let dec_is_untyped = match dec_type {
         // `is_untyped_decorator(None)` is True (get_proper_type(None) is falsy).
         None => Some(true),
-        Some(bytes) => match crate::checkmember::decode_type(bytes) {
-            Some(t) => crate::checkexpr_functions::is_untyped_decorator_inner(&t),
-            None => return Ok(None),
-        },
+        Some(obj) => crate::checkexpr_functions::is_untyped_decorator_live(py, obj),
     };
-    Ok(check_untyped_decorator(
-        disallow_untyped_decorators,
-        func_is_typed,
-        dec_is_untyped,
-        current_node_deferred,
-    ))
+    match dec_is_untyped {
+        Some(false) => return Ok(Some(false)),
+        None => return Ok(None),
+        Some(true) => {}
+    }
+    Ok(Some(!current_node_deferred))
 }
 
 /// `TypeChecker.check_match_args` (checker.py:3128-3141): the type
