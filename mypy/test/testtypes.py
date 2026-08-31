@@ -47201,11 +47201,80 @@ class NativeFindSelfTypeSuite(Suite):
         t = TypeAliasType(self.alias_plain, [UnboundType("Self")])
         self._assert_par(t, {"Self": "typing.Self"}, False)
 
-    def test_seam_resolverless_alias_defers(self) -> None:
+    def test_seam_resolverless_alias_decides(self) -> None:
+        # Issue #1308: the no-resolver window (pre-first-SCC semanal)
+        # expands alias targets over live objects instead of deferring
+        # every TypeAliasType seen during that window.
         lookup = self._lookup({"Self": "typing.Self"})
         t = TypeAliasType(self.alias_self, [])
         result = _type_kernel.rust_find_self_type(t, lookup)
-        assert result is None, f"resolver-less seam answered {result}"
+        assert result is True, f"resolver-less seam deferred or answered {result}"
+
+    def test_seam_resolverless_alias_substituted_tvar(self) -> None:
+        # _expand_once substitution: t.args[i] replaces the alias tvar
+        # occurrence in the target, keyed by TypeVarId equality.
+        alias_g = TypeAlias(
+            Instance(self.fx.ai, [self.fx.t]), "mod.G", "mod", 1, 1, alias_tvars=[self.fx.t]
+        )
+        t = TypeAliasType(alias_g, [UnboundType("Self")])
+        self._assert_seam(t, {"Self": "typing.Self"}, True)
+
+    def test_seam_resolverless_alias_noargs(self) -> None:
+        # no_args aliases copy t.args over the target Instance's args;
+        # the query runs over t.args directly.
+        alias_lst = TypeAlias(Instance(self.fx.std_listi, []), "mod.Lst", "mod", 1, 1, no_args=True)
+        t = TypeAliasType(alias_lst, [UnboundType("Self")])
+        self._assert_seam(t, {"Self": "typing.Self"}, True)
+
+    def test_seam_resolverless_alias_nested(self) -> None:
+        # A target carrying another TypeAliasType recurses through the
+        # same live expansion.
+        alias_n = TypeAlias(
+            Instance(self.fx.ai, [TypeAliasType(self.alias_self, [])]), "mod.N", "mod", 1, 1
+        )
+        t = TypeAliasType(alias_n, [])
+        self._assert_seam(t, {"Self": "typing.Self"}, True)
+
+    def test_seam_resolverless_alias_tvt_defers(self) -> None:
+        # The tvar_tuple_index mid-split mapping is not representable in
+        # the (tvar -> arg) map; the defer stays parity-safe on both
+        # seams.
+        ts = TypeVarTupleType(
+            "Ts",
+            "mod.Ts",
+            TypeVarId(1),
+            self.fx.o,
+            self.fx.std_tuple,
+            AnyType(TypeOfAny.special_form),
+        )
+        alias_ts = TypeAlias(self.fx.std_tuple, "mod.T", "mod", 1, 1, alias_tvars=[ts])
+        lookup = self._lookup({"Self": "typing.Self"})
+        t = TypeAliasType(alias_ts, [self.fx.o])
+        result = _type_kernel.rust_find_self_type(t, lookup)
+        assert result is None, f"tvar-tuple alias answered {result}"
+
+    def test_seam_resolverless_alias_nested_chain(self) -> None:
+        # A[T] = B[T], B[S] = list[S], use site A[Self] expands to
+        # list[Self] -> True (nested alias args resolve via the outer
+        # subst, InstantiateAliasVisitor semantics).
+        alias_b = TypeAlias(
+            Instance(self.fx.std_listi, [self.fx.t]),
+            "mod.B",
+            "mod",
+            1,
+            1,
+            alias_tvars=[self.fx.t],
+        )
+        alias_a = TypeAlias(
+            TypeAliasType(alias_b, [self.fx.t]),
+            "mod.A",
+            "mod",
+            1,
+            1,
+            alias_tvars=[self.fx.t],
+        )
+        t = TypeAliasType(alias_a, [UnboundType("Self")])
+        self._assert_seam(t, {"Self": "typing.Self"}, True)
 
     def test_seam_live_alias_target_self(self) -> None:
         lookup = self._lookup({"Self": "typing.Self"})
