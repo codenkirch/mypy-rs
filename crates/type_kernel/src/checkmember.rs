@@ -751,9 +751,8 @@ fn tuple_special_map(
 }
 
 /// Value-level port of `FreezeTypeVarsVisitor` (typeops.py:2107-2113),
-/// in three steps: `collect_freeze_ids` gathers the ids of every callable's
-/// `variables`, `survivors_freezable` verifies that every surviving typevar
-/// is one of them, and `apply_freeze` sets `meta_level = 0` on matching
+/// in two steps: `collect_freeze_ids` gathers the ids of every callable's
+/// `variables`, and `apply_freeze` sets `meta_level = 0` on matching
 /// typevars anywhere in the tree. Python freezes by shared-object mutation
 /// (`freshen_function_type_vars` shares one typevar object per variable
 /// between `variables` and every occurrence, expandtype.py:550); the wire
@@ -781,40 +780,6 @@ fn collect_freeze_ids(typ: &mut Type, ids: &mut Vec<(i64, i64, String)>) {
     freeze_children(typ, &mut |c| collect_freeze_ids(c, ids));
 }
 
-/// Verify every surviving typevar is a `variables` entry collected by
-/// `collect_freeze_ids`, i.e. a freshened method type var Python's freeze
-/// would reify. Anything else defers: a leftover outside any `variables`
-/// list is an env miss the wire expand could not key (Python substitutes it
-/// via live binder ids), and ParamSpec/TypeVarTuple entries carry no
-/// `meta_level` on the wire, so their ids cannot be frozen here.
-fn survivors_freezable(typ: &mut Type, ids: &[(i64, i64, String)]) -> bool {
-    if !typevar_freezable(typ, ids) {
-        return false;
-    }
-    let mut ok = true;
-    freeze_children(typ, &mut |c| {
-        if !survivors_freezable(c, ids) {
-            ok = false;
-        }
-    });
-    ok
-}
-
-fn typevar_freezable(typ: &Type, ids: &[(i64, i64, String)]) -> bool {
-    match typ {
-        Type::TypeVarType {
-            raw_id,
-            namespace,
-            meta_level,
-            ..
-        } => ids
-            .iter()
-            .any(|(r, m, ns)| *r == *raw_id && *m == *meta_level && ns == namespace),
-        Type::ParamSpecType { .. } | Type::TypeVarTupleType { .. } => false,
-        _ => true,
-    }
-}
-
 fn apply_freeze(typ: &mut Type, ids: &[(i64, i64, String)]) {
     if let Type::TypeVarType {
         raw_id,
@@ -831,6 +796,199 @@ fn apply_freeze(typ: &mut Type, ids: &[(i64, i64, String)]) {
         }
     }
     freeze_children(typ, &mut |c| apply_freeze(c, ids));
+}
+
+fn key_in(keys: &[BindTVarKey], raw_id: i64, meta_level: i64, namespace: &str) -> bool {
+    keys.iter()
+        .any(|(r, m, ns)| *r == raw_id && *m == meta_level && ns == namespace)
+}
+
+/// Collect the (raw_id, meta_level, namespace) triple of every typevar-like
+/// node in the tree.
+fn collect_tvar_keys(typ: &Type, keys: &mut Vec<BindTVarKey>) {
+    match typ {
+        Type::TypeVarType {
+            raw_id,
+            meta_level,
+            namespace,
+            ..
+        } => keys.push((*raw_id, *meta_level, namespace.clone())),
+        Type::ParamSpecType {
+            raw_id, namespace, ..
+        }
+        | Type::TypeVarTupleType {
+            raw_id, namespace, ..
+        } => keys.push((*raw_id, -1, namespace.clone())),
+        _ => {}
+    }
+    for_each_child(typ, &mut |c| collect_tvar_keys(c, keys));
+}
+
+/// Narrowed survivor gate (issue #1277): a tvar leftover in the expanded tree
+/// rides through only when it is a `variables` entry or an occurrence among
+/// the mapped receiver's args; anything else, or an UnpackType, defers.
+fn survivors_allowed(typ: &Type, ids: &[BindTVarKey], recv: &[BindTVarKey]) -> bool {
+    let ok = match typ {
+        Type::TypeVarType {
+            raw_id,
+            meta_level,
+            namespace,
+            ..
+        } => {
+            key_in(ids, *raw_id, *meta_level, namespace)
+                || key_in(recv, *raw_id, *meta_level, namespace)
+        }
+        Type::ParamSpecType {
+            raw_id, namespace, ..
+        }
+        | Type::TypeVarTupleType {
+            raw_id, namespace, ..
+        } => key_in(recv, *raw_id, -1, namespace),
+        Type::UnpackType { .. } => false,
+        _ => true,
+    };
+    if !ok {
+        return false;
+    }
+    let mut all = true;
+    for_each_child(typ, &mut |c| {
+        if all {
+            all = survivors_allowed(c, ids, recv);
+        }
+    });
+    all
+}
+
+/// Read-only mirror of `freeze_children`, used by the survivor-gate walks
+/// (which must consult exactly the tree freeze would reach).
+fn for_each_child<F: FnMut(&Type)>(typ: &Type, f: &mut F) {
+    match typ {
+        Type::TypeVarType {
+            values,
+            upper_bound,
+            default,
+            ..
+        } => {
+            for v in values.iter() {
+                f(v);
+            }
+            f(upper_bound);
+            f(default);
+        }
+        Type::Instance { args, .. }
+        | Type::TypeAliasType { args, .. }
+        | Type::UnboundType { args, .. } => {
+            for a in args.iter() {
+                f(a);
+            }
+        }
+        Type::AnyType { source_any, .. } => {
+            if let Some(src) = source_any {
+                f(src);
+            }
+        }
+        Type::ParamSpecType {
+            prefix,
+            upper_bound,
+            default,
+            ..
+        } => {
+            let Parameters {
+                arg_types,
+                variables,
+                ..
+            } = &**prefix;
+            for a in arg_types.iter() {
+                f(a);
+            }
+            for v in variables.iter() {
+                f(v);
+            }
+            f(upper_bound);
+            f(default);
+        }
+        Type::TypeVarTupleType {
+            tuple_fallback,
+            upper_bound,
+            default,
+            ..
+        } => {
+            f(tuple_fallback);
+            f(upper_bound);
+            f(default);
+        }
+        Type::UnpackType { typ } => f(typ),
+        Type::CallableType {
+            fallback,
+            instance_type,
+            arg_types,
+            ret_type,
+            variables,
+            type_guard,
+            type_is,
+            ..
+        } => {
+            f(fallback);
+            if let Some(it) = instance_type {
+                f(it);
+            }
+            for a in arg_types.iter() {
+                f(a);
+            }
+            f(ret_type);
+            for v in variables.iter() {
+                f(v);
+            }
+            if let Some(g) = type_guard {
+                f(g);
+            }
+            if let Some(i) = type_is {
+                f(i);
+            }
+        }
+        Type::Overloaded { items } => {
+            for it in items.iter() {
+                f(it);
+            }
+        }
+        Type::TupleType {
+            partial_fallback,
+            items,
+            ..
+        } => {
+            f(partial_fallback);
+            for it in items.iter() {
+                f(it);
+            }
+        }
+        Type::TypedDictType {
+            fallback, items, ..
+        } => {
+            f(fallback);
+            for (_, it) in items.iter() {
+                f(it);
+            }
+        }
+        Type::LiteralType { fallback, .. } => f(fallback),
+        Type::UnionType { items, .. } => {
+            for it in items.iter() {
+                f(it);
+            }
+        }
+        Type::TypeType { item, .. } => f(item),
+        Type::Parameters(params) => {
+            for a in params.arg_types.iter() {
+                f(a);
+            }
+            for v in params.variables.iter() {
+                f(v);
+            }
+        }
+        Type::NoneType
+        | Type::ErasedType
+        | Type::UninhabitedType { .. }
+        | Type::DeletedType { .. } => {}
+    }
 }
 
 fn freeze_children<F: FnMut(&mut Type)>(typ: &mut Type, f: &mut F) {
@@ -988,19 +1146,16 @@ fn freeze_children<F: FnMut(&mut Type)>(typ: &mut Type, f: &mut F) {
 ///     Overloaded with zero items); a zero-arg or *args/**kwargs callable is
 ///     returned unchanged by bind_self_fast, and Rust mirrors that as the
 ///     unchanged callable, not a deferral
-///   * an expansion whose result still carries a typevar that is not a
-///     `variables` entry of some callable in the tree (an env miss, see
-///     below), or a ParamSpec/TypeVarTuple survivor the wire cannot freeze
 ///
 /// Python's `freeze_all_type_vars` (typeops.py:2102) sets `meta_level = 0`
 /// on the `variables` entries of every callable in the result; shared-object
 /// mutation freezes all occurrences. The wire round-trip breaks sharing, so
 /// the tail rewrites by id: collect the ids of every callable's `variables`,
-/// verify every surviving typevar is one of them (a leftover outside any
-/// `variables` list is an env miss the wire expand could not key; Python
-/// substitutes it via live binder ids, e.g. a function-local PEP695 class
-/// whose declared typevar namespace differs from the receiver fullname), and
-/// only then set `meta_level = 0` on the survivors.
+/// then set `meta_level = 0` on the matching occurrences. Leftover tvars
+/// ride through only when they occur in the mapped receiver's args (the
+/// caller-tvar substitution class the cold corpus showed); the narrowed
+/// survivor gate (#1277) defers everything else, whose decoded round-trip
+/// broke downstream inference in 28 testcheck defenses.
 #[allow(clippy::too_many_arguments)]
 fn static_member_tail(
     instance: &Type,
@@ -1014,9 +1169,7 @@ fn static_member_tail(
 ) -> Option<Type> {
     let (left_ref, left_args) = match instance {
         Type::Instance { type_ref, args, .. } => (type_ref.as_str(), args.as_slice()),
-        _ => {
-            return None;
-        }
+        _ => return None,
     };
     // `map_instance_to_supertype` walks map_derivation_path and returns
     // None for a non-base receiver, deferring to Python exactly as the
@@ -1061,22 +1214,24 @@ fn static_member_tail(
     // checkmember.py:451 `expand_type_by_instance(signature, typ)`. Expand
     // the unbound callable first (binding would defer the expand). The free-result
     // variant mirrors Python (`freeze_all_type_vars` on return).
-    let expanded = crate::expandtype::expand_type_by_instance_free(
+    let mut expanded = crate::expandtype::expand_type_by_instance_free(
         signature,
         &mapped_instance,
         resolver,
         strict_optional,
-    );
-    let mut expanded = match expanded {
-        Some(e) => e,
-        None => {
-            return None;
+    )?;
+    // checkmember.py:503 `freeze_all_type_vars(member_type)`. First the
+    // narrowed survivor gate (#1277): receiver-arg tvars ride through, any
+    // other leftover defers.
+    let mut recv_keys: Vec<BindTVarKey> = Vec::new();
+    if let Type::Instance { args, .. } = &mapped_instance {
+        for a in args {
+            collect_tvar_keys(a, &mut recv_keys);
         }
-    };
-    // checkmember.py:503 `freeze_all_type_vars(member_type)`.
+    }
     let mut ids: Vec<(i64, i64, String)> = Vec::new();
     collect_freeze_ids(&mut expanded, &mut ids);
-    if !survivors_freezable(&mut expanded, &ids) {
+    if !survivors_allowed(&expanded, &ids, &recv_keys) {
         return None;
     }
     apply_freeze(&mut expanded, &ids);
@@ -1442,11 +1597,12 @@ fn remove_self_vars(item: &mut Type, keys: &[BindTVarKey]) {
 
 /// Freeze the freshened method typevars of one item (typeops.py:2102
 /// `freeze_all_type_vars` mirror): collect the `variables`-declared ids,
-/// verify every survivor is among them, zero their meta levels, else defer.
-fn freeze_item(mut item: Type) -> Option<Type> {
+/// zero their meta levels everywhere in the tree; leftovers are gated by
+/// `survivors_allowed` against the mapped receiver's args.
+fn freeze_item(mut item: Type, recv_keys: &[BindTVarKey]) -> Option<Type> {
     let mut freeze_ids: Vec<(i64, i64, String)> = Vec::new();
     collect_freeze_ids(&mut item, &mut freeze_ids);
-    if !survivors_freezable(&mut item, &freeze_ids) {
+    if !survivors_allowed(&item, &freeze_ids, recv_keys) {
         return None;
     }
     apply_freeze(&mut item, &freeze_ids);
@@ -1560,6 +1716,12 @@ pub(crate) fn member_method_inner(
             return None;
         }
     };
+    let mut recv_keys: Vec<BindTVarKey> = Vec::new();
+    if let Type::Instance { args, .. } = &mapped_instance {
+        for a in args {
+            collect_tvar_keys(a, &mut recv_keys);
+        }
+    }
     // bind_self (strip tail): the self-arg filter kept only receiver-
     // compatible items, so `bind_self_fast_inner` strips and sets
     // `is_bound`; leftover typevars after bare-subst + freeze defer.
@@ -1572,7 +1734,7 @@ pub(crate) fn member_method_inner(
             for (mut item, plan) in items.into_iter().zip(bind_plans) {
                 subst_tvar_keys(&mut item, &plan.bare, self_type);
                 remove_self_vars(&mut item, &plan.self_vars);
-                let item = match freeze_item(item) {
+                let item = match freeze_item(item, &recv_keys) {
                     Some(i) => i,
                     None => {
                         return None;
@@ -1587,7 +1749,7 @@ pub(crate) fn member_method_inner(
             let mut item = item;
             subst_tvar_keys(&mut item, &plan.bare, self_type);
             remove_self_vars(&mut item, &plan.self_vars);
-            let item = match freeze_item(item) {
+            let item = match freeze_item(item, &recv_keys) {
                 Some(i) => i,
                 None => {
                     return None;
@@ -4839,14 +5001,14 @@ mod tests {
     }
 
     #[test]
-    fn test_static_member_tail_env_miss_typevar_defers() {
-        // A leftover typevar outside any `variables` list is an env miss:
-        // wire env keys by receiver fullname, Python substitutes via live
-        // binder ids (PEP695 function-local class); defer to Python.
+    fn test_static_member_tail_defers_foreign_leftover_tvar() {
+        // A tvar outside every `variables` list AND outside the receiver's
+        // args broke downstream inference when returned decoded (28 testcheck
+        // defenses, #1277): the narrowed survivor gate defers to Python.
         let resolver = snap_resolver();
         let mut sig = make_callable(vec![], false);
         if let Type::CallableType { ret_type, .. } = &mut sig {
-            **ret_type = make_meta_tvar(7, "__main__.B@3", 0);
+            **ret_type = make_meta_tvar(7, "__main__.B@3", 1);
         }
         let inst = Type::Instance {
             type_ref: "builtins.int".to_string(),
@@ -4862,7 +5024,72 @@ mod tests {
             &resolver,
             false,
             false,
-            None
+            None,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn test_static_member_tail_leaves_receiver_arg_tvar_untouched() {
+        // A caller tvar among the receiver's args rides through (759 of 689
+        // defers in the cold corpus): Python's freeze only rewrites
+        // `variables` entries, so it keeps its original meta level.
+        let resolver = snap_resolver();
+        let mut sig = make_callable(vec![], false);
+        if let Type::CallableType { ret_type, .. } = &mut sig {
+            **ret_type = make_meta_tvar(7, "__main__.B@3", 1);
+        }
+        let inst = Type::Instance {
+            type_ref: "builtins.int".to_string(),
+            args: vec![make_meta_tvar(7, "__main__.B@3", 1)],
+            last_known_value: None,
+            extra_attrs: None,
+        };
+        let result = static_member_tail(
+            &inst,
+            &sig,
+            "builtins.int",
+            false,
+            &resolver,
+            false,
+            false,
+            None,
+        );
+        match result {
+            Some(Type::CallableType { ret_type, .. }) => match *ret_type {
+                Type::TypeVarType {
+                    raw_id, meta_level, ..
+                } => {
+                    assert_eq!(raw_id, 7);
+                    assert_eq!(meta_level, 1);
+                }
+                other => panic!("expected TypeVarType ret, got {other:?}"),
+            },
+            other => panic!("expected frozen callable, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_static_member_tail_defers_unpack_occurrence() {
+        // An UnpackType survivor defers outright, like the pre-port gate's
+        // special-shape class (#1277).
+        let resolver = snap_resolver();
+        let mut sig = make_callable(vec![], false);
+        if let Type::CallableType { ret_type, .. } = &mut sig {
+            **ret_type = Type::UnpackType {
+                typ: Box::new(Type::NoneType {}),
+            };
+        }
+        let inst = make_instance("builtins.int");
+        assert!(static_member_tail(
+            &inst,
+            &sig,
+            "builtins.int",
+            false,
+            &resolver,
+            false,
+            false,
+            None,
         )
         .is_none());
     }
