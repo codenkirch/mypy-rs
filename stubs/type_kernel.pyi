@@ -1754,6 +1754,7 @@ def rust_analyze_member_access(
     preserve_type_var_ids: bool,
     start_raw_id: int,
     strict_optional: bool,
+    plugin: Any | None = None,
 ) -> tuple[int, bool, bytes] | None: ...
 def rust_analyze_union_member_access(
     resolver: NativeTypeResolver,

@@ -1944,6 +1944,7 @@ fn dispatch_instance_member_inner(
     next_raw_id: &mut i64,
     changed: &mut bool,
     strict_optional: bool,
+    plugin: Option<&PyAny>,
 ) -> Option<Type> {
     let type_ref = match instance {
         Type::Instance { type_ref, .. } => type_ref.as_str(),
@@ -1979,6 +1980,7 @@ fn dispatch_instance_member_inner(
                 next_raw_id,
                 changed,
                 strict_optional,
+                plugin,
             );
         }
     };
@@ -2171,6 +2173,7 @@ pub(crate) fn rust_analyze_instance_member_dispatch(
         &mut next_raw_id,
         &mut changed,
         strict_optional,
+        None,
     );
     let result = result?;
     Some((next_raw_id, changed, encode_type(&result)?))
@@ -2208,6 +2211,7 @@ fn dispatch_var_member_inner(
     next_raw_id: &mut i64,
     changed: &mut bool,
     strict_optional: bool,
+    plugin: Option<&PyAny>,
 ) -> Option<Type> {
     // `mx.is_self` routes through expand_self_type / bind_self with live
     // Var state (checkmember.py:1898): defer to the Python body.
@@ -2415,10 +2419,11 @@ fn dispatch_var_member_inner(
         }
     }
 
-    // checkmember.py:1855-1863 plugin hook gate; a possible hook defers
-    // (AttributeContext application stays in Python).
+    // checkmember.py:1862-1870 plugin hook gate. The registry fast path proves
+    // absence for config-static DefaultPlugin names; otherwise the live plugin
+    // chain is authoritative (user plugins are not enumerable); no handle defers.
     let fullname = format!("{}.{}", var_info_fullname, name);
-    let hook_absent = py
+    let fast_absent = py
         .import("mypy.checkexpr")
         .ok()?
         .getattr("plugin_hook_known_absent")
@@ -2427,8 +2432,15 @@ fn dispatch_var_member_inner(
         .ok()?
         .extract::<bool>()
         .ok()?;
-    if !hook_absent {
-        return None;
+    if !fast_absent {
+        match plugin {
+            Some(p) => match p.call_method1("get_attribute_hook", (&fullname,)) {
+                Ok(hook) if hook.is_none() => {}
+                Ok(_) => return None,
+                Err(_) => return None,
+            },
+            None => return None,
+        }
     }
 
     // checkmember.py:1876-1877 descriptor pass-through: `not (implicit or
@@ -2553,7 +2565,7 @@ fn classify_member_access_inner(typ: &Type, resolver: &TypeResolver) -> i64 {
 #[pyfunction]
 #[pyo3(signature = (resolver, name, typ_bytes, self_type_bytes, is_lvalue, is_super,
                     is_operator, is_self, preserve_type_var_ids, start_raw_id,
-                    strict_optional))]
+                    strict_optional, plugin=None))]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn rust_analyze_member_access(
     py: Python<'_>,
@@ -2568,6 +2580,7 @@ pub(crate) fn rust_analyze_member_access(
     preserve_type_var_ids: bool,
     start_raw_id: i64,
     strict_optional: bool,
+    plugin: Option<&PyAny>,
 ) -> Option<(i64, bool, Vec<u8>)> {
     let typ = decode_type(typ_bytes)?;
     let self_type = decode_type(self_type_bytes)?;
@@ -2586,6 +2599,7 @@ pub(crate) fn rust_analyze_member_access(
         next_raw_id: &mut next_raw_id,
         changed: &mut changed,
         strict_optional,
+        plugin,
     };
     let result = analyze_member_access_inner(&typ, Some(&mut ctx), resolver.resolver())?;
     Some((next_raw_id, changed, encode_type(&result)?))
@@ -2610,6 +2624,10 @@ struct MemberAccessCtx<'a> {
     next_raw_id: &'a mut i64,
     changed: &'a mut bool,
     strict_optional: bool,
+    /// Live plugin chain (`mx.chk.plugin`) for the attribute-hook verdict;
+    /// `None` when the caller has no plugin (suite calls, union/none
+    /// seams), in which case the var hook gate defers as before.
+    plugin: Option<&'a PyAny>,
 }
 
 fn analyze_member_access_inner<'a>(
@@ -2640,6 +2658,7 @@ fn analyze_member_access_inner<'a>(
                         ctx.next_raw_id,
                         ctx.changed,
                         ctx.strict_optional,
+                        ctx.plugin,
                     )?;
                     return Some(r);
                 }
@@ -2876,6 +2895,9 @@ pub(crate) fn rust_analyze_union_member_access(
                     &mut next_raw_id,
                     &mut changed,
                     strict_optional,
+                    // Union-item shims have no plugin handle; the var
+                    // hook gate defers exactly as before.
+                    None,
                 )
             }
             _ => {
@@ -2970,6 +2992,9 @@ pub(crate) fn rust_analyze_none_member_access(
         &mut next_raw_id,
         &mut changed,
         strict_optional,
+        // NoneType shims have no plugin handle; the var hook gate
+        // defers exactly as before.
+        None,
     ) {
         Some(r) => r,
         None => {

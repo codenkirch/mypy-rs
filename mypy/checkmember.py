@@ -636,6 +636,7 @@ def _analyze_member_access(
                 mx.preserve_type_var_ids,
                 TypeVarId.next_raw_id,
                 state.state.strict_optional,
+                mx.chk.plugin,
             )
             if result is not None:
                 next_raw_id, changed, wire_bytes = result
