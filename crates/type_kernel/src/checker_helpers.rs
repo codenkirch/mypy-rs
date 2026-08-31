@@ -286,7 +286,13 @@ pub(crate) fn custom_special_method_inner(
         }
         Type::TypeType { item, .. } => {
             if let Type::Instance { type_ref, .. } = item.as_ref() {
+                // Tri-state: Some("") = Python None (no metaclass);
+                // Python's TypeType arm falls through to False then
+                // (typeops.py:2211-2214 + 2215-2219).
                 if let Some(metaclass_fullname) = &resolver.get(type_ref)?.metaclass_fullname {
+                    if metaclass_fullname.is_empty() {
+                        return Some(false);
+                    }
                     // Look up __method__ on the metaclass for class objects
                     // (typeops.py:1584-1586), recursing on the metaclass
                     // Instance through the usual MRO walk.

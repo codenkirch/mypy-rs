@@ -568,10 +568,12 @@ fn meta_has_operator_inner(item: &Type, op_method: &str, resolver: &TypeResolver
                 _ => return None,
             };
             // meta = item.type.metaclass_type or Instance(builtins.type)
+            // (checkmember.py:2832-2835); tri-state Some("") = Python None.
             let snap = resolver.get(type_ref)?;
             let meta_ref = snap
                 .metaclass_fullname
                 .as_deref()
+                .filter(|m| !m.is_empty())
                 .unwrap_or("builtins.type");
             has_readable_member_by_ref(resolver, meta_ref, op_method)
         }

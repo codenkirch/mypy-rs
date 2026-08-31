@@ -791,6 +791,25 @@ def find_config_file_line_number(path: str, section: str, setting_name: str) -> 
     return -1
 
 
+def _native_ctor_blob(info: TypeInfo) -> bytes | None:
+    """Serialize `typeops.type_object_type(info)` to the type-kernel wire
+    format for the subtype kernel's `type[...]` constructor arm
+    (issue #1298). Python is the semantic owner: the blob is exactly the
+    object the checker would build at decision time. Any failure keeps
+    the snapshot MRO fast path / Python fallback in charge (defer-only).
+    """
+    from librt.internal import WriteBuffer
+    from mypy import typeops
+
+    try:
+        ctor = typeops.type_object_type(info)
+        buf = WriteBuffer()
+        ctor.write(buf)
+        return buf.getvalue()
+    except Exception:
+        return None
+
+
 class BuildManager:
     """This class holds shared state for building a mypy program.
 
@@ -1535,8 +1554,15 @@ class BuildManager:
                         infer_class_variances(info)
                 except (AssertionError, NotImplementedError):
                     pass
+        ctor_blobs: dict[str, bytes] = {}
         if self._native_resolver is None:
-            resolver = _type_kernel.build_native_resolver(type_infos, aliases, self.modules)
+            for info in type_infos:
+                blob = _native_ctor_blob(info)
+                if blob is not None:
+                    ctor_blobs[info.fullname] = blob
+            resolver = _type_kernel.build_native_resolver(
+                type_infos, aliases, self.modules, ctor_blobs
+            )
             # Grow the accumulated fullname -> TypeInfo map with this
             # call's infos. First call: everything is new.
             for info in type_infos:
@@ -1557,7 +1583,13 @@ class BuildManager:
                     self._native_snapshotted.add(info.fullname)
                 elif info.fullname.startswith("builtins."):
                     pending.append(info)
-            resolver.update(pending, aliases, self.modules)
+            # Constructor blobs for first-seal classes only; builtins.*
+            # re-snapshots skip blobs the same way Rust update does.
+            for info in new_infos:
+                blob = _native_ctor_blob(info)
+                if blob is not None:
+                    ctor_blobs[info.fullname] = blob
+            resolver.update(pending, aliases, self.modules, ctor_blobs)
         self._native_resolver = resolver
         typeinfo_map = self._native_typeinfo_map
         # Stage 3c resolvers wired: the subtype/join kernels now defer

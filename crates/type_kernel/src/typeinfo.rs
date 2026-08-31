@@ -209,6 +209,11 @@ pub(crate) struct TypeResolver {
     /// via `set_live_typeinfo_map` from `BuildManager._native_typeinfo_map`.
     /// `None` until set (engine protocol-right defers without it).
     live_info_map: Option<PyObject>,
+    /// `fullname -> wire bytes` for `type_object_type(info)` per class,
+    /// built once per resolver build/update (visit_type_type ctor arm).
+    /// Populated only for classes the snapshot MRO walk cannot decide;
+    /// absent entries keep the snapshot fast path.
+    ctor_types: HashMap<String, Vec<u8>>,
 }
 
 #[allow(dead_code)]
@@ -218,6 +223,7 @@ impl TypeResolver {
             snapshots: HashMap::new(),
             modules: HashMap::new(),
             live_info_map: None,
+            ctor_types: HashMap::new(),
         }
     }
 
@@ -256,6 +262,14 @@ impl TypeResolver {
 
     pub fn get_module(&self, fullname: &str) -> Option<&ModuleSnapshot> {
         self.modules.get(fullname)
+    }
+
+    pub(crate) fn insert_ctor(&mut self, fullname: String, bytes: Vec<u8>) {
+        self.ctor_types.insert(fullname, bytes);
+    }
+
+    pub(crate) fn ctor(&self, fullname: &str) -> Option<&[u8]> {
+        self.ctor_types.get(fullname).map(|b| b.as_slice())
     }
 
     pub fn len(&self) -> usize {
@@ -316,6 +330,23 @@ fn read_opt_instance_fullname(obj: &PyAny, attr: &str) -> Option<String> {
         .ok()
 }
 
+/// Read `metaclass_type` as a tri-state fullname. `TypeInfo.metaclass_type`
+/// is a real attribute initialized to `None` (nodes.py:4027), so a `None`
+/// attribute read means Python's `None` (no metaclass), encoded as
+/// `Some("")`. A `None` result here means the attribute itself was
+/// unreadable and consumers must defer.
+fn read_metaclass_fullname(obj: &PyAny) -> Option<String> {
+    let value = obj.getattr("metaclass_type").ok()?;
+    if value.is_none() {
+        return Some(String::new());
+    }
+    let type_info = value.getattr("type").ok()?;
+    type_info
+        .getattr("fullname")
+        .and_then(|f| f.extract::<String>())
+        .ok()
+}
+
 /// Read a `list[TypeInfo]` attribute as a Vec of fullname strings.
 pub(crate) fn read_mro_fullnames(obj: &PyAny, attr: &str) -> Option<Vec<String>> {
     let value = obj.getattr(attr).ok()?;
@@ -357,6 +388,46 @@ pub(crate) fn serialize_type_to_bytes(py: Python<'_>, obj: &PyAny) -> Option<Vec
     write.call1((buf,)).ok()?;
     let bytes = buf.getattr("getvalue").ok()?.call0().ok()?;
     bytes.extract::<Vec<u8>>().ok()
+}
+
+/// Insert Python-side computed constructor blobs (`fullname ->` serialized
+/// `typeops.type_object_type(info)` wire bytes) into the resolver. Only
+/// classes the snapshot MRO walk would defer on keep a blob (`ctor_blob_needed`
+/// sees the fully built snapshot table), and first seal wins; when `fresh_only`
+/// is given, fullnames outside the list are skipped (builtins.* re-snapshots
+/// in `update` must not reblob).
+fn apply_ctor_blobs(
+    resolver: &mut TypeResolver,
+    ctor_blobs: &PyAny,
+    fresh_only: Option<&[String]>,
+) -> PyResult<()> {
+    let dict = ctor_blobs.downcast::<PyDict>()?;
+    for (key, value) in dict.iter() {
+        let fullname: String = match key.extract() {
+            Ok(f) => f,
+            Err(_) => continue,
+        };
+        let blob: Vec<u8> = match value.extract() {
+            Ok(b) => b,
+            Err(_) => continue,
+        };
+        if resolver.ctor(&fullname).is_some() {
+            continue;
+        }
+        if let Some(names) = fresh_only {
+            if !names.iter().any(|n| n == &fullname) {
+                continue;
+            }
+        }
+        let Some(snap) = resolver.get(&fullname) else {
+            continue;
+        };
+        if !crate::subtypes::ctor_blob_needed(snap, resolver) {
+            continue;
+        }
+        resolver.insert_ctor(fullname, blob);
+    }
+    Ok(())
 }
 
 /// Serialize each element of a `list[Type]` attribute to wire-format bytes.
@@ -712,8 +783,9 @@ pub(crate) fn build_resolver(py: Python<'_>, type_infos: &PyAny) -> PyResult<PyO
         let alt = read_opt_instance_fullname(item, "alt_promote");
         snap_dict.set_item("alt_promote_fullname", alt.as_ref())?;
 
-        // metaclass_type: Option[Instance] -> Option[fullname].
-        let meta = read_opt_instance_fullname(item, "metaclass_type");
+        // metaclass_type: Option[Instance] -> tri-state fullname
+        // (Some("") = Python None, None = unreadable).
+        let meta = read_metaclass_fullname(item);
         snap_dict.set_item("metaclass_fullname", meta.as_ref())?;
 
         // bases: serialize each `TypeInfo.bases` Instance to wire bytes.
@@ -1054,15 +1126,17 @@ impl NativeTypeResolver {
     /// graph (~8490 items) on every call. Returns `(added_infos,
     /// added_aliases)` so the Python side can grow its accumulated
     /// `typeinfo_map` in lockstep.
-    #[pyo3(signature = (type_infos, aliases, modules=None))]
+    #[pyo3(signature = (type_infos, aliases, modules=None, ctor_blobs=None))]
     fn update(
         &mut self,
         py: Python<'_>,
         type_infos: &PyAny,
         aliases: &PyAny,
         modules: Option<&PyAny>,
+        ctor_blobs: Option<&PyAny>,
     ) -> PyResult<(usize, usize)> {
         let mut added_infos = 0usize;
+        let mut fresh_names: Vec<String> = Vec::new();
         for item in type_infos.iter()? {
             let item = item?;
             let fullname = match read_str_attr(item, "fullname") {
@@ -1088,10 +1162,17 @@ impl NativeTypeResolver {
                 continue;
             };
             let fresh = self.resolver.get(&fullname).is_none();
-            self.resolver.insert(snap.fullname.clone(), snap);
             if fresh {
+                fresh_names.push(fullname.clone());
                 added_infos += 1;
             }
+            self.resolver.insert(snap.fullname.clone(), snap);
+        }
+        // Constructor blobs are Python-side computed (Port 3, #1298) and
+        // applied to fresh classes only: a builtins.* re-snapshot is
+        // never fresh, preserving first-seal-wins.
+        if let Some(blobs) = ctor_blobs {
+            apply_ctor_blobs(&mut self.resolver, blobs, Some(&fresh_names))?;
         }
         let mut added_aliases = 0usize;
         for item in aliases.iter()? {
@@ -1190,7 +1271,7 @@ fn snapshot_type_info(py: Python<'_>, item: &PyAny, fullname: &str) -> Option<Ty
         .unwrap_or_default();
     let promote_bytes = read_promote_bytes(py, item);
     let alt_promote_fullname = read_opt_instance_fullname(item, "alt_promote");
-    let metaclass_fullname = read_opt_instance_fullname(item, "metaclass_type");
+    let metaclass_fullname = read_metaclass_fullname(item);
     let bases = read_type_list_bytes(py, item, "bases");
     let tuple_type = read_opt_type_bytes(py, item, "tuple_type");
     let type_var_tuple_prefix = read_opt_usize_attr(item, "type_var_tuple_prefix");
@@ -1387,12 +1468,13 @@ impl NativeTypeResolver {
 /// `is_subtype`. The dict-returning `build_resolver` remains for one
 /// release as a deprecated alias so Stage 3b parity tests don't break.
 #[pyfunction]
-#[pyo3(signature = (type_infos, aliases, modules=None))]
+#[pyo3(signature = (type_infos, aliases, modules=None, ctor_blobs=None))]
 pub(crate) fn build_native_resolver(
     py: Python<'_>,
     type_infos: &PyAny,
     aliases: &PyAny,
     modules: Option<&PyAny>,
+    ctor_blobs: Option<&PyAny>,
 ) -> PyResult<Py<NativeTypeResolver>> {
     let mut resolver = TypeResolver::new();
     for item in type_infos.iter()? {
@@ -1405,6 +1487,12 @@ pub(crate) fn build_native_resolver(
             continue;
         };
         resolver.insert(snap.fullname.clone(), snap);
+    }
+    // Ctor blob pass: blobs are computed Python-side (Port 3, #1298); the
+    // predicate sees the fully built snapshot table. First seal wins
+    // (a ctor type does not change after semanal); extra blobs are fine.
+    if let Some(blobs) = ctor_blobs {
+        apply_ctor_blobs(&mut resolver, blobs, None)?;
     }
 
     let mut alias_resolver = crate::aliases::TypeAliasResolver::new();

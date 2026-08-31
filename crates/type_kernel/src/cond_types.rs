@@ -406,8 +406,7 @@ pub(crate) fn conditional_types_inner(
     if !ranges.iter().any(|r| r.is_upper_bound) {
         // Concrete proper subtype (checker.py:9381-9383): proposed covers
         // current, so the if-branch keeps default and the else is
-        // unreachable. Python's is_proper_subtype expands both operands,
-        // so the decision runs on the expanded current.
+        // unreachable. Python's is_proper_subtype expands operands.
         let proper_ctx = SubtypeContext::new(false, false, false, true, true, strict_optional);
         match is_subtype(p_current, &proposed, &proper_ctx, resolver) {
             Some(true) => {
@@ -460,7 +459,7 @@ pub(crate) fn conditional_types_inner(
     // Overlap (checker.py:9404-9406): never of any proposed type -> the
     // if-branch is unreachable. A Rust `None` means "cannot decide", so
     // defer the whole call rather than assume overlap.
-    match overlap(
+    if !overlap(
         // Python's is_overlapping_types expands alias operands internally,
         // so the decision must run on the expanded current.
         p_current,
@@ -470,15 +469,11 @@ pub(crate) fn conditional_types_inner(
         false,
         resolver,
         0,
-    ) {
-        Some(false) => {
-            return Some((
-                Some(Type::UninhabitedType { ambiguous: false }),
-                default.cloned(),
-            ));
-        }
-        Some(true) => {}
-        None => return None,
+    )? {
+        return Some((
+            Some(Type::UninhabitedType { ambiguous: false }),
+            default.cloned(),
+        ));
     }
 
     // Only restrict when the type is precise, not bounded
