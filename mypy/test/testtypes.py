@@ -6230,6 +6230,29 @@ class NativeTypeObjectTypeSuite(Suite):
         )
         self._assert_par(sig, self.fx.gi)
 
+    def test_generic_init_binds_self_typevar(self) -> None:
+        # A `variables`-carrying __init__ on Generic[T] must run the generic
+        # bind_self arm natively: the unbound T is filled from the enclosing
+        # class frame of `info`, not deferred to the Python path.
+        info = self.fx.std_listi
+        tvar = info.defn.type_vars[0]
+        sig = CallableType(
+            [tvar],
+            [ARG_POS],
+            [None],
+            NoneType(),
+            self.fx.function,
+            name="<init>",
+            variables=[tvar],
+        )
+        off = self._with_gate(False, lambda: self._type_object(sig, info, False))
+        on = self._with_gate(True, lambda: self._type_object(sig, info, False))
+        assert_equal(str(on), str(off), "generic __init__ parity")
+        # The self param (x: T) is stripped; T stays free in `variables`
+        # (bound to itself via the class frame), so it survives in the
+        # bound callable's own variables.
+        assert_equal(str(on), "def [T] () -> builtins.list[T]")
+
     def test_parity_classmethod_new(self) -> None:
         # A classmethod `__new__`: the self param is dropped and the ret is
         # the instance type.
@@ -6300,6 +6323,7 @@ class NativeTypeObjectTypeSuite(Suite):
             _serialize_type(self.fx.type_type),
             False,
             True,
+            False,
             self._resolver,
         )
         assert result is not None, "Rust type_object_type_from_function did not engage"
@@ -24295,15 +24319,16 @@ class NativeBuiltinItemTypeSuite(Suite):
     `builtin_item_type` extracts the element type of a builtin container
     (list, dict, set, frozenset, dict_keys, KeysView, Tuple, TypedDict)
     so the checker can narrow optional types in `x in (...)`. The Rust
-    port claims only the positive cases on the wire `Type` enum: an
-    `Instance` of one of the 7 builtin containers whose first arg is not
-    `Any`, a `TupleType` whose normalized items are all non-`Any`
-    (`UnpackType` items normalize through their `upper_bound`), and a
-    `TypedDictType` whose fallback's MRO contains `typing.Mapping`.
-    Every `None`-result case and wire-unsupported shape defers to the
-    pure-Python path. Toggling the checker gate off (Python) and on
-    (Rust) must produce identical results; a direct seam call proves the
-    Rust function engages rather than silently deferring.
+    port speaks the #1101 decided-None protocol: positive cases return
+    the element type, shapes whose Python answer is None (non-container
+    instances, unparameterized containers, Any first args, tuples with
+    Any items, TypedDicts without a Mapping base, other types) return a
+    decided no-result instead of deferring. Only wire-unsupported shapes
+    (TypeAliasType, non-tuple unpacks, missing snapshots, encode/decode
+    failures) defer to the pure-Python path. Toggling the checker gate
+    off (Python) and on (Rust) must produce identical results; a direct
+    seam call proves the Rust function engages rather than silently
+    deferring.
     """
 
     def setUp(self) -> None:
@@ -24365,6 +24390,20 @@ class NativeBuiltinItemTypeSuite(Suite):
             _serialize_type_for_checker(t), state.strict_optional, self.resolver
         )
         assert result is not None, f"Rust builtin_item_type did not engage for {t}"
+        decided, _value = result
+        assert decided, f"Rust builtin_item_type deferred (undecided) for {t}"
+
+    def _assert_decided_none(self, t: Type) -> None:
+        from mypy.checker import _serialize_type_for_checker
+
+        result = _type_kernel.rust_builtin_item_type(
+            _serialize_type_for_checker(t), state.strict_optional, self.resolver
+        )
+        assert result is not None, f"Rust builtin_item_type did not engage for {t}"
+        decided, value = result
+        assert decided and value is None, (
+            f"expected decided-None for {t}, got {result!r}"
+        )
 
     def test_list_instance(self) -> None:
         from mypy.checker import builtin_item_type
@@ -24381,14 +24420,16 @@ class NativeBuiltinItemTypeSuite(Suite):
         t = Instance(self.fx.std_listi, [])
         self._assert_par(t)
         assert self._with_gate(True, lambda: builtin_item_type(t)) is None
+        self._assert_decided_none(t)
 
-    def test_any_first_arg_defers(self) -> None:
-        # Rust defers on an Any first arg; the Python path returns None.
+    def test_any_first_arg_decided_none(self) -> None:
+        # Rust decides Any first arg as None (Python's answer), not a defer.
         from mypy.checker import builtin_item_type
 
         t = Instance(self.fx.std_listi, [self.fx.anyt])
         self._assert_par(t)
         assert self._with_gate(True, lambda: builtin_item_type(t)) is None
+        self._assert_decided_none(t)
 
     def test_non_container_instance(self) -> None:
         from mypy.checker import builtin_item_type
@@ -24396,6 +24437,7 @@ class NativeBuiltinItemTypeSuite(Suite):
         t = Instance(self.fx.ai, [])
         self._assert_par(t)
         assert builtin_item_type(t) is None
+        self._assert_decided_none(t)
 
     def test_tuple_items(self) -> None:
         from mypy.checker import builtin_item_type

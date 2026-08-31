@@ -2437,6 +2437,7 @@ def rust_type_object_type_from_function(
     fallback_bytes: bytes,
     is_new: bool,
     strict_optional: bool,
+    infer_unions: bool,
     resolver: NativeTypeResolver,
 ) -> Any: ...
 def rust_yield_nonoverlapping_types(nonoverlapping_types: Any, unreachable_lines: Any) -> Any: ...

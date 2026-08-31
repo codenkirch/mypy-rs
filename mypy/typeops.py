@@ -38,6 +38,7 @@ from mypy.nodes import (
     Var,
 )
 from mypy.state import state
+from mypy.typestate import type_state
 from mypy.types import (
     ELLIPSIS_TYPE_NAMES,
     NOT_IMPLEMENTED_TYPE_NAMES,
@@ -644,6 +645,8 @@ def type_object_type_from_function(
         and _native_typeops_resolver is not None
         and not _needs_python(signature, definition_gate=False)
     ):
+        from mypy.wirefixup import resync_var_identities
+
         try:
             result = _type_kernel.rust_type_object_type_from_function(
                 _serialize_type(signature),
@@ -652,26 +655,36 @@ def type_object_type_from_function(
                 _serialize_type(fallback),
                 is_new,
                 state.strict_optional,
+                type_state.infer_unions,
                 _native_typeops_resolver,
             )
             if result is not None:
                 decoded = _deserialize_type(bytes(result))
                 if decoded is not None and isinstance(decoded, FunctionLike):
-                    fixed = _restamp_composite_definitions(signature, decoded)
-                    if fixed is not None:
-                        if isinstance(fixed, CallableType):
-                            return fixed.copy_modified(
-                                special_sig=special_sig_seam, instance_type=default_ret_seam
-                            )
-                        ov_items = []
-                        for item in fixed.items:
-                            assert isinstance(item, CallableType)
-                            ov_items.append(
-                                item.copy_modified(
+                    # Expansion may leave leftover TypeVars; re-link their
+                    # identities to the live originals. A resync defer (None)
+                    # falls back to the pure-Python body.
+                    resynced = resync_var_identities(signature, decoded, [default_ret_seam])
+                    if (
+                        resynced is not None
+                        and isinstance(resynced, FunctionLike)  # type: ignore[misc]
+                    ):
+                        fixed = _restamp_composite_definitions(signature, resynced)
+                        if fixed is not None:
+                            if isinstance(fixed, CallableType):
+                                return fixed.copy_modified(
                                     special_sig=special_sig_seam, instance_type=default_ret_seam
                                 )
-                            )
-                        return Overloaded(ov_items)
+                            ov_items = []
+                            for item in fixed.items:
+                                assert isinstance(item, CallableType)
+                                ov_items.append(
+                                    item.copy_modified(
+                                        special_sig=special_sig_seam,
+                                        instance_type=default_ret_seam,
+                                    )
+                                )
+                            return Overloaded(ov_items)
         except (AssertionError, NotImplementedError, ValueError):
             pass
 
