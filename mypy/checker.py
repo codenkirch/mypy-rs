@@ -11033,9 +11033,15 @@ def builtin_item_type(tp: Type) -> Type | None:
                 _serialize_type_for_checker(tp), state.strict_optional, _native_checker_resolver
             )
             if result is not None:
-                dec = _deserialize_type_from_checker(bytes(result))
-                if dec is not None:
-                    return dec
+                # #1101 decided-None protocol: (decided, value).
+                decided, value = result
+                if decided:
+                    if value is None:
+                        # Decided no-result: Python answers None here.
+                        return None
+                    dec = _deserialize_type_from_checker(bytes(value))
+                    if dec is not None:
+                        return dec
         except (AssertionError, NotImplementedError, ValueError):
             pass
     tp = get_proper_type(tp)

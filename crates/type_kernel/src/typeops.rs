@@ -18,12 +18,13 @@
 //! call behind `Options.native_type_kernel`. `None` means "Rust doesn't handle
 //! this, let Python decide".
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use pyo3::prelude::*;
 use pyo3::types::{PyList, PyType};
 use pyo3::IntoPy;
 
+use crate::supported_self_type::supported_self_type_inner;
 use crate::typeinfo::{
     read_bool_attr, read_mro_fullnames, read_str_list_attr, serialize_type_to_bytes,
     NativeTypeResolver, TypeResolver,
@@ -1555,8 +1556,15 @@ pub(crate) fn rust_map_type_from_supertype(
     strict_optional: bool,
 ) -> Option<Vec<u8>> {
     let typ = decode_type(type_bytes)?;
-    let mapped =
-        map_type_from_supertype_inner(py, resolver, &typ, sub_info, super_info, strict_optional)?;
+    let mapped = map_type_from_supertype_inner(
+        py,
+        resolver,
+        &typ,
+        sub_info,
+        super_info,
+        strict_optional,
+        false,
+    )?;
     encode_type(&mapped)
 }
 
@@ -1575,6 +1583,7 @@ fn map_type_from_supertype_inner(
     sub_info: &PyAny,
     super_info: &PyAny,
     strict_optional: bool,
+    allow_free: bool,
 ) -> Option<Type> {
     let mut inst = fill_typevars_inner(py, sub_info)?;
     // Step 2: named tuples and plain tuples get an element-preserving
@@ -1622,12 +1631,24 @@ fn map_type_from_supertype_inner(
         last_known_value: None,
         extra_attrs: None,
     };
-    crate::expandtype::expand_type_by_instance_core(
-        typ,
-        &inst,
-        resolver.resolver(),
-        strict_optional,
-    )
+    // allow_free=true (the typeobj composite) returns leftover TypeVars like
+    // Python's expand_type_by_instance; the composite's Python tail re-links
+    // their identities via wirefixup. The standalone seam keeps the core.
+    if allow_free {
+        crate::expandtype::expand_type_by_instance_free(
+            typ,
+            &inst,
+            resolver.resolver(),
+            strict_optional,
+        )
+    } else {
+        crate::expandtype::expand_type_by_instance_core(
+            typ,
+            &inst,
+            resolver.resolver(),
+            strict_optional,
+        )
+    }
 }
 
 /// `mypy.typeops.coerce_to_literal` (typeops.py:1629-1645): recursively
@@ -2069,6 +2090,48 @@ fn get_self_type(py: Python<'_>, func: &Type, def_info: &PyAny) -> Option<Option
     Some(None)
 }
 
+/// `bind_self` over a `FunctionLike` for the typeobj composite seam:
+/// Callable items take `bind_self_composite_item`, `Overloaded` recurses
+/// into each item exactly like the Python body.
+#[allow(clippy::too_many_arguments)]
+fn bind_self_composite(
+    py: Python<'_>,
+    method: &Type,
+    is_new: bool,
+    original_type: &Type,
+    strict_optional: bool,
+    infer_unions: bool,
+    resolver: &NativeTypeResolver,
+) -> Option<Type> {
+    match method {
+        Type::CallableType { .. } => bind_self_composite_item(
+            py,
+            method,
+            is_new,
+            original_type,
+            strict_optional,
+            infer_unions,
+            resolver,
+        ),
+        Type::Overloaded { items } => {
+            let mut bound = Vec::with_capacity(items.len());
+            for item in items {
+                bound.push(bind_self_composite_item(
+                    py,
+                    item,
+                    is_new,
+                    original_type,
+                    strict_optional,
+                    infer_unions,
+                    resolver,
+                )?);
+            }
+            Some(Type::Overloaded { items: bound })
+        }
+        _ => None,
+    }
+}
+
 /// `mypy.typeops.type_object_type_from_function` (typeops.py:410-460).
 ///
 /// Composite seam mirroring the whole Python body:
@@ -2076,9 +2139,9 @@ fn get_self_type(py: Python<'_>, func: &Type, def_info: &PyAny) -> Option<Option
 ///      signature.items]` unless `is_new or info.is_newtype` (then all
 ///      `None`).
 ///   2. `signature = bind_self(signature, original_type=fill_typevars(info),
-///      is_classmethod=is_new, ignore_instances=True)` — the non-generic
-///      fast path (`bind_self_inner`); generic signatures with type
-///      variables defer.
+///      is_classmethod=is_new, ignore_instances=True)` — non-generic
+///      signatures strip via `bind_self_inner`; generic signatures solve
+///      the self parameter's variables (`bind_self_composite_item`).
 ///   3. `signature = map_type_from_supertype(signature, info, def_info)`.
 ///   4. `special_sig = "dict"` when `def_info.fullname == "builtins.dict"`.
 ///   5. For each callable item, `class_callable(item, info, def_info,
@@ -2092,7 +2155,7 @@ fn get_self_type(py: Python<'_>, func: &Type, def_info: &PyAny) -> Option<Option
 /// Returns the fully-assembled wire `FunctionLike` (CallableType or
 /// Overloaded), or `None` to defer to the pure-Python body.
 #[pyfunction]
-#[pyo3(signature = (signature_bytes, info, def_info, fallback_bytes, is_new, strict_optional, resolver))]
+#[pyo3(signature = (signature_bytes, info, def_info, fallback_bytes, is_new, strict_optional, infer_unions, resolver))]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn rust_type_object_type_from_function(
     py: Python<'_>,
@@ -2102,6 +2165,7 @@ pub(crate) fn rust_type_object_type_from_function(
     fallback_bytes: &[u8],
     is_new: bool,
     strict_optional: bool,
+    infer_unions: bool,
     resolver: &mut NativeTypeResolver,
 ) -> Option<Vec<u8>> {
     let signature = decode_type(signature_bytes)?;
@@ -2124,17 +2188,25 @@ pub(crate) fn rust_type_object_type_from_function(
             _ => return None,
         }
     };
-    // 2. bind_self non-generic fast path. Python's bind_self with
-    // `ignore_instances=True` takes the strip path for signature without
-    // type variables; generic signatures (needing infer_type_arguments)
+    // 2. bind_self. Python's bind_self with `ignore_instances=True` takes
+    // the strip path for signatures without type variables; generic ones
+    // solve the self parameter's vars against fill_typevars (1058-1099).
 
-    // defer.
-    let bound = bind_self_overloaded(&signature)?;
-    // 3. map the bound signature from def_info's frame into info's frame.
-    let mapped =
-        map_type_from_supertype_inner(py, resolver, &bound, info, def_info, strict_optional)?;
-    // instance_type = fill_typevars(info) for the class_callable assembly.
+    // 3. map the bound signature from def_info's frame into info's frame
+    // (allow_free: leftover class-tvar values survive expansion and the
+    // Python shim re-links their identities via wirefixup).
     let default_ret = fill_typevars_inner(py, info)?;
+    let bound = bind_self_composite(
+        py,
+        &signature,
+        is_new,
+        &default_ret,
+        strict_optional,
+        infer_unions,
+        resolver,
+    )?;
+    let mapped =
+        map_type_from_supertype_inner(py, resolver, &bound, info, def_info, strict_optional, true)?;
     // 5. class_callable per item.
     let result = match &mapped {
         Type::CallableType { .. } => class_callable_item_wire(
@@ -2172,20 +2244,364 @@ pub(crate) fn rust_type_object_type_from_function(
     encode_type(&result)
 }
 
-/// Apply `bind_self` to a `FunctionLike`, recursing into `Overloaded` items
-/// exactly like the Python body does.
-fn bind_self_overloaded(method: &Type) -> Option<Type> {
-    match method {
-        Type::CallableType { .. } => bind_self_inner(method),
-        Type::Overloaded { items } => {
-            let mut bound = Vec::with_capacity(items.len());
-            for item in items {
-                bound.push(bind_self_inner(item)?);
-            }
-            Some(Type::Overloaded { items: bound })
-        }
+/// `(raw_id, meta_level, namespace)` — the wire shape of `TypeVarId`, the
+/// same key space as `solve::tv_id` and `expandtype::EnvKey`.
+type TvarKey = (i64, i64, String);
+
+/// Wire mirror of `solve::tv_id` (solve.rs): ParamSpec and TypeVarTuple
+/// carry meta_level 0.
+fn typevar_key(t: &Type) -> Option<TvarKey> {
+    match t {
+        Type::TypeVarType {
+            raw_id,
+            meta_level,
+            namespace,
+            ..
+        } => Some((*raw_id, *meta_level, namespace.clone())),
+        Type::ParamSpecType {
+            raw_id, namespace, ..
+        } => Some((*raw_id, 0, namespace.clone())),
+        Type::TypeVarTupleType {
+            raw_id, namespace, ..
+        } => Some((*raw_id, 0, namespace.clone())),
         _ => None,
     }
+}
+
+/// Collect the keys of all TypeVar-like nodes a `TypeQuery(get_all_type_vars)`
+/// walk with `include_all=True` would visit (TypeQuery positions,
+/// type_visitor.py:415-466). Returns `None` on a `TypeAliasType`: Python
+/// expands those with `get_proper_type`, which needs live alias nodes.
+fn collect_query_tvars(t: &Type, out: &mut Vec<TvarKey>) -> Option<()> {
+    match t {
+        Type::TypeAliasType { .. } => None,
+        Type::TypeVarType {
+            upper_bound,
+            default,
+            ..
+        }
+        | Type::ParamSpecType {
+            upper_bound,
+            default,
+            ..
+        }
+        | Type::TypeVarTupleType {
+            upper_bound,
+            default,
+            ..
+        } => {
+            out.push(typevar_key(t)?);
+            collect_query_tvars(upper_bound, out)?;
+            collect_query_tvars(default, out)?;
+            for v in values_for_tvar(t) {
+                collect_query_tvars(v, out)?;
+            }
+            if let Type::ParamSpecType { prefix, .. } = t {
+                for a in &prefix.arg_types {
+                    collect_query_tvars(a, out)?;
+                }
+            }
+            Some(())
+        }
+        Type::CallableType {
+            arg_types,
+            ret_type,
+            instance_type,
+            ..
+        } => {
+            for a in arg_types {
+                collect_query_tvars(a, out)?;
+            }
+            collect_query_tvars(ret_type, out)?;
+            if let Some(it) = instance_type {
+                // The query only descends when instance_type != ret_type.
+                if **it != **ret_type {
+                    collect_query_tvars(it, out)?;
+                }
+            }
+            Some(())
+        }
+        Type::Overloaded { items } => {
+            for it in items {
+                collect_query_tvars(it, out)?;
+            }
+            Some(())
+        }
+        Type::Instance { args, .. }
+        | Type::UnboundType { args, .. }
+        | Type::UnionType { items: args, .. } => {
+            for a in args {
+                collect_query_tvars(a, out)?;
+            }
+            Some(())
+        }
+        Type::TupleType {
+            partial_fallback,
+            items,
+            ..
+        } => {
+            collect_query_tvars(partial_fallback, out)?;
+            for a in items {
+                collect_query_tvars(a, out)?;
+            }
+            Some(())
+        }
+        Type::TypedDictType { items, .. } => {
+            for (_, v) in items {
+                collect_query_tvars(v, out)?;
+            }
+            Some(())
+        }
+        Type::TypeType { item, .. } => collect_query_tvars(item, out),
+        Type::UnpackType { typ } => collect_query_tvars(typ, out),
+        Type::Parameters(p) => {
+            for a in &p.arg_types {
+                collect_query_tvars(a, out)?;
+            }
+            Some(())
+        }
+        // Leaf shapes and Any/None/Literal/Raw/Ellipsis/Uninhabited/Erased/
+        // Deleted carry no tvars at the query positions.
+        _ => Some(()),
+    }
+}
+
+fn values_for_tvar(t: &Type) -> &[Type] {
+    match t {
+        Type::TypeVarType { values, .. } => values,
+        Type::ParamSpecType { .. } | Type::TypeVarTupleType { .. } => &[],
+        _ => &[],
+    }
+}
+
+/// The generic `bind_self` arm (typeops.py:1058-1099) for the typeobj
+/// composite seam, mirroring `bind_self(..., ignore_instances=True)`:
+/// solve the self-parameter's variables against `original_type` and
+/// substitute. Returns `Some(item)` unchanged for the Python early returns
+/// (no args, `*args`/`**kwargs` first). Non-generic signatures take the
+/// shipped `bind_self_inner` strip path. Defers on unsupported self-type
+/// shapes (alias bridges, unsupported self types).
+fn bind_self_composite_item(
+    py: Python<'_>,
+    item: &Type,
+    is_new: bool,
+    original_type: &Type,
+    strict_optional: bool,
+    infer_unions: bool,
+    resolver: &NativeTypeResolver,
+) -> Option<Type> {
+    let Type::CallableType {
+        arg_types,
+        arg_kinds,
+        variables,
+        ..
+    } = item
+    else {
+        return None;
+    };
+    // Python: invalid method / signature absorbing *args -> method unchanged.
+    if arg_types.is_empty() {
+        return Some(item.clone());
+    }
+    if matches!(
+        arg_kinds.first(),
+        Some(&k) if k == ARG_STAR || k == ARG_STAR2
+    ) {
+        return Some(item.clone());
+    }
+    if variables.is_empty() {
+        return bind_self_inner(item);
+    }
+    generic_bind_self_item(
+        py,
+        item,
+        is_new,
+        original_type,
+        strict_optional,
+        infer_unions,
+        resolver,
+    )
+}
+
+/// The generic solve arm itself; kept separate so the non-generic strip
+/// path (`bind_self_inner`) and the Python early returns stay in one place.
+#[allow(clippy::too_many_arguments)]
+fn generic_bind_self_item(
+    py: Python<'_>,
+    item: &Type,
+    is_new: bool,
+    original_type: &Type,
+    strict_optional: bool,
+    infer_unions: bool,
+    resolver: &NativeTypeResolver,
+) -> Option<Type> {
+    let Type::CallableType {
+        fallback,
+        instance_type,
+        is_ellipsis_args,
+        implicit,
+        is_bound: _,
+        from_concatenate,
+        imprecise_arg_kinds,
+        unpack_kwargs,
+        from_type_type,
+        arg_types,
+        arg_kinds,
+        arg_names,
+        ret_type,
+        name,
+        variables,
+        type_guard,
+        type_is,
+    } = item
+    else {
+        return None;
+    };
+    // Python: `self_param_type = get_proper_type(arg_types[0])`; a wire
+    // alias defers (Python expands from the live alias node).
+    let self_param = match arg_types.first() {
+        Some(t) if !matches!(t, Type::TypeAliasType { .. }) => t,
+        _ => return None,
+    };
+    // allow_callable guard (typeops.py:1058-1060).
+    let allow_callable = name
+        .as_deref()
+        .is_none_or(|n| !n.starts_with("__call__ of"));
+    // The composite passes ignore_instances=True -> allow_instances=False.
+    let supported = supported_self_type_inner(py, self_param, resolver, allow_callable, false)?;
+    if !supported {
+        return Some(Type::CallableType {
+            fallback: fallback.clone(),
+            instance_type: instance_type.clone(),
+            is_ellipsis_args: *is_ellipsis_args,
+            implicit: *implicit,
+            is_bound: true,
+            from_concatenate: *from_concatenate,
+            imprecise_arg_kinds: *imprecise_arg_kinds,
+            unpack_kwargs: *unpack_kwargs,
+            from_type_type: *from_type_type,
+            arg_types: arg_types[1..].to_vec(),
+            arg_kinds: arg_kinds[1..].to_vec(),
+            arg_names: arg_names[1..].to_vec(),
+            ret_type: ret_type.clone(),
+            name: name.clone(),
+            variables: variables.clone(),
+            type_guard: type_guard.clone(),
+            type_is: type_is.clone(),
+        });
+    }
+    // Solve for the method's variables that appear in the self type.
+    let mut tv_keys: Vec<TvarKey> = Vec::new();
+    collect_query_tvars(self_param, &mut tv_keys)?;
+    let self_ids: HashSet<TvarKey> = tv_keys.into_iter().collect();
+    let mut self_vars: Vec<Type> = Vec::with_capacity(variables.len());
+    for tv in variables {
+        let key = typevar_key(tv)?;
+        if self_ids.contains(&key) {
+            self_vars.push(tv.clone());
+        }
+    }
+    let mut typeargs = crate::solve::infer_type_arguments_inner(
+        &self_vars,
+        self_param,
+        original_type,
+        true,
+        false,
+        false,
+        strict_optional,
+        infer_unions,
+        resolver,
+    )?;
+    // Classmethod fallback: infer against type(x) when a solution is Never.
+    if is_new
+        && typeargs
+            .iter()
+            .any(|t| matches!(t, Some(Type::UninhabitedType { .. })))
+        && matches!(
+            original_type,
+            Type::Instance { .. } | Type::TypeVarType { .. } | Type::TupleType { .. }
+        )
+    {
+        let tt = Type::TypeType {
+            item: Box::new(original_type.clone()),
+            is_type_form: false,
+        };
+        typeargs = crate::solve::infer_type_arguments_inner(
+            &self_vars,
+            self_param,
+            &tt,
+            true,
+            false,
+            false,
+            strict_optional,
+            infer_unions,
+            resolver,
+        )?;
+    }
+    // to_apply: unsolved -> Never (UninhabitedType(), ambiguous=False).
+    let mut env: HashMap<crate::expandtype::EnvKey, Type> = HashMap::new();
+    for (tv, arg) in self_vars.iter().zip(typeargs.iter()) {
+        let key = typevar_key(tv)?;
+        let apply = arg
+            .clone()
+            .unwrap_or(Type::UninhabitedType { ambiguous: false });
+        env.insert(key, apply);
+    }
+    let expanded = crate::expandtype::expand_type_with_env_inner(
+        item,
+        &env,
+        strict_optional,
+        true,
+        false,
+        false,
+    )?;
+    let Type::CallableType {
+        fallback: ex_fb,
+        instance_type: ex_inst,
+        is_ellipsis_args: ex_ell,
+        implicit: ex_impl,
+        is_bound: _,
+        from_concatenate: ex_concat,
+        imprecise_arg_kinds: ex_impr,
+        unpack_kwargs: ex_unpk,
+        from_type_type: ex_ftt,
+        arg_types: ex_args,
+        arg_kinds: ex_kinds,
+        arg_names: ex_names,
+        ret_type: ex_ret,
+        name: ex_name,
+        variables: ex_vars,
+        type_guard: ex_guard,
+        type_is: ex_tis,
+    } = expanded
+    else {
+        return None;
+    };
+    let mut kept: Vec<Type> = Vec::with_capacity(ex_vars.len());
+    for tv in ex_vars {
+        if typevar_key(&tv).is_some_and(|id| !self_ids.contains(&id)) {
+            kept.push(tv.clone());
+        }
+    }
+    Some(Type::CallableType {
+        fallback: ex_fb,
+        instance_type: ex_inst,
+        is_ellipsis_args: ex_ell,
+        implicit: ex_impl,
+        is_bound: true,
+        from_concatenate: ex_concat,
+        imprecise_arg_kinds: ex_impr,
+        unpack_kwargs: ex_unpk,
+        from_type_type: ex_ftt,
+        arg_types: ex_args[1..].to_vec(),
+        arg_kinds: ex_kinds[1..].to_vec(),
+        arg_names: ex_names[1..].to_vec(),
+        ret_type: ex_ret,
+        name: ex_name,
+        variables: kept,
+        type_guard: ex_guard,
+        type_is: ex_tis,
+    })
 }
 
 /// Assemble one wire `CallableType` for `class_callable` (typeops.py:448-459):

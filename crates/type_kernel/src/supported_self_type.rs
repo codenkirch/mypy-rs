@@ -51,7 +51,7 @@ pub(crate) fn rust_supported_self_type(
 /// Python body's `supported_self_type(typ.item)` which drops the caller's
 /// flags. A bare non-proper node (e.g. a `TypeAliasType`) answers `false`,
 /// matching the Python tail predicate.
-fn supported_self_type_inner(
+pub(crate) fn supported_self_type_inner(
     py: Python<'_>,
     typ: &Type,
     resolver: &NativeTypeResolver,

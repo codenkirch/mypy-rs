@@ -1541,6 +1541,71 @@ fn solve_constraints_native(
     Ok((sol_blob, free_blob))
 }
 
+/// `mypy.infer.infer_type_arguments` (infer.py:67-80): constraints from a
+/// single template/actual pair, solved for `type_vars`. Mirrors the Python
+/// defaults: `skip_unsatisfied=False`, `strict=True`,
+/// `allow_polymorphic=False` (no `skip_reverse_union_constraints`), and
+/// `infer_unions` from `type_state.infer_unions` (solve.py:242-289). Used
+/// by the typeops composite generic `bind_self` arm (typeops.py:1074).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn infer_type_arguments_inner(
+    type_vars: &[Type],
+    template: &Type,
+    actual: &Type,
+    is_supertype: bool,
+    skip_unsatisfied: bool,
+    erase_types: bool,
+    strict_optional: bool,
+    infer_unions: bool,
+    resolver: &crate::typeinfo::NativeTypeResolver,
+) -> Option<Vec<Option<Type>>> {
+    let direction = if is_supertype {
+        crate::constraints::SUPERTYPE_OF
+    } else {
+        crate::constraints::SUBTYPE_OF
+    };
+    let constraints = crate::constraints::infer_constraints_full_inner(
+        template,
+        actual,
+        direction,
+        resolver.resolver(),
+        resolver.alias_resolver(),
+        strict_optional,
+        false,
+        false,
+        erase_types,
+    )?;
+    let (sol_blob, _free_blob) = solve_constraints_native(
+        type_vars,
+        type_vars,
+        &constraints,
+        // Python solve_constraints default strict=True.
+        true,
+        infer_unions,
+        strict_optional,
+        skip_unsatisfied,
+        resolver,
+    )
+    .ok()?;
+    let solutions = decode_solve_solutions_here(&sol_blob)?;
+    let tvids: Vec<TvId> = type_vars
+        .iter()
+        .map(|t| tv_id(t).ok_or(()))
+        .collect::<Result<_, _>>()
+        .ok()?;
+    Some(
+        tvids
+            .iter()
+            .map(|tv| {
+                solutions
+                    .iter()
+                    .find(|(k, _)| k == tv)
+                    .and_then(|(_, v)| v.clone())
+            })
+            .collect(),
+    )
+}
+
 /// `#[pyfunction]` entry for the non-polymorphic `solve_constraints`.
 ///
 /// `vars` are serialized originals for `vars + extra_vars`; `original_vars`
