@@ -7114,7 +7114,17 @@ class NativeTypeopsDeferralSuite(Suite):
         # Two resolvable aliases: one to the enum, one to a plain str.
         self.rgb_alias = TypeAlias(self.enum_inst, "mod.RGB", "mod", -1, -1)
         self.str_alias = TypeAlias(self.str_inst, "mod.S", "mod", -1, -1)
-        self.aliases = [self.rgb_alias, self.str_alias]
+        # A generic alias whose target carries the alias tvar T:
+        # mod.Lst = list[T]. Used for the get_type_vars live expansion.
+        self.lst_alias = TypeAlias(
+            Instance(self.fx.std_listi, [self.fx.t]),
+            "mod.Lst",
+            "mod",
+            -1,
+            -1,
+            alias_tvars=[self.fx.t],
+        )
+        self.aliases = [self.rgb_alias, self.str_alias, self.lst_alias]
 
         self._resolver = _type_kernel.build_native_resolver(type_infos, self.aliases)
         self._resolver.set_live_typeinfo_map({info.fullname: info for info in type_infos})
@@ -7269,6 +7279,60 @@ class NativeTypeopsDeferralSuite(Suite):
         assert off is not None
         assert_equal(str(on), str(off), f"missing-snapshot fallback parity {alias}")
         assert_equal(on, self.str_inst)
+
+    # get_type_vars alias expansion (issue #1313)
+
+    def _type_vars_on(self, tp: Type) -> str:
+        from mypy.typeops import get_type_vars
+
+        return str(self._with_gate(True, lambda: get_type_vars(tp)))
+
+    def test_get_type_vars_alias_target_tvar_collected(self) -> None:
+        # mod.Lst = list[T] with no explicit args: the alias expands to
+        # list[T], so T is collected. Gate parity + direct seam engagement.
+        from mypy.typeops import _serialize_type, get_type_vars
+        from mypy.types import TypeAliasType
+
+        alias = TypeAliasType(self.lst_alias, [])
+        off = self._with_gate(False, lambda: str(get_type_vars(alias)))
+        on = str(self._type_vars_on(alias))
+        assert_equal(on, off, "get_type_vars alias parity")
+        assert_equal(on, f"[{self.fx.t}]", "get_type_vars collects the alias tvar")
+        raw = _type_kernel.rust_get_type_vars_live(
+            self._resolver, _serialize_type(alias), False
+        )
+        assert raw is not None, "live get_type_vars deferred on a resolvable alias"
+
+    def test_get_type_vars_alias_arg_substituted(self) -> None:
+        # mod.Lst[A]: the alias tvar T is substituted with A (no tvar left),
+        # so nothing is collected. Same tree through the byte-only entry
+        # defers; the live entry decides.
+        from mypy.typeops import _serialize_type, get_type_vars
+        from mypy.types import TypeAliasType
+
+        alias = TypeAliasType(self.lst_alias, [self.fx.a])
+        off = self._with_gate(False, lambda: str(get_type_vars(alias)))
+        on = str(self._type_vars_on(alias))
+        assert_equal(on, off, "get_type_vars alias arg parity")
+        assert_equal(on, "[]")
+        raw = _type_kernel.rust_get_type_vars_live(
+            self._resolver, _serialize_type(alias), False
+        )
+        assert raw is not None, "live get_type_vars deferred on a resolvable alias"
+
+    def test_get_type_vars_alias_in_union(self) -> None:
+        # Nested unions carrying two applications of one alias: both
+        # Python (collect_type_vars dedup) and the Rust seen-by-type_ref
+        # guard collapse the duplicate descent to one T.
+        from mypy.typeops import get_type_vars
+        from mypy.types import TypeAliasType, UnionType
+
+        u = UnionType([TypeAliasType(self.lst_alias, []), self.fx.b])
+        nested = UnionType([TypeAliasType(self.lst_alias, []), u])
+        off = str(self._with_gate(False, lambda: str(get_type_vars(nested))))
+        on = self._type_vars_on(nested)
+        assert_equal(on, off, "get_type_vars union parity")
+        assert_equal(on, f"[{self.fx.t}]")
 
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
@@ -17597,6 +17661,16 @@ class NativeMessagesSuite(Suite):
             )
             self.assertIsNotNone(actual, f"rust invariance notes deferred for {arg_t} vs {exp_t}")
             assert_equal(actual, expected, f"invariance notes mismatch {arg_t} vs {exp_t}")
+
+        # Non-list/dict pairs with empty args (a class with no type vars):
+        # decided natively as no-op instead of deferring on the args scan.
+        empty = Instance(self.fx.make_type_info("mod.X"), [])
+        expected = append_invariance_notes([], empty, empty)
+        actual = _type_kernel.rust_append_invariance_notes(
+            self._bytes_of(empty), self._bytes_of(empty), self.resolver
+        )
+        self.assertIsNotNone(actual, "rust deferred on an empty-args non-list/dict pair")
+        assert_equal(actual, expected, "empty-args non-list/dict mismatch")
 
     def test_append_numbers_notes_par(self) -> None:
         from mypy.messages import append_numbers_notes

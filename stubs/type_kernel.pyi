@@ -257,6 +257,7 @@ __all__ = [
     "rust_find_linear",
     "rust_separate_union_literals",
     "rust_get_type_vars",
+    "rust_get_type_vars_live",
     "rust_solve_constraints",
     "rust_solve_dependent",
     "rust_replace_implicit_first_type",
@@ -1305,6 +1306,9 @@ def rust_find_linear(
 ) -> tuple[bool, tuple[int, int, str] | None] | None: ...
 def rust_separate_union_literals(type_bytes: bytes) -> tuple[list[bytes], list[bytes]] | None: ...
 def rust_get_type_vars(type_bytes: bytes, include_all: bool) -> list[bytes] | None: ...
+def rust_get_type_vars_live(
+    resolver: NativeTypeResolver, type_bytes: bytes, include_all: bool
+) -> list[bytes] | None: ...
 def rust_get_vars(
     target_bytes: bytes, vars: list[tuple[int, int, str]]
 ) -> list[tuple[int, int, str]] | None: ...

@@ -1538,6 +1538,9 @@ fn append_invariance_notes_inner(
     expected: &Type,
     resolver: &TypeResolver,
 ) -> Option<Vec<String>> {
+    // Python only indexes args[0]/args[1] inside the list/list and
+    // dict/dict arms (its `and` chains short-circuit on the fullnames), so
+    // any other Instance pair contributes no notes even with empty args.
     let Type::Instance {
         type_ref: arg_ref,
         args: arg_args,
@@ -1554,31 +1557,44 @@ fn append_invariance_notes_inner(
     else {
         return None;
     };
-    if arg_args.is_empty() || exp_args.is_empty() {
-        return None;
-    }
 
     let ctx = SubtypeContext::new(false, false, false, false, false, true);
-    let (invariant_type, covariant_suggestion) = if arg_ref == "builtins.list"
-        && exp_ref == "builtins.list"
-        && is_subtype(&arg_args[0], &exp_args[0], &ctx, resolver)?
-    {
-        (
-            "list",
-            "Consider using \"Sequence\" instead, which is covariant",
-        )
-    } else if arg_ref == "builtins.dict"
-        && exp_ref == "builtins.dict"
-        && is_same(&arg_args[0], &exp_args[0], resolver)?
-        && is_subtype(&arg_args[1], &exp_args[1], &ctx, resolver)?
-    {
-        (
-            "dict",
-            "Consider using \"Mapping\" instead, which is covariant in the value type",
-        )
-    } else {
-        return Some(Vec::new());
-    };
+    let (invariant_type, covariant_suggestion) =
+        if arg_ref == "builtins.list" && exp_ref == "builtins.list" {
+            if arg_args.is_empty() || exp_args.is_empty() {
+                // Python would index args[0]; defer so the fallback body
+                // reproduces the same behavior.
+                return None;
+            }
+            match is_subtype(&arg_args[0], &exp_args[0], &ctx, resolver) {
+                Some(true) => (
+                    "list",
+                    "Consider using \"Sequence\" instead, which is covariant",
+                ),
+                Some(false) => return Some(Vec::new()),
+                None => return None,
+            }
+        } else if arg_ref == "builtins.dict" && exp_ref == "builtins.dict" {
+            if arg_args.is_empty() || exp_args.is_empty() {
+                // Python would index args[0]/args[1].
+                return None;
+            }
+            match is_same(&arg_args[0], &exp_args[0], resolver) {
+                Some(true) => {}
+                Some(false) => return Some(Vec::new()),
+                None => return None,
+            }
+            match is_subtype(&arg_args[1], &exp_args[1], &ctx, resolver) {
+                Some(true) => (
+                    "dict",
+                    "Consider using \"Mapping\" instead, which is covariant in the value type",
+                ),
+                Some(false) => return Some(Vec::new()),
+                None => return None,
+            }
+        } else {
+            return Some(Vec::new());
+        };
 
     Some(vec![
         format!(
@@ -3082,6 +3098,35 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn test_append_invariance_notes_non_list_dict_empty_args_native() {
+        // Python indexes args[0]/args[1] only inside the list/list and
+        // dict/dict arms; any other pair contributes no notes even with
+        // empty args, so Rust answers Some(vec![]) instead of deferring.
+        let r = make_resolver(vec![]);
+        let arg = instance("a.X", vec![]);
+        let exp = instance("a.Y", vec![]);
+        assert_eq!(append_invariance_notes_inner(&arg, &exp, &r), Some(vec![]));
+        // Instance vs the same fullname with no args: still no notes.
+        assert_eq!(append_invariance_notes_inner(&arg, &arg, &r), Some(vec![]));
+    }
+
+    #[test]
+    fn test_append_invariance_notes_list_empty_args_defers() {
+        // list/list with empty args would index args[0] in Python; defer so
+        // the Python body reproduces its own behavior.
+        let r = make_resolver(vec![]);
+        let arg = instance("builtins.list", vec![]);
+        assert_eq!(append_invariance_notes_inner(&arg, &arg, &r), None);
+    }
+
+    #[test]
+    fn test_append_invariance_notes_dict_empty_args_defers() {
+        let r = make_resolver(vec![]);
+        let arg = instance("builtins.dict", vec![]);
+        assert_eq!(append_invariance_notes_inner(&arg, &arg, &r), None);
     }
 
     #[test]

@@ -3517,7 +3517,7 @@ fn check_self_arg_inner(
         // always_covariant: True if any type var in get_all_type_vars(selfarg)
         // is NOT a TypeVarType (i.e. ParamSpec or TypeVarTuple).
         let mut tvs = Vec::new();
-        crate::typeops::collect_type_vars(selfarg, false, &mut tvs)?;
+        crate::typeops::collect_type_vars(selfarg, false, None, &mut Vec::new(), &mut tvs)?;
         let always_covariant = tvs.iter().any(|tv| !matches!(tv, Type::TypeVarType { .. }));
 
         let ctx = SubtypeContext::new(
