@@ -2412,6 +2412,7 @@ fn classify_missing_annotations(
     arg_types: &[Type],
     strict_optional: bool,
     res: &TypeResolver,
+    alias: &crate::aliases::TypeAliasResolver,
 ) -> Option<(i64, bool)> {
     // show_untyped = not is_typeshed_stub or warn_incomplete_stub.
     if is_typeshed_stub && !warn_incomplete_stub {
@@ -2451,12 +2452,18 @@ fn classify_missing_annotations(
         ));
     }
     if type_tag == TYPE_TAG_CALLABLE {
-        let ret = ret_type?;
-        // get_proper_type(fdef.type.ret_type): an alias expands on the
-        // Python side (the wire carries no alias target), so defer.
-        if matches!(ret, Type::TypeAliasType { .. }) {
-            return None;
-        }
+        let ret_raw = ret_type?;
+        // get_proper_type(fdef.type.ret_type): an alias expands through the
+        // alias snapshot (defers on a missing snapshot or cycle, same as the
+        // Python `get_proper_type` cannot terminate a cyclic chain here).
+        let ret_owned;
+        let ret: &Type = match ret_raw {
+            Type::TypeAliasType { .. } => {
+                ret_owned = crate::checkexpr_functions::get_proper_or_expand(ret_raw, alias)?;
+                &ret_owned
+            }
+            _ => ret_raw,
+        };
         let ret_fail = if crate::visitor::is_unannotated_any_inner(ret) {
             true
         } else if is_generator {
@@ -2547,6 +2554,7 @@ pub(crate) fn rust_classify_missing_annotations(
         &arg_types,
         strict_optional,
         resolver.resolver(),
+        resolver.alias_resolver(),
     ))
 }
 
@@ -2720,6 +2728,7 @@ mod missing_annotations_tests {
         args: Vec<Type>,
     ) -> Option<(i64, bool)> {
         let res = make_resolver(vec![generator_snap(), instance_snap()]);
+        let alias = crate::aliases::TypeAliasResolver::new();
         classify_missing_annotations(
             is_typeshed_stub,
             warn_incomplete_stub,
@@ -2734,6 +2743,7 @@ mod missing_annotations_tests {
             &args,
             true,
             &res,
+            &alias,
         )
     }
 

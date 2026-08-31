@@ -910,6 +910,7 @@ pub(crate) fn callables_compatible_with_ignore_return(
         strict_concatenate,
         ignore_return,
         false, // check_args_covariantly
+        false, // allow_partial_overlap
         resolver,
     )
 }
@@ -940,8 +941,8 @@ fn ctx_compat_is_subtype(
 /// closure (e.g. `is_subtype` / `is_proper_subtype` / `is_more_precise` /
 /// `is_same_type`), `ignore_return` (skip the return-type check), and
 /// `check_args_covariantly` (flip `is_compat` for the argument path, keeping
-/// the return path unflipped). `allow_partial_overlap` is always `False` here
-/// and `is_compat_return = is_compat`. Returns `None` to defer.
+/// the return path unflipped). `is_compat_return = is_compat`. Returns
+/// `None` to defer.
 ///
 /// The caller is responsible for the `left.variables` unify gate (Python
 /// unifies a generic `left` via `unify_generic_callable` before this check);
@@ -956,6 +957,7 @@ pub(crate) fn is_callable_compatible(
     strict_concatenate: bool,
     ignore_return: bool,
     check_args_covariantly: bool,
+    allow_partial_overlap: bool,
     resolver: &TypeResolver,
 ) -> Option<bool> {
     let lf = callable_fields(left)?;
@@ -965,15 +967,15 @@ pub(crate) fn is_callable_compatible(
     // (subtypes.py:1841-1842).
     let ignore_pos_arg_names = ignore_pos_arg_names || lf.implicit || rf.implicit;
 
-    // right.is_type_obj() and not left.is_type_obj() and not allow_partial_overlap
-    // → False (subtypes.py:1845-1846). allow_partial_overlap is False here, so:
-    // right is a type object and left is not → False. If either side's
-
-    // is_type_obj result is unknown (resolver miss), defer via `?`.
-    let right_is_type_obj = is_type_obj(right, resolver)?;
-    let left_is_type_obj = is_type_obj(left, resolver)?;
-    if right_is_type_obj && !left_is_type_obj {
-        return Some(false);
+    // right.is_type_obj() and not left.is_type_obj() and not
+    // allow_partial_overlap → False (subtypes.py:1845-1846); skipped under
+    // allow_partial_overlap (existential overlap). Resolver misses defer.
+    if !allow_partial_overlap {
+        let right_is_type_obj = is_type_obj(right, resolver)?;
+        let left_is_type_obj = is_type_obj(left, resolver)?;
+        if right_is_type_obj && !left_is_type_obj {
+            return Some(false);
+        }
     }
 
     // Check return types (subtypes.py:1866-1867), covariant:
@@ -1009,7 +1011,7 @@ pub(crate) fn is_callable_compatible(
         eff_is_compat,
         is_proper_subtype,
         ignore_pos_arg_names,
-        false, // allow_partial_overlap
+        allow_partial_overlap,
         strict_concatenate_check,
     )
 }
