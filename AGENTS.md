@@ -857,15 +857,28 @@ including:
   native checkmember suites and Rust unit tests in `checkmember.rs`.
   Issue #1129 ports the tail's `freeze_all_type_vars` (typeops.py:2102): the
   static tail free-expands via `expand_type_by_instance_free`, then
-  `collect_freeze_ids` / `survivors_freezable` / `apply_freeze` set
-  `meta_level = 0` on every typevar listed in a `variables` entry (wire
-  round-trip broke Python's shared-object mutation), deferring when a
-  surviving typevar is outside every `variables` list (env miss: wire env
-  keys by receiver fullname, Python substitutes via live binder ids, e.g.
-  a PEP695 function-local class) or is ParamSpec/TypeVarTuple. Measured
-  (#1129): seam calls 4,983 → 2,763, global python fallbacks 88,985 →
-  79,986; remaining seam defers are TypeAliasType in the signature (~55%),
-  alias surviving expansion (~20%), and env miss (~19%).
+  `collect_freeze_ids` / `apply_freeze` set `meta_level = 0` on every
+  typevar listed in a `variables` entry (the wire round-trip broke Python's
+  shared-object mutation, so the rewrite is id-keyed over the whole tree).
+  Measured (#1129): seam calls 4,983 → 2,763, global python fallbacks
+  88,985 → 79,986; remaining seam defers are TypeAliasType in the signature
+  (~55%), alias surviving expansion (~20%), and env miss (~19%).
+  Issue #1277 narrows the #1129 survivors gate: after a successful
+  expansion the old gate rejected legal leftovers Python's freeze also
+  leaves untouched (a caller's own tvars riding in through the substituted
+  receiver args of class-tvar methods, whose `variables` list is empty) and
+  deferred 97.6% of the seam. The #1129 "env miss" rationale was
+  over-conservative: the expand already defers on what it cannot key, so a
+  gated post-expand tree was by construction post-substitution. The gate
+  now defers only on a leftover that is neither a `variables` entry nor
+  among the mapped receiver's args (collected via `collect_tvar_keys`;
+  ParamSpec/TypeVarTuple match by the -1 meta sentinel) or on any
+  `UnpackType` occurrence; the freeze step is parity-safe for the
+  receiver-arg class because Python's freeze only rewrites `variables`
+  entries. Measured: 689 calls @ 17% native (incl. 561 re-entrant seam
+  calls spawned by the defers' Python fallback) → 128 calls @ 92% native;
+  the 10 residual defers are 6 `map:failed` and 4 `codec:decode-instance`,
+  the same unported small buckets as before.
 - `rust_analyze_instance_member_dispatch` defer closures (issue #1112) —
   ports two IAMA dispatch defers into the kernel: (a) the
   `rust_freshen_function_type_vars` `TypeAliasType` arm (freshen walks alias
