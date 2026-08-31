@@ -108,24 +108,32 @@ impl EqualityValueInfo {
 /// `checker.equality_value_info(t)` — collect value-equality domains of `t`.
 ///
 /// Mirrors checker.py:10696-10721 with `combine_equality_value_info`
-/// folded in. Returns `None` (defer) on a `TypeAliasType` (the Python body
-/// resolves it via `get_proper_type` from live `TypeInfo`) or an `Instance`
-/// whose TypeInfo snapshot is missing from the resolver. Recursion into
+/// folded in. Alias nodes expand through the type alias snapshot
+/// (`expanded_alias_target`), mirroring the leading `get_proper_type`; a
+/// snapshot miss or an undecidable substitution defers. Also defers on an
+/// `Instance` whose TypeInfo snapshot is missing from the resolver. Recursion into
 /// `last_known_value`, `LiteralType.fallback`, `TypeVarType` values /
 /// upper_bound, and union items mirrors the Python dispatch order exactly.
 /// Reused by `equality_ambiguity` for the per-item split.
 pub(crate) fn equality_value_info_inner(
     t: &Type,
     resolver: &TypeResolver,
+    aliases: &dyn crate::aliases::AliasLookup,
 ) -> Option<EqualityValueInfo> {
     match t {
-        // get_proper_type(t) would expand a TypeAliasType from live TypeInfo;
-        // the wire cannot, so defer.
-        Type::TypeAliasType { .. } => None,
+        // get_proper_type(t) expands the alias from the live TypeAlias node
+        // (checker.py:12505); mirror it with the alias snapshot. The
+        // recursion re-enters through raw items, so each level re-expands.
+        // A snapshot miss or an undecidable substitution defers (a snapshot
+        // cycle is semanal-rejected, so its defer stays conservative).
+        Type::TypeAliasType { .. } => {
+            let (proper, _, _) = crate::checkexpr_functions::expanded_alias_target(t, aliases)?;
+            equality_value_info_inner(&proper, resolver, aliases)
+        }
         Type::UnionType { items, .. } => {
             let mut out = EqualityValueInfo::default();
             for item in items {
-                out.merge(equality_value_info_inner(item, resolver)?);
+                out.merge(equality_value_info_inner(item, resolver, aliases)?);
             }
             Some(out)
         }
@@ -135,11 +143,11 @@ pub(crate) fn equality_value_info_inner(
             ..
         } => {
             if values.is_empty() {
-                return equality_value_info_inner(upper_bound, resolver);
+                return equality_value_info_inner(upper_bound, resolver, aliases);
             }
             let mut out = EqualityValueInfo::default();
             for value in values {
-                out.merge(equality_value_info_inner(value, resolver)?);
+                out.merge(equality_value_info_inner(value, resolver, aliases)?);
             }
             Some(out)
         }
@@ -149,7 +157,7 @@ pub(crate) fn equality_value_info_inner(
             ..
         } => {
             if let Some(lkv) = last_known_value {
-                return equality_value_info_inner(lkv, resolver);
+                return equality_value_info_inner(lkv, resolver, aliases);
             }
             if type_ref == "builtins.object" {
                 return Some(EqualityValueInfo::top());
@@ -178,7 +186,9 @@ pub(crate) fn equality_value_info_inner(
                 is_top: false,
             })
         }
-        Type::LiteralType { fallback, .. } => equality_value_info_inner(fallback, resolver),
+        Type::LiteralType { fallback, .. } => {
+            equality_value_info_inner(fallback, resolver, aliases)
+        }
         Type::AnyType { .. } => Some(EqualityValueInfo::top()),
         _ => Some(EqualityValueInfo::default()),
     }
@@ -195,7 +205,7 @@ pub(crate) fn rust_equality_value_info(
     resolver: &mut NativeTypeResolver,
 ) -> EqualityResult {
     let t = decode_type(t_bytes)?;
-    let info = equality_value_info_inner(&t, resolver.resolver())?;
+    let info = equality_value_info_inner(&t, resolver.resolver(), resolver.alias_resolver())?;
     let mut domains: Vec<(String, Vec<String>, Vec<String>)> =
         Vec::with_capacity(info.domains.len());
     for (domain, domain_info) in info.domains {

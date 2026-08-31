@@ -10,9 +10,9 @@
 //!
 //! The per-type domain collection reuses
 //! `equality_info::equality_value_info_inner` (the #679 port) so both
-//! functions share one source of truth. The call defers (`None`) when any
-//! involved type is a `TypeAliasType` or a missing-snapshot `Instance`,
-//! matching `equality_info`'s deferral so the Python fallback stays exact.
+//! functions share one source of truth. Alias nodes expand via the type
+//! alias snapshot (`expanded_alias_target`); the call defers (`None`) when
+//! an alias snapshot is missing or any `Instance` snapshot is absent.
 //!
 //! Return protocol of `rust_partition_equality_ambiguous_types`:
 //! `Some((narrowable, ambiguous))` where each side is `None` (empty side)
@@ -102,6 +102,7 @@ fn partition_inner(
     is_identity: bool,
     strict_optional: bool,
     resolver: &TypeResolver,
+    aliases: &dyn crate::aliases::AliasLookup,
 ) -> Option<(Option<Vec<u8>>, Option<Vec<u8>>)> {
     if is_identity {
         return Some((Some(encode_type_list(std::slice::from_ref(current))?), None));
@@ -121,11 +122,11 @@ fn partition_inner(
         _ => vec![typ],
     };
 
-    let target_info = equality_value_info_inner(target, resolver)?;
+    let target_info = equality_value_info_inner(target, resolver, aliases)?;
     let mut narrowable: Vec<Type> = Vec::new();
     let mut ambiguous: Vec<Type> = Vec::new();
     for item in &items {
-        let item_info = equality_value_info_inner(item, resolver)?;
+        let item_info = equality_value_info_inner(item, resolver, aliases)?;
         if is_equality_ambiguous_for_infos(&item_info, &target_info) {
             ambiguous.push(item.clone());
         } else {
@@ -164,10 +165,14 @@ pub(crate) fn rust_is_equality_ambiguous_for_narrowing(
     let Some(right) = decode_type(right_bytes) else {
         return Ok(None);
     };
-    let Some(left_info) = equality_value_info_inner(&left, resolver.resolver()) else {
+    let Some(left_info) =
+        equality_value_info_inner(&left, resolver.resolver(), resolver.alias_resolver())
+    else {
         return Ok(None);
     };
-    let Some(right_info) = equality_value_info_inner(&right, resolver.resolver()) else {
+    let Some(right_info) =
+        equality_value_info_inner(&right, resolver.resolver(), resolver.alias_resolver())
+    else {
         return Ok(None);
     };
     Ok(Some(is_equality_ambiguous_for_infos(
@@ -205,6 +210,7 @@ pub(crate) fn rust_partition_equality_ambiguous_types(
         is_identity,
         strict_optional,
         resolver.resolver(),
+        resolver.alias_resolver(),
     ))
 }
 
