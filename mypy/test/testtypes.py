@@ -3138,6 +3138,25 @@ class NativeJoinTypeListSuite(Suite):
         assert isinstance(on, UninhabitedType)
         assert join_type_list([self.fx.a]) == self.fx.a
 
+    def test_nle1_lists_never_cross_ffi(self) -> None:
+        # Locks the n<=1 early return (join.py:1510-1515) with the gate
+        # on from setUp. Uses RuntimeError, not AssertionError: the shim
+        # catches AssertionError and would fall back to the pure body.
+        from mypy.join import join_type_list
+
+        def forbid(*args: object) -> object:
+            raise RuntimeError("length <= 1 lists must never cross the FFI")
+
+        original = getattr(_type_kernel, "rust_join_type_list")
+        setattr(_type_kernel, "rust_join_type_list", forbid)
+        try:
+            empty = join_type_list([])
+            assert isinstance(get_proper_type(empty), UninhabitedType)
+            item = self.fx.a
+            assert join_type_list([item]) is item
+        finally:
+            setattr(_type_kernel, "rust_join_type_list", original)
+
     def test_duplicate_same_instances(self) -> None:
         # [A, A] -> A (the args-less prejoin's same-ref arm).
         assert self._assert_parity([self.fx.a, self.fx.a]) == self.fx.a

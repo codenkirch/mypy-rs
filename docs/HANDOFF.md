@@ -1,67 +1,91 @@
 # Handoff: strangler-fig Rust migration loop (seam-deferral reduction)
 
-*Written 2026-08-28, refreshed 2026-08-30 (post-survey10-wave). Goal:
+*Written 2026-08-28, refreshed 2026-08-31 (post-survey12, #1274
+merged). Goal:
 "migrate all python code to rust, really all" — pursued as the
 established measure -> file -> dispatch-2-agents -> process-PRs -> gate
 loop. This file is the resume point.*
 
 ## Where main stands
 
-- `main` = `f76d216bd` (`perf(type_kernel): port type[T]-vs-callable and
-  protocol-arm constraint inference (#1263)`), local ff'd to origin.
-- Gates on clean main: survey11 self-check run by the orchestrator on the
-  fresh shared `.so` = 345 files 0 issues; cargo test green (~2,396-2,399
-  passed per the two merged PRs' pre-merge runs).
-- Shared `.so` set rebuilt + codesigned at `f76d216bd`
+- `main` = `c4dabfa83` (`fix(type_kernel): correct type_of_any
+  literals at join/meet/solve Any sinks (#1271) (#1274)`), local ff'd
+  to origin.
+- Gates on clean main: self-check clean (survey12 run: 345 files 0
+  issues); cargo test green (2,416 passed on the #1274 pre-merge runs).
+- Shared `.so` set rebuilt + codesigned at `c4dabfa83` content
   (`/private/tmp/mypy-rs-local-typekernel|resolver|ast`; type_kernel
-  refreshed by the orchestrator after the merges); rebuild before the
-  next survey (procedure under "The loop").
-- Last survey (survey11, `f76d216bd`): 5,142,259 seam calls, 5,131
-  fallbacks (0.1% defer) — survey10 was 8,970 (0.2%), so the wave cut
-  fallbacks 43%. Residual <99% pools by absolute fallbacks:
-  analyze_member_access 1,322 @ 89%, classify_unbound_front 1,095 @ 89%,
-  join_type_list 904 @ 64%, analyze_instance_member_access 572 @ 17%,
-  callables_compatible 498 @ 1%, analyze_unbound_without_info 466 @ 72%,
-  expand_type_by_instance 445 @ 56%, type_object_type_from_function 288
-  @ 84%, is_overlapping_types 284 @ 90%, are_parameters_compatible 258
-  @ 44%, infer_function_type_arguments 234 @ 55% (was 828 @ 40%).
-  is_subtype flat at 95% by design (#1256 precedent: kernel-boundary
-  share flat, wins land in testdata parity suites).
-- Wave wins (survey10 -> survey11): check_overload_call 1,459 @ 89% ->
-  656 @ 95%; infer_constraints_full 1,368 @ 94% -> 213 @ 99%;
-  solve_generic_call 1,140 @ 87% -> 245 @ 97%.
+  built from the #1274 branch tip, byte-identical tree). Rebuild before
+  the next survey (procedure under "The loop").
+- Last survey (survey12, worktree at the #1274 tip): 5,131,412 seam
+  calls, 3,349 fallbacks (0.07% defer) — survey11 was 5,131 (0.1%), so
+  the wave cut fallbacks ~35%. Residual <97% pools by absolute
+  fallbacks (calls x (1 - native%)):
+  is_subtype 29,637 @ 95% (~1,482; flat by design, #1256 precedent),
+  analyze_member_access 12,015 @ 89% (1,322),
+  check_overload_call 13,125 @ 95% (656),
+  analyze_instance_member_access 689 @ 17% (572),
+  callables_compatible 503 @ 1% (498),
+  analyze_unbound_without_info 568 @ 19% (460),
+  expand_type_by_instance 1,010 @ 56% (444),
+  type_object_type_from_function 1,797 @ 84% (288),
+  is_overlapping_types 2,834 @ 90% (283),
+  are_parameters_compatible 459 @ 44% (257),
+  infer_function_type_arguments 518 @ 55% (233).
+  is_subtype_batch's 211% line is a kernel-boundary counting artifact;
+  discount it (see survey caveat below).
+- Wave wins (survey11 -> survey12): classify_unbound_front 1,095
+  defers @ 89% -> 9,960 @ 100% (0 defers, #1267); join_type_list
+  904 @ 64% -> 74 @ 28% (~53 defers; basis changed with the #1270
+  core-routing, see "In flight: #1266"); infer_constraints_full 213
+  @ 99% held; solve_generic_call 245 @ 97% held.
 - Runner/OCR note: the repo's ephemeral runner cannot re-register (403,
   admin-blocked; #1249 open). OCR gates stay `queued` forever; use the
-  local fallback `runners/_shared/ocr-review-pr.sh` (or direct `ocr
-  review --from <merge-base> --to <head> --format json --audience
-  agent`, resume errored files with `--resume <session_id>` and the
-  exact full-SHA range) and merge `--squash --admin` after pr-gate +
-  parity are green.
+  local fallback (`ocr review --from <merge-base> --to <head> --format
+  json --audience agent`, resume an interrupted session with
+  `--resume <session_id>` and the exact full-SHA range) and merge
+  `--squash --admin` after pr-gate + parity are green. Note `ocr
+  review` needs ~6-8 min for a 7-file range and dies silently when its
+  parent shell is reaped; resume recovers in-place.
 
-## Recent merges (since 2026-08-30 refresh)
+## Recent merges (since 2026-08-31 refresh)
 
 | PR | Issue | What | Numbers |
 |----|-------|------|---------|
-| #1261 | #1259 | per-PR decides type-object/callable + tuple-fallback constraint arms in constraints/solve | infer_constraints_full 22,792 calls 94% -> 99% (1,368 -> 213 fallbacks); OCR: 2 low nits acknowledged |
-| #1263 | #1260 | rusty port type[T]-vs-callable + protocol-arm + inst-protocol-template constraint inference; rebased over #1261 | solve_generic_call 8,768 calls 87% -> 97% (1,140 -> 245 fallbacks); RESULT_OK 10,840 -> 10,992 / 11,420 (96.2%); OCR 3 findings (2 med dead-code, 1 low) all fixed |
-| #1250 | #1247 | docs: bytes-literal escape leniency matches CPython | docs only; runner-blocked OCR bypassed via fallback script |
-| #1252 | #1251 | ci: squash-gate treats `skipped` + "No supported files changed" + no comments as clean | unblocks doc-only PRs; ocr-review CI jobs stay queued (runner 403) |
-| #1253 | #1248 | fix(type_kernel): str.format char-vs-byte offsets + multibyte parity | 9 unit tests; testtypes 2904, testcheck 8198, self-check clean, mypyc run-strings 25 passed |
-| #1257 | #1254 | perf: expand alias operands in rust_check_overload_call | 13,260 calls 87% -> 89% (1,724 -> 1,459 fallbacks); ol.alias*/union_item_none defers gone |
-| #1256 | #1255 | perf: Instance>callable and callable>protocol __call__ arms in rust_is_subtype | seam-level 95% (flat on self-check corpus; wins land in testdata parity suites) |
+| #1267 | #1265 | unbound-tvar front decided natively under allow_unbound_tvars | classify_unbound_front 1,095 defers @ 89% -> 0 (9,960 @ 100%) |
+| #1268 | #1262 | erase_typevars make_any emits TypeOfAny.special_form (6), not the bogus 12 | ~5 literals + round-trip test; #1262 closed |
+| #1270 | #1266 | join_type_list defers route through the InstanceJoiner core (round 1) | join_type_list basis rebuilt; pair/lkv defers now join_instances_core |
+| #1272 | #1269 | join disc-4 arm emits TypeOfAny.from_another_any (7) | first 7-at-sink fix |
+| #1274 | #1271 | all remaining reachable Any-reconstruction sinks emit correct type_of_any (6/7+source); solve.rs expand_actual_arg fallbacks 5 | survey12: 5,131 fallbacks -> 3,349 (0.07%); two local OCR rounds (16 findings: 11 fixed, 5 acknowledged) |
 
 Discovered during the wave, not yet fixed:
 
-- **#1262** — `erase_typevars.rs make_any()` emits `type_of_any: 12`,
-  not a `TypeOfAny` member (`special_form` is 6); comment lies. Raw
-  value round-trips through the wire; latent parity hazard at
-  `typeanal.py:2853`, `checkexpr.py:8886`, `stats.py:489`. Fix is ~5
-  literals + a round-trip test.
+- (none — #1262 was fixed by #1268; the #1274 OCR rounds' residual
+  is the disc-4 helper quadruplication across setops/condmaps/
+  checker_helpers/checkexpr_functions, acknowledged in the PR body,
+  unfiled)
 
-## In flight: #1266 (join_type_list round 2) — resume here
+## Closed: #1266 (join_type_list round 2) history and residual walls
 
-Written 2026-08-30 21:35 during the audit phase; design settled, port not
-started. Issue #1266 assigned to @Jonathangadeaharder.
+STATUS 2026-08-31, CLOSED. Round 1 (route mid-fold pair defers through
+the #824 `join_instances_core`) and design part 1 (the n<=1 shim early
+path) BOTH LANDED in #1270; the "design part 1 remains" text below was
+written pre-#1270 and is stale. Routing n<=1 lists THROUGH the Rust
+single-item passthrough would regress, not improve: a single item
+would come back as a wire-decoded copy instead of the live
+`types[0]`, and the non-round-trippable singleton shapes (`tv|T` 333,
+`union|n2` 158, `params` 93, dict tvs 74) defer inside the kernel
+anyway. Post-merge residual (survey12): 74 whole-call events @ 28%
+native, ~53 defers (lkv 39, join_instances_core-declined pairs 9,
+join_one_pair arg_disc-4 4); all three walls are Rust-side, tracked in
+#1281 (round 3). Regression lock added on top of #1270:
+`NativeJoinTypeListSuite.test_nle1_lists_never_cross_ffi` forbids FFI
+crossings for length <= 1 lists (uses RuntimeError because the shim
+catches AssertionError and would silently fall back).
+
+Audit history (pre-#1270 numbers, written 2026-08-30 21:35 during the
+audit phase; design settled. Issue #1266 assigned to
+@Jonathangadeaharder):
 
 - **Setup**: worktree `/Users/jonathangadeaharder/projects/coding-utils/
   mypy-rs-i1266`, branch `perf/1266` at `f76d216bd`, two modified files
@@ -104,25 +128,16 @@ started. Issue #1266 assigned to @Jonathangadeaharder.
      — record as residual. Post-port expectation: ~10-20 defers on
      2,715 entries (>=99% native); measure with the same audit env and
      update this section's numbers in the PR body.
-- **TEMP AUDIT instrumentation is live in TWO files and MUST be
-  stripped before commit**: `mypy/join.py` `join_type_list` (two hunks,
-  `# TEMP AUDIT #1266`, ~lines 1510-1541) and
-  `crates/type_kernel/src/checker_helpers.rs` `join_type_list_inner`
-  (`=== TEMP AUDIT #1266 ===` blocks incl. `jtl_log`/`jtl_tag`, ~lines
-  678-800). After stripping: rebuild (worktree `cargo rustc
-  --manifest-path <worktree>/crates/type_kernel/Cargo.toml -p
-  mypy-type-kernel --features extension-module --lib --crate-type
-  cdylib --release -- -C link-arg=-undefined
-  -C link-arg=dynamic_lookup`; cargo from the worktree root — a plain
-  `cargo rustc` in another checkout builds the wrong tree silently).
-- **Remaining sequence**: strip instrumentation → implement the two
-  design parts → cargo test → testtypes + testcheck parity (-n4) →
-  self-check clean → measure post-port numbers → commit (`perf:
-  ...` conventional) → push `perf/1266` → PR to `main` → pr-gate +
-  parity green → runner-403 fallback OCR (`runners/_shared/
-  ocr-review-pr.sh`) → merge `--squash --admin` → refresh shared `.so`
-  set (`/private/tmp/mypy-rs-local-typekernel|resolver|ast`) → update
-  this file's numbers + close #1266.
+- **TEMP AUDIT instrumentation** was stripped before the #1270 commit
+  (it had lived in `mypy/join.py` `join_type_list` and
+  `checker_helpers.rs` `join_type_list_inner`); the audit env was
+  `MYPY_TK_JTL_AUDIT` with the instrumented build at
+  `/private/tmp/mypy-rs-local-tk-i1266/`.
+- Archive note (implementation consumed by #1270): strip
+  instrumentation → implement the two design parts → cargo test →
+  testtypes + testcheck parity (-n4) → self-check clean → measure
+  post-port numbers → commit → PR → pr-gate + parity green →
+  fallback OCR → merge `--squash --admin` → refresh shared `.so` set.
 - Shared-`.so` hygiene: `/private/tmp/mypy-rs-local-typekernel/` was
   accidentally overwritten with the instrumented build on 2026-08-30
   ~21:22 and restored to the `f76d216bd` baseline (5645616-byte dylib
@@ -160,29 +175,32 @@ and stashes are pre-existing — leave them.
 
 ## Open backlog (next waves; dispatch max ~2 port agents)
 
-1. **is_subtype tail (~20.7k defers)** — the largest remaining bucket.
-   Remaining protoR defers (~13.1k) are dominated by
-   `get_protocol_member_inner` deferrals (extra_attrs, base-class members
-   behind the same-class guard, descriptors). Unfiled — file an issue with
-   these numbers before dispatching.
-2. **#1114** — rust_find_self_type 35,210 @ 93% (~2.5k defers).
-3. **#1115** — build-side decode lifecycle; bigger slice crossing
+1. **is_subtype tail (~1,482 defers @ 95%)** — the largest remaining
+   bucket. The protoR defers are dominated by
+   `get_protocol_member_inner` deferrals (extra_attrs, base-class
+   members behind the same-class guard, descriptors). Unfiled — file
+   an issue with these numbers before dispatching.
+2. **#1115** — build-side decode lifecycle; bigger slice crossing
    semanal/worker build paths; needs careful daemon/cache parity assessment.
-4. **#342** — analyze_class_attribute_access mega-port (now owns the
-   member_access CallableType/Overloaded tail; also the natural home for
-   the analyze_member_access 1,322 @ 89% residual — audit-first).
-5. Next-wave queue from survey11 (file issues with these numbers, then
+3. **#342** — analyze_class_attribute_access mega-port (owns the
+   member_access CallableType/Overloaded tail; also the natural home
+   for the analyze_member_access 1,322 @ 89% residual — audit-first).
+4. Next-wave queue from survey12 (file issues with these numbers, then
    dispatch ~2):
-   - **classify_unbound_front 1,095 @ 89%** (round 1).
-   - **join_type_list 904 @ 64%** (round 2; now in flight as #1266,
-     see "In flight: #1266" above — audit done, port next).
-   - Then: analyze_unbound_without_info 466 @ 72%,
-     expand_type_by_instance 445 @ 56% (#1113 buckets structural —
-     check the precedent first), callables_compatible 498 @ 1% (low
-     volume), type_object_type_from_function 288 @ 84%,
-     is_overlapping_types 284 @ 90%, are_parameters_compatible 258 @ 44%.
-   - **#1262** is a quick standalone fix — slot it into any wave.
-6. After the above, re-survey.
+   - **analyze_instance_member_access 689 @ 17%** (572 defers).
+   - **analyze_unbound_without_info 568 @ 19%** (460 defers).
+   - **callables_compatible 503 @ 1%** (498 defers; low volume but
+     near-total defer).
+   - Then: expand_type_by_instance 1,010 @ 56% (#1113 buckets
+     structural — check the precedent first),
+     infer_function_type_arguments 518 @ 55%,
+     are_parameters_compatible 459 @ 44%,
+     type_object_type_from_function 1,797 @ 84%,
+     is_overlapping_types 2,834 @ 90%.
+   - Also: the #1274 residual disc-4 helper convergence (pub(crate)
+     helper across setops/condmaps/checker_helpers/checkexpr) — good
+     small cleanup PR, not a port.
+5. After the above, re-survey.
 
 ## The loop (how to continue)
 
