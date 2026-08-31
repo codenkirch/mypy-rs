@@ -3151,7 +3151,7 @@ class NativeJoinTypeListSuite(Suite):
         setattr(_type_kernel, "rust_join_type_list", forbid)
         try:
             empty = join_type_list([])
-            assert isinstance(empty, UninhabitedType)
+            assert isinstance(get_proper_type(empty), UninhabitedType)
             item = self.fx.a
             assert join_type_list([item]) is item
         finally:
