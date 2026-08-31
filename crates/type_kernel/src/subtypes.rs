@@ -21,7 +21,7 @@ use pyo3::prelude::*;
 use std::cell::RefCell;
 use std::collections::HashSet;
 
-use crate::typeinfo::{NativeTypeResolver, TypeResolver};
+use crate::typeinfo::{NativeTypeResolver, TypeInfoSnapshot, TypeResolver};
 use crate::wire::{self, ReadBuffer, Type, WriteBuffer};
 
 /// Variance constants mirroring `mypy.nodes` (nodes.py:3146).
@@ -52,6 +52,134 @@ fn get_proper_type_or_defer<'a>(typ: &'a Type, _resolver: &'a TypeResolver) -> O
         Type::TypeAliasType { .. } => None,
         t => Some(t),
     }
+}
+
+/// Outcome of the snapshot MRO walk mirroring `TypeInfo.get(name)` +
+/// `is_valid_constructor` for the visit_type_type constructor decision.
+enum MroCtorDefiner {
+    /// First MRO entry whose own names define `name` with a constructor
+    /// node (FuncBase or Decorator); the value is `node.info.fullname`.
+    Definer(String),
+    /// The name is defined somewhere on the MRO but the node is not a valid
+    /// constructor (Var or another kind): `type_object_type` returns the
+    /// invalid-class-definition Any.
+    Invalid,
+    /// Not defined anywhere on the MRO.
+    Missing,
+    /// An MRO entry's snapshot is absent: cannot decide (defer).
+    Defer,
+}
+
+/// MRO walk for `info.get(name)` with `is_valid_constructor` verdicts,
+/// decided from each MRO entry's own `member_definers` / `member_info`
+/// map. `member_definers` stores FuncBase/Decorator/Var nodes with each
+/// node's `info.fullname`; a name present in the wider `member_info` map
+/// but absent from `member_definers` is a node whose kind is neither, i.e.
+/// invalid.
+fn mro_constructor_definer(
+    snap: &TypeInfoSnapshot,
+    name: &str,
+    resolver: &TypeResolver,
+) -> MroCtorDefiner {
+    for entry in &snap.mro {
+        let Some(entry_snap) = resolver.get(entry) else {
+            return MroCtorDefiner::Defer;
+        };
+        let Some((kind, definer)) = entry_snap.member_definers.get(name) else {
+            if entry_snap.member_info.contains_key(name) {
+                return MroCtorDefiner::Invalid;
+            }
+            continue;
+        };
+        if *kind == 0 || *kind == 1 {
+            return MroCtorDefiner::Definer(definer.clone());
+        }
+        return MroCtorDefiner::Invalid;
+    }
+    MroCtorDefiner::Missing
+}
+
+/// The visit_type_type Instance-item decision head
+/// (subtypes.py:1816-1832). Decides the constructor path when the chosen
+/// `__init__`/`__new__` method is `builtins.object`'s `__init__`
+/// (`ret_type` None; universal callable with ret Any on a fallback_to_any
+/// tie). Everything else needs live `function_type` / `class_callable`
+/// bytes and defers (`None`).
+fn type_object_ret_decision(
+    item_type_ref: &str,
+    right_ret: &Type,
+    left_item: &Type,
+    ctx: &SubtypeContext,
+    resolver: &TypeResolver,
+) -> Option<bool> {
+    let item_snap = resolver.get(item_type_ref)?;
+    let init = mro_constructor_definer(item_snap, "__init__", resolver);
+    let new = mro_constructor_definer(item_snap, "__new__", resolver);
+    // Python: a missing or invalid __init__, or (when __new__ exists) an
+    // invalid __new__, makes type_object_type return the
+    // invalid-class-definition Any, which falls through to the unsound
+    // tail. A missing __new__ is replaced by __init__ (an MRO tie).
+    let init = match init {
+        MroCtorDefiner::Definer(def) => Some(def),
+        MroCtorDefiner::Invalid | MroCtorDefiner::Missing => None,
+        MroCtorDefiner::Defer => return None,
+    };
+    let Some(init_definer) = init else {
+        return is_subtype(left_item, right_ret, ctx, resolver);
+    };
+    let new = match new {
+        MroCtorDefiner::Definer(def) => Some(def),
+        MroCtorDefiner::Invalid => {
+            return is_subtype(left_item, right_ret, ctx, resolver);
+        }
+        MroCtorDefiner::Missing => None,
+        MroCtorDefiner::Defer => return None,
+    };
+    let init_idx = item_snap.mro.iter().position(|m| m == &init_definer);
+    let Some(init_idx) = init_idx else {
+        // `mro.index(node.info)` failure is unreachable for sane snapshots.
+        return None;
+    };
+    let (_new_definer, new_idx) = match new {
+        Some(def) => {
+            let idx = item_snap.mro.iter().position(|m| m == &def);
+            (Some(def), idx)
+        }
+        None => (None, Some(init_idx)),
+    };
+    let Some(new_idx) = new_idx else {
+        return None;
+    };
+    if init_idx > new_idx {
+        // __new__ wins the MRO race. object.__new__ carries a Self-typed
+        // ret that only the live expansion can decide; everything else
+        // needs live `function_type` bytes. Defer.
+        return None;
+    }
+    if init_definer == "builtins.object" {
+        // On the exact MRO tie for a bogus-base (fallback_to_any) class,
+        // Python builds the universal callable with ret Any.
+        if init_idx == new_idx && item_snap.fallback_to_any {
+            return Some(true);
+        }
+        // Python keeps going: the method is object.__init__ and
+        // type_object_type_from_function replaces a non-__new__ ret with
+        // fill_typevars(info). expand_type_by_instance(constructor, item)
+        // maps those class tvars onto item's args, so the compared ret is
+        // structurally `item` itself for a plain non-generic class with
+        // this type_ref. Generic classes (TVT/ParamSpec/unpack shapes)
+        // defer; the unsound tail is not reachable from this arm.
+        if let Type::Instance { type_ref, args, .. } = left_item {
+            if *type_ref == item_type_ref
+                && args.is_empty()
+                && item_snap.type_vars_with_variance.is_empty()
+            {
+                return is_subtype(left_item, right_ret, ctx, resolver);
+            }
+        }
+        return None;
+    }
+    None
 }
 
 fn any_type_of(type_of_any: i64) -> Type {
@@ -692,11 +820,25 @@ pub(crate) fn is_subtype(
             } else {
                 item_ref = left_item.as_ref();
             }
-            // subtypes.py:1256-1268: an Instance item needs the live
-            // type_object_type (init/new MRO selection + class_callable),
-            // which the wire snapshot does not carry. Defer; Python re-runs.
-            if matches!(item_ref, Type::Instance { .. }) {
-                return None;
+            // subtypes.py:1256-1268: an Instance item compares through the
+            // constructor (`type_object_type(item.type)` after expansion).
+            // The wire snapshot carries no method type bytes, so only the
+            // object-defined subset is decidable: when the chosen method is
+            // object's `__init__`, the constructor's `ret_type` is None
+            // (or Any for a fallback_to_any tie, the universal callable).
+            // A user-defined or semanal-incomplete constructor defers.
+            if let Type::Instance {
+                type_ref: item_type_ref,
+                ..
+            } = item_ref
+            {
+                return type_object_ret_decision(
+                    item_type_ref,
+                    right_ret,
+                    left_item,
+                    ctx,
+                    resolver,
+                );
             }
             // subtypes.py:1271: fallthrough — unsound, no __init__ check.
             return is_subtype(left_item, right_ret, ctx, resolver);

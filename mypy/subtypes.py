@@ -1995,6 +1995,27 @@ def is_protocol_implementation(
 def get_protocol_member(
     left: Instance, original_left: Type, member: str, class_obj: bool, is_lvalue: bool = False
 ) -> Type | None:
+    if (
+        _native_find_member_prelude_active()
+        and not class_obj
+        and not is_lvalue
+        and member != "__call__"
+        and left.extra_attrs is not None
+    ):
+        # The kernel defers gpm on extra_attrs-bearing instances (module
+        # types); resolve the miss/hit through the #1074 prelude classifier
+        # so the decision still comes from Rust and the Python fallback
+        # body below does not re-run. `__call__` is excluded because the
+        # metaclass special-case at the bottom must still fire.
+        try:
+            tag = _rust_classify_find_member(member, left, False, False)
+        except (AssertionError, NotImplementedError, ValueError, AttributeError):
+            tag = None
+        if tag == NATIVE_FIND_MEMBER_EXTRA_ATTR:
+            assert left.extra_attrs is not None
+            return left.extra_attrs.attrs[member]
+        if tag == NATIVE_FIND_MEMBER_NOT_FOUND:
+            return None
     if _HAS_TYPE_KERNEL and _native_subtype_active and _native_subtype_resolver is not None:
         try:
             result = _type_kernel.rust_get_protocol_member(
