@@ -2112,7 +2112,14 @@ def _rust_type_vars(tp: Type) -> list[TypeVarLikeType] | None:
     """
     if _HAS_TYPE_KERNEL and _native_typeops_active:
         try:
-            result = _type_kernel.rust_get_type_vars(_serialize_type(tp), False)
+            if _native_typeops_resolver is not None:
+                # Alias-bearing trees expand through the resolver snapshot
+                # (rust_get_type_vars); the plain byte entry defers on them.
+                result = _type_kernel.rust_get_type_vars_live(
+                    _native_typeops_resolver, _serialize_type(tp), False
+                )
+            else:
+                result = _type_kernel.rust_get_type_vars(_serialize_type(tp), False)
         except (AssertionError, NotImplementedError):
             return None
         if result is not None:

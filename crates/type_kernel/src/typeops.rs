@@ -24,6 +24,8 @@ use pyo3::prelude::*;
 use pyo3::types::{PyList, PyType};
 use pyo3::IntoPy;
 
+use crate::aliases::TypeAliasResolver;
+use crate::checkexpr_functions::expanded_alias_target;
 use crate::supported_self_type::supported_self_type_inner;
 use crate::typeinfo::{
     read_bool_attr, read_mro_fullnames, read_str_list_attr, serialize_type_to_bytes,
@@ -1335,9 +1337,9 @@ pub(crate) fn rust_separate_union_literals(t_bytes: &[u8]) -> Option<(Vec<Vec<u8
 /// instance args, callable arg/ret/instance types, tuple partial fallback +
 /// items, typed-dict item values, type_obj item, overload items, union
 /// items, unpacked type, parameter arg types, and placeholder args.
-/// `TypeAliasType` targets would require alias expansion (the `TypeQuery`
-/// default eagerly expands via `get_proper_type`), so any alias defers the
-/// whole call to Python. Non-type-var leaves contribute nothing.
+/// The byte-only entry defers on any `TypeAliasType` (no alias target on
+/// the wire); the resolver-backed `rust_get_type_vars_live` below expands
+/// through the alias snapshot. Non-type-var leaves contribute nothing.
 ///
 /// Returns a list of wire-encoded `Type` blobs, or `None` to defer (decode
 /// failure, or a shape the Rust traversal does not handle).
@@ -1345,7 +1347,38 @@ pub(crate) fn rust_separate_union_literals(t_bytes: &[u8]) -> Option<(Vec<Vec<u8
 pub(crate) fn rust_get_type_vars(t_bytes: &[u8], include_all: bool) -> Option<Vec<Vec<u8>>> {
     let t = decode_type(t_bytes)?;
     let mut out: Vec<Type> = Vec::new();
-    collect_type_vars(&t, include_all, &mut out)?;
+    collect_type_vars(&t, include_all, None, &mut Vec::new(), &mut out)?;
+    let mut blobs = Vec::with_capacity(out.len());
+    for tv in out {
+        blobs.push(encode_type(&tv)?);
+    }
+    Some(blobs)
+}
+
+/// Resolver-backed variant of `rust_get_type_vars`: a `TypeAliasType`
+/// expands through the `NativeTypeResolver` alias snapshot, mirroring
+/// `TypeQuery.visit_type_alias_type` (type_visitor.py:459-467): the
+/// substituted target only (plain `TypeQuery` does NOT additionally visit
+/// `t.args`; that extra visit is the `BoolTypeQuery` variant). A repeated
+/// alias on a descent contributes nothing, matching `seen_aliases`.
+/// Missing snapshot, an alias cycle, or a substitution the kernel cannot
+/// perform exactly defers (`None`) and the Python shim falls back to the
+/// pure-Python `TypeVarExtractor`.
+#[pyfunction]
+pub(crate) fn rust_get_type_vars_live(
+    resolver: &NativeTypeResolver,
+    t_bytes: &[u8],
+    include_all: bool,
+) -> Option<Vec<Vec<u8>>> {
+    let t = decode_type(t_bytes)?;
+    let mut out: Vec<Type> = Vec::new();
+    collect_type_vars(
+        &t,
+        include_all,
+        Some(resolver.alias_resolver()),
+        &mut Vec::new(),
+        &mut out,
+    )?;
     let mut blobs = Vec::with_capacity(out.len());
     for tv in out {
         blobs.push(encode_type(&tv)?);
@@ -2743,9 +2776,21 @@ fn class_callable_item_wire(
     })
 }
 
-/// Return `None` when any shape needs alias expansion or is not handled,
+/// Collect the type variables of `t` into `out` (mirroring
+/// `TypeVarExtractor`, see `rust_get_type_vars` above). With `aliases`
+/// set, a `TypeAliasType` expands through the alias snapshot (the live
+/// seam); `None` defers on any alias (the byte-only seam). `seen` holds
+/// the alias fullnames already visited on this descent, mirroring
+/// `TypeQuery.seen_aliases` (a repeat contributes nothing). Returns
+/// `None` when any shape needs something the Rust path cannot decide,
 /// deferring the entire extraction to the Python `TypeVarExtractor`.
-pub(crate) fn collect_type_vars(t: &Type, include_all: bool, out: &mut Vec<Type>) -> Option<()> {
+pub(crate) fn collect_type_vars(
+    t: &Type,
+    include_all: bool,
+    aliases: Option<&TypeAliasResolver>,
+    seen: &mut Vec<String>,
+    out: &mut Vec<Type>,
+) -> Option<()> {
     match t {
         Type::TypeVarType { .. } => {
             out.push(t.clone());
@@ -2763,52 +2808,75 @@ pub(crate) fn collect_type_vars(t: &Type, include_all: bool, out: &mut Vec<Type>
             }
             Some(())
         }
-        Type::TypeAliasType { .. } => None,
-        Type::Instance { args, .. } => collect_list(args, include_all, out),
+        Type::TypeAliasType { type_ref, .. } => {
+            let aliases = aliases?;
+            if seen.contains(type_ref) {
+                return Some(());
+            }
+            seen.push(type_ref.clone());
+            // Plain TypeQuery visits only the substituted target
+            // (`get_proper_type(t)`), not `t.args`; the args are already
+            // folded into the substituted target.
+            let (target, _args, _py312) = expanded_alias_target(t, aliases)?;
+            collect_type_vars(&target, include_all, Some(aliases), seen, out)
+        }
+        Type::Instance { args, .. } => collect_list(args, include_all, aliases, seen, out),
         // TupleType: skip the partial fallback Instance like Python's copy
         // (typeops.py:1471), so a TypeVarTuple in the items is not
         // double-collected via its synthetic tuple fallback.
-        Type::TupleType { items, .. } => collect_list(items, include_all, out),
+        Type::TupleType { items, .. } => collect_list(items, include_all, aliases, seen, out),
         Type::CallableType {
             arg_types,
             ret_type,
             instance_type,
             ..
         } => {
-            collect_list(arg_types, include_all, out)?;
-            collect(ret_type, include_all, out)?;
+            collect_list(arg_types, include_all, aliases, seen, out)?;
+            collect(ret_type, include_all, aliases, seen, out)?;
             if let Some(it) = instance_type {
                 if it.as_ref() != (ret_type.as_ref()) {
-                    collect(it, include_all, out)?;
+                    collect(it, include_all, aliases, seen, out)?;
                 }
             }
             Some(())
         }
         Type::TypedDictType { items, .. } => {
             for (_, v) in items {
-                collect(v, include_all, out)?;
+                collect(v, include_all, aliases, seen, out)?;
             }
             Some(())
         }
-        Type::TypeType { item, .. } => collect(item, include_all, out),
-        Type::Overloaded { items } => collect_list(items, include_all, out),
-        Type::UnionType { items, .. } => collect_list(items, include_all, out),
-        Type::UnpackType { typ } => collect(typ, include_all, out),
-        Type::Parameters(p) => collect_list(&p.arg_types, include_all, out),
-        Type::UnboundType { args, .. } => collect_list(args, include_all, out),
+        Type::TypeType { item, .. } => collect(item, include_all, aliases, seen, out),
+        Type::Overloaded { items } => collect_list(items, include_all, aliases, seen, out),
+        Type::UnionType { items, .. } => collect_list(items, include_all, aliases, seen, out),
+        Type::UnpackType { typ } => collect(typ, include_all, aliases, seen, out),
+        Type::Parameters(p) => collect_list(&p.arg_types, include_all, aliases, seen, out),
+        Type::UnboundType { args, .. } => collect_list(args, include_all, aliases, seen, out),
         // Leaf types: any, none, uninhabited, deleted, erased, literal,
         // ellipsis, raw expression, partial, has no children.
         _ => Some(()),
     }
 }
 
-fn collect(t: &Type, include_all: bool, out: &mut Vec<Type>) -> Option<()> {
-    collect_type_vars(t, include_all, out)
+fn collect(
+    t: &Type,
+    include_all: bool,
+    aliases: Option<&TypeAliasResolver>,
+    seen: &mut Vec<String>,
+    out: &mut Vec<Type>,
+) -> Option<()> {
+    collect_type_vars(t, include_all, aliases, seen, out)
 }
 
-fn collect_list(ts: &[Type], include_all: bool, out: &mut Vec<Type>) -> Option<()> {
+fn collect_list(
+    ts: &[Type],
+    include_all: bool,
+    aliases: Option<&TypeAliasResolver>,
+    seen: &mut Vec<String>,
+    out: &mut Vec<Type>,
+) -> Option<()> {
     for t in ts {
-        collect_type_vars(t, include_all, out)?;
+        collect_type_vars(t, include_all, aliases, seen, out)?;
     }
     Some(())
 }
@@ -4762,6 +4830,89 @@ mod tests {
         // extraction succeeds at the encode boundary but still defers in
         // the visitor (no resolver to expand through).
         assert!(super::encode_type(&alias).is_some());
+    }
+
+    fn alias_list_target() -> Type {
+        Type::Instance {
+            type_ref: "builtins.list".to_string(),
+            args: vec![tv_type(1, "T")],
+            last_known_value: None,
+            extra_attrs: None,
+        }
+    }
+
+    #[test]
+    fn get_type_vars_live_expands_alias_target() {
+        // Plain TypeQuery visits get_proper_type(t) only: the alias node
+        // contributes its substituted target, not its own args (those are
+        // folded in by the substitution).
+        let mut aliases = crate::aliases::TypeAliasResolver::new();
+        aliases.insert(
+            "mod.Lst".to_string(),
+            alias_snap("mod.Lst", &alias_list_target()),
+        );
+        let t = Type::TypeAliasType {
+            args: vec![],
+            type_ref: "mod.Lst".to_string(),
+        };
+        let mut out = Vec::new();
+        collect_type_vars(&t, false, Some(&aliases), &mut Vec::new(), &mut out).unwrap();
+        assert_eq!(out, vec![tv_type(1, "T")]);
+        // The byte-only entry defers on the same tree.
+        assert!(rust_get_type_vars(&encode(&t), false).is_none());
+    }
+
+    #[test]
+    fn get_type_vars_live_substitutes_alias_args() {
+        // mod.Pair = list[T] with declared tvar T; the alias application
+        // mod.Pair[U] substitutes U for T, so U is collected.
+        let mut aliases = crate::aliases::TypeAliasResolver::new();
+        let mut snap = alias_snap("mod.Pair", &alias_list_target());
+        snap.alias_tvars = vec![crate::aliases::AliasTvar {
+            name: "T".to_string(),
+            raw_id: 1,
+            meta_level: 0,
+            namespace: String::new(),
+            is_type_var_tuple: false,
+        }];
+        aliases.insert("mod.Pair".to_string(), snap);
+        let t = Type::TypeAliasType {
+            args: vec![tv_type(5, "U")],
+            type_ref: "mod.Pair".to_string(),
+        };
+        let mut out = Vec::new();
+        collect_type_vars(&t, false, Some(&aliases), &mut Vec::new(), &mut out).unwrap();
+        assert_eq!(out, vec![tv_type(5, "U")]);
+    }
+
+    #[test]
+    fn get_type_vars_live_seen_alias_contributes_nothing() {
+        // mod.R = union[mod.R, T]: the repeated alias on the descent is
+        // skipped (seen_aliases), mirroring TypeQuery's recursion guard.
+        let mut aliases = crate::aliases::TypeAliasResolver::new();
+        let target = union_of(vec![
+            Type::TypeAliasType {
+                args: vec![],
+                type_ref: "mod.R".to_string(),
+            },
+            tv_type(1, "T"),
+        ]);
+        aliases.insert("mod.R".to_string(), alias_snap("mod.R", &target));
+        let t = Type::TypeAliasType {
+            args: vec![],
+            type_ref: "mod.R".to_string(),
+        };
+        let mut out = Vec::new();
+        collect_type_vars(&t, false, Some(&aliases), &mut Vec::new(), &mut out).unwrap();
+        assert_eq!(out, vec![tv_type(1, "T")]);
+    }
+
+    #[test]
+    fn get_type_vars_live_missing_snapshot_defers() {
+        let aliases = empty_aliases();
+        let t = alias_type("mod.Missing");
+        let mut out = Vec::new();
+        assert!(collect_type_vars(&t, false, Some(&aliases), &mut Vec::new(), &mut out).is_none());
     }
 
     // ------------------------------------------------------------------

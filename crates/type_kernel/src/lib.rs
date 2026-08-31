@@ -359,6 +359,7 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         module
     )?)?;
     module.add_function(wrap_pyfunction!(typeops::rust_get_type_vars, module)?)?;
+    module.add_function(wrap_pyfunction!(typeops::rust_get_type_vars_live, module)?)?;
     module.add_function(wrap_pyfunction!(typeops::rust_erase_to_bound, module)?)?;
     module.add_function(wrap_pyfunction!(typeops::rust_tuple_fallback, module)?)?;
     module.add_function(wrap_pyfunction!(typeops::rust_bind_self, module)?)?;
