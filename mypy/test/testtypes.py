@@ -3149,7 +3149,7 @@ class NativeJoinTypeListSuite(Suite):
             raise RuntimeError("length <= 1 lists must never cross the FFI")
 
         original = _type_kernel.rust_join_type_list
-        _type_kernel.rust_join_type_list = forbid
+        _type_kernel.rust_join_type_list = forbid  # type: ignore[assignment]
         try:
             empty = join_type_list([])
             assert isinstance(get_proper_type(empty), UninhabitedType)
@@ -28903,7 +28903,7 @@ class NativeCallableUnifyPreludeSuite(Suite):
                     fn = cast(Callable[..., object], orig)
                     return fn(*args, **kwargs)
 
-                tk_mod.rust_callables_compatible = counting
+                tk_mod.rust_callables_compatible = counting  # type: ignore[assignment]
                 try:
                     yield calls
                 finally:
