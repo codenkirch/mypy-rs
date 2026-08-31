@@ -628,7 +628,10 @@ def expand_type_by_instance(typ: Type, instance: Instance) -> Type:
                         resync_var_identities,
                     )
 
-                    fixed = fixup_wire_type(decoded)
+                    # resolve_aliases=True re-links wire-decoded
+                    # TypeAliasType nodes to live TypeAlias nodes (#1224
+                    # pattern); a missing map entry defers via fixer.missing.
+                    fixed = fixup_wire_type(decoded, resolve_aliases=True)
                     # The wire round-trip splits fresh meta-var occurrences
                     # into distinct objects: re-unify them so a downstream
                     # in-place freeze touches every occurrence (pre-stamping).
