@@ -1,22 +1,22 @@
 # Handoff: strangler-fig Rust migration loop (seam-deferral reduction)
 
-*Written 2026-08-28, refreshed 2026-08-31 (post-wave14, #1294 + #1299 +
-#1302 + #1301 merged; #1291-#1293 in the same window). Goal:
+*Written 2026-08-28, refreshed 2026-08-31 (post-wave16, #1306 + #1307
+merged; wave15 #1303 merged, #1276 negative-closed). Goal:
 "migrate all python code to rust, really all", pursued as the
 established measure -> file -> dispatch-agents -> process-PRs -> gate
 loop. This file is the resume point.*
 
 ## Where main stands
 
-- `main` = `46237517c` (`perf(type_kernel): decided-None literal seam +
-  live untyped-decorator walk (#1301)`), local ff'd to origin.
-- Gates on clean main: shared-`.so` testtypes parity 2970 passed /
+- `main` = `9d181f2bf` (`perf(type_kernel): port alias defers in
+  ewb/cma/meet-overlap seams (#1304)`), local ff'd to origin.
+- Gates on clean main: shared-`.so` testtypes parity 2986 passed /
   3 skipped; `cargo fmt` clean for `type_kernel` (NOTE: `ast_serialize`
   has 2 pre-existing fmt diffs on main; the gate only checks
   `type_kernel`, do not reformat ast_serialize opportunistically).
 - Self-check baseline: `UpdateDataSuite::test_update_data` FAILS on
   clean main too; tracked as #1300 (noticed during #1302, not fixed).
-- Shared `.so` set rebuilt + codesigned at `46237517c` content
+- Shared `.so` set rebuilt + codesigned at `9d181f2bf` content
   (`/private/tmp/mypy-rs-local-typekernel|resolver|ast`). Rebuild
   before the next survey (procedure under "The loop").
 - Env-gate semantics settled (#1285 + #1287/#1294): missing extensions
@@ -28,65 +28,68 @@ loop. This file is the resume point.*
   json --audience agent`) and merge `--squash --admin` after pr-gate +
   parity are green.
 
-## Merged since the survey13 refresh
+## Merged since the survey15 refresh (waves 15 + 16)
 
 | PR | Issue | What | Numbers |
 |----|-------|------|---------|
-| #1291 | #1285 | fail loudly when env gates request a missing extension | correctness guard |
-| #1292 | (perf) | alias round-trip in `rust_expand_type_by_instance` | 55% -> 99% native |
-| #1293 | (perf) | MA var hook gate consults the live plugin chain | correctness guard |
-| #1294 | #1287 | decode `TEST_NATIVE_*` so `0` forces Python fallback | gate-off differential now real |
-| #1299 | #1288 | property callable bind + var self-type expansion | `rust_analyze_member_access` 97% -> 98% |
-| #1302 | #1297 | generic bind_self + free map expand in typeobj seam | `type_object_type_from_function` 84% -> 97%, `builtin_item_type` 84% -> 99% |
-| #1301 | #1295, #1296 | decided-None literal seam + live untyped-decorator walk | `simple_literal_type` 0% -> 100%; `check_for_untyped_decorator` 64% -> 86%; `is_untyped_decorator` 220 @ 15% -> 75 calls (residual defers are the #942 seam's own tail) |
+| #1303 | #1298 | alias defers in rmv/ivit/use-meet seams + erasetype flag-rebind bug fix | rmv 662 -> 0, ivit 790 -> 0, use-meet 297 -> 0 |
+| #1306 | #1298 | ct alias fronts (cur-alias, tgt0-alias, prop-alias, restrict-subtype-away) + ndt ri-decl/msu-narrow2 | ~440 events closed; ct 96% -> 98%, ndt 98% -> 98% (residuals re-tabled on #1298) |
+| #1307 | #1304 | ewb alias-args + alias-Vars; cma alias ret-type; iot Callable-vs-Callable overlap arm | ewb ~270 closed, cma 313-defer wall closed, iot ~120 closed |
 
-Discovered during the wave, not yet fixed:
+Closed in the same window: #1276 not-planned (audit comment with bucket
+table; no portable bucket >= 15%), #1304 closed with residual note,
+#1288/#1289 closed as superseded (survey17 numbers show their targets
+collapsed across later waves).
+
+Discovered during the waves, not yet fixed:
 
 - #1300 (filed): `UpdateDataSuite::test_update_data` self-check failure,
   pre-existing on main.
 - #1280 (filed): disc-4 AnyType-reconstruction helper duplicated across
   setops/condmaps/checker_helpers/checkexpr (cleanup PR, not a port).
-- #1298 (filed): setops hot set ~3,300 fallbacks (is_valid_inferred_type
-  717 @ 96%, check_overload_call 656 @ 95%, replace_meta_vars 643 @ 97%,
-  narrow_declared_type 582 @ 98%, conditional_types 384 @ 96%,
-  and_conditional_maps 325 @ 96%), held for wave15.
-- join_type_list round 3 walls remain at 74 @ 28% (#1281 filed).
+- #1298 (open): remaining setops residuals (ct sub-concrete/sub-structural
+  need a subtype-callback channel, same wall as #1260; ndt
+  ovl-disjoint/ovl-pair need Python overload context; oc buckets all
+  SKIP by prior decision).
+- #1281 (open): join_type_list round 3 (74 @ 28%).
 
-## Residual ranking (survey15, post-wave14, `/tmp/survey15.txt`)
+## Residual ranking (survey17, post-wave16, `/tmp/survey17.txt`)
 
-Total 5,148,842 seam calls. By absolute fallbacks (calls x (1 - native%)):
+Total 5,155,526 seam calls. By absolute fallbacks (calls x (1 - native%)):
 
-- is_subtype 29,408 @ 95% (~1,470; #1276 filed, largest bucket)
-- expand_without_binding 11,255 @ 97% (~338)
-- classify_missing_annotations 15,260 @ 98% (~305)
-- make_simplified_union 29,435 @ 99% (~294)
-- is_overlapping_types 2,836 @ 90% (~284)
-- solve_generic_call 8,197 @ 97% (~246)
-- infer_function_type_arguments 522 @ 55% (~235)
-- analyze_instance_member_access 335 @ 34% (~221)
+- is_subtype 29,363 @ 95% (~1,468; #1276 closed not-planned, blocked on
+  #1184 unify_generic_callable; do not reopen)
+- check_overload_call 13,198 @ 95% (~659; oc buckets all SKIP by prior
+  decision on #1298)
+- narrow_declared_type 28,949 @ 98% (~578; residual walls documented on
+  #1298: overload context + live objects)
+- find_self_type 35,462 @ 99% (~354; was 100% after #1114, possible
+  regression -> #1308 wave17 audit)
+- make_simplified_union 29,000 @ 99% (~290; intentional decode/fixup
+  defers, closed with #1304)
+- is_overlapping_types 2,263 @ 88% (~271; residual ~120 small shapes
+  after #1307)
+- solve_generic_call 8,204 @ 97% (~246; #826 residual)
+- analyze_member_access 12,040 @ 98% (~240; #1288 closed as superseded)
+- infer_function_type_arguments 522 @ 55% (~234; #1308 wave17)
+- expand_and_bind_callable 5,562 @ 96% (~222; ParamSpec/Unpack walls)
+- analyze_instance_member_access 335 @ 34% (~221; #1309 wave17)
 - map_instance_to_supertype 5,521 @ 96% (~221)
-- append_invariance_notes 201 @ 15% (~171)
-- get_type_vars 1,876 @ 91% (~169)
-- is_typeddict_type_context 257 @ 56% (~113)
-- join_types 539 @ 79% (~113)
-- map_type_from_supertype 129 @ 6% (~121; call count collapsed from
-  302 post-#1302, re-audit before chasing)
-- add_class_tvars 1,265 @ 93% (~89); get_protocol_member 487 @ 81%
-  (~93); freshen_all_functions_type_vars 808 @ 92% (~65);
-  find_type_overlaps 74 @ 65%; analyze_member_method 48 @ 6%;
-  is_equality_ambiguous_for_narrowing 53 @ 15%.
-- Setops cluster (#1298, wave15 primary):
-  is_valid_inferred_type 718, check_overload_call 657,
-  replace_meta_vars 644, narrow_declared_type 583, conditional_types
-  385, and_conditional_maps 326 (~3,300 absolute fallbacks).
-- find_self_type dropped off the ranking (99%+ of 35,446; wall already
-  ported); w14 wins confirmed: simple_literal_type 239 @ 100%,
-  type_object_type_from_function 1,800 @ 97%, builtin_item_type
-  1,400 @ 99%, check_for_untyped_decorator 522 @ 86%.
+- infer_constraints_full 21,459 @ 99% (~214)
+- join_instances 316 @ 36% (~202; #1281-adjacent)
+- conditional_types 8,959 @ 98% (~179; subtype-callback wall on #1298)
+- remove_redundant_union_items 5,831 @ 97% (~174)
+- get_type_vars 1,894 @ 91% (~170)
+- append_invariance_notes 201 @ 15% (~170; #1308 wave17 territory)
+- has_any_from_unimported_type 7,838 @ 98% (~156)
+- map_type_from_supertype 129 @ 6% (~121; #1309 wave17)
+- is_typeddict_type_context 257 @ 56% (~113; #1309 wave17)
+- get_protocol_member 487 @ 81% (~93); add_class_tvars 1,265 @ 93%
+  (~89); join_types 539 @ 79% (~113).
 - Survey caveats: `is_subtype_batch` 213% and `rust_type_analyze` lines
   are kernel-boundary counting artifacts; discount when ranking;
-  `analyze_instance_member_dispatch` 451 "fallbacks" are decided
-  negatives (0% defer), skip them.
+  `analyze_instance_member_dispatch` "0% defer" negatives are not
+  fallbacks.
 
 ## Older session record
 
@@ -126,24 +129,25 @@ Closed not-planned with evidence (negative results, the loop working):
 
 ## Open backlog (next waves; dispatch max ~2 port agents)
 
-1. **#1298 (filed, wave15 primary)**: setops hot set ~3,300 fallbacks
-   (numbers above). Agent briefing: audit-first, one seam at a time,
-   the #1091/#1109/#1113 precedent.
-2. **#1276 (filed)**: is_subtype protoR residual (~1,475 @ 95%),
-   get_protocol_member_inner deferrals dominate. Largest bucket.
+1. **#1308 (in flight, wave17 A)**: find_self_type regression audit +
+   infer_function_type_arguments residual (agent-86, worktree
+   `wave17-1308`).
+2. **#1309 (in flight, wave17 B)**: low-share bundle ama /
+   is_typeddict_type_context / map_type_from_supertype (agent-87,
+   worktree `wave17-1309`).
 3. **#1115**: build-side decode lifecycle; bigger slice crossing
    semanal/worker build paths; needs careful daemon/cache parity
    assessment.
 4. **#342**: analyze_class_attribute_access mega-port (owns the
    member_access CallableType/Overloaded tail; audit-first).
 5. **#1280**: disc-4 helper convergence (cleanup PR, not a port).
-6. **#1281**: join_type_list round 3 (74 @ 28%).
-7. Next-wave queue (file issues with fresh survey15 numbers, then
-   dispatch ~2): expand_without_binding ~340, classify_missing_annotations
-   ~304, make_simplified_union ~294, map_type_from_supertype 302 @ 43%,
-   is_overlapping_types ~283, is_typeddict_type_context 257 @ 56%,
-   solve_generic_call ~245, infer_function_type_arguments ~234,
-   analyze_instance_member_access ~221, append_invariance_notes ~170.
+6. **#1281**: join_type_list round 3 (74 @ 28%); join_instances 316 @
+   36% is adjacent.
+7. Next-wave queue (file issues with fresh survey17 numbers, then
+   dispatch ~2): solve_generic_call ~246, expand_and_bind_callable
+   ~222, map_instance_to_supertype ~221, remove_redundant_union_items
+   ~174, get_type_vars ~170, has_any_from_unimported_type ~156,
+   get_protocol_member ~93, add_class_tvars ~89.
 
 ## The loop (how to continue)
 
