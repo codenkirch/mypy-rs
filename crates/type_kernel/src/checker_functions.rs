@@ -2396,7 +2396,8 @@ const TYPE_TAG_OTHER: i64 = 2;
 /// Returns `(tag, param_fail)`: `tag` selects the untyped-def /
 /// return-site failure, `param_fail` is the independent
 /// PARAM_TYPE_EXPECTED site. `None` defers to the pure-Python body
-/// (alias ret type, decode failure, or an undecided generator unwrap).
+/// (unresolvable alias ret type, decode failure, or an undecided
+/// generator unwrap).
 #[allow(clippy::too_many_arguments)]
 fn classify_missing_annotations(
     is_typeshed_stub: bool,
@@ -2505,8 +2506,9 @@ fn classify_missing_annotations(
 /// the Python shim applies the fail/note side effects (the RETURN_UNTYPED
 /// note decision routes through the existing `rust_has_return_statement`
 /// seam) and keeps the pure-Python body as the fallback. Defers (`None`)
-/// on an undecodable blob, a `TypeAliasType` ret type, or an undecided
-/// generator unwrap.
+/// on an undecodable blob, an unresolvable `TypeAliasType` ret type
+/// (missing snapshot, undecodable target, or cyclic chain), or an
+/// undecided generator unwrap.
 #[pyfunction]
 #[pyo3(signature = (is_typeshed_stub, warn_incomplete_stub, disallow_untyped_defs, disallow_incomplete_defs, type_tag, arguments_len, arg_names, is_generator, is_coroutine, ret_type_bytes, arg_type_blobs, strict_optional, resolver))]
 #[allow(clippy::too_many_arguments)]
