@@ -4756,12 +4756,7 @@ fn via_supertype_arg_type(
 ) -> Option<Type> {
     let t_inst = mk_wire_instance(t_ref, t_args.to_vec());
     let s_inst = mk_wire_instance(s_ref, s_args.to_vec());
-    let t_snap = match resolver.get(t_ref) {
-        Some(snap) => snap,
-        None => {
-            return None;
-        }
-    };
+    let t_snap = resolver.get(t_ref)?;
     let s_snap = resolver.get(s_ref);
 
     // join.py:352-361: _promote walks. First loop returns s (t wins the
@@ -4852,10 +4847,7 @@ fn join_and_consider(
     let mark = seen.len();
     let res = join_instances_core(candidate, s_inst, ctx, resolver, seen);
     seen.truncate(mark);
-    match res {
-        Some(r) => consider(candidate, r),
-        None => None,
-    }
+    res.and_then(|r| consider(candidate, r))
 }
 
 /// MRO length for `is_better` (join.py:804+). Returns 0 if the
@@ -9789,6 +9781,65 @@ mod tests {
             join_instances_core(&t, &s, &ctx(true), &r, &mut seen),
             Some(SetOpResult::SameS)
         );
+    }
+
+    #[test]
+    fn via_supertype_subjoin_sametypewithargs_result_is_considered() {
+        // Regression for #1314: the old consider whitelist dropped a
+        // SameTypeWithArgs sub-join (the join.py:283-295 Any-arg arm,
+        // disc 4); it must be considered and materialize instead.
+        let generic = |s: &mut TypeInfoSnapshot| {
+            s.type_vars_with_variance = vec![("T".to_string(), 0, 0)];
+            s.type_var_upper_bounds =
+                vec![encode_type(&instance("builtins.object", vec![])).unwrap()];
+        };
+        let mut b = snap("a.B", "B");
+        generic(&mut b);
+        let mut t = snap("a.T", "T");
+        generic(&mut t);
+        t.bases = vec![encode_type(&instance(
+            "a.B",
+            vec![type_var(1, "a.T", instance("builtins.object", vec![]))],
+        ))
+        .unwrap()];
+        t.mro = vec![
+            "a.T".to_string(),
+            "a.B".to_string(),
+            "builtins.object".to_string(),
+        ];
+        t.has_base = ["a.T", "a.B", "builtins.object"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        let obj = snap("builtins.object", "object");
+        let r = make_resolver(vec![obj, b, t]);
+        let any = Type::AnyType {
+            type_of_any: TYPE_OF_ANY_SPECIAL_FORM,
+            source_any: None,
+            missing_import_name: None,
+        };
+        let join_t = instance("a.T", vec![instance("builtins.int", vec![])]);
+        let s = instance("a.B", vec![any.clone()]);
+        let mut seen: SeenInstances = Vec::new();
+        let result = join_instances_core(&join_t, &s, &ctx(true), &r, &mut seen);
+        let Some(SetOpResult::Encoded(bytes)) = result else {
+            panic!("expected Encoded, got {result:?}");
+        };
+        // The encoded result is Instance(a.B, [Any(from_another_any,
+        // source=the original special-form Any)]), neither operand.
+        let mut rbuf = ReadBuffer::new(&bytes);
+        let decoded = wire::read_type(&mut rbuf, None).expect("decode failed");
+        let expected = Type::Instance {
+            type_ref: "a.B".to_string(),
+            args: vec![Type::AnyType {
+                type_of_any: TYPE_OF_ANY_FROM_ANOTHER_ANY,
+                source_any: Some(Box::new(any)),
+                missing_import_name: None,
+            }],
+            last_known_value: None,
+            extra_attrs: None,
+        };
+        assert_eq!(decoded, expected);
     }
 
     fn encode_type(typ: &Type) -> Option<Vec<u8>> {
