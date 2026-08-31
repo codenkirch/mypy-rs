@@ -103,6 +103,7 @@ pub(crate) fn overload_can_never_match_inner(
         false, // strict_concatenate
         true,  // ignore_return
         false, // check_args_covariantly
+        false, // allow_partial_overlap
         res,
     )
 }
@@ -147,6 +148,7 @@ pub(crate) fn rust_is_more_general_arg_prefix(
         false, // strict_concatenate
         true,  // ignore_return
         false, // check_args_covariantly
+        false, // allow_partial_overlap
         res,
     )
 }
@@ -171,6 +173,7 @@ pub(crate) fn rust_is_same_arg_prefix(
         false, // strict_concatenate
         true,  // ignore_return
         true,  // check_args_covariantly
+        false, // allow_partial_overlap
         res,
     )
 }

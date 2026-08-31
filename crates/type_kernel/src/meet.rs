@@ -516,8 +516,59 @@ fn overlap_impl(
         return Some(false);
     }
     if let (Type::CallableType { .. }, Type::CallableType { .. }) = (&left, &right) {
-        // is_callable_compatible (bidirectional) not ported -> defer.
-        return None;
+        // is_callable_compatible both directions (meet.py:730-745), through
+        // the shared engine with is_compat = overlap. Python's normalizations
+        // (with_unpacked_kwargs, generic-left unify) defer (subtypes.py:2479).
+        if crate::callable_compat::any_unpack_anywhere(&left)
+            || crate::callable_compat::any_unpack_anywhere(&right)
+        {
+            return None;
+        }
+        let has_variables =
+            |t: &Type| matches!(t, Type::CallableType { variables, .. } if !variables.is_empty());
+        if has_variables(&left) || has_variables(&right) {
+            return None;
+        }
+        let is_compat = |l: &Type, r: &Type| {
+            overlap_impl(
+                l,
+                r,
+                strict_optional,
+                ignore_promotions,
+                overlap_for_overloads,
+                res,
+                aliases,
+                depth + 1,
+            )
+        };
+        match crate::callable_compat::is_callable_compatible(
+            &left,
+            &right,
+            &is_compat,
+            false, // is_proper_subtype
+            !overlap_for_overloads,
+            false, // strict_concatenate
+            false, // ignore_return
+            false, // check_args_covariantly
+            true,  // allow_partial_overlap
+            res,
+        ) {
+            Some(true) => return Some(true),
+            Some(false) => {}
+            None => return None,
+        }
+        return crate::callable_compat::is_callable_compatible(
+            &right,
+            &left,
+            &is_compat,
+            false, // is_proper_subtype
+            !overlap_for_overloads,
+            false, // strict_concatenate
+            false, // ignore_return
+            true,  // check_args_covariantly
+            true,  // allow_partial_overlap
+            res,
+        );
     }
     if matches!(left, Type::CallableType { .. }) && matches!(right, Type::Instance { .. })
         || matches!(right, Type::CallableType { .. }) && matches!(left, Type::Instance { .. })

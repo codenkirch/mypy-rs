@@ -15076,6 +15076,62 @@ class NativeMeetDeferralSuite(Suite):
         assert r is not None, "rust_is_overlapping_types deferred on an Erased operand"
         self.assertTrue(r)
 
+    # -- CallableType vs CallableType arm (wave16: lifted defer) --
+
+    def _cc(self, l_args: list[Type], r_args: list[Type]) -> tuple[Type, Type]:
+        def mk(args: list[Type], star: bool) -> CallableType:
+            kinds = [ARG_STAR] if star else [ARG_POS] * len(args)
+            names = [None] if star else ["x"] * len(args)
+            return CallableType(args, kinds, names, self.fx.nonet, self.fx.function, name="f")
+
+        return mk(l_args, False), mk(r_args, False)
+
+    def test_overlap_callable_pairs_parity(self) -> None:
+        # Plain callables: gate-on decides through the ported arm, gate-off is
+        # the Python reference. (int vs str pos args are disjoint; required
+        # vs optional/vararg arg partial-overlaps.)
+        f_int, f_str = self._cc([self.fx.a], [self.fx.d])
+        left_star = CallableType(
+            [self.fx.a], [ARG_STAR], [None], self.fx.nonet, self.fx.function, name="sl"
+        )
+        right_req = CallableType(
+            [self.fx.a], [ARG_POS], ["x"], self.fx.nonet, self.fx.function, name="rr"
+        )
+        for pair in (f_int, f_str), (left_star, right_req), (right_req, left_star):
+            off = self._overlap(False, *pair)
+            on = self._overlap(True, *pair)
+            self.assertEqual(on, off, f"parity for {pair[0]} vs {pair[1]}")
+
+    def test_overlap_callable_decisions(self) -> None:
+        f_int, f_str = self._cc([self.fx.a], [self.fx.d])
+        self.assertFalse(self._overlap(True, f_int, f_str))
+        left_star = CallableType(
+            [self.fx.a], [ARG_STAR], [None], self.fx.nonet, self.fx.function, name="sl"
+        )
+        right_req = CallableType(
+            [self.fx.a], [ARG_POS], ["x"], self.fx.nonet, self.fx.function, name="rr"
+        )
+        # Any call that satisfies the required single arg also satisfies
+        # the vararg (and vice versa for callables it is assignable to),
+        # so the pair overlaps in both directions.
+        self.assertTrue(self._overlap(True, left_star, right_req))
+        self.assertTrue(self._overlap(True, right_req, left_star))
+
+    def test_overlap_callable_seam_engages(self) -> None:
+        from mypy.join import _serialize_type
+
+        f_int, f_str = self._cc([self.fx.a], [self.fx.d])
+        r = _type_kernel.rust_is_overlapping_types(
+            _serialize_type(f_int),
+            _serialize_type(f_str),
+            False,
+            False,
+            True,
+            self.resolver,
+        )
+        assert r is not None, "seam deferred on a plain callable pair"
+        self.assertFalse(r)
+
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeMeetUnboundSuite(Suite):
@@ -19250,6 +19306,107 @@ class NativeCheckMemberSuite(Suite):
         assert decoded.arg_types == [self.fx.a]
         assert decoded.is_bound
         assert decoded.ret_type == self.fx.ga
+
+    def test_expand_without_binding_alias_survives(self) -> None:
+        # Wave16: an alias-carrying method signature no longer defers. The
+        # alias arg survives expansion (fixup relinks it through the wire
+        # alias map), so gate-on must match gate-off.
+        import contextlib
+        from types import SimpleNamespace
+
+        from mypy.checkmember import (
+            MemberContext,
+            _deserialize_type_for_checkmember,
+            expand_without_binding,
+        )
+        from mypy.nodes import TypeAlias
+        from mypy.wirefixup import set_wire_alias_map
+
+        alias = TypeAlias(self.fx.a, "mod.WA", "mod", -1, -1)
+        infos = [self.fx.oi, self.fx.ai, self.fx.bi, self.fx.gi, self.fx.functioni]
+        resolver = self._tk.build_native_resolver(infos, [alias])
+        var = Var("m")
+        var.info = self.fx.gi
+        # Method type of G with a G[T] parameter (T bound to the class
+        # namespace like a real method): expansion substitutes the
+        # receiver's arg (the alias) into the parameter type.
+        ns_t = self.fx.gi.defn.type_vars[0]
+        typ = CallableType(
+            arg_types=[Instance(self.fx.gi, [ns_t])],
+            arg_kinds=[ARG_POS],
+            arg_names=["self"],
+            ret_type=Instance(self.fx.gi, [ns_t]),
+            fallback=self.fx.function,
+        )
+        itype = Instance(self.fx.gi, [TypeAliasType(alias, [])])
+        original_itype = Instance(self.fx.gi, [self.fx.a])
+        mx = MemberContext(
+            is_lvalue=False,
+            is_super=False,
+            is_operator=False,
+            original_type=typ,
+            context=NameExpr("x"),
+            chk=cast(
+                Any,
+                SimpleNamespace(
+                    msg=SimpleNamespace(
+                        fail=lambda *a: None,
+                        note=lambda *a: None,
+                        filter_errors=lambda *a, **kw: contextlib.nullcontext(),
+                        disable_type_names=lambda: contextlib.nullcontext(),
+                    )
+                ),
+            ),
+            self_type=None,
+        )
+
+        def run() -> str:
+            got = expand_without_binding(typ, var, itype, original_itype, mx)
+            return str(getattr(got, "arg_types", [None])[0])
+
+        set_wire_alias_map({alias.fullname: alias})
+        self._set_resolver(resolver)
+        try:
+            results = {}
+            for active in (False, True):
+                self._set_active(active)
+                try:
+                    results[active] = run()
+                finally:
+                    self._set_active(True)
+        finally:
+            set_wire_alias_map(None)
+            self._set_resolver(self.resolver)
+        assert_equal(results[True], results[False], "alias-carrying expansion parity")
+        assert results[False] == "G[A]", results[False]
+
+        # Direct seam: decide on the alias input instead of deferring.
+        from mypy.checkmember import _serialize_type_for_checkmember
+        from mypy.expandtype import expand_type_by_instance
+
+        self._set_resolver(resolver)
+        set_wire_alias_map({alias.fullname: alias})
+        try:
+            seam = self._tk.rust_expand_without_binding(
+                _serialize_type_for_checkmember(typ),
+                _serialize_type_for_checkmember(itype),
+                False,
+                False,
+                TypeVarId.next_raw_id,
+                state.strict_optional,
+                resolver,
+            )
+            assert seam is not None, "seam deferred on an alias-carrying signature"
+            _, _, wire_bytes = seam
+            decoded = _deserialize_type_for_checkmember(bytes(wire_bytes), freeze=True)
+            assert decoded is not None
+            expected = expand_type_by_instance(typ, itype)
+            assert isinstance(decoded, CallableType)
+            assert isinstance(expected, CallableType)
+            assert str(decoded.arg_types[0]) == str(expected.arg_types[0])
+        finally:
+            set_wire_alias_map(None)
+            self._set_resolver(self.resolver)
 
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
@@ -40327,7 +40484,11 @@ class NativeMissingAnnotationsSuite(Suite):
             self.coroi,
         ]
         set_wire_typeinfo_map({info.fullname: info for info in types_to_resolve})
-        self.resolver = _type_kernel.build_native_resolver(types_to_resolve, [])
+        # Registered under a fullname distinct from the ghost "mod.A" used by
+        # test_seam_defers_on_ghost_alias_return; the alias-return expansion
+        # round (wave16) needs it in the snapshot.
+        self.ret_alias = TypeAlias(self.fx.a, "mod.RA", "mod", -1, -1)
+        self.resolver = _type_kernel.build_native_resolver(types_to_resolve, [self.ret_alias])
         self._set_active = _set_native_checker_active
         self._set_resolver = _set_native_checker_resolver
         self._set_active(True)
@@ -40512,7 +40673,7 @@ class NativeMissingAnnotationsSuite(Suite):
         res = self._seam(fdef)
         assert res == (3, False)
 
-    def test_seam_defers_on_alias_return(self) -> None:
+    def test_seam_defers_on_ghost_alias_return(self) -> None:
         # TypeAliasType has no resolved alias target on the wire, so the
         # classifier defers and the Python body handles the type.
         from mypy.nodes import TypeAlias
@@ -40521,6 +40682,79 @@ class NativeMissingAnnotationsSuite(Suite):
         fdef = self._fdef(self._callable(TypeAliasType(alias, []), []), ())
         res = self._seam(fdef)
         assert res is None
+
+    # -- alias-expansion round (wave16: the alias-return defer was lifted) --
+
+    def test_seam_alias_return_expands(self) -> None:
+        # A resolvable alias return expands instead of deferring: the ret
+        # type is "annotated" (a plain Instance) after expansion.
+        from mypy.nodes import TypeAlias
+
+        alias = TypeAlias(self.fx.a, "mod.RA", "mod", -1, -1)
+        fdef = self._fdef(self._callable(TypeAliasType(alias, []), []), ())
+        res = self._seam_alias(fdef, alias)
+        assert res == (0, False)
+
+    def test_seam_alias_return_unannotated_args(self) -> None:
+        # Expansion decides the ret site, so only the param fail bit fires.
+        from mypy.nodes import TypeAlias
+
+        alias = TypeAlias(self.fx.a, "mod.RA", "mod", -1, -1)
+        fdef = self._fdef(
+            self._callable(TypeAliasType(alias, []), [AnyType(TypeOfAny.unannotated)]),
+            ("x",),
+        )
+        res = self._seam_alias(fdef, alias)
+        assert res == (0, True)
+
+    def test_alias_return_parity(self) -> None:
+        # Gate-off expands the alias through get_proper_type; gate-on now
+        # expands inside the seam. Both must produce the same messages.
+        from mypy.nodes import TypeAlias
+
+        alias = TypeAlias(self.fx.a, "mod.RA", "mod", -1, -1)
+        fdef = self._fdef(
+            self._callable(TypeAliasType(alias, []), [AnyType(TypeOfAny.unannotated)]),
+            ("x",),
+        )
+        self._assert_par(
+            fdef,
+            ["Function is missing a type annotation for one or more parameters"],
+            [],
+            disallow_untyped_defs=True,
+            disallow_incomplete_defs=True,
+        )
+        fdef2 = self._fdef(self._callable(TypeAliasType(alias, []), []), ())
+        self._assert_par(fdef2, [], [])
+
+    def _seam_alias(self, fdef: FuncItem, alias: Any) -> Any:
+        # Same as _seam but with a resolver snapshot that can expand the
+        # alias (the suite resolver is built without one).
+        from mypy.checker import _serialize_type_for_checker
+
+        resolver = _type_kernel.build_native_resolver(
+            [self.fx.ai, self.fx.bi, self.fx.oi, self.fx.str_type_info],
+            [alias],
+        )
+        type_tag = 1
+        assert isinstance(fdef.type, CallableType)
+        ret_bytes = _serialize_type_for_checker(fdef.type.ret_type)
+        arg_blobs = [_serialize_type_for_checker(t) for t in fdef.type.arg_types]
+        return _type_kernel.rust_classify_missing_annotations(
+            False,
+            False,
+            True,
+            False,
+            type_tag,
+            len(fdef.arguments),
+            list(fdef.arg_names),
+            bool(fdef.is_generator),
+            bool(fdef.is_coroutine),
+            ret_bytes,
+            arg_blobs,
+            state.strict_optional,
+            resolver,
+        )
 
     # -- gate-off vs gate-on differentials --
 

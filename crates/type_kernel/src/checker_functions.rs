@@ -2396,7 +2396,8 @@ const TYPE_TAG_OTHER: i64 = 2;
 /// Returns `(tag, param_fail)`: `tag` selects the untyped-def /
 /// return-site failure, `param_fail` is the independent
 /// PARAM_TYPE_EXPECTED site. `None` defers to the pure-Python body
-/// (alias ret type, decode failure, or an undecided generator unwrap).
+/// (unresolvable alias ret type, decode failure, or an undecided
+/// generator unwrap).
 #[allow(clippy::too_many_arguments)]
 fn classify_missing_annotations(
     is_typeshed_stub: bool,
@@ -2412,6 +2413,7 @@ fn classify_missing_annotations(
     arg_types: &[Type],
     strict_optional: bool,
     res: &TypeResolver,
+    alias: &crate::aliases::TypeAliasResolver,
 ) -> Option<(i64, bool)> {
     // show_untyped = not is_typeshed_stub or warn_incomplete_stub.
     if is_typeshed_stub && !warn_incomplete_stub {
@@ -2451,12 +2453,18 @@ fn classify_missing_annotations(
         ));
     }
     if type_tag == TYPE_TAG_CALLABLE {
-        let ret = ret_type?;
-        // get_proper_type(fdef.type.ret_type): an alias expands on the
-        // Python side (the wire carries no alias target), so defer.
-        if matches!(ret, Type::TypeAliasType { .. }) {
-            return None;
-        }
+        let ret_raw = ret_type?;
+        // get_proper_type(fdef.type.ret_type): an alias expands through the
+        // alias snapshot (defers on a missing snapshot or cycle, same as the
+        // Python `get_proper_type` cannot terminate a cyclic chain here).
+        let ret_owned;
+        let ret: &Type = match ret_raw {
+            Type::TypeAliasType { .. } => {
+                ret_owned = crate::checkexpr_functions::get_proper_or_expand(ret_raw, alias)?;
+                &ret_owned
+            }
+            _ => ret_raw,
+        };
         let ret_fail = if crate::visitor::is_unannotated_any_inner(ret) {
             true
         } else if is_generator {
@@ -2498,8 +2506,9 @@ fn classify_missing_annotations(
 /// the Python shim applies the fail/note side effects (the RETURN_UNTYPED
 /// note decision routes through the existing `rust_has_return_statement`
 /// seam) and keeps the pure-Python body as the fallback. Defers (`None`)
-/// on an undecodable blob, a `TypeAliasType` ret type, or an undecided
-/// generator unwrap.
+/// on an undecodable blob, an unresolvable `TypeAliasType` ret type
+/// (missing snapshot, undecodable target, or cyclic chain), or an
+/// undecided generator unwrap.
 #[pyfunction]
 #[pyo3(signature = (is_typeshed_stub, warn_incomplete_stub, disallow_untyped_defs, disallow_incomplete_defs, type_tag, arguments_len, arg_names, is_generator, is_coroutine, ret_type_bytes, arg_type_blobs, strict_optional, resolver))]
 #[allow(clippy::too_many_arguments)]
@@ -2547,6 +2556,7 @@ pub(crate) fn rust_classify_missing_annotations(
         &arg_types,
         strict_optional,
         resolver.resolver(),
+        resolver.alias_resolver(),
     ))
 }
 
@@ -2720,6 +2730,7 @@ mod missing_annotations_tests {
         args: Vec<Type>,
     ) -> Option<(i64, bool)> {
         let res = make_resolver(vec![generator_snap(), instance_snap()]);
+        let alias = crate::aliases::TypeAliasResolver::new();
         classify_missing_annotations(
             is_typeshed_stub,
             warn_incomplete_stub,
@@ -2734,6 +2745,7 @@ mod missing_annotations_tests {
             &args,
             true,
             &res,
+            &alias,
         )
     }
 

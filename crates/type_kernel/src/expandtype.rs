@@ -324,6 +324,21 @@ pub(crate) fn expand_type_by_instance_relink(
     expand_type_by_instance_inner(typ, instance, resolver, strict_optional, false, true, true)
 }
 
+/// Core semantics (full binding, no leftover TypeVars) with alias
+/// passthrough, mirroring Python's `expand_type_by_instance`
+/// (`visit_type_alias_type` expands alias args and keeps the node). For
+/// callers running behind `fixup_wire_type(resolve_aliases=True)` (#1224):
+/// the decoded result's surviving alias nodes are re-linked to their live
+/// `TypeAlias` by the shim; an alias absent from the map defers there.
+pub(crate) fn expand_type_by_instance_core_alias(
+    typ: &Type,
+    instance: &Type,
+    resolver: &TypeResolver,
+    strict_optional: bool,
+) -> Option<Type> {
+    expand_type_by_instance_inner(typ, instance, resolver, strict_optional, false, false, true)
+}
+
 /// Free-result variant of `expand_type_by_instance_core`: leftover TypeVars
 /// in the expansion are returned instead of deferring, mirroring Python's
 /// `expand_type_by_instance` (which never defers on leftover method type

@@ -3694,7 +3694,7 @@ fn expand_without_binding_inner(
         )?;
     }
 
-    let expanded = crate::expandtype::expand_type_by_instance_core(
+    let expanded = crate::expandtype::expand_type_by_instance_core_alias(
         &current,
         itype,
         resolver,
