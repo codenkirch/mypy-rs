@@ -922,12 +922,15 @@ mod tests {
     }
 
     #[test]
-    fn test_has_no_typevars_defers_on_alias() {
+    fn test_has_no_typevars_alias_with_no_args() {
+        // #1298: erase_typevars_inner mirrors TypeVarEraser's
+        // visit_type_alias_type (erase written args only), so an empty-args
+        // alias erases to itself and `typ == erase_typevars(typ)` is True.
         let alias = Type::TypeAliasType {
             args: vec![],
             type_ref: "mod.Alias".to_string(),
         };
-        assert_eq!(has_no_typevars_inner(&alias), None);
+        assert_eq!(has_no_typevars_inner(&alias), Some(true));
     }
 
     #[test]

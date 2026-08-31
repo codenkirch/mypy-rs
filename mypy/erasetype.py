@@ -166,17 +166,21 @@ def _serialize_typevar_ids(ids: Container[TypeVarId] | None) -> bytes:
     return buf.getvalue()
 
 
-def _deserialize_type(data: bytes) -> Type | None:
+def _deserialize_type(data: bytes, *, resolve_aliases: bool = False) -> Type | None:
     """Decode wire bytes, resolving type_ref to live TypeInfo via wirefixup.
 
     Returns None when a type_ref is unresolvable so callers defer to Python.
+    ``resolve_aliases=True`` additionally re-links decoded TypeAliasTypes to
+    their live TypeAlias nodes via the per-build alias map; results may then
+    carry aliases, which is what the erase_typevars/replace_meta_vars shims
+    need now that the Rust kernel recurses into alias args.
     """
     cached = _erase_decode_cache.get(data)
     if cached is not None:
         return cached
     from mypy.wirefixup import fixup_wire_type
 
-    fixed = fixup_wire_type(_read_type(_ReadBuffer(data)))
+    fixed = fixup_wire_type(_read_type(_ReadBuffer(data)), resolve_aliases=resolve_aliases)
     if fixed is not None:
         _erase_decode_cache[data] = fixed
     return fixed
@@ -191,16 +195,19 @@ def _deserialize_type_with_erased(data: bytes) -> Type | None:
     around the decode and restore afterwards; the cache is per-result, so
     no ErasedType poisoning can leak beyond this decode.
     """
-    from mypy.types import _ALLOW_WIRE_ERASED_TYPE
+    # The flag is read as a global inside mypy.types (types.py:5358), so it must
+    # be set on that module: rebinding the imported name here only sets a
+    # shadowed local attribute and the decode would always fail back to Python.
+    from mypy import types as types_mod
 
-    old = _ALLOW_WIRE_ERASED_TYPE
-    _ALLOW_WIRE_ERASED_TYPE = True
+    old = types_mod._ALLOW_WIRE_ERASED_TYPE
+    types_mod._ALLOW_WIRE_ERASED_TYPE = True
     try:
-        return _deserialize_type(data)
+        return _deserialize_type(data, resolve_aliases=True)
     except (AssertionError, NotImplementedError):
         return None
     finally:
-        _ALLOW_WIRE_ERASED_TYPE = old
+        types_mod._ALLOW_WIRE_ERASED_TYPE = old
 
 
 def erase_type(typ: Type) -> ProperType:
@@ -322,7 +329,7 @@ def erase_typevars(t: Type, ids_to_erase: Container[TypeVarId] | None = None) ->
             ids_bytes = _serialize_typevar_ids(ids_to_erase)
             result = _rust_erase_typevars(type_bytes, ids_bytes)
             if result is not None:
-                decoded = _deserialize_type(bytes(result))
+                decoded = _deserialize_type(bytes(result), resolve_aliases=True)
                 if decoded is not None:
                     return decoded
         except (AssertionError, NotImplementedError):

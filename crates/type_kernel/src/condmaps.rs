@@ -163,14 +163,9 @@ pub(crate) fn rust_and_conditional_maps(
     let r = resolver.resolver();
     let ctx = SubtypeContext::new(false, false, false, false, false, strict_optional);
 
-    // Defer use_meet path: the meet_types Rust kernel does not yet handle
-    // all type combinations correctly (TypedDict meets, intersection types).
-    // Python handles these correctly; only the common use_meet=False path
-
-    // goes through Rust.
-    if use_meet {
-        return Ok(None);
-    }
+    // The use_meet path rides the same meet_types kernel the adt_rec / meet
+    // seams already route through (#1298): common keys meet pairwise, and any
+    // pair the kernel cannot decide defers the whole call to the Python body.
 
     // Decode all values. Defer on any decode failure.
     let mut decoded1: Vec<Type> = Vec::with_capacity(values1.len());

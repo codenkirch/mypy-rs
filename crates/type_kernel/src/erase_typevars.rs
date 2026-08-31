@@ -11,9 +11,14 @@
 //! the Rust subset does not handle so the Python caller falls through to the
 //! pure-Python visitor (the strangler-fig per-call contract).
 //!
+//! Handles:
+//!   * `TypeAliasType` — mirrors Python's visitor
+//!     `t.copy_modified(args=...)` (erasetype.py:423-426), recursing into
+//!     the written args and keeping the alias node; the Python shim must
+//!     decode with `resolve_aliases=True` so the decoded alias re-links to
+//!     its live `TypeAlias` node via the alias map.
+//!
 //! Deferred (return None):
-//!   * `TypeAliasType` — Python's visitor calls `t.copy_modified(args=...)`
-//!     which needs the live alias target. Defer to Python.
 //!   * `Overloaded` — Python recurses into items; we defer to keep the
 //!     parity surface narrow (Overloaded is rare in constraint contexts).
 //!   * `UnboundType` — Python returns `AnyType(from_error)`, but the
@@ -455,8 +460,16 @@ pub(crate) fn erase_typevars_inner(
             Some(Type::Parameters(new_params))
         }
 
-        // Deferred: TypeAliasType needs live alias target.
-        Type::TypeAliasType { .. } => None,
+        Type::TypeAliasType { args, type_ref } => {
+            // Mirrors TypeVarEraser.visit_type_alias_type (erasetype.py:423-426):
+            // the alias target cannot carry type vars unbound by the alias, so
+            // erasing the written args is safe; decode re-links via resolve_aliases.
+            let new_args = erase_typevars_list(args, ids, replacement)?;
+            Some(Type::TypeAliasType {
+                args: new_args,
+                type_ref: type_ref.clone(),
+            })
+        }
         // Deferred: UnboundType needs defn.type_vars for erasure.
         Type::UnboundType { .. } => None,
     }
@@ -771,7 +784,18 @@ fn erase_typevars_with_meta_check(typ: &Type, target: &Type) -> Option<Type> {
         | Type::UninhabitedType { .. }
         | Type::DeletedType { .. } => Some(typ.clone()),
         // Deferred (mirror main's wire deferral contract).
-        Type::TypeAliasType { .. } => None,
+        Type::TypeAliasType { args, type_ref } => {
+            // Same erasetype.py:423-426 semantics as the ids-based arm above,
+            // recursing with the meta-var-only predicate.
+            let new_args: Vec<Type> = args
+                .iter()
+                .map(|t| replace_meta_vars_inner(t, target))
+                .collect::<Option<Vec<_>>>()?;
+            Some(Type::TypeAliasType {
+                args: new_args,
+                type_ref: type_ref.clone(),
+            })
+        }
         Type::UnboundType { .. } => None,
         // TypeVar-like variants are handled in replace_meta_vars_inner
         // before dispatching to this function. Return None as a safety net.
@@ -918,6 +942,45 @@ mod tests {
         let target = make_instance("builtins.int", vec![]);
         let result = replace_meta_vars_inner(&t, &target);
         assert!(matches!(result, Some(Type::TypeVarType { .. })));
+    }
+
+    #[test]
+    fn test_replace_meta_vars_alias_args() {
+        // Meta vars nested in a TypeAliasType's args are replaced; the alias
+        // node itself survives with its type_ref intact.
+        let alias = Type::TypeAliasType {
+            args: vec![make_typevar_meta(1, "ns")],
+            type_ref: "mod.A".to_string(),
+        };
+        let target = make_instance("builtins.int", vec![]);
+        let result = replace_meta_vars_inner(&alias, &target).unwrap();
+        match result {
+            Type::TypeAliasType { args, type_ref } => {
+                assert_eq!(type_ref, "mod.A");
+                assert!(
+                    matches!(&args[0], Type::Instance { type_ref, .. } if type_ref == "builtins.int")
+                );
+            }
+            _ => panic!("expected TypeAliasType"),
+        }
+    }
+
+    #[test]
+    fn test_erase_typevars_alias_args() {
+        // Type vars in a TypeAliasType's args are erased to Any; the alias
+        // node itself survives with its type_ref intact.
+        let alias = Type::TypeAliasType {
+            args: vec![make_typevar(1, "ns")],
+            type_ref: "mod.A".to_string(),
+        };
+        let result = erase_typevars_inner(&alias, None, &make_any()).unwrap();
+        match result {
+            Type::TypeAliasType { args, type_ref } => {
+                assert_eq!(type_ref, "mod.A");
+                assert!(matches!(args[0], Type::AnyType { .. }));
+            }
+            _ => panic!("expected TypeAliasType"),
+        }
     }
 
     fn make_type_var_tuple(raw_id: i64) -> Type {

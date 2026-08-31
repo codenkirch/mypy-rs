@@ -984,11 +984,19 @@ def _try_native_is_valid_inferred_type(
     diagnostics or side effects. Returns the bool result, or None to
     defer to the pure-Python path.
     """
-    if not (_CHECKER_HAS_TYPE_KERNEL and _native_checker_stmts_active):
+    if not (
+        _CHECKER_HAS_TYPE_KERNEL
+        and _native_checker_stmts_active
+        and _native_checker_resolver is not None
+    ):
         return None
     try:
         return _rust_is_valid_inferred_type(
-            _serialize_type_for_checker(typ), is_lvalue_final, is_lvalue_member, allow_redefinition
+            _serialize_type_for_checker(typ),
+            is_lvalue_final,
+            is_lvalue_member,
+            allow_redefinition,
+            _native_checker_resolver,
         )
     except (AssertionError, NotImplementedError, ValueError):
         return None

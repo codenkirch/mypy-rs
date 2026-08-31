@@ -1644,9 +1644,7 @@ except ImportError:
 
 _NATIVE_WIRE_ENABLED = _env_gate("TEST_NATIVE_TYPE_KERNEL") and _HAS_TYPE_KERNEL_WIRE
 
-_NATIVE_SEMANAL_LOOKUP_ENABLED = (
-    _env_gate("TEST_NATIVE_TYPE_KERNEL") and _HAS_TYPE_KERNEL_WIRE
-)
+_NATIVE_SEMANAL_LOOKUP_ENABLED = _env_gate("TEST_NATIVE_TYPE_KERNEL") and _HAS_TYPE_KERNEL_WIRE
 
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
@@ -3924,11 +3922,100 @@ class NativeSubtypesDeferralSuite(Suite):
             _set_native_checker_stmts_active(True)
             assert is_valid_inferred_type(t, options) is expected
             rusted = _type_kernel.rust_is_valid_inferred_type(
-                _serialize_type_for_checker(t), False, False, False
+                _serialize_type_for_checker(t), False, False, False, self.resolver
             )
             assert rusted is False
         finally:
             _set_native_checker_stmts_active(False)
+
+    def test_valid_inferred_alias_operand_native(self) -> None:
+        # Issue #1298: is_valid_inferred_type serializes its operand wholesale,
+        # so a TypeAliasType operand rides the wire into the kernel, which now
+        # expands it via the resolver snapshot instead of deferring.
+        from mypy.checker import (
+            _serialize_type_for_checker,
+            _set_native_checker_resolver,
+            _set_native_checker_stmts_active,
+            is_valid_inferred_type,
+        )
+
+        options = Options()
+        alias = TypeAlias(self.fx.a, "mod.A", "mod", -1, -1)
+        self._rebuild_with_aliases([alias])
+        t = TypeAliasType(alias, [])
+        try:
+            _set_native_checker_resolver(self.resolver)
+            _set_native_checker_stmts_active(False)
+            expected = is_valid_inferred_type(t, options)
+            assert expected is True
+            _set_native_checker_stmts_active(True)
+            assert is_valid_inferred_type(t, options) is expected
+            # The direct seam call proves the alias path is native now
+            # (non-None), not deferring back to Python.
+            rusted = _type_kernel.rust_is_valid_inferred_type(
+                _serialize_type_for_checker(t), False, False, False, self.resolver
+            )
+            assert rusted is True
+        finally:
+            _set_native_checker_stmts_active(False)
+            _set_native_checker_resolver(None)
+
+    def test_valid_inferred_pep695_alias_edge_differential(self) -> None:
+        # Mirror of the kernel's edge-continuation tests (checker_stmts.rs): a
+        # PEP-695 alias's written args are still queried, so a meta-var arg
+        # flips the verdict; an old-style alias skips the args query and stays valid.
+        from mypy.checker import (
+            _serialize_type_for_checker,
+            _set_native_checker_resolver,
+            _set_native_checker_stmts_active,
+            is_valid_inferred_type,
+        )
+
+        options = Options()
+        meta = TypeVarType(
+            "T",
+            "mod.T",
+            TypeVarId(-1, meta_level=1),
+            [],
+            self.fx.o,
+            AnyType(TypeOfAny.from_omitted_generics),
+        )
+        tvar = TypeVarType(
+            "T", "mod.T", TypeVarId(1), [], self.fx.o, AnyType(TypeOfAny.from_omitted_generics)
+        )
+        pep695 = TypeAlias(
+            self.fx.a, "mod.A", "mod", -1, -1, alias_tvars=[tvar], python_3_12_type_alias=True
+        )
+        old_style = TypeAlias(
+            self.fx.a, "mod.B", "mod", -1, -1, alias_tvars=[tvar], python_3_12_type_alias=False
+        )
+        self._rebuild_with_aliases([pep695, old_style])
+        try:
+            _set_native_checker_resolver(self.resolver)
+            _set_native_checker_stmts_active(False)
+            # Python: get_proper_type expands mod.A to a clean Instance, so the
+            # verdict comes from the ORIGINAL alias operand (checker.py:11760),
+            # whose visit_type_alias_type edge only consults args under PEP-695.
+            pep_expected = is_valid_inferred_type(TypeAliasType(pep695, [meta]), options)
+            assert pep_expected is False
+            old_expected = is_valid_inferred_type(TypeAliasType(old_style, [meta]), options)
+            assert old_expected is True
+            _set_native_checker_stmts_active(True)
+            assert is_valid_inferred_type(TypeAliasType(pep695, [meta]), options) is pep_expected
+            assert (
+                is_valid_inferred_type(TypeAliasType(old_style, [meta]), options) is old_expected
+            )
+            rusted = _type_kernel.rust_is_valid_inferred_type(
+                _serialize_type_for_checker(TypeAliasType(pep695, [meta])),
+                False,
+                False,
+                False,
+                self.resolver,
+            )
+            assert rusted is False
+        finally:
+            _set_native_checker_stmts_active(False)
+            _set_native_checker_resolver(None)
 
     def test_callable_protocol_right_no_call_non_typeobj_native(self) -> None:
         """Issue #1233 (Port A): CallableType left vs protocol Instance
@@ -4648,9 +4735,7 @@ class NativeExpandTypeByInstanceSuite(Suite):
         binder = info.defn.type_vars[0]
         binder.id = TypeVarId(1, namespace="Bag")
         alias = TypeAlias(Instance(self.fx.std_listi, [binder]), "mod.A", "mod", -1, -1)
-        self._resolver = _type_kernel.build_native_resolver(
-            [info, *self._type_infos], [alias]
-        )
+        self._resolver = _type_kernel.build_native_resolver([info, *self._type_infos], [alias])
         self._set_resolver(self._resolver)
         set_wire_alias_map({alias.fullname: alias})
         return alias, info, binder
@@ -4665,10 +4750,7 @@ class NativeExpandTypeByInstanceSuite(Suite):
         typ = Instance(self.fx.std_listi, [TypeAliasType(alias, [binder])])
         instance = Instance(info, [self.fx.a])
         result = _type_kernel.rust_expand_type_by_instance(
-            self._resolver,
-            _serialize_type(typ),
-            _serialize_type(instance),
-            state.strict_optional,
+            self._resolver, _serialize_type(typ), _serialize_type(instance), state.strict_optional
         )
         assert result is not None, "alias-bearing by_instance expansion deferred"
         self._assert_par(typ, instance)
@@ -4691,10 +4773,7 @@ class NativeExpandTypeByInstanceSuite(Suite):
         typ = UnionType([TypeAliasType(alias, [binder]), self.fx.b])
         instance = Instance(info, [self.fx.a])
         result = _type_kernel.rust_expand_type_by_instance(
-            self._resolver,
-            _serialize_type(typ),
-            _serialize_type(instance),
-            state.strict_optional,
+            self._resolver, _serialize_type(typ), _serialize_type(instance), state.strict_optional
         )
         assert result is not None, "alias union item by_instance deferred"
         self._assert_par(typ, instance)
@@ -7008,7 +7087,9 @@ class NativeTypeopsDeferralSuite(Suite):
         from mypy.typeops import _serialize_type, simple_literal_type
         from mypy.types import LiteralType
 
-        inst = Instance(self.fx.str_type_info, [], last_known_value=LiteralType("x", self.str_inst))
+        inst = Instance(
+            self.fx.str_type_info, [], last_known_value=LiteralType("x", self.str_inst)
+        )
         off = self._with_gate(False, lambda: simple_literal_type(inst))
         on = self._with_gate(True, lambda: simple_literal_type(inst))
         assert off is not None
@@ -10033,9 +10114,7 @@ class NativeUnboundWithoutTypeInfoSuite(Suite):
         allow_unbound_tvars: bool = False,
     ) -> tuple[Type, list[str]]:
         ta = self._analyser(allow_type_any=allow_type_any, allow_unbound_tvars=allow_unbound_tvars)
-        result = cast(
-            "Type", ta.analyze_unbound_type_without_type_info(t, sym, defining_literal)
-        )
+        result = cast("Type", ta.analyze_unbound_type_without_type_info(t, sym, defining_literal))
         return result, ta.messages
 
     def _assert_par(
@@ -10073,9 +10152,7 @@ class NativeUnboundWithoutTypeInfoSuite(Suite):
             f"analyze_unbound_type_without_type_info parity {sym.fullname}",
         )
         assert_equal(
-            on[1],
-            off[1],
-            f"analyze_unbound_type_without_type_info messages parity {sym.fullname}",
+            on[1], off[1], f"analyze_unbound_type_without_type_info messages parity {sym.fullname}"
         )
 
     def _assert_engages(
@@ -10253,18 +10330,11 @@ class NativeUnboundWithoutTypeInfoSuite(Suite):
         from mypy.nodes import TypeVarExpr
 
         tv = TypeVarExpr(
-            "T",
-            "m.T",
-            [],
-            self.fx.o,
-            AnyType(TypeOfAny.from_omitted_generics),
-            is_new_style=True,
+            "T", "m.T", [], self.fx.o, AnyType(TypeOfAny.from_omitted_generics), is_new_style=True
         )
         sym = SymbolTableNode(MDEF, tv)
         self._assert_par(t, sym, False)
-        self._assert_engages(
-            unbound_tvar=True, is_new_style=True, name="m.T", tail_kind=3
-        )
+        self._assert_engages(unbound_tvar=True, is_new_style=True, name="m.T", tail_kind=3)
 
     def test_type_type_any_special_form(self) -> None:
         # `Var` typed TypeType[Any] under allow_type_any ->
@@ -15847,9 +15917,74 @@ class NativeWireFixupSuite(Suite):
         _set_native_erase_typevars_active(True)
         actual = replace_meta_vars(typ, target)
         self._assert_no_fake_info(actual)
-        assert_equal(actual, expected)
+        # ErasedType has no __eq__ (identity), and the native path returns a
+        # fresh wire-decoded instance, so compare the semantic content.
+        assert_equal(actual.serialize(), expected.serialize())
         assert isinstance(actual, Instance)  # type: ignore[misc]
         assert isinstance(actual.args[0], ErasedType)
+
+    def test_replace_meta_vars_fixes_up_alias_args(self) -> None:
+        # Issue #1298: replace_meta_vars round-trips literals nested in a
+        # TypeAliasType. The Rust kernel recurses into the alias args and keeps
+        # the alias node; Python decode re-links it to the live TypeAlias.
+        from mypy.erasetype import _set_native_erase_typevars_active, replace_meta_vars
+        from mypy.wirefixup import set_wire_alias_map
+
+        meta = TypeVarType(
+            "T",
+            "T",
+            TypeVarId(-1, meta_level=1),
+            [],
+            self.fx.o,
+            AnyType(TypeOfAny.from_omitted_generics),
+        )
+        alias = TypeAlias(Instance(self.fx.std_listi, [self.fx.a]), "mod.A", "mod", -1, -1)
+        target = self.fx.a
+        typ = TypeAliasType(alias, [meta])
+        set_wire_alias_map({alias.fullname: alias})
+        try:
+            _set_native_erase_typevars_active(False)
+            expected = replace_meta_vars(typ, target)
+            _set_native_erase_typevars_active(True)
+            actual = replace_meta_vars(typ, target)
+            self._assert_no_fake_info(actual)
+            assert_equal(actual, expected)
+            assert isinstance(actual, TypeAliasType)
+            assert actual.alias is alias, "decoded alias node not re-linked"
+            assert isinstance(get_proper_type(actual.args[0]), Instance)
+        finally:
+            set_wire_alias_map(None)
+
+    def test_erase_typevars_fixes_up_alias_args(self) -> None:
+        # Issue #1298: erase_typevars now recurses into TypeAliasType args
+        # too (the meta var is erased to Any and the alias node survives,
+        # re-linked to the live node on decode).
+        from mypy.erasetype import _set_native_erase_typevars_active, erase_typevars
+        from mypy.wirefixup import set_wire_alias_map
+
+        meta = TypeVarType(
+            "T",
+            "T",
+            TypeVarId(-1, meta_level=1),
+            [],
+            self.fx.o,
+            AnyType(TypeOfAny.from_omitted_generics),
+        )
+        alias = TypeAlias(Instance(self.fx.std_listi, [self.fx.a]), "mod.A", "mod", -1, -1)
+        typ = TypeAliasType(alias, [meta])
+        set_wire_alias_map({alias.fullname: alias})
+        try:
+            _set_native_erase_typevars_active(False)
+            expected = erase_typevars(typ)
+            _set_native_erase_typevars_active(True)
+            actual = erase_typevars(typ)
+            self._assert_no_fake_info(actual)
+            assert_equal(actual, expected)
+            assert isinstance(actual, TypeAliasType)
+            assert actual.alias is alias, "decoded alias node not re-linked"
+            assert isinstance(get_proper_type(actual.args[0]), AnyType)
+        finally:
+            set_wire_alias_map(None)
 
     def test_copy_type_fixes_up_instance(self) -> None:
         from mypy.copytype import _set_native_copy_active, copy_type
@@ -24434,9 +24569,7 @@ class NativeBuiltinItemTypeSuite(Suite):
         )
         assert result is not None, f"Rust builtin_item_type did not engage for {t}"
         decided, value = result
-        assert decided and value is None, (
-            f"expected decided-None for {t}, got {result!r}"
-        )
+        assert decided and value is None, f"expected decided-None for {t}, got {result!r}"
 
     def test_list_instance(self) -> None:
         from mypy.checker import builtin_item_type
@@ -25155,25 +25288,17 @@ class NativeAndOrConditionalMapsSuite(Suite):
         assert_equal(self._normalize(result), {("NameExpr(x)", "Any")})
         self._and_engages(m1, m2)
 
-    def test_and_use_meet_true_defers(self) -> None:
-        from mypy.checker import _serialize_type_for_checker
-        from mypy.literals import literal_hash
+    def test_and_use_meet_true_native(self) -> None:
+        from mypy.checker import and_conditional_maps
 
-        # use_meet=True hard-defers in Rust: the seam must return None, and
-        # both gates run the Python meet loop, so parity still holds.
+        # use_meet=True is decided natively (#1298): the seam engages and the
+        # meet result matches the Python meet loop.
         m1 = self._map([("x", self.fx.a)])
         m2 = self._map([("x", self.fx.b)])
         self._assert_and_parity(m1, m2, use_meet=True)
-        result = _type_kernel.rust_and_conditional_maps(
-            [hash(literal_hash(NameExpr("x")))],
-            [_serialize_type_for_checker(self.fx.a)],
-            [hash(literal_hash(NameExpr("x")))],
-            [_serialize_type_for_checker(self.fx.b)],
-            True,
-            state.strict_optional,
-            self.resolver,
-        )
-        assert result is None, f"expected use_meet deferral, got {result}"
+        self._and_engages(m1, m2, use_meet=True)
+        result = self._with_gate(True, lambda: and_conditional_maps(m1, m2, use_meet=True))
+        assert_equal(self._normalize(result), {("NameExpr(x)", "B")})
 
     def test_or_common_key_union(self) -> None:
         from mypy.checker import or_conditional_maps
@@ -27060,14 +27185,20 @@ class NativeUntypedDecoratorSuite(Suite):
     def test_seam_instance_decorator_head(self) -> None:
         # Decorator head: untyped func.type decides True before var.type.
         dec = self._decorator_method(self._untyped_callable(), self._typed_callable())
-        assert self._seam(True, self._typed_callable(), self._instance_with_call(dec), False) is True
+        assert (
+            self._seam(True, self._typed_callable(), self._instance_with_call(dec), False) is True
+        )
         # Typed func.type defers to var.type; a None var.type is untyped.
         dec = self._decorator_method(self._typed_callable(), None)
-        assert self._seam(True, self._typed_callable(), self._instance_with_call(dec), False) is True
+        assert (
+            self._seam(True, self._typed_callable(), self._instance_with_call(dec), False) is True
+        )
         # None func.type is untyped on both paths (is_untyped_decorator(
         # None) is True), regardless of var.type.
         dec = self._decorator_method(None, self._typed_callable())
-        assert self._seam(True, self._typed_callable(), self._instance_with_call(dec), False) is True
+        assert (
+            self._seam(True, self._typed_callable(), self._instance_with_call(dec), False) is True
+        )
 
     def test_parity_decorator_none_func_type(self) -> None:
         # Python returns True at the func.type arm (is_untyped_decorator(

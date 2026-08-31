@@ -403,24 +403,23 @@ fn encode_type_owned(t: &Type) -> Option<Vec<u8>> {
 //     + partial_fallback).
 
 // The top-level `is_valid_inferred_type` first calls `get_proper_type`
-// (which needs the live alias target for a `TypeAliasType`, so any alias at
-// the top level defers). Then:
+// (top-level alias chains expand via the alias snapshot). Then:
 
 //   * `NoneType`: `is_lvalue_final or (not is_lvalue_member and allow_redefinition)`.
 //   * `UninhabitedType`: `False`.
-//   * Otherwise: `not typ.accept(InvalidInferredTypes())`.
+//   * Otherwise: `not typ.accept(InvalidInferredTypes())` — note Python runs
+//     the query on the ORIGINAL `typ`, not the expanded proper type
+//     (checker.py:11744).
+
+// `BoolTypeQuery.visit_type_alias_type` (type_visitor.py:599-616): alias nodes
+// inside the query chain-expand via the alias snapshot (revisits guarded by
+// seen_aliases); the PEP-695 edge flag is read from the node's own snapshot.
 
 // Deferred (return None) cases:
 //   * Undecodable input bytes.
 
-//   * `TypeAliasType` at the top level (get_proper_type needs the live
-//     alias target).
-
-//   * `TypeAliasType` anywhere in the tree: the base `visit_type_alias_type`
-//     calls `get_proper_type` and recurses into the alias target, which
-//     needs the live `alias` node. The wire format stores only `type_ref`,
-
-//     so defer the entire query to the pure-Python path.
+//   * An alias whose snapshot is missing, cycles, or needs a substitution
+//     the kernel cannot perform exactly (expanded_alias_target defers).
 
 /// `mypy.checker.is_valid_inferred_type` — pure boolean validity query.
 ///
@@ -433,48 +432,75 @@ pub(crate) fn rust_is_valid_inferred_type(
     is_lvalue_final: bool,
     is_lvalue_member: bool,
     allow_redefinition: bool,
+    resolver: &mut NativeTypeResolver,
 ) -> PyResult<Option<bool>> {
     let typ = match decode_type(type_bytes) {
         Some(t) => t,
         None => return Ok(None),
     };
-    Ok(is_valid_inferred_type_inner(
+    Ok(is_valid_inferred_type_with_aliases(
         &typ,
         is_lvalue_final,
         is_lvalue_member,
         allow_redefinition,
+        resolver.alias_resolver(),
     ))
 }
 
+#[cfg(test)]
 fn is_valid_inferred_type_inner(
     typ: &Type,
     is_lvalue_final: bool,
     is_lvalue_member: bool,
     allow_redefinition: bool,
 ) -> Option<bool> {
-    // get_proper_type: TypeAliasType needs the live alias target.
-    if matches!(typ, Type::TypeAliasType { .. }) {
-        return None;
-    }
-    // Top-level NoneType short-circuit.
-    if matches!(typ, Type::NoneType) {
+    // Test-facing wrapper: no alias snapshots (tests exercise non-alias
+    // shapes; alias behavior is covered by the alias-aware unit tests).
+    is_valid_inferred_type_with_aliases(
+        typ,
+        is_lvalue_final,
+        is_lvalue_member,
+        allow_redefinition,
+        &crate::aliases::TypeAliasResolver::default(),
+    )
+}
+
+fn is_valid_inferred_type_with_aliases(
+    typ: &Type,
+    is_lvalue_final: bool,
+    is_lvalue_member: bool,
+    allow_redefinition: bool,
+    aliases: &crate::aliases::TypeAliasResolver,
+) -> Option<bool> {
+    // get_proper_type: a top-level TypeAliasType expands via the alias
+    // snapshot (chain-resolve + substitution, mirroring _expand_once).
+    let proper: Type = match typ {
+        Type::TypeAliasType { .. } => expanded_alias_target(typ, aliases)?.0,
+        t => t.clone(),
+    };
+    // Top-level NoneType short-circuit (evaluated on the expanded type).
+    if matches!(proper, Type::NoneType) {
         return Some(is_lvalue_final || (!is_lvalue_member && allow_redefinition));
     }
     // Top-level UninhabitedType short-circuit.
-    if let Type::UninhabitedType { .. } = typ {
+    if let Type::UninhabitedType { .. } = proper {
         return Some(false);
     }
-    // not typ.accept(InvalidInferredTypes()).
-    let invalid = invalid_inferred_types_query(typ)?;
+    // not typ.accept(InvalidInferredTypes()) — on the ORIGINAL typ.
+    let mut seen: Vec<String> = Vec::new();
+    let invalid = invalid_inferred_types_query(typ, aliases, &mut seen)?;
     Some(!invalid)
 }
 
 /// `InvalidInferredTypes` query: ANY_STRATEGY (short-circuit OR).
 ///
 /// Returns `Some(true)` if any invalid component is found, `Some(false)`
-/// if none, or `None` to defer (a `TypeAliasType` encountered anywhere in
-/// the tree).
-fn invalid_inferred_types_query(typ: &Type) -> Option<bool> {
+/// if none, or `None` to defer (an alias node the snapshot cannot expand).
+fn invalid_inferred_types_query(
+    typ: &Type,
+    aliases: &crate::aliases::TypeAliasResolver,
+    seen: &mut Vec<String>,
+) -> Option<bool> {
     // Per-variant overrides mirror InvalidInferredTypes.visit_*.
     match typ {
         // visit_uninhabited_type: returns t.ambiguous.
@@ -489,7 +515,7 @@ fn invalid_inferred_types_query(typ: &Type) -> Option<bool> {
         Type::TupleType { items, .. } => {
             // ANY_STRATEGY: any item invalid -> True. Short-circuit.
             for item in items {
-                match invalid_inferred_types_query(item) {
+                match invalid_inferred_types_query(item, aliases, seen) {
                     Some(true) => return Some(true),
                     None => return None,
                     Some(false) => {}
@@ -497,14 +523,13 @@ fn invalid_inferred_types_query(typ: &Type) -> Option<bool> {
             }
             Some(false)
         }
-        // TypeAliasType: base visit_type_alias_type needs get_proper_type
-        // (live alias target). Defer.
-        Type::TypeAliasType { .. } => None,
+        // BoolTypeQuery.visit_type_alias_type (type_visitor.py:599-616).
+        Type::TypeAliasType { .. } => invalid_query_alias_node(typ, aliases, seen),
         // Base BoolTypeQuery(ANY_STRATEGY) for all other variants.
         _ => {
             // default = False for ANY_STRATEGY. Query children.
             for child in invalid_inferred_children(typ) {
-                match invalid_inferred_types_query(child) {
+                match invalid_inferred_types_query(child, aliases, seen) {
                     Some(true) => return Some(true),
                     None => return None,
                     Some(false) => {}
@@ -513,6 +538,45 @@ fn invalid_inferred_types_query(typ: &Type) -> Option<bool> {
             Some(false)
         }
     }
+}
+
+/// `BoolTypeQuery.visit_type_alias_type` for the ANY_STRATEGY query
+/// (type_visitor.py:599-616): a permanent seen-guard (a revisit yields the
+/// default, False), then query the chain-expanded substituted target, then
+/// the edge continuation `res or (python_3_12_type_alias and
+/// query_types(t.args))`. The flag comes from the node's own alias
+/// snapshot, mirroring Python's `t.alias.python_3_12_type_alias` (not
+/// OR-ed across the chain).
+fn invalid_query_alias_node(
+    typ: &Type,
+    aliases: &crate::aliases::TypeAliasResolver,
+    seen: &mut Vec<String>,
+) -> Option<bool> {
+    let (args, type_ref) = match typ {
+        Type::TypeAliasType { args, type_ref } => (args, type_ref),
+        _ => return None,
+    };
+    if seen.iter().any(|r| r == type_ref) {
+        // Already visited: simple-minded cache, default (False).
+        return Some(false);
+    }
+    seen.push(type_ref.clone());
+    // res = get_proper_type(t).accept(self)
+    let (target, _, _) = expanded_alias_target(typ, aliases)?;
+    let res = invalid_inferred_types_query(&target, aliases, seen)?;
+    if res {
+        return Some(true);
+    }
+    // Edge: res or (t.alias.python_3_12_type_alias and query(t.args)).
+    let py312 = aliases.get(type_ref)?.python_3_12_type_alias;
+    if py312 {
+        for a in args {
+            if invalid_inferred_types_query(a, aliases, seen)? {
+                return Some(true);
+            }
+        }
+    }
+    Some(false)
 }
 
 /// Yield the child types that `InvalidInferredTypes`'s base visitor would
@@ -1668,14 +1732,157 @@ mod tests {
     }
 
     #[test]
-    fn valid_inferred_alias_nested_defers() {
+    fn valid_inferred_alias_nested_missing_snapshot_defers() {
         let t = Type::UnionType {
             items: vec![instance("builtins.int"), type_alias()],
             uses_pep604_syntax: false,
             can_be_true: true,
             can_be_false: true,
         };
-        assert_eq!(invalid_inferred_types_query(&t), None);
+        let mut seen: Vec<String> = Vec::new();
+        assert_eq!(
+            invalid_inferred_types_query(&t, &Default::default(), &mut seen),
+            None
+        );
+    }
+
+    #[test]
+    fn valid_inferred_alias_top_expands_before_none_branch() {
+        // get_proper_type runs BEFORE the NoneType/Uninhabited checks
+        // (checker.py:11731-11743): an alias expanding to NoneType takes the
+        // NoneType branch (Some(false) here) instead of deferring.
+        let t = Type::TypeAliasType {
+            args: Vec::new(),
+            type_ref: "mod.A".to_string(),
+        };
+        let mut aliases = crate::aliases::TypeAliasResolver::default();
+        aliases.insert(
+            "mod.A".to_string(),
+            crate::aliases::TypeAliasSnapshot {
+                fullname: "mod.A".to_string(),
+                target: encode_type(&Type::NoneType),
+                no_args: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            is_valid_inferred_type_with_aliases(&t, false, false, false, &aliases),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn valid_inferred_alias_top_expands_to_instance() {
+        let t = Type::TypeAliasType {
+            args: Vec::new(),
+            type_ref: "mod.A".to_string(),
+        };
+        let mut aliases = crate::aliases::TypeAliasResolver::default();
+        aliases.insert(
+            "mod.A".to_string(),
+            crate::aliases::TypeAliasSnapshot {
+                fullname: "mod.A".to_string(),
+                target: encode_type(&instance("builtins.int")),
+                no_args: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            is_valid_inferred_type_with_aliases(&t, false, false, false, &aliases),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn valid_inferred_alias_edge_continuation_queries_args() {
+        // BoolTypeQuery.visit_type_alias_type's ANY_STRATEGY edge (type_visitor.py
+        // 609-613): with a clean target, a PEP-695 alias's written args are still
+        // queried, so a meta-var arg flips the verdict to invalid.
+        let t = Type::TypeAliasType {
+            args: vec![Type::TypeVarType {
+                name: "T".to_string(),
+                fullname: "mod.T".to_string(),
+                raw_id: 1,
+                namespace: String::new(),
+                values: Vec::new(),
+                upper_bound: Box::new(instance("builtins.object")),
+                default: Box::new(Type::AnyType {
+                    type_of_any: 0,
+                    source_any: None,
+                    missing_import_name: None,
+                }),
+                variance: 0,
+                meta_level: 1,
+            }],
+            type_ref: "mod.A".to_string(),
+        };
+        let mut aliases = crate::aliases::TypeAliasResolver::default();
+        aliases.insert(
+            "mod.A".to_string(),
+            crate::aliases::TypeAliasSnapshot {
+                fullname: "mod.A".to_string(),
+                target: encode_type(&instance("builtins.int")),
+                alias_tvars: vec![crate::aliases::AliasTvar {
+                    name: "T".to_string(),
+                    raw_id: 2,
+                    meta_level: 0,
+                    namespace: String::new(),
+                    is_type_var_tuple: false,
+                }],
+                python_3_12_type_alias: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            is_valid_inferred_type_with_aliases(&t, false, false, false, &aliases),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn valid_inferred_alias_old_style_args_not_queried() {
+        // Same shape as the edge-continuation test but with an old-style
+        // alias (python_3_12_type_alias=False): Python skips the args query,
+        // so the meta-var arg must NOT flip the verdict (valid=True).
+        let t = Type::TypeAliasType {
+            args: vec![Type::TypeVarType {
+                name: "T".to_string(),
+                fullname: "mod.T".to_string(),
+                raw_id: 1,
+                namespace: String::new(),
+                values: Vec::new(),
+                upper_bound: Box::new(instance("builtins.object")),
+                default: Box::new(Type::AnyType {
+                    type_of_any: 0,
+                    source_any: None,
+                    missing_import_name: None,
+                }),
+                variance: 0,
+                meta_level: 1,
+            }],
+            type_ref: "mod.A".to_string(),
+        };
+        let mut aliases = crate::aliases::TypeAliasResolver::default();
+        aliases.insert(
+            "mod.A".to_string(),
+            crate::aliases::TypeAliasSnapshot {
+                fullname: "mod.A".to_string(),
+                target: encode_type(&instance("builtins.int")),
+                alias_tvars: vec![crate::aliases::AliasTvar {
+                    name: "T".to_string(),
+                    raw_id: 2,
+                    meta_level: 0,
+                    namespace: String::new(),
+                    is_type_var_tuple: false,
+                }],
+                python_3_12_type_alias: false,
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            is_valid_inferred_type_with_aliases(&t, false, false, false, &aliases),
+            Some(true)
+        );
     }
 
     #[test]
@@ -1694,10 +1901,18 @@ mod tests {
 
     #[test]
     fn valid_inferred_garbage_bytes_defers() {
-        assert_eq!(
-            rust_is_valid_inferred_type(b"\xff\xff", false, false, false).unwrap(),
-            None
-        );
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|_py| {
+            let mut resolver = crate::typeinfo::NativeTypeResolver::new(
+                crate::typeinfo::TypeResolver::default(),
+                crate::aliases::TypeAliasResolver::default(),
+            );
+            assert_eq!(
+                rust_is_valid_inferred_type(b"\xff\xff", false, false, false, &mut resolver)
+                    .unwrap(),
+                None
+            );
+        });
     }
 
     #[test]
