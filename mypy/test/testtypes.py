@@ -35315,10 +35315,10 @@ class NativeMemberVarDispatchSuite(Suite):
         _, _, decoded = result
         assert str(decoded) == "mod.Base"
 
-    def test_seam_property_callable_defers(self) -> None:
+    def test_seam_property_callable_native_tail(self) -> None:
         # The regression shape: a property getter CallableType under the
-        # class-var call_type gate would bind and return the raw bound
-        # callable, losing the property-extract ret_type tail.
+        # class-var call_type gate binds and then applies the ret_type tail.
+        # The whole path is native now and returns "mod.Base", like Python.
         getter = CallableType(
             [Instance(self.base, [])],
             [ArgKind.ARG_POS],
@@ -35335,7 +35335,10 @@ class NativeMemberVarDispatchSuite(Suite):
             is_initialized_in_class=True,
             is_inferred=True,
         )
-        assert self._seam(Instance(self.info, []), "x") is None
+        result = self._seam(Instance(self.info, []), "x")
+        assert result is not None
+        _, _, decoded = result
+        assert str(decoded) == "mod.Base"
 
     def test_seam_property_not_in_gate_engages(self) -> None:
         # is_property with the call_type gate not entered (is_inferred True
@@ -35435,9 +35438,12 @@ class NativeMemberVarDispatchSuite(Suite):
         assert slots[0] is not None
         plain = _deserialize_type_for_checkmember(bytes(slots[0]), freeze=True)
         assert str(plain) == "mod.Base"
-        # The property item defers: Python fills the slot through the
-        # pure-Python per-item loop (the unionproperty regression).
-        assert slots[1] is None
+        # The property item is native since the var-prop-bind port; the tail
+        # returns the getter ret_type, matching the pure-Python per-item
+        # loop (the unionproperty regression keeps a value assertion).
+        assert slots[1] is not None
+        prop = _deserialize_type_for_checkmember(bytes(slots[1]), freeze=True)
+        assert str(prop) == "mod.Base"
 
     def test_none_seam_bool_fixed(self) -> None:
         from mypy.checkmember import (

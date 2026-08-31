@@ -44,7 +44,7 @@
 
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyType};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use crate::freshen::freshen_type;
 use crate::setops::make_simplified_union;
@@ -1938,6 +1938,7 @@ fn dispatch_instance_member_inner(
     name: &str,
     override_info: Option<&str>,
     self_type: &Type,
+    is_lvalue: bool,
     is_operator: bool,
     is_self: bool,
     preserve_type_var_ids: bool,
@@ -1974,6 +1975,8 @@ fn dispatch_instance_member_inner(
                 instance,
                 name,
                 info,
+                self_type,
+                is_lvalue,
                 is_operator,
                 is_self,
                 preserve_type_var_ids,
@@ -2165,8 +2168,10 @@ pub(crate) fn rust_analyze_instance_member_dispatch(
         name,
         override_info.as_deref(),
         &self_type,
-        // The Python gate requires a found non-property method, so the
-        // var arm is unreachable from this entry point.
+        // is_lvalue/is_operator/is_self: the Python gate requires a found
+        // non-property method, so the var arm (the only is_lvalue consumer)
+        // is unreachable from this entry point.
+        false,
         false,
         false,
         preserve_type_var_ids,
@@ -2205,6 +2210,8 @@ fn dispatch_var_member_inner(
     instance: &Type,
     name: &str,
     info: &PyAny,
+    self_type: &Type,
+    is_lvalue: bool,
     is_operator: bool,
     is_self: bool,
     preserve_type_var_ids: bool,
@@ -2272,12 +2279,26 @@ fn dispatch_var_member_inner(
     if var_info_is_enum {
         return None;
     }
-    // expand_without_binding native gate: `var.info.self_type is None or
-    // var.is_property` (checkmember.py:1902); otherwise expand_self_type
-    // needs the live Var.
-    if !var_info.getattr("self_type").ok()?.is_none() && !is_property {
-        return None;
-    }
+    // expand_without_binding native gate (checkmember.py:1902): a Var whose
+    // `self_type` is set and which is not a property now replaces Self with
+    // mx.self_type via the env (expandtype.py:1345); unreadable defers.
+    let self_tvar_obj = var_info.getattr("self_type").ok()?;
+    let self_tvar_key: Option<(i64, i64, String)> =
+        if !self_tvar_obj.is_none() && !is_property {
+            let bytes = serialize_type_to_bytes(py, self_tvar_obj)?;
+            match decode_type(&bytes)? {
+                Type::TypeVarType {
+                    raw_id,
+                    namespace,
+                    meta_level,
+                    ..
+                } => Some((raw_id, meta_level, namespace)),
+                _ => return None,
+            }
+        } else {
+            None
+        };
+    let self_expand_arg = self_tvar_key.as_ref().map(|k| (k, self_type));
 
     // checkmember.py:1802 `itype = map_instance_to_supertype(itype,
     // var.info)`; a snapshot miss defers.
@@ -2318,6 +2339,7 @@ fn dispatch_var_member_inner(
         *next_raw_id,
         strict_optional,
         resolver.resolver(),
+        self_expand_arg,
     )?;
     *next_raw_id = nri;
     if ch {
@@ -2380,13 +2402,29 @@ fn dispatch_var_member_inner(
                 Type::CallableType { is_bound, .. } => {
                     // `p_ct.bound()` for a CallableType is its `is_bound`
                     // flag (types.py:2048; items = [self]).
-                    if is_property {
-                        // Python's expand_and_bind_callable binds, then
-                        // returns the getter ret_type or the setter arg;
-                        // the inner port returns the raw CallableType, so defer.
-                        return None;
-                    }
-                    let (nri, ch, t) = if !is_bound {
+                    let (nri, ch, t) = if is_property {
+                        // Property callable (checkmember.py:1729) goes
+                        // through expand_and_bind_callable even when bound;
+                        // the property tail picks getter ret / setter arg.
+                        let is_settable_property =
+                            get_bool_flag(py, var, "is_settable_property")?;
+                        let has_setter_type =
+                            !var.getattr("setter_type").ok()?.is_none();
+                        bind_property_callable_inner(
+                            resolver,
+                            &ct,
+                            &itype,
+                            self_type,
+                            name,
+                            is_trivial_self,
+                            preserve_type_var_ids,
+                            *next_raw_id,
+                            strict_optional,
+                            is_settable_property,
+                            has_setter_type,
+                            is_lvalue,
+                        )?
+                    } else if !is_bound {
                         if !is_trivial_self {
                             return None;
                         }
@@ -2406,6 +2444,7 @@ fn dispatch_var_member_inner(
                             *next_raw_id,
                             strict_optional,
                             resolver.resolver(),
+                            self_expand_arg,
                         )?
                     };
                     *next_raw_id = nri;
@@ -2649,6 +2688,7 @@ fn analyze_member_access_inner<'a>(
                         ctx.name,
                         None,
                         ctx.self_type,
+                        ctx.is_lvalue,
                         ctx.is_operator,
                         ctx.is_self,
                         ctx.preserve_type_var_ids,
@@ -2883,6 +2923,9 @@ pub(crate) fn rust_analyze_union_member_access(
                     name,
                     None,
                     item,
+                    // is_lvalue: the caller early-returns on a union
+                    // lvalue/super, so it is always false here.
+                    false,
                     // Conservative: the var arm's own guards keep these
                     // facts safe (is_operator only widens deferral;
                     // is_self is re-guarded via the self_type check).
@@ -2982,7 +3025,9 @@ pub(crate) fn rust_analyze_none_member_access(
         name,
         None,
         &self_type,
-        // Conservative: same rationale as the union-item call site.
+        // Conservative: same rationale as the union-item call site
+        // (is_lvalue is false because the caller early-returns on it).
+        false,
         false,
         false,
         preserve_type_var_ids,
@@ -3597,6 +3642,9 @@ pub(crate) fn rust_expand_without_binding(
         start_raw_id,
         strict_optional,
         resolver.resolver(),
+        // The has_self_type gate above already deferred, so there is no
+        // self-type env to thread through the standalone entry point.
+        None,
     );
     match result {
         Some((next_raw_id, changed, t)) => {
@@ -3617,6 +3665,7 @@ fn expand_without_binding_inner(
     start_raw_id: i64,
     strict_optional: bool,
     resolver: &TypeResolver,
+    self_expand: Option<(&(i64, i64, String), &Type)>,
 ) -> Option<(i64, bool, Type)> {
     let mut current = typ.clone();
     let mut next_raw_id = start_raw_id;
@@ -3632,9 +3681,21 @@ fn expand_without_binding_inner(
         current = freshened;
     }
 
-    // expand_self_type_if_needed: when has_self_type is False and not
-    // is_self/is_super, expand_self_type returns typ unchanged. We only
-    // handle this case (caller sets has_self_type=False).
+    // expand_self_type_if_needed (checkmember.py:2033-2043, is_class=False
+    // for the var arm): expands expand_type({self_type.id: mx.self_type})
+    // between freshen and the by-instance expand; None when no self_type.
+    if let Some((key, repl)) = self_expand {
+        let mut env = HashMap::new();
+        env.insert(key.clone(), repl.clone());
+        current = crate::expandtype::expand_type_with_env_inner(
+            &current,
+            &env,
+            strict_optional,
+            true, // allow_free: Python's expand_type leaves leftovers as-is
+            false, false,
+        )?;
+    }
+
     let expanded = crate::expandtype::expand_type_by_instance_core(
         &current,
         itype,
@@ -3739,8 +3800,152 @@ fn expand_and_bind_callable_inner(
 }
 
 // ---------------------------------------------------------------------------
-// add_class_tvars
+// property callable bind (issue #1288 var-prop-bind)
 // ---------------------------------------------------------------------------
+
+/// Property-callable bind arm of the var dispatch (checkmember.py:1729,
+/// property tail at checkmember.py:2039-2059); no self-type env since
+/// expand_self_type is a no-op for properties (expandtype.py:1347).
+#[allow(clippy::too_many_arguments)]
+fn bind_property_callable_inner(
+    resolver: &NativeTypeResolver,
+    ct: &Type,
+    itype: &Type,
+    self_type: &Type,
+    name: &str,
+    is_trivial_self: bool,
+    preserve_type_var_ids: bool,
+    start_raw_id: i64,
+    strict_optional: bool,
+    is_settable_property: bool,
+    has_setter_type: bool,
+    is_lvalue: bool,
+) -> Option<(i64, bool, Type)> {
+    let r = resolver.resolver();
+    let (nri, ch, expanded) = if is_trivial_self {
+        expand_and_bind_callable_inner(
+            ct,
+            itype,
+            preserve_type_var_ids,
+            start_raw_id,
+            strict_optional,
+            r,
+        )?
+    } else {
+        let mut next_raw_id = start_raw_id;
+        let mut changed = false;
+        let mut current = ct.clone();
+        if !preserve_type_var_ids {
+            let freshened = crate::freshen::freshen_type(
+                &current,
+                &mut next_raw_id,
+                &mut changed,
+                strict_optional,
+            )?;
+            current = freshened;
+        }
+        // checkmember.py:1978 `check_self_arg(typ, mx.self_type,
+        // var.is_classmethod, mx.context, name, mx.msg)`; suppress=False so
+        // an error path defers and Python emits the message.
+        let filtered = check_self_arg_inner(
+            &current,
+            self_type,
+            false,
+            name,
+            strict_optional,
+            r,
+            false,
+        )?;
+        // A plain property callable is a single CallableType; the property
+        // tail destructures one, so an Overloaded self-filter result defers.
+        let plan = match &filtered {
+            Type::CallableType { .. } => plan_item_bind(&filtered)?,
+            _ => return None,
+        };
+        if !plan.bare.is_empty() && contains_tvar_like(self_type) {
+            return None;
+        }
+        let expanded = crate::expandtype::expand_type_by_instance_free(
+            &filtered,
+            itype,
+            r,
+            strict_optional,
+        )?;
+        let mut item = match expanded {
+            Type::CallableType { .. } => expanded,
+            _ => return None,
+        };
+        subst_tvar_keys(&mut item, &plan.bare, self_type);
+        remove_self_vars(&mut item, &plan.self_vars);
+        let mut recv_keys: Vec<BindTVarKey> = Vec::new();
+        if let Type::Instance { args, .. } = itype {
+            for a in args {
+                collect_tvar_keys(a, &mut recv_keys);
+            }
+        }
+        let item = freeze_item(item, &recv_keys)?;
+        let item = bind_self_fast_inner(&item)?;
+        (next_raw_id, changed, item)
+    };
+    let t = property_tail(&expanded, is_settable_property, has_setter_type, is_lvalue)?;
+    Some((nri, ch, t))
+}
+
+/// Property extraction tail of `expand_and_bind_callable`
+/// (checkmember.py:2039-2059): a settable property read as an lvalue with
+/// a setter returns the setter's first arg; a setter carrying typevars defers.
+fn property_tail(
+    expanded: &Type,
+    is_settable_property: bool,
+    has_setter_type: bool,
+    is_lvalue: bool,
+) -> Option<Type> {
+    // Legacy settable-property overloads: select the first item; an empty
+    // overload is a broken one, error already reported.
+    let expanded = match expanded {
+        Type::Overloaded { items } => match items.first() {
+            Some(first) => first,
+            None => {
+                return Some(Type::AnyType {
+                    type_of_any: 5, // TypeOfAny.from_error
+                    source_any: None,
+                    missing_import_name: None,
+                })
+            }
+        },
+        other => other,
+    };
+    match expanded {
+        Type::CallableType {
+            arg_types,
+            ret_type,
+            variables,
+            ..
+        } => {
+            if is_settable_property && is_lvalue && has_setter_type {
+                if !variables.is_empty() {
+                    // check_call needs mx.rvalue; defer to the Python body.
+                    return None;
+                }
+                if arg_types.is_empty() {
+                    // Accessing an invalid property from its own body.
+                    return Some(Type::AnyType {
+                        type_of_any: 5, // TypeOfAny.from_error
+                        source_any: None,
+                        missing_import_name: None,
+                    });
+                }
+                Some(arg_types[0].clone())
+            } else {
+                Some((**ret_type).clone())
+            }
+        }
+        // Python asserts `isinstance(expanded, CallableType)` here; a
+        // non-callable expand result defers so the Python fallback re-runs
+        // from analyze_var (no assert is reached on the re-run).
+        _ => None,
+    }
+}
 
 /// `mypy.checkmember.add_class_tvars` (checkmember.py:1707-1774), the
 /// `is_classmethod + is_trivial_self` path for CallableType, plus the
@@ -4591,6 +4796,132 @@ mod tests {
     }
 
     #[test]
+    fn test_property_tail_getter_returns_ret_type() {
+        let getter = make_callable(vec![ARG_POS], false);
+        let result = property_tail(&getter, false, false, false).expect("getter returns ret");
+        match result {
+            Type::Instance { type_ref, .. } => assert_eq!(type_ref, "builtins.int"),
+            other => panic!("expected ret_type Instance, got {other:?}"),
+        }
+        // Setter facts are ignored off the lvalue arm.
+        let result2 = property_tail(&getter, true, true, false).expect("getter returns ret");
+        assert!(matches!(result2, Type::Instance { .. }));
+    }
+
+    #[test]
+    fn test_property_tail_setter_lvalue_returns_first_arg() {
+        let setter = make_callable(vec![ARG_POS], false);
+        let result = property_tail(&setter, true, true, true).expect("setter lvalue first arg");
+        match result {
+            Type::Instance { type_ref, .. } => assert_eq!(type_ref, "builtins.int"),
+            other => panic!("expected setter arg Instance, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_property_tail_setter_with_variables_defers() {
+        // check_call inference (mx.rvalue) stays Python-side.
+        let mut setter = make_callable(vec![ARG_POS], false);
+        if let Type::CallableType {
+            variables, arg_types, ..
+        } = &mut setter
+        {
+            variables.push(Type::TypeVarType {
+                name: "T".to_string(),
+                fullname: "T".to_string(),
+                raw_id: 1,
+                namespace: "".to_string(),
+                values: vec![],
+                upper_bound: Box::new(make_instance("builtins.object")),
+                default: Box::new(make_instance("builtins.object")),
+                variance: 0,
+                meta_level: 0,
+            });
+            arg_types.clear(); // empty arg_types after variables guard
+        }
+        let result = property_tail(&setter, true, true, true);
+        assert!(result.is_none(), "variables must defer");
+    }
+
+    #[test]
+    fn test_property_tail_setter_empty_args_any_from_error() {
+        let mut setter = make_callable(vec![], false);
+        if let Type::CallableType { arg_types, arg_names, .. } = &mut setter {
+            arg_types.clear();
+            arg_names.clear();
+        }
+        let result = property_tail(&setter, true, true, true).expect("empty setter -> Any");
+        match result {
+            Type::AnyType { type_of_any, .. } => assert_eq!(type_of_any, 5),
+            other => panic!("expected AnyType(from_error), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_property_tail_overloaded() {
+        let first = make_callable(vec![ARG_POS], false);
+        let second = make_callable(vec![ARG_POS], false);
+        // A property callable overload selects the first item; the tail
+        // then returns that item's ret_type (make_callable's ret is int).
+        let result = property_tail(
+            &make_overloaded(vec![first.clone(), second]),
+            false,
+            false,
+            false,
+        )
+        .expect("overload selects first item");
+        match result {
+            Type::Instance { type_ref, .. } => assert_eq!(type_ref, "builtins.int"),
+            other => panic!("expected first item's ret_type, got {other:?}"),
+        }
+        // Broken (empty) overload returns AnyType(from_error).
+        let result2 = property_tail(&make_overloaded(vec![]), false, false, false)
+            .expect("empty overload -> Any");
+        match result2 {
+            Type::AnyType { type_of_any, .. } => assert_eq!(type_of_any, 5),
+            other => panic!("expected AnyType(from_error), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_property_tail_non_callable_defers() {
+        let inst = make_instance("builtins.int");
+        assert!(property_tail(&inst, false, false, false).is_none());
+    }
+
+    #[test]
+    fn test_bind_property_callable_nontrivial() {
+        // Non-trivial arm: a plain Var property getter on the same class.
+        // The full path freshens, filters self, expands, then the property
+        // tail returns the getter's ret_type.
+        let getter = make_callable(vec![ARG_POS], false);
+        let itype = make_instance("builtins.int");
+        let self_type = itype.clone();
+        let result = bind_property_callable_inner(
+            &NativeTypeResolver::new(
+                int_resolver(),
+                crate::aliases::TypeAliasResolver::new(),
+            ),
+            &getter,
+            &itype,
+            &self_type,
+            "x",
+            false,
+            false,
+            100,
+            true,
+            false,
+            false,
+            false,
+        )
+        .expect("non-trivial property bind");
+        match result.2 {
+            Type::Instance { type_ref, .. } => assert_eq!(type_ref, "builtins.int"),
+            other => panic!("expected getter ret_type, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn test_bind_self_fast_strips_first_arg() {
         let method = make_callable(vec![ARG_POS], false);
         let result = bind_self_fast_inner(&method).expect("expected bound callable");
@@ -5103,13 +5434,9 @@ mod tests {
 
     #[test]
     fn test_static_member_tail_defers_meta1_receiver_arg_tvar() {
-        // A caller's fresh (meta_level > 0) unification variable must NOT
-        // ride through the decoded IAMA tail even when it is among the
-        // receiver's args: the wire round-trip arrives here as a doppelganger
-        // with no object-identity link to anything Python-side, and the
-        // solve's freshening fuses identities that live in one object, so
-        // the declared-var association breaks and the target collapses to
-        // `Never` (issue #1286). Defer to the pure-Python body.
+        // A caller's fresh (meta_level > 0) unification variable must not
+        // ride through the decoded IAMA tail: the wire round-trip loses the
+        // identity link, so the declared-var association breaks (#1286).
         let resolver = snap_resolver();
         let mut sig = make_callable(vec![], false);
         if let Type::CallableType { ret_type, .. } = &mut sig {
@@ -5696,8 +6023,9 @@ mod tests {
         let resolver = int_resolver();
         let typ = make_instance("builtins.int");
         let itype = make_instance("builtins.int");
-        let result = expand_without_binding_inner(&typ, &itype, false, 100, true, &resolver)
-            .expect("simple type expands");
+        let result =
+            expand_without_binding_inner(&typ, &itype, false, 100, true, &resolver, None)
+                .expect("simple type expands");
         assert!(!result.1); // no freshening of non-generic type
         match result.2 {
             Type::Instance { type_ref, .. } => assert_eq!(type_ref, "builtins.int"),
@@ -5740,7 +6068,15 @@ mod tests {
             type_is: None,
         };
         let itype = make_instance("builtins.int");
-        let result = expand_without_binding_inner(&callable, &itype, false, 100, true, &resolver);
+        let result = expand_without_binding_inner(
+            &callable,
+            &itype,
+            false,
+            100,
+            true,
+            &resolver,
+            None,
+        );
         // Freshening a generic callable succeeds; expand may defer due to
         // unbound T, but freshen itself must have run (changed=true).
         assert!(result.is_some());

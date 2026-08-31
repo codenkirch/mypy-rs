@@ -224,7 +224,7 @@ pub(crate) fn expand_type_with_env(
 /// typeops.py:2102). The surviving-alias check still applies: a
 /// wire-decoded alias node carries `alias=None` and Python asserts against
 /// it (types.py:397).
-fn expand_type_with_env_inner(
+pub(crate) fn expand_type_with_env_inner(
     typ: &Type,
     env: &HashMap<EnvKey, Type>,
     strict_optional: bool,
@@ -356,10 +356,8 @@ fn expand_type_by_instance_inner(
         return None;
     };
     // Wire-decoded TypeAliasType carries alias=None, which the Python
-    // graph asserts against (is_recursive/_expand_once, types.py:362/397)
-    // unless the shim re-links it. Callers with alias_ok=true run behind
-    // `fixup_wire_type(resolve_aliases=True)`; others defer alias-bearing
-    // input to Python.
+    // graph asserts against (types.py:362/397) unless the shim re-links
+    // it. alias_ok=true callers run behind fixup_wire_type; others defer.
     if !alias_ok && result_contains_typealias(typ) {
         return None;
     }
@@ -1594,9 +1592,8 @@ mod tests {
     #[test]
     fn expand_alias_entry_unmatched_tvar_expands_via_relink() {
         // `expand_type(X[T], {})` leaves T unmatched inside the alias args;
-        // with relink_ok the FFI entry returns the expansion and the Python
-        // shim relinks the decoded TypeVar onto the live original
-        // (`wirefixup.resync_var_identities`, NativeExpandTypeEmptyEnvSuite).
+        // with relink_ok the FFI entry returns the expansion and Python's
+        // shim relinks the TypeVar (wirefixup.resync_var_identities).
         let typ = alias_type("foo.Alias", vec![tvar(0)]);
         let env: HashMap<EnvKey, Type> = HashMap::new();
         match expand_with_env(&typ, &env, false, true) {
