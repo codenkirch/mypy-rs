@@ -661,8 +661,11 @@ fn unknown_unpack_live_inner(t: &Type, aliases: &TypeAliasResolver) -> Option<bo
 ///
 /// `lookup` is a Python callable `Callable[[str], SymbolTableNode | None]`.
 /// Returns `None` (defer) when a type variant is not handled by Rust, or
-/// when a `TypeAliasType` cannot be expanded (no resolver — the Python
-/// fallback then runs the full `HasSelfType` visitor).
+/// when a `TypeAliasType` cannot be expanded over live objects. With no
+/// resolver installed (issue #1308), the live alias expansion still
+/// decides `UnboundType`-carrying shapes; the Python fallback then runs
+/// the full `HasSelfType` visitor only in genuinely undecidable
+/// window cases.
 #[pyfunction]
 pub(crate) fn rust_find_self_type(
     py: Python<'_>,
@@ -678,6 +681,7 @@ pub(crate) fn rust_find_self_type(
         lookup: &SelfLookup::Py(lookup),
         aliases: None,
         seen_aliases: Vec::new(),
+        subst: Vec::new(),
     };
     run_find_self_type(py, &mut ctx, typ)
 }
@@ -706,6 +710,7 @@ pub(crate) fn rust_find_self_type_live(
         lookup: &SelfLookup::Py(lookup),
         aliases: Some(resolver.alias_resolver()),
         seen_aliases: Vec::new(),
+        subst: Vec::new(),
     };
     run_find_self_type(py, &mut ctx, typ)
 }
@@ -727,11 +732,15 @@ pub(crate) struct DeferError;
 struct SelfTypeCtx<'a> {
     refs: &'a TypeRefs<'a>,
     lookup: &'a SelfLookup<'a>,
-    /// Alias snapshots for `TypeAliasType` expansion; `None` defers.
+    /// Alias snapshots for the resolver-backed `TypeAliasType` expansion;
+    /// `None` (the pre-first-SCC semanal window) takes the live expansion.
     aliases: Option<&'a TypeAliasResolver>,
     /// `self.seen_aliases`: identity guard over the whole query,
     /// push-never-pop like the Python set (type_visitor.py:602-608).
     seen_aliases: Vec<usize>,
+    /// Alias-tvar substitution for a live no-snapshot alias expansion
+    /// (`(tvar.id, t.args[i])` pairs); empty when unsubstituted.
+    subst: Vec<(Py<PyAny>, Py<PyAny>)>,
 }
 
 /// `HasSelfType.lookup` shim: the production seam takes a live Python
@@ -785,6 +794,24 @@ fn find_self_type_inner(
     // mirroring visit_type_var / visit_param_spec / visit_type_var_tuple
     // in type_visitor.py.
     if is_instance(obj, ctx.refs.type_var_type) {
+        // Live alias substitution: an alias tvar occurrence is replaced by
+        // the corresponding `t.args` element (InstantiateAliasVisitor
+        // semantics via TypeVarId equality).
+        if !ctx.subst.is_empty() {
+            let id = obj.getattr("id").map_err(|_| DeferError)?;
+            for (key, arg) in &ctx.subst {
+                if key.as_ref(py).eq(id).map_err(|_| DeferError)? {
+                    let arg = arg.clone();
+                    // The substituted arg is already instantiated
+                    // (expand_type semantics): never re-walk it under the
+                    // same subst, or `A[T]` with args `[T]` recurses forever.
+                    let outer = std::mem::take(&mut ctx.subst);
+                    let out = find_self_type_inner(py, arg.as_ref(py), ctx);
+                    ctx.subst = outer;
+                    return out;
+                }
+            }
+        }
         let upper = get_attr_or_defer(obj, "upper_bound")?;
         if find_self_type_inner(py, upper, ctx)? {
             return Ok(true);
@@ -877,11 +904,14 @@ fn find_self_type_inner(
         let item = get_attr_or_defer(obj, "item")?;
         return find_self_type_inner(py, item, ctx);
     }
-    // TypeAliasType: expand through the alias snapshot (issue #1157),
-    // mirroring BoolTypeQuery.visit_type_alias_type — the expanded
-    // proper target, plus `t.args` for PEP 695 aliases.
+    // TypeAliasType: expand through the alias snapshot (issue #1157);
+    // with no snapshot (the pre-first-SCC semanal window) take the live
+    // expansion instead (see self_type_visit_alias_live).
     if is_instance(obj, ctx.refs.type_alias_type) {
-        return self_type_visit_alias(py, obj, ctx);
+        if ctx.aliases.is_some() {
+            return self_type_visit_alias(py, obj, ctx);
+        }
+        return self_type_visit_alias_live(py, obj, ctx);
     }
     // Parameters: recurse arg_types.
     if class_name_is(obj, "Parameters") {
@@ -988,12 +1018,12 @@ fn self_type_callable(
     Ok(false)
 }
 
-/// `BoolTypeQuery.visit_type_alias_type` (type_visitor.py:599-617) with a
-/// resolver: expand the proper target through the alias snapshot, then
-/// re-query the node's own args for new-style aliases. Seen-guard keyed
-/// by node identity, push-never-pop like the Python set. Everything
-/// undecidable (no resolver, missing snapshot, substituted expansion,
-/// unreadable facts) defers.
+/// `BoolTypeQuery.visit_type_alias_type` (type_visitor.py:599-617)
+/// resolver-backed: expand the proper target through the alias snapshot,
+/// then re-query the node's own args for new-style aliases. Seen-guard
+/// keyed by node identity, push-never-pop like the Python set. Called
+/// only with a snapshot installed; missing snapshots, substituted
+/// expansions (the live path handles those), and unreadable facts defer.
 fn self_type_visit_alias(
     py: Python<'_>,
     obj: &PyAny,
@@ -1006,7 +1036,9 @@ fn self_type_visit_alias(
     ctx.seen_aliases.push(key);
     let aliases = match ctx.aliases {
         Some(a) => a,
-        None => return Err(DeferError),
+        None => {
+            return Err(DeferError);
+        }
     };
     let alias = obj.getattr("alias").map_err(|_| DeferError)?;
     if alias.is_none() {
@@ -1023,7 +1055,12 @@ fn self_type_visit_alias(
         .to_string();
     let args_seq = get_attr_or_defer(obj, "args")?;
     let args = iter_seq(args_seq)?;
-    let snap = aliases.get(&type_ref).ok_or(DeferError)?;
+    let snap = match aliases.get(&type_ref) {
+        Some(s) => s,
+        None => {
+            return Err(DeferError);
+        }
+    };
     if snap.no_args && !args.is_empty() {
         // Python copies the live args into the bare target
         // (types.py:453-457) — not representable from the snapshot.
@@ -1039,7 +1076,12 @@ fn self_type_visit_alias(
         args: Vec::new(),
         type_ref: type_ref.clone(),
     };
-    let (target, _, py312) = expanded_alias_target(&bare, aliases).ok_or(DeferError)?;
+    let (target, _, py312) = match expanded_alias_target(&bare, aliases) {
+        Some(t) => t,
+        None => {
+            return Err(DeferError);
+        }
+    };
     let target = if snap.no_args {
         // `_expand_once` for a no_args alias asserts an Instance target
         // and writes `args=[]` over it (types.py:453-457, the live args
@@ -1074,6 +1116,91 @@ fn self_type_visit_alias(
     Ok(false)
 }
 
+/// No-snapshot live alias expansion for the pre-first-SCC semanal window
+/// (issue #1308): mirrors `BoolTypeQuery.visit_type_alias_type`
+/// (type_visitor.py:599-617) plus `TypeAliasType._expand_once`
+/// (types.py:436-461) over live objects instead of the resolver snapshot.
+/// Decisions:
+/// - `alias.tvar_tuple_index` set: the middle-split mapping is not
+///   representable in the tvar map; defer.
+/// - `no_args`: the target is asserted to be an `Instance` and the query
+///   is over `t.args` (the substituted instance's only queried children).
+/// - otherwise: walk `alias.target` with the `(tvar.id -> t.args[i])`
+///   substitution map (zipped, matching Python's `zip` truncation), then
+///   `t.args` for new-style aliases when the target found nothing.
+/// - `alias is None` or an unreadable fact: defer (the Python fallback
+///   surfaces the same assert/error).
+fn self_type_visit_alias_live(
+    py: Python<'_>,
+    obj: &PyAny,
+    ctx: &mut SelfTypeCtx<'_>,
+) -> Result<bool, DeferError> {
+    let key = obj.as_ptr() as usize;
+    if ctx.seen_aliases.contains(&key) {
+        return Ok(false);
+    }
+    ctx.seen_aliases.push(key);
+    let alias = obj.getattr("alias").map_err(|_| DeferError)?;
+    if alias.is_none() {
+        // Python asserts `t.alias is not None`; defer so the fallback
+        // surfaces the same error.
+        return Err(DeferError);
+    }
+    let target = alias.getattr("target").map_err(|_| DeferError)?;
+    let py312 = alias
+        .getattr("python_3_12_type_alias")
+        .map_err(|_| DeferError)?
+        .is_true()
+        .map_err(|_| DeferError)?;
+    let no_args = alias
+        .getattr("no_args")
+        .map_err(|_| DeferError)?
+        .is_true()
+        .map_err(|_| DeferError)?;
+    let args_seq = get_attr_or_defer(obj, "args")?;
+    if no_args {
+        // Python asserts an Instance target and copies `t.args` over it
+        // (types.py:441-444); the substituted instance's only queried
+        // children are its args.
+        let is_inst = is_instance(target, ctx.refs.instance);
+        if !is_inst {
+            return Err(DeferError);
+        }
+        return self_type_any_seq(py, args_seq, ctx);
+    }
+    let tvt_index = alias.getattr("tvar_tuple_index").map_err(|_| DeferError)?;
+    if !tvt_index.is_none() {
+        // split_with_prefix_and_suffix mapping: defer (parity-safe).
+        return Err(DeferError);
+    }
+    let tvars = alias.getattr("alias_tvars").map_err(|_| DeferError)?;
+    let tvars: Vec<Py<PyAny>> = iter_seq(tvars)?
+        .into_iter()
+        .map(|t| t.into_py(py))
+        .collect();
+    let args: Vec<Py<PyAny>> = iter_seq(args_seq)?
+        .into_iter()
+        .map(|t| t.into_py(py))
+        .collect();
+    let outer = std::mem::take(&mut ctx.subst);
+    let mut inner = Vec::new();
+    for (tv, arg) in tvars.iter().zip(args.iter()) {
+        let id = tv.as_ref(py).getattr("id").map_err(|_| DeferError)?;
+        let id = id.into_py(py);
+        inner.push((id, arg.clone()));
+    }
+    ctx.subst = inner;
+    let out = find_self_type_inner(py, target, ctx);
+    ctx.subst = outer;
+    let res = out?;
+    if !res && py312 && !args.is_empty() {
+        // Weird edge case (type_visitor.py:610-615): visit the node's own
+        // arguments when the expansion found nothing, new-style only.
+        return self_type_any_seq(py, obj.getattr("args").map_err(|_| DeferError)?, ctx);
+    }
+    Ok(res)
+}
+
 /// Wire-mode `HasSelfType` query over an expanded alias target with no
 /// live Python types. Decides the same leaf shapes as the live walk and
 /// defers on anything else. The `seen` set substitutes for the Python
@@ -1092,7 +1219,12 @@ fn find_self_type_wire(
                 return Ok(false);
             }
             seen.push(type_ref.clone());
-            let (target, _, py312) = expanded_alias_target(t, aliases).ok_or(DeferError)?;
+            let (target, _, py312) = match expanded_alias_target(t, aliases) {
+                Some(x) => x,
+                None => {
+                    return Err(DeferError);
+                }
+            };
             if find_self_type_wire(&target, lookup, aliases, seen)? {
                 return Ok(true);
             }
