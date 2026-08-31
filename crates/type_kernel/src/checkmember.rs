@@ -2433,13 +2433,10 @@ fn dispatch_var_member_inner(
         .extract::<bool>()
         .ok()?;
     if !fast_absent {
-        match plugin {
-            Some(p) => match p.call_method1("get_attribute_hook", (&fullname,)) {
-                Ok(hook) if hook.is_none() => {}
-                Ok(_) => return None,
-                Err(_) => return None,
-            },
-            None => return None,
+        let p = plugin?;
+        match p.call_method1("get_attribute_hook", (&fullname,)) {
+            Ok(hook) if hook.is_none() => {}
+            _ => return None,
         }
     }
 
