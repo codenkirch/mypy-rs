@@ -424,7 +424,7 @@ def _flush_subtype_batch() -> dict[tuple[bytes, bytes, tuple[bool, ...]], bool]:
     for left_b, right_b, _ in pairs:
         flat.append(left_b)
         flat.append(right_b)
-    # All buffered pairs share one ctx key (the accreting caller only
+    # All buffered pairs share one ctx key (the accumulating caller only
     # buffers under the key it holds), so take the first entry's flags.
     _, _, ctx_key = pairs[0]
     (
@@ -1343,20 +1343,34 @@ class SubtypeVisitor(TypeVisitor[bool]):
                 # Similarly, if one function has `TypeIs` and the other does not,
                 # they are not compatible.
                 return False
-            # Native callable-compat engine (Stage 3c/M8c). Returns None for
-            # unhandled shapes (Parameters, generics, unpack, unpacked-kwargs,
-            # resolver misses), falling through to the Python engine below.
+            # Native callable-compat engine (Stage 3c/M8c). The kernel has no
+            # constraint solver, so the is_callable_compatible prelude runs
+            # here (#1279); unhandled shapes defer to the Python engine below.
+            norm_left = left.with_unpacked_kwargs().with_normalized_var_args()
+            norm_right = right.with_unpacked_kwargs().with_normalized_var_args()
+            ignore_pos = self.subtype_context.ignore_pos_arg_names or (
+                norm_left.implicit or norm_right.implicit
+            )
             if (
                 _HAS_TYPE_KERNEL
                 and _native_subtype_active
                 and _native_subtype_resolver is not None
             ):
+                if norm_right.is_type_obj() and not norm_left.is_type_obj():
+                    return False
+                if norm_left.variables:
+                    unified = unify_generic_callable(norm_left, norm_right, ignore_return=False)
+                    if unified is None:
+                        return False
+                    # Kernel gates on left.variables but never reads them;
+                    # dropping them skips its unify defer.
+                    norm_left = unified.copy_modified(variables=[])
                 try:
                     result = _type_kernel.rust_callables_compatible(
-                        _serialize_type(left),
-                        _serialize_type(right),
+                        _serialize_type(norm_left),
+                        _serialize_type(norm_right),
                         self.proper_subtype,
-                        self.subtype_context.ignore_pos_arg_names,
+                        ignore_pos,
                         (
                             (self.options.extra_checks or self.options.strict_concatenate)
                             if self.options
@@ -1369,12 +1383,15 @@ class SubtypeVisitor(TypeVisitor[bool]):
                     result = None
                 if result is not None:
                     return result
+                # The shim already unified norm_left, so pass the normalized
+                # pair below; re-unifying the original left would allocate a
+                # second round of fresh tvar ids and shift their numbering.
             return is_callable_compatible(
-                left,
-                right,
+                norm_left,
+                norm_right,
                 is_compat=self._is_subtype,
                 is_proper_subtype=self.proper_subtype,
-                ignore_pos_arg_names=self.subtype_context.ignore_pos_arg_names,
+                ignore_pos_arg_names=ignore_pos,
                 strict_concatenate=(
                     (self.options.extra_checks or self.options.strict_concatenate)
                     if self.options
