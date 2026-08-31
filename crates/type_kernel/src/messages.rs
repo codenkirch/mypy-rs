@@ -1575,8 +1575,9 @@ fn append_invariance_notes_inner(
                 None => return None,
             }
         } else if arg_ref == "builtins.dict" && exp_ref == "builtins.dict" {
-            if arg_args.is_empty() || exp_args.is_empty() {
-                // Python would index args[0]/args[1].
+            if arg_args.len() < 2 || exp_args.len() < 2 {
+                // Python would index args[0]/args[1]; a one-arg dict must
+                // defer so the fallback body reproduces its behavior.
                 return None;
             }
             match is_same(&arg_args[0], &exp_args[0], resolver) {
@@ -3127,6 +3128,31 @@ mod tests {
         let r = make_resolver(vec![]);
         let arg = instance("builtins.dict", vec![]);
         assert_eq!(append_invariance_notes_inner(&arg, &arg, &r), None);
+    }
+
+    #[test]
+    fn test_append_invariance_notes_dict_one_arg_defers() {
+        // The arm indexes args[1] after comparing args[0]; a one-arg dict
+        // side would panic index-side, so the guard must defer. The converse
+        // two-arg pair still classifies as before.
+        let r = make_resolver(vec![
+            snap("builtins.str", "str"),
+            snap("builtins.object", "object"),
+        ]);
+        let one = instance("builtins.dict", vec![instance("builtins.str", vec![])]);
+        let two = instance(
+            "builtins.dict",
+            vec![
+                instance("builtins.str", vec![]),
+                instance("builtins.str", vec![]),
+            ],
+        );
+        assert_eq!(append_invariance_notes_inner(&one, &two, &r), None);
+        assert_eq!(append_invariance_notes_inner(&two, &one, &r), None);
+        assert_eq!(append_invariance_notes_inner(&one, &one, &r), None);
+        let notes = append_invariance_notes_inner(&two, &two, &r).unwrap();
+        assert_eq!(notes.len(), 2);
+        assert!(notes[0].contains("\"dict\" is invariant"));
     }
 
     #[test]
