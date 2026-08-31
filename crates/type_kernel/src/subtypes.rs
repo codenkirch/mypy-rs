@@ -1454,7 +1454,10 @@ fn visit_instance_noninstance_right(
             // class object is expected.)
             if left_ref == "builtins.type" {
                 let special_any = Type::AnyType {
-                    type_of_any: 0, // TypeOfAny.special_form
+                    // TypeOfAny.special_form (types.py:309), mirroring
+                    // subtypes.py:789-792's TypeType.make_normalized(
+                    // AnyType(TypeOfAny.special_form)).
+                    type_of_any: ANY_SPECIAL_FORM,
                     source_any: None,
                     missing_import_name: None,
                 };

@@ -20,6 +20,16 @@ use crate::subtypes::SubtypeContext;
 use crate::typeinfo::NativeTypeResolver;
 use crate::wire::Type;
 
+/// `TypeOfAny.special_form` == 6. Special forms are not real Any types
+/// (types.py:309); the join/meet shims build AnyType(special_form) for
+/// a whole-result disc 4 (join.py:241, meet.py:194).
+const TYPE_OF_ANY_SPECIAL_FORM: i64 = 6;
+
+/// `TypeOfAny.from_another_any` == 7. The source is the Any operand
+/// (types.py:311); the join body builds this for a per-arg disc 4
+/// (join.py:131-135, :282-295, pure body join.py:335-338).
+const TYPE_OF_ANY_FROM_ANOTHER_ANY: i64 = 7;
+
 /// Convert a `SetOpResult` from `meet_types` back into a concrete `Type`.
 /// Mirrors the inline conversion in `setops.rs` (around line 672).
 fn meet_result_to_type(r: SetOpResult, s: &Type, t: &Type) -> Option<Type> {
@@ -28,7 +38,7 @@ fn meet_result_to_type(r: SetOpResult, s: &Type, t: &Type) -> Option<Type> {
         SetOpResult::SameT => Some(t.clone()),
         SetOpResult::Bottom => Some(Type::UninhabitedType { ambiguous: true }),
         SetOpResult::Any => Some(Type::AnyType {
-            type_of_any: 3,
+            type_of_any: TYPE_OF_ANY_SPECIAL_FORM,
             source_any: None,
             missing_import_name: None,
         }),
@@ -67,8 +77,9 @@ fn meet_result_to_type(r: SetOpResult, s: &Type, t: &Type) -> Option<Type> {
     }
 }
 
-/// Reconstruct per-arg types from discriminators. 0=left (s), 1=right (t),
-/// 4=AnyType(from_another_any). Mirrors `setops.rs` (SameTypeWithArgs arm).
+/// Reconstruct per-arg types from discriminators. 0=left (s), 1=right
+/// (t), 4=AnyType(from_another_any, Any side, t preferred),
+/// mirroring `setops.rs` (SameTypeWithArgs arm) and join.py:335-338.
 fn reconstruct_args_from_discs(arg_discs: &[i8], s_args: &[Type], t_args: &[Type]) -> Vec<Type> {
     arg_discs
         .iter()
@@ -76,11 +87,18 @@ fn reconstruct_args_from_discs(arg_discs: &[i8], s_args: &[Type], t_args: &[Type
         .map(|(i, d)| match d {
             0 => s_args[i].clone(),
             1 => t_args[i].clone(),
-            4 => Type::AnyType {
-                type_of_any: 3,
-                source_any: None,
-                missing_import_name: None,
-            },
+            4 => {
+                let src = if matches!(t_args[i], Type::AnyType { .. }) {
+                    t_args[i].clone()
+                } else {
+                    s_args[i].clone()
+                };
+                Type::AnyType {
+                    type_of_any: TYPE_OF_ANY_FROM_ANOTHER_ANY,
+                    source_any: Some(Box::new(src)),
+                    missing_import_name: None,
+                }
+            }
             _ => s_args[i].clone(),
         })
         .collect()
@@ -336,4 +354,79 @@ pub(crate) fn rust_or_conditional_maps(
     }
 
     Ok(Some((out_keys, out_vals)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn any() -> Type {
+        Type::AnyType {
+            type_of_any: 1,
+            source_any: None,
+            missing_import_name: None,
+        }
+    }
+
+    fn inst() -> Type {
+        Type::Instance {
+            type_ref: "builtins.int".to_string(),
+            args: vec![],
+            last_known_value: None,
+            extra_attrs: None,
+        }
+    }
+
+    #[test]
+    fn meet_result_any_is_special_form() {
+        // meet.py mirror: Any-typed meet result is
+        // AnyType(TypeOfAny.special_form), not unannotated (types.py:309).
+        let r = meet_result_to_type(SetOpResult::Any, &inst(), &inst()).unwrap();
+        match r {
+            Type::AnyType {
+                type_of_any,
+                source_any,
+                missing_import_name,
+            } => {
+                assert_eq!(type_of_any, TYPE_OF_ANY_SPECIAL_FORM);
+                assert!(source_any.is_none());
+                assert!(missing_import_name.is_none());
+            }
+            other => panic!("expected AnyType, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reconstruct_disc4_is_from_another_any() {
+        // Per-arg disc 4 mirrors the join body: AnyType(7, Any side),
+        // t (right) preferred (join.py:131-135, :282-295, :335-338).
+        let s_inst = inst();
+        let t_any = any();
+        let out = reconstruct_args_from_discs(&[4], &[s_inst.clone()], &[t_any.clone()]);
+        match &out[0] {
+            Type::AnyType {
+                type_of_any,
+                source_any,
+                ..
+            } => {
+                assert_eq!(*type_of_any, TYPE_OF_ANY_FROM_ANOTHER_ANY);
+                assert_eq!(source_any.as_deref().map(|s| s == &t_any), Some(true));
+            }
+            other => panic!("expected AnyType, got {other:?}"),
+        }
+        // Non-Any t and s sides: source is the s operand verbatim
+        // (join.py:285-294 wraps s when t is not Any).
+        let out = reconstruct_args_from_discs(&[4], &[s_inst.clone()], &[s_inst.clone()]);
+        match &out[0] {
+            Type::AnyType {
+                type_of_any,
+                source_any,
+                ..
+            } => {
+                assert_eq!(*type_of_any, TYPE_OF_ANY_FROM_ANOTHER_ANY);
+                assert_eq!(source_any.as_deref().map(|s| s == &s_inst), Some(true));
+            }
+            other => panic!("expected AnyType, got {other:?}"),
+        }
+    }
 }

@@ -26,6 +26,25 @@ use crate::wire::{read_type, write_type, LiteralValue, ReadBuffer, Type, WriteBu
 /// `TypeOfAny.special_form` == 6. Special forms are not real Any types.
 const TYPE_OF_ANY_SPECIAL_FORM: i64 = 6;
 
+/// `TypeOfAny.from_another_any` == 7. The source is the Any operand.
+const TYPE_OF_ANY_FROM_ANOTHER_ANY: i64 = 7;
+
+/// Same-type-with-args join disc 4: the joined arg is
+/// `AnyType(from_another_any, <Any side>)`, t-preferred
+/// (join.py:131-135, :282-295, :335-338); s verbatim when t is not Any.
+fn joined_arg_any(src_s: &Type, src_t: &Type) -> Type {
+    let src = if matches!(src_t, Type::AnyType { .. }) {
+        src_t.clone()
+    } else {
+        src_s.clone()
+    };
+    Type::AnyType {
+        type_of_any: TYPE_OF_ANY_FROM_ANOTHER_ANY,
+        source_any: Some(Box::new(src)),
+        missing_import_name: None,
+    }
+}
+
 /// `TypeOfAny.unannotated` == 1.
 const TYPE_OF_ANY_UNANNOTATED: i64 = 1;
 
@@ -1787,11 +1806,14 @@ fn conditional_join_inner(
     // Build the subtype context: strict_optional = true (safe default).
     let ctx = SubtypeContext::new(false, false, false, false, false, true);
 
-    // Re-use setops::trivial_join which handles the common cases:
-    // - subtype check s <: t → return t
-    // - subtype check t <: s → return s
+    // join.py:651: `join(Any, t) = Any` — Python returns the s operand
+    // itself (preserving its type_of_any / source). Without this the
+    // subtype kernel's `Any <: X = True` fast path returns the other side.
+    if matches!(if_type, Type::AnyType { .. }) {
+        return encode_type(if_type);
+    }
 
-    // - Instance right → return object
+    // trivial_join handles s <: t -> t, t <: s -> s, Instance-right -> object.
     match crate::setops::trivial_join(if_type, else_type, &ctx, resolver) {
         Some(crate::setops::SetOpResult::SameS) => encode_type(if_type),
         Some(crate::setops::SetOpResult::SameT) => encode_type(else_type),
@@ -1815,9 +1837,10 @@ fn conditional_join_inner(
             })
         }
         Some(crate::setops::SetOpResult::Any) => {
-            // Any is the universal supertype.
+            // Any is the universal supertype: the join shim's disc-4
+            // arm is AnyType(TypeOfAny.special_form) (join.py:547).
             encode_type(&Type::AnyType {
-                type_of_any: 0, // TYPE_OF_ANY_SPECIAL_FORM
+                type_of_any: TYPE_OF_ANY_SPECIAL_FORM,
                 source_any: None,
                 missing_import_name: None,
             })
@@ -1852,19 +1875,19 @@ fn conditional_join_inner(
             if arg_discs.len() != if_args.len() || arg_discs.len() != else_args.len() {
                 return None;
             }
-            let final_args: Vec<Type> = arg_discs
+            let final_args: Option<Vec<Type>> = arg_discs
                 .iter()
                 .enumerate()
                 .map(|(i, &d)| match d {
-                    0 => if_args[i].clone(),
-                    1 => else_args[i].clone(),
-                    _ => Type::AnyType {
-                        type_of_any: 0,
-                        source_any: None,
-                        missing_import_name: None,
-                    },
+                    0 => Some(if_args[i].clone()),
+                    1 => Some(else_args[i].clone()),
+                    // Disc 4: joined arg is Any (from_another_any, Any
+                    // side); other discs defer. See `joined_arg_any`.
+                    4 => Some(joined_arg_any(&if_args[i], &else_args[i])),
+                    _ => None,
                 })
                 .collect();
+            let final_args = final_args?;
             encode_type(&Type::Instance {
                 type_ref,
                 args: final_args,
@@ -2114,19 +2137,19 @@ fn join_one_pair(
             if arg_discs.len() != l_args.len() || arg_discs.len() != r_args.len() {
                 return None;
             }
-            let final_args: Vec<Type> = arg_discs
+            let final_args: Option<Vec<Type>> = arg_discs
                 .iter()
                 .enumerate()
                 .map(|(i, &d)| match d {
-                    0 => l_args[i].clone(),
-                    1 => r_args[i].clone(),
-                    _ => Type::AnyType {
-                        type_of_any: 0,
-                        source_any: None,
-                        missing_import_name: None,
-                    },
+                    0 => Some(l_args[i].clone()),
+                    1 => Some(r_args[i].clone()),
+                    // Disc 4: joined arg is Any (from_another_any, Any
+                    // side); other discs defer. See `joined_arg_any`.
+                    4 => Some(joined_arg_any(&l_args[i], &r_args[i])),
+                    _ => None,
                 })
                 .collect();
+            let final_args = final_args?;
             Some(Type::Instance {
                 type_ref,
                 args: final_args,
@@ -5135,16 +5158,17 @@ mod tests {
 
     #[test]
     fn test_conditional_join_object_right_returns_object() {
-        // Instance right → trivial_join fast-path returns Object (line 115).
-        // Left is a non-Instance (Any) so the left-Instance gate is skipped
-        // and the Object result is produced without needing the resolver.
+        // join.py:651: `join(Any, t) = Any` fires before the Instance-
+        // right fast path, so the s operand (Any itself) is returned.
         let any = make_any(TYPE_OF_ANY_SPECIAL_FORM);
         let obj = make_instance("builtins.object", vec![]);
         let out = conditional_join_inner(&any, &obj, &empty_resolver()).unwrap();
         let decoded = decode_type(&out).unwrap();
         match decoded {
-            Type::Instance { type_ref, .. } => assert_eq!(type_ref, "builtins.object"),
-            other => panic!("expected object, got {other:?}"),
+            Type::AnyType { type_of_any, .. } => {
+                assert_eq!(type_of_any, TYPE_OF_ANY_SPECIAL_FORM)
+            }
+            other => panic!("expected Any, got {other:?}"),
         }
     }
 
@@ -5609,6 +5633,21 @@ mod tests {
             }
             other => panic!("expected AnyType(2, Some(...)), got {:?}", other),
         }
+    }
+
+    #[test]
+    fn conditional_join_any_left_is_passthrough() {
+        // join.py:651: `join(Any, t) = Any` returning the s operand
+        // itself, preserving its type_of_any (5 here) and source.
+        let any = Type::AnyType {
+            type_of_any: 5,
+            source_any: None,
+            missing_import_name: None,
+        };
+        let int_t = make_instance("builtins.int", vec![]);
+        let bytes = conditional_join_inner(&any, &int_t, &TypeResolver::new()).unwrap();
+        let decoded = decode_type(&bytes).unwrap();
+        assert_eq!(decoded, any);
     }
 }
 

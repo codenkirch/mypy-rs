@@ -1785,7 +1785,9 @@ fn expand_actual_arg(
             // Iterable unpacking / TypeVarTuple upper bound: defer.
             Type::Instance { .. } | Type::TypeVarTupleType { .. } => None,
             _ => Some(Type::AnyType {
-                type_of_any: 2, // TypeOfAny.from_error
+                // AnyType(TypeOfAny.from_error) (types.py:309; value 5),
+                // mirroring argmap.py:402/429.
+                type_of_any: 5,
                 source_any: None,
                 missing_import_name: None,
             }),
@@ -1809,7 +1811,9 @@ fn expand_actual_arg(
             // Mapping unpacking: defer.
             Type::Instance { .. } => None,
             _ => Some(Type::AnyType {
-                type_of_any: 2,
+                // AnyType(TypeOfAny.from_error) (types.py:309; value 5),
+                // mirroring argmap.py:429 (ARG_STAR2 tail).
+                type_of_any: 5,
                 source_any: None,
                 missing_import_name: None,
             }),

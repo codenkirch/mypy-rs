@@ -797,19 +797,31 @@ fn join_one_pair(
             if arg_discs.len() != l_args.len() || arg_discs.len() != r_args.len() {
                 return None;
             }
-            let final_args: Vec<Type> = arg_discs
+            let final_args: Option<Vec<Type>> = arg_discs
                 .iter()
                 .enumerate()
                 .map(|(i, &d)| match d {
-                    0 => l_args[i].clone(),
-                    1 => r_args[i].clone(),
-                    _ => Type::AnyType {
-                        type_of_any: 0,
-                        source_any: None,
-                        missing_import_name: None,
-                    },
+                    0 => Some(l_args[i].clone()),
+                    1 => Some(r_args[i].clone()),
+                    // Disc 4: AnyType arg -> AnyType(7, Any side)
+                    // (join.py:335-338, shim join.py:283-295); t-preferred,
+                    // s verbatim when t is not Any. Other discs defer.
+                    4 => {
+                        let src = if matches!(r_args[i], Type::AnyType { .. }) {
+                            r_args[i].clone()
+                        } else {
+                            l_args[i].clone()
+                        };
+                        Some(Type::AnyType {
+                            type_of_any: TYPE_OF_ANY_FROM_ANOTHER_ANY,
+                            source_any: Some(Box::new(src)),
+                            missing_import_name: None,
+                        })
+                    }
+                    _ => None,
                 })
                 .collect();
+            let final_args = final_args?;
             Some(Type::Instance {
                 type_ref,
                 args: final_args,
@@ -3142,5 +3154,72 @@ mod tests {
             rust_restrict_subtype_away(&t, &s, true, true, &mut native),
             None
         );
+    }
+
+    #[test]
+    fn join_one_pair_disc4_any_arg_is_from_another_any() {
+        // join(G[Any-5, int], G[int, Any-7]) with two invariant tvars:
+        // both args are Any (disc 4). The mirror is AnyType(7, Any side)
+        // with the t (right) side preferred (join.py:335-338).
+        let mut r = TypeResolver::new();
+        let mut g_sn = TypeInfoSnapshot {
+            fullname: "g.G".to_string(),
+            name: "G".to_string(),
+            type_vars_with_variance: vec![
+                ("T1".to_string(), crate::subtypes::INVARIANT, 0),
+                ("T2".to_string(), crate::subtypes::INVARIANT, 0),
+            ],
+            ..Default::default()
+        };
+        g_sn.mro.push("g.G".to_string());
+        g_sn.has_base.insert("g.G".to_string());
+        r.insert("g.G".to_string(), g_sn);
+        let ctx = crate::subtypes::SubtypeContext::new(false, false, false, false, false, true);
+        let any_left = Type::AnyType {
+            type_of_any: 5,
+            source_any: None,
+            missing_import_name: None,
+        };
+        let any_right = Type::AnyType {
+            type_of_any: 6,
+            source_any: None,
+            missing_import_name: None,
+        };
+        let s = make_instance(
+            "g.G",
+            vec![any_left.clone(), make_instance("builtins.int", vec![])],
+        );
+        let t = make_instance(
+            "g.G",
+            vec![make_instance("builtins.int", vec![]), any_right.clone()],
+        );
+        let out = join_one_pair(&s, &t, &ctx, &r).unwrap();
+        match out {
+            Type::Instance { args, .. } => {
+                // right arg not Any -> source is the left Any (5); right
+                // arg is Any -> source is itself (6).
+                match (&args[0], &args[1]) {
+                    (
+                        Type::AnyType {
+                            type_of_any: toa0,
+                            source_any: src0,
+                            ..
+                        },
+                        Type::AnyType {
+                            type_of_any: toa1,
+                            source_any: src1,
+                            ..
+                        },
+                    ) => {
+                        assert_eq!(*toa0, TYPE_OF_ANY_FROM_ANOTHER_ANY);
+                        assert_eq!(src0.as_ref().unwrap().as_ref(), &any_left);
+                        assert_eq!(*toa1, TYPE_OF_ANY_FROM_ANOTHER_ANY);
+                        assert_eq!(src1.as_ref().unwrap().as_ref(), &any_right);
+                    }
+                    other => panic!("expected AnyType args, got {other:?}"),
+                }
+            }
+            other => panic!("expected Instance, got {other:?}"),
+        }
     }
 }
