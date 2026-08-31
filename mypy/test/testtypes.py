@@ -46723,7 +46723,7 @@ class NativeProtocolMemberMissSuite(Suite):
         # The resolver snapshot serializes `info.bases`; real TypeInfos
         # carry them, and the accessor arm's map_instance_to_supertype
         # needs the derivation path.
-        info.bases = list(mro_bases)
+        info.bases = [Instance(b, []) for b in mro_bases]
         if protocol:
             info.is_protocol = True
         if fallback_to_any:
