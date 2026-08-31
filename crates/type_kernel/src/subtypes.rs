@@ -2001,7 +2001,12 @@ pub(crate) fn map_instance_to_supertype(
     right_ref: &str,
     resolver: &TypeResolver,
 ) -> Option<Vec<Type>> {
-    let _left_snap = resolver.get(left_ref)?;
+    let _left_snap = match resolver.get(left_ref) {
+        Some(s) => s,
+        None => {
+            return None;
+        }
+    };
     // Fast path: left.type == right.type (maptype.py:15-17).
     if left_ref == right_ref {
         return Some(left_args.to_vec());
@@ -2029,7 +2034,12 @@ fn map_derivation_path(
     }
     let expand = |typ: &Type| -> Option<Type> { expand_type_by_instance(typ, left_ref, left_args) };
     for base_blob in &left_snap.bases {
-        let base = decode_type(base_blob)?;
+        let base = match decode_type(base_blob) {
+            Some(b) => b,
+            None => {
+                return None;
+            }
+        };
         if let Type::Instance {
             type_ref: base_ref,
             args: _base_args,
@@ -2038,7 +2048,12 @@ fn map_derivation_path(
         {
             if base_ref == right_ref {
                 // Direct base: expand base's args by left's frame.
-                let expanded = expand(&base)?;
+                let expanded = match expand(&base) {
+                    Some(e) => e,
+                    None => {
+                        return None;
+                    }
+                };
                 if let Type::Instance { args, .. } = expanded {
                     return Some(args);
                 }
@@ -2046,7 +2061,12 @@ fn map_derivation_path(
             }
             // Multi-level: recurse through this base. First map left to
             // this base's frame, then continue from there.
-            let mapped = expand(&base)?;
+            let mapped = match expand(&base) {
+                Some(m) => m,
+                None => {
+                    return None;
+                }
+            };
             if let Type::Instance {
                 type_ref: mid_ref,
                 args: mid_args,
