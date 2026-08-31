@@ -672,6 +672,34 @@ including:
   `mypy/test/testtypes.py` (gate-off vs gate-on differential on the
   result string, error messages, and defer / record counts), plus pure
   decision unit tests in `typeanal_unbound2.rs`.
+- `rust_analyze_unbound_without_info` (issue #1278) — mirrors the full
+  back seam `TypeAnalyser.analyze_unbound_type_without_type_info`
+  (typeanal.py:986-1107), the hook the unbound-front classifier's
+  deferred branches route into. The Python shim computes raw node facts
+  (isinstance chain on the live `sym.node`, the `sym.fullname` ->
+  `node.name` fallback, and skip-to-assert when both are None) and Rust
+  decides the ordered table: Var typed Any; under `allow_type_any` the
+  `type` special form and `TypeType[Any]`
+  (`AnyType(from_another_any, source_any=...)`); the unbound type
+  variable kept under `allow_unbound_tvars` or rejected with the
+  PEP 695 / classic split; the enum member as a `LiteralType` inside
+  Literal or the raw-enum error outside; then the message-tail kinds
+  (Var / function symbol / MypyFile / other) from the shim-precomputed
+  `tail_kind` plus the resolved `name`, with the
+  `builtins.any` / `builtins.callable` / callback-protocol notes
+  returned as note tags. Python keeps `tvar_scope.get_binding` (a fact
+  input), the `anal_array` arg re-analysis, all result-object
+  construction on live objects, and every fail/note emission keyed by
+  the returned tag. Never defers on well-formed facts. Gated by
+  `_set_native_typeanal_active` (wired from `mypy/build.py`) and
+  covered by `NativeUnboundWithoutTypeInfoSuite` in
+  `mypy/test/testtypes.py` (gate-off vs gate-on differential on
+  `str(result)` and captured fail/note messages, plus direct seam calls
+  for every table branch), and 10 pure decision unit tests in
+  `typeanal_unbound.rs`. Cold self-check: 574 calls @ 19% -> 570 @
+  100% native (0 defers; the audit's decidable buckets were
+  tail:Var 310, tail:FuncLike 119, tvar_rejected 22, tail:MypyFile 14,
+  type_type_any 1).
 - `rust_classify_special_unbound` (issue #720) — mirrors the special-form
   dispatch classifier of
   `mypy.typeanal.TypeAnalyser.try_analyze_special_unbound_type`

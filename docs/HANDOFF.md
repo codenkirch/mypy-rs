@@ -26,7 +26,6 @@ loop. This file is the resume point.*
   check_overload_call 13,125 @ 95% (656),
   analyze_instance_member_access 689 @ 17% (572),
   callables_compatible 503 @ 1% (498),
-  analyze_unbound_without_info 568 @ 19% (460),
   expand_type_by_instance 1,010 @ 56% (444),
   type_object_type_from_function 1,797 @ 84% (288),
   is_overlapping_types 2,834 @ 90% (283),
@@ -39,6 +38,9 @@ loop. This file is the resume point.*
   904 @ 64% -> 74 @ 28% (~53 defers; basis changed with the #1270
   core-routing, see "In flight: #1266"); infer_constraints_full 213
   @ 99% held; solve_generic_call 245 @ 97% held.
+- Post-survey12 win: analyze_unbound_without_info 574 @ 19% (466
+  defer buckets tail:Var 310 / tail:FuncLike 119 / tvar_rejected 22 /
+  tail:MypyFile 14 / type_type_any 1) -> 570 @ 100% (0 defers, #1278).
 - Runner/OCR note: the repo's ephemeral runner cannot re-register (403,
   admin-blocked; #1249 open). OCR gates stay `queued` forever; use the
   local fallback (`ocr review --from <merge-base> --to <head> --format
@@ -188,7 +190,6 @@ and stashes are pre-existing — leave them.
 4. Next-wave queue from survey12 (file issues with these numbers, then
    dispatch ~2):
    - **analyze_instance_member_access 689 @ 17%** (572 defers).
-   - **analyze_unbound_without_info 568 @ 19%** (460 defers).
    - **callables_compatible 503 @ 1%** (498 defers; low volume but
      near-total defer).
    - Then: expand_type_by_instance 1,010 @ 56% (#1113 buckets

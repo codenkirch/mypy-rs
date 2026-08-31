@@ -2198,6 +2198,9 @@ def rust_analyze_unbound_without_info(
     allow_unbound_tvars: bool,
     is_enum_member: bool,
     defining_literal: Any,
+    is_new_style: bool,
+    tail_kind: int,
+    name: str,
 ) -> Any: ...
 def rust_any_causes_overload_ambiguity(
     resolver: NativeTypeResolver,
