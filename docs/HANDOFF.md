@@ -65,18 +65,27 @@ Discovered during the wave, not yet fixed:
   checker_helpers/checkexpr_functions, acknowledged in the PR body,
   unfiled)
 
-## In flight: #1266 (join_type_list round 2) — PART DONE, resume here
+## Closed: #1266 (join_type_list round 2) history and residual walls
 
-STATUS 2026-08-31: round 1 (route mid-fold pair defers through the
-#824 `join_instances_core`) MERGED as #1270. Post-merge survey12:
-join_type_list 74 calls @ 28% (~53 defers). What remains is design
-part 1: the shim early path for n<=1 at the top of `join_type_list`
-in `mypy/join.py`, before the native gate and serialization (kills
-the 889 n==1 single-unsafe defers and 2,629 serializations). All
-numbers below are pre-#1270 audit history.
+STATUS 2026-08-31, CLOSED. Round 1 (route mid-fold pair defers through
+the #824 `join_instances_core`) and design part 1 (the n<=1 shim early
+path) BOTH LANDED in #1270; the "design part 1 remains" text below was
+written pre-#1270 and is stale. Routing n<=1 lists THROUGH the Rust
+single-item passthrough would regress, not improve: a single item
+would come back as a wire-decoded copy instead of the live
+`types[0]`, and the non-round-trippable singleton shapes (`tv|T` 333,
+`union|n2` 158, `params` 93, dict tvs 74) defer inside the kernel
+anyway. Post-merge residual (survey12): 74 whole-call events @ 28%
+native, ~53 defers (lkv 39, join_instances_core-declined pairs 9,
+join_one_pair arg_disc-4 4); all three walls are Rust-side, tracked in
+#1281 (round 3). Regression lock added on top of #1270:
+`NativeJoinTypeListSuite.test_nle1_lists_never_cross_ffi` forbids FFI
+crossings for length <= 1 lists (uses RuntimeError because the shim
+catches AssertionError and would silently fall back).
 
-Written 2026-08-30 21:35 during the audit phase; design settled. Issue
-#1266 assigned to @Jonathangadeaharder.
+Audit history (pre-#1270 numbers, written 2026-08-30 21:35 during the
+audit phase; design settled. Issue #1266 assigned to
+@Jonathangadeaharder):
 
 - **Setup**: worktree `/Users/jonathangadeaharder/projects/coding-utils/
   mypy-rs-i1266`, branch `perf/1266` at `f76d216bd`, two modified files
@@ -119,25 +128,16 @@ Written 2026-08-30 21:35 during the audit phase; design settled. Issue
      — record as residual. Post-port expectation: ~10-20 defers on
      2,715 entries (>=99% native); measure with the same audit env and
      update this section's numbers in the PR body.
-- **TEMP AUDIT instrumentation is live in TWO files and MUST be
-  stripped before commit**: `mypy/join.py` `join_type_list` (two hunks,
-  `# TEMP AUDIT #1266`, ~lines 1510-1541) and
-  `crates/type_kernel/src/checker_helpers.rs` `join_type_list_inner`
-  (`=== TEMP AUDIT #1266 ===` blocks incl. `jtl_log`/`jtl_tag`, ~lines
-  678-800). After stripping: rebuild (worktree `cargo rustc
-  --manifest-path <worktree>/crates/type_kernel/Cargo.toml -p
-  mypy-type-kernel --features extension-module --lib --crate-type
-  cdylib --release -- -C link-arg=-undefined
-  -C link-arg=dynamic_lookup`; cargo from the worktree root — a plain
-  `cargo rustc` in another checkout builds the wrong tree silently).
-- **Remaining sequence**: strip instrumentation → implement the two
-  design parts → cargo test → testtypes + testcheck parity (-n4) →
-  self-check clean → measure post-port numbers → commit (`perf:
-  ...` conventional) → push `perf/1266` → PR to `main` → pr-gate +
-  parity green → runner-403 fallback OCR (`runners/_shared/
-  ocr-review-pr.sh`) → merge `--squash --admin` → refresh shared `.so`
-  set (`/private/tmp/mypy-rs-local-typekernel|resolver|ast`) → update
-  this file's numbers + close #1266.
+- **TEMP AUDIT instrumentation** was stripped before the #1270 commit
+  (it had lived in `mypy/join.py` `join_type_list` and
+  `checker_helpers.rs` `join_type_list_inner`); the audit env was
+  `MYPY_TK_JTL_AUDIT` with the instrumented build at
+  `/private/tmp/mypy-rs-local-tk-i1266/`.
+- Archive note (implementation consumed by #1270): strip
+  instrumentation → implement the two design parts → cargo test →
+  testtypes + testcheck parity (-n4) → self-check clean → measure
+  post-port numbers → commit → PR → pr-gate + parity green →
+  fallback OCR → merge `--squash --admin` → refresh shared `.so` set.
 - Shared-`.so` hygiene: `/private/tmp/mypy-rs-local-typekernel/` was
   accidentally overwritten with the instrumented build on 2026-08-30
   ~21:22 and restored to the `f76d216bd` baseline (5645616-byte dylib
