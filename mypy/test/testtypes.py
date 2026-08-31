@@ -27013,7 +27013,7 @@ class NativeUntypedDecoratorSuite(Suite):
         from mypy.nodes import MDEF, SymbolTableNode
 
         info = self._fixture_info()
-        info.names["__call__"] = SymbolTableNode(MDEF, method)
+        info.names["__call__"] = SymbolTableNode(MDEF, method)  # type: ignore[arg-type]
         return Instance(info, [])
 
     def _fixture_info(self) -> TypeInfo:
@@ -27039,7 +27039,7 @@ class NativeUntypedDecoratorSuite(Suite):
         info = self._fixture_info()
         func = self._method_fdef(func_type)
         var = Var("__call__")
-        var.type = var_type  # type: ignore[assignment]
+        var.type = var_type
         dec = Decorator(func, [], var)
         info.names["__call__"] = SymbolTableNode(GDEF, dec)
         return dec
