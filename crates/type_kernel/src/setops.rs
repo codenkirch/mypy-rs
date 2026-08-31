@@ -4695,12 +4695,7 @@ fn join_diff_instances_with_args(
     // join.py:403 dispatch: Python decides direction with
     // is_proper_subtype(t, s, ignore_type_params=True) on the FULL
     // instances (args-less mapping defers on tvar base blobs).
-    let t_snap = match resolver.get(t_ref) {
-        Some(snap) => snap,
-        None => {
-            return None;
-        }
-    };
+    let t_snap = resolver.get(t_ref)?;
     let proper_ctx = SubtypeContext {
         proper_subtype: true,
         ignore_type_params: true,
@@ -4709,12 +4704,7 @@ fn join_diff_instances_with_args(
     let t_full = mk_wire_instance(t_ref, t_args.to_vec());
     let s_full = mk_wire_instance(s_ref, s_args.to_vec());
     let t_lt_s = if !t_snap.bases.is_empty() {
-        match is_subtype(&t_full, &s_full, &proper_ctx, resolver) {
-            Some(v) => v,
-            None => {
-                return None;
-            }
-        }
+        is_subtype(&t_full, &s_full, &proper_ctx, resolver)?
     } else {
         false
     };
@@ -4740,9 +4730,7 @@ fn join_diff_instances_with_args(
         Some(SetOpResult::Object)
     } else {
         let mut wbuf = WriteBuffer::new();
-        if wire::write_type(&mut wbuf, &result).is_err() {
-            return None;
-        }
+        wire::write_type(&mut wbuf, &result).ok()?;
         Some(SetOpResult::Encoded(wbuf.into_bytes()))
     }
 }
@@ -4779,34 +4767,16 @@ fn via_supertype_arg_type(
     // join.py:352-361: _promote walks. First loop returns s (t wins the
     // promote); second returns t.
     for pb in &t_snap.promote_bytes {
-        let p = match decode_type(pb) {
-            Some(p) => p,
-            None => {
-                return None;
-            }
-        };
-        match is_subtype(&p, &s_inst, ctx, resolver) {
-            Some(true) => return Some(s_inst),
-            Some(false) => {}
-            None => {
-                return None;
-            }
+        let p = decode_type(pb)?;
+        if is_subtype(&p, &s_inst, ctx, resolver)? {
+            return Some(s_inst);
         }
     }
     if let Some(ss) = &s_snap {
         for pb in &ss.promote_bytes {
-            let p = match decode_type(pb) {
-                Some(p) => p,
-                None => {
-                    return None;
-                }
-            };
-            match is_subtype(&p, &t_inst, ctx, resolver) {
-                None => {
-                    return None;
-                }
-                Some(true) => return Some(t_inst),
-                Some(false) => {}
+            let p = decode_type(pb)?;
+            if is_subtype(&p, &t_inst, ctx, resolver)? {
+                return Some(t_inst);
             }
         }
     }
@@ -4826,12 +4796,7 @@ fn via_supertype_arg_type(
     };
 
     for base_blob in &t_snap.bases {
-        let base = match decode_type(base_blob) {
-            Some(b) => b,
-            None => {
-                return None;
-            }
-        };
+        let base = decode_type(base_blob)?;
         let Type::Instance {
             type_ref: base_ref, ..
         } = &base
@@ -4839,30 +4804,9 @@ fn via_supertype_arg_type(
             // Non-Instance base (e.g. ParamSpec): defer.
             return None;
         };
-        let mapped_args = match map_instance_to_supertype(t_ref, t_args, base_ref, resolver) {
-            Some(a) => a,
-            None => {
-                return None;
-            }
-        };
+        let mapped_args = map_instance_to_supertype(t_ref, t_args, base_ref, resolver)?;
         let mapped = mk_wire_instance(base_ref, mapped_args);
-        let mark = seen.len();
-        let res = join_instances_core(&mapped, &s_inst, ctx, resolver, seen);
-        // Python's InstanceJoiner pops (t, s) off seen_instances when a
-        // join_instances call returns; restore that stack discipline so
-        // sibling candidates do not see each other's guard entries.
-        seen.truncate(mark);
-        // Python considers every sub-join result (join.py:447-450);
-        // SameS/SameT materialize to s_inst/mapped via consider, so the
-        // base walk reaches the sub-join answer instead of deferring.
-        match res {
-            Some(r) => {
-                consider(&mapped, r)?;
-            }
-            None => {
-                return None;
-            }
-        }
+        join_and_consider(&mapped, &s_inst, ctx, resolver, seen, &mut consider)?;
     }
     if let Some(ss) = &s_snap {
         for base_blob in &ss.bases {
@@ -4874,60 +4818,44 @@ fn via_supertype_arg_type(
                 continue;
             };
             if let Some(b_snap) = resolver.get(base_ref) {
-                if b_snap.is_protocol {
-                    match is_subtype(&t_inst, &base, ctx, resolver) {
-                        Some(true) => {}
-                        Some(false) => continue,
-                        None => {
-                            return None;
-                        }
-                    }
-                    let mapped_args =
-                        match map_instance_to_supertype(t_ref, t_args, base_ref, resolver) {
-                            Some(a) => a,
-                            None => {
-                                return None;
-                            }
-                        };
+                if b_snap.is_protocol && is_subtype(&t_inst, &base, ctx, resolver)? {
+                    let mapped_args = map_instance_to_supertype(t_ref, t_args, base_ref, resolver)?;
                     let mapped = mk_wire_instance(base_ref, mapped_args);
-                    let mark = seen.len();
-                    let res = join_instances_core(&mapped, &s_inst, ctx, resolver, seen);
-                    seen.truncate(mark);
-                    match res {
-                        Some(r) => {
-                            consider(&mapped, r)?;
-                        }
-                        None => {
-                            return None;
-                        }
-                    }
+                    join_and_consider(&mapped, &s_inst, ctx, resolver, seen, &mut consider)?;
                 }
             }
         }
     }
     // Second _promote pass (join.py:458-462): t's promote Instances.
     for pb in &t_snap.promote_bytes {
-        let p = match decode_type(pb) {
-            Some(p) => p,
-            None => {
-                return None;
-            }
-        };
+        let p = decode_type(pb)?;
         if let Type::Instance { .. } = &p {
-            let mark = seen.len();
-            let res = join_instances_core(&p, &s_inst, ctx, resolver, seen);
-            seen.truncate(mark);
-            match res {
-                Some(r) => {
-                    consider(&p, r)?;
-                }
-                None => {
-                    return None;
-                }
-            }
+            join_and_consider(&p, &s_inst, ctx, resolver, seen, &mut consider)?;
         }
     }
     best
+}
+
+/// Sub-join step of the via-supertype base walk: recurse into
+/// `join_instances_core(candidate, s_inst)` with the seen-guard
+/// discipline (Python's InstanceJoiner pops (t, s) when a join returns,
+/// so siblings must not see each other's entries), then hand the
+/// result to `consider`; a None sub-join defers the whole walk.
+fn join_and_consider(
+    candidate: &Type,
+    s_inst: &Type,
+    ctx: &SubtypeContext,
+    resolver: &TypeResolver,
+    seen: &mut SeenInstances,
+    consider: &mut dyn FnMut(&Type, SetOpResult) -> Option<()>,
+) -> Option<()> {
+    let mark = seen.len();
+    let res = join_instances_core(candidate, s_inst, ctx, resolver, seen);
+    seen.truncate(mark);
+    match res {
+        Some(r) => consider(candidate, r),
+        None => None,
+    }
 }
 
 /// MRO length for `is_better` (join.py:804+). Returns 0 if the
