@@ -19401,6 +19401,8 @@ class NativeCheckMemberSuite(Suite):
             decoded = _deserialize_type_for_checkmember(bytes(wire_bytes), freeze=True)
             assert decoded is not None
             expected = expand_type_by_instance(typ, itype)
+            assert isinstance(decoded, CallableType)
+            assert isinstance(expected, CallableType)
             assert str(decoded.arg_types[0]) == str(expected.arg_types[0])
         finally:
             set_wire_alias_map(None)
