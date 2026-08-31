@@ -35279,6 +35279,7 @@ class NativeMemberVarDispatchSuite(Suite):
         is_operator: bool = False,
         is_self: bool = False,
         start_raw_id: int = 100,
+        plugin: object | None = None,
     ) -> tuple[int, bool, Type] | None:
         from mypy.checkmember import _serialize_type_for_checkmember
 
@@ -35294,6 +35295,7 @@ class NativeMemberVarDispatchSuite(Suite):
             False,  # preserve_type_var_ids
             start_raw_id,
             True,  # strict_optional
+            plugin,
         )
         if result is None:
             return None
@@ -35475,6 +35477,36 @@ class NativeMemberVarDispatchSuite(Suite):
             True,
         )
         assert result is None
+
+    def test_seam_var_hook_chain_decisions(self) -> None:
+        # The var hook gate defers only when a hook provably applies; the
+        # live plugin chain is authoritative when the registry fast path
+        # cannot prove absence (user plugins, issue #1288).
+        class _NoAttrHook:
+            def get_attribute_hook(self, fullname: str) -> None:
+                return None
+
+        class _WithAttrHook:
+            def get_attribute_hook(self, fullname: str) -> Callable[[Any], Any]:
+                return lambda ctx: ctx.default_attr_type
+
+        self._register_var(self.info, "x", Instance(self.base, []))
+        present = SimpleNamespace(has_hook_for=lambda kind, fullname: True)
+        self._set_plugin_hook(present, False)
+        try:
+            # Chain answers "no hook": the native path proceeds.
+            result = self._seam(Instance(self.info, []), "x", plugin=_NoAttrHook())
+            assert result is not None
+            _, _, decoded = result
+            assert str(decoded) == "mod.Base"
+            # Chain says a hook applies: defer so Python applies it.
+            assert self._seam(Instance(self.info, []), "x", plugin=_WithAttrHook()) is None
+            # No plugin handle: defer (the pre-#1288 behavior).
+            assert self._seam(Instance(self.info, []), "x", plugin=None) is None
+        finally:
+            self._set_plugin_hook(
+                SimpleNamespace(has_hook_for=lambda kind, fullname: False), False
+            )
 
     # --- gate differentials ---
 

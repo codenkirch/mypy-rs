@@ -6,6 +6,13 @@ merged). Goal:
 established measure -> file -> dispatch-2-agents -> process-PRs -> gate
 loop. This file is the resume point.*
 
+In flight now (survey13 wave, mid-audits): #1288 and #1289 each have an
+open audit in their own worktree at the survey13 numbers. The #1288
+wrap-up (measured buckets, run recipe, next steps) is in
+`docs/HANDOFF-1288.md`. Active PRs: #1291 (fix/1285) open. After the
+two audits, new issues were filed: #1288 (member_access ~1.3k @ 89%)
+and #1289 (expand_type_by_instance 995 @ 55%).
+
 ## Where main stands
 
 - `main` = `6d5b0c473` (`perf(type_kernel): narrow IAMA freeze
