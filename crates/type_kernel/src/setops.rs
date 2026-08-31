@@ -46,6 +46,7 @@ use crate::subtypes::{
     is_subtype, map_instance_to_supertype, SubtypeContext, CONTRAVARIANT, COVARIANT, INVARIANT,
     VARIANCE_NOT_READY,
 };
+use crate::visitor::has_type_vars_inner;
 
 /// `TypeOfAny.special_form` == 6 (types.py:309). The join/meet shims
 /// build AnyType(special_form) for a whole-result disc 4
@@ -4790,6 +4791,26 @@ fn via_supertype_arg_type(
         Some(())
     };
 
+    /// Guard for the base walk: the Rust `map_instance_to_supertype`
+    /// ports `maptype.py`'s plain expand step but not the
+    /// `builtins.tuple` special case in
+    /// `map_instance_to_direct_supertypes` (maptype.py:78-92), which
+    /// expands the class's `tuple_type` and takes `tuple_fallback` when
+    /// it has type vars (why `mypy/maptype.py` gates every
+    /// `builtins.tuple` supertype mapping to Python). Without it a
+    /// generic tuple subclass (e.g. a generic NamedTuple) would map to
+    /// `tuple[Any, ...]` and join away its element type
+    /// (testGenericNamedTupleJoin). Returns `true` when the map would
+    /// diverge for base `builtins.tuple`; `false` otherwise; `None`
+    /// (defer) on an unreadable `tuple_type`.
+    fn tuple_map_diverges(t_ref: &str, resolver: &TypeResolver) -> Option<bool> {
+        let snap = resolver.get(t_ref)?;
+        let Some(tt) = &snap.tuple_type else {
+            return Some(false);
+        };
+        Some(has_type_vars_inner(&decode_type(tt)?))
+    }
+
     for base_blob in &t_snap.bases {
         let base = decode_type(base_blob)?;
         let Type::Instance {
@@ -4799,6 +4820,9 @@ fn via_supertype_arg_type(
             // Non-Instance base (e.g. ParamSpec): defer.
             return None;
         };
+        if base_ref == "builtins.tuple" && tuple_map_diverges(t_ref, resolver)? {
+            return None;
+        }
         let mapped_args = map_instance_to_supertype(t_ref, t_args, base_ref, resolver)?;
         let mapped = mk_wire_instance(base_ref, mapped_args);
         join_and_consider(&mapped, &s_inst, ctx, resolver, seen, &mut consider)?;
@@ -4814,6 +4838,9 @@ fn via_supertype_arg_type(
             };
             if let Some(b_snap) = resolver.get(base_ref) {
                 if b_snap.is_protocol && is_subtype(&t_inst, &base, ctx, resolver)? {
+                    if base_ref == "builtins.tuple" && tuple_map_diverges(t_ref, resolver)? {
+                        return None;
+                    }
                     let mapped_args = map_instance_to_supertype(t_ref, t_args, base_ref, resolver)?;
                     let mapped = mk_wire_instance(base_ref, mapped_args);
                     join_and_consider(&mapped, &s_inst, ctx, resolver, seen, &mut consider)?;
@@ -9840,6 +9867,62 @@ mod tests {
             extra_attrs: None,
         };
         assert_eq!(decoded, expected);
+    }
+
+    /// Regression for #1317 (testGenericNamedTupleJoin): the
+    /// via-supertype base walk must defer when it maps a class whose
+    /// `tuple_type` carries type vars onto `builtins.tuple` (the
+    /// Rust map lacks maptype.py's tuple_fallback special case, so
+    /// the sub-join would collapse the element type to
+    /// tuple[Any, ...]; Python produces tuple[int, ...]).
+    #[test]
+    fn via_supertype_generic_tuple_type_base_defers() {
+        let mut nt = snap("a.NT", "NT");
+        nt.is_named_tuple = true;
+        nt.type_vars_with_variance = vec![("T".to_string(), 1, 0)];
+        nt.type_var_upper_bounds = vec![encode_type(&instance("builtins.object", vec![])).unwrap()];
+        nt.tuple_type = Some(
+            encode_type(&Type::TupleType {
+                items: vec![type_var(1, "a.NT", instance("builtins.object", vec![]))],
+                partial_fallback: Box::new(instance("builtins.tuple", vec![])),
+                implicit: false,
+            })
+            .unwrap(),
+        );
+        nt.bases = vec![encode_type(&instance(
+            "builtins.tuple",
+            vec![Type::UnpackType {
+                typ: Box::new(Type::TupleType {
+                    items: vec![Type::AnyType {
+                        type_of_any: TYPE_OF_ANY_SPECIAL_FORM,
+                        source_any: None,
+                        missing_import_name: None,
+                    }],
+                    partial_fallback: Box::new(instance("builtins.tuple", vec![])),
+                    implicit: false,
+                }),
+            }],
+        ))
+        .unwrap()];
+        let mut tuple_snap = snap("builtins.tuple", "tuple");
+        tuple_snap.has_type_var_tuple_type = true;
+        tuple_snap.type_var_tuple_prefix = Some(0);
+        tuple_snap.type_var_tuple_suffix = Some(0);
+        let obj = snap("builtins.object", "object");
+        let int_snap = snap("builtins.int", "int");
+        let r = make_resolver(vec![obj, int_snap, tuple_snap, nt]);
+        let nt_i = instance("a.NT", vec![instance("builtins.int", vec![])]);
+        let tuple_i = instance(
+            "builtins.tuple",
+            vec![Type::UnpackType {
+                typ: Box::new(Type::TupleType {
+                    items: vec![instance("builtins.int", vec![])],
+                    partial_fallback: Box::new(instance("builtins.tuple", vec![])),
+                    implicit: false,
+                }),
+            }],
+        );
+        assert_eq!(join_diff(&tuple_i, &nt_i, &r), None);
     }
 
     fn encode_type(typ: &Type) -> Option<Vec<u8>> {
