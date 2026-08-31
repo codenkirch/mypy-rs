@@ -1946,7 +1946,11 @@ def rust_group_comparison_operands(
     operators_to_group: list[str],
 ) -> list[tuple[str, list[int]]]: ...
 def rust_is_valid_inferred_type(
-    typ_bytes: bytes, is_lvalue_final: bool, is_lvalue_member: bool, allow_redefinition: bool
+    typ_bytes: bytes,
+    is_lvalue_final: bool,
+    is_lvalue_member: bool,
+    allow_redefinition: bool,
+    resolver: NativeTypeResolver,
 ) -> bool | None: ...
 def rust_has_custom_eq_checks(typ_bytes: bytes, resolver: NativeTypeResolver) -> bool | None: ...
 

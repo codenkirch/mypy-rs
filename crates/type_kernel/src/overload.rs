@@ -418,7 +418,9 @@ fn evaluate_plain_target(
                     }
                     return MatchDecision::No;
                 }
-                None => return MatchDecision::Undecided,
+                None => {
+                    return MatchDecision::Undecided;
+                }
             }
         }
     }
