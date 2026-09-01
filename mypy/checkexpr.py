@@ -2983,14 +2983,13 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
 
                         lam_typevar_ctx = any(_lam_ctx_has_callee_var(i) for i in lam_idx)
                         if not lam_typevar_ctx:
-                            arg_types_bytes = [
-                                _serialize_type_for_checkexpr(
-                                    get_proper_type(
-                                        self.accept(a, ctx) if ctx is not None else self.accept(a)
-                                    )
-                                )
-                                for a, ctx in zip(args, arg_context)
-                            ]
+                            arg_types_bytes = []
+                            arg_pts: list[Any] = []
+                            for a, ctx in zip(args, arg_context):
+                                _at = self.accept(a, ctx) if ctx is not None else self.accept(a)
+                                _pt = get_proper_type(_at)
+                                arg_types_bytes.append(_serialize_type_for_checkexpr(_pt))
+                                arg_pts.append(_pt)
                             resolved_bytes = _rust_solve_generic_call(
                                 _native_checkexpr_resolver,
                                 _serialize_type_for_checkexpr(callee),
@@ -3007,6 +3006,21 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
                                 # Deserialize may return None when a type_ref
                                 # cannot resolve to a live TypeInfo; defer.
                                 # The isinstance narrows None out of the union.
+                                if isinstance(resolved_callee, CallableType):
+                                    from mypy.wirefixup import resync_var_identities
+
+                                    # A solved value may carry an outer-context
+                                    # type var; re-link its wire copy to the
+                                    # live object (#1215 pattern). None defers.
+                                    relinked = resync_var_identities(
+                                        callee, resolved_callee, arg_pts
+                                    )
+                                    if relinked is None:
+                                        resolved_callee = None
+                                    else:
+                                        # The canonicalizer rebuilds the tree;
+                                        # use the relinked copy, not the decode.
+                                        resolved_callee = cast(CallableType, relinked)
                                 if isinstance(resolved_callee, CallableType):
                                     # Wire round-trip drops provenance needed
                                     # by fine-grained notes ("Called function
