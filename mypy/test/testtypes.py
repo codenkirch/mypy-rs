@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 import re
 import sys
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from types import SimpleNamespace
 from typing import Any, TypeVar, cast
@@ -5468,6 +5468,206 @@ class NativeExpandTypeAliasSuite(Suite):
             self._assert_par(alias_t)
         finally:
             set_wire_alias_map({self.alias.fullname: self.alias})
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeExpandParamSpecSpliceSuite(Suite):
+    """Parity for the Rust `expand_type` ParamSpec splice (wave29 #1343).
+
+    `visit_callable_type`'s Concatenate splice (expandtype.py:1149-1195)
+    and `visit_param_spec` (:963-996) run natively when the env maps the
+    ParamSpec to a Parameters or to another ParamSpecType. Shapes the
+    port does not cover (a fresh meta substitute keyed only at a nonzero
+    meta level, an unpack it cannot normalize, an ARGS/KWARGS leaf with
+    a Parameters replacement) defer, and the Python shim runs the pure
+    body, so gate-on == gate-off everywhere.
+    """
+
+    def setUp(self) -> None:
+        from mypy.expandtype import (
+            _set_native_expand_type_active,
+            _set_native_expand_type_resolver,
+            _set_native_expand_type_typeinfo_map,
+        )
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        self.fx = TypeFixture(INVARIANT)
+        self._set_active = _set_native_expand_type_active
+        self._set_resolver = _set_native_expand_type_resolver
+        self._set_map = _set_native_expand_type_typeinfo_map
+        type_infos = []
+        for name in dir(self.fx):
+            if not name.endswith("i"):
+                continue
+            value = getattr(self.fx, name)
+            if _is_type_info(value):
+                type_infos.append(value)
+        self._resolver = _type_kernel.build_native_resolver(type_infos, [])
+        self._set_resolver(self._resolver)
+        self._set_map({info.fullname: info for info in type_infos})
+        set_wire_typeinfo_map({info.fullname: info for info in type_infos})
+        self._set_active(True)
+
+    def tearDown(self) -> None:
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        self._set_active(False)
+        self._set_resolver(None)
+        self._set_map(None)
+        set_wire_typeinfo_map(None)
+
+    def _with_gate(self, active: bool, fn: Callable[[], Any]) -> Any:
+        self._set_active(active)
+        try:
+            return fn()
+        finally:
+            self._set_active(True)
+
+    def _expand(self, typ: Type, env: Mapping[TypeVarId, Type]) -> Any:
+        from mypy.expandtype import expand_type
+
+        return expand_type(typ, env)
+
+    def _assert_par(self, typ: Type, env: Mapping[TypeVarId, Type]) -> None:
+        off = str(self._with_gate(False, lambda: self._expand(typ, env)))
+        on = str(self._with_gate(True, lambda: self._expand(typ, env)))
+        assert_equal(on, off, f"expand_type(ps splice) parity {typ}")
+
+    def _param_spec(
+        self, raw_id: int = 1, name: str = "P", fullname: str = "mod.P"
+    ) -> ParamSpecType:
+        return ParamSpecType(
+            name, fullname, TypeVarId(raw_id), 0, self.fx.o, AnyType(TypeOfAny.special_form)
+        )
+
+    def _splice_callable(
+        self, ps: ParamSpecType, lead: Sequence[Type], ret: Type | None = None
+    ) -> CallableType:
+        # Concatenate[*lead, P.args, **P.kwargs]: the trailing ARGS and
+        # KWARGS occurrences occupy the last two arg slots; Python's
+        # CallableType.param_spec() canonicalizes the head likewise.
+        arg_types = [*lead, ps.with_flavor(ParamSpecFlavor.ARGS), ps.with_flavor(ParamSpecFlavor.KWARGS)]
+        arg_kinds = [ARG_POS] * len(lead) + [ARG_STAR, ARG_STAR2]
+        return CallableType(
+            arg_types,
+            arg_kinds,
+            [None] * len(arg_types),
+            ret if ret is not None else self.fx.anyt,
+            self.fx.function,
+        )
+
+    def _engaged(self, typ: Type, env: Mapping[TypeVarId, Type]) -> bool:
+        from mypy.expandtype import _serialize_env, _serialize_type
+
+        result = _type_kernel.rust_expand_type(
+            self._resolver,
+            _serialize_type(typ),
+            _serialize_env(env),
+            state.strict_optional,
+        )
+        return result is not None
+
+    def test_splice_with_parameters_repl(self) -> None:
+        # Concatenate[int, P] with P -> Parameters[str]: natively spliced
+        # (args + kinds + names concat), the repl's prefix rides in.
+        from mypy.types import Parameters
+
+        ps = self._param_spec()
+        callee = self._splice_callable(ps, [self.fx.a])
+        repl = Parameters([self.fx.str_type], [ARG_POS], [None])
+        env = {ps.id: repl}
+        assert self._engaged(callee, env), "paramspec splice deferred"
+        self._assert_par(callee, env)
+
+    def test_splice_with_paramspec_repl(self) -> None:
+        # P -> Q with a prefix: prefix merges before the clean
+        # *Q.args/**Q.kwargs copies.
+        from mypy.types import Parameters
+
+        ps = self._param_spec()
+        repl = ParamSpecType(
+            "Q",
+            "mod.Q",
+            TypeVarId(2),
+            0,
+            self.fx.o,
+            AnyType(TypeOfAny.special_form),
+            prefix=Parameters([self.fx.str_type], [ARG_POS], [None]),
+        )
+        callee = self._splice_callable(ps, [self.fx.a])
+        env = {ps.id: repl}
+        assert self._engaged(callee, env), "paramspec splice deferred"
+        self._assert_par(callee, env)
+
+    def test_splice_without_repl_keeps_occurrences(self) -> None:
+        # Empty env: both splice and default leaf keep the occurrences
+        # installed in the signature (Python's t.copy_with()... default).
+        ps = self._param_spec()
+        callee = self._splice_callable(ps, [self.fx.a])
+        assert self._engaged(callee, {}), "splice-less callable deferred"
+        self._assert_par(callee, {})
+
+    def test_splice_fresh_key_defers(self) -> None:
+        # A fresh (meta level 1) env entry keyed raw_id+namespace masks
+        # the bare key: the kernel defers and Python answers.
+        ps = self._param_spec()
+        fresh = ParamSpecType(
+            "Q", "mod.Q", TypeVarId(ps.id.raw_id, 1), 0, self.fx.o,
+            AnyType(TypeOfAny.special_form),
+        )
+        callee = self._splice_callable(ps, [self.fx.a])
+        env = {fresh.id: self.fx.a}
+        assert not self._engaged(callee, env), "fresh-key splice engaged"
+        self._assert_par(callee, env)
+
+    def test_splice_unpack_repl_defers(self) -> None:
+        # An unpack in the splice result needs Python's
+        # normalize_trivial_unpack (expandtype.py:1173-1176); defer.
+        from mypy.types import Parameters, UnpackType
+
+        ps = self._param_spec()
+        callee = self._splice_callable(ps, [self.fx.a])
+        unpacked = UnpackType(Instance(self.fx.std_tuplei, [self.fx.anyt]))
+        env = {ps.id: Parameters([unpacked], [ARG_STAR], [None])}
+        assert not self._engaged(callee, env), "unpack splice engaged"
+        self._assert_par(callee, env)
+
+    def test_leaf_bare_parameters_repl(self) -> None:
+        # A bare P occurrence expands to the Parameters replacement
+        # (prefix concat, occurrence flavor preserved per Python).
+        from mypy.types import Parameters
+
+        ps = self._param_spec()
+        repl = Parameters([self.fx.str_type], [ARG_POS], [None])
+        env = {ps.id: repl}
+        typ = Instance(self.fx.gi, [ps])
+        assert self._engaged(typ, env), "bare leaf deferred"
+        self._assert_par(typ, env)
+
+    def test_leaf_args_flavor_defers(self) -> None:
+        # An ARGS occurrence with a Parameters replacement rides the
+        # unported _possible_callable_varargs arm; defer -> Python parity.
+        from mypy.types import Parameters
+
+        ps = self._param_spec()
+        env = {ps.id: Parameters([self.fx.str_type], [ARG_POS], [None])}
+        typ = Instance(self.fx.gi, [ps.with_flavor(ParamSpecFlavor.ARGS)])
+        assert not self._engaged(typ, env), "ARGS leaf engaged"
+        self._assert_par(typ, env)
+
+    def test_leaf_missing_env_expands_prefix(self) -> None:
+        # No repl for P: Python's default expands only P's own prefix and
+        # keeps the occurrence. The occurrence rides a plain Instance arg
+        # (CallableType asserts empty prefixes on raw arg slots).
+        from mypy.types import Parameters
+
+        ps = ParamSpecType(
+            "P", "mod.P", TypeVarId(1), 0, self.fx.o, AnyType(TypeOfAny.special_form),
+            prefix=Parameters([self.fx.bool_type], [ARG_POS], [None]),
+        )
+        typ = Instance(self.fx.gi, [ps])
+        assert self._engaged(typ, {}), "prefix-expansion leaf deferred"
+        self._assert_par(typ, {})
 
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")

@@ -8,13 +8,15 @@
 //! the pure-Python visitor (the strangler-fig per-call contract).
 //!
 //! Deferred (return None):
-//!   * ParamSpec (`visit_param_spec`, expandtype.py:252-285) — prefix
-//!     merging and flavor handling are too complex for this stage.
 //!   * TypeVarTuple substitution requiring `split_with_prefix_and_suffix`
 //!     (the variadic middle of a generic instance).
 //!   * `TypeAliasType` (unfixed) — defer.
-//!   * `Overloaded`, `PartialType`, `Parameters` — defer.
-//!   * `visit_callable_type` ParamSpec branch (expandtype.py:436-480).
+//!   * `PartialType` — defer.
+//!   * `visit_param_spec` ARGS/KWARGS flavors and non-Instance upper
+//!     bounds (`_possible_callable_varargs`/`_possible_callable_kwargs`).
+//!   * `visit_callable_type` ParamSpec splices carrying an UnpackType
+//!     result (Python's `normalize_trivial_unpack` is not ported).
+//!   * Fresh (meta-level 1) ParamSpec substitutes the wire cannot key.
 //!   * `visit_type_var_tuple` (expandtype.py:355-368) raises
 //!     `NotImplementedError` in Python for non-trivial replacements; we
 //!     defer those to Python rather than raise over FFI.
@@ -516,9 +518,310 @@ fn encode_type(typ: &Type) -> Option<Vec<u8>> {
     Some(wbuf.into_bytes())
 }
 
+/// Fresh-var parity guard for ParamSpec env lookups (shared by the
+/// ParamSpec splice arms in `param_spec_callable_arm` and
+/// `param_spec_leaf`). The wire drops meta_level on ParamSpecType
+/// occurrences, so a fresh (meta-level 1) substitute is invisible here;
+/// meta vars allocate their own raw ids (types.py:645-648), so any env
+/// key matching the raw id + namespace at a nonzero meta level can only
+/// be a fresh substitute, which callers defer rather than answer with
+/// the wrong id.
+fn has_fresh_param_spec_key(raw_id: i64, namespace: &str, env: &HashMap<EnvKey, Type>) -> bool {
+    env.keys()
+        .any(|k| k.0 == raw_id && k.1 != 0 && k.2 == namespace)
+}
+
+/// `ExpandTypeVisitor.visit_param_spec` (expandtype.py:963-996). Returns
+/// `None` when the leaf defers to Python (ARGS/KWARGS flavors, a
+/// non-Instance upper bound, an unpack in the expanded prefix, or a
+/// fresh meta var substitute the wire cannot key).
+fn param_spec_leaf(t: &Type, env: &HashMap<EnvKey, Type>, strict_optional: bool) -> Option<Type> {
+    let Type::ParamSpecType {
+        prefix,
+        raw_id,
+        namespace,
+        flavor,
+        upper_bound,
+        default,
+        ..
+    } = t
+    else {
+        return None;
+    };
+    // Python's `get(t.id, default)` default (expandtype.py:965): t itself
+    // with an empty prefix, which only ever expands the prefix arg types.
+    let default_repl = Type::ParamSpecType {
+        prefix: Box::new(crate::wire::Parameters {
+            arg_types: Vec::new(),
+            arg_kinds: Vec::new(),
+            arg_names: Vec::new(),
+            variables: Vec::new(),
+            imprecise_arg_kinds: false,
+            is_ellipsis_args: false,
+        }),
+        name: String::new(),
+        fullname: String::new(),
+        raw_id: *raw_id,
+        namespace: namespace.clone(),
+        flavor: *flavor,
+        upper_bound: upper_bound.clone(),
+        default: default.clone(),
+    };
+    let repl: &Type = match env.get(&(*raw_id, 0, namespace.to_string())) {
+        Some(r) => r,
+        None => {
+            // Distinguish "no env entry" (use the Python default) from the
+            // fresh-var guard above (defer).
+            if has_fresh_param_spec_key(*raw_id, namespace, env) {
+                return None;
+            }
+            &default_repl
+        }
+    };
+    match repl {
+        Type::ParamSpecType {
+            prefix: repl_prefix,
+            ..
+        } => {
+            // (expandtype.py:966-974): repl.copy_modified(flavor=t.flavor,
+            // prefix=...); everything else comes from the replacement, and
+            // the new prefix is t's prefix concat'd with the replacement's.
+            let new_kinds = [prefix.arg_kinds.clone(), repl_prefix.arg_kinds.clone()].concat();
+            let new_names = [prefix.arg_names.clone(), repl_prefix.arg_names.clone()].concat();
+            let occ_vars = prefix.variables.clone();
+            let occ_imprecise = prefix.imprecise_arg_kinds;
+            let occ_ellipsis = prefix.is_ellipsis_args;
+            let occ_flavor = *flavor;
+            let mut new_arg_types = Vec::with_capacity(prefix.arg_types.len());
+            for at in &prefix.arg_types {
+                new_arg_types.push(expand_type_inner(at, env, strict_optional)?);
+            }
+            new_arg_types.extend(repl_prefix.arg_types.iter().cloned());
+            if new_arg_types
+                .iter()
+                .any(|at| matches!(at, Type::UnpackType { .. }))
+            {
+                // Expanded prefix can produce unpacks Python handles via
+                // its own fuller normalization; defer instead.
+                return None;
+            }
+            let mut res = repl.clone();
+            if let Type::ParamSpecType { prefix, flavor, .. } = &mut res {
+                *prefix = crate::wire::Parameters {
+                    arg_types: new_arg_types,
+                    arg_kinds: new_kinds,
+                    arg_names: new_names,
+                    variables: occ_vars,
+                    imprecise_arg_kinds: occ_imprecise,
+                    is_ellipsis_args: occ_ellipsis,
+                }
+                .into();
+                *flavor = occ_flavor;
+            }
+            Some(res)
+        }
+        Type::Parameters(repl_params) => {
+            if *flavor != 0 {
+                // BARE only: the ARGS/KWARGS arms
+                // (_possible_callable_varargs/_kwargs, expandtype.py:998-...)
+                // are not ported.
+                return None;
+            }
+            // Python asserts a proper Instance upper bound here
+            // (expandtype.py:976); defer anything else so the pure body
+            // surfaces the same behavior.
+            if !matches!(upper_bound.as_ref(), Type::Instance { .. }) {
+                return None;
+            }
+            let mut new_arg_types = Vec::with_capacity(prefix.arg_types.len());
+            for at in &prefix.arg_types {
+                new_arg_types.push(expand_type_inner(at, env, strict_optional)?);
+            }
+            new_arg_types.extend(repl_params.arg_types.iter().cloned());
+            Some(Type::Parameters(crate::wire::Parameters {
+                arg_types: new_arg_types,
+                arg_kinds: [prefix.arg_kinds.clone(), repl_params.arg_kinds.clone()].concat(),
+                arg_names: [prefix.arg_names.clone(), repl_params.arg_names.clone()].concat(),
+                variables: [prefix.variables.clone(), repl_params.variables.clone()].concat(),
+                imprecise_arg_kinds: repl_params.imprecise_arg_kinds,
+                is_ellipsis_args: false,
+            }))
+        }
+        other => Some(other.clone()),
+    }
+}
+
+/// `ExpandTypeVisitor.visit_callable_type` ParamSpec splice
+/// (expandtype.py:1149-1195). Returns `Some(Some(t))` when the splice
+/// ran, `Some(None)` when the case defers to Python (an UnpackType in
+/// the splice result, or a fresh meta var substitute the wire cannot
+/// key), and `None` when there is no ParamSpec replacement in the env
+/// (the caller continues with the generic expansion path).
+fn param_spec_callable_arm(
+    t: &Type,
+    env: &HashMap<EnvKey, Type>,
+    strict_optional: bool,
+) -> Option<Option<Type>> {
+    let Type::CallableType {
+        arg_types,
+        arg_kinds,
+        arg_names,
+        ret_type,
+        type_guard,
+        type_is,
+        ..
+    } = t
+    else {
+        return None;
+    };
+    let ps = crate::constraints::param_spec_of(arg_types, arg_kinds, arg_names)?;
+    let (raw_id, namespace) = match &ps {
+        Type::ParamSpecType {
+            raw_id, namespace, ..
+        } => (*raw_id, namespace.as_str()),
+        _ => return None,
+    };
+    let repl = match env.get(&(raw_id, 0, namespace.to_string())) {
+        Some(r) => r,
+        None => {
+            if has_fresh_param_spec_key(raw_id, namespace, env) {
+                return Some(None);
+            }
+            // No replacement: visit_callable_type falls through to the
+            // generic expansion path (expandtype.py:1197).
+            return None;
+        }
+    };
+    match repl {
+        Type::Parameters(repl_params) => {
+            let n = arg_types.len();
+            // Python only normalizes the new var_arg via
+            // normalize_trivial_unpack (expandtype.py:1173-1176), not
+            // ported: defer whenever the splice carries an unpack.
+            if arg_types[..n - 2]
+                .iter()
+                .chain(repl_params.arg_types.iter())
+                .any(|at| matches!(at, Type::UnpackType { .. }))
+            {
+                return Some(None);
+            }
+            let mut new_arg_types = Vec::with_capacity(n - 2 + repl_params.arg_types.len());
+            for at in &arg_types[..n - 2] {
+                new_arg_types.push(expand_type_inner(at, env, strict_optional)?);
+            }
+            new_arg_types.extend(repl_params.arg_types.iter().cloned());
+            let mut new_arg_kinds = arg_kinds[..n - 2].to_vec();
+            new_arg_kinds.extend(repl_params.arg_kinds.iter().copied());
+            let mut new_arg_names = arg_names[..n - 2].to_vec();
+            new_arg_names.extend(repl_params.arg_names.iter().cloned());
+            let new_ret = expand_type_inner(ret_type, env, strict_optional)?;
+            let new_guard = match type_guard {
+                Some(tg) => Some(Box::new(expand_type_inner(tg, env, strict_optional)?)),
+                None => None,
+            };
+            let new_is = match type_is {
+                Some(ti) => Some(Box::new(expand_type_inner(ti, env, strict_optional)?)),
+                None => None,
+            };
+            let mut res = t.clone();
+            if let Type::CallableType {
+                arg_types,
+                arg_kinds,
+                arg_names,
+                ret_type,
+                type_guard,
+                type_is,
+                imprecise_arg_kinds,
+                variables,
+                ..
+            } = &mut res
+            {
+                *arg_types = new_arg_types;
+                *arg_kinds = new_arg_kinds;
+                *arg_names = new_arg_names;
+                *ret_type = new_ret.into();
+                *type_guard = new_guard;
+                *type_is = new_is;
+                *imprecise_arg_kinds = *imprecise_arg_kinds || repl_params.imprecise_arg_kinds;
+                *variables = [repl_params.variables.clone(), variables.clone()].concat();
+            }
+            Some(Some(res))
+        }
+        Type::ParamSpecType {
+            prefix: repl_prefix,
+            name: repl_name,
+            fullname: repl_fullname,
+            raw_id: repl_raw_id,
+            namespace: repl_namespace,
+            flavor: _,
+            upper_bound: repl_upper_bound,
+            default: repl_default,
+        } => {
+            // Substituting one ParamSpec for another (e.g. Concatenate[int,
+            // P] for Q): the prefix merges and the last two args become
+            // P.args/**P.kwargs of the clean replacement (expandtype.py:1178).
+            let n = arg_types.len();
+            let mut new_arg_types = Vec::with_capacity(n - 2 + 2 + repl_prefix.arg_types.len());
+            for at in &arg_types[..n - 2] {
+                new_arg_types.push(expand_type_inner(at, env, strict_optional)?);
+            }
+            new_arg_types.extend(repl_prefix.arg_types.iter().cloned());
+            let clean_prefix = crate::wire::Parameters {
+                arg_types: Vec::new(),
+                arg_kinds: Vec::new(),
+                arg_names: Vec::new(),
+                variables: Vec::new(),
+                imprecise_arg_kinds: false,
+                is_ellipsis_args: false,
+            };
+            let clean_repl = |flavor: i64| Type::ParamSpecType {
+                prefix: Box::new(clean_prefix.clone()),
+                name: repl_name.clone(),
+                fullname: repl_fullname.clone(),
+                raw_id: *repl_raw_id,
+                namespace: repl_namespace.clone(),
+                flavor,
+                upper_bound: repl_upper_bound.clone(),
+                default: repl_default.clone(),
+            };
+            new_arg_types.push(clean_repl(1)); // ParamSpecFlavor.ARGS
+            new_arg_types.push(clean_repl(2)); // ParamSpecFlavor.KWARGS
+            let mut new_arg_kinds = arg_kinds[..n - 2].to_vec();
+            new_arg_kinds.extend(repl_prefix.arg_kinds.iter().copied());
+            new_arg_kinds.extend(arg_kinds[n - 2..].to_vec());
+            let mut new_arg_names = arg_names[..n - 2].to_vec();
+            new_arg_names.extend(repl_prefix.arg_names.iter().cloned());
+            new_arg_names.extend(arg_names[n - 2..].to_vec());
+            let new_ret = expand_type_inner(ret_type, env, strict_optional)?;
+            let mut res = t.clone();
+            if let Type::CallableType {
+                arg_types,
+                arg_kinds,
+                arg_names,
+                ret_type,
+                from_concatenate,
+                imprecise_arg_kinds,
+                ..
+            } = &mut res
+            {
+                *arg_types = new_arg_types;
+                *arg_kinds = new_arg_kinds;
+                *arg_names = new_arg_names;
+                *ret_type = new_ret.into();
+                *from_concatenate = *from_concatenate || !repl_prefix.arg_types.is_empty();
+                *imprecise_arg_kinds = *imprecise_arg_kinds || repl_prefix.imprecise_arg_kinds;
+            }
+            Some(Some(res))
+        }
+        // An env replacement of another shape (e.g. Any): Python falls
+        // through to the generic expansion path too.
+        _ => None,
+    }
+}
+
 /// Substitute TypeVar references in `typ` using `env`, mirroring
-/// `ExpandTypeVisitor`. Returns `None` for deferred cases (ParamSpec,
-/// TypeAliasType, Overloaded, etc.) so the caller falls through to Python.
+/// `ExpandTypeVisitor`. Returns `None` for deferred cases (see the
+/// module-level "Deferred" list) so the caller falls through to Python.
 pub(crate) fn expand_type_inner(
     typ: &Type,
     env: &HashMap<EnvKey, Type>,
@@ -752,13 +1055,13 @@ pub(crate) fn expand_type_inner(
             type_is,
             ..
         } => {
-            // (expandtype.py:435-502). The ParamSpec branch
-            // (expandtype.py:436-480) is deferred to Python: if any
-            // variable is a ParamSpecType, return None.
-            for v in variables {
-                if matches!(v, Type::ParamSpecType { .. }) {
-                    return None;
-                }
+            // (expandtype.py:1148-1217). The ParamSpec splice
+            // (expandtype.py:1149-1195) runs first; see
+            // `param_spec_callable_arm` for the deferral contract.
+            match param_spec_callable_arm(typ, env, strict_optional) {
+                Some(Some(res)) => return Some(res),
+                Some(None) => return None,
+                None => {}
             }
             // `is_bound` needs no special handling here: it survives
             // copy_modified unchanged and expansion never branches on it.
@@ -863,9 +1166,8 @@ pub(crate) fn expand_type_inner(
             }))
         }
 
-        // Deferred variants: ParamSpecType (prefix merging too complex for
-        // this stage).
-        Type::ParamSpecType { .. } => None,
+        // ParamSpecType leaf: visit_param_spec (expandtype.py:963-996).
+        Type::ParamSpecType { .. } => param_spec_leaf(typ, env, strict_optional),
 
         // TypeVarTupleType (expandtype.py:703-715): expand the replacement
         // if bound; Any/Uninhabited build tuple_fallback[args=[repl]];
@@ -2063,5 +2365,382 @@ mod tests {
         with_alias_map(map, || {
             assert!(expand_type_by_instance_relink(&typ, &inst, &resolver, false).is_none());
         });
+    }
+
+    // -- ParamSpec splice (wave29 #1343) ----------------------------------
+
+    fn empty_params() -> crate::wire::Parameters {
+        crate::wire::Parameters {
+            arg_types: Vec::new(),
+            arg_kinds: Vec::new(),
+            arg_names: Vec::new(),
+            variables: Vec::new(),
+            imprecise_arg_kinds: false,
+            is_ellipsis_args: false,
+        }
+    }
+
+    fn params_of(arg_types: Vec<Type>, variables: Vec<Type>) -> crate::wire::Parameters {
+        let n = arg_types.len();
+        crate::wire::Parameters {
+            arg_kinds: vec![0; n], // ARG_POS
+            arg_names: vec![None; n],
+            variables,
+            imprecise_arg_kinds: false,
+            is_ellipsis_args: false,
+            arg_types,
+        }
+    }
+
+    /// `P.args`/`P.kwargs` occurrence: empty prefix, ARGS/KWARGS flavor.
+    fn ps_occurrence(raw_id: i64, flavor: i64) -> Type {
+        param_spec_node(raw_id, flavor, empty_params())
+    }
+
+    fn param_spec_node(raw_id: i64, flavor: i64, prefix: crate::wire::Parameters) -> Type {
+        Type::ParamSpecType {
+            prefix: Box::new(prefix),
+            name: "P".to_string(),
+            fullname: "__main__.P".to_string(),
+            raw_id,
+            namespace: String::new(),
+            flavor,
+            upper_bound: Box::new(any()),
+            default: Box::new(any()),
+        }
+    }
+
+    /// `Callable[lead..., *P.args, **P.kwargs]` with the two trailing
+    /// splice slots (ARG_STAR = 2, ARG_STAR2 = 4).
+    fn ps_callable(raw_id: i64, lead: Vec<Type>, ret: Type) -> Type {
+        let mut arg_types = lead.clone();
+        arg_types.push(ps_occurrence(raw_id, 1));
+        arg_types.push(ps_occurrence(raw_id, 2));
+        let mut arg_kinds = vec![0; arg_types.len() - 2];
+        arg_kinds.push(2);
+        arg_kinds.push(4);
+        let arg_names = vec![None; arg_types.len()];
+        Type::CallableType {
+            fallback: Box::new(instance("builtins.function", vec![])),
+            instance_type: None,
+            is_ellipsis_args: false,
+            implicit: false,
+            is_bound: true,
+            from_concatenate: false,
+            imprecise_arg_kinds: false,
+            unpack_kwargs: false,
+            from_type_type: false,
+            arg_types,
+            arg_kinds,
+            arg_names,
+            ret_type: Box::new(ret),
+            name: None,
+            variables: vec![tvar(5)],
+            type_guard: None,
+            type_is: None,
+            special_sig: None,
+        }
+    }
+
+    #[test]
+    fn ps_splice_callable_with_parameters_repl() {
+        // Concatenate[int, P] / P -> Parameters: the lead expands, the
+        // splice args are replaced by the repl arg list, the ret expands,
+        // and the repl variables lead the variables list.
+        let typ = ps_callable(1, vec![instance("builtins.list", vec![tvar(5)])], tvar(5));
+        let env: HashMap<EnvKey, Type> = HashMap::from([
+            (
+                (1, 0, String::new()),
+                Type::Parameters(params_of(
+                    vec![
+                        instance("builtins.str", vec![]),
+                        instance("builtins.bool", vec![]),
+                    ],
+                    vec![tvar(6)],
+                )),
+            ),
+            ((5, 0, String::new()), instance("builtins.int", vec![])),
+        ]);
+        let out = expand_type_inner(&typ, &env, false).unwrap();
+        match out {
+            Type::CallableType {
+                arg_types,
+                arg_kinds,
+                ret_type,
+                variables,
+                from_concatenate,
+                ..
+            } => {
+                assert!(
+                    matches!(&arg_types[0], Type::Instance { type_ref, args, .. }
+                    if type_ref == "builtins.list"
+                        && matches!(args.as_slice(), [Type::Instance { .. }]))
+                );
+                assert!(matches!(arg_types[1], Type::Instance { ref type_ref, .. }
+                    if type_ref == "builtins.str"));
+                assert!(matches!(arg_types[2], Type::Instance { ref type_ref, .. }
+                    if type_ref == "builtins.bool"));
+                assert_eq!(arg_kinds, vec![0, 0, 0]);
+                assert!(matches!(*ret_type, Type::Instance { .. }));
+                assert_eq!(variables.len(), 2); // repl variables + old [tvar(5)]
+                assert!(!from_concatenate);
+            }
+            other => panic!("expected CallableType, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn ps_splice_callable_with_paramspec_repl() {
+        // P -> Q where Q has a prefix: prefix merges before the clean
+        // ARGS/KWARGS copies (expandtype.py:1178-1195).
+        let typ = ps_callable(1, vec![instance("builtins.int", vec![])], any());
+        let env: HashMap<EnvKey, Type> = HashMap::from([(
+            (1, 0, String::new()),
+            param_spec_node(
+                2,
+                0,
+                params_of(vec![instance("builtins.str", vec![])], vec![]),
+            ),
+        )]);
+        let out = expand_type_inner(&typ, &env, false).unwrap();
+        match out {
+            Type::CallableType {
+                arg_types,
+                arg_kinds,
+                from_concatenate,
+                ..
+            } => {
+                assert_eq!(arg_types.len(), 4); // lead + prefix + ARGS + KWARGS
+                assert!(matches!(arg_types[1], Type::Instance { ref type_ref, .. }
+                    if type_ref == "builtins.str"));
+                let (f1, f2) = match (&arg_types[2], &arg_types[3]) {
+                    (
+                        Type::ParamSpecType {
+                            flavor: a, raw_id, ..
+                        },
+                        Type::ParamSpecType { flavor: b, .. },
+                    ) => {
+                        assert_eq!(*raw_id, 2);
+                        (*a, *b)
+                    }
+                    other => panic!("expected clean P.args/P.kwargs, got {:?}", other),
+                };
+                assert_eq!((f1, f2), (1, 2));
+                assert_eq!(arg_kinds, vec![0, 0, 2, 4]);
+                assert!(from_concatenate);
+            }
+            other => panic!("expected CallableType, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn ps_splice_callable_without_env_entry_falls_through() {
+        // No P in the env: the arm returns None and the generic path
+        // keeps the occurrences (Python default keeps t untouched).
+        let typ = ps_callable(1, vec![instance("builtins.int", vec![])], tvar(5));
+        let env: HashMap<EnvKey, Type> = HashMap::new();
+        assert!(param_spec_callable_arm(&typ, &env, false).is_none());
+        let out = expand_type_inner(&typ, &env, false).unwrap();
+        match out {
+            Type::CallableType { arg_types, .. } => {
+                assert_eq!(arg_types.len(), 3);
+                assert!(matches!(arg_types[1], Type::ParamSpecType { .. }));
+            }
+            other => panic!("expected CallableType, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn ps_splice_callable_fresh_key_defers() {
+        // A fresh (meta-level 1) env key at the same raw id + namespace
+        // is a fresh substitute the wire cannot key; both splice and
+        // leaf defer.
+        let typ = ps_callable(1, vec![], any());
+        let env: HashMap<EnvKey, Type> =
+            HashMap::from([((1, 1, String::new()), param_spec_node(1, 0, empty_params()))]);
+        assert!(matches!(
+            param_spec_callable_arm(&typ, &env, false),
+            Some(None)
+        ));
+        assert!(expand_type_inner(&typ, &env, false).is_none());
+    }
+
+    #[test]
+    fn ps_splice_callable_unpack_repl_defers() {
+        // The splice result carries an unpack Python would normalize;
+        // the port defers instead (expandtype.py:1173-1176 unported).
+        let typ = ps_callable(1, vec![], any());
+        let env: HashMap<EnvKey, Type> = HashMap::from([(
+            (1, 0, String::new()),
+            Type::Parameters(params_of(
+                vec![Type::UnpackType {
+                    typ: Box::new(tuple_instance()),
+                    from_star_syntax: false,
+                }],
+                vec![],
+            )),
+        )]);
+        assert!(matches!(
+            param_spec_callable_arm(&typ, &env, false),
+            Some(None)
+        ));
+        assert!(expand_type_inner(&typ, &env, false).is_none());
+    }
+
+    #[test]
+    fn ps_leaf_parameters_repl_concats_prefix() {
+        // expandtype.py:966-974 tail: t's own prefix (expanded) then the
+        // repl's args; variables concat; the result is a plain Parameters.
+        let mut prefix = params_of(vec![instance("builtins.bool", vec![])], vec![tvar(5)]);
+        prefix.arg_kinds[0] = 1; // flavor detail: keep kinds from t's prefix
+        let mut t = param_spec_node(1, 0, prefix);
+        if let Type::ParamSpecType { upper_bound, .. } = &mut t {
+            // Python asserts a proper Instance upper bound here.
+            *upper_bound = instance("builtins.object", vec![]).into();
+        }
+        let mut repl = params_of(vec![instance("builtins.str", vec![])], vec![tvar(6)]);
+        repl.imprecise_arg_kinds = true;
+        let env: HashMap<EnvKey, Type> =
+            HashMap::from([((1, 0, String::new()), Type::Parameters(repl))]);
+        let out = param_spec_leaf(&t, &env, false).unwrap();
+        match out {
+            Type::Parameters(p) => {
+                assert_eq!(p.arg_types.len(), 2);
+                assert!(matches!(p.arg_types[0], Type::Instance { ref type_ref, .. }
+                    if type_ref == "builtins.bool"));
+                assert!(matches!(p.arg_types[1], Type::Instance { ref type_ref, .. }
+                    if type_ref == "builtins.str"));
+                assert_eq!(p.arg_kinds, vec![1, 0]);
+                assert_eq!(p.variables.len(), 2); // [tvar(5), tvar(6)]
+                assert!(p.imprecise_arg_kinds);
+                assert!(!p.is_ellipsis_args);
+            }
+            other => panic!("expected Parameters, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn ps_leaf_paramspec_repl_merges_prefix_keeps_flavor() {
+        // repl.copy_modified(prefix=concat, flavor=t.flavor): the
+        // occurrence flavor survives, fresh vars in the own prefix
+        // expand via the env.
+        let mut prefix = params_of(vec![instance("builtins.bool", vec![])], vec![]);
+        prefix.arg_names[0] = Some("x".to_string());
+        prefix.imprecise_arg_kinds = true;
+        let t = param_spec_node(1, 1, prefix); // ARGS occurrence
+        let env: HashMap<EnvKey, Type> = HashMap::from([(
+            (1, 0, String::new()),
+            param_spec_node(
+                2,
+                0,
+                params_of(vec![instance("builtins.str", vec![])], vec![]),
+            ),
+        )]);
+        let out = param_spec_leaf(&t, &env, false).unwrap();
+        match out {
+            Type::ParamSpecType {
+                prefix,
+                raw_id,
+                flavor,
+                name,
+                ..
+            } => {
+                assert_eq!(prefix.arg_types.len(), 2); // t prefix + repl prefix
+                assert_eq!(prefix.arg_kinds, vec![0, 0]);
+                assert_eq!(prefix.arg_names, vec![Some("x".to_string()), None]);
+                assert!(prefix.imprecise_arg_kinds); // from t's own prefix
+                assert_eq!(raw_id, 2);
+                assert_eq!(flavor, 1);
+                assert_eq!(name, "P");
+            }
+            other => panic!("expected ParamSpecType, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn ps_leaf_args_flavor_with_parameters_repl_defers() {
+        // The _possible_callable_varargs/_kwargs arms are unported; a
+        // Parameters repl on an ARGS/KWARGS occurrence defers.
+        let t = ps_occurrence(1, 1);
+        let env: HashMap<EnvKey, Type> = HashMap::from([(
+            (1, 0, String::new()),
+            Type::Parameters(params_of(vec![], vec![])),
+        )]);
+        assert!(param_spec_leaf(&t, &env, false).is_none());
+        let t2 = ps_occurrence(1, 2);
+        assert!(param_spec_leaf(&t2, &env, false).is_none());
+    }
+
+    #[test]
+    fn ps_leaf_non_instance_upper_bound_defers() {
+        // Python asserts a proper Instance upper bound before the
+        // Parameters concat; anything else defers.
+        let mut t = ps_occurrence(1, 0);
+        if let Type::ParamSpecType { upper_bound, .. } = &mut t {
+            *upper_bound = any().into();
+        }
+        let env: HashMap<EnvKey, Type> = HashMap::from([(
+            (1, 0, String::new()),
+            Type::Parameters(params_of(vec![], vec![])),
+        )]);
+        assert!(param_spec_leaf(&t, &env, false).is_none());
+    }
+
+    #[test]
+    fn ps_leaf_missing_env_expands_own_prefix() {
+        // Python's get(t.id, default): t itself with an empty prefix,
+        // which only expands the prefix arg types.
+        let mut prefix = params_of(vec![instance("builtins.list", vec![tvar(5)])], vec![]);
+        prefix.arg_kinds[0] = 0;
+        let t = param_spec_node(1, 0, prefix);
+        let env: HashMap<EnvKey, Type> =
+            HashMap::from([((5, 0, String::new()), instance("builtins.int", vec![]))]);
+        let out = param_spec_leaf(&t, &env, false).unwrap();
+        match out {
+            Type::ParamSpecType {
+                prefix,
+                raw_id,
+                flavor,
+                ..
+            } => {
+                match &prefix.arg_types[0] {
+                    Type::Instance { type_ref, args, .. } => {
+                        assert_eq!(type_ref, "builtins.list");
+                        // List[T] with T -> int expands the arg too.
+                        assert!(matches!(args.as_slice(), [Type::Instance { .. }]));
+                    }
+                    other => panic!("expected Instance prefix arg, got {:?}", other),
+                }
+                assert_eq!(raw_id, 1);
+                assert_eq!(flavor, 0);
+            }
+            other => panic!("expected ParamSpecType, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn ps_leaf_unpack_in_prefix_defers() {
+        // An unpack produced by the prefix concat defers; Python
+        // normalizes such splices at the visitor tail.
+        let mut prefix = params_of(
+            vec![Type::UnpackType {
+                typ: Box::new(tuple_instance()),
+                from_star_syntax: false,
+            }],
+            vec![],
+        );
+        prefix.arg_kinds[0] = 2;
+        let t = param_spec_node(1, 0, prefix);
+        let env: HashMap<EnvKey, Type> = HashMap::new();
+        assert!(param_spec_leaf(&t, &env, false).is_none());
+    }
+
+    #[test]
+    fn ps_leaf_any_repl_passthrough() {
+        // A repl of another shape (e.g. Any) is returned as-is.
+        let t = ps_occurrence(1, 0);
+        let env: HashMap<EnvKey, Type> = HashMap::from([((1, 0, String::new()), any())]);
+        let out = param_spec_leaf(&t, &env, false).unwrap();
+        assert!(matches!(out, Type::AnyType { .. }));
     }
 }
