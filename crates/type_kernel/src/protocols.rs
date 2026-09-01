@@ -74,7 +74,9 @@ pub(crate) fn is_protocol_implementation_inner(
         return None;
     }
     // Protocol-left: recursion-prone (`assuming` guard not mirrored).
-    // Defer to Python's guarded loop.
+    // The subtypes.py:1906-1911 member-set fast path is NOT portable: it
+    // changes callers' via-supertype walks (#1356, testMeetOfIncompatible-
+    // Protocols). Defer to Python's guarded loop.
     let left_snap = resolver.get(left_ref(left)?);
     if left_snap.is_some_and(|s| s.is_protocol) {
         return None;

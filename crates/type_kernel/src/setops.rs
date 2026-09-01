@@ -2273,7 +2273,7 @@ fn visit_join(
                 // ret_type. Returns None (defer) if any is_subtype
 
                 // can't decide (non-Instance, generic args, etc.).
-                let equivalent = is_equivalent_callable(
+                let equiv = is_equivalent_callable(
                     arg_types,
                     ret_type,
                     s_arg_types,
@@ -2282,7 +2282,8 @@ fn visit_join(
                     s_arg_names,
                     ctx,
                     resolver,
-                )?;
+                );
+                let equivalent = equiv?;
                 // match_generic_callables (join.py:1039-1053): renumber
                 // tvars so both callables share the same id space.
                 // When `min_len == 0` (one side has no variables), the
@@ -2346,7 +2347,7 @@ fn visit_join(
                 // abstract-instantiation error when concrete class objects
 
                 // join to their abstract superclass) is replicated.
-                join_similar_callables_impl(
+                let r = join_similar_callables_impl(
                     s,
                     t,
                     s_arg_types,
@@ -2364,7 +2365,8 @@ fn visit_join(
                     variables,
                     ctx,
                     resolver,
-                )
+                );
+                r
             } else if let Type::Overloaded { .. } = s {
                 // join.py:583-585: s is Overloaded -> swap so the
                 // visit_overloaded walk runs with self.s=callable
@@ -2944,7 +2946,7 @@ fn visit_join(
 
         // Case 2 (s is not TupleType): join_types(self.s,
         // tuple_fallback(t)). SameS/SameT -> outer SameS; Ancestor/Object
-        // pass through; else defer.
+        // pass through; Any/Bottom/Encoded -> encode whole (disc=7).
 
         //
         // `tuple_fallback(t)` (typeops.py:194-235) equals
@@ -3053,8 +3055,19 @@ fn visit_join(
             } = t_pf.as_ref()
             {
                 // Case 2: s is not TupleType. join_types(s, tuple_fallback(t)).
-                if fb_ref != "builtins.tuple" {
-                    let r = join_types(s, t_pf, ctx, resolver)?;
+                // For a builtins.tuple partial_fallback, tuple_fallback(t)
+                // builds Instance(builtins.tuple, [union of items]) (#1356);
+                // non-tuple fallbacks come back as-is, so join t_pf directly.
+                let pf_owned;
+                let pf: &Type = if fb_ref == "builtins.tuple" {
+                    let v = crate::typeops::tuple_fallback(t, resolver);
+                    pf_owned = v?;
+                    &pf_owned
+                } else {
+                    t_pf
+                };
+                {
+                    let r = join_types(s, pf, ctx, resolver)?;
                     match &r {
                         SetOpResult::SameS | SetOpResult::SameT => Some(SetOpResult::SameS),
                         SetOpResult::Ancestor(fullname) => {
@@ -3062,7 +3075,7 @@ fn visit_join(
                         }
                         SetOpResult::Object => Some(SetOpResult::Object),
                         SetOpResult::Any | SetOpResult::Bottom => {
-                            match setop_result_to_type(Some(r.clone()), s, t_pf) {
+                            match setop_result_to_type(Some(r.clone()), s, pf) {
                                 Some(typ) => {
                                     let mut wbuf = WriteBuffer::new();
                                     wire::write_type(&mut wbuf, &typ).ok()?;
@@ -3072,10 +3085,15 @@ fn visit_join(
                             }
                         }
                         SetOpResult::Encoded(bytes) => Some(SetOpResult::Encoded(bytes.clone())),
-                        SetOpResult::SameTypeWithArgs { .. } => None,
+                        // Same-ref args joined by disc (viwa): reconstruct
+                        // the absolute Instance from (s, pf) and encode.
+                        SetOpResult::SameTypeWithArgs { .. } => {
+                            let typ = fruit_to_type(r, s, pf)?;
+                            let mut wbuf = WriteBuffer::new();
+                            wire::write_type(&mut wbuf, &typ).ok()?;
+                            Some(SetOpResult::Encoded(wbuf.into_bytes()))
+                        }
                     }
-                } else {
-                    None
                 }
             } else {
                 None
@@ -4200,16 +4218,18 @@ pub(crate) fn visit_instance_join(
         }
         // Same type with args: M8g handles AnyType + invariant
         // is_equivalent; covariant / variadic / ParamSpec defer.
-        return visit_instance_with_args(s_ref, s_args, t_args, ctx, resolver);
+        let r = visit_instance_with_args(s_ref, s_args, t_args, ctx, resolver);
+        return r;
     }
 
-    // Different types with args: the via_supertype path needs
-    // expand_type_by_instance on each base (join.py:204-240 with
-    // args). Deferred — fall through to Python.
+    // Different types with args: args-aware via-supertype walk
+    // (join.py:350-427), as join_instances_core does for the join seam;
+    // fresh seen stack shared via join_and_consider, no higher pusher.
     if !s_args.is_empty() || !t_args.is_empty() {
-        {
-            return None;
-        };
+        let mut seen: SeenInstances = Vec::new();
+        let res =
+            join_diff_instances_with_args(t_ref, t_args, s_ref, s_args, ctx, resolver, &mut seen);
+        return res;
     }
 
     // join.py:403 dispatch (args are empty here): Python decides
@@ -4443,17 +4463,28 @@ fn visit_instance_with_args(
 
                 // via setop_result_to_type and emit the whole Instance
                 // encoded (disc=7) instead of deferring.
-                let r = join_types(ta, sa, ctx, resolver)?;
+                let r = match join_types(ta, sa, ctx, resolver) {
+                    Some(r) => r,
+                    None => {
+                        return None;
+                    }
+                };
                 let (disc, typ) = match &r {
                     SetOpResult::SameS => (1i8, ta.clone()),
                     SetOpResult::SameT => (0, sa.clone()),
                     _ => {
-                        let typ = materialize_join(ta, sa, r, resolver)?;
+                        let typ = match materialize_join(ta, sa, r, resolver) {
+                            Some(t) => t,
+                            None => {
+                                return None;
+                            }
+                        };
                         needs_encode = true;
                         (0, typ)
                     }
                 };
-                if !is_subtype(&typ, &upper_bound, ctx, resolver)? {
+                let ubv = is_subtype(&typ, &upper_bound, ctx, resolver);
+                if !ubv? {
                     return Some(SetOpResult::Object);
                 }
                 arg_discs.push(disc);
@@ -4465,8 +4496,15 @@ fn visit_instance_with_args(
                 // is_subtype(sa, ta). If not equivalent ->
 
                 // object_from_instance(t) (Object).
-                let equiv =
-                    is_subtype(ta, sa, ctx, resolver)? && is_subtype(sa, ta, ctx, resolver)?;
+                let eq1 = is_subtype(ta, sa, ctx, resolver);
+                let equiv = match eq1 {
+                    Some(v1) if v1 => {
+                        let eq2 = is_subtype(sa, ta, ctx, resolver);
+                        eq2?
+                    }
+                    Some(v1) => v1,
+                    None => return None,
+                };
                 if !equiv {
                     return Some(SetOpResult::Object);
                 }
@@ -4475,12 +4513,22 @@ fn visit_instance_with_args(
                 // sa = s.args[i] (disc 0). Ancestor/Object/Any/Bottom
 
                 // -> real join, encode whole (disc=7).
-                let r = join_types(ta, sa, ctx, resolver)?;
+                let r = match join_types(ta, sa, ctx, resolver) {
+                    Some(r) => r,
+                    None => {
+                        return None;
+                    }
+                };
                 let (disc, typ) = match &r {
                     SetOpResult::SameS => (1i8, ta.clone()),
                     SetOpResult::SameT => (0, sa.clone()),
                     _ => {
-                        let typ = materialize_join(ta, sa, r, resolver)?;
+                        let typ = match materialize_join(ta, sa, r, resolver) {
+                            Some(t) => t,
+                            None => {
+                                return None;
+                            }
+                        };
                         needs_encode = true;
                         (0, typ)
                     }
@@ -4798,16 +4846,19 @@ fn join_diff_instances_with_args(
     let t_full = mk_wire_instance(t_ref, t_args.to_vec());
     let s_full = mk_wire_instance(s_ref, s_args.to_vec());
     let t_lt_s = if !t_snap.bases.is_empty() {
-        is_subtype(&t_full, &s_full, &proper_ctx, resolver)?
+        let v = is_subtype(&t_full, &s_full, &proper_ctx, resolver);
+        v?
     } else {
         false
     };
     // Compute the winner as an absolute Type, then re-express it
     // relative to the outer (t, s).
     let result = if t_lt_s {
-        via_supertype_arg_type(t_ref, t_args, s_ref, s_args, ctx, resolver, seen)?
+        let v = via_supertype_arg_type(t_ref, t_args, s_ref, s_args, ctx, resolver, seen);
+        v?
     } else {
-        via_supertype_arg_type(s_ref, s_args, t_ref, t_args, ctx, resolver, seen)?
+        let v = via_supertype_arg_type(s_ref, s_args, t_ref, t_args, ctx, resolver, seen);
+        v?
     };
     if result == t_full {
         Some(SetOpResult::SameT)
@@ -4857,14 +4908,16 @@ fn via_supertype_arg_type(
     // promote); second returns t.
     for pb in &t_snap.promote_bytes {
         let p = decode_type(pb)?;
-        if is_subtype(&p, &s_inst, ctx, resolver)? {
+        let v = is_subtype(&p, &s_inst, ctx, resolver);
+        if v? {
             return Some(s_inst);
         }
     }
     if let Some(ss) = &s_snap {
         for pb in &ss.promote_bytes {
             let p = decode_type(pb)?;
-            if is_subtype(&p, &t_inst, ctx, resolver)? {
+            let v = is_subtype(&p, &t_inst, ctx, resolver);
+            if v? {
                 return Some(t_inst);
             }
         }
@@ -4877,7 +4930,8 @@ fn via_supertype_arg_type(
         // join_instances_core(candidate, s_inst) names its operands
         // (t=candidate, s=s_inst); materialize_join maps SameS to the
         // first param and SameT to the second, so order (s_inst, candidate).
-        let res_type = materialize_join(&s_inst, candidate, res, resolver)?;
+        let mt = materialize_join(&s_inst, candidate, res, resolver);
+        let res_type = mt?;
         if best.is_none() || is_better_join(&res_type, best.as_ref().unwrap(), resolver) {
             best = Some(res_type);
         }
@@ -4905,7 +4959,12 @@ fn via_supertype_arg_type(
     }
 
     for base_blob in &t_snap.bases {
-        let base = decode_type(base_blob)?;
+        let base = match decode_type(base_blob) {
+            Some(b) => b,
+            None => {
+                return None;
+            }
+        };
         let Type::Instance {
             type_ref: base_ref, ..
         } = &base
@@ -4916,9 +4975,14 @@ fn via_supertype_arg_type(
         if base_ref == "builtins.tuple" && tuple_map_diverges(t_ref, resolver)? {
             return None;
         }
-        let mapped_args = map_instance_to_supertype(t_ref, t_args, base_ref, resolver)?;
+        let mapped_args = match map_instance_to_supertype(t_ref, t_args, base_ref, resolver) {
+            Some(m) => m,
+            None => {
+                return None;
+            }
+        };
         let mapped = mk_wire_instance(base_ref, mapped_args);
-        join_and_consider(&mapped, &s_inst, ctx, resolver, seen, &mut consider)?;
+        let _ = join_and_consider(&mapped, &s_inst, ctx, resolver, seen, &mut consider)?;
     }
     if let Some(ss) = &s_snap {
         for base_blob in &ss.bases {
@@ -4930,13 +4994,32 @@ fn via_supertype_arg_type(
                 continue;
             };
             if let Some(b_snap) = resolver.get(base_ref) {
-                if b_snap.is_protocol && is_subtype(&t_inst, &base, ctx, resolver)? {
-                    if base_ref == "builtins.tuple" && tuple_map_diverges(t_ref, resolver)? {
+                if b_snap.is_protocol {
+                    let sub = is_subtype(&t_inst, &base, ctx, resolver);
+                    if sub.is_none() {
                         return None;
                     }
-                    let mapped_args = map_instance_to_supertype(t_ref, t_args, base_ref, resolver)?;
-                    let mapped = mk_wire_instance(base_ref, mapped_args);
-                    join_and_consider(&mapped, &s_inst, ctx, resolver, seen, &mut consider)?;
+                    if sub.unwrap() {
+                        if base_ref == "builtins.tuple" && tuple_map_diverges(t_ref, resolver)? {
+                            return None;
+                        }
+                        let mapped_args =
+                            match map_instance_to_supertype(t_ref, t_args, base_ref, resolver) {
+                                Some(m) => m,
+                                None => {
+                                    return None;
+                                }
+                            };
+                        let mapped = mk_wire_instance(base_ref, mapped_args);
+                        let _ = join_and_consider(
+                            &mapped,
+                            &s_inst,
+                            ctx,
+                            resolver,
+                            seen,
+                            &mut consider,
+                        )?;
+                    }
                 }
             }
         }
@@ -4945,7 +5028,7 @@ fn via_supertype_arg_type(
     for pb in &t_snap.promote_bytes {
         let p = decode_type(pb)?;
         if let Type::Instance { .. } = &p {
-            join_and_consider(&p, &s_inst, ctx, resolver, seen, &mut consider)?;
+            let _ = join_and_consider(&p, &s_inst, ctx, resolver, seen, &mut consider)?;
         }
     }
     best
@@ -4967,6 +5050,9 @@ fn join_and_consider(
     let mark = seen.len();
     let res = join_instances_core(candidate, s_inst, ctx, resolver, seen);
     seen.truncate(mark);
+    if res.is_none() {
+        return None;
+    }
     res.and_then(|r| consider(candidate, r))
 }
 
@@ -5290,7 +5376,8 @@ pub(crate) fn join_instances_core(
                 }
             } else {
                 // join.py:241-290: non-variadic same-type with args.
-                visit_instance_with_args(t_ref, s_args, t_args, ctx, resolver)?
+                let r = visit_instance_with_args(t_ref, s_args, t_args, ctx, resolver);
+                r?
             }
         }
     } else {
@@ -5308,11 +5395,14 @@ pub(crate) fn join_instances_core(
         };
         // join.py:292-295: t <: s? -> join_instances_via_supertype(t, s).
         // JoinResult::Left means the first arg (t) won -> SameT.
-        let t_is_subtype = is_subtype(t, s, &proper_ctx, resolver)?;
+        let t_is_subtype = is_subtype(t, s, &proper_ctx, resolver);
+        let t_is_subtype = t_is_subtype?;
         let result_ref = if t_is_subtype {
-            join_instances_nominal(t_ref, s_ref, ctx, resolver)?
+            let r = join_instances_nominal(t_ref, s_ref, ctx, resolver);
+            r?
         } else {
-            join_instances_nominal(s_ref, t_ref, ctx, resolver)?
+            let r = join_instances_nominal(s_ref, t_ref, ctx, resolver);
+            r?
         };
         match result_ref {
             JoinResult::Left => {
@@ -8421,19 +8511,52 @@ mod tests {
     }
 
     #[test]
-    fn join_tuple_with_builtins_tuple_fallback_defers() {
+    fn join_tuple_bare_tuple_instance_inner_args_defers() {
         // visit_tuple_type case 2: s is Instance, t=Tuple with
-        // partial_fallback=builtins.tuple. tuple_fallback(t) constructs
-        // Instance(builtins.tuple, [make_simplified_union(items)])
-
-        // (typeops.py:110-129) — NOT the same as partial_fallback.
-        // Rust can't replicate without a Type encoder -> defer.
+        // partial_fallback=builtins.tuple. The tuplefb port (#1356) builds
+        // tuple_fallback(t) = Instance(tuple,[int]) and recurses, but the
+        // inner same-ref join hits a 1-vs-0 arg arity mismatch and defers.
         let o = snap("builtins.object", "object");
         let tuple = snap_with_bases("builtins.tuple", "tuple", &["builtins.object"]);
         let r = make_resolver(vec![o, tuple]);
         let s = instance("builtins.tuple", vec![]);
         let t = tuple_type("builtins.tuple", vec![instance("builtins.int", vec![])]);
         assert_eq!(join_types(&s, &t, &ctx(true), &r), None);
+    }
+
+    #[test]
+    fn join_tuple_with_instance_tuplefb_port_decides() {
+        // visit_tuple_type case 2 with the #1356 tuplefb port: tuple_fallback
+        // builds Instance(tuple,[int]) instead of the raw bare fallback, so
+        // the inner join decides trivially instead of deferring on arity 1-vs-0.
+        let o = snap("builtins.object", "object");
+        let int = snap("builtins.int", "int");
+        let mut tuple = snap_with_bases("builtins.tuple", "tuple", &["builtins.object"]);
+        tuple.type_vars_with_variance = vec![("T".to_string(), COVARIANT, 0)];
+        tuple.type_var_upper_bounds = vec![crate::wire::encode_instance_simple_for_test(
+            "builtins.object",
+        )];
+        let r = make_resolver(vec![o, int, tuple]);
+        let s = instance("builtins.tuple", vec![instance("builtins.int", vec![])]);
+        let t = tuple_type("builtins.tuple", vec![instance("builtins.int", vec![])]);
+        let result = join_types(&s, &t, &ctx(true), &r);
+        match result {
+            Some(SetOpResult::Encoded(bytes)) => {
+                let mut rbuf = ReadBuffer::new(&bytes);
+                let decoded = read_type(&mut rbuf, None).expect("decode failed");
+                match decoded {
+                    Type::Instance { type_ref, args, .. } => {
+                        assert_eq!(type_ref, "builtins.tuple");
+                        assert_eq!(args.len(), 1);
+                        assert!(
+                            matches!(&args[0], Type::Instance { type_ref, .. } if type_ref == "builtins.int")
+                        );
+                    }
+                    other => panic!("expected Instance, got {other:?}"),
+                }
+            }
+            other => panic!("expected Encoded, got {other:?}"),
+        }
     }
 
     #[test]
