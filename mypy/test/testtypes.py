@@ -8980,6 +8980,25 @@ class NativeProtocolImplementationSuite(Suite):
         result = self._seam_call(Instance(i, []), Instance(i, []))
         assert result is None, f"non-protocol right must defer, got {result!r}"
 
+    def test_protocol_left_defers_with_member_miss(self) -> None:
+        """Protocol-left defers even when the left member set provably
+        misses a required member of the right protocol. The
+        subtypes.py:1906-1911 fast path (return False on set miss) is
+        intentionally NOT mirrored: deciding the probe False lets the
+        join kernel's via-supertype walk proceed solo, and it diverges
+        from Python under --no-strict-optional
+        (testMeetOfIncompatibleProtocols, #1356)."""
+        from mypy.types import Instance
+
+        self._live_info = {}
+        # left protocol: only `f`; right protocol: requires `f` and `g`.
+        p1 = self._protocol("mod.P1", ["f"])
+        p2 = self._protocol("mod.P2", ["f", "g"])
+        self._build_resolver()
+        left, right = Instance(p1, []), Instance(p2, [])
+        result = self._seam_call(left, right)
+        assert result is None, f"member-set-miss pair must still defer, got {result!r}"
+
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeProtocolMemberDeferSuite(Suite):
