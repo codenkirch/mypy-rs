@@ -5476,11 +5476,13 @@ class NativeExpandParamSpecSpliceSuite(Suite):
 
     `visit_callable_type`'s Concatenate splice (expandtype.py:1149-1195)
     and `visit_param_spec` (:963-996) run natively when the env maps the
-    ParamSpec to a Parameters or to another ParamSpecType. Shapes the
-    port does not cover (a fresh meta substitute keyed only at a nonzero
-    meta level, an unpack it cannot normalize, an ARGS/KWARGS leaf with
-    a Parameters replacement) defer, and the Python shim runs the pure
-    body, so gate-on == gate-off everywhere.
+    ParamSpec to a Parameters and no ParamSpecType occurs in the result.
+    Shapes the port defers (a fresh meta substitute keyed only at a
+    nonzero meta level, an unpack it cannot normalize, an ARGS/KWARGS
+    leaf with a Parameters replacement, and any splice or leaf result
+    that embeds a ParamSpecType -- the wire drops meta_level, so a
+    fresh origin would round-trip at meta level 0) fall back to the
+    pure Python body, so gate-on == gate-off everywhere.
     """
 
     def setUp(self) -> None:
@@ -5579,9 +5581,10 @@ class NativeExpandParamSpecSpliceSuite(Suite):
         assert self._engaged(callee, env), "paramspec splice deferred"
         self._assert_par(callee, env)
 
-    def test_splice_with_paramspec_repl(self) -> None:
-        # P -> Q with a prefix: prefix merges before the clean
-        # *Q.args/**Q.kwargs copies.
+    def test_splice_with_paramspec_repl_defers(self) -> None:
+        # P -> Q with a prefix: the splice output embeds clean
+        # Q.args/**Q.kwargs ParamSpecTypes the wire would flatten
+        # (meta_level dropped). Defer to Python (issue #1343).
         from mypy.types import Parameters
 
         ps = self._param_spec()
@@ -5596,15 +5599,16 @@ class NativeExpandParamSpecSpliceSuite(Suite):
         )
         callee = self._splice_callable(ps, [self.fx.a])
         env = {ps.id: repl}
-        assert self._engaged(callee, env), "paramspec splice deferred"
+        assert not self._engaged(callee, env), "paramspec splice engaged"
         self._assert_par(callee, env)
 
-    def test_splice_without_repl_keeps_occurrences(self) -> None:
-        # Empty env: both splice and default leaf keep the occurrences
-        # installed in the signature (Python's t.copy_with()... default).
+    def test_splice_without_repl_defers(self) -> None:
+        # Empty env: the splice arm falls through and the generic path
+        # keeps the occurrences, but the output embeds ParamSpecTypes
+        # the wire cannot round-trip; the kernel defers to Python.
         ps = self._param_spec()
         callee = self._splice_callable(ps, [self.fx.a])
-        assert self._engaged(callee, {}), "splice-less callable deferred"
+        assert not self._engaged(callee, {}), "occurrence keeper engaged"
         self._assert_par(callee, {})
 
     def test_splice_fresh_key_defers(self) -> None:
@@ -5655,10 +5659,10 @@ class NativeExpandParamSpecSpliceSuite(Suite):
         assert not self._engaged(typ, env), "ARGS leaf engaged"
         self._assert_par(typ, env)
 
-    def test_leaf_missing_env_expands_prefix(self) -> None:
-        # No repl for P: Python's default expands only P's own prefix and
-        # keeps the occurrence. The occurrence rides a plain Instance arg
-        # (CallableType asserts empty prefixes on raw arg slots).
+    def test_leaf_missing_env_prefix_defers(self) -> None:
+        # No repl for P: Python's default expands only P's own prefix
+        # and keeps the occurrence, but the output is a ParamSpecType
+        # whose meta_level the wire would flatten; the kernel defers.
         from mypy.types import Parameters
 
         ps = ParamSpecType(
@@ -5666,7 +5670,7 @@ class NativeExpandParamSpecSpliceSuite(Suite):
             prefix=Parameters([self.fx.bool_type], [ARG_POS], [None]),
         )
         typ = Instance(self.fx.gi, [ps])
-        assert self._engaged(typ, {}), "prefix-expansion leaf deferred"
+        assert not self._engaged(typ, {}), "prefix-expansion leaf engaged"
         self._assert_par(typ, {})
 
 

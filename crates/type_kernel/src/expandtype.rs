@@ -17,6 +17,9 @@
 //!   * `visit_callable_type` ParamSpec splices carrying an UnpackType
 //!     result (Python's `normalize_trivial_unpack` is not ported).
 //!   * Fresh (meta-level 1) ParamSpec substitutes the wire cannot key.
+//!   * Splice or leaf results embedding a `ParamSpecType` (the wire drops
+//!     its meta_level, so a fresh origin round-trips at meta level 0 and
+//!     the constraint solver mis-keys the constraint origin).
 //!   * `visit_type_var_tuple` (expandtype.py:355-368) raises
 //!     `NotImplementedError` in Python for non-trivial replacements; we
 //!     defer those to Python rather than raise over FFI.
@@ -531,10 +534,107 @@ fn has_fresh_param_spec_key(raw_id: i64, namespace: &str, env: &HashMap<EnvKey, 
         .any(|k| k.0 == raw_id && k.1 != 0 && k.2 == namespace)
 }
 
+/// Does `t` embed a `ParamSpecType` anywhere?
+///
+/// The wire format does not carry `meta_level` on `ParamSpecType` ids (it
+/// does on `TypeVarType`), so any splice result that embeds one cannot
+/// round-trip: a fresh (meta-level 1) call-site ParamSpec comes back at
+/// meta level 0 and the constraint solver then mis-keys the constraint
+/// against the solve variables (see `_rebuild_wire_origin` /
+/// `_try_native_constraint_builder` in mypy/constraints.py). Splice arms
+/// that would produce an embedded ParamSpecType defer to Python instead
+/// of answering with the flattened id.
+fn contains_param_spec(t: &Type) -> bool {
+    match t {
+        Type::ParamSpecType {
+            prefix,
+            upper_bound,
+            default,
+            ..
+        } => {
+            // The node itself is an occurrence: always true.
+            let _ = (prefix, upper_bound, default);
+            true
+        }
+        Type::Parameters(p) => contains_param_spec_in_params(p),
+        Type::Instance {
+            args,
+            last_known_value,
+            ..
+        } => {
+            args.iter().any(contains_param_spec)
+                || last_known_value.as_deref().is_some_and(contains_param_spec)
+        }
+        Type::TypeAliasType { args, .. } => args.iter().any(contains_param_spec),
+        Type::TypeVarType {
+            values,
+            upper_bound,
+            default,
+            ..
+        } => {
+            values.iter().any(contains_param_spec)
+                || contains_param_spec(upper_bound)
+                || contains_param_spec(default)
+        }
+        Type::TypeVarTupleType {
+            tuple_fallback,
+            upper_bound,
+            default,
+            ..
+        } => {
+            contains_param_spec(tuple_fallback)
+                || contains_param_spec(upper_bound)
+                || contains_param_spec(default)
+        }
+        Type::UnboundType { args, .. } => args.iter().any(contains_param_spec),
+        Type::UnpackType { typ, .. } => contains_param_spec(typ),
+        Type::AnyType { source_any, .. } => source_any.as_deref().is_some_and(contains_param_spec),
+        Type::CallableType {
+            fallback,
+            instance_type,
+            arg_types,
+            ret_type,
+            variables,
+            type_guard,
+            type_is,
+            ..
+        } => {
+            contains_param_spec(fallback)
+                || instance_type.as_deref().is_some_and(contains_param_spec)
+                || arg_types.iter().any(contains_param_spec)
+                || contains_param_spec(ret_type)
+                || variables.iter().any(contains_param_spec)
+                || type_guard.as_deref().is_some_and(contains_param_spec)
+                || type_is.as_deref().is_some_and(contains_param_spec)
+        }
+        Type::Overloaded { items } => items.iter().any(contains_param_spec),
+        Type::TupleType {
+            partial_fallback,
+            items,
+            ..
+        } => contains_param_spec(partial_fallback) || items.iter().any(contains_param_spec),
+        Type::TypedDictType {
+            fallback, items, ..
+        } => contains_param_spec(fallback) || items.iter().any(|(_, v)| contains_param_spec(v)),
+        Type::LiteralType { fallback, .. } => contains_param_spec(fallback),
+        Type::UnionType { items, .. } => items.iter().any(contains_param_spec),
+        Type::TypeType { item, .. } => contains_param_spec(item),
+        Type::NoneType
+        | Type::ErasedType
+        | Type::DeletedType { .. }
+        | Type::UninhabitedType { .. } => false,
+    }
+}
+
+fn contains_param_spec_in_params(p: &crate::wire::Parameters) -> bool {
+    p.arg_types.iter().any(contains_param_spec) || p.variables.iter().any(contains_param_spec)
+}
+
 /// `ExpandTypeVisitor.visit_param_spec` (expandtype.py:963-996). Returns
 /// `None` when the leaf defers to Python (ARGS/KWARGS flavors, a
-/// non-Instance upper bound, an unpack in the expanded prefix, or a
-/// fresh meta var substitute the wire cannot key).
+/// non-Instance upper bound, an unpack in the expanded prefix, a fresh
+/// meta var substitute the wire cannot key, or a result embedding a
+/// ParamSpecType whose meta_level the wire drops).
 fn param_spec_leaf(t: &Type, env: &HashMap<EnvKey, Type>, strict_optional: bool) -> Option<Type> {
     let Type::ParamSpecType {
         prefix,
@@ -578,7 +678,7 @@ fn param_spec_leaf(t: &Type, env: &HashMap<EnvKey, Type>, strict_optional: bool)
             &default_repl
         }
     };
-    match repl {
+    let res = match repl {
         Type::ParamSpecType {
             prefix: repl_prefix,
             ..
@@ -648,15 +748,24 @@ fn param_spec_leaf(t: &Type, env: &HashMap<EnvKey, Type>, strict_optional: bool)
             }))
         }
         other => Some(other.clone()),
+    };
+    if let Some(r) = &res {
+        if contains_param_spec(r) {
+            // The wire round-trip flattens any embedded ParamSpecType to
+            // meta level 0; defer so Python answers with the live tree.
+            return None;
+        }
     }
+    res
 }
 
 /// `ExpandTypeVisitor.visit_callable_type` ParamSpec splice
 /// (expandtype.py:1149-1195). Returns `Some(Some(t))` when the splice
 /// ran, `Some(None)` when the case defers to Python (an UnpackType in
-/// the splice result, or a fresh meta var substitute the wire cannot
-/// key), and `None` when there is no ParamSpec replacement in the env
-/// (the caller continues with the generic expansion path).
+/// the splice result, a fresh meta var substitute the wire cannot
+/// key, or a splice result embedding a ParamSpecType whose meta_level
+/// the wire drops), and `None` when there is no ParamSpec replacement
+/// in the env (the caller continues with the generic expansion path).
 fn param_spec_callable_arm(
     t: &Type,
     env: &HashMap<EnvKey, Type>,
@@ -745,6 +854,9 @@ fn param_spec_callable_arm(
                 *imprecise_arg_kinds = *imprecise_arg_kinds || repl_params.imprecise_arg_kinds;
                 *variables = [repl_params.variables.clone(), variables.clone()].concat();
             }
+            if contains_param_spec(&res) {
+                return Some(None);
+            }
             Some(Some(res))
         }
         Type::ParamSpecType {
@@ -810,6 +922,12 @@ fn param_spec_callable_arm(
                 *ret_type = new_ret.into();
                 *from_concatenate = *from_concatenate || !repl_prefix.arg_types.is_empty();
                 *imprecise_arg_kinds = *imprecise_arg_kinds || repl_prefix.imprecise_arg_kinds;
+            }
+            // The clean ARGS/KWARGS nodes are ParamSpecTypes; the wire
+            // cannot carry their meta_level, so this splice never
+            // round-trips. Defer to the live Python tree.
+            if contains_param_spec(&res) {
+                return Some(None);
             }
             Some(Some(res))
         }
@@ -2490,9 +2608,10 @@ mod tests {
     }
 
     #[test]
-    fn ps_splice_callable_with_paramspec_repl() {
-        // P -> Q where Q has a prefix: prefix merges before the clean
-        // ARGS/KWARGS copies (expandtype.py:1178-1195).
+    fn ps_splice_callable_with_paramspec_repl_defers() {
+        // P -> Q splice output embeds clean Q.args/Q.kwargs
+        // ParamSpecTypes; the wire drops their meta_level, so a fresh
+        // origin round-trips at meta level 0 (issue #1343). Defer.
         let typ = ps_callable(1, vec![instance("builtins.int", vec![])], any());
         let env: HashMap<EnvKey, Type> = HashMap::from([(
             (1, 0, String::new()),
@@ -2502,52 +2621,22 @@ mod tests {
                 params_of(vec![instance("builtins.str", vec![])], vec![]),
             ),
         )]);
-        let out = expand_type_inner(&typ, &env, false).unwrap();
-        match out {
-            Type::CallableType {
-                arg_types,
-                arg_kinds,
-                from_concatenate,
-                ..
-            } => {
-                assert_eq!(arg_types.len(), 4); // lead + prefix + ARGS + KWARGS
-                assert!(matches!(arg_types[1], Type::Instance { ref type_ref, .. }
-                    if type_ref == "builtins.str"));
-                let (f1, f2) = match (&arg_types[2], &arg_types[3]) {
-                    (
-                        Type::ParamSpecType {
-                            flavor: a, raw_id, ..
-                        },
-                        Type::ParamSpecType { flavor: b, .. },
-                    ) => {
-                        assert_eq!(*raw_id, 2);
-                        (*a, *b)
-                    }
-                    other => panic!("expected clean P.args/P.kwargs, got {:?}", other),
-                };
-                assert_eq!((f1, f2), (1, 2));
-                assert_eq!(arg_kinds, vec![0, 0, 2, 4]);
-                assert!(from_concatenate);
-            }
-            other => panic!("expected CallableType, got {:?}", other),
-        }
+        assert!(matches!(
+            param_spec_callable_arm(&typ, &env, false),
+            Some(None)
+        ));
+        assert!(expand_type_inner(&typ, &env, false).is_none());
     }
 
     #[test]
-    fn ps_splice_callable_without_env_entry_falls_through() {
-        // No P in the env: the arm returns None and the generic path
-        // keeps the occurrences (Python default keeps t untouched).
+    fn ps_splice_callable_without_env_entry_defers() {
+        // No P in the env: the splice arm falls through to the generic
+        // path, which keeps the occurrences — and the output therefore
+        // embeds ParamSpecTypes the wire cannot round-trip. Defer.
         let typ = ps_callable(1, vec![instance("builtins.int", vec![])], tvar(5));
         let env: HashMap<EnvKey, Type> = HashMap::new();
         assert!(param_spec_callable_arm(&typ, &env, false).is_none());
-        let out = expand_type_inner(&typ, &env, false).unwrap();
-        match out {
-            Type::CallableType { arg_types, .. } => {
-                assert_eq!(arg_types.len(), 3);
-                assert!(matches!(arg_types[1], Type::ParamSpecType { .. }));
-            }
-            other => panic!("expected CallableType, got {:?}", other),
-        }
+        assert!(expand_type_inner(&typ, &env, false).is_none());
     }
 
     #[test]
@@ -2620,10 +2709,10 @@ mod tests {
     }
 
     #[test]
-    fn ps_leaf_paramspec_repl_merges_prefix_keeps_flavor() {
-        // repl.copy_modified(prefix=concat, flavor=t.flavor): the
-        // occurrence flavor survives, fresh vars in the own prefix
-        // expand via the env.
+    fn ps_leaf_paramspec_repl_defers() {
+        // A ParamSpecType repl output cannot round-trip: the wire drops
+        // meta_level on ParamSpecType ids, so the fresh origin inside
+        // the result would come back at meta level 0. Defer to Python.
         let mut prefix = params_of(vec![instance("builtins.bool", vec![])], vec![]);
         prefix.arg_names[0] = Some("x".to_string());
         prefix.imprecise_arg_kinds = true;
@@ -2636,25 +2725,8 @@ mod tests {
                 params_of(vec![instance("builtins.str", vec![])], vec![]),
             ),
         )]);
-        let out = param_spec_leaf(&t, &env, false).unwrap();
-        match out {
-            Type::ParamSpecType {
-                prefix,
-                raw_id,
-                flavor,
-                name,
-                ..
-            } => {
-                assert_eq!(prefix.arg_types.len(), 2); // t prefix + repl prefix
-                assert_eq!(prefix.arg_kinds, vec![0, 0]);
-                assert_eq!(prefix.arg_names, vec![Some("x".to_string()), None]);
-                assert!(prefix.imprecise_arg_kinds); // from t's own prefix
-                assert_eq!(raw_id, 2);
-                assert_eq!(flavor, 1);
-                assert_eq!(name, "P");
-            }
-            other => panic!("expected ParamSpecType, got {:?}", other),
-        }
+        assert!(param_spec_leaf(&t, &env, false).is_none());
+        assert!(expand_type_inner(&t, &env, false).is_none());
     }
 
     #[test]
@@ -2687,35 +2759,59 @@ mod tests {
     }
 
     #[test]
-    fn ps_leaf_missing_env_expands_own_prefix() {
-        // Python's get(t.id, default): t itself with an empty prefix,
-        // which only expands the prefix arg types.
+    fn ps_leaf_missing_env_default_path_defers() {
+        // Python's get(t.id, default) expands the own prefix, but the
+        // result is still a ParamSpecType the wire would flatten to
+        // meta level 0; defer so Python answers with the live object.
         let mut prefix = params_of(vec![instance("builtins.list", vec![tvar(5)])], vec![]);
         prefix.arg_kinds[0] = 0;
         let t = param_spec_node(1, 0, prefix);
         let env: HashMap<EnvKey, Type> =
             HashMap::from([((5, 0, String::new()), instance("builtins.int", vec![]))]);
-        let out = param_spec_leaf(&t, &env, false).unwrap();
-        match out {
-            Type::ParamSpecType {
-                prefix,
-                raw_id,
-                flavor,
-                ..
-            } => {
-                match &prefix.arg_types[0] {
-                    Type::Instance { type_ref, args, .. } => {
-                        assert_eq!(type_ref, "builtins.list");
-                        // List[T] with T -> int expands the arg too.
-                        assert!(matches!(args.as_slice(), [Type::Instance { .. }]));
-                    }
-                    other => panic!("expected Instance prefix arg, got {:?}", other),
-                }
-                assert_eq!(raw_id, 1);
-                assert_eq!(flavor, 0);
-            }
-            other => panic!("expected ParamSpecType, got {:?}", other),
+        assert!(param_spec_leaf(&t, &env, false).is_none());
+    }
+
+    #[test]
+    fn ps_splice_parameters_repl_embedded_paramspec_defers() {
+        // A Parameters repl arg that itself carries a ParamSpecType
+        // occurrence cannot round-trip; the whole splice defers.
+        let typ = ps_callable(1, vec![], any());
+        let env: HashMap<EnvKey, Type> = HashMap::from([(
+            (1, 0, String::new()),
+            Type::Parameters(params_of(vec![ps_occurrence(9, 1)], vec![])),
+        )]);
+        assert!(matches!(
+            param_spec_callable_arm(&typ, &env, false),
+            Some(None)
+        ));
+        assert!(expand_type_inner(&typ, &env, false).is_none());
+    }
+
+    #[test]
+    fn ps_leaf_parameters_repl_embedded_paramspec_defers() {
+        // BARE occurrence with a Parameters repl whose args embed a
+        // ParamSpecType occurrence: the concat result cannot round-trip.
+        let mut t = ps_occurrence(1, 0);
+        if let Type::ParamSpecType { upper_bound, .. } = &mut t {
+            *upper_bound = instance("builtins.object", vec![]).into();
         }
+        let env: HashMap<EnvKey, Type> = HashMap::from([(
+            (1, 0, String::new()),
+            Type::Parameters(params_of(vec![ps_occurrence(9, 1)], vec![])),
+        )]);
+        assert!(param_spec_leaf(&t, &env, false).is_none());
+    }
+
+    #[test]
+    fn contains_param_spec_walks_nested_positions() {
+        // Direct kernel-unit coverage for the defer predicate.
+        assert!(contains_param_spec(&ps_occurrence(1, 0)));
+        assert!(contains_param_spec(&param_spec_node(1, 0, empty_params())));
+        assert!(contains_param_spec(&ps_callable(1, vec![], any())));
+        assert!(!contains_param_spec(&instance("builtins.int", vec![])));
+        assert!(!contains_param_spec(&any()));
+        assert!(!contains_param_spec(&tvar(5)));
+        assert!(!contains_param_spec(&Type::Parameters(empty_params())));
     }
 
     #[test]
