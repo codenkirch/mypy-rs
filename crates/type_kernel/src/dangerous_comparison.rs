@@ -12,8 +12,10 @@
 //! `Some(bool)`, or `None` to defer to the untouched pure-Python body.
 //!
 //! Deferral policy (correctness > coverage): every sub-decision that Rust
-//! cannot reproduce exactly falls back to Python. That includes any
-//! `TypeAliasType` on the wire (no alias target), an unresolved
+//! cannot reproduce exactly falls back to Python. That includes a
+//! `TypeAliasType` whose alias snapshot is missing, cyclic, or undecodable
+//! (well-formed aliases expand natively via the alias resolver, mirroring
+//! `get_proper_type`), an unresolved
 //! `Instance` snapshot, a missing known-fullname snapshot for the mapped
 //! AbstractSet/Mapping item recursion, and an unknown `LiteralValue`
 //! variant. `None` is always safe: the Python fallback body is unchanged.
@@ -68,24 +70,17 @@ fn decode_type(bytes: &[u8]) -> Option<Type> {
     wire::read_type(&mut buf, None).ok()
 }
 
-/// `get_proper_type`: a `TypeAliasType` has no proper form on the wire, so
-/// defer to the Python path (which expands the alias).
-fn get_proper_or_none(typ: &Type) -> Option<&Type> {
-    match typ {
-        Type::TypeAliasType { .. } => None,
-        _ => Some(typ),
-    }
-}
-
-/// `mypy.types_utils.remove_optional` (types_utils.py:132-140): drop
-/// `NoneType` items from a union, `NoneType` -> bottom, else identity.
-fn remove_optional(typ: &Type) -> Option<Type> {
-    let proper = get_proper_or_none(typ)?;
-    match proper {
+/// `mypy.types_utils.remove_optional` (types_utils.py:132-140): expand a
+/// top-level alias, drop `NoneType` items from a union (each item is
+/// expanded only to *test* for `NoneType`; the original item is kept in
+/// the output, mirroring Python), `NoneType` -> bottom, else identity.
+fn remove_optional(typ: &Type, aliases: &crate::aliases::TypeAliasResolver) -> Option<Type> {
+    let proper = crate::checkexpr_functions::get_proper_or_expand(typ, aliases)?;
+    match &proper {
         Type::UnionType { items, .. } => {
             let mut out: Vec<Type> = Vec::with_capacity(items.len());
             for item in items {
-                let proper_item = get_proper_or_none(item)?;
+                let proper_item = crate::checkexpr_functions::get_proper_or_expand(item, aliases)?;
                 if matches!(proper_item, Type::NoneType) {
                     continue;
                 }
@@ -94,7 +89,7 @@ fn remove_optional(typ: &Type) -> Option<Type> {
             Some(crate::setops::union_make_union(out))
         }
         Type::NoneType => Some(Type::UninhabitedType { ambiguous: false }),
-        _ => Some(proper.clone()),
+        _ => Some(proper),
     }
 }
 
@@ -111,7 +106,9 @@ fn has_bytes_component(typ: &Type, aliases: &crate::aliases::TypeAliasResolver) 
 /// `mypy.checkexpr.ExpressionChecker.dangerous_comparison`, Rust subset.
 ///
 /// Mirrors the Python body branch-for-branch. Deferral (`None`) fires on:
-///   * a wire `TypeAliasType` anywhere a `get_proper_type` is needed,
+///   * a wire `TypeAliasType` whose alias snapshot is missing, cyclic, or
+///     undecodable (well-formed aliases expand natively, mirroring
+///     `get_proper_type`),
 ///   * a missing `TypeInfo` snapshot for an `Instance`,
 ///   * an AbstractSet/Mapping recursion whose mapped supertype snapshot is
 ///     not among the passed known fullnames (the shim passes the resolved
@@ -145,8 +142,8 @@ fn dangerous_comparison_inner(
         return Some(false);
     }
 
-    let left = get_proper_or_none(left)?.clone();
-    let right = get_proper_or_none(right)?.clone();
+    let left = crate::checkexpr_functions::get_proper_or_expand(left, aliases)?;
+    let right = crate::checkexpr_functions::get_proper_or_expand(right, aliases)?;
 
     // Custom __eq__ on either side suppresses the error (equal
     // non-overlapping types are allowed). The shim computed these via the
@@ -177,7 +174,15 @@ fn dangerous_comparison_inner(
 
     let (left, right) =
         if matches!(left, Type::UnionType { .. }) && matches!(right, Type::UnionType { .. }) {
-            (remove_optional(&left)?, remove_optional(&right)?)
+            let l = remove_optional(&left, aliases)?;
+            let r = remove_optional(&right, aliases)?;
+            // checkexpr.py:5737: `left, right = get_proper_types(...)` right
+            // after remove_optional; a collapsed single-item union can be a
+            // bare alias item, which Python expands here.
+            (
+                crate::checkexpr_functions::get_proper_or_expand(&l, aliases)?,
+                crate::checkexpr_functions::get_proper_or_expand(&r, aliases)?,
+            )
         } else {
             (left, right)
         };
@@ -300,8 +305,8 @@ fn dangerous_comparison_inner(
         } else if (left_ref == "builtins.list" || left_ref == "builtins.tuple")
             && right_ref == left_ref
         {
-            let left_item = args_of(&left)?.first()?.clone();
-            let right_item = args_of(&right)?.first()?.clone();
+            let left_item = args_of(&left)?.first().cloned()?;
+            let right_item = args_of(&right)?.first().cloned()?;
             let (item_custom_eq_left, item_custom_eq_right) =
                 recursion_custom_eq(&left_item, &right_item, resolver)?;
             return dangerous_comparison_inner(
@@ -370,7 +375,8 @@ fn dangerous_comparison_inner(
     }
 
     // Final: never of any pair of the two types.
-    overlap(&left, &right, strict_optional, false, false, resolver, 0).map(|overlaps| !overlaps)
+    let result = overlap(&left, &right, strict_optional, false, false, resolver, 0);
+    result.map(|overlaps| !overlaps)
 }
 
 /// Extract the `args` field of a wire `Instance`; `None` on any other shape.
@@ -468,11 +474,13 @@ pub(crate) fn rust_dangerous_comparison(
     abstract_map_ref: Option<String>,
     resolver: &mut NativeTypeResolver,
 ) -> PyResult<Option<bool>> {
-    let Some(left) = decode_type(left_bytes) else {
-        return Ok(None);
+    let left = match decode_type(left_bytes) {
+        Some(t) => t,
+        None => return Ok(None),
     };
-    let Some(right) = decode_type(right_bytes) else {
-        return Ok(None);
+    let right = match decode_type(right_bytes) {
+        Some(t) => t,
+        None => return Ok(None),
     };
     let original_container = match original_container_bytes {
         Some(bytes) => match decode_type(bytes) {
@@ -498,4 +506,113 @@ pub(crate) fn rust_dangerous_comparison(
         resolver.resolver(),
         resolver.alias_resolver(),
     ))
+}
+
+// ---------------------------------------------------------------------------
+// Unit tests for the alias-aware `remove_optional` port
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::aliases::{TypeAliasResolver, TypeAliasSnapshot};
+    use crate::wire::WriteBuffer;
+
+    fn inst(type_ref: &str, args: Vec<Type>) -> Type {
+        Type::Instance {
+            type_ref: type_ref.to_owned(),
+            args,
+            last_known_value: None,
+            extra_attrs: None,
+        }
+    }
+
+    fn alias_ref(type_ref: &str) -> Type {
+        Type::TypeAliasType {
+            args: Vec::new(),
+            type_ref: type_ref.to_owned(),
+        }
+    }
+
+    fn union(items: Vec<Type>) -> Type {
+        let can_be_true = true;
+        let can_be_false = true;
+        Type::UnionType {
+            items,
+            uses_pep604_syntax: false,
+            can_be_true,
+            can_be_false,
+        }
+    }
+
+    fn target_snapshot(fullname: &str, target: &Type) -> TypeAliasSnapshot {
+        let mut buf = WriteBuffer::new();
+        wire::write_type(&mut buf, target).expect("target must encode");
+        TypeAliasSnapshot {
+            fullname: fullname.to_owned(),
+            target: buf.into_bytes(),
+            ..Default::default()
+        }
+    }
+
+    fn resolver_with(entries: &[(&str, Type)]) -> TypeAliasResolver {
+        let mut aliases = TypeAliasResolver::new();
+        for (name, target) in entries {
+            aliases.insert((*name).to_owned(), target_snapshot(name, target));
+        }
+        aliases
+    }
+
+    #[test]
+    fn remove_optional_keeps_non_none_alias_item() {
+        // `mod.A = builtins.A` has no NoneType in its target, so a union
+        // item holding the alias is KEPT AS THE ALIAS NODE (expanded only
+        // to *test* None-ness, mirroring types_utils.remove_optional).
+        let aliases = resolver_with(&[("mod.A", inst("builtins.A", Vec::new()))]);
+        let alias = alias_ref("mod.A");
+        let input = union(vec![Type::NoneType, alias.clone()]);
+        let out = remove_optional(&input, &aliases).expect("must decide");
+        assert_eq!(out, alias, "alias item must survive, not be replaced");
+    }
+
+    #[test]
+    fn remove_optional_expands_top_level_alias_with_none_target() {
+        // `mod.O = Union[builtins.A, None]` as a top-level operand: the
+        // expansion reaches the union, whose NoneType item is dropped and
+        // a single-item union collapses to the bare Instance.
+        let target = union(vec![inst("builtins.A", Vec::new()), Type::NoneType]);
+        let aliases = resolver_with(&[("mod.O", target)]);
+        let out = remove_optional(&alias_ref("mod.O"), &aliases).expect("must decide");
+        assert_eq!(out, inst("builtins.A", Vec::new()));
+    }
+
+    #[test]
+    fn remove_optional_bare_none_is_uninhabited() {
+        let aliases = TypeAliasResolver::new();
+        let out = remove_optional(&Type::NoneType, &aliases).expect("must decide");
+        assert_eq!(out, Type::UninhabitedType { ambiguous: false });
+    }
+
+    #[test]
+    fn remove_optional_missing_alias_snapshot_defers() {
+        // No snapshot for `mod.M`: the expansion must defer, not guess.
+        let aliases = TypeAliasResolver::new();
+        let input = alias_ref("mod.M");
+        assert!(remove_optional(&input, &aliases).is_none());
+    }
+
+    #[test]
+    fn remove_optional_alias_item_with_union_target_is_kept() {
+        // `mod.B = Union[builtins.A, None]` as a UNION ITEM: the item's
+        // proper type is a union, not NoneType, so the item stays (Python
+        // tests only the immediate item, single expansion).
+        let target = union(vec![inst("builtins.A", Vec::new()), Type::NoneType]);
+        let aliases = resolver_with(&[("mod.B", target)]);
+        let alias = alias_ref("mod.B");
+        let input = union(vec![Type::NoneType, alias.clone()]);
+        let out = remove_optional(&input, &aliases).expect("must decide");
+        // Single non-None item collapses via union_make_union (len 1 ->
+        // the item itself), so the bare alias node is the result.
+        assert_eq!(out, alias);
+    }
 }

@@ -26558,6 +26558,7 @@ class NativeDangerousComparisonSuite(Suite):
                 self.memoryviewi,
             ]
         )
+        self._infos = type_infos
         self.resolver = _type_kernel.build_native_resolver(type_infos, [])
         self._set_active = _set_native_checkexpr_active
         self._set_resolver = _set_native_checkexpr_resolver
@@ -26598,13 +26599,11 @@ class NativeDangerousComparisonSuite(Suite):
         on = self._with_gate(True, lambda: self.method.dangerous_comparison(left, right, **kw))
         assert_equal(on, off, f"dangerous_comparison parity {left} / {right}")
 
-    def _assert_engages(
-        self, left: Type, right: Type, original: Type | None = None, **kw: Any
-    ) -> None:
+    def _seam(self, left: Type, right: Type, original: Type | None = None, **kw: Any) -> Any:
         from mypy.checkexpr import _serialize_type_for_checkexpr
         from mypy.typeops import custom_special_method
 
-        result = _type_kernel.rust_dangerous_comparison(
+        return _type_kernel.rust_dangerous_comparison(
             _serialize_type_for_checkexpr(left),
             _serialize_type_for_checkexpr(right),
             _serialize_type_for_checkexpr(original) if original is not None else None,
@@ -26620,6 +26619,11 @@ class NativeDangerousComparisonSuite(Suite):
             "typing.Mapping",
             self.resolver,
         )
+
+    def _assert_engages(
+        self, left: Type, right: Type, original: Type | None = None, **kw: Any
+    ) -> None:
+        result = self._seam(left, right, original, **kw)
         assert result is not None, f"Rust dangerous_comparison did not engage for {left} / {right}"
 
     def test_disjoint_siblings_true(self) -> None:
@@ -26688,6 +26692,40 @@ class NativeDangerousComparisonSuite(Suite):
         b = Instance(self.bytesi, [])
         self._assert_par(ba, b)
         self._assert_engages(ba, b)
+
+    def _rebuild_with_aliases(self, aliases: list[TypeAlias]) -> None:
+        self.resolver = _type_kernel.build_native_resolver(self._infos, aliases)
+        self._set_resolver(self.resolver)
+
+    def test_alias_operand_disjoint_true(self) -> None:
+        # `mod.A = A`: an alias operand expands natively, so the strict
+        # comparison against disjoint D decides True in the seam.
+        alias = TypeAlias(self.fx.a, "mod.A", "mod", -1, -1)
+        left = TypeAliasType(alias, [])
+        self._rebuild_with_aliases([alias])
+        self._assert_par(left, self.fx.d)
+        result = self._with_gate(True, lambda: self.method.dangerous_comparison(left, self.fx.d))
+        assert_equal(result, True)
+        self._assert_engages(left, self.fx.d)
+
+    def test_alias_optional_union_true(self) -> None:
+        # `mod.O = Optional[A]` vs `Optional[D]`: remove_optional drops
+        # None on both sides (the alias expands into the union branch) and
+        # the A / D items are disjoint.
+        alias = TypeAlias(UnionType([self.fx.a, self.fx.nonet]), "mod.O", "mod", -1, -1)
+        left = TypeAliasType(alias, [])
+        right = UnionType([self.fx.d, self.fx.nonet])
+        self._rebuild_with_aliases([alias])
+        self._assert_par(left, right)
+        self._assert_engages(left, right)
+
+    def test_alias_missing_snapshot_defers_parity(self) -> None:
+        # An alias with no resolver snapshot defers: both gates answer via
+        # the pure-Python body and must agree.
+        alias = TypeAlias(self.fx.a, "mod.Missing", "mod", -1, -1)
+        left = TypeAliasType(alias, [])
+        self._assert_par(left, self.fx.d)
+        assert self._seam(left, self.fx.d) is None
 
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
