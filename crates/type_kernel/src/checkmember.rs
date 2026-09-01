@@ -1297,10 +1297,7 @@ pub(crate) fn rust_analyze_instance_member_access(
         false,
         None,
     );
-    match result {
-        Some(t) => encode_type(&t),
-        None => None,
-    }
+    result.and_then(|t| encode_type(&t))
 }
 
 // ---------------------------------------------------------------------------
@@ -4019,7 +4016,9 @@ pub(crate) fn rust_add_class_tvars(
 ) -> PyResult<Option<(i64, bool, Vec<u8>)>> {
     let t = match decode_type(t_bytes) {
         Some(t) => t,
-        None => return Ok(None),
+        None => {
+            return Ok(None);
+        }
     };
     let isuper = if isuper_bytes.is_empty() {
         None
@@ -4031,7 +4030,9 @@ pub(crate) fn rust_add_class_tvars(
     } else {
         match decode_type_list_blob(original_vars_bytes) {
             Some(v) => v,
-            None => return Ok(None),
+            None => {
+                return Ok(None);
+            }
         }
     };
     let result = add_class_tvars_inner(
@@ -4049,7 +4050,9 @@ pub(crate) fn rust_add_class_tvars(
         Some((next_raw_id, changed, typ)) => {
             let bytes = match encode_type(&typ) {
                 Some(b) => b,
-                None => return Ok(None),
+                None => {
+                    return Ok(None);
+                }
             };
             Ok(Some((next_raw_id, changed, bytes)))
         }
@@ -4073,33 +4076,50 @@ fn add_class_tvars_inner(
         Type::CallableType { is_bound, .. } => {
             // Only handle classmethod + trivial_self + not already bound.
             if !is_classmethod || !is_trivial_self || *is_bound {
-                return None;
+                {
+                    return None;
+                };
             }
             let mut current = t.clone();
             let mut next_raw_id = start_raw_id;
             let mut changed = false;
 
             if !preserve_type_var_ids {
-                let freshened = crate::freshen::freshen_type(
+                let freshened = match crate::freshen::freshen_type(
                     &current,
                     &mut next_raw_id,
                     &mut changed,
                     strict_optional,
-                )?;
+                ) {
+                    Some(f) => f,
+                    None => {
+                        return None;
+                    }
+                };
                 current = freshened;
             }
 
             // bind_self_fast for trivial_self classmethod.
-            let bound = bind_self_fast_inner(&current)?;
+            let bound = match bind_self_fast_inner(&current) {
+                Some(b) => b,
+                None => {
+                    return None;
+                }
+            };
 
             // expand_type_by_instance(bound, isuper) if isuper is Some.
             let expanded = if let Some(isup) = isuper {
-                crate::expandtype::expand_type_by_instance_core(
+                match crate::expandtype::expand_type_by_instance_core_alias(
                     &bound,
                     isup,
                     resolver,
                     strict_optional,
-                )?
+                ) {
+                    Some(e) => e,
+                    None => {
+                        return None;
+                    }
+                }
             } else {
                 bound
             };
@@ -4116,7 +4136,9 @@ fn add_class_tvars_inner(
                     combined.extend(exp_vars.iter().cloned());
                     combined
                 }
-                _ => return None,
+                _ => {
+                    return None;
+                }
             };
 
             let result = match &expanded {
@@ -4157,13 +4179,17 @@ fn add_class_tvars_inner(
                     type_guard: etg.clone(),
                     type_is: eti.clone(),
                 },
-                _ => return None,
+                _ => {
+                    return None;
+                }
             };
             Some((next_raw_id, changed, result))
         }
         Type::Overloaded { items } => {
             if items.is_empty() {
-                return None;
+                {
+                    return None;
+                };
             }
             let mut new_items = Vec::with_capacity(items.len());
             let mut next_raw_id = start_raw_id;
@@ -4186,7 +4212,9 @@ fn add_class_tvars_inner(
                 }
                 // Python casts each item to CallableType.
                 if !matches!(r.2, Type::CallableType { .. }) {
-                    return None;
+                    {
+                        return None;
+                    };
                 }
                 new_items.push(r.2);
             }
@@ -4195,7 +4223,17 @@ fn add_class_tvars_inner(
         _ => {
             // Non-callable: expand_type_by_instance(t, isuper) if isuper.
             let expanded = if let Some(isup) = isuper {
-                crate::expandtype::expand_type_by_instance_core(t, isup, resolver, strict_optional)?
+                match crate::expandtype::expand_type_by_instance_core_alias(
+                    t,
+                    isup,
+                    resolver,
+                    strict_optional,
+                ) {
+                    Some(e) => e,
+                    None => {
+                        return None;
+                    }
+                }
             } else {
                 t.clone()
             };
