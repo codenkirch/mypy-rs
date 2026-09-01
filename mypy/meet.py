@@ -1218,6 +1218,27 @@ class TypeMeetVisitor(TypeVisitor[ProperType]):
         function is roughly a mirror of join_tuples() w.r.t. to the fact that fixed
         tuples are subtypes of variadic ones but not vice versa.
         """
+        s_unpack_index = find_unpack_in_list(s.items)
+        t_unpack_index = find_unpack_in_list(t.items)
+        # Scalar-only parity-None guards hoisted ahead of the native path so
+        # these shapes never cross the seam; Python returns None for them
+        # without needing get_proper_type.
+        if s_unpack_index is None and t_unpack_index is None:
+            if s.length() != t.length():
+                return None
+        elif s_unpack_index is not None and t_unpack_index is not None:
+            if s.length() != t.length() or s_unpack_index != t_unpack_index:
+                return None
+        else:
+            if s_unpack_index is not None:
+                variadic = s
+                fixed = t
+            else:
+                variadic = t
+                fixed = s
+            if fixed.length() < variadic.length() - 1:
+                return None
+
         # Stage 4 (M494) type-kernel seam: try the Rust meet_tuples path.
         # Rust returns None for unhandled cases (defer to Python).
         if (
@@ -1261,8 +1282,6 @@ class TypeMeetVisitor(TypeVisitor[ProperType]):
                 if fixed_items is not None:
                     return fixed_items
 
-        s_unpack_index = find_unpack_in_list(s.items)
-        t_unpack_index = find_unpack_in_list(t.items)
         if s_unpack_index is None and t_unpack_index is None:
             if s.length() == t.length():
                 items: list[Type] = []
