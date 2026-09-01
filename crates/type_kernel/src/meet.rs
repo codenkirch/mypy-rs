@@ -1570,7 +1570,8 @@ fn materialize_meet_result(
             source_any: None,
             missing_import_name: None,
         }),
-        _ => None, // meet never emits Object/Ancestor/SameTypeWithArgs/Encoded.
+        SetOpResult::Encoded(bytes) => decode_type(&bytes),
+        _ => None,
     }
 }
 
@@ -2210,4 +2211,70 @@ mod tests {
             other => panic!("expected AnyType, got {other:?}"),
         }
     }
+
+    #[test]
+    fn materialize_meet_encoded_roundtrips() {
+        // Same-ref generic instances emit Encoded(bytes) from
+        // visit_instance_meet_args; materialize_meet_result must decode
+        // them instead of dropping to None (Python fallback).
+        let r = TypeResolver::new();
+        let list_i = Type::Instance {
+            type_ref: "builtins.list".to_string(),
+            args: vec![instance("builtins.int")],
+            last_known_value: None,
+            extra_attrs: None,
+        };
+        let mut buf = WriteBuffer::new();
+        wire::write_type(&mut buf, &list_i).expect("Instance must encode");
+        let out = materialize_meet_result(
+            crate::setops::SetOpResult::Encoded(buf.into_bytes()),
+            &list_i,
+            &any_type(),
+            true,
+            &r,
+        );
+        assert_eq!(out.as_ref(), Some(&list_i));
+    }
+
+    #[test]
+    fn narrow_same_ref_generic_via_meet_materializes_encoded() {
+        // G[object] ~ G[Any]: neither is a proper subtype of the other, so
+        // visit_instance_meet_args runs and the result instance rides the
+        // Encoded arm; narrow_declared_type(G[object], G[Any]) == G[object].
+        let mut r = make_resolver();
+        let mut g = TypeInfoSnapshot {
+            fullname: "g.G".to_string(),
+            name: "G".to_string(),
+            ..Default::default()
+        };
+        // Python's mro and has_base include the class itself;
+        // visit_instance_nominal keys the same-ref branch on
+        // has_base(right_ref).
+        g.mro.push("g.G".to_string());
+        g.mro.push("builtins.object".to_string());
+        g.has_base.insert("g.G".to_string());
+        g.has_base.insert("builtins.object".to_string());
+        g.type_vars_with_variance.push(("T".to_string(), 1, 0));
+        r.insert("g.G".to_string(), g);
+        let g_obj = Type::Instance {
+            type_ref: "g.G".to_string(),
+            args: vec![instance("builtins.object")],
+            last_known_value: None,
+            extra_attrs: None,
+        };
+        let g_any = Type::Instance {
+            type_ref: "g.G".to_string(),
+            args: vec![any_type()],
+            last_known_value: None,
+            extra_attrs: None,
+        };
+        let out = meet_types(&g_obj, &g_any, &SubtypeContext::default(), &r)
+            .expect("same-ref G[object] ~ G[Any] must decide");
+        let bytes = match out {
+            crate::setops::SetOpResult::Encoded(bytes) => bytes,
+            other => panic!("expected Encoded, got {other:?}"),
+        };
+        assert_eq!(decode_type(&bytes).as_ref(), Some(&g_obj));
+    }
 }
+

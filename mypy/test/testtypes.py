@@ -15396,6 +15396,45 @@ class NativeMeetDeferralSuite(Suite):
         assert decoded is not None
         self.assertEqual(str(decoded), "A")
 
+    # -- Same-ref generic narrow via the Encoded materialization arm --
+
+    def _narrow(self, active: bool, declared: Type, narrowed: Type) -> str:
+        import mypy.join
+        from mypy.meet import narrow_declared_type
+
+        old = mypy.join._native_join_active
+        mypy.join._set_native_join_active(active)
+        try:
+            with state.strict_optional_set(True):
+                return str(narrow_declared_type(declared, narrowed))
+        finally:
+            mypy.join._set_native_join_active(old)
+
+    def test_narrow_same_ref_generic_parity(self) -> None:
+        # G[object] declared, G[Any] narrowed: the pair rides
+        # visit_instance_meet_args and the result was previously a blind
+        # None (mat-encoded defer) in the Encoded materialization arm.
+        declared = Instance(self.fx.gi, [self.fx.o])
+        narrowed = Instance(self.fx.gi, [self.fx.anyt])
+        expected = str(declared)
+        off = self._narrow(False, declared, narrowed)
+        on = self._narrow(True, declared, narrowed)
+        self.assertEqual(on, off)
+        self.assertEqual(on, expected)
+
+    def test_narrow_same_ref_generic_seam_engages(self) -> None:
+        from mypy.join import _deserialize_type, _serialize_type
+
+        declared = Instance(self.fx.gi, [self.fx.o])
+        narrowed = Instance(self.fx.gi, [self.fx.anyt])
+        r = _type_kernel.rust_narrow_declared_type(
+            _serialize_type(declared), _serialize_type(narrowed), True, self.resolver
+        )
+        assert r is not None, "rust_narrow_declared_type deferred on G[object] ~ G[Any]"
+        decoded = _deserialize_type(bytes(r))
+        assert decoded is not None
+        self.assertEqual(str(decoded), str(declared))
+
     def test_is_overlapping_erased_operand(self) -> None:
         # Python treats Unbound/Erased/Deleted operands as overlapping (meet.py:568);
         # the overlap shim serializes Erased unfiltered, so the wire tag-122 leaf
