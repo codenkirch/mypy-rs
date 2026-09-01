@@ -31210,12 +31210,16 @@ class NativeCombineSimilarCallablesSuite(Suite):
 
     Runs the pure-Python body (join gate off) and the Rust path (join
     gate on) on the same callable pairs and asserts identical results.
-    Cases Rust cannot handle (both-generic callables, per-arg joins it
-    cannot decide) return None and the Python body runs unchanged, so
-    the differential still passes.
+    Both-generic callables renumber natively since the TypeVarId
+    registry (#1345): their ids are Rust-side fresh ids, so only the
+    direct-seam engagement and value shape are asserted, not parity
+    with Python's TypeVarId.new ids. Per-arg joins it cannot decide
+    still return None and the Python body runs unchanged.
     """
 
     def setUp(self) -> None:
+
+        from mypy.join import _set_native_join_typeinfo_map
 
         self.fx = TypeFixture(INVARIANT)
         type_infos = []
@@ -31227,13 +31231,19 @@ class NativeCombineSimilarCallablesSuite(Suite):
                 type_infos.append(value)
         type_infos.extend([self.fx.str_type_info, self.fx.bool_type_info])
         self.resolver = _type_kernel.build_native_resolver(type_infos, [])
+        _set_native_join_typeinfo_map({info.fullname: info for info in type_infos})
         self._set_active(True)
 
     def tearDown(self) -> None:
-        from mypy.join import _set_native_join_active, _set_native_join_resolver
+        from mypy.join import (
+            _set_native_join_active,
+            _set_native_join_resolver,
+            _set_native_join_typeinfo_map,
+        )
 
         _set_native_join_active(False)
         _set_native_join_resolver(None)
+        _set_native_join_typeinfo_map(None)
 
     def _set_active(self, active: bool) -> None:
         from mypy.join import _set_native_join_active, _set_native_join_resolver
@@ -31315,10 +31325,10 @@ class NativeCombineSimilarCallablesSuite(Suite):
         s = CallableType([self.fx.a], [ARG_POS], [None], self.fx.b, self.fx.function)
         self._assert_parity(t, s)
 
-    def test_generic_both_defers(self) -> None:
-        # Both generic: Rust can't replicate TypeVarId.new's global
-        # counter, returns None, Python body runs unchanged. Direct
-        # kernel assertion (fresh tvar ids differ run to run).
+    def test_generic_both_renumbers_natively(self) -> None:
+        # Both generic: the TypeVarId registry (#1345) renumbers both
+        # operands into one sentinel-namespace batch (ids are Rust-side
+        # fresh ids; id-only difference accepted, as in setops.rs tests).
         tv = [
             TypeVarType(
                 "T", "T", TypeVarId(10), [], self.fx.o, AnyType(TypeOfAny.from_omitted_generics)
@@ -31330,7 +31340,19 @@ class NativeCombineSimilarCallablesSuite(Suite):
         result = _type_kernel.rust_combine_similar_callables(
             _serialize_type(t), _serialize_type(t), True, self.resolver
         )
-        assert result is None, "Rust must defer both-generic combine"
+        assert result is not None, "Rust must renumber both-generic combine natively"
+        # SameS through the shim: identical operands keep one renumbered
+        # variable, and arg/ret ids point at the shared variable id.
+        combined = self._native_result(t, t)
+        assert isinstance(combined, CallableType)
+        assert len(combined.variables) == 1
+        arg_t = combined.arg_types[0]
+        assert isinstance(arg_t, TypeVarType)
+        ret_t = combined.ret_type
+        assert isinstance(ret_t, TypeVarType)
+        assert arg_t.id == combined.variables[0].id
+        assert ret_t.id == combined.variables[0].id
+        assert str(combined.variables[0]) == "T"
 
     def test_no_variables_unchanged(self) -> None:
         # min_len == 0: match_generic_callables no-op; plain join.
@@ -37542,8 +37564,6 @@ class NativeIsRecursivePairSuite(Suite):
         return _type_kernel.rust_is_recursive_pair(
             _serialize_type(s),
             _serialize_type(t),
-            isinstance(s, TypeAliasType) and s.is_recursive,
-            isinstance(t, TypeAliasType) and t.is_recursive,
             self._resolver,
         )
 

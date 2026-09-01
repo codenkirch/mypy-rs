@@ -1296,11 +1296,58 @@ fn read_type_type(buf: &mut ReadBuffer<'_>) -> Result<Type, WireError> {
 }
 
 /// Read a `TypeAliasType` (tag already consumed).
+///
+/// Mirrors `TypeAliasType.write` in types.py: the recursion flag is a
+/// tagged conditional int appended only when True (same pattern as
+/// `TypeVarType.meta_level`). The decoded variant drops the flag (the
+/// Rust `Type::TypeAliasType` has no `is_recursive` field); the
+/// `is_recursive_pair` seam reads it back via `read_alias_recursion_flag`.
 fn read_type_alias_type(buf: &mut ReadBuffer<'_>) -> Result<Type, WireError> {
+    let (t, _is_rec) = read_type_alias_type_flagged(buf)?;
+    Ok(t)
+}
+
+/// Read a `TypeAliasType` and report the trailing recursion flag
+/// (`true` iff the writer emitted the conditional int).
+fn read_type_alias_type_flagged(buf: &mut ReadBuffer<'_>) -> Result<(Type, bool), WireError> {
     let args = read_type_list(buf)?;
     let type_ref = read_str(buf)?;
-    expect_end_tag(buf)?;
-    Ok(Type::TypeAliasType { args, type_ref })
+    let is_rec = match read_tag(buf)? {
+        LITERAL_INT => {
+            let flag = read_int_bare(buf)?;
+            // The writer ends with a conditional int then END_TAG; the
+            // LITERAL_INT read consumed the int but not END_TAG, so
+            // consume it to keep back-to-back records aligned.
+            let end = read_tag(buf)?;
+            if end != END_TAG {
+                return Err(WireError::invalid(format!(
+                    "expected END_TAG (255) after TypeAliasType recursion flag, got tag {end}"
+                )));
+            }
+            flag != 0
+        }
+        END_TAG => false,
+        other => {
+            return Err(WireError::invalid(format!(
+                "expected END_TAG (255) or LITERAL_INT (TypeAliasType recursion flag), got tag \
+                 {other}"
+            )));
+        }
+    };
+    Ok((Type::TypeAliasType { args, type_ref }, is_rec))
+}
+
+/// Read ONLY the trailing recursion flag of a serialized
+/// `TypeAliasType` without decoding into a `Type`. `None` when the
+/// bytes do not carry a `TypeAliasType` at the top level or do not
+/// parse (the caller defers to Python).
+pub(crate) fn read_alias_recursion_flag(bytes: &[u8]) -> Option<bool> {
+    let mut buf = ReadBuffer::new(bytes);
+    let tag = read_tag(&mut buf).ok()?;
+    if tag != TYPE_ALIAS_TYPE {
+        return None;
+    }
+    read_type_alias_type_flagged(&mut buf).ok().map(|(_, r)| r)
 }
 
 /// Assert the next byte is `END_TAG`.
@@ -1471,11 +1518,7 @@ impl fmt::Display for Type {
             Type::UnpackType { typ, .. } => write!(f, "*{typ}"),
             Type::LiteralType { value, .. } => write!(f, "Literal[{value}]"),
             Type::TypeAliasType { args, .. } => {
-                // The wire format carries `type_ref: String` but no resolved
-                // `TypeAlias` node, so `t.alias is None` and `TypeStrVisitor`
-                // renders `"<alias (unfixed)>"`. `rust_type_analyze` passes
-                // the alias through unchanged (a pure passthrough mirroring
-                // `visit_type_alias_type`), so the args render below.
+                // Wire `type_ref` has no resolved alias node: renders "<alias (unfixed)>".
                 write!(f, "<alias (unfixed)>")?;
                 if !args.is_empty() {
                     write!(f, "[")?;
@@ -2522,6 +2565,8 @@ pub(crate) fn write_type(buf: &mut WriteBuffer, t: &Type) -> Result<(), WireErro
             write_tag(buf, TYPE_ALIAS_TYPE);
             write_type_list(buf, args)?;
             write_str(buf, type_ref)?;
+            // Kernel-constructed aliases are never recursive: write the
+            // `is_recursive=False` shape, byte-identical to Python's writer.
             write_tag(buf, END_TAG);
             Ok(())
         }

@@ -3513,16 +3513,27 @@ pub(crate) fn is_disjoint_base_inner(info: &PyAny) -> PyResult<bool> {
 pub(crate) fn rust_is_recursive_pair(
     s_bytes: &[u8],
     t_bytes: &[u8],
-    s_is_recursive: bool,
-    t_is_recursive: bool,
     resolver: &mut NativeTypeResolver,
 ) -> Option<bool> {
     let s = decode_type(s_bytes)?;
     let t = decode_type(t_bytes)?;
     let aliases = resolver.alias_resolver();
 
-    let s_rec = matches!(s, Type::TypeAliasType { .. }) && s_is_recursive;
-    let t_rec = matches!(t, Type::TypeAliasType { .. }) && t_is_recursive;
+    // The recursion flag rides the wire as a tagged conditional int on
+    // each TypeAliasType (see types.py write); read it from raw bytes.
+    // Non-alias operands carry no flag; undecodable flags defer (None).
+    let s_rec_opt = if matches!(s, Type::TypeAliasType { .. }) {
+        crate::wire::read_alias_recursion_flag(s_bytes)
+    } else {
+        Some(false)
+    };
+    let t_rec_opt = if matches!(t, Type::TypeAliasType { .. }) {
+        crate::wire::read_alias_recursion_flag(t_bytes)
+    } else {
+        Some(false)
+    };
+    let s_rec = s_rec_opt?;
+    let t_rec = t_rec_opt?;
 
     if s_rec {
         // Branch b: t is a recursive alias (resolver-free).
@@ -5256,6 +5267,44 @@ mod tests {
         }
     }
 
+    /// Serialize a top-level TypeAliasType, hand-appending the flagged
+    /// conditional int the kernel writer never emits (kernel aliases are
+    /// non-recursive; only the Python writer can emit `true`).
+    fn encode_alias_bytes_with_flag(name: &str, is_rec: bool) -> Vec<u8> {
+        let mut buf = WriteBuffer::new();
+        wire::write_tag(&mut buf, wire::TYPE_ALIAS_TYPE);
+        wire::write_type_list(&mut buf, &[]).unwrap();
+        wire::write_str(&mut buf, name).unwrap();
+        if is_rec {
+            wire::write_int(&mut buf, 1).unwrap();
+        }
+        wire::write_tag(&mut buf, wire::END_TAG);
+        buf.into_bytes()
+    }
+
+    #[test]
+    fn alias_recursion_flag_roundtrip() {
+        // Flagged blob: read_type_alias_type_flagged reports the flag,
+        // read_alias_recursion_flag reports it without decoding.
+        let rec = encode_alias_bytes_with_flag("A", true);
+        assert_eq!(crate::wire::read_alias_recursion_flag(&rec), Some(true));
+        let plain = encode_alias_bytes_with_flag("A", false);
+        assert_eq!(crate::wire::read_alias_recursion_flag(&plain), Some(false));
+        // Kernel-encoded alias blob (no flag): reads back as False.
+        assert_eq!(
+            crate::wire::read_alias_recursion_flag(&encode_type(&recursive_alias("A")).unwrap()),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn alias_recursion_flag_non_alias_defers() {
+        assert_eq!(
+            crate::wire::read_alias_recursion_flag(&encode_type(&plain_instance("A")).unwrap()),
+            None
+        );
+    }
+
     #[test]
     fn is_recursive_pair_neither_alias_false() {
         let s = plain_instance("A");
@@ -5263,8 +5312,6 @@ mod tests {
         let r = rust_is_recursive_pair(
             &encode_type(&s).unwrap(),
             &encode_type(&t).unwrap(),
-            false,
-            false,
             &mut empty_resolver(),
         );
         assert_eq!(r, Some(false));
@@ -5272,21 +5319,16 @@ mod tests {
 
     #[test]
     fn is_recursive_pair_s_rec_t_instance_true() {
-        let s = recursive_alias("A");
-        let t = plain_instance("B");
-        let r = rust_is_recursive_pair(
-            &encode_type(&s).unwrap(),
-            &encode_type(&t).unwrap(),
-            true,
-            false,
-            &mut empty_resolver(),
-        );
+        // s is a recursive alias (Python writer emits the flag int).
+        let s = encode_alias_bytes_with_flag("A", true);
+        let t = encode_type(&plain_instance("B")).unwrap();
+        let r = rust_is_recursive_pair(&s, &t, &mut empty_resolver());
         assert_eq!(r, Some(true));
     }
 
     #[test]
     fn is_recursive_pair_s_rec_t_union_true() {
-        let s = recursive_alias("A");
+        let s = encode_alias_bytes_with_flag("A", true);
         let t = Type::UnionType {
             items: vec![plain_instance("B"), plain_instance("C")],
             uses_pep604_syntax: false,
@@ -5296,41 +5338,23 @@ mod tests {
             original_str_expr: None,
             original_str_fallback: None,
         };
-        let r = rust_is_recursive_pair(
-            &encode_type(&s).unwrap(),
-            &encode_type(&t).unwrap(),
-            true,
-            false,
-            &mut empty_resolver(),
-        );
+        let r = rust_is_recursive_pair(&s, &encode_type(&t).unwrap(), &mut empty_resolver());
         assert_eq!(r, Some(true));
     }
 
     #[test]
     fn is_recursive_pair_both_rec_true() {
-        let s = recursive_alias("A");
-        let t = recursive_alias("B");
-        let r = rust_is_recursive_pair(
-            &encode_type(&s).unwrap(),
-            &encode_type(&t).unwrap(),
-            true,
-            true,
-            &mut empty_resolver(),
-        );
+        let s = encode_alias_bytes_with_flag("A", true);
+        let t = encode_alias_bytes_with_flag("B", true);
+        let r = rust_is_recursive_pair(&s, &t, &mut empty_resolver());
         assert_eq!(r, Some(true));
     }
 
     #[test]
     fn is_recursive_pair_s_not_rec_t_rec_with_instance_s_true() {
-        let s = plain_instance("A");
-        let t = recursive_alias("B");
-        let r = rust_is_recursive_pair(
-            &encode_type(&s).unwrap(),
-            &encode_type(&t).unwrap(),
-            false,
-            true,
-            &mut empty_resolver(),
-        );
+        let s = encode_type(&plain_instance("A")).unwrap();
+        let t = encode_alias_bytes_with_flag("B", true);
+        let r = rust_is_recursive_pair(&s, &t, &mut empty_resolver());
         assert_eq!(r, Some(true));
     }
 
@@ -5339,16 +5363,21 @@ mod tests {
         // s is recursive alias, t is NoneType (not Instance/Union, not rec
         // alias). Branch c needs get_proper_type(s) which needs the alias
         // resolver; empty resolver has no snapshot -> defer.
-        let s = recursive_alias("A");
-        let t = Type::NoneType;
-        let r = rust_is_recursive_pair(
-            &encode_type(&s).unwrap(),
-            &encode_type(&t).unwrap(),
-            true,
-            false,
-            &mut empty_resolver(),
-        );
+        let s = encode_alias_bytes_with_flag("A", true);
+        let t = encode_type(&Type::NoneType).unwrap();
+        let r = rust_is_recursive_pair(&s, &t, &mut empty_resolver());
         assert_eq!(r, None);
+    }
+
+    #[test]
+    fn is_recursive_pair_unflagged_rec_alias_reads_false() {
+        // Kernel-encoded alias blob (no flag int): flag defaults to
+        // False, branches a/b/c skipped, answer False outright (typeops.py
+        // returns False without expanding when neither alias is recursive).
+        let s = encode_type(&recursive_alias("A")).unwrap();
+        let t = encode_type(&plain_instance("B")).unwrap();
+        let r = rust_is_recursive_pair(&s, &t, &mut empty_resolver());
+        assert_eq!(r, Some(false));
     }
 }
 

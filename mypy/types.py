@@ -539,13 +539,32 @@ class TypeAliasType(Type):
         write_type_list(data, self.args)
         assert self.alias is not None
         write_str(data, self.alias.fullname)
+        # Recursion flag: tagged conditional int (True only), like
+        # TypeVarType.meta_level, computed inline so it never populates
+        # the _is_recursive cache (old readers see END_TAG and ignore it).
+        is_recursive = self.alias._is_recursive
+        if is_recursive is None:
+            target = self.alias.target
+            # A structural/unfixed alias can have target=None; it cannot
+            # be (known) recursive, so the flag is simply omitted.
+            if target is not None:
+                is_recursive = self.alias in target.accept(CollectAliasesVisitor())
+        if is_recursive:
+            write_int(data, 1)
         write_tag(data, END_TAG)
 
     @classmethod
     def read(cls, data: ReadBuffer) -> TypeAliasType:
         alias = TypeAliasType(None, read_type_list(data))
         alias.type_ref = read_str(data)
-        assert read_tag(data) == END_TAG
+        # Consume the optional recursion flag (present only when True).
+        # The decoded object has alias=None, so the flag has no consumer;
+        # the native is_recursive_pair seam re-reads it from raw bytes.
+        tag = read_tag(data)
+        if tag == LITERAL_INT:
+            read_int_bare(data)
+            tag = read_tag(data)
+        assert tag == END_TAG
         return alias
 
 

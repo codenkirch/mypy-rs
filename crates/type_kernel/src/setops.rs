@@ -39,6 +39,7 @@
 
 use pyo3::prelude::*;
 
+use crate::freshen::renumber_generic_pair;
 use crate::typeinfo::{NativeTypeResolver, TypeResolver};
 use crate::wire::{self, ExtraAttrs, LiteralValue, ReadBuffer, Type, WriteBuffer};
 
@@ -2079,6 +2080,20 @@ fn visit_join(
     ctx: &SubtypeContext,
     resolver: &TypeResolver,
 ) -> Option<SetOpResult> {
+    visit_join_inner(s, t, ctx, resolver, false)
+}
+
+/// One level past `visit_join`: `renumbered` marks that both-generic
+/// operands were already renumbered onto a shared native id space, so
+/// the CallableType arm must not renumber again (the guard would
+/// recurse forever).
+fn visit_join_inner(
+    s: &Type,
+    t: &Type,
+    ctx: &SubtypeContext,
+    resolver: &TypeResolver,
+    renumbered: bool,
+) -> Option<SetOpResult> {
     match t {
         // visit_any (join.py:353-354): return t.
         Type::AnyType { .. } => Some(SetOpResult::SameT),
@@ -2172,6 +2187,16 @@ fn visit_join(
             type_is,
             ..
         } => {
+            // Both-generic operands must share one id space before the
+            // structural comparisons (join.py match_generic_callables).
+            // Renumber once, run renumbered=true to prevent recursion.
+            if !renumbered
+                && !variables.is_empty()
+                && matches!(s, Type::CallableType { variables: s_variables, .. } if !s_variables.is_empty())
+            {
+                let (t2, s2) = renumber_generic_pair(t, s, resolver)?;
+                return visit_join_inner(&s2, &t2, ctx, resolver, true);
+            }
             if let Type::CallableType {
                 fallback: s_fallback,
                 arg_types: s_arg_types,
@@ -2193,28 +2218,14 @@ fn visit_join(
                 ..
             } = s
             {
-                // join.py:620-622: is_similar_callables(t, self.s) &&
-                // is_equivalent(t, self.s) -> combine_similar_callables.
-                // For the structurally-identical case (t == s on all
+                // join.py:620-622: is_similar_callables(t, s) &&
+                // is_equivalent(t, s) -> combine. In the identical case
+                // combine(t, t) returns t (all joins identity, fallback kept).
 
-                // wire-relevant fields), combine_similar_callables(t, t)
-                // returns t (every arg_join is join(x, x) = x, ret_join
-                // is join(x, x) = x, fallback is t.fallback). So SameS
-
-                // is correct without building a new CallableType.
-                //
-                // BUT: when `variables` is non-empty, Python's
-
-                // `combine_similar_callables` always calls
-                // `match_generic_callables`, which renumbers the tvars
-                // via `TypeVarId.new` (a Python global counter). The
-
-                // result has fresh tvar ids that differ from the inputs,
-                // so `SameS` (= the original) would be wrong. Defer
-                // the both-generic identical case to Python.
-                let both_generic = !variables.is_empty() && !s_variables.is_empty();
-                let identical = !both_generic
-                    && arg_kinds == s_arg_kinds
+                // So SameS is right without building a CallableType. A
+                // both-generic pair renumbers to one shared id space
+                // (ids in result: originals; id-only diff, accepted).
+                let identical = arg_kinds == s_arg_kinds
                     && arg_names == s_arg_names
                     && arg_types == s_arg_types
                     && ret_type == s_ret_type
@@ -2273,7 +2284,7 @@ fn visit_join(
                 // ret_type. Returns None (defer) if any is_subtype
 
                 // can't decide (non-Instance, generic args, etc.).
-                let equiv = is_equivalent_callable(
+                let equivalent = is_equivalent_callable(
                     arg_types,
                     ret_type,
                     s_arg_types,
@@ -2282,33 +2293,10 @@ fn visit_join(
                     s_arg_names,
                     ctx,
                     resolver,
-                );
-                let equivalent = equiv?;
-                // match_generic_callables (join.py:1039-1053): renumber
-                // tvars so both callables share the same id space.
-                // When `min_len == 0` (one side has no variables), the
-
-                // renumber is a no-op (Python returns the callables
-                // unchanged), so the combine/join_similar path proceeds
-                // with the original fields.
-
-                //
-                // When `min_len > 0` (both sides have variables), Python
-                // allocates fresh `TypeVarId`s via `TypeVarId.new` (a
-
-                // Python global counter, types.py:559-562). The result's
-                // tvar ids differ from any deterministic Rust allocation,
-                // and `CallableType.__eq__` compares tvar ids in
-
-                // `arg_types`/`ret_type`. Rust can't replicate the
-                // counter without FFI back to Python, so the both-generic
-                // case defers to preserve parity.
-                let min_len = variables.len().min(s_variables.len());
-                if min_len > 0 {
-                    {
-                        return None;
-                    };
-                }
+                )?;
+                // The renumbered-recursion head already renumbered both
+                // operands onto one shared native id space (match path),
+                // so combine/join_similar below proceed like Python.
                 if equivalent {
                     // `from_type_type` rides the wire now (issue #388),
                     // so combine_similar_callables preserves it via
@@ -7250,24 +7238,10 @@ mod tests {
     }
 
     #[test]
-    fn combine_similar_callables_both_generic_defers() {
-        // join(def f[T](x: T) -> T, def g[T](x: T) -> T) where BOTH
-        // callables are generic (min_len > 0). Python's
-        // match_generic_callables renumbers both T's via
-
-        // TypeVarId.new (a Python global counter, types.py:559-562).
-        // The result's tvar ids differ from any deterministic Rust
-        // allocation, and CallableType.__eq__ compares tvar ids in
-
-        // arg_types/ret_type (types.py:2590-2604 + 699-706). Rust
-        // can't replicate the counter without FFI back to Python, so
-        // the both-generic case DEFERS to preserve parity.
-
-        //
-        // This test documents the defer (returns None) and guards
-        // against a future change that ports match_generic_callables
-
-        // without solving the fresh-id parity gap.
+    fn combine_similar_callables_both_generic_renumbers_natively() {
+        // join(seed, other) with BOTH callables generic (def f[Ts], def g[Tt]).
+        // Python renumbers both via the global TypeVarId.new counter; the
+        // native renumber (freshen.rs) uses the registry, giving SameS result.
         let o = snap("builtins.object", "object");
         let func = snap_with_bases("builtins.function", "function", &["builtins.object"]);
         let r = make_resolver(vec![o, func]);
@@ -7288,31 +7262,18 @@ mod tests {
         );
         let result = join_types(&s, &t, &ctx(true), &r);
         assert_eq!(
-            result, None,
-            "both-generic must defer (fresh-id parity gap): got {:?}",
+            result,
+            Some(SetOpResult::SameS),
+            "both-generic must renumber natively and collapse: got {:?}",
             result
         );
     }
 
     #[test]
-    fn identical_generic_callable_defers() {
-        // join(c, c) where c is a generic CallableType. Both sides are
-        // structurally identical, BUT Python's combine_similar_callables
-        // always calls match_generic_callables (join.py:1114), which
-
-        // renumbers the tvars via TypeVarId.new even when both sides
-        // share the same id (join.py:1047-1053). The result has fresh
-        // tvar ids, so it is NOT equal to c (CallableType.__eq__
-
-        // compares arg_types/ret_type which carry tvar ids). Returning
-        // SameS (= c) would be a parity bug.
-        //
-
-        // The M8z identical-check guard defers when both sides have
-        // non-empty variables (both_generic). This test documents that
-        // guard: join(c, c) for generic c returns None (defer to
-
-        // Python, which produces the correctly-renumbered result).
+    fn identical_generic_callable_renumbers_natively() {
+        // join(c, c) where c is a generic CallableType: both sides renumber
+        // to the native registry id space, compare equal, collapse to SameS
+        // (ids are originals vs Python's fresh: id-only diff, accepted).
         let o = snap("builtins.object", "object");
         let func = snap_with_bases("builtins.function", "function", &["builtins.object"]);
         let r = make_resolver(vec![o, func]);
@@ -7326,8 +7287,9 @@ mod tests {
         );
         let result = join_types(&c, &c, &ctx(true), &r);
         assert_eq!(
-            result, None,
-            "identical generic callable must defer (renumber parity): got {:?}",
+            result,
+            Some(SetOpResult::SameS),
+            "identical generic callable must renumber natively: got {:?}",
             result
         );
     }

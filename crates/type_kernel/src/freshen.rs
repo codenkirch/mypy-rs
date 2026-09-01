@@ -23,6 +23,7 @@ use pyo3::prelude::*;
 
 use crate::expandtype::{expand_type_inner, make_type_normalized, EnvKey};
 use crate::setops::{union_item_can_be_false, union_item_can_be_true};
+use crate::typeinfo::TypeResolver;
 use crate::wire::{read_type, write_type, ReadBuffer, Type, WriteBuffer};
 
 /// `#[pyfunction]` entry for `freshen_all_functions_type_vars`. Returns
@@ -139,6 +140,7 @@ fn update_callable_ids_core(
     base: &[Type],
     operand: &Type,
     new_ids: &[(i64, i64)],
+    ns: &str,
 ) -> Option<(Type, Vec<Type>)> {
     // The exchange map mirrors the env byte layout consumed by
     // `decode_env` (expandtype.rs): each entry is
@@ -159,7 +161,7 @@ fn update_callable_ids_core(
             unreachable!("TypeVarType matched above");
         };
         let old_key = (*old_raw_id, *old_meta_level, namespace.clone());
-        let fresh = set_typevar_id(v.clone(), *raw_id);
+        let fresh = set_typevar_id(v.clone(), *raw_id, ns);
         tvmap.insert(old_key, fresh.clone());
         new_vars.push(fresh);
     }
@@ -167,11 +169,13 @@ fn update_callable_ids_core(
     Some((expanded, new_vars))
 }
 
-/// Set a TypeVarType's `raw_id` to the fresh `TypeVarId.new(meta_level=0)`
-/// id (join.py:1110-1120). `copy_modified(id=...)` replaces the whole id,
-/// so the fresh id's namespace (`""`) and meta_level (0) win over the old
-/// id's. Mirrors `TypeVarLikeType.copy_modified(id=...)`.
-fn set_typevar_id(t: Type, raw_id: i64) -> Type {
+/// Set a TypeVarType's `raw_id` to a fresh id
+/// (join.py:1110-1120). `copy_modified(id=...)` replaces the whole id,
+/// so the fresh id's namespace `ns` and meta_level (0) win over the old
+/// id's. Mirrors `TypeVarLikeType.copy_modified(id=...)`. `ns` is `""`
+/// for the FFI counter-driven path (matching `TypeVarId.new`) and
+/// `NATIVE_TVAR_NAMESPACE` for the registry-based renumber path.
+fn set_typevar_id(t: Type, raw_id: i64, ns: &str) -> Type {
     match t {
         Type::TypeVarType {
             name,
@@ -187,7 +191,7 @@ fn set_typevar_id(t: Type, raw_id: i64) -> Type {
             name,
             fullname,
             raw_id,
-            namespace: String::new(),
+            namespace: ns.to_string(),
             values,
             upper_bound,
             default,
@@ -196,6 +200,57 @@ fn set_typevar_id(t: Type, raw_id: i64) -> Type {
         },
         _ => unreachable!("set_typevar_id: non-TypeVarType"),
     }
+}
+
+/// Sentinel namespace for native-allocated `TypeVarId`s. Contains a NUL
+/// byte, which can never appear in a Python `TypeVarId.namespace` (a
+/// dotted qualified name), so native ids never compare `==` to any
+/// Python id even if raw ids were to collide (they cannot either: the
+/// native counter starts at `NATIVE_TVAR_RAW_ID_BASE`).
+pub(crate) const NATIVE_TVAR_NAMESPACE: &str = "\0native";
+
+/// Native counterpart of `match_generic_callables`
+/// (join.py:1292-1317) for in-engine callers: when both operands are
+/// generic callables, renumber their type variables so both share one
+/// id space, using ids allocated from the resolver's native registry
+/// (never Python's global counter). `min_len == 0` is a no-op
+/// (Python returns the inputs unchanged). `None` defers.
+///
+/// Both renumbered operands carry `NATIVE_TVAR_NAMESPACE` ids; the
+/// `update_callable_ids_core` exchange maps keyed on the OLD ids keep
+/// the substitution consistent across arg_types/ret_type on each side.
+pub(crate) fn renumber_generic_pair(
+    t: &Type,
+    s: &Type,
+    resolver: &TypeResolver,
+) -> Option<(Type, Type)> {
+    let (t_vars, s_vars) = match (t, s) {
+        (Type::CallableType { variables: tv, .. }, Type::CallableType { variables: sv, .. }) => {
+            (tv, sv)
+        }
+        _ => return None,
+    };
+    if t_vars
+        .iter()
+        .chain(s_vars.iter())
+        .any(|v| !matches!(v, Type::TypeVarType { .. }))
+    {
+        return None;
+    }
+    let min_len = t_vars.len().min(s_vars.len());
+    if min_len == 0 {
+        return Some((t.clone(), s.clone()));
+    }
+    let num_vars = t_vars.len().max(s_vars.len());
+    let new_ids = resolver.alloc_fresh_tvar_ids(num_vars);
+    let (t_expanded, t_vars_out) =
+        update_callable_ids_core(t_vars, t, &new_ids, NATIVE_TVAR_NAMESPACE)?;
+    let (s_expanded, s_vars_out) =
+        update_callable_ids_core(s_vars, s, &new_ids, NATIVE_TVAR_NAMESPACE)?;
+    Some((
+        id_rewrite(t_expanded, t_vars_out),
+        id_rewrite(s_expanded, s_vars_out),
+    ))
 }
 
 /// `#[pyfunction]` entry for `rust_match_generic_callables` (the
@@ -250,11 +305,11 @@ pub(crate) fn rust_match_generic_callables(
         new_ids.push((next_raw_id, 0));
         next_raw_id += 1;
     }
-    let (t_expanded, t_vars_out) = match update_callable_ids_core(t_vars, &t, &new_ids) {
+    let (t_expanded, t_vars_out) = match update_callable_ids_core(t_vars, &t, &new_ids, "") {
         Some(pair) => pair,
         None => return Ok(None),
     };
-    let (s_expanded, s_vars_out) = match update_callable_ids_core(s_vars, &s, &new_ids) {
+    let (s_expanded, s_vars_out) = match update_callable_ids_core(s_vars, &s, &new_ids, "") {
         Some(pair) => pair,
         None => return Ok(None),
     };
@@ -759,6 +814,7 @@ fn encode_type(typ: &Type) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::typeinfo::NATIVE_TVAR_RAW_ID_BASE;
 
     /// A generic callable `def f(tv: tv) -> tv`, mirroring
     /// `NativeJoinCallableIdsSuite._generic`.
@@ -935,6 +991,170 @@ mod tests {
         // seam still defers instead of mis-behaving.
         let result = rust_match_generic_callables(0, 0, b"", b"").unwrap();
         assert!(result.is_none(), "num_vars == 0 defers");
+    }
+
+    #[test]
+    fn renumber_registry_shared_batch_sentinel_ns() {
+        // renumber_generic_pair: both operands share one registry batch
+        // and the fresh ids carry the sentinel NUL namespace (never == to
+        // a Python id) with raw ids starting at NATIVE_TVAR_RAW_ID_BASE.
+        let r = TypeResolver::new();
+        let t = generic(&tvar("T", 1, 0));
+        let s = generic(&tvar("U", 2, 0));
+        let (t_out, s_out) = renumber_generic_pair(&t, &s, &r).expect("engages");
+        // The fixture helper uses namespace ""; stamp the sentinel in.
+        let expected = match tvar("T", NATIVE_TVAR_RAW_ID_BASE, 0) {
+            Type::TypeVarType {
+                name,
+                fullname,
+                raw_id,
+                values,
+                upper_bound,
+                default,
+                variance,
+                meta_level,
+                ..
+            } => Type::TypeVarType {
+                name,
+                fullname,
+                raw_id,
+                namespace: NATIVE_TVAR_NAMESPACE.to_string(),
+                values,
+                upper_bound,
+                default,
+                variance,
+                meta_level,
+            },
+            other => other,
+        };
+        let (t_vars, s_vars) = match (&t_out, &s_out) {
+            (
+                Type::CallableType { variables: tv, .. },
+                Type::CallableType { variables: sv, .. },
+            ) => (tv, sv),
+            other => panic!("expected CallableTypes, got {other:?}"),
+        };
+        assert_eq!(t_vars[0], expected);
+        // Both operands must share the same (raw_id, namespace) id.
+        let s_expected = match tvar("U", NATIVE_TVAR_RAW_ID_BASE, 0) {
+            Type::TypeVarType {
+                ref name,
+                ref fullname,
+                raw_id,
+                ref values,
+                ref upper_bound,
+                ref default,
+                variance,
+                meta_level,
+                ..
+            } => Type::TypeVarType {
+                name: name.clone(),
+                fullname: fullname.clone(),
+                raw_id,
+                namespace: NATIVE_TVAR_NAMESPACE.to_string(),
+                values: values.clone(),
+                upper_bound: upper_bound.clone(),
+                default: default.clone(),
+                variance,
+                meta_level,
+            },
+            other => other,
+        };
+        assert_eq!(s_vars[0], s_expected);
+        // The substitution reached the arg and ret positions too.
+        let (t_args, t_ret) = match &t_out {
+            Type::CallableType {
+                arg_types,
+                ret_type,
+                ..
+            } => (arg_types, ret_type.as_ref()),
+            other => panic!("expected CallableType, got {other:?}"),
+        };
+        assert_eq!(t_args[0], expected);
+        assert_eq!(t_ret, &expected);
+    }
+
+    #[test]
+    fn renumber_registry_min_len_zero_noop() {
+        // One side non-generic: Python returns the inputs unchanged.
+        let t = generic(&tvar("T", 1, 0));
+        let s = Type::CallableType {
+            fallback: Box::new(Type::Instance {
+                type_ref: "builtins.function".to_string(),
+                args: Vec::new(),
+                last_known_value: None,
+                extra_attrs: None,
+            }),
+            instance_type: None,
+            is_ellipsis_args: false,
+            implicit: false,
+            is_bound: false,
+            from_concatenate: false,
+            imprecise_arg_kinds: false,
+            unpack_kwargs: false,
+            from_type_type: false,
+            arg_types: vec![Type::Instance {
+                type_ref: "builtins.object".to_string(),
+                args: Vec::new(),
+                last_known_value: None,
+                extra_attrs: None,
+            }],
+            arg_kinds: vec![1],
+            arg_names: vec![None],
+            ret_type: Box::new(Type::Instance {
+                type_ref: "builtins.object".to_string(),
+                args: Vec::new(),
+                last_known_value: None,
+                extra_attrs: None,
+            }),
+            name: None,
+            variables: Vec::new(),
+            type_guard: None,
+            type_is: None,
+            special_sig: None,
+        };
+        let (t_out, s_out) = renumber_generic_pair(&t, &s, &TypeResolver::new()).unwrap();
+        assert_eq!(t_out, t);
+        assert_eq!(s_out, s);
+    }
+
+    #[test]
+    fn renumber_registry_non_callable_defers() {
+        let not_callable = Type::Instance {
+            type_ref: "builtins.object".to_string(),
+            args: Vec::new(),
+            last_known_value: None,
+            extra_attrs: None,
+        };
+        assert!(
+            renumber_generic_pair(&not_callable, &not_callable, &TypeResolver::new()).is_none()
+        );
+    }
+
+    #[test]
+    fn renumber_registry_counter_monotonic() {
+        // Two sequential renumbers allocate disjoint id batches; the
+        // registry never reuses ids.
+        let r = TypeResolver::new();
+        let t = generic(&tvar("T", 1, 0));
+        let (t1, _s1) = renumber_generic_pair(&t, &t, &r).unwrap();
+        let (t2, _s2) = renumber_generic_pair(&t, &t, &r).unwrap();
+        let id1 = match &t1 {
+            Type::CallableType { variables, .. } => match &variables[0] {
+                Type::TypeVarType { raw_id, .. } => *raw_id,
+                other => panic!("expected TypeVarType, got {other:?}"),
+            },
+            other => panic!("expected CallableType, got {other:?}"),
+        };
+        let id2 = match &t2 {
+            Type::CallableType { variables, .. } => match &variables[0] {
+                Type::TypeVarType { raw_id, .. } => *raw_id,
+                other => panic!("expected TypeVarType, got {other:?}"),
+            },
+            other => panic!("expected CallableType, got {other:?}"),
+        };
+        assert_eq!(id1, NATIVE_TVAR_RAW_ID_BASE);
+        assert_eq!(id2, NATIVE_TVAR_RAW_ID_BASE + 1);
     }
 
     #[test]
