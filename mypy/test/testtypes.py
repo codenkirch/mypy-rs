@@ -7658,6 +7658,21 @@ class NativeRemoveRedundantUnionItemsSuite(Suite):
         self._assert_par([self.fx.o, self._int()], "two-pass reversed")
         assert_equal(self._with_gate(True, lambda: self._strs(items)), ["builtins.object"])
 
+    def test_lkv_item_then_plain_collapses_to_plain(self) -> None:
+        # typeops.py:1420-1428: an Instance with a last_known_value never
+        # removes a plain Instance of the same class; both orderings must
+        # be gate-stable (issue #1335).
+        from mypy.types import LiteralType
+
+        lkv = Instance(self.int_info, [], last_known_value=LiteralType(1, self._int()))
+        items = [lkv, self._int()]
+        self._assert_par(items, "lkv then plain")
+        self._assert_par(list(reversed(items)), "plain then lkv")
+        assert_equal(
+            self._with_gate(True, lambda: self._strs(items)),
+            self._with_gate(False, lambda: self._strs(items)),
+        )
+
     def test_seam_engages(self) -> None:
         from mypy.typeops import _serialize_type_list
 
