@@ -684,6 +684,24 @@ def _deserialize_type_from_checkexpr(b: bytes) -> ProperType | None:
     return cast(ProperType, fixed)
 
 
+def _deserialize_solved_callable_from_checkexpr(b: bytes) -> ProperType | None:
+    """Like _deserialize_type_from_checkexpr, but re-links surviving alias
+    nodes through the per-build wire alias map (the #1224 pattern).
+
+    A solved generic callable may legitimately keep an alias node (Python's
+    own infer_function_type_arguments result can carry one); the plain
+    deserializer defers on it, forcing ~200 cold self-check fallbacks.
+    """
+    from mypy.wirefixup import fixup_wire_type
+
+    fixed = fixup_wire_type(
+        _checkexpr_read_type(_CheckExprReadBuffer(b)), resolve_aliases=True
+    )
+    if fixed is None:
+        return None
+    return cast(ProperType, fixed)
+
+
 def _deserialize_optional_type_list(raw: bytes) -> list[Type | None] | None:
     """Decode a Rust optional-type list blob (`count` + per-var `0|1 + Type`).
 
@@ -2983,7 +3001,7 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
                                 state.strict_optional,
                             )
                             if resolved_bytes is not None:
-                                resolved_callee = _deserialize_type_from_checkexpr(
+                                resolved_callee = _deserialize_solved_callable_from_checkexpr(
                                     bytes(resolved_bytes)
                                 )
                                 # Deserialize may return None when a type_ref

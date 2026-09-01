@@ -3845,8 +3845,11 @@ fn expand_and_bind_callable_inner(
     // caller ensures has_self_type=False, so expand_self_type returns t.
     // bind_self_fast for trivial_self.
     let bound = bind_self_fast_inner(&current)?;
+    // expand_type_by_instance_free (not _core): Python's compute path returns
+    // leftover TypeVars as-is and freezes afterwards; alias survivors re-link
+    // in the shim decode (resolve_aliases=True). See expandtype.rs:349-357.
     let expanded =
-        crate::expandtype::expand_type_by_instance_core(&bound, itype, resolver, strict_optional)?;
+        crate::expandtype::expand_type_by_instance_free(&bound, itype, resolver, strict_optional)?;
 
     Some((next_raw_id, changed, expanded))
 }
