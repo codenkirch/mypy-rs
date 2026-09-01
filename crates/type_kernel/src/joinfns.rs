@@ -16,16 +16,17 @@
 //! `combine_similar_callables` mirrors join.py:1193-1219: per-arg
 //! `safe_join`, `join_types` on ret/instance_type, `combine_arg_names`,
 //! and the fallback pick (builtins.function wins). `match_generic_callables`
-//! (join.py:1110-1120) renumbers type variables so both callables share an
-//! id space; Rust cannot replicate Python's `TypeVarId.new` global counter,
-//! so the both-generic case (min_len > 0) defers to Python and the
-//! min_len == 0 case is a no-op (Python returns the inputs unchanged). The
-//! result is a fresh wire CallableType encoded via `write_type`; the Python
-//! shim restores `definition` from the live right operand after fixup,
+//! (join.py:1292-1317) renumbers type variables so both callables share an
+//! id space; both-generic renumbering runs on the native `TypeVarId`
+//! registry (`freshen.rs::renumber_generic_pair`, sentinel namespace,
+//! Python's global counter untouched). The result is a fresh wire
+//! CallableType encoded via `write_type`; the Python shim restores
+//! `definition` from the live right operand after fixup,
 //! mirroring the existing rust_join_types disc==7 path.
 
 use pyo3::prelude::*;
 
+use crate::freshen::renumber_generic_pair;
 use crate::setops::{
     combine_arg_names, extract_callable_invariants, join_types, pick_fallback, safe_join,
     setop_result_to_type,
@@ -151,26 +152,15 @@ pub(crate) fn rust_object_from_instance(
     Some(snap.mro.last()?.clone())
 }
 
-/// `match_generic_callables` (join.py:1110-1120): when both callables are
+/// `match_generic_callables` (join.py:1292-1317): when both callables are
 /// generic, renumber the type variables so both share the same id space.
-/// `min_len == 0` is a no-op (Python returns the inputs unchanged). The
-/// both-generic case defers — Python's `TypeVarId.new` is a global counter
-/// Rust cannot replicate without breaking parity (the ids leak into the
-/// wire-equal `CallableType.__eq__` comparison).
-fn match_generic_callables(t: &Type, s: &Type) -> Option<(Type, Type)> {
-    let t_vars_len = match t {
-        Type::CallableType { variables, .. } => variables.len(),
-        _ => return None,
-    };
-    let s_vars_len = match s {
-        Type::CallableType { variables, .. } => variables.len(),
-        _ => return None,
-    };
-    if t_vars_len.min(s_vars_len) == 0 {
-        Some((t.clone(), s.clone()))
-    } else {
-        None
-    }
+/// Delegates to the native registry (`freshen.rs::renumber_generic_pair`);
+/// Python's global `TypeVarId.new` counter is never advanced, and the
+/// fresh ids carry the sentinel `NATIVE_TVAR_NAMESPACE` so they can never
+/// collide with a Python id. `min_len == 0` is a no-op (Python returns the
+/// inputs unchanged).
+fn match_generic_callables(t: &Type, s: &Type, resolver: &TypeResolver) -> Option<(Type, Type)> {
+    renumber_generic_pair(t, s, resolver)
 }
 
 /// `combine_similar_callables` (join.py:1193-1219): per-arg safe_join,
@@ -182,9 +172,10 @@ pub(crate) fn combine_similar_callables_core(
     strict_optional: bool,
     resolver: &TypeResolver,
 ) -> Option<Vec<u8>> {
-    // match_generic_callables first (join.py:1194). Both-generic defers
-    // here (None); min_len == 0 returns the untouched operands.
-    let (t_c, s_c) = match_generic_callables(t, s)?;
+    // match_generic_callables first (join.py:1194). Both-generic
+    // renumbers on the native registry (Python re-allocates from the
+    // global counter); min_len == 0 returns the untouched operands.
+    let (t_c, s_c) = match_generic_callables(t, s, resolver)?;
     let Type::CallableType {
         fallback: t_fallback,
         arg_types: t_arg_types,

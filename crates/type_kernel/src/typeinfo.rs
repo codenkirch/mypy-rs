@@ -16,6 +16,7 @@
 //! over the `TypeFixture` corpus (see `NativeTypeWireSuite` in
 //! `testtypes.py`).
 
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 
@@ -214,7 +215,31 @@ pub(crate) struct TypeResolver {
     /// Populated only for classes the snapshot MRO walk cannot decide;
     /// absent entries keep the snapshot fast path.
     ctor_types: HashMap<String, Vec<u8>>,
+    /// Fresh `TypeVarId` allocation for the native renumber path
+    /// (`freshen.rs::renumber_generic_pair`). Interior-mutable through
+    /// `&TypeResolver` because the setops engine holds only a shared
+    /// reference; borrows are scoped (each allocation returns owned
+    /// data), so a join re-entering the allocator cannot double-borrow.
+    tvar_ids: RefCell<TvarIdAllocator>,
 }
+
+/// Native counterpart of the `TypeVarId.new(meta_level=0)` counter.
+pub(crate) struct TvarIdAllocator {
+    next_raw_id: i64,
+}
+
+impl TvarIdAllocator {
+    fn new() -> Self {
+        Self {
+            next_raw_id: NATIVE_TVAR_RAW_ID_BASE,
+        }
+    }
+}
+
+/// Raw-id base for native-allocated `TypeVarId`s, far above Python's
+/// global `TypeVarId.next_raw_id` (which starts at 1 and counts up), so
+/// a native raw id can never collide with a Python-allocated one.
+pub(crate) const NATIVE_TVAR_RAW_ID_BASE: i64 = 1_i64 << 62;
 
 #[allow(dead_code)]
 impl TypeResolver {
@@ -224,7 +249,23 @@ impl TypeResolver {
             modules: HashMap::new(),
             live_info_map: None,
             ctor_types: HashMap::new(),
+            tvar_ids: RefCell::new(TvarIdAllocator::new()),
         }
+    }
+
+    /// Allocate `count` fresh `(raw_id, meta_level)` pairs from the
+    /// native registry, mirroring a `TypeVarId.new(meta_level=0)` batch
+    /// (join.py:1117 allocates one shared list for both operands). The
+    /// borrow is scoped: allocation returns owned data, so a nested
+    /// join during the caller's expansion cannot double-borrow.
+    pub(crate) fn alloc_fresh_tvar_ids(&self, count: usize) -> Vec<(i64, i64)> {
+        let mut alloc = self.tvar_ids.borrow_mut();
+        let mut ids = Vec::with_capacity(count);
+        for _ in 0..count {
+            ids.push((alloc.next_raw_id, 0));
+            alloc.next_raw_id += 1;
+        }
+        ids
     }
 
     /// Whether a live TypeInfo map is installed (engine protocol-right

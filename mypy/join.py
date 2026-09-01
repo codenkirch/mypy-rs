@@ -188,9 +188,10 @@ def _try_native_object_or_any_from_type(typ: ProperType) -> ProperType | None:
 def _try_native_combine_similar_callables(t: CallableType, s: CallableType) -> CallableType | None:
     """Try `combine_similar_callables` in Rust; None defers to Python.
 
-    The kernel returns None for the both-generic case (Rust cannot
-    replicate `TypeVarId.new`'s global counter) and for per-arg joins it
-    cannot decide; the caller then runs the pure-Python body.
+    Both-generic callables renumber via the shared TypeVarId registry
+    batch (#1345) instead of deferring; None still covers per-arg joins
+    the kernel cannot decide, and the caller then runs the pure-Python
+    body.
     """
     try:
         result = _type_kernel.rust_combine_similar_callables(
