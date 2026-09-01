@@ -1304,14 +1304,14 @@ def match_generic_callables(t: CallableType, s: CallableType) -> tuple[CallableT
     # added to
 
     # type variables, and it worked relatively well.
+    min_len = min(len(t.variables), len(s.variables))
+    if min_len == 0:
+        return t, s
     if _HAS_TYPE_KERNEL and _native_join_active and _native_join_resolver is not None:
         res = _try_native_match_generic_callables(t, s)
         if res is not None:
             return res
     max_len = max(len(t.variables), len(s.variables))
-    min_len = min(len(t.variables), len(s.variables))
-    if min_len == 0:
-        return t, s
     new_ids = [TypeVarId.new(meta_level=0) for _ in range(max_len)]
     # Note: this relies on variables being in order they appear in function definition.
     return update_callable_ids(t, new_ids), update_callable_ids(s, new_ids)
