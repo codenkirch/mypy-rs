@@ -37,7 +37,6 @@ _map_supertype_decode_cache: dict[bytes, Instance] = {}
 def _clear_map_supertype_decode_cache() -> None:
     _map_supertype_decode_cache.clear()
 
-
 try:
     import type_kernel as _type_kernel
     from librt.internal import ReadBuffer as _ReadBuffer, WriteBuffer as _WriteBuffer
@@ -82,15 +81,18 @@ def _serialize_type(t: Type) -> bytes:
     return buf.getvalue()
 
 
-def _needs_python(typ: Type) -> bool:
+def _needs_python(typ: Type, allow_alias: bool = False) -> bool:
     """True if `typ` nests a node a kernel round-trip cannot carry.
 
     Named callables lose their FuncDef/Decorator definition node, breaking
-    error formatting that names the function; TypeAliasType would loop while
-    decoding. Both must defer to the pure-Python path. Fresh meta-vars
-    (TypeVarType with meta_level > 0) need no branch: the wire carries them
-    fine, and the decode steps re-unify split occurrences
-    (canonicalize_fresh_vars, #1198).
+    error formatting that names the function; both must defer to the
+    pure-Python path. Fresh meta-vars (TypeVarType with meta_level > 0)
+    need no branch: the wire carries them fine, and the decode steps
+    re-unify split occurrences (canonicalize_fresh_vars, #1198).
+    TypeAliasType used to always defer (the decode used to loop); with
+    `allow_alias` the Rust walker expands alias args and keeps the node,
+    so the gate only keeps descending into the alias args (the target
+    stays lazy, mirroring expandtype.py's visit_type_alias_type).
     """
     stack: list[Type] = [typ]
     visited: set[int] = set()
@@ -107,7 +109,9 @@ def _needs_python(typ: Type) -> bool:
             stack.extend(p.arg_types)
             stack.append(p.fallback)
         elif isinstance(p, TypeAliasType):
-            return True
+            if not allow_alias:
+                return True
+            stack.extend(p.args)
         elif isinstance(p, Instance):
             stack.extend(p.args)
         elif isinstance(p, UnionType):
@@ -126,7 +130,7 @@ def _native_map_instance_to_supertype(instance: Instance, superclass: TypeInfo) 
         and _native_map_active
         and _native_map_resolver is not None
         and superclass.fullname != "builtins.tuple"
-        and not _needs_python(instance)
+        and not _needs_python(instance, allow_alias=True)
     ):
         return None
     try:
@@ -137,6 +141,7 @@ def _native_map_instance_to_supertype(instance: Instance, superclass: TypeInfo) 
             superclass.fullname,
         )
         if result is None:
+            # Walker-level defer (snapshot gap or undecided shape): defer.
             return None
         raw = bytes(result)
         cached = _map_supertype_decode_cache.get(raw)
@@ -150,7 +155,13 @@ def _native_map_instance_to_supertype(instance: Instance, superclass: TypeInfo) 
         decoded = read_type(_ReadBuffer(raw))
         from mypy.wirefixup import canonicalize_fresh_vars_reported, fixup_wire_type
 
-        fixed = fixup_wire_type(decoded)
+        # The walker keeps alias nodes in place; Python's expandtype expands
+        # only the alias args, so decoded alias nodes must re-link to the live
+        # TypeAlias via the per-build wire alias map (#1224); None fixup defers.
+        fixed = fixup_wire_type(decoded, resolve_aliases=True)
+        if fixed is None:
+            # An alias node absent from the per-build wire alias map: defer.
+            return None
         # The wire round-trip splits fresh meta-var occurrences of one id
         # into distinct equal-id objects; re-unify them here (#1198). Note
         # that `fixup_wire_type` itself does not canonicalize.
