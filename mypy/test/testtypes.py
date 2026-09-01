@@ -48116,10 +48116,12 @@ class NativeSolveGenericCallSuite(Suite):
       Stage-20 seam (#382) already relies on; the check_call shim skips
       the vacuous polymorphic retry and applies Never.
     - Multi-lower joins: the solver joins lowers via solve_one_inner; an
-      invariant conflict defers later in apply. Only a joined solution
-      that is itself a FunctionLike still defers (nested FuncDef
-      definitions do not survive the wire; Python's pretty_callable
-      renders them with the def name, e.g. list-literal item messages).
+      invariant conflict defers later in apply. A joined solution that
+      is itself a FunctionLike solves too (combine_similar_callables /
+      join_similar_callables are already wired); the wire round-trip
+      drops nested FuncDef definitions, so the decoded joined callable
+      keeps definition=None where Python keeps the sorted-lowers head's
+      (str()-invisible, pinned by the live-definitions render test).
     - Positional TupleType actuals: star actuals are gated Python-side
       (checkexpr.py `any(k.is_star() ...)`), so a tuple actual reaches
       the kernel only as a positional argument that ArgTypeExpander
@@ -48149,6 +48151,10 @@ class NativeSolveGenericCallSuite(Suite):
         self._set_active(True)
         self._set_resolver(self.resolver_for(self.fx))
         typeinfo_map = {info.fullname: info for info in self._type_infos(self.fx)}
+        # The wire join echoes actual arg Instances (builtins.str) into
+        # the solution; the _type_infos scan only sees attrs ending in
+        # "i", so the str fixture must be registered explicitly.
+        typeinfo_map[self.fx.str_type_info.fullname] = self.fx.str_type_info
         set_wire_typeinfo_map(typeinfo_map)
         self._callcall_active = _set_native_checkcall_active
         self._callcall_active(True)
@@ -48322,9 +48328,10 @@ class NativeSolveGenericCallSuite(Suite):
         actual = TupleType([self.fx.a, self.fx.d], self.fx.std_tuple)
         self._assert_seam_parity(callee, [actual], [[0]])
 
-    def test_multilower_callable_defers(self) -> None:
-        # Two callable lowers join to a FunctionLike, which loses its
-        # nested FuncDef over the wire: defer to Python.
+    def test_multilower_callable_join_parity(self) -> None:
+        # Two callable lowers join to a FunctionLike: the seam must not
+        # defer. Builtins.str echoes decode through the setUp map, and
+        # Python's join clears the name so definition stays None.
         t = self._generic_t()
         callee = self._callee_of([t, t], t, t)
         f = CallableType(
@@ -48333,9 +48340,37 @@ class NativeSolveGenericCallSuite(Suite):
         g = CallableType(
             [self.fx.str_type], [ARG_POS], ["y"], self.fx.str_type, self.fx.function, name="g"
         )
-        assert (
-            self._seam(callee, [f, g], [[0], [1]]) is None
-        ), "multi-lower callable join must defer (definition loss)"
+        self._assert_seam_parity(callee, [f, g], [[0], [1]])
+
+    def test_multilower_live_definitions_render_parity(self) -> None:
+        # Leak wall: with LIVE FuncDef definitions Python keeps the
+        # head's definition; decode leaves definition=None (wire has
+        # no FuncDefs). Parity contract is type str() only.
+        t = self._generic_t()
+        callee = self._callee_of([t, t], t, t)
+        fn = FuncDef("m")
+        f = CallableType(
+            [self.fx.str_type],
+            [ARG_POS],
+            ["x"],
+            self.fx.str_type,
+            self.fx.function,
+            name="f",
+            definition=fn,
+        )
+        g = CallableType(
+            [self.fx.str_type],
+            [ARG_POS],
+            ["y"],
+            self.fx.str_type,
+            self.fx.function,
+            name="g",
+            definition=fn,
+        )
+        native = self._seam(callee, [f, g], [[0], [1]])
+        assert native is not None, "multi-lower callable join must solve natively"
+        py = self._python_reference(callee, [f, g], [ARG_POS, ARG_POS], None, [[0], [1]])
+        assert str(native) == str(py), f"join str parity: {native} vs {py}"
 
     def test_unsolvable_var_defers(self) -> None:
         # def [T] (a: G[T], b: G[T]) -> T with G-invariant args A and D
@@ -48427,6 +48462,10 @@ class NativeStarExpansionSuite(Suite):
         self._set_active(True)
         self._set_resolver(self.resolver_for(self.fx))
         typeinfo_map = {info.fullname: info for info in self._type_infos(self.fx)}
+        # The wire join echoes actual arg Instances (builtins.str) into
+        # the solution; the _type_infos scan only sees attrs ending in
+        # "i", so the str fixture must be registered explicitly.
+        typeinfo_map[self.fx.str_type_info.fullname] = self.fx.str_type_info
         set_wire_typeinfo_map(typeinfo_map)
         self._callcall_active = _set_native_checkcall_active
         self._callcall_active(True)

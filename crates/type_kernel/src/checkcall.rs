@@ -914,37 +914,6 @@ pub fn rust_solve_generic_call(
     // Empty constraints are still solvable: the solver fills every
     // unconstrained var with strict Never / lax Any (solve.py:277-289),
     // matching Python's empty-cmap fill (#382 path). No deferral needed.
-    let tv_key = |t: &Type| -> Option<(i64, String)> {
-        match t {
-            Type::TypeVarType {
-                raw_id, namespace, ..
-            } => Some((*raw_id, namespace.clone())),
-            Type::ParamSpecType {
-                raw_id, namespace, ..
-            } => Some((*raw_id, namespace.clone())),
-            Type::TypeVarTupleType {
-                raw_id, namespace, ..
-            } => Some((*raw_id, namespace.clone())),
-            _ => None,
-        }
-    };
-    // A var with multiple lowers is joined by the solver. When the joined
-    // solution nests a FunctionLike, the nested FuncDef definitions do not
-    // survive the wire (pretty_callable needs them): defer those joins.
-    let mut lowers_by_var: std::collections::HashMap<(i64, String), usize> =
-        std::collections::HashMap::new();
-    for c in &all_constraints {
-        if c.op == crate::constraints::SUPERTYPE_OF {
-            if let Some(key) = tv_key(&c.origin_type_var) {
-                *lowers_by_var.entry(key).or_insert(0) += 1;
-            }
-        }
-    }
-    let multi_lower_vars: std::collections::HashSet<(i64, String)> = lowers_by_var
-        .iter()
-        .filter(|(_, &n)| n >= 2)
-        .map(|(k, _)| k.clone())
-        .collect();
 
     // Step 3: Solve constraints for the callable's type vars.
     let tvar_types: Vec<Type> = variables.to_vec();
@@ -1000,25 +969,6 @@ pub fn rust_solve_generic_call(
     if orig_types.iter().any(|t| t.is_none()) {
         return None;
     }
-    // Multi-lower joins whose solution is a FunctionLike (or nests one)
-    // lose nested FuncDef definitions over the wire (see comment above
-    // where multi_lower_vars is built): defer to Python.
-    if !multi_lower_vars.is_empty() {
-        let nested_fnlike = orig_types.iter().zip(variables.iter()).any(|(s, tv)| {
-            let Some(sol) = s else { return false };
-            if !contains_function_like(sol) {
-                return false;
-            }
-            match solve_typevar_key(tv) {
-                Some((raw, _meta, ns)) => multi_lower_vars.contains(&(raw, ns)),
-                None => false,
-            }
-        });
-        if nested_fnlike {
-            return None;
-        }
-    }
-
     // Serialize orig_types in the wire format expected by apply_generic_arguments.
     let orig_types_blob = serialize_optional_types(&orig_types)?;
 
@@ -1035,33 +985,6 @@ pub fn rust_solve_generic_call(
     Some(applied)
 }
 
-/// Whether a type (recursively) contains a FunctionLike (CallableType or
-/// Overloaded). Conservative recursion over the wire shape; used to decide
-/// whether a joined multi-lower solution would lose nested FuncDef
-/// definitions in the round-trip.
-fn contains_function_like(t: &Type) -> bool {
-    match t {
-        Type::CallableType { .. } | Type::Overloaded { .. } => true,
-        Type::Instance { args, .. } => args.iter().any(contains_function_like),
-        Type::UnionType { items, .. } => items.iter().any(contains_function_like),
-        Type::TupleType { items, .. } => items.iter().any(contains_function_like),
-        Type::TypeAliasType { args, .. } => args.iter().any(contains_function_like),
-        Type::UnpackType { typ, .. } => contains_function_like(typ),
-        Type::TypeType { item, .. } => contains_function_like(item),
-        Type::Parameters(params) => params.arg_types.iter().any(contains_function_like),
-        Type::NoneType
-        | Type::AnyType { .. }
-        | Type::TypeVarType { .. }
-        | Type::ParamSpecType { .. }
-        | Type::TypeVarTupleType { .. }
-        | Type::UnboundType { .. }
-        | Type::TypedDictType { .. }
-        | Type::LiteralType { .. }
-        | Type::UninhabitedType { .. }
-        | Type::ErasedType
-        | Type::DeletedType { .. } => false,
-    }
-}
 /// A solved type-var entry: `(raw_id, meta_level, namespace)` key plus the
 /// substituted type (None when the solver left it unsolved).
 type SolveEntry = ((i64, i64, String), Option<Type>);
@@ -2351,10 +2274,10 @@ mod tests {
     }
 
     #[test]
-    fn solve_generic_multilower_callable_defers() {
-        // Two callable lowers join to a FunctionLike; the live FuncDef
-        // definitions nested callables carry do not survive the wire and
-        // Python's pretty_callable needs them (def NAME(...) rendering).
+    fn solve_generic_multilower_callable_join_solves() {
+        // Two callable lowers join to a FunctionLike. The seam solves:
+        // decode fixup re-links name-bearing callables; anonymous joins
+        // keep definition=None, invisible to type str() rendering.
         let mut two = generic_identity();
         if let Type::CallableType {
             arg_types,
@@ -2373,7 +2296,10 @@ mod tests {
         let f = callable(0);
         let g = callable(0);
         let out = solve_generic_bytes(&two, &[f, g], vec![vec![0], vec![1]]);
-        assert!(out.is_none(), "expected deferral on callable join");
+        let bytes = out.expect("expected multi-lower callable join to solve");
+        let mut rb = ReadBuffer::new(&bytes);
+        let resolved = read_type(&mut rb, None).unwrap();
+        assert!(solved_typevar(&resolved), "expected resolved callable");
     }
 
     #[test]
