@@ -489,10 +489,15 @@ fn evaluate_generic_target(
         resolver,
         target_blob,
         arg_types_bytes.to_vec(),
+        arg_kinds.to_vec(),
         formal_to_actual,
         strict,
         infer_unions,
         strict_optional,
+        // The overload path has no Iterable/Mapping context: the expander
+        // defers (Undecided) when a star arm needs one.
+        None,
+        None,
     ) {
         Some(b) => b,
         None => return MatchDecision::Undecided,

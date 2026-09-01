@@ -1088,10 +1088,13 @@ def rust_solve_generic_call(
     resolver: NativeTypeResolver,
     callee_bytes: bytes,
     arg_types_bytes: list[bytes],
+    arg_kinds: list[int],
     formal_to_actual: list[list[int]],
     strict: bool,
     infer_unions: bool,
     strict_optional: bool,
+    iterable_type: bytes | None,
+    mapping_type: bytes | None,
 ) -> bytes | None: ...
 def rust_get_arg_infer_passes(
     resolver: NativeTypeResolver,
@@ -1343,6 +1346,8 @@ def rust_infer_function_type_arguments(
     strict: bool,
     infer_unions: bool,
     strict_optional: bool,
+    iterable_type: bytes | None,
+    mapping_type: bytes | None,
 ) -> bytes | None: ...
 def rust_solve_dependent(
     vars_bytes: list[bytes],

@@ -21,7 +21,7 @@ use crate::typeinfo::NativeTypeResolver;
 use crate::wire::{self, ReadBuffer, Type, WriteBuffer};
 
 /// Wrap `wire::read_type` into an `Option`, mirroring `setops::decode_type`.
-fn decode_type(bytes: &[u8]) -> Option<Type> {
+pub(crate) fn decode_type(bytes: &[u8]) -> Option<Type> {
     let mut buf = ReadBuffer::new(bytes);
     wire::read_type(&mut buf, None).ok()
 }
@@ -1688,6 +1688,8 @@ pub(crate) fn rust_infer_function_type_arguments(
     strict: bool,
     infer_unions: bool,
     strict_optional: bool,
+    iterable_type: Option<Vec<u8>>,
+    mapping_type: Option<Vec<u8>>,
 ) -> Option<Vec<u8>> {
     let mut buf = ReadBuffer::new(callee_bytes);
     let callee = match wire::read_type(&mut buf, None) {
@@ -1747,6 +1749,10 @@ pub(crate) fn rust_infer_function_type_arguments(
     }
     let mut tuple_index: i64 = 0;
     let mut kwargs_used: Option<Vec<String>> = None;
+    // ArgTypeExpander Iterable/Mapping context (checkexpr.py:3725-3730).
+    // A missing blob defers only when the corresponding arm is reached.
+    let iterable_type = iterable_type.as_ref().and_then(|b| decode_type(b));
+    let mapping_type = mapping_type.as_ref().and_then(|b| decode_type(b));
     let mut constraints: Vec<Constraint> = Vec::new();
     for (i, actuals) in formal_to_actual.iter().enumerate() {
         let formal_type = formal_types.get(i)?;
@@ -1770,7 +1776,15 @@ pub(crate) fn rust_infer_function_type_arguments(
                 actual_kind,
                 formal_name,
                 formal_kind,
+                // UnpackType formals defer above (the constraints.py:644-727
+                // star-unpack branch), so every expansion here is a plain
+                // positional/keyword formal: allow_unpack is False.
+                false,
+                iterable_type.as_ref(),
+                mapping_type.as_ref(),
                 resolver.alias_resolver(),
+                resolver.resolver(),
+                strict_optional,
             ) {
                 Some(e) => e,
                 None => {
@@ -1837,19 +1851,33 @@ pub(crate) fn rust_infer_function_type_arguments(
     Some(out.into_bytes())
 }
 
-/// One arg-expansion pass of `ArgTypeExpander.expand_actual_type`
-/// (argmap.py:269-364), returning the expanded `Type` directly. Branches
-/// that need `is_subtype` (Iterable/Mapping unpacking, TypeVarTuple upper
-/// bounds) or arbitrary-key TypedDict popping return `None` so the whole
-/// call defers to Python.
-fn expand_actual_arg(
+fn any_from_error() -> Type {
+    // AnyType(TypeOfAny.from_error) (types.py:309; value 5), mirroring
+    // argmap.py:402/429.
+    Type::AnyType {
+        type_of_any: 5,
+        source_any: None,
+        missing_import_name: None,
+    }
+}
+
+/// One arg-expansion pass of `ArgTypeExpander.expand_actual_type` (argmap.py:269-364).
+/// Returns the expanded `Type` directly; undecidable subtype/map decisions, a
+/// missing context, aliases, or arbitrary-key pops answer `None` to defer to Python.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn expand_actual_arg(
     tuple_index: &mut i64,
     kwargs_used: &mut Option<Vec<String>>,
     actual: &Type,
     actual_kind: i64,
     formal_name: Option<&str>,
     formal_kind: i64,
+    allow_unpack: bool,
+    iterable_type: Option<&Type>,
+    mapping_type: Option<&Type>,
     alias_resolver: &crate::aliases::TypeAliasResolver,
+    resolver: &crate::typeinfo::TypeResolver,
+    strict_optional: bool,
 ) -> Option<Type> {
     if matches!(actual, Type::UnboundType { .. }) {
         return None;
@@ -1873,41 +1901,101 @@ fn expand_actual_arg(
         other => other,
     };
     match actual_kind {
-        2 => match actual {
-            Type::TupleType { items, .. } => {
-                let len = items.len() as i64;
-                *tuple_index = if *tuple_index >= len {
-                    1
-                } else {
-                    *tuple_index + 1
-                };
-                let mut item = items.get((*tuple_index - 1) as usize)?.clone();
-                if let Type::UnpackType { typ: inner, .. } = &item {
-                    let unpacked = match inner.as_ref() {
-                        Type::TypeVarTupleType { upper_bound, .. } => upper_bound.as_ref(),
+        2 => {
+            // *Ts passed to a callable: continue with the upper bound
+            // (argmap.py:358-362); an alias upper bound expands first.
+            let upper_bound_holder: Option<Type>;
+            let star_actual = match actual {
+                Type::TypeVarTupleType { upper_bound, .. } => {
+                    let bound = match upper_bound.as_ref() {
+                        Type::TypeAliasType { .. } => {
+                            let e = crate::checkexpr_functions::get_proper_or_expand(
+                                upper_bound.as_ref(),
+                                alias_resolver,
+                            )?;
+                            if matches!(e, Type::TypeAliasType { .. } | Type::UnboundType { .. }) {
+                                return None;
+                            }
+                            upper_bound_holder = Some(e);
+                            upper_bound_holder.as_ref()?
+                        }
                         other => other,
                     };
-                    let Type::Instance { type_ref, args, .. } = unpacked else {
+                    bound
+                }
+                other => other,
+            };
+            match star_actual {
+                Type::Instance { type_ref, args, .. } if !args.is_empty() => {
+                    // Iterable unpacking (argmap.py:363-369).
+                    let iterable = iterable_type?;
+                    let Type::Instance {
+                        type_ref: iterable_ref,
+                        ..
+                    } = iterable
+                    else {
                         return None;
                     };
-                    if type_ref != "builtins.tuple" {
-                        return None;
+                    let ctx =
+                        SubtypeContext::new(false, false, false, false, false, strict_optional);
+                    match subtypes::is_subtype(star_actual, iterable, &ctx, resolver) {
+                        Some(true) => {
+                            let mapped = subtypes::map_instance_to_supertype(
+                                type_ref,
+                                args,
+                                iterable_ref,
+                                resolver,
+                            )?;
+                            Some(mapped.into_iter().next()?)
+                        }
+                        // Not a proper Iterable: other parts of the code
+                        // raise a different error for improper use
+                        // (argmap.py:370-376, 402).
+                        Some(false) => Some(any_from_error()),
+                        None => None,
                     }
-                    item = args.first()?.clone();
                 }
-                Some(item)
+                Type::TupleType { items, .. } => {
+                    let len = items.len() as i64;
+                    *tuple_index = if *tuple_index >= len {
+                        1
+                    } else {
+                        *tuple_index + 1
+                    };
+                    let mut item = items.get((*tuple_index - 1) as usize)?.clone();
+                    if let Type::UnpackType { typ: inner, .. } = &item {
+                        if allow_unpack {
+                            // An unpack item with special handling: pass
+                            // the node through (argmap.py:385).
+                        } else {
+                            // An unpack item that doesn't have special
+                            // handling: use the upper bound
+                            // (argmap.py:386-396).
+                            let unpacked = match inner.as_ref() {
+                                Type::TypeVarTupleType { upper_bound, .. } => upper_bound.as_ref(),
+                                other => other,
+                            };
+                            let Type::Instance { type_ref, args, .. } = unpacked else {
+                                return None;
+                            };
+                            if type_ref != "builtins.tuple" || args.is_empty() {
+                                return None;
+                            }
+                            item = args[0].clone();
+                        }
+                    }
+                    Some(item)
+                }
+                Type::ParamSpecType { .. } => {
+                    // ParamSpec is valid in *args but cannot be unpacked
+                    // (argmap.py:398-400).
+                    Some(star_actual.clone())
+                }
+                // Instance without args (argmap.py:402 tail) and every
+                // other shape.
+                _ => Some(any_from_error()),
             }
-            Type::ParamSpecType { .. } => Some(actual.clone()),
-            // Iterable unpacking / TypeVarTuple upper bound: defer.
-            Type::Instance { .. } | Type::TypeVarTupleType { .. } => None,
-            _ => Some(Type::AnyType {
-                // AnyType(TypeOfAny.from_error) (types.py:309; value 5),
-                // mirroring argmap.py:402/429.
-                type_of_any: 5,
-                source_any: None,
-                missing_import_name: None,
-            }),
-        },
+        }
         4 => match actual {
             Type::TypedDictType { items, .. } => {
                 if formal_kind == 4 {
@@ -1923,16 +2011,42 @@ fn expand_actual_arg(
                 }
                 Some(items.iter().find(|(k, _)| k == chosen)?.1.clone())
             }
-            Type::ParamSpecType { .. } => Some(actual.clone()),
-            // Mapping unpacking: defer.
-            Type::Instance { .. } => None,
-            _ => Some(Type::AnyType {
-                // AnyType(TypeOfAny.from_error) (types.py:309; value 5),
-                // mirroring argmap.py:429 (ARG_STAR2 tail).
-                type_of_any: 5,
-                source_any: None,
-                missing_import_name: None,
-            }),
+            Type::Instance { type_ref, args, .. } => {
+                // Mapping unpacking (argmap.py:417-424). Python matches
+                // every Instance here without an args guard and then
+                // compares against the Mapping context directly.
+                let mapping = mapping_type?;
+                let Type::Instance {
+                    type_ref: mapping_ref,
+                    ..
+                } = mapping
+                else {
+                    return None;
+                };
+                let ctx = SubtypeContext::new(false, false, false, false, false, strict_optional);
+                match subtypes::is_subtype(actual, mapping, &ctx, resolver) {
+                    Some(true) => {
+                        let mapped = subtypes::map_instance_to_supertype(
+                            type_ref,
+                            args,
+                            mapping_ref,
+                            resolver,
+                        )?;
+                        Some(mapped.get(1)?.clone())
+                    }
+                    // Only `Mapping` can be unpacked with `**`; other
+                    // types produce an error somewhere else
+                    // (argmap.py:420-424, 428-429).
+                    Some(false) => Some(any_from_error()),
+                    None => None,
+                }
+            }
+            Type::ParamSpecType { .. } => {
+                // ParamSpec is valid in **kwargs but it cannot be unpacked
+                // (argmap.py:425-427).
+                Some(actual.clone())
+            }
+            _ => Some(any_from_error()),
         },
         // No translation for other kinds: 1:1 mapping.
         _ => Some(actual.clone()),
@@ -2900,6 +3014,7 @@ mod tests {
         let actual = alias_type(vec![], "mod.IntStrAlias");
         let mut tuple_index = 0;
         let mut kwargs_used = None;
+        let empty_resolver = make_resolver(vec![]);
         let out = expand_actual_arg(
             &mut tuple_index,
             &mut kwargs_used,
@@ -2907,14 +3022,33 @@ mod tests {
             2, // ARG_STAR
             None,
             2,
+            false,
+            None,
+            None,
             &ar,
+            &empty_resolver,
+            true,
         )
         .unwrap();
         assert_eq!(out, instance("builtins.int", vec![]));
         // Unresolvable alias defers; UnboundType still defers.
         let ar2 = TypeAliasResolver::new();
         let mut ti2 = 0;
-        assert!(expand_actual_arg(&mut ti2, &mut kwargs_used, &actual, 2, None, 2, &ar2).is_none());
+        assert!(expand_actual_arg(
+            &mut ti2,
+            &mut kwargs_used,
+            &actual,
+            2,
+            None,
+            2,
+            false,
+            None,
+            None,
+            &ar2,
+            &empty_resolver,
+            true,
+        )
+        .is_none());
         let unbound = Type::UnboundType {
             name: "x".to_string(),
             args: Vec::new(),
@@ -2924,8 +3058,189 @@ mod tests {
             optional: false,
         };
         let mut ti3 = 0;
-        assert!(
-            expand_actual_arg(&mut ti3, &mut kwargs_used, &unbound, 2, None, 2, &ar2).is_none()
+        assert!(expand_actual_arg(
+            &mut ti3,
+            &mut kwargs_used,
+            &unbound,
+            2,
+            None,
+            2,
+            false,
+            None,
+            None,
+            &ar2,
+            &empty_resolver,
+            true,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn expand_actual_arg_star_iterator_instance_expands_to_item() {
+        // New ARG_STAR iterable arm (argmap.py:363-369): *x where `x` is an
+        // Instance feeds the formal with its element type. The same-ref map
+        // fast path keeps this test snapshot-free; the arity-1 Iterable yields args[0].
+        let resolver = make_resolver(vec![snap("typing.Iterable")]);
+        let item = instance("builtins.int", vec![]);
+        let iterable = instance("typing.Iterable", vec![item.clone()]);
+        let actual = instance("typing.Iterable", vec![item.clone()]);
+        let mut tuple_index = 0;
+        let mut kwargs_used = None;
+        let out = expand_actual_arg(
+            &mut tuple_index,
+            &mut kwargs_used,
+            &actual,
+            2,
+            None,
+            2,
+            false,
+            Some(&iterable),
+            None,
+            &TypeAliasResolver::new(),
+            &resolver,
+            true,
+        )
+        .unwrap();
+        assert_eq!(out, item);
+    }
+
+    #[test]
+    fn expand_actual_arg_star_iterator_no_context_defers() {
+        // Missing Iterable/Mapping context blobs: the arm defers so the
+        // whole solve falls back to Python instead of guessing.
+        let resolver = make_resolver(vec![]);
+        let item = instance("builtins.int", vec![]);
+        let actual = instance("typing.Iterable", vec![item]);
+        let mut tuple_index = 0;
+        let mut kwargs_used = None;
+        assert!(expand_actual_arg(
+            &mut tuple_index,
+            &mut kwargs_used,
+            &actual,
+            2,
+            None,
+            2,
+            false,
+            None,
+            None,
+            &TypeAliasResolver::new(),
+            &resolver,
+            true,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn expand_actual_arg_star_kwargs_getitem_instance_expands_value_type() {
+        // New ARG_STAR2 mapping arm (argmap.py:417-424): **x where `x` is a
+        // Mapping formal feeds the value type (mapped args[1]). Identical
+        // args hit the visit_instance_nominal same-ref fast path.
+        let resolver = make_resolver(vec![snap("typing.Mapping")]);
+        let key = instance("builtins.str", vec![]);
+        let value = instance("builtins.int", vec![]);
+        let mapping = instance("typing.Mapping", vec![key.clone(), value.clone()]);
+        let actual = instance("typing.Mapping", vec![key, value.clone()]);
+        let mut tuple_index = 0;
+        let mut kwargs_used = None;
+        let out = expand_actual_arg(
+            &mut tuple_index,
+            &mut kwargs_used,
+            &actual,
+            4,
+            None,
+            2,
+            false,
+            None,
+            Some(&mapping),
+            &TypeAliasResolver::new(),
+            &resolver,
+            true,
+        )
+        .unwrap();
+        assert_eq!(out, value);
+    }
+
+    #[test]
+    fn expand_actual_arg_star_kwargs_no_context_defers() {
+        let resolver = make_resolver(vec![]);
+        let actual = instance(
+            "typing.Mapping",
+            vec![instance("builtins.str", vec![]), any_from_error()],
         );
+        let mut tuple_index = 0;
+        let mut kwargs_used = None;
+        assert!(expand_actual_arg(
+            &mut tuple_index,
+            &mut kwargs_used,
+            &actual,
+            4,
+            None,
+            2,
+            false,
+            None,
+            None,
+            &TypeAliasResolver::new(),
+            &resolver,
+            true,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn expand_actual_arg_star_tvt_upper_bound_flows_to_tuple_arm() {
+        // *Ts actual (argmap.py:358-362): the upper bound is unwrapped and
+        // re-enters the same chain, so a tuple upper bound feeds the
+        // positional tuple-indexing arm with the shared tuple_index state.
+        let resolver = make_resolver(vec![]);
+        let int_item = instance("builtins.int", vec![]);
+        let str_item = instance("builtins.str", vec![]);
+        let tvt = Type::TypeVarTupleType {
+            tuple_fallback: Box::new(instance("builtins.tuple", vec![])),
+            name: "Ts".to_string(),
+            fullname: "".to_string(),
+            raw_id: 3,
+            namespace: "".to_string(),
+            upper_bound: Box::new(Type::TupleType {
+                partial_fallback: Box::new(instance("builtins.tuple", vec![])),
+                items: vec![int_item.clone(), str_item.clone()],
+                implicit: false,
+            }),
+            default: Box::new(any_from_error()),
+            min_len: 0,
+        };
+        let mut tuple_index = 0;
+        let mut kwargs_used = None;
+        let first = expand_actual_arg(
+            &mut tuple_index,
+            &mut kwargs_used,
+            &tvt,
+            2,
+            None,
+            2,
+            false,
+            None,
+            None,
+            &TypeAliasResolver::new(),
+            &resolver,
+            true,
+        )
+        .unwrap();
+        assert_eq!(first, int_item);
+        let second = expand_actual_arg(
+            &mut tuple_index,
+            &mut kwargs_used,
+            &tvt,
+            2,
+            None,
+            2,
+            false,
+            None,
+            None,
+            &TypeAliasResolver::new(),
+            &resolver,
+            true,
+        )
+        .unwrap();
+        assert_eq!(second, str_item);
     }
 }

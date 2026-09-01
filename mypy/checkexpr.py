@@ -2965,75 +2965,87 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
                                 continue
                             if fi < len(callee.arg_types):
                                 arg_context[ai] = callee.arg_types[fi]
-                    # Any star actual (*x, *y) needs Python's ArgTypeExpander to expand
-                    # the iterable/tuple element-wise against the formal.
-                    if any(k.is_star() for k in arg_kinds):
-                        pass  # fall through to Python below
-                    else:
-                        # A lambda arg whose context depends on a callee type
-                        # variable needs Python's two-pass inference.
-                        lam_idx = [i for i, a in enumerate(args) if isinstance(a, LambdaExpr)]
-                        callee_var_ids = {v.id for v in callee.variables}
+                    # Star actuals (*x, **x) now expand natively through the
+                    # ArgTypeExpander port (argmap.py:278-432); Rust defers only
+                    # missing context blobs, residual aliases, TypedDict pops.
 
-                        def _lam_ctx_has_callee_var(i: int) -> bool:
-                            ctx = arg_context[i]
-                            if ctx is None:
-                                return False
-                            return any(tv.id in callee_var_ids for tv in get_type_vars(ctx))
+                    # A lambda arg whose type variable needs Python's
+                    # two-pass inference.
+                    lam_idx = [i for i, a in enumerate(args) if isinstance(a, LambdaExpr)]
+                    callee_var_ids = {v.id for v in callee.variables}
 
-                        lam_typevar_ctx = any(_lam_ctx_has_callee_var(i) for i in lam_idx)
-                        if not lam_typevar_ctx:
-                            arg_types_bytes = []
-                            arg_pts: list[Any] = []
-                            for a, ctx in zip(args, arg_context):
-                                _at = self.accept(a, ctx) if ctx is not None else self.accept(a)
-                                _pt = get_proper_type(_at)
-                                arg_types_bytes.append(_serialize_type_for_checkexpr(_pt))
-                                arg_pts.append(_pt)
-                            resolved_bytes = _rust_solve_generic_call(
-                                _native_checkexpr_resolver,
-                                _serialize_type_for_checkexpr(callee),
-                                arg_types_bytes,
-                                formal_to_actual,
-                                self.chk.in_checked_function(),
-                                type_state.infer_unions,
-                                state.strict_optional,
+                    def _lam_ctx_has_callee_var(i: int) -> bool:
+                        ctx = arg_context[i]
+                        if ctx is None:
+                            return False
+                        return any(tv.id in callee_var_ids for tv in get_type_vars(ctx))
+
+                    lam_typevar_ctx = any(_lam_ctx_has_callee_var(i) for i in lam_idx)
+                    if not lam_typevar_ctx:
+                        arg_types_bytes = []
+                        arg_pts: list[Any] = []
+                        for a, ctx in zip(args, arg_context):
+                            _at = self.accept(a, ctx) if ctx is not None else self.accept(a)
+                            _pt = get_proper_type(_at)
+                            arg_types_bytes.append(_serialize_type_for_checkexpr(_pt))
+                            arg_pts.append(_pt)
+                        # Star actuals need the Iterable/Mapping context
+                        # (checkexpr.py:3725-3730); feed both even without
+                        # star actuals, the blobs decode lazily Rust-side.
+                        context_type = self.argument_infer_context()
+                        iterable_blob = _serialize_type_for_checkexpr(
+                            context_type.iterable_type
+                        )
+                        mapping_blob = _serialize_type_for_checkexpr(
+                            context_type.mapping_type
+                        )
+                        resolved_bytes = _rust_solve_generic_call(
+                            _native_checkexpr_resolver,
+                            _serialize_type_for_checkexpr(callee),
+                            arg_types_bytes,
+                            [int(k.value) for k in arg_kinds],
+                            formal_to_actual,
+                            self.chk.in_checked_function(),
+                            type_state.infer_unions,
+                            state.strict_optional,
+                            iterable_blob,
+                            mapping_blob,
+                        )
+                        if resolved_bytes is not None:
+                            resolved_callee = _deserialize_solved_callable_from_checkexpr(
+                                bytes(resolved_bytes)
                             )
-                            if resolved_bytes is not None:
-                                resolved_callee = _deserialize_solved_callable_from_checkexpr(
-                                    bytes(resolved_bytes)
-                                )
-                                # Deserialize may return None when a type_ref
-                                # cannot resolve to a live TypeInfo; defer.
-                                # The isinstance narrows None out of the union.
-                                if isinstance(resolved_callee, CallableType):
-                                    from mypy.wirefixup import resync_var_identities
+                            # Deserialize may return None when a type_ref
+                            # cannot resolve to a live TypeInfo; defer.
+                            # The isinstance narrows None out of the union.
+                            if isinstance(resolved_callee, CallableType):
+                                from mypy.wirefixup import resync_var_identities
 
-                                    # A solved value may carry an outer-context
-                                    # type var; re-link its wire copy to the
-                                    # live object (#1215 pattern). None defers.
-                                    relinked = resync_var_identities(
-                                        callee, resolved_callee, arg_pts
-                                    )
-                                    if relinked is None:
-                                        resolved_callee = None
-                                    else:
-                                        # The canonicalizer rebuilds the tree;
-                                        # use the relinked copy, not the decode.
-                                        resolved_callee = cast(CallableType, relinked)
-                                if isinstance(resolved_callee, CallableType):
-                                    # Wire round-trip drops provenance needed
-                                    # by fine-grained notes ("Called function
-                                    # defined here") and AstNode contexts.
-                                    callee = resolved_callee.copy_modified(
-                                        name=callee.name,
-                                        definition=callee.definition,
-                                        line=callee.line,
-                                        column=callee.column,
-                                    )
-                                    # Native solve succeeded; skip Python's infer pass.
-                                    native_solved = True
-                            # Rust returned None: fall through to Python below.
+                                # A solved value may carry an outer-context
+                                # type var; re-link its wire copy to the
+                                # live object (#1215 pattern). None defers.
+                                relinked = resync_var_identities(
+                                    callee, resolved_callee, arg_pts
+                                )
+                                if relinked is None:
+                                    resolved_callee = None
+                                else:
+                                    # The canonicalizer rebuilds the tree;
+                                    # use the relinked copy, not the decode.
+                                    resolved_callee = cast(CallableType, relinked)
+                            if isinstance(resolved_callee, CallableType):
+                                # Wire round-trip drops provenance needed
+                                # by fine-grained notes ("Called function
+                                # defined here") and AstNode contexts.
+                                callee = resolved_callee.copy_modified(
+                                    name=callee.name,
+                                    definition=callee.definition,
+                                    line=callee.line,
+                                    column=callee.column,
+                                )
+                                # Native solve succeeded; skip Python's infer pass.
+                                native_solved = True
+                        # Rust returned None: fall through to Python below.
                 except (AssertionError, NotImplementedError, ValueError, TypeError):
                     pass  # Defer to Python
 
@@ -3522,10 +3534,12 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
                     pass1_args.append(arg)
 
             # Stage 20 (#382): pass-1 type-argument inference through the
-            # Rust kernel. Rust returns None for ParamSpec/TypeVarTuple
-            # variables, UnpackType formals, TypeAliasType/UnboundType
+            # Rust kernel. Star actuals now expand natively (argmap.py:278-432);
+            # the kernel returns None for branches it cannot decide
 
-            # actuals and other deferred branches, so the whole call falls
+            # ParamSpec/TypeVarTuple variables, UnpackType formals,
+            # TypeAliasType/UnboundType actuals: the whole call falls
+
             # back to Python. Pass 2 (multi-pass inference, below) always
             # stays in Python.
             inferred_args: list[Type | None] | None = None
@@ -3536,6 +3550,19 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
                 and 2 not in arg_pass_nums
             ):
                 try:
+                    # Star-arm context blobs; decode failures leave them None.
+                    iterable_blob: bytes | None = None
+                    mapping_blob: bytes | None = None
+                    try:
+                        context_type = self.argument_infer_context()
+                        iterable_blob = _serialize_type_for_checkexpr(
+                            context_type.iterable_type
+                        )
+                        mapping_blob = _serialize_type_for_checkexpr(
+                            context_type.mapping_type
+                        )
+                    except (AssertionError, NotImplementedError, ValueError, TypeError):
+                        pass
                     raw = _rust_infer_function_type_arguments(
                         _native_checkexpr_resolver,
                         _serialize_type_for_checkexpr(callee_type),
@@ -3548,6 +3575,8 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
                         self.chk.in_checked_function(),
                         type_state.infer_unions,
                         state.strict_optional,
+                        iterable_blob,
+                        mapping_blob,
                     )
                     if raw is not None:
                         decoded = _deserialize_optional_type_list(bytes(raw))

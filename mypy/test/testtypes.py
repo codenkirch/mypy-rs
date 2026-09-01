@@ -48206,19 +48206,30 @@ class NativeSolveGenericCallSuite(Suite):
         )
 
     def _seam_raw(
-        self, callee: CallableType, arg_types: list[Type], formal_to_actual: list[list[int]]
+        self,
+        callee: CallableType,
+        arg_types: list[Type],
+        formal_to_actual: list[list[int]],
+        arg_kinds: list[Any] | None = None,
+        iterable_type: Any | None = None,
+        mapping_type: Any | None = None,
     ) -> bytes | None:
         from mypy.checkexpr import _serialize_type_for_checkexpr
 
         blobs = [_serialize_type_for_checkexpr(t) for t in arg_types]
+        if arg_kinds is None:
+            arg_kinds = [ARG_POS] * len(arg_types)
         result = _type_kernel.rust_solve_generic_call(
             self.resolver_for(self.fx),
             _serialize_type_for_checkexpr(callee),
             blobs,
+            [int(k.value) for k in arg_kinds],
             formal_to_actual,
             True,
             False,
             True,
+            _serialize_type_for_checkexpr(iterable_type) if iterable_type is not None else None,
+            _serialize_type_for_checkexpr(mapping_type) if mapping_type is not None else None,
         )
         if result is None:
             return None
@@ -48379,6 +48390,278 @@ class NativeSolveGenericCallSuite(Suite):
         assert raw == _serialize_type_for_checkexpr(
             py
         ), f"solve parity: native={raw!r} python={py!r}"
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeStarExpansionSuite(Suite):
+    """Parity for the ArgTypeExpander star-expansion port (piece 1, #1343).
+
+    The sgc / ifta seams previously gated every call that carried a star
+    actual Python-side (checkexpr.py ``any(k.is_star() ...)``). The
+    ArgTypeExpander port (argmap.py:278-432, expanded per (formal,
+    actual) pair at constraints.py:751-758) now decides natively inside
+    rust_solve_generic_call / rust_infer_function_type_arguments, fed
+    the Iterable/Mapping argument-infer context (checkexpr.py:3725-3730)
+    as blobs with the per-actual ArgKind ints and the shared
+    tuple_index / kwargs_used state.
+
+    Differential: each case runs the seam and a pure-Python reference
+    (native constraints + solve gates off) with the same context and
+    asserts equal resolved callables. Direct calls prove which star
+    shapes engage and which still defer (missing context blob,
+    TypedDict key miss, TypedDict **kwargs formal).
+    """
+
+    def setUp(self) -> None:
+        from mypy.checkexpr import (
+            _set_native_checkcall_active,
+            _set_native_checkexpr_active,
+            _set_native_checkexpr_resolver,
+        )
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        self.fx = TypeFixture(INVARIANT)
+        self._set_active = _set_native_checkexpr_active
+        self._set_resolver = _set_native_checkexpr_resolver
+        self._aliases: list[Any] = []
+        self._set_active(True)
+        self._set_resolver(self.resolver_for(self.fx))
+        typeinfo_map = {info.fullname: info for info in self._type_infos(self.fx)}
+        set_wire_typeinfo_map(typeinfo_map)
+        self._callcall_active = _set_native_checkcall_active
+        self._callcall_active(True)
+
+    def tearDown(self) -> None:
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        self._set_active(False)
+        self._set_resolver(None)
+        self._callcall_active(False)
+        set_wire_typeinfo_map(None)
+
+    def _type_infos(self, fx: TypeFixture) -> list[TypeInfo]:
+        infos = []
+        for name in dir(fx):
+            if not name.endswith("i"):
+                continue
+            value = getattr(fx, name)
+            if _is_type_info(value):
+                infos.append(value)
+        return infos
+
+    def resolver_for(self, fx: TypeFixture) -> Any:
+        return _type_kernel.build_native_resolver(self._type_infos(fx), [])
+
+    def _generic_t(self) -> Any:
+        return TypeVarType(
+            "T",
+            "mod.T",
+            TypeVarId(1),
+            values=[],
+            upper_bound=self.fx.o,
+            default=AnyType(TypeOfAny.special_form),
+        )
+
+    def _callee_of(self, formals: list[Type], ret: TypeVarType) -> CallableType:
+        return CallableType(
+            formals,
+            [ARG_POS] * len(formals),
+            ["x", "y"][: len(formals)],
+            ret,
+            self.fx.function,
+            variables=[ret],
+        )
+
+    def _seam(
+        self,
+        callee: CallableType,
+        arg_types: list[Type],
+        arg_kinds: list[Any],
+        formal_to_actual: list[list[int]],
+        iterable_ctx: Any | None = None,
+        mapping_ctx: Any | None = None,
+    ) -> Any:
+        from mypy.checkexpr import (
+            _deserialize_type_from_checkexpr,
+            _serialize_type_for_checkexpr,
+        )
+
+        result = _type_kernel.rust_solve_generic_call(
+            self.resolver_for(self.fx),
+            _serialize_type_for_checkexpr(callee),
+            [_serialize_type_for_checkexpr(t) for t in arg_types],
+            [int(k.value) for k in arg_kinds],
+            formal_to_actual,
+            True,
+            False,
+            True,
+            _serialize_type_for_checkexpr(iterable_ctx) if iterable_ctx else None,
+            _serialize_type_for_checkexpr(mapping_ctx) if mapping_ctx else None,
+        )
+        if result is None:
+            return None
+        return _deserialize_type_from_checkexpr(bytes(result))
+
+    def _python_reference(
+        self,
+        callee: CallableType,
+        arg_types: list[Type],
+        arg_kinds: list[Any],
+        formal_to_actual: list[list[int]],
+        iterable_ctx: Any | None = None,
+        mapping_ctx: Any | None = None,
+    ) -> CallableType:
+        from mypy.applytype import apply_generic_arguments
+        from mypy.constraints import _set_native_constraints_active
+        from mypy.infer import ArgumentInferContext, infer_function_type_arguments
+        from mypy.nodes import TempNode
+        from mypy.solve import _set_native_solve_active
+        from mypy.types import TypeOfAny
+
+        _set_native_constraints_active(False)
+        _set_native_solve_active(False)
+        try:
+            ctx = ArgumentInferContext(mapping_ctx, iterable_ctx)  # type: ignore[arg-type]
+            inferred, _ = infer_function_type_arguments(
+                callee, arg_types, arg_kinds, ["x", "y"], formal_to_actual, ctx, strict=True
+            )
+            return apply_generic_arguments(
+                callee,
+                inferred,
+                lambda *a: None,
+                TempNode(AnyType(TypeOfAny.special_form)),
+                skip_unsatisfied=False,
+            )
+        finally:
+            _set_native_constraints_active(True)
+            _set_native_solve_active(True)
+
+    def _assert_star_parity(
+        self,
+        callee: CallableType,
+        arg_types: list[Type],
+        arg_kinds: list[Any],
+        formal_to_actual: list[list[int]],
+        iterable_ctx: Any | None = None,
+        mapping_ctx: Any | None = None,
+    ) -> None:
+        native = self._seam(
+            callee, arg_types, arg_kinds, formal_to_actual, iterable_ctx, mapping_ctx
+        )
+        assert native is not None, f"Rust deferred on {arg_types!r} kinds={arg_kinds!r}"
+        py = self._python_reference(
+            callee, arg_types, arg_kinds, formal_to_actual, iterable_ctx, mapping_ctx
+        )
+        assert str(native) == str(py), f"star parity: native={native} python={py}"
+
+    def test_star_tuple_two_actuals_shared_tuple_index(self) -> None:
+        # Two *x actuals of the same tuple[A, D] feed x and y: the shared
+        # tuple_index state resumes across actuals (argmap.py:379-396),
+        # so the lowers are A then D (T joins to object via the solver).
+        t = self._generic_t()
+        callee = self._callee_of([t, t], t)
+        tup = TupleType([self.fx.a, self.fx.d], self.fx.std_tuple)
+        self._assert_star_parity(callee, [tup, tup], [ARG_STAR, ARG_STAR], [[0], [1]])
+
+    def test_star_iterable_instance_same_args(self) -> None:
+        # *x where x: G[A] against context G[A]: identical-args subtype
+        # decides true, the same-ref map yields args[0] = A
+        # (argmap.py:363-369).
+        t = self._generic_t()
+        callee = self._callee_of([t], t)
+        ctx = Instance(self.fx.gi, [self.fx.a])
+        self._assert_star_parity(callee, [ctx], [ARG_STAR], [[0]], iterable_ctx=ctx)
+
+    def test_star_iterable_instance_not_a_subtype(self) -> None:
+        # *x where x: G[B] against context G[A] (invariant): not a
+        # subtype, so the expander answers the improper-use tail
+        # AnyType(from_error) (argmap.py:370-376, 402).
+        t = self._generic_t()
+        callee = self._callee_of([t], t)
+        actual = Instance(self.fx.gi, [self.fx.b])
+        ctx = Instance(self.fx.gi, [self.fx.a])
+        self._assert_star_parity(callee, [actual], [ARG_STAR], [[0]], iterable_ctx=ctx)
+
+    def test_star_kwargs_typeddict_named_key(self) -> None:
+        # **x where x is a TypedDict feeds the named formal's value type;
+        # kwargs_used records the consumed key (argmap.py:405-416).
+        t = self._generic_t()
+        callee = CallableType(
+            [t],
+            [ARG_NAMED],
+            ["a"],
+            t,
+            self.fx.function,
+            variables=[t],
+        )
+        td = TypedDictType(
+            {"a": self.fx.a}, set(["a"]), set(), Instance(self.fx.ai, [])
+        )
+        self._assert_star_parity(callee, [td], [ARG_STAR2], [[0]])
+
+    def test_star_kwargs_mapping_instance_same_args(self) -> None:
+        # **x where x: H[D, A] against context H[D, A]: subtype decides
+        # true, the mapped args[1] is the value type A
+        # (argmap.py:417-424).
+        t = self._generic_t()
+        callee = self._callee_of([t], t)
+        ctx = Instance(self.fx.hi, [self.fx.d, self.fx.a])
+        self._assert_star_parity(callee, [ctx], [ARG_STAR2], [[0]], mapping_ctx=ctx)
+
+    def test_star_kwargs_mapping_instance_not_a_subtype(self) -> None:
+        # **x where x: G[A] cannot be unpacked with **: the expander
+        # answers AnyType(from_error) (argmap.py:420-424, 428-429).
+        t = self._generic_t()
+        callee = self._callee_of([t], t)
+        actual = Instance(self.fx.gi, [self.fx.a])
+        mapping_ctx = Instance(self.fx.hi, [self.fx.d, self.fx.a])
+        self._assert_star_parity(
+            callee, [actual], [ARG_STAR2], [[0]], mapping_ctx=mapping_ctx
+        )
+
+    def test_star_tvt_upper_bound_shared_tuple_index(self) -> None:
+        # *x where x is a TypeVarTuple with upper_bound tuple[A, D]: the
+        # expander continues with the upper bound (argmap.py:358-362)
+        # and the tuple walk resumes across actuals (x: A, y: D).
+        t = self._generic_t()
+        callee = self._callee_of([t, t], t)
+        tvt = TypeVarTupleType(
+            "Ts",
+            "mod.Ts",
+            TypeVarId(3),
+            upper_bound=TupleType([self.fx.a, self.fx.d], self.fx.std_tuple),
+            tuple_fallback=Instance(self.fx.std_tuplei, [self.fx.anyt]),
+            default=AnyType(TypeOfAny.special_form),
+        )
+        self._assert_star_parity(
+            callee, [tvt, tvt], [ARG_STAR, ARG_STAR], [[0], [1]]
+        )
+
+    def test_missing_iterable_context_defers(self) -> None:
+        # A star Instance actual without an Iterable context blob defers
+        # the whole seam to Python (no context, no guess).
+        t = self._generic_t()
+        callee = self._callee_of([t], t)
+        actual = Instance(self.fx.gi, [self.fx.a])
+        assert (
+            self._seam(callee, [actual], [ARG_STAR], [[0]]) is None
+        ), "missing Iterable context must defer"
+
+    def test_star_kwargs_key_miss_defers(self) -> None:
+        # A TypedDict ** actual whose named formal has no matching item
+        # defers (argmap.py:407-410 unreachable-name tail is checker-side).
+        t = self._generic_t()
+        callee = CallableType(
+            [t],
+            [ARG_NAMED],
+            ["z"],
+            t,
+            self.fx.function,
+            variables=[t],
+        )
+        td = TypedDictType({"a": self.fx.a}, set(["a"]), set(), Instance(self.fx.ai, []))
+        assert self._seam(callee, [td], [ARG_STAR2], [[0]]) is None
+
 
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
