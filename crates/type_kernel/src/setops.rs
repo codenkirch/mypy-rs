@@ -2338,16 +2338,12 @@ fn visit_join(
                 // `join_similar_callables` (join.py:622-637). The caller's
                 // fallback-join (join.py:628-629, when an arg meets to
 
-                // NoneType/UninhabitedType) cannot be reproduced here
-                // without recursing into the visitor with a half-built
-                // operand, so the Rust impl defers (returns None) in that
-
                 // case and Python runs the original path. The
                 // `from_type_type` force (join.py:630-636, suppress the
                 // abstract-instantiation error when concrete class objects
 
                 // join to their abstract superclass) is replicated.
-                let r = join_similar_callables_impl(
+                join_similar_callables_impl(
                     s,
                     t,
                     s_arg_types,
@@ -2365,8 +2361,7 @@ fn visit_join(
                     variables,
                     ctx,
                     resolver,
-                );
-                r
+                )
             } else if let Type::Overloaded { .. } = s {
                 // join.py:583-585: s is Overloaded -> swap so the
                 // visit_overloaded walk runs with self.s=callable
@@ -4982,7 +4977,7 @@ fn via_supertype_arg_type(
             }
         };
         let mapped = mk_wire_instance(base_ref, mapped_args);
-        let _ = join_and_consider(&mapped, &s_inst, ctx, resolver, seen, &mut consider)?;
+        join_and_consider(&mapped, &s_inst, ctx, resolver, seen, &mut consider)?;
     }
     if let Some(ss) = &s_snap {
         for base_blob in &ss.bases {
@@ -4994,32 +4989,19 @@ fn via_supertype_arg_type(
                 continue;
             };
             if let Some(b_snap) = resolver.get(base_ref) {
-                if b_snap.is_protocol {
-                    let sub = is_subtype(&t_inst, &base, ctx, resolver);
-                    if sub.is_none() {
+                if b_snap.is_protocol && is_subtype(&t_inst, &base, ctx, resolver)? {
+                    if base_ref == "builtins.tuple" && tuple_map_diverges(t_ref, resolver)? {
                         return None;
                     }
-                    if sub.unwrap() {
-                        if base_ref == "builtins.tuple" && tuple_map_diverges(t_ref, resolver)? {
-                            return None;
-                        }
-                        let mapped_args =
-                            match map_instance_to_supertype(t_ref, t_args, base_ref, resolver) {
-                                Some(m) => m,
-                                None => {
-                                    return None;
-                                }
-                            };
-                        let mapped = mk_wire_instance(base_ref, mapped_args);
-                        let _ = join_and_consider(
-                            &mapped,
-                            &s_inst,
-                            ctx,
-                            resolver,
-                            seen,
-                            &mut consider,
-                        )?;
-                    }
+                    let mapped_args =
+                        match map_instance_to_supertype(t_ref, t_args, base_ref, resolver) {
+                            Some(m) => m,
+                            None => {
+                                return None;
+                            }
+                        };
+                    let mapped = mk_wire_instance(base_ref, mapped_args);
+                    join_and_consider(&mapped, &s_inst, ctx, resolver, seen, &mut consider)?;
                 }
             }
         }
@@ -5028,7 +5010,7 @@ fn via_supertype_arg_type(
     for pb in &t_snap.promote_bytes {
         let p = decode_type(pb)?;
         if let Type::Instance { .. } = &p {
-            let _ = join_and_consider(&p, &s_inst, ctx, resolver, seen, &mut consider)?;
+            join_and_consider(&p, &s_inst, ctx, resolver, seen, &mut consider)?;
         }
     }
     best
@@ -5050,10 +5032,8 @@ fn join_and_consider(
     let mark = seen.len();
     let res = join_instances_core(candidate, s_inst, ctx, resolver, seen);
     seen.truncate(mark);
-    if res.is_none() {
-        return None;
-    }
-    res.and_then(|r| consider(candidate, r))
+    let result = res?;
+    consider(candidate, result)
 }
 
 /// MRO length for `is_better` (join.py:804+). Returns 0 if the
