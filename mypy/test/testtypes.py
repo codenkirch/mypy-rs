@@ -37564,8 +37564,6 @@ class NativeIsRecursivePairSuite(Suite):
         return _type_kernel.rust_is_recursive_pair(
             _serialize_type(s),
             _serialize_type(t),
-            isinstance(s, TypeAliasType) and s.is_recursive,
-            isinstance(t, TypeAliasType) and t.is_recursive,
             self._resolver,
         )
 
