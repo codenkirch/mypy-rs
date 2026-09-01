@@ -26732,6 +26732,27 @@ class NativeDangerousComparisonSuite(Suite):
         self.bytesi = self.fx.make_type_info("builtins.bytes")
         self.bytearrayi = self.fx.make_type_info("builtins.bytearray")
         self.memoryviewi = self.fx.make_type_info("builtins.memoryview")
+        # AbstractSet / Mapping fixtures for the container recursions: the
+        # shim resolves their fullnames so Rust maps set/dict instances
+        # through the typing supertypes without crossing back to Python.
+        self.abstract_seti = self.fx.make_type_info("typing.AbstractSet", typevars=["T"])
+        self.seti = self.fx.make_type_info(
+            "builtins.set", mro=[self.abstract_seti, self.fx.oi], typevars=["T"]
+        )
+        self.seti.bases = [Instance(self.abstract_seti, [self.seti.defn.type_vars[0]])]
+        self.abstract_mapi = self.fx.make_type_info("typing.Mapping", typevars=["K", "V"])
+        self.dicti = self.fx.make_type_info(
+            "builtins.dict", mro=[self.abstract_mapi, self.fx.oi], typevars=["K", "V"]
+        )
+        self.dicti.bases = [Instance(self.abstract_mapi, list(self.dicti.defn.type_vars))]
+        # Production class typevars bind TypeVarId(raw_id, namespace=<class
+        # fullname>) (types.py:554); make_type_info leaves namespace empty,
+        # so stamp it for the fixtures the native mapping walks.
+        from mypy.types import TypeVarId
+
+        for info in (self.abstract_seti, self.seti, self.abstract_mapi, self.dicti):
+            for tv in info.defn.type_vars:
+                tv.id = TypeVarId(tv.id.raw_id, namespace=info.fullname)
 
         type_infos = []
         for name in dir(self.fx):
@@ -26752,8 +26773,13 @@ class NativeDangerousComparisonSuite(Suite):
                 self.bytesi,
                 self.bytearrayi,
                 self.memoryviewi,
+                self.abstract_seti,
+                self.seti,
+                self.abstract_mapi,
+                self.dicti,
             ]
         )
+        self._infos = type_infos
         self.resolver = _type_kernel.build_native_resolver(type_infos, [])
         self._set_active = _set_native_checkexpr_active
         self._set_resolver = _set_native_checkexpr_resolver
@@ -26769,11 +26795,15 @@ class NativeDangerousComparisonSuite(Suite):
         chk = _types.SimpleNamespace(
             options=options,
             binder=ConditionalTypeBinder(options),
+            # Dict subscript raises KeyError on a miss, mirroring the real
+            # TypeChecker.lookup_typeinfo so the shim defers cleanly.
             lookup_typeinfo=lambda name: {
                 "builtins.bytes": self.bytesi,
                 "builtins.bytearray": self.bytearrayi,
                 "builtins.memoryview": self.memoryviewi,
-            }.get(name),
+                "typing.AbstractSet": self.abstract_seti,
+                "typing.Mapping": self.abstract_mapi,
+            }[name],
         )
         self.method = ExpressionChecker.__new__(ExpressionChecker)
         self.method.chk = chk  # type: ignore[assignment]
@@ -26794,13 +26824,11 @@ class NativeDangerousComparisonSuite(Suite):
         on = self._with_gate(True, lambda: self.method.dangerous_comparison(left, right, **kw))
         assert_equal(on, off, f"dangerous_comparison parity {left} / {right}")
 
-    def _assert_engages(
-        self, left: Type, right: Type, original: Type | None = None, **kw: Any
-    ) -> None:
+    def _seam(self, left: Type, right: Type, original: Type | None = None, **kw: Any) -> Any:
         from mypy.checkexpr import _serialize_type_for_checkexpr
         from mypy.typeops import custom_special_method
 
-        result = _type_kernel.rust_dangerous_comparison(
+        return _type_kernel.rust_dangerous_comparison(
             _serialize_type_for_checkexpr(left),
             _serialize_type_for_checkexpr(right),
             _serialize_type_for_checkexpr(original) if original is not None else None,
@@ -26816,6 +26844,11 @@ class NativeDangerousComparisonSuite(Suite):
             "typing.Mapping",
             self.resolver,
         )
+
+    def _assert_engages(
+        self, left: Type, right: Type, original: Type | None = None, **kw: Any
+    ) -> None:
+        result = self._seam(left, right, original, **kw)
         assert result is not None, f"Rust dangerous_comparison did not engage for {left} / {right}"
 
     def test_disjoint_siblings_true(self) -> None:
@@ -26884,6 +26917,70 @@ class NativeDangerousComparisonSuite(Suite):
         b = Instance(self.bytesi, [])
         self._assert_par(ba, b)
         self._assert_engages(ba, b)
+
+    def _rebuild_with_aliases(self, aliases: list[TypeAlias]) -> None:
+        self.resolver = _type_kernel.build_native_resolver(self._infos, aliases)
+        self._set_resolver(self.resolver)
+
+    def test_alias_operand_disjoint_true(self) -> None:
+        # `mod.A = A`: an alias operand expands natively, so the strict
+        # comparison against disjoint D decides True in the seam.
+        alias = TypeAlias(self.fx.a, "mod.A", "mod", -1, -1)
+        left = TypeAliasType(alias, [])
+        self._rebuild_with_aliases([alias])
+        self._assert_par(left, self.fx.d)
+        result = self._with_gate(True, lambda: self.method.dangerous_comparison(left, self.fx.d))
+        assert_equal(result, True)
+        self._assert_engages(left, self.fx.d)
+
+    def test_alias_optional_union_true(self) -> None:
+        # `mod.O = Optional[A]` vs `Optional[D]`: remove_optional drops
+        # None on both sides (the alias expands into the union branch) and
+        # the A / D items are disjoint.
+        alias = TypeAlias(UnionType([self.fx.a, self.fx.nonet]), "mod.O", "mod", -1, -1)
+        left = TypeAliasType(alias, [])
+        right = UnionType([self.fx.d, self.fx.nonet])
+        self._rebuild_with_aliases([alias])
+        self._assert_par(left, right)
+        self._assert_engages(left, right)
+
+    def test_alias_missing_snapshot_defers_parity(self) -> None:
+        # An alias with no resolver snapshot defers: both gates answer via
+        # the pure-Python body and must agree.
+        alias = TypeAlias(self.fx.a, "mod.Missing", "mod", -1, -1)
+        left = TypeAliasType(alias, [])
+        self._assert_par(left, self.fx.d)
+        assert self._seam(left, self.fx.d) is None
+
+    def test_set_same_elem_not_dangerous(self) -> None:
+        # set[A] vs set[A]: item A/A overlaps -> not dangerous.
+        sa = Instance(self.seti, [self.fx.a])
+        self._assert_par(sa, sa)
+        self._assert_engages(sa, sa)
+
+    def test_set_disjoint_elem_dangerous(self) -> None:
+        # set[A] vs set[D]: AbstractSet item recursion sees A/D disjoint.
+        sa = Instance(self.seti, [self.fx.a])
+        sd = Instance(self.seti, [self.fx.d])
+        self._assert_par(sa, sd)
+        result = self._with_gate(True, lambda: self.method.dangerous_comparison(sa, sd))
+        assert_equal(result, True)
+        self._assert_engages(sa, sd)
+
+    def test_dict_value_disjoint_dangerous(self) -> None:
+        # dict[str, A] vs dict[str, D]: keys overlap, values are disjoint,
+        # so the Mapping recursion flags the comparison.
+        da = Instance(self.dicti, [self.fx.str_type, self.fx.a])
+        dd = Instance(self.dicti, [self.fx.str_type, self.fx.d])
+        self._assert_par(da, dd)
+        result = self._with_gate(True, lambda: self.method.dangerous_comparison(da, dd))
+        assert_equal(result, True)
+        self._assert_engages(da, dd)
+
+    def test_dict_same_value_not_dangerous(self) -> None:
+        da = Instance(self.dicti, [self.fx.str_type, self.fx.a])
+        self._assert_par(da, da)
+        self._assert_engages(da, da)
 
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
