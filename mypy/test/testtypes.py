@@ -7336,6 +7336,84 @@ class NativeTypeopsDeferralSuite(Suite):
 
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeCtorBlobPureSuite(Suite):
+    """`_native_ctor_blob` must build the blob without native seam detours.
+
+    The typeops resolver installed at blob time is the stale one from the
+    previous `_build_native_resolvers` call: the fresh class being blobbed
+    is not in its snapshot table yet. Any native detour inside
+    `type_object_type` (the type_object_type_from_function composite,
+    map_type_from_supertype) therefore defers on the missing snapshot and
+    its Python fallback re-enters the same seams, which defer again — the
+    wave22 regression measured after #1324 (totf 1800 @ 97% -> 4249 @ 63%,
+    mts 129 @ 81% -> 1637 @ 9%). The fix runs the constructor pure; this
+    suite pins zero totf/mts seam traffic and a successful blob build.
+    """
+
+    def setUp(self) -> None:
+        from mypy.typeops import _set_native_typeops_active, _set_native_typeops_resolver
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        self.fx = TypeFixture()
+        type_infos = [v for v in vars(self.fx).values() if _is_type_info(v)]
+        self._resolver = _type_kernel.build_native_resolver(type_infos, [])
+        # The class under blob is created below and stays OUT of the
+        # snapshot table: exactly the mid-build stale-resolver shape.
+        self._set_active = _set_native_typeops_active
+        self._set_resolver = _set_native_typeops_resolver
+        self._set_active(True)
+        self._set_resolver(self._resolver)
+        set_wire_typeinfo_map({info.fullname: info for info in type_infos})
+
+    def tearDown(self) -> None:
+        from mypy.typeops import _set_native_typeops_active, _set_native_typeops_resolver
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        self._set_active(False)
+        self._set_resolver(None)
+        set_wire_typeinfo_map(None)
+
+    def test_blob_building_makes_no_totf_or_mts_seam_calls(self) -> None:
+        from mypy.build import _native_ctor_blob
+        from mypy.nodes import Block, FuncDef, MDEF, SymbolTableNode
+
+        info = self.fx.make_type_info("mod.BlobPure")
+        # A metaclass fallback avoids the stdlib typeinfo lookup, which
+        # needs modules_state content unit tests do not populate.
+        info.metaclass_type = Instance(self.fx.type_typei, [])
+        fd = FuncDef("__init__", [], Block([]))
+        fd.info = info
+        info.names["__init__"] = SymbolTableNode(MDEF, fd)
+
+        counters = {"totf": 0, "mts": 0}
+        orig_totf = _type_kernel.rust_type_object_type_from_function
+        orig_mts = _type_kernel.rust_map_type_from_supertype
+
+        def spy_totf(*args: Any, **kwargs: Any) -> Any:
+            counters["totf"] += 1
+            return orig_totf(*args, **kwargs)
+
+        def spy_mts(*args: Any, **kwargs: Any) -> Any:
+            counters["mts"] += 1
+            return orig_mts(*args, **kwargs)
+
+        _type_kernel.rust_type_object_type_from_function = spy_totf
+        _type_kernel.rust_map_type_from_supertype = spy_mts
+        try:
+            blob = _native_ctor_blob(info)
+        finally:
+            _type_kernel.rust_type_object_type_from_function = orig_totf
+            _type_kernel.rust_map_type_from_supertype = orig_mts
+
+        assert_equal(
+            counters,
+            {"totf": 0, "mts": 0},
+            "ctor blob building must not enter the stale-resolver seams",
+        )
+        assert blob is not None, "ctor blob failed to build"
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeContractLiteralsSuite(Suite):
     """Parity for the Rust `try_contracting_literals_in_union` port
     (mypy.typeops.try_contracting_literals_in_union, #492 family).

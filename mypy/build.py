@@ -797,12 +797,23 @@ def _native_ctor_blob(info: TypeInfo) -> bytes | None:
     (issue #1298). Python is the semantic owner: the blob is exactly the
     object the checker would build at decision time. Any failure keeps
     the snapshot MRO fast path / Python fallback in charge (defer-only).
+
+    The typeops kernel gate is cleared for the duration: the installed
+    resolver is stale at blob time (the fresh class is not yet in its
+    snapshot table), so a native detour inside type_object_type defers on
+    the missing snapshot and its Python fallback re-enters the same seams
+    (wave22 regression from #1324). The blob is built pure.
     """
     from librt.internal import WriteBuffer
     from mypy import typeops
 
     try:
-        ctor = typeops.type_object_type(info)
+        active = typeops._native_typeops_active
+        typeops._set_native_typeops_active(False)
+        try:
+            ctor = typeops.type_object_type(info)
+        finally:
+            typeops._set_native_typeops_active(active)
         buf = WriteBuffer()
         ctor.write(buf)
         return buf.getvalue()
