@@ -7397,13 +7397,13 @@ class NativeCtorBlobPureSuite(Suite):
             counters["mts"] += 1
             return orig_mts(*args, **kwargs)
 
-        _type_kernel.rust_type_object_type_from_function = spy_totf  # type: ignore[assignment]
-        _type_kernel.rust_map_type_from_supertype = spy_mts  # type: ignore[assignment]
+        _type_kernel.rust_type_object_type_from_function = spy_totf
+        _type_kernel.rust_map_type_from_supertype = spy_mts
         try:
             blob = _native_ctor_blob(info)
         finally:
-            _type_kernel.rust_type_object_type_from_function = orig_totf  # type: ignore[assignment]
-            _type_kernel.rust_map_type_from_supertype = orig_mts  # type: ignore[assignment]
+            _type_kernel.rust_type_object_type_from_function = orig_totf
+            _type_kernel.rust_map_type_from_supertype = orig_mts
 
         assert_equal(
             counters,
