@@ -49,8 +49,12 @@ Follow a strangler-fig approach:
 - Keep Python-facing behavior stable while adding Rust behind narrow interfaces.
 - Prefer Rust adapters that exchange plain records, bytes, or stable IDs with
   Python.
-- Do not start by porting `mypy.nodes` or `mypy.types`; they are widely shared
-  mutable object graphs and plugin-visible.
+- Goal revised 2026-09-01 (#1347): the endgame is a full Rust port. Rust
+  becomes the owner of the `mypy.nodes` and `mypy.types` graphs themselves
+  (Phases F-H in `docs/remaining-migration-plan.md`), with Python remaining
+  as host, config/CLI surface, and plugin compatibility bridge. Until the
+  Phase F/G flips graduate, those graphs stay Python-canonical and the
+  per-call defer gates remain the mechanism: do not port them ad hoc.
 - Treat the native parser path as the first production migration seam.
 - The native module resolver (`FindModuleCache._find_module`) and the
   dependency-records extraction (`BuildManager.all_imported_modules_in_file`)

@@ -21,6 +21,50 @@ That is the right shape for the rest of the migration: keep Python-facing
 interfaces stable, add Rust adapters behind narrow interfaces, and migrate
 behavior only when parity is measurable.
 
+## Goal Revision (2026-09-01): From Strangler-Fig Kernel to Full Port
+
+The migration goal now extends past the per-call kernel: Rust becomes the
+owner of the AST and type graphs themselves (`mypy.nodes`, `mypy.types`).
+Python remains as the embedding host, the configuration and CLI surface, and
+the plugin compatibility bridge. This supersedes the E1 decision in
+`docs/remaining-migration-plan.md` ("nodes.py / types.py out of scope") and,
+in one respect, the Main Constraint below: those graphs are no longer exempt
+from porting; they are the endgame. The Main Constraint's risk list (plugin
+compatibility, daemon identity, cache, mypyc) transfers unchanged into the
+Phase F-H risk register.
+
+What does not change:
+
+- The per-call defer gates and the wave 28-32 schedule. Every kernel leaf
+  ported now is code that does not need re-porting when storage moves to
+  Rust; the kernel stays the fast path during and after ownership transfer.
+- Parity discipline: differential suites, self-check byte parity, daemon,
+  cache, and incremental-mode semantics.
+
+Claim discipline: public framing tracks the actual phase. The honest status
+today is "Rust kernel, Python host" (native parser, native resolver, ~97%
+native kernel). "Full Rust port" becomes true when Phases F and G graduate:
+the checking pipeline executes on Rust-owned data structures with Python as
+host and plugin bridge. Do not claim ahead of the phase.
+
+Phase sketch (details and risk register in `docs/remaining-migration-plan.md`):
+
+- **Phase F: Rust-owned type graph.** The Stage 3a Rust `Type` enum becomes
+  canonical storage. Python type classes keep their names and API but become
+  views over Rust handles, preserving isinstance semantics and mutation
+  visibility for plugins. Dual-write shadow first, read flip second, write
+  flip per class family (Instance, CallableType, TypeVarType, UnionType,
+  then the rest).
+- **Phase G: Rust-owned AST nodes.** Same pattern family by family: the
+  expression and statement nodes the kernel already serializes first, then
+  the remaining statement kinds, then `TypeInfo.names` symbol tables last
+  (semanal mutates them mid-pass).
+- **Phase H: Rust traversal drivers.** The semanal and checker visitor loops
+  move into Rust; Python callbacks shrink to plugin hooks and message
+  rendering.
+- **Phase J (optional endgame): standalone Rust binary.** The Python host
+  becomes optional rather than required.
+
 ## Repository Facts Observed
 
 - `README.md` documents that mypy is already compiled with mypyc and is about

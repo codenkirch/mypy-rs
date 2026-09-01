@@ -584,27 +584,26 @@ GitHub's count tracks the real Rust tree.
 Evaluated 2026-08-14 (after A-D complete). The three items are
 decision records against current reality; none requires a port today.
 
-**E1: nodes.py / types.py (out of scope, confirmed)**
+**E1: nodes.py / types.py (SUPERSEDED 2026-09-01, see Phase F)**
 
-`mypy/nodes.py` and `mypy/types.py` remain the "widely shared mutable
-object graphs" the migration plan says NOT to port. They are
-plugin-visible, cache-serialized, and identity-sensitive. Nothing in
-A-D changed that calculus. The Rust `Type` enum + binary wire reader
-(`wire::read_type_to_str`, `typeinfo::read_type_to_str_with_resolver`,
-Stage 3a) is parity-tested foundation for a possible `is_subtype`
-port, but enabling it in production would require the full cost list
-below; it stays off until the migration has proven stable over time.
+The 2026-08-14 decision below kept `mypy/nodes.py` and `mypy/types.py` out of
+scope. The migration goal has since been revised: Rust becomes the owner of
+both graphs (Phases F-G below). The original decision text is kept as the
+record of what made the graphs hard; its risk list transfers unchanged into
+the Phase F risk register.
 
-A future port would require:
+Original decision (2026-08-14): `mypy/nodes.py` and `mypy/types.py` remain the
+"widely shared mutable object graphs" the migration plan says NOT to port. They
+are plugin-visible, cache-serialized, and identity-sensitive. The Rust `Type`
+enum + binary wire reader (`wire::read_type_to_str`,
+`typeinfo::read_type_to_str_with_resolver`, Stage 3a) is parity-tested
+foundation for a possible `is_subtype` port. A future port would require:
 - A Rust-owned `Type` enum with Python proxy objects
 - Plugin API changes (hooks receive Rust types, not Python objects)
 - Cache format changes (Rust-owned serialization)
 - Daemon mode changes (identity preservation across incremental updates)
 
-Multi-quarter effort. Do not start while the strangler-fig per-call
-gates (Rust returns a value or `None`, Python falls back) are still
-carrying the load; a wholesale `Type`/`Node` reimplementation removes
-that fallback safety net.
+Multi-quarter effort; that estimate still holds for Phases F-H.
 
 **E2: Daemon FS ownership (already Rust-backed; no port warranted)**
 
@@ -654,6 +653,127 @@ hazards to watch are mypyc-attr subclassing rules and the
 (prepends now, so Rust dirs survive). No conflicts have been
 observed; no work is scheduled.
 
+## Phase F: Rust-owned type graph
+
+Goal: `mypy.types.Type` instances become views over Rust-owned storage. The
+checking semantics, the plugin API surface, and the test suites stay
+unchanged as a contract.
+
+### Why this is now in scope
+
+The E1 decision (2026-08-14) kept the graphs out of scope while the per-call
+gates carried the load. The gates are graduated (the kernel runs 96-99%+ of
+its hot paths natively in production), so the fallback net is exercised far
+less often than it was, and the Stage 3a Rust `Type` enum is already
+parity-tested. The goal change (#1347) makes ownership transfer the stated
+endgame rather than a possible future.
+
+### Steps in order (each step is its own merge-gated PR)
+
+- **F0: full-fidelity type enum + identity service.** Audit the Rust `Type`
+  enum against every `mypy/types.py` class and field (the Stage 3a reader
+  covers the wire subset; production needs everything, including the fields
+  Python never serializes today). Add a stable identity service: per-object
+  Rust handles replacing every `id()` / object-identity use in the kernel
+  and seams (the wave30 pair-identity registry generalizes into this).
+- **F1: dual-write shadow.** Keep Python objects canonical. Behind a default-
+  off flag, mirror every construction and mutation of the target class
+  families into Rust storage and assert equivalence over the self-check and
+  parity corpora. No consumer reads Rust storage yet. This step proves the
+  mutation graph is completely captured before anything trusts it.
+- **F2: read flip.** The already-native kernel reads Rust storage directly
+  for the mirrored families; seam-boundary wire serialization for in-process
+  traffic drops out (the wire format remains for cache and snapshots).
+  Differential suites gate every flip.
+- **F3: write flip, family by family.** `Instance` first (highest traffic),
+  then `CallableType`, `TypeVarType`, `UnionType`, then the remaining
+  classes. The Python class keeps its name, `isinstance`, and attribute
+  API: `__init__` allocates a Rust handle, attribute reads and writes route
+  through the view into Rust storage. Where Python aliasing semantics
+  require shared mutation, views share the handle.
+- **F4: graduation.** Cache writes serialize directly from Rust; the daemon
+  preserves identity across incremental updates through handles; the plugin
+  bridge serves the view objects unchanged to plugins. Claim graduation:
+  "the type graph executes on Rust storage."
+
+### Risk register (each item needs an F-phase answer before its step merges)
+
+- **Plugin compatibility.** Plugins must not be able to tell storage moved:
+  same classes (isinstance), same mutation visibility through shared
+  aliases, same reprs. Gate: run the DefaultPlugin suite plus the
+  plugin-driven testcheck subsets against every flip; keep a documented
+  fuzz harness against at least one third-party plugin.
+- **Cold-path wrapper overhead.** PyO3 attribute round-trips are slower
+  than pure-Python attribute access. Hot paths are already native; cold
+  paths regress until Phase H. Gate: self-check wall clock within 10% of
+  baseline at F3, or the regressed path gets ported first.
+- **Identity.** Code keyed on object identity (kernel caches,
+  `assuming`-style guards, node cross-references) moves to stable handles in
+  the same PR that flips the family, never later.
+- **Cache and daemon.** Cache format may version-bump freely (we own the
+  users); daemon identity across fine-grained updates rides the handle
+  service. Incremental + daemon suites must pass at every flip.
+- **mypyc.** View classes may need `@mypyc_attr` treatment (see E3); the
+  mypyc-compiled build is assessed, not exercised locally, so flips must
+  degrade gracefully there (interpreted fallback answer documented per
+  flip).
+- **Effort.** Multi-quarter. Phase F is the largest single phase of the
+  migration; the wave schedule (28-32 and successors) continues in
+  parallel, since every ported kernel leaf is code that survives the
+  transfer unchanged.
+
+## Phase G: Rust-owned AST nodes
+
+Same pattern as Phase F for `mypy.nodes`, family by family:
+
+- **G0:** full-fidelity node enum + the AST writer (the native parser already
+  serializes expression and statement heads via `ast_serialize`; extend to
+  full parity including the fields Python-only paths mutate).
+- **G1-G3:** dual-write shadow, read flip, write flip per family: expression
+  nodes first (highest kernel traffic, already serialized), then statement
+  nodes, then symbol tables (`TypeInfo.names`, `MypyFile.symbol_table`)
+  last, because semanal mutates them mid-pass.
+- **G4:** graduation: "the AST executes on Rust storage."
+
+The same risk register applies, with one extra item: semanal visitor
+mutation sites must migrate behind accessor methods on the views as their
+families flip; defer-compatible returns stay until Phase H.
+
+## Phase H: Rust traversal drivers
+
+With F and G graduated, the visitor loops themselves move:
+
+- **H1:** checker driver (`TypeChecker` visit methods) runs as Rust
+  traversal; Python callbacks remain only for plugin hooks, binder side
+  effects, and message emission.
+- **H2:** semanal driver likewise (scope stack, deferrals).
+- **H3:** message formatting (`mypy/messages.py`) moves off live-object
+  formatting onto Rust-side data formatting.
+- Graduation claim: "the type-checking pipeline executes in Rust; Python is
+  the host and plugin bridge."
+
+## Phase J: optional standalone binary (endgame, unscheduled)
+
+Once H graduates, the Python host is optional: a Rust binary could drive the
+whole pipeline with the plugin bridge remaining the one Python dependency.
+This phase is recorded so the endgame is named honestly; it starts only
+after F-H prove the ownership transfer, and it may be declined permanently
+if the bridge costs outweigh the standalone benefit.
+
+## Claim ladder (public framing, updated per phase)
+
+- Today (after wave 28-32): "Rust kernel, Python host": native parser,
+  native resolver, ~97%+ native type kernel with every undecidable case
+  documented.
+- After F4: "the type graph executes in Rust; Python is the host and plugin
+  bridge."
+- After G4: "the AST and type graph execute in Rust."
+- After H: "the type-checking pipeline executes in Rust."
+- After J: "full Rust port", with the Python plugin bridge optional.
+
+The policy is exact: claims may only move when the corresponding phase
+graduates.
+
 ## Execution Order
 
 ```
@@ -677,11 +797,30 @@ Phase D (infrastructure, parallel with B/C):
   D3: Performance regression tracking
   D4: Rust % measurement
 
-Phase E (long-term, after A-D complete; decision records, no ports):
-  E1: nodes.py / types.py, confirmed out of scope
+Phase E (long-term, after A-D; decision records):
+  E1: nodes.py / types.py scope decision, SUPERSEDED by the goal revision
   E2: Daemon FS ownership, confirmed Rust-backed (fscache); watcher stays Python
   E3: mypyc coexistence, assessed but not exercised locally
-```
+
+Waves 28-32 (in flight, unchanged; see issues #1342, #1343, #1344, #1345,
+#1346): audit-first defer-reduction rounds, solver-core port, protocol-left,
+wire identity, live-state tails.
+
+Phase F (after wave32 or in parallel by capacity, DUAL-WRITE FIRST):
+  F0: full-fidelity type enum + identity service
+  F1: dual-write shadow (Instance, CallableType, TypeVarType, UnionType)
+  F2: read flip per family
+  F3: write flip per family (Instance first)
+  F4: graduation (cache, daemon, plugin bridge)
+
+Phase G (after F4):
+  G0-G4: nodes ownership transfer, families as listed in Phase G
+
+Phase H (after G4):
+  H1: checker driver, H2: semanal driver, H3: message formatting
+
+Phase J (optional, unscheduled; may be declined):
+  standalone Rust binary
 
 ## Contract for every change
 
