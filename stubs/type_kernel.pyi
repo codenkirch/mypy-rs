@@ -2432,7 +2432,11 @@ def rust_partition_equality_ambiguous_types(
 def rust_process_start_options(flags: Any, allow_sources: bool) -> Any: ...
 def rust_remove_path_prefix(path: Any, prefix: Any) -> Any: ...
 def rust_remove_redundant_union_items(
-    type_list_bytes: bytes, keep_erased: bool, strict_optional: bool, resolver: NativeTypeResolver
+    type_list_bytes: bytes,
+    truthiness_bytes: bytes,
+    keep_erased: bool,
+    strict_optional: bool,
+    resolver: NativeTypeResolver,
 ) -> Any: ...
 def rust_report_internal_error(
     file: Any, line: Any, show_traceback: Any, mypy_version: Any
