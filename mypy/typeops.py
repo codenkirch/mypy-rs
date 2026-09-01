@@ -275,15 +275,26 @@ def _deserialize_type_list(data: bytes) -> list[Type] | None:
     """Deserialize wire bytes to a list of Types, fixing type_ref strings.
 
     Returns None if any type_ref cannot be resolved to a live TypeInfo
-    (so the caller defers to Python).
+    (so the caller defers to Python). Decoding opts into the ErasedType
+    wire tag (122): the rru seam runs with keep_erased=True and its
+    output may legitimately carry ErasedType nodes. The flag is set on
+    mypy.types itself (read there as a module global); this decoder's
+    only caller is the rru seam, whose cache is list-value-only and
+    never stamped, so a shared flag-on cache is safe.
     """
     cached = _typeops_decode_list_cache.get(data)
     if cached is not None:
         return cached
+    from mypy import types as types_mod
     from mypy.types import instance_cache, read_type_list
     from mypy.wirefixup import fixup_wire_type
 
-    decoded = read_type_list(_ReadBuffer(data))
+    old = types_mod._ALLOW_WIRE_ERASED_TYPE
+    types_mod._ALLOW_WIRE_ERASED_TYPE = True
+    try:
+        decoded = read_type_list(_ReadBuffer(data))
+    finally:
+        types_mod._ALLOW_WIRE_ERASED_TYPE = old
     # Same NOT_READY-singleton hygiene as _deserialize_type.
     instance_cache.int_type = None
     instance_cache.str_type = None
@@ -1370,24 +1381,44 @@ def make_simplified_union(
 
 
 def _remove_redundant_union_items(items: list[Type], keep_erased: bool) -> list[Type]:
-    if (
-        _HAS_TYPE_KERNEL
-        and _native_typeops_active
-        and _native_typeops_resolver is not None
-        and not any(_has_mutated_truthiness(item) for item in items)
-    ):
+    if _HAS_TYPE_KERNEL and _native_typeops_active and _native_typeops_resolver is not None:
         try:
+            # The wire drops can_be_true/can_be_false: pass them as a
+            # per-item blob (flags + mutated bit). A widen on a mutated
+            # survivor defers the whole call to Python.
+            flags_blob = bytearray()
+            mutated_any = False
+            for item in items:
+                flags_blob += bytes(
+                    (
+                        1 if item.can_be_true else 0,
+                        1 if item.can_be_false else 0,
+                        1 if _has_mutated_truthiness(item) else 0,
+                    )
+                )
+                mutated_any = mutated_any or bool(flags_blob[-1])
             result = _type_kernel.rust_remove_redundant_union_items(
                 _serialize_type_list(items),
+                bytes(flags_blob),
                 keep_erased,
                 state.strict_optional,
                 _native_typeops_resolver,
             )
             if result is not None:
-                decoded = _deserialize_type_list(bytes(result))
+                out, prov = bytes(result[0]), result[1]
+                decoded = _deserialize_type_list(out)
                 if decoded is not None:
+                    if mutated_any:
+                        # Mutated survivors keep their original live object
+                        # (true_or_false resets flags Rust cannot know);
+                        # decoded may be a shared cache entry, copy first.
+                        decoded = list(decoded)
+                        for i, src in enumerate(prov):
+                            if _has_mutated_truthiness(items[src]):
+                                decoded[i] = items[src]
                     return decoded
         except (AssertionError, NotImplementedError, ValueError):
+            # Unserializable variant or decode/read failure: defer.
             pass
     from mypy.subtypes import is_proper_subtype
 

@@ -7085,6 +7085,24 @@ class NativeCoerceLiteralSingletonSuite(Suite):
         assert eq_r is True, "Rust singleton equality did not engage"
 
 
+def _rru_flags_blob(items: Sequence[Type]) -> bytes:
+    # Per-item truthiness blob for rust_remove_redundant_union_items:
+    # (can_be_true, can_be_false, mutated) triples, computed like the
+    # shim in mypy.typeops._remove_redundant_union_items.
+    from mypy.typeops import _has_mutated_truthiness
+
+    blob = bytearray()
+    for it in items:
+        blob += bytes(
+            (
+                1 if it.can_be_true else 0,
+                1 if it.can_be_false else 0,
+                1 if _has_mutated_truthiness(it) else 0,
+            )
+        )
+    return bytes(blob)
+
+
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeTypeopsDeferralSuite(Suite):
     """Parity for TypeAliasType-operand deferral reduction in typeops.rs.
@@ -7690,10 +7708,69 @@ class NativeRemoveRedundantUnionItemsSuite(Suite):
         from mypy.typeops import _serialize_type_list
 
         r = _type_kernel.rust_remove_redundant_union_items(
-            _serialize_type_list([self.fx.a, self.fx.a]), False, True, self._resolver
+            _serialize_type_list([self.fx.a, self.fx.a]),
+            _rru_flags_blob([self.fx.a, self.fx.a]),
+            False,
+            True,
+            self._resolver,
         )
         assert r is not None, "Rust _remove_redundant_union_items did not engage"
-        assert len(r) > 0
+        out, prov = r[0], r[1]
+        assert len(out) > 0
+        assert prov == [0], f"provenance must trace input 0, got {prov!r}"
+
+    def test_mutated_survivor_keeps_original_object(self) -> None:
+        # A mutated survivor whose duplicate needs no widening: the
+        # provenance substitution returns the ORIGINAL live object so
+        # the narrowed flag survives (the round-trip would reset it).
+        from mypy.typeops import _remove_redundant_union_items, _serialize_type_list
+
+        mut = self._int()
+        mut.can_be_false = False
+        items = [mut, mut]
+        self._assert_par(items, "mutated survivor dedup")
+        res = self._with_gate(True, lambda: _remove_redundant_union_items(list(items), False))
+        assert res == [mut], f"mutated survivor must dedup, got {res!r}"
+        assert res[0] is mut, "mutated survivor must keep its original object"
+        assert res[0].can_be_false is False
+        r = _type_kernel.rust_remove_redundant_union_items(
+            _serialize_type_list(items), _rru_flags_blob(items), False, True, self._resolver
+        )
+        assert r is not None, "Rust deferred on mutated-survivor dedup"
+        assert r[1] == [0], f"provenance must trace input 0, got {r[1]!r}"
+
+    def test_widen_on_mutated_survivor_defers(self) -> None:
+        # The duplicate would widen the mutated survivor: true_or_false
+        # resets flags Rust cannot reproduce, so the seam defers and the
+        # Python body reruns (gate parity holds through the fallback).
+        from mypy.typeops import _serialize_type_list
+
+        mut = self._int()
+        mut.can_be_false = False
+        items = [mut, self._int()]
+        self._assert_par(items, "widen on mutated survivor")
+        r = _type_kernel.rust_remove_redundant_union_items(
+            _serialize_type_list(items), _rru_flags_blob(items), False, True, self._resolver
+        )
+        assert r is None, "seam must defer when a widen hits a mutated survivor"
+
+    def test_keep_erased_erased_type_decodes_natively(self) -> None:
+        # keep_erased=True with a surviving ErasedType item: the output
+        # carries wire tag 122, which read_type refuses unless
+        # _ALLOW_WIRE_ERASED_TYPE is set; the shim now opts in.
+        from mypy.typeops import _serialize_type_list
+        from mypy.types import ErasedType
+
+        items = [self._int(), ErasedType()]
+        off = self._with_gate(False, lambda: self._strs_erased(items))
+        on = self._with_gate(True, lambda: self._strs_erased(items))
+        assert_equal(on, off, "keep_erased ErasedType parity")
+        assert len(on) == 2, f"both items must survive, got {on!r}"
+        r = _type_kernel.rust_remove_redundant_union_items(
+            _serialize_type_list(items), _rru_flags_blob(items), True, True, self._resolver
+        )
+        assert r is not None, "seam deferred on a surviving ErasedType"
+        assert len(r[0]) > 0
 
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
@@ -9100,7 +9177,7 @@ class NativeAliasExpansionSuite(Suite):
         assert_equal(str(on), str(off), "remove_redundant alias parity")
         assert on == [self.fx.a], f"alias of A must dedup, got {on!r}"
         rusted = _type_kernel.rust_remove_redundant_union_items(
-            _serialize_type_list(items), False, True, self._resolver
+            _serialize_type_list(items), _rru_flags_blob(items), False, True, self._resolver
         )
         assert rusted is not None, "Rust deferred on remove_redundant alias"
 
@@ -9117,7 +9194,7 @@ class NativeAliasExpansionSuite(Suite):
         assert_equal(str(on), str(off), "remove_redundant alias subtype parity")
         assert on == [self.fx.o], f"alias to list[A] must be removed, got {on!r}"
         rusted = _type_kernel.rust_remove_redundant_union_items(
-            _serialize_type_list(items), False, True, self._resolver
+            _serialize_type_list(items), _rru_flags_blob(items), False, True, self._resolver
         )
         assert rusted is not None, "Rust deferred on remove_redundant alias subtype"
 
