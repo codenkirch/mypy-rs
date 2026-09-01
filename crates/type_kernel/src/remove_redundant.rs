@@ -29,6 +29,96 @@ fn encode_type_list(items: &[Type]) -> Option<Vec<u8>> {
     Some(buf.into_bytes())
 }
 
+/// True when any `TypeAliasType` survives in the tree. The pass re-encodes
+/// its result as wire bytes, and the Python side's wire fixup defers on a
+/// decoded alias, so a surviving alias makes the whole result undecodable.
+fn tree_has_alias(t: &Type) -> bool {
+    match t {
+        Type::TypeAliasType { .. } => true,
+        Type::Instance {
+            args,
+            last_known_value,
+            extra_attrs,
+            ..
+        } => {
+            args.iter().any(tree_has_alias)
+                || last_known_value.as_deref().is_some_and(tree_has_alias)
+                || extra_attrs
+                    .as_ref()
+                    .is_some_and(|e| e.attrs.values().any(tree_has_alias))
+        }
+        Type::TypeVarType {
+            values,
+            upper_bound,
+            default,
+            ..
+        } => {
+            values.iter().any(tree_has_alias)
+                || tree_has_alias(upper_bound)
+                || tree_has_alias(default)
+        }
+        Type::TypeVarTupleType {
+            tuple_fallback,
+            upper_bound,
+            default,
+            ..
+        } => {
+            tree_has_alias(tuple_fallback) || tree_has_alias(upper_bound) || tree_has_alias(default)
+        }
+        Type::ParamSpecType {
+            prefix,
+            upper_bound,
+            default,
+            ..
+        } => {
+            prefix.arg_types.iter().any(tree_has_alias)
+                || prefix.variables.iter().any(tree_has_alias)
+                || tree_has_alias(upper_bound)
+                || tree_has_alias(default)
+        }
+        Type::UnboundType { args, .. } => args.iter().any(tree_has_alias),
+        Type::UnpackType { typ } => tree_has_alias(typ),
+        Type::AnyType { source_any, .. } => source_any.as_deref().is_some_and(tree_has_alias),
+        Type::CallableType {
+            fallback,
+            instance_type,
+            arg_types,
+            ret_type,
+            variables,
+            type_guard,
+            type_is,
+            ..
+        } => {
+            tree_has_alias(fallback)
+                || instance_type.as_deref().is_some_and(tree_has_alias)
+                || arg_types.iter().any(tree_has_alias)
+                || tree_has_alias(ret_type)
+                || variables.iter().any(tree_has_alias)
+                || type_guard.as_deref().is_some_and(tree_has_alias)
+                || type_is.as_deref().is_some_and(tree_has_alias)
+        }
+        Type::Overloaded { items } => items.iter().any(tree_has_alias),
+        Type::TupleType {
+            partial_fallback,
+            items,
+            ..
+        } => tree_has_alias(partial_fallback) || items.iter().any(tree_has_alias),
+        Type::TypedDictType {
+            fallback, items, ..
+        } => tree_has_alias(fallback) || items.iter().any(|(_, t)| tree_has_alias(t)),
+        Type::LiteralType { fallback, .. } => tree_has_alias(fallback),
+        Type::UnionType { items, .. } => items.iter().any(tree_has_alias),
+        Type::TypeType { item, .. } => tree_has_alias(item),
+        Type::Parameters(p) => {
+            p.arg_types.iter().any(tree_has_alias) || p.variables.iter().any(tree_has_alias)
+        }
+        Type::UninhabitedType { .. }
+        | Type::NoneType
+        | Type::ErasedType
+        | Type::DeletedType { .. } => false,
+    }
+}
+
 /// `Type.can_be_true_default()` for the wire variants, for the
 /// truthiness merge in `remove_redundant_pass`. Mirrors
 /// `types.py:295-3459` restricted to the forms that can appear as
@@ -269,7 +359,10 @@ pub(crate) fn rust_remove_redundant_union_items(
     resolver: &mut NativeTypeResolver,
 ) -> Option<Vec<u8>> {
     let mut buf = ReadBuffer::new(items_bytes);
-    let items = wire::read_type_list(&mut buf).ok()?;
+    let items = match wire::read_type_list(&mut buf) {
+        Ok(items) => items,
+        Err(_) => return None,
+    };
     // Python computes `proper_ti = get_proper_type(ti)` per item
     // (typeops.py:1148): an alias-backed item dedups as its expanded
     // target. Expand alias items up front (raw target); defer on `?`.
@@ -283,7 +376,18 @@ pub(crate) fn rust_remove_redundant_union_items(
                 )?;
                 current.push(target);
             }
-            _ => current.push(ti),
+            _ => {
+                // Python only expands alias roots per item, so a nested
+                // alias may survive here; the sweep below fixes that.
+                current.push(ti);
+            }
+        }
+    }
+    // Post-root-expansion sweep, covering chain aliases whose raw target
+    // still carries an alias node.
+    for ti in &current {
+        if tree_has_alias(ti) {
+            return None;
         }
     }
     let ctx = SubtypeContext::new(false, false, false, true, true, strict_optional);
