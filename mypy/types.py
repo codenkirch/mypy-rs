@@ -482,7 +482,8 @@ class TypeAliasType(Type):
             is_recursive = self.alias in self.alias.target.accept(CollectAliasesVisitor())
             # We cache the value on the underlying TypeAlias node as an optimization,
             # since the value is the same for all instances of the same alias.
-            self.alias._is_recursive = is_recursive
+            if not _REC_CACHE_SUPPRESSED:
+                self.alias._is_recursive = is_recursive
         return is_recursive
 
     def can_be_true_default(self) -> bool:
@@ -4963,6 +4964,12 @@ def _encode_literal_value(value: LiteralValue) -> tuple[str, str]:
     if isinstance(value, bytes):  # type: ignore[unreachable]
         return ("bytes", value.decode("latin-1"))
     return ("", "")
+
+
+# Type-kernel seam (issue #1337): set while a native ctor blob is built.
+# Python reached from that chain reads is_recursive on fresh alias nodes
+# far earlier than the checker would; writes would pin stale identities.
+_REC_CACHE_SUPPRESSED: bool = False
 
 
 def has_type_vars(typ: Type) -> bool:

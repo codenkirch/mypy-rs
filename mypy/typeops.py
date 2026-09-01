@@ -43,6 +43,7 @@ from mypy.types import (
     NOT_IMPLEMENTED_TYPE_NAMES,
     AnyType,
     CallableType,
+    CollectAliasesVisitor,
     ExtraAttrs,
     FormalArgument,
     FunctionLike,
@@ -300,6 +301,20 @@ def _deserialize_type_list(data: bytes) -> list[Type] | None:
     return result
 
 
+def _alias_is_recursive_uncached(t: TypeAliasType) -> bool:
+    """Like TypeAliasType.is_recursive, but never writes the cache.
+
+    The native gate reads is_recursive eagerly, before astmerge copies state
+    between alias nodes; populating the cache here would pin a value computed
+    against a stale alias identity and diverge from the pure Python path.
+    """
+    alias = t.alias
+    assert alias is not None, "Unfixed type alias"
+    if alias._is_recursive is not None:
+        return alias._is_recursive
+    return alias in alias.target.accept(CollectAliasesVisitor())
+
+
 def is_recursive_pair(s: Type, t: Type) -> bool:
     """Is this a pair of recursive types?
 
@@ -312,8 +327,8 @@ def is_recursive_pair(s: Type, t: Type) -> bool:
         # also needs a recursive alias) can be recursive, so skip the wire
         # round-trip for non-alias pairs: the Python fallback is False.
         if isinstance(s, TypeAliasType) or isinstance(t, TypeAliasType):
-            s_is_rec = isinstance(s, TypeAliasType) and s.is_recursive
-            t_is_rec = isinstance(t, TypeAliasType) and t.is_recursive
+            s_is_rec = isinstance(s, TypeAliasType) and _alias_is_recursive_uncached(s)
+            t_is_rec = isinstance(t, TypeAliasType) and _alias_is_recursive_uncached(t)
             try:
                 result = _type_kernel.rust_is_recursive_pair(
                     _serialize_type(s),

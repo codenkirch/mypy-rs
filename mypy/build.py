@@ -805,14 +805,21 @@ def _native_ctor_blob(info: TypeInfo) -> bytes | None:
     (wave22 regression from #1324). The blob is built pure.
     """
     from librt.internal import WriteBuffer
+
+    import mypy.types as _types
     from mypy import typeops
 
     try:
         active = typeops._native_typeops_active
         typeops._set_native_typeops_active(False)
+        # Keep the is_recursive cache untouched by the blob chain: it reads
+        # fresh semantic aliases whose identity astmerge may later rebind.
+        prev_suppressed = _types._REC_CACHE_SUPPRESSED
+        _types._REC_CACHE_SUPPRESSED = True
         try:
             ctor = typeops.type_object_type(info)
         finally:
+            _types._REC_CACHE_SUPPRESSED = prev_suppressed
             typeops._set_native_typeops_active(active)
         buf = WriteBuffer()
         ctor.write(buf)
