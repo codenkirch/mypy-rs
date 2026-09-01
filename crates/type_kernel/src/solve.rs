@@ -986,26 +986,38 @@ fn choose_free_single(scc: &BTreeSet<TvId>) -> Option<TvId> {
     }
 }
 
-/// Check a candidate `Type` for structures that cannot round-trip the wire
-/// without breaking identity or leaking illegal Any places.
-fn wire_unsafe_solution(typ: &Type) -> bool {
+/// Check a candidate `Type` for wire-unsafe structures: an Any whose
+/// identity cannot survive the wire, or a type var owned by the solve
+/// call. Foreign vars are safe: the shim re-links them (#1215 pattern).
+fn wire_unsafe_solution(typ: &Type, owned: &HashSet<TvId>) -> bool {
+    wire_unsafe_reason(typ, owned).is_some()
+}
+
+fn wire_unsafe_reason(typ: &Type, owned: &HashSet<TvId>) -> Option<&'static str> {
     match typ {
         Type::TypeVarType { .. } | Type::ParamSpecType { .. } | Type::TypeVarTupleType { .. } => {
-            true
+            if tv_id(typ).is_some_and(|k| owned.contains(&k)) {
+                Some("owned-tv")
+            } else {
+                None
+            }
         }
         Type::AnyType {
             type_of_any,
             source_any,
             missing_import_name: _,
         } => {
-            // type_of_any 0 is illegal on the wire (TypeOfAny starts at 1);
-            // defer so Python rebuilds a valid Any. Also defer Anys that
-            // own a source (from_another_any identity cannot survive).
-            *type_of_any == 0 || (*type_of_any == 1 && source_any.is_some())
+            if *type_of_any == 0 {
+                Some("any0")
+            } else if *type_of_any == 1 && source_any.is_some() {
+                Some("any1")
+            } else {
+                None
+            }
         }
-        Type::UnionType { items, .. } => items.iter().any(wire_unsafe_solution),
-        Type::Instance { args, .. } => args.iter().any(wire_unsafe_solution),
-        _ => false,
+        Type::UnionType { items, .. } => items.iter().find_map(|t| wire_unsafe_reason(t, owned)),
+        Type::Instance { args, .. } => args.iter().find_map(|t| wire_unsafe_reason(t, owned)),
+        _ => None,
     }
 }
 
@@ -1018,6 +1030,7 @@ fn solve_one_for_dependent(
     infer_unions: bool,
     strict_optional: bool,
     resolver: &crate::typeinfo::TypeResolver,
+    owned: &HashSet<TvId>,
 ) -> Result<Option<Type>, ()> {
     // Filter ambiguous UninhabitedType uppers (solve.py:372-378).
     let filtered_uppers: Vec<Type> = uppers
@@ -1058,7 +1071,7 @@ fn solve_one_for_dependent(
     match out {
         (0, Some(bytes)) | (1, Some(bytes)) | (3, Some(bytes)) => {
             let typ = decode_type(&bytes).ok_or(())?;
-            if wire_unsafe_solution(&typ) {
+            if wire_unsafe_solution(&typ, owned) {
                 return Err(());
             }
             Ok(Some(typ))
@@ -1072,6 +1085,7 @@ fn solve_one_for_dependent(
 
 /// `solve_iteratively` (solve.py:295-352). Solves one batch and returns
 /// the per-var solutions. Returns `Err(())` to defer.
+#[allow(clippy::too_many_arguments)]
 fn solve_iteratively_native(
     batch: &[TvId],
     graph: &mut HashSet<(TvId, TvId)>,
@@ -1080,6 +1094,7 @@ fn solve_iteratively_native(
     infer_unions: bool,
     strict_optional: bool,
     resolver: &crate::typeinfo::TypeResolver,
+    owned: &HashSet<TvId>,
 ) -> Result<Vec<(TvId, Option<Type>)>, ()> {
     let mut solutions: Vec<(TvId, Option<Type>)> = Vec::new();
     // s_batch ordered by raw_id only (solve.py:314 sorts by `.raw_id`);
@@ -1101,7 +1116,8 @@ fn solve_iteratively_native(
 
         let lo = lowers.get(&solvable_tv).cloned().unwrap_or_default();
         let up = uppers.get(&solvable_tv).cloned().unwrap_or_default();
-        let result = solve_one_for_dependent(&lo, &up, infer_unions, strict_optional, resolver)?;
+        let result =
+            solve_one_for_dependent(&lo, &up, infer_unions, strict_optional, resolver, owned)?;
         solutions.push((solvable_tv.clone(), result.clone()));
         let Some(result) = result else {
             continue;
@@ -1166,6 +1182,7 @@ fn solve_with_dependent_native(
         .iter()
         .map(|t| tv_id(t).ok_or(()))
         .collect::<Result<_, _>>()?;
+    let owned: HashSet<TvId> = tvars.iter().cloned().collect();
     let (mut graph, mut lowers, mut uppers) =
         transitive_closure(&tvars, constraints, resolver, strict_optional)?;
     let dmap = compute_dependencies(&tvars, &graph, &lowers, &uppers);
@@ -1236,6 +1253,7 @@ fn solve_with_dependent_native(
             infer_unions,
             strict_optional,
             resolver,
+            &owned,
         ) {
             Ok(res) => solutions.extend(res),
             Err(()) => return Err(()),
@@ -1428,14 +1446,12 @@ fn solve_constraints_native(
                 r,
             ) {
                 Some(o) => o,
-                None => {
-                    return Err(());
-                }
+                None => return Err(()),
             };
             match out {
                 (0, Some(bytes)) | (1, Some(bytes)) | (3, Some(bytes)) => {
                     let typ = decode_type(&bytes).ok_or(())?;
-                    if wire_unsafe_solution(&typ) {
+                    if wire_unsafe_solution(&typ, &all_ids) {
                         return Err(());
                     }
                     Some(typ)
@@ -2469,7 +2485,14 @@ mod tests {
         // mirroring solve.py's `bottom = UnionType.make_union([A])`.
         let r = make_resolver(vec![snap("a.A")]);
         let lo = instance("a.A", vec![]);
-        let out = solve_one_for_dependent(std::slice::from_ref(&lo), &[], false, true, &r);
+        let out = solve_one_for_dependent(
+            std::slice::from_ref(&lo),
+            &[],
+            false,
+            true,
+            &r,
+            &HashSet::new(),
+        );
         assert_eq!(out, Ok(Some(lo)));
     }
 
@@ -2485,7 +2508,15 @@ mod tests {
             can_be_true: true,
             can_be_false: true,
         };
-        let out = solve_one_for_dependent(std::slice::from_ref(&u), &[], true, true, &r).unwrap();
+        let out = solve_one_for_dependent(
+            std::slice::from_ref(&u),
+            &[],
+            true,
+            true,
+            &r,
+            &HashSet::new(),
+        )
+        .unwrap();
         assert_eq!(out, Some(u));
     }
 
@@ -2494,7 +2525,14 @@ mod tests {
         // T <: A only -> candidate = the raw upper A.
         let r = make_resolver(vec![snap("a.A")]);
         let up = instance("a.A", vec![]);
-        let out = solve_one_for_dependent(&[], std::slice::from_ref(&up), false, true, &r);
+        let out = solve_one_for_dependent(
+            &[],
+            std::slice::from_ref(&up),
+            false,
+            true,
+            &r,
+            &HashSet::new(),
+        );
         assert_eq!(out, Ok(Some(up)));
     }
 
@@ -2509,8 +2547,15 @@ mod tests {
             source_any: None,
             missing_import_name: Some("mod.thing".to_string()),
         };
-        let out =
-            solve_one_for_dependent(std::slice::from_ref(&any), &[], false, true, &r).unwrap();
+        let out = solve_one_for_dependent(
+            std::slice::from_ref(&any),
+            &[],
+            false,
+            true,
+            &r,
+            &HashSet::new(),
+        )
+        .unwrap();
         let Some(typ) = out else {
             panic!("expected a solution, got None");
         };
@@ -2537,7 +2582,7 @@ mod tests {
             can_be_true: true,
             can_be_false: true,
         };
-        let out = solve_one_for_dependent(&[lo], &[], false, true, &r);
+        let out = solve_one_for_dependent(&[lo], &[], false, true, &r, &HashSet::new());
         assert_eq!(out, Err(()));
     }
 
@@ -2607,9 +2652,53 @@ mod tests {
             panic!("expected AnyType");
         };
         assert_eq!(*type_of_any, 6);
-        assert!(!wire_unsafe_solution(&any));
+        assert!(!wire_unsafe_solution(&any, &HashSet::new()));
         let bytes = encode_type(&any).unwrap();
         assert_eq!(decode_type(&bytes).unwrap(), any);
+    }
+
+    #[test]
+    fn wire_unsafe_foreign_tv_allowed() {
+        let tv = tv_type(7, "T");
+        assert!(!wire_unsafe_solution(&tv, &HashSet::new()));
+    }
+
+    #[test]
+    fn wire_unsafe_owned_tv_defers() {
+        let tv = tv_type(7, "T");
+        let owned: HashSet<TvId> = [tv_id(&tv).unwrap()].into_iter().collect();
+        assert_eq!(wire_unsafe_reason(&tv, &owned), Some("owned-tv"));
+    }
+
+    #[test]
+    fn wire_unsafe_nested_tv_respected_both_ways() {
+        // The probe descends Instance args: an owned nested var defers,
+        // the same tree with a foreign var is safe (shim relinks it).
+        let tv = tv_type(7, "T");
+        let owned: HashSet<TvId> = [tv_id(&tv).unwrap()].into_iter().collect();
+        let inst = instance("builtins.list", vec![tv]);
+        assert_eq!(wire_unsafe_reason(&inst, &owned), Some("owned-tv"));
+        assert!(!wire_unsafe_solution(&inst, &HashSet::new()));
+    }
+
+    #[test]
+    fn wire_unsafe_union_descends() {
+        let tv = tv_type(7, "T");
+        let owned: HashSet<TvId> = [tv_id(&tv).unwrap()].into_iter().collect();
+        let union = Type::UnionType {
+            items: vec![any_type(), tv],
+            uses_pep604_syntax: false,
+            can_be_true: true,
+            can_be_false: true,
+        };
+        assert_eq!(wire_unsafe_reason(&union, &owned), Some("owned-tv"));
+        assert!(!wire_unsafe_solution(&union, &HashSet::new()));
+    }
+
+    #[test]
+    fn wire_unsafe_any1_with_source_defers() {
+        let any1 = any_type_from(any_type());
+        assert!(wire_unsafe_solution(&any1, &HashSet::new()));
     }
 
     // ------------------------------------------------------------------

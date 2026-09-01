@@ -854,7 +854,7 @@ pub fn rust_solve_generic_call(
                 }
                 t => get_proper_or_none(t)?,
             };
-            let constraints = match crate::constraints::infer_constraints_full_inner(
+            let constraints = crate::constraints::infer_constraints_full_inner(
                 formal_proper,
                 actual_proper,
                 crate::constraints::SUPERTYPE_OF, // mirrors constraints.py:641
@@ -865,12 +865,7 @@ pub fn rust_solve_generic_call(
                 false,
                 // Python `infer_constraints` wrapper default (constraints.py:802).
                 true,
-            ) {
-                Some(c) => c,
-                None => {
-                    return None;
-                }
-            };
+            )?;
             all_constraints.extend(constraints);
         }
     }
