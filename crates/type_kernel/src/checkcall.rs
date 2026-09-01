@@ -114,6 +114,7 @@ pub(crate) fn normalize_callable(callee: &Type) -> Result<Type, WireError> {
         variables,
         type_guard,
         type_is,
+        ..
     } = callee
     else {
         return Err(WireError::invalid(
@@ -213,7 +214,7 @@ fn with_normalized_var_args(base: &mut CallableBase) -> Result<(), WireError> {
     let var_arg_index = base.arg_kinds.iter().position(|&k| k == ARG_STAR);
     let unpacked_items = match var_arg_index {
         Some(idx) => match &base.arg_types[idx] {
-            Type::UnpackType { typ } => match &**typ {
+            Type::UnpackType { typ, .. } => match &**typ {
                 Type::TupleType { items, .. } => Some(items.clone()),
                 _ => None,
             },
@@ -245,7 +246,7 @@ fn with_normalized_var_args(base: &mut CallableBase) -> Result<(), WireError> {
         )
     } else {
         let ui_idx = unpack_index as usize;
-        let Type::UnpackType { typ } = &unpacked_items[ui_idx] else {
+        let Type::UnpackType { typ, .. } = &unpacked_items[ui_idx] else {
             unreachable!("unpack_index points at an UnpackType");
         };
         let nested_unpacked = &**typ;
@@ -310,6 +311,7 @@ pub(crate) fn callable_base(callee: &Type) -> Result<CallableBase, WireError> {
         variables,
         type_guard,
         type_is,
+        ..
     } = callee
     else {
         return Err(WireError::invalid(
@@ -357,6 +359,7 @@ impl CallableBase {
             variables: self.variables,
             type_guard: self.type_guard,
             type_is: self.type_is,
+            special_sig: None,
         }
     }
 }
@@ -783,13 +786,16 @@ pub fn rust_solve_generic_call(
         let formal_type = formal_arg_types.get(fi)?;
 
         // Handle UnpackType formals (*args: *Tuple[...], etc.)
-        if let Type::UnpackType { typ: unpack_inner } = formal_type {
+        if let Type::UnpackType {
+            typ: unpack_inner, ..
+        } = formal_type
+        {
             if let Type::TypeVarTupleType { tuple_fallback, .. } = unpack_inner.as_ref() {
                 // Collect expanded actual types for TupleType constraint.
                 let mut expanded: Vec<Type> = Vec::with_capacity(actual_indices.len());
                 for &ai in actual_indices {
                     let at = arg_types_vec.get(ai as usize)?;
-                    if let Type::UnpackType { typ: inner } = at {
+                    if let Type::UnpackType { typ: inner, .. } = at {
                         if let Type::TupleType { items, .. } = inner.as_ref() {
                             expanded.extend(items.iter().cloned());
                         } else {
@@ -1005,7 +1011,7 @@ fn contains_function_like(t: &Type) -> bool {
         Type::UnionType { items, .. } => items.iter().any(contains_function_like),
         Type::TupleType { items, .. } => items.iter().any(contains_function_like),
         Type::TypeAliasType { args, .. } => args.iter().any(contains_function_like),
-        Type::UnpackType { typ } => contains_function_like(typ),
+        Type::UnpackType { typ, .. } => contains_function_like(typ),
         Type::TypeType { item, .. } => contains_function_like(item),
         Type::Parameters(params) => params.arg_types.iter().any(contains_function_like),
         Type::NoneType
@@ -1169,7 +1175,7 @@ fn arg_infer_second_pass(
             arg_infer_second_pass(upper_bound, aliases, seen)?
                 || arg_infer_second_pass(default, aliases, seen)?,
         ),
-        Type::UnpackType { typ } => arg_infer_second_pass(typ, aliases, seen),
+        Type::UnpackType { typ, .. } => arg_infer_second_pass(typ, aliases, seen),
         Type::Parameters(p) => any_second_pass(&p.arg_types, aliases, seen),
         Type::Instance { args, .. } => any_second_pass(args, aliases, seen),
         Type::TupleType {
@@ -1206,7 +1212,7 @@ fn has_type_vars_arg_query(t: &Type) -> bool {
             true
         }
         Type::UnboundType { args, .. } => args.iter().any(has_type_vars_arg_query),
-        Type::UnpackType { typ } => has_type_vars_arg_query(typ),
+        Type::UnpackType { typ, .. } => has_type_vars_arg_query(typ),
         Type::Parameters(p) => p.arg_types.iter().any(has_type_vars_arg_query),
         Type::Instance { args, .. } => args.iter().any(has_type_vars_arg_query),
         Type::CallableType {
@@ -1385,7 +1391,10 @@ mod tests {
     }
 
     fn unpack(typ: Type) -> Type {
-        Type::UnpackType { typ: Box::new(typ) }
+        Type::UnpackType {
+            typ: Box::new(typ),
+            from_star_syntax: false,
+        }
     }
 
     fn tuple_of(items: Vec<Type>) -> Type {
@@ -1423,6 +1432,7 @@ mod tests {
             variables: Vec::new(),
             type_guard: None,
             type_is: None,
+            special_sig: None,
         }
     }
 
@@ -1476,6 +1486,7 @@ mod tests {
             variables: vec![type_var(); variables],
             type_guard: None,
             type_is: None,
+            special_sig: None,
         }
     }
 
@@ -1514,6 +1525,9 @@ mod tests {
             uses_pep604_syntax: false,
             can_be_true: true,
             can_be_false: true,
+            is_evaluated: true,
+            original_str_expr: None,
+            original_str_fallback: None,
         };
         assert_eq!(classify_bytes(&t), Some(CALL_UNION));
     }
@@ -1606,6 +1620,9 @@ mod tests {
             uses_pep604_syntax: false,
             can_be_true: true,
             can_be_false: true,
+            is_evaluated: true,
+            original_str_expr: None,
+            original_str_fallback: None,
         }
     }
 
@@ -1630,6 +1647,7 @@ mod tests {
             variables: Vec::new(),
             type_guard: None,
             type_is: None,
+            special_sig: None,
         }
     }
 
@@ -1996,6 +2014,7 @@ mod tests {
             variables: Vec::new(),
             type_guard: None,
             type_is: None,
+            special_sig: None,
         }
     }
 
@@ -2167,6 +2186,7 @@ mod tests {
             variables: vec![type_var()],
             type_guard: None,
             type_is: None,
+            special_sig: None,
         }
     }
 

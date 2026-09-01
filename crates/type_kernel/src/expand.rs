@@ -213,6 +213,7 @@ mod tests {
         let t = tuple_type(vec![
             Type::UnpackType {
                 typ: Box::new(any_type()),
+                from_star_syntax: false,
             },
             str_type(),
         ]);

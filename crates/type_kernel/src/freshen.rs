@@ -102,6 +102,7 @@ fn id_rewrite(expanded: Type, new_vars: Vec<Type>) -> Type {
             variables: _,
             type_guard,
             type_is,
+            ..
         } => Type::CallableType {
             fallback,
             instance_type,
@@ -120,6 +121,7 @@ fn id_rewrite(expanded: Type, new_vars: Vec<Type>) -> Type {
             variables: new_vars,
             type_guard,
             type_is,
+            special_sig: None,
         },
         _ => unreachable!("id_rewrite: non-CallableType"),
     }
@@ -470,8 +472,7 @@ pub(crate) fn freshen_type(
         Type::UnionType {
             items,
             uses_pep604_syntax,
-            can_be_true: _,
-            can_be_false: _,
+            ..
         } => {
             let mut new_items = Vec::with_capacity(items.len());
             for item in items {
@@ -482,6 +483,9 @@ pub(crate) fn freshen_type(
                 can_be_false: new_items.iter().any(union_item_can_be_false),
                 uses_pep604_syntax: *uses_pep604_syntax,
                 items: new_items,
+                is_evaluated: true,
+                original_str_expr: None,
+                original_str_fallback: None,
             })
         }
 
@@ -504,10 +508,11 @@ pub(crate) fn freshen_type(
             })
         }
 
-        Type::UnpackType { typ } => {
+        Type::UnpackType { typ, .. } => {
             let new_typ = freshen_type(typ, next_raw_id, changed, strict_optional)?;
             Some(Type::UnpackType {
                 typ: Box::new(new_typ),
+                from_star_syntax: false,
             })
         }
 
@@ -532,6 +537,7 @@ pub(crate) fn freshen_type(
             variables,
             type_guard,
             type_is,
+            ..
         } => {
             let new_instance_type = match instance_type {
                 Some(it) => Some(Box::new(freshen_type(
@@ -571,6 +577,7 @@ pub(crate) fn freshen_type(
                 variables: variables.clone(),
                 type_guard: type_guard.clone(),
                 type_is: type_is.clone(),
+                special_sig: None,
             };
 
             if variables.is_empty() {
@@ -708,7 +715,7 @@ fn set_callable_variables(t: Type, tvs: Vec<Type>) -> Type {
             name,
             type_guard,
             type_is,
-            variables: _,
+            ..
         } => Type::CallableType {
             fallback,
             instance_type,
@@ -727,6 +734,7 @@ fn set_callable_variables(t: Type, tvs: Vec<Type>) -> Type {
             variables: tvs,
             type_guard,
             type_is,
+            special_sig: None,
         },
         _ => unreachable!("freshen: non-CallableType"),
     }
@@ -778,6 +786,7 @@ mod tests {
             variables: vec![t.clone()],
             type_guard: None,
             type_is: None,
+            special_sig: None,
         }
     }
 
@@ -869,6 +878,7 @@ mod tests {
             variables: vec![tvar("U", 2, 0), tvar("V", 3, 0)],
             type_guard: None,
             type_is: None,
+            special_sig: None,
         };
         let (next, t_wire, s_wire) = rust_match_generic_callables(
             2,

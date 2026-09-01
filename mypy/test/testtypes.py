@@ -1687,6 +1687,45 @@ class NativeTypeWireSuite(Suite):
             UnboundType("Foo", [UnboundType("T"), AnyType(TypeOfAny.special_form)])
         )
 
+    def test_unbound_plain_data_fields(self) -> None:
+        # optional / empty_tuple_index: plain data mypy.types carries but
+        # the wire never serializes (Phase F0, #1349); Rust reader fills
+        # the class defaults, str() unaffected (wire-drop: f0_* in wire.rs).
+        self.assert_wire_par(UnboundType("Foo", optional=True, empty_tuple_index=True))
+        # `original_str_expr` / `original_str_fallback` are pre-existing
+        # wire fields; verify the Python-written bytes still read back.
+        u = UnboundType("Foo")
+        u.original_str_expr = "Foo"
+        u.original_str_fallback = "builtins.str"
+        self.assert_wire_par(u)
+
+    def test_unpack_from_star_syntax(self) -> None:
+        # `from_star_syntax` is another wire-resident gap (Phase F0, #1349).
+        self.assert_wire_par(UnpackType(UnboundType("T"), from_star_syntax=True))
+        self.assert_wire_par(UnpackType(self.fx.std_tuple, from_star_syntax=True))
+
+    def test_callable_special_sig(self) -> None:
+        # `special_sig` ("tuple") is a plain-data field on CallableType the
+        # wire format does not serialize (Phase F0, #1349).
+        c = CallableType(
+            [self.fx.a],
+            [ARG_POS],
+            [None],
+            AnyType(TypeOfAny.special_form),
+            self.fx.function,
+            special_sig="tuple",
+        )
+        self.assert_wire_par(c)
+
+    def test_union_plain_data_fields(self) -> None:
+        # `is_evaluated` and `original_str_*` are plain data on UnionType
+        # (Phase F0, #1349); only the original_str_* fields already had a
+        # wire representation pre-#1349 for UnboundType, never for unions.
+        u = UnionType([self.fx.a, self.fx.b], is_evaluated=False)
+        u.original_str_expr = "A | B"
+        u.original_str_fallback = "builtins.str"
+        self.assert_wire_par(u)
+
     def test_instance_singletons(self) -> None:
         # INSTANCE_STR / INSTANCE_FUNCTION / INSTANCE_INT / INSTANCE_BOOL /
         # INSTANCE_OBJECT fast paths, plus INSTANCE_SIMPLE for non-builtin.

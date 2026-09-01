@@ -1210,6 +1210,9 @@ mod tests {
             uses_pep604_syntax: false,
             can_be_true: true,
             can_be_false: true,
+            is_evaluated: true,
+            original_str_expr: None,
+            original_str_fallback: None,
         };
         let union_bytes = encode(&union);
         let result =
@@ -1232,6 +1235,9 @@ mod tests {
             uses_pep604_syntax: false,
             can_be_true: true,
             can_be_false: true,
+            is_evaluated: true,
+            original_str_expr: None,
+            original_str_fallback: None,
         };
         let union_bytes = encode(&union);
         let result = rust_should_dispatch_union_call(
@@ -1249,6 +1255,9 @@ mod tests {
             uses_pep604_syntax: false,
             can_be_true: true,
             can_be_false: true,
+            is_evaluated: true,
+            original_str_expr: None,
+            original_str_fallback: None,
         };
         let union_bytes = encode(&union);
         let result = rust_should_dispatch_union_call(&union_bytes, None, None);

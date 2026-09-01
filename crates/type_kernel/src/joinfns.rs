@@ -267,6 +267,7 @@ pub(crate) fn combine_similar_callables_core(
         variables: t_variables.clone(),
         type_guard,
         type_is,
+        special_sig: None,
     };
     encode_type(&new_callable)
 }

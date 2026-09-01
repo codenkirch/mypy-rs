@@ -169,7 +169,7 @@ fn decode_arg_list(arg_blobs: &[Vec<u8>]) -> Option<Vec<Type>> {
 /// (`get_proper_type` needs the live alias target): `None` -> treated as
 /// unknown, so the whole call defers.
 fn unknown_unpack_inner(t: &Type) -> bool {
-    let Type::UnpackType { typ } = t else {
+    let Type::UnpackType { typ, .. } = t else {
         return false;
     };
     match typ.as_ref() {
@@ -274,7 +274,7 @@ fn fill_typevars_required(
                 // Python: get_proper_type(a.type) is an Instance with
                 // fullname "builtins.tuple" -> always correct.
                 let some_tuple = match a {
-                    Type::UnpackType { typ } => match typ.as_ref() {
+                    Type::UnpackType { typ, .. } => match typ.as_ref() {
                         Type::TypeAliasType { .. } => false,
                         Type::Instance { type_ref, .. } => type_ref == "builtins.tuple",
                         _ => false,
@@ -318,7 +318,7 @@ fn tvar_tuple_split_too_small(node: &PyAny, args: &[Type]) -> Result<bool, Defer
     };
     // Python: isinstance(unpack_arg.type, TypeVarTupleType).
     let is_tvt = match &args[unpack] {
-        Type::UnpackType { typ } => matches!(typ.as_ref(), Type::TypeVarTupleType { .. }),
+        Type::UnpackType { typ, .. } => matches!(typ.as_ref(), Type::TypeVarTupleType { .. }),
         _ => false,
     };
     if !is_tvt {
@@ -377,7 +377,10 @@ mod tests {
     }
 
     fn make_unpack(typ: Type) -> Type {
-        Type::UnpackType { typ: Box::new(typ) }
+        Type::UnpackType {
+            typ: Box::new(typ),
+            from_star_syntax: false,
+        }
     }
 
     #[test]

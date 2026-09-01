@@ -542,6 +542,9 @@ mod tests {
             uses_pep604_syntax: false,
             can_be_true,
             can_be_false,
+            is_evaluated: true,
+            original_str_expr: None,
+            original_str_fallback: None,
         }
     }
 

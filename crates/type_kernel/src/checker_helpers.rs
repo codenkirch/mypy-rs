@@ -794,6 +794,9 @@ fn join_one_pair(
             uses_pep604_syntax: false,
             can_be_true: true,
             can_be_false: true,
+            is_evaluated: true,
+            original_str_expr: None,
+            original_str_fallback: None,
         }),
         Some(crate::setops::SetOpResult::Any) => Some(Type::AnyType {
             type_of_any: TYPE_OF_ANY_SPECIAL_FORM,
@@ -933,6 +936,9 @@ fn map_core_result(res: crate::setops::SetOpResult, left: &Type, right: &Type) -
             uses_pep604_syntax: false,
             can_be_true: true,
             can_be_false: true,
+            is_evaluated: true,
+            original_str_expr: None,
+            original_str_fallback: None,
         }),
         crate::setops::SetOpResult::Any => Some(Type::AnyType {
             type_of_any: TYPE_OF_ANY_SPECIAL_FORM,
@@ -2010,6 +2016,7 @@ mod tests {
             variables: vec![],
             type_guard: None,
             type_is: None,
+            special_sig: None,
         }
     }
 
@@ -2296,6 +2303,9 @@ mod tests {
             uses_pep604_syntax: false,
             can_be_true: true,
             can_be_false: true,
+            is_evaluated: true,
+            original_str_expr: None,
+            original_str_fallback: None,
         };
         assert_eq!(
             custom_special_method_inner(&t, "__eq__", false, &r),
@@ -2317,6 +2327,9 @@ mod tests {
             uses_pep604_syntax: false,
             can_be_true: true,
             can_be_false: true,
+            is_evaluated: true,
+            original_str_expr: None,
+            original_str_fallback: None,
         };
         // check_all=True: first item returns false -> Some(false).
         assert_eq!(
@@ -2648,6 +2661,9 @@ info.mro = [Cls()]
             uses_pep604_syntax: false,
             can_be_true: true,
             can_be_false: true,
+            is_evaluated: true,
+            original_str_expr: None,
+            original_str_fallback: None,
         };
         // Non-Instance, non-Union item -> Some(false).
         assert_eq!(is_descriptor_wire(&any, &r), Some(false));
@@ -2790,6 +2806,9 @@ info.mro = [Cls()]
             uses_pep604_syntax: false,
             can_be_true: true,
             can_be_false: true,
+            is_evaluated: true,
+            original_str_expr: None,
+            original_str_fallback: None,
         };
         let a = make_instance("builtins.int", vec![]);
         assert_eq!(
@@ -3151,6 +3170,9 @@ info.mro = [Cls()]
             uses_pep604_syntax: false,
             can_be_true: true,
             can_be_false: true,
+            is_evaluated: true,
+            original_str_expr: None,
+            original_str_fallback: None,
         };
         let result =
             restrict_subtype_away_inner(&union, &str_t, false, true, &r, &TypeAliasResolver::new());
@@ -3182,6 +3204,9 @@ info.mro = [Cls()]
             uses_pep604_syntax: false,
             can_be_true: true,
             can_be_false: true,
+            is_evaluated: true,
+            original_str_expr: None,
+            original_str_fallback: None,
         };
         let s = make_instance("mymod.Proto", vec![]);
         let result =

@@ -88,7 +88,7 @@ pub(crate) fn has_type_vars_inner(typ: &Type) -> bool {
             true
         }
         Type::UnboundType { args, .. } => args.iter().any(has_type_vars_inner),
-        Type::UnpackType { typ } => has_type_vars_inner(typ),
+        Type::UnpackType { typ, .. } => has_type_vars_inner(typ),
         Type::Instance {
             args,
             last_known_value,
@@ -210,7 +210,7 @@ fn children(typ: &Type) -> Vec<&Type> {
     let mut out = Vec::new();
     match typ {
         Type::UnboundType { args, .. } => out.extend(args.iter()),
-        Type::UnpackType { typ } => out.push(typ),
+        Type::UnpackType { typ, .. } => out.push(typ),
         Type::Instance {
             args,
             last_known_value,
@@ -435,6 +435,7 @@ pub(crate) fn type_vars_as_args_inner(type_vars: &[Type]) -> Vec<Type> {
         .map(|tv| match tv {
             Type::TypeVarTupleType { .. } => Type::UnpackType {
                 typ: Box::new(tv.clone()),
+                from_star_syntax: false,
             },
             _ => tv.clone(),
         })
@@ -500,6 +501,7 @@ pub(crate) fn callable_with_ellipsis_inner(
         variables: Vec::new(),
         type_guard: None,
         type_is: None,
+        special_sig: None,
     }
 }
 
@@ -608,7 +610,7 @@ pub(crate) fn extend_args_for_prefix_and_suffix_inner(
     let mut idx: Option<usize> = None;
     let mut item: Option<Type> = None;
     for (i, t) in types.iter().enumerate() {
-        if let Type::UnpackType { typ } = t {
+        if let Type::UnpackType { typ, .. } = t {
             if let Type::Instance { type_ref, args, .. } = typ.as_ref() {
                 if type_ref == "builtins.tuple" && !args.is_empty() {
                     item = Some(args[0].clone());
@@ -747,7 +749,7 @@ pub(crate) fn flatten_nested_tuples_inner(
 ) -> Option<Vec<Type>> {
     let mut res: Vec<Type> = Vec::with_capacity(types.len());
     for typ in types {
-        if let Type::UnpackType { typ: inner } = typ {
+        if let Type::UnpackType { typ: inner, .. } = typ {
             // Defer if the unpacked type is a TypeAliasType (no target).
             if let Type::TypeAliasType { .. } = inner.as_ref() {
                 if !handle_recursive {
@@ -852,6 +854,9 @@ mod tests {
             uses_pep604_syntax: false,
             can_be_true: true,
             can_be_false: true,
+            is_evaluated: true,
+            original_str_expr: None,
+            original_str_fallback: None,
         }
     }
 
@@ -982,6 +987,7 @@ mod tests {
         let a = make_instance("A", vec![]);
         let unpack = Type::UnpackType {
             typ: Box::new(make_instance("builtins.tuple", vec![])),
+            from_star_syntax: false,
         };
         let b = make_instance("B", vec![]);
         let result = find_unpack_in_list_inner(&[a, unpack, b]);

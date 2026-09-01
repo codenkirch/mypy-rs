@@ -356,6 +356,7 @@ fn evaluate_plain_target(
                 uses_pep604_syntax,
                 can_be_true,
                 can_be_false,
+                ..
             } => {
                 if items
                     .iter()
@@ -372,6 +373,9 @@ fn evaluate_plain_target(
                         uses_pep604_syntax: *uses_pep604_syntax,
                         can_be_true: *can_be_true,
                         can_be_false: *can_be_false,
+                        is_evaluated: true,
+                        original_str_expr: None,
+                        original_str_fallback: None,
                     })
                 } else {
                     None
@@ -777,6 +781,9 @@ mod pair_flip_tests {
             uses_pep604_syntax: false,
             can_be_true: true,
             can_be_false: true,
+            is_evaluated: true,
+            original_str_expr: None,
+            original_str_fallback: None,
         }
     }
 

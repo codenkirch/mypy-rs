@@ -553,7 +553,7 @@ fn format_type_inner(
             Some(format!("{base_str}[{formatted_args}]"))
         }
 
-        Type::UnpackType { typ } => {
+        Type::UnpackType { typ, .. } => {
             // messages.py:2740: options.use_star_unpack()
             let inner = format_type_inner(
                 py,
@@ -1489,7 +1489,7 @@ fn collect_named_types(t: &Type, d: &mut std::collections::HashMap<String, HashS
         Type::TypeType { item, .. } => {
             collect_named_types(item, d);
         }
-        Type::UnpackType { typ } => {
+        Type::UnpackType { typ, .. } => {
             collect_named_types(typ, d);
         }
         Type::LiteralType { fallback, .. } => {
@@ -2890,6 +2890,7 @@ mod tests {
             variables: vec![],
             type_guard: None,
             type_is: None,
+            special_sig: None,
         }
     }
 

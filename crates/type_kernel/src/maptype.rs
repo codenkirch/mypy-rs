@@ -473,6 +473,9 @@ fn expand_frame(typ: &Type, left_ref: &str, left_args: &[Type]) -> Option<Type> 
                 uses_pep604_syntax: *uses_pep604_syntax,
                 can_be_true,
                 can_be_false,
+                is_evaluated: true,
+                original_str_expr: None,
+                original_str_fallback: None,
             })
         }
         Type::NoneType | Type::UninhabitedType { .. } => Some(typ.clone()),
@@ -497,6 +500,7 @@ fn expand_frame(typ: &Type, left_ref: &str, left_args: &[Type]) -> Option<Type> 
             variables,
             type_guard,
             type_is,
+            ..
         } => {
             // visit_callable_type (expandtype.py:870-918). Defer when a
             // declared ParamSpec means Python's param_spec() takes the
@@ -548,6 +552,7 @@ fn expand_frame(typ: &Type, left_ref: &str, left_args: &[Type]) -> Option<Type> 
                 variables: variables.clone(),
                 type_guard: new_guard,
                 type_is: new_type_is,
+                special_sig: None,
             })
         }
         Type::Overloaded { items } => {
@@ -599,10 +604,11 @@ fn expand_frame(typ: &Type, left_ref: &str, left_args: &[Type]) -> Option<Type> 
                 is_type_form: *is_type_form,
             })
         }
-        Type::UnpackType { typ } => {
+        Type::UnpackType { typ, .. } => {
             let new_typ = expand_frame(typ, left_ref, left_args)?;
             Some(Type::UnpackType {
                 typ: Box::new(new_typ),
+                from_star_syntax: false,
             })
         }
         _ => None,
@@ -791,6 +797,7 @@ mod tests {
                 variables: vec![],
                 type_guard: None,
                 type_is: None,
+                special_sig: None,
             },
         ])
         .unwrap();
@@ -876,6 +883,7 @@ mod tests {
                     "m.AliasKey",
                     vec![Type::UnpackType {
                         typ: Box::new(tvar("m.B", 1)),
+                        from_star_syntax: false,
                     }],
                 )],
             )],

@@ -205,7 +205,7 @@ fn can_be_false_default_inner(typ: &Type) -> Option<bool> {
             }
             // length == 1: special case tuple[*Ts].
             let item = &items[0];
-            if let Type::UnpackType { typ: inner } = item {
+            if let Type::UnpackType { typ: inner, .. } = item {
                 if let Type::TypeVarTupleType { min_len, .. } = inner.as_ref() {
                     return Some(*min_len == 0);
                 }
@@ -504,7 +504,7 @@ fn can_be_false_live(py: Python<'_>, typ: &Type, resolver: &NativeTypeResolver) 
                 return Some(false);
             }
             let item = &items[0];
-            if let Type::UnpackType { typ: inner } = item {
+            if let Type::UnpackType { typ: inner, .. } = item {
                 if let Type::TypeVarTupleType { min_len, .. } = inner.as_ref() {
                     return Some(*min_len == 0);
                 }
@@ -941,6 +941,9 @@ mod tests {
             uses_pep604_syntax: false,
             can_be_true: false,
             can_be_false: true,
+            is_evaluated: true,
+            original_str_expr: None,
+            original_str_fallback: None,
         };
         let bytes = encode(&t);
         assert_eq!(
@@ -1054,6 +1057,9 @@ mod tests {
             uses_pep604_syntax: false,
             can_be_true: true,
             can_be_false: false,
+            is_evaluated: true,
+            original_str_expr: None,
+            original_str_fallback: None,
         };
         let bytes = encode(&t);
         assert_eq!(
@@ -1132,6 +1138,7 @@ mod tests {
             partial_fallback: Box::new(fallback),
             items: vec![Type::UnpackType {
                 typ: Box::new(inner),
+                from_star_syntax: false,
             }],
             implicit: false,
         };
@@ -1172,6 +1179,7 @@ mod tests {
             partial_fallback: Box::new(fallback),
             items: vec![Type::UnpackType {
                 typ: Box::new(inner),
+                from_star_syntax: false,
             }],
             implicit: false,
         };
@@ -1246,6 +1254,7 @@ mod tests {
             variables: vec![],
             type_guard: None,
             type_is: None,
+            special_sig: None,
         };
         let bytes = encode(&t);
         assert_eq!(
@@ -1279,6 +1288,7 @@ mod tests {
             variables: vec![],
             type_guard: None,
             type_is: None,
+            special_sig: None,
         };
         let t_no_star = make(vec![ARG_POS, 1, 3]);
         let bytes = encode(&t_no_star);
@@ -1319,6 +1329,7 @@ mod tests {
             variables: vec![],
             type_guard: None,
             type_is: None,
+            special_sig: None,
         };
         let t_no_kw = make(vec![ARG_POS, 1, 3]);
         let bytes = encode(&t_no_kw);
@@ -1359,6 +1370,7 @@ mod tests {
             variables: vec![],
             type_guard: None,
             type_is: None,
+            special_sig: None,
         };
         let t_plain = make(vec![ARG_POS, 0, 1, 3]);
         let bytes = encode(&t_plain);
@@ -1405,6 +1417,7 @@ mod tests {
             variables: vars,
             type_guard: None,
             type_is: None,
+            special_sig: None,
         };
         let t_no_vars = make(vec![]);
         let bytes = encode(&t_no_vars);
@@ -1463,6 +1476,9 @@ mod tests {
             uses_pep604_syntax: false,
             can_be_true: true,
             can_be_false: true,
+            is_evaluated: true,
+            original_str_expr: None,
+            original_str_fallback: None,
         };
         let bytes = encode(&t);
         assert_eq!(union_length_inner(&decode_type(&bytes).unwrap()), Some(2));

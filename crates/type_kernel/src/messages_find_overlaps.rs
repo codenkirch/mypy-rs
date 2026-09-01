@@ -215,7 +215,7 @@ fn collect_named_types(t: &Type, d: &mut HashMap<String, HashSet<String>>) -> Re
         Type::TypeType { item, .. } => {
             collect_named_types(item, d)?;
         }
-        Type::UnpackType { typ } => {
+        Type::UnpackType { typ, .. } => {
             collect_named_types(typ, d)?;
         }
         Type::LiteralType { fallback, .. } => {
@@ -284,6 +284,9 @@ mod tests {
             uses_pep604_syntax: false,
             can_be_true: false,
             can_be_false: false,
+            is_evaluated: true,
+            original_str_expr: None,
+            original_str_fallback: None,
         }
     }
 

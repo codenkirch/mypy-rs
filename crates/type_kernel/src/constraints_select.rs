@@ -174,6 +174,9 @@ fn make_union(items: Vec<Type>) -> Type {
                 uses_pep604_syntax: false,
                 can_be_true: true,
                 can_be_false: true,
+                is_evaluated: true,
+                original_str_expr: None,
+                original_str_fallback: None,
             }
         }
     }
@@ -643,7 +646,7 @@ pub(crate) fn rust_repack_callable_args(
     let prefix = &arg_types[..star_index];
     let star_type = &arg_types[star_index];
     let (middle, suffix_types): (Type, Vec<Type>) = match star_type {
-        Type::UnpackType { typ } => match typ.as_ref() {
+        Type::UnpackType { typ, .. } => match typ.as_ref() {
             Type::TupleType { items, .. } => {
                 // Python: `assert isinstance(tp.items[0], UnpackType);
                 // star_type = tp.items[0]` — the first item itself (an
@@ -665,6 +668,7 @@ pub(crate) fn rust_repack_callable_args(
                     last_known_value: None,
                     extra_attrs: None,
                 }),
+                from_star_syntax: false,
             },
             Vec::new(),
         ),

@@ -506,6 +506,9 @@ mod tests {
             uses_pep604_syntax: false,
             can_be_true: true,
             can_be_false: true,
+            is_evaluated: true,
+            original_str_expr: None,
+            original_str_fallback: None,
         };
         let cs = vec![wc(t.clone(), SUBTYPE_OF, union)];
         let result = skip_reverse_union_inner(&cs).unwrap();
@@ -530,6 +533,9 @@ mod tests {
             uses_pep604_syntax: false,
             can_be_true: true,
             can_be_false: true,
+            is_evaluated: true,
+            original_str_expr: None,
+            original_str_fallback: None,
         };
         // Original: T :> Union[S, int] (op=SUPERTYPE_OF=1)
         let c_orig = wc(t.clone(), 1, union);
@@ -680,6 +686,9 @@ mod tests {
             uses_pep604_syntax: false,
             can_be_true: true,
             can_be_false: true,
+            is_evaluated: true,
+            original_str_expr: None,
+            original_str_fallback: None,
         };
         let mut buf = WriteBuffer::new();
         write_type(&mut buf, &tp).unwrap();
@@ -707,6 +716,9 @@ mod tests {
             uses_pep604_syntax: false,
             can_be_true: true,
             can_be_false: true,
+            is_evaluated: true,
+            original_str_expr: None,
+            original_str_fallback: None,
         };
         let mut buf = WriteBuffer::new();
         write_type(&mut buf, &tp).unwrap();
@@ -742,6 +754,9 @@ mod tests {
             uses_pep604_syntax: false,
             can_be_true: true,
             can_be_false: true,
+            is_evaluated: true,
+            original_str_expr: None,
+            original_str_fallback: None,
         };
         let mut buf = WriteBuffer::new();
         write_type(&mut buf, &tp).unwrap();
@@ -795,6 +810,7 @@ mod tests {
     fn test_infer_directed_arg_constraints_unpack_returns_empty() {
         let unpack = Type::UnpackType {
             typ: Box::new(type_var(1, 0, "T")),
+            from_star_syntax: false,
         };
         let right = instance("builtins.int");
         let mut left_buf = WriteBuffer::new();

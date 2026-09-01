@@ -194,6 +194,7 @@ fn replace_implicit_first_type_inner(sig: Type, new: &Type) -> Option<Type> {
             variables,
             type_guard,
             type_is,
+            ..
         } => Some(if arg_types.is_empty() {
             Type::CallableType {
                 fallback,
@@ -213,6 +214,7 @@ fn replace_implicit_first_type_inner(sig: Type, new: &Type) -> Option<Type> {
                 variables,
                 type_guard,
                 type_is,
+                special_sig: None,
             }
         } else {
             let mut new_arg_types = Vec::with_capacity(arg_types.len());
@@ -236,6 +238,7 @@ fn replace_implicit_first_type_inner(sig: Type, new: &Type) -> Option<Type> {
                 variables,
                 type_guard,
                 type_is,
+                special_sig: None,
             }
         }),
         Type::Overloaded { items } => {
@@ -299,14 +302,18 @@ fn transform_children<F: Fn(Type) -> Type>(t: Type, f: F) -> Type {
             args,
             original_str_expr,
             original_str_fallback,
+            ..
         } => Type::UnboundType {
             name,
             args: args.into_iter().map(&f).collect(),
             original_str_expr,
             original_str_fallback,
+            empty_tuple_index: false,
+            optional: false,
         },
-        Type::UnpackType { typ } => Type::UnpackType {
+        Type::UnpackType { typ, .. } => Type::UnpackType {
             typ: Box::new(f(*typ)),
+            from_star_syntax: false,
         },
         Type::CallableType {
             fallback,
@@ -326,6 +333,7 @@ fn transform_children<F: Fn(Type) -> Type>(t: Type, f: F) -> Type {
             variables,
             type_guard,
             type_is,
+            ..
         } => Type::CallableType {
             fallback: Box::new(f(*fallback)),
             instance_type: instance_type.map(|it| Box::new(f(*it))),
@@ -344,6 +352,7 @@ fn transform_children<F: Fn(Type) -> Type>(t: Type, f: F) -> Type {
             variables: variables.into_iter().map(&f).collect(),
             type_guard: type_guard.map(|tg| Box::new(f(*tg))),
             type_is: type_is.map(|ti| Box::new(f(*ti))),
+            special_sig: None,
         },
         Type::Overloaded { items } => Type::Overloaded {
             items: items.into_iter().map(&f).collect(),
@@ -389,6 +398,9 @@ fn transform_children<F: Fn(Type) -> Type>(t: Type, f: F) -> Type {
                 uses_pep604_syntax,
                 can_be_true,
                 can_be_false,
+                is_evaluated: true,
+                original_str_expr: None,
+                original_str_fallback: None,
             }
         }
         Type::TypeType { item, is_type_form } => Type::TypeType {
@@ -497,6 +509,9 @@ mod tests {
             uses_pep604_syntax: true,
             can_be_true: true,
             can_be_false: true,
+            is_evaluated: true,
+            original_str_expr: None,
+            original_str_fallback: None,
         }
     }
 
@@ -700,6 +715,7 @@ mod tests {
             variables: Vec::new(),
             type_guard: None,
             type_is: None,
+            special_sig: None,
         }
     }
 

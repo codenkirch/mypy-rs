@@ -90,6 +90,9 @@ pub(crate) fn solve_one_inner(
                 uses_pep604_syntax: false,
                 can_be_true: true,
                 can_be_false: true,
+                is_evaluated: true,
+                original_str_expr: None,
+                original_str_fallback: None,
             },
         })
     } else {
@@ -457,7 +460,7 @@ fn collect_type_var_ids(typ: &Type, out: &mut Vec<TvId>) {
                 collect_type_var_ids(a, out);
             }
         }
-        Type::UnpackType { typ } => collect_type_var_ids(typ, out),
+        Type::UnpackType { typ, .. } => collect_type_var_ids(typ, out),
         Type::Instance {
             args,
             last_known_value,
@@ -565,7 +568,7 @@ fn find_linear(c: &Constraint) -> (bool, Option<TvId>) {
         if let Type::TupleType { items, .. } = &c.target {
             if items.len() == 1 {
                 let item = &items[0];
-                if let Type::UnpackType { typ } = item {
+                if let Type::UnpackType { typ, .. } = item {
                     if matches!(typ.as_ref(), Type::TypeVarTupleType { .. }) {
                         return (true, tv_id(typ));
                     }
@@ -1879,7 +1882,7 @@ fn expand_actual_arg(
                     *tuple_index + 1
                 };
                 let mut item = items.get((*tuple_index - 1) as usize)?.clone();
-                if let Type::UnpackType { typ: inner } = &item {
+                if let Type::UnpackType { typ: inner, .. } = &item {
                     let unpacked = match inner.as_ref() {
                         Type::TypeVarTupleType { upper_bound, .. } => upper_bound.as_ref(),
                         other => other,
@@ -2318,6 +2321,7 @@ mod tests {
             partial_fallback: Box::new(instance("builtins.tuple", vec![])),
             items: vec![Type::UnpackType {
                 typ: Box::new(tvv.clone()),
+                from_star_syntax: false,
             }],
             implicit: true,
         };
@@ -2336,6 +2340,7 @@ mod tests {
             items: vec![
                 Type::UnpackType {
                     typ: Box::new(tvv.clone()),
+                    from_star_syntax: false,
                 },
                 instance("builtins.int", vec![]),
             ],
@@ -2507,6 +2512,9 @@ mod tests {
             uses_pep604_syntax: false,
             can_be_true: true,
             can_be_false: true,
+            is_evaluated: true,
+            original_str_expr: None,
+            original_str_fallback: None,
         };
         let out = solve_one_for_dependent(
             std::slice::from_ref(&u),
@@ -2581,6 +2589,9 @@ mod tests {
             uses_pep604_syntax: false,
             can_be_true: true,
             can_be_false: true,
+            is_evaluated: true,
+            original_str_expr: None,
+            original_str_fallback: None,
         };
         let out = solve_one_for_dependent(&[lo], &[], false, true, &r, &HashSet::new());
         assert_eq!(out, Err(()));
@@ -2690,6 +2701,9 @@ mod tests {
             uses_pep604_syntax: false,
             can_be_true: true,
             can_be_false: true,
+            is_evaluated: true,
+            original_str_expr: None,
+            original_str_fallback: None,
         };
         assert_eq!(wire_unsafe_reason(&union, &owned), Some("owned-tv"));
         assert!(!wire_unsafe_solution(&union, &HashSet::new()));
@@ -2906,6 +2920,8 @@ mod tests {
             args: Vec::new(),
             original_str_expr: None,
             original_str_fallback: None,
+            empty_tuple_index: false,
+            optional: false,
         };
         let mut ti3 = 0;
         assert!(

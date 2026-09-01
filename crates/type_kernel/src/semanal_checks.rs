@@ -619,7 +619,7 @@ fn classify_remove_unpack_kwargs(
         return Some((UNPACK_KW_PASSTHROUGH, Vec::new()));
     }
     let last_type = last_type?;
-    let Type::UnpackType { typ } = last_type else {
+    let Type::UnpackType { typ, .. } = last_type else {
         return Some((UNPACK_KW_PASSTHROUGH, Vec::new()));
     };
     // get_proper_type(last_type.type): a TypeAliasType target cannot be
@@ -1084,6 +1084,7 @@ mod tests {
     fn unpack_wire(inner: &Type) -> Option<Vec<u8>> {
         crate::checkmember::encode_type(&Type::UnpackType {
             typ: Box::new(inner.clone()),
+            from_star_syntax: false,
         })
     }
 

@@ -833,6 +833,9 @@ fn make_union(items: Vec<Type>) -> Type {
                 uses_pep604_syntax: false,
                 can_be_true,
                 can_be_false,
+                is_evaluated: true,
+                original_str_expr: None,
+                original_str_fallback: None,
             }
         }
     }
@@ -1079,7 +1082,7 @@ pub(crate) fn tuple_fallback(typ: &Type, resolver: &TypeResolver) -> Option<Type
     let mut collected: Vec<Type> = Vec::with_capacity(items.len());
     for item in items {
         match item {
-            Type::UnpackType { typ } => {
+            Type::UnpackType { typ, .. } => {
                 let unpacked = typ.as_ref();
                 // Unwrap TypeVarTupleType to its upper_bound, matching
                 // get_proper_type(item.type) then the TypeVarTupleType
@@ -1436,7 +1439,10 @@ fn fill_typevars_inner(py: Python<'_>, typ: &PyAny) -> Option<Type> {
             // copy_modified(line=-1, column=-1) does.
             Type::TypeVarType { .. } | Type::ParamSpecType { .. } => args.push(t),
             Type::TypeVarTupleType { .. } => {
-                args.push(Type::UnpackType { typ: Box::new(t) });
+                args.push(Type::UnpackType {
+                    typ: Box::new(t),
+                    from_star_syntax: false,
+                });
             }
             // A stored UnpackType or any other kind would trip Python's
             // `assert isinstance(tv, ParamSpecType)`; defer instead.
@@ -1901,6 +1907,7 @@ fn bind_self_inner(typ: &Type) -> Option<Type> {
             variables,
             type_guard,
             type_is,
+            ..
         } => {
             if !variables.is_empty() {
                 return None;
@@ -1928,6 +1935,7 @@ fn bind_self_inner(typ: &Type) -> Option<Type> {
                     variables: variables.clone(),
                     type_guard: type_guard.clone(),
                     type_is: type_is.clone(),
+                    special_sig: None,
                 }),
                 None => None,
             }
@@ -2400,7 +2408,7 @@ fn collect_query_tvars(t: &Type, out: &mut Vec<TvarKey>) -> Option<()> {
             Some(())
         }
         Type::TypeType { item, .. } => collect_query_tvars(item, out),
-        Type::UnpackType { typ } => collect_query_tvars(typ, out),
+        Type::UnpackType { typ, .. } => collect_query_tvars(typ, out),
         Type::Parameters(p) => {
             for a in &p.arg_types {
                 collect_query_tvars(a, out)?;
@@ -2500,6 +2508,7 @@ fn generic_bind_self_item(
         variables,
         type_guard,
         type_is,
+        ..
     } = item
     else {
         return None;
@@ -2535,6 +2544,7 @@ fn generic_bind_self_item(
             variables: variables.clone(),
             type_guard: type_guard.clone(),
             type_is: type_is.clone(),
+            special_sig: None,
         });
     }
     // Solve for the method's variables that appear in the self type.
@@ -2620,6 +2630,7 @@ fn generic_bind_self_item(
         variables: ex_vars,
         type_guard: ex_guard,
         type_is: ex_tis,
+        ..
     } = expanded
     else {
         return None;
@@ -2648,6 +2659,7 @@ fn generic_bind_self_item(
         variables: kept,
         type_guard: ex_guard,
         type_is: ex_tis,
+        special_sig: None,
     })
 }
 
@@ -2773,6 +2785,7 @@ fn class_callable_item_wire(
         variables,
         type_guard: type_guard.clone(),
         type_is: type_is.clone(),
+        special_sig: None,
     })
 }
 
@@ -2849,7 +2862,7 @@ pub(crate) fn collect_type_vars(
         Type::TypeType { item, .. } => collect(item, include_all, aliases, seen, out),
         Type::Overloaded { items } => collect_list(items, include_all, aliases, seen, out),
         Type::UnionType { items, .. } => collect_list(items, include_all, aliases, seen, out),
-        Type::UnpackType { typ } => collect(typ, include_all, aliases, seen, out),
+        Type::UnpackType { typ, .. } => collect(typ, include_all, aliases, seen, out),
         Type::Parameters(p) => collect_list(&p.arg_types, include_all, aliases, seen, out),
         Type::UnboundType { args, .. } => collect_list(args, include_all, aliases, seen, out),
         // Leaf types: any, none, uninhabited, deleted, erased, literal,
@@ -2986,6 +2999,7 @@ fn dummy_callable(fallback: &Type) -> Type {
         variables: Vec::new(),
         type_guard: None,
         type_is: None,
+        special_sig: None,
     }
 }
 
@@ -3076,6 +3090,7 @@ fn callable_type_inner(
         variables: Vec::new(),
         type_guard: None,
         type_is: None,
+        special_sig: None,
     })
 }
 
@@ -3722,6 +3737,9 @@ mod tests {
             uses_pep604_syntax: false,
             can_be_true: true,
             can_be_false: true,
+            is_evaluated: true,
+            original_str_expr: None,
+            original_str_fallback: None,
         };
         let result = Python::with_gil(|py| true_only(py, &t, &empty_resolver())).unwrap();
         assert!(matches!(result, TruthinessResult::CopyTrueOnly));
@@ -3821,6 +3839,9 @@ mod tests {
             uses_pep604_syntax: true,
             can_be_true: true,
             can_be_false: true,
+            is_evaluated: true,
+            original_str_expr: None,
+            original_str_fallback: None,
         };
         assert_eq!(is_literal_type_like(&t), Some(true));
     }
@@ -3834,6 +3855,9 @@ mod tests {
             uses_pep604_syntax: true,
             can_be_true: true,
             can_be_false: true,
+            is_evaluated: true,
+            original_str_expr: None,
+            original_str_fallback: None,
         };
         assert_eq!(is_literal_type_like(&t), Some(true));
     }
@@ -3907,6 +3931,7 @@ mod tests {
             variables: vec![],
             type_guard: None,
             type_is: None,
+            special_sig: None,
         };
         assert_eq!(is_literal_type_like(&t), Some(false));
     }
@@ -3945,6 +3970,9 @@ mod tests {
             uses_pep604_syntax: true,
             can_be_true: true,
             can_be_false: true,
+            is_evaluated: true,
+            original_str_expr: None,
+            original_str_fallback: None,
         }
     }
 
@@ -4202,6 +4230,9 @@ mod tests {
                 uses_pep604_syntax: false,
                 can_be_true: true,
                 can_be_false: true,
+                is_evaluated: true,
+                original_str_expr: None,
+                original_str_fallback: None,
             },
             Type::TypeType {
                 item: Box::new(plain_instance("builtins.object")),
@@ -4214,9 +4245,12 @@ mod tests {
                 args: vec![],
                 original_str_expr: None,
                 original_str_fallback: None,
+                empty_tuple_index: false,
+                optional: false,
             },
             Type::UnpackType {
                 typ: Box::new(Type::NoneType),
+                from_star_syntax: false,
             },
         ] {
             assert_eq!(
@@ -4317,6 +4351,7 @@ mod tests {
             variables: vec![],
             type_guard: None,
             type_is: None,
+            special_sig: None,
         };
         assert_eq!(
             try_getting_instance_fallback(&callable, &empty_aliases()),
@@ -4345,6 +4380,7 @@ mod tests {
                 variables: vec![],
                 type_guard: None,
                 type_is: None,
+                special_sig: None,
             }],
         };
         assert_eq!(
@@ -4536,6 +4572,9 @@ mod tests {
             uses_pep604_syntax: true,
             can_be_true: true,
             can_be_false: true,
+            is_evaluated: true,
+            original_str_expr: None,
+            original_str_fallback: None,
         };
         let result = try_expanding_sum_type_to_union_inner(&t, None, true, &r);
         assert!(result.is_none());
@@ -4553,6 +4592,9 @@ mod tests {
             uses_pep604_syntax: true,
             can_be_true: true,
             can_be_false: true,
+            is_evaluated: true,
+            original_str_expr: None,
+            original_str_fallback: None,
         };
         let result = try_expanding_sum_type_to_union_inner(&t, None, false, &r).unwrap();
         // NoneType dropped (strict_optional off), bool expands to
@@ -4574,6 +4616,9 @@ mod tests {
             uses_pep604_syntax: true,
             can_be_true: true,
             can_be_false: true,
+            is_evaluated: true,
+            original_str_expr: None,
+            original_str_fallback: None,
         };
         let result = try_expanding_sum_type_to_union_inner(&t, None, true, &r).unwrap();
         match result {
@@ -4756,6 +4801,7 @@ mod tests {
             variables: vec![],
             type_guard: None,
             type_is: None,
+            special_sig: None,
         };
         let blobs = rust_get_type_vars(&encode(&t), false).unwrap();
         assert_eq!(blobs.len(), 3);
@@ -5037,6 +5083,7 @@ mod tests {
         // NotImplementedError).
         let unpack = Type::UnpackType {
             typ: Box::new(plain_instance("builtins.int")),
+            from_star_syntax: false,
         };
         let tup = tuple_instance_fallback(vec![unpack]);
         let resolver = crate::typeinfo::TypeResolver::new();
@@ -5169,6 +5216,9 @@ mod tests {
             uses_pep604_syntax: false,
             can_be_true: true,
             can_be_false: true,
+            is_evaluated: true,
+            original_str_expr: None,
+            original_str_fallback: None,
         };
         let default = plain_instance(DEFAULT_OBJ);
         let ret = class_callable_ret(Some(&explicit), &default, false, false, false, true).unwrap();
@@ -5242,6 +5292,9 @@ mod tests {
             uses_pep604_syntax: false,
             can_be_true: true,
             can_be_false: true,
+            is_evaluated: true,
+            original_str_expr: None,
+            original_str_fallback: None,
         };
         let r = rust_is_recursive_pair(
             &encode_type(&s).unwrap(),

@@ -92,6 +92,8 @@ mod expandtype;
 mod fixup;
 mod freshen;
 mod generators;
+// Phase F0 (#1349): identity service for future graph-owner phases.
+mod identity;
 mod infer_variance;
 mod joinfns;
 mod lennarrow;

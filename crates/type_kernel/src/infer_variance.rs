@@ -135,6 +135,7 @@ fn erase_return_self_types_wire(typ: &Type, self_type: &Type) -> Option<Type> {
                     variables,
                     type_guard,
                     type_is,
+                    ..
                 } = t
                 else {
                     unreachable!()
@@ -162,6 +163,7 @@ fn erase_return_self_types_wire(typ: &Type, self_type: &Type) -> Option<Type> {
                     variables,
                     type_guard,
                     type_is,
+                    special_sig: None,
                 })
             } else {
                 Some(t)
@@ -304,6 +306,7 @@ mod tests {
             variables: vec![],
             type_guard: None,
             type_is: None,
+            special_sig: None,
         }
     }
 

@@ -307,6 +307,7 @@ mod tests {
             variables: vec![],
             type_guard: None,
             type_is: None,
+            special_sig: None,
         };
         assert_eq!(covers_at_runtime_inner(&item, &callable, true, &res), None);
     }

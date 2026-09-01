@@ -334,6 +334,7 @@ pub(crate) fn erase_typevars_inner(
             variables,
             type_guard,
             type_is,
+            ..
         } => {
             let new_fallback = erase_typevars_inner(fallback, ids, replacement)?;
             let new_instance_type = erase_typevars_opt(instance_type.as_deref(), ids, replacement)?;
@@ -349,7 +350,7 @@ pub(crate) fn erase_typevars_inner(
             if let Some(idx) = arg_kinds.iter().position(|k| *k == 2) {
                 // ARG_STAR == 2. Only when the star arg is an unpack of a
                 // builtins.tuple Instance.
-                if let Type::UnpackType { typ: inner } = &new_arg_types[idx] {
+                if let Type::UnpackType { typ: inner, .. } = &new_arg_types[idx] {
                     if let Type::Instance {
                         type_ref,
                         args,
@@ -381,6 +382,7 @@ pub(crate) fn erase_typevars_inner(
                 variables: new_variables,
                 type_guard: new_type_guard.map(Box::new),
                 type_is: new_type_is.map(Box::new),
+                special_sig: None,
             })
         }
 
@@ -400,6 +402,9 @@ pub(crate) fn erase_typevars_inner(
                 uses_pep604_syntax: *uses_pep604_syntax,
                 can_be_true,
                 can_be_false,
+                is_evaluated: true,
+                original_str_expr: None,
+                original_str_fallback: None,
             })
         }
 
@@ -448,10 +453,11 @@ pub(crate) fn erase_typevars_inner(
             Some(Type::Overloaded { items: new_items })
         }
 
-        Type::UnpackType { typ: inner } => {
+        Type::UnpackType { typ: inner, .. } => {
             let new_inner = erase_typevars_inner(inner, ids, replacement)?;
             Some(Type::UnpackType {
                 typ: Box::new(new_inner),
+                from_star_syntax: false,
             })
         }
 
@@ -648,6 +654,7 @@ fn erase_typevars_with_meta_check(typ: &Type, target: &Type) -> Option<Type> {
             variables,
             type_guard,
             type_is,
+            ..
         } => {
             let new_fallback = replace_meta_vars_inner(fallback, target)?;
             let new_instance_type = match instance_type {
@@ -674,7 +681,7 @@ fn erase_typevars_with_meta_check(typ: &Type, target: &Type) -> Option<Type> {
             let mut new_arg_types = new_arg_types;
             // Same normalize_trivial_unpack as erase_typevars_inner.
             if let Some(idx) = arg_kinds.iter().position(|k| *k == 2) {
-                if let Type::UnpackType { typ: inner } = &new_arg_types[idx] {
+                if let Type::UnpackType { typ: inner, .. } = &new_arg_types[idx] {
                     if let Type::Instance {
                         type_ref,
                         args,
@@ -706,6 +713,7 @@ fn erase_typevars_with_meta_check(typ: &Type, target: &Type) -> Option<Type> {
                 variables: new_variables,
                 type_guard: new_type_guard,
                 type_is: new_type_is,
+                special_sig: None,
             })
         }
         Type::UnionType {
@@ -724,6 +732,9 @@ fn erase_typevars_with_meta_check(typ: &Type, target: &Type) -> Option<Type> {
                 uses_pep604_syntax: *uses_pep604_syntax,
                 can_be_true,
                 can_be_false,
+                is_evaluated: true,
+                original_str_expr: None,
+                original_str_fallback: None,
             })
         }
         Type::TypeType { item, is_type_form } => {
@@ -767,10 +778,11 @@ fn erase_typevars_with_meta_check(typ: &Type, target: &Type) -> Option<Type> {
             }
             Some(Type::Overloaded { items: new_items })
         }
-        Type::UnpackType { typ: inner } => {
+        Type::UnpackType { typ: inner, .. } => {
             let new_inner = replace_meta_vars_inner(inner, target)?;
             Some(Type::UnpackType {
                 typ: Box::new(new_inner),
+                from_star_syntax: false,
             })
         }
         Type::Parameters(params) => {
@@ -809,7 +821,7 @@ fn erase_typevars_with_meta_check(typ: &Type, target: &Type) -> Option<Type> {
 /// Mirrors the normalization in TypeVarEraser.visit_instance (erasetype.py:241-247)
 /// and visit_tuple_type (erasetype.py:260-271).
 fn normalize_tuple_unpack(t: &Type) -> Option<Type> {
-    if let Type::UnpackType { typ: inner } = t {
+    if let Type::UnpackType { typ: inner, .. } = t {
         if let Type::Instance { type_ref, args, .. } = inner.as_ref() {
             if type_ref == "builtins.tuple" && args.len() == 1 {
                 return Some(inner.as_ref().clone());
@@ -914,6 +926,9 @@ mod tests {
             uses_pep604_syntax: true,
             can_be_true: true,
             can_be_false: true,
+            is_evaluated: true,
+            original_str_expr: None,
+            original_str_fallback: None,
         };
         let result = erase_typevars_inner(&t, None, &make_any()).unwrap();
         match result {
