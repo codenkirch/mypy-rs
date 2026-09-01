@@ -7380,7 +7380,6 @@ class NativeCtorBlobPureSuite(Suite):
         set_wire_typeinfo_map({info.fullname: info for info in type_infos})
 
     def tearDown(self) -> None:
-        from mypy.typeops import _set_native_typeops_active, _set_native_typeops_resolver
         from mypy.wirefixup import set_wire_typeinfo_map
 
         self._set_active(False)
@@ -7389,7 +7388,7 @@ class NativeCtorBlobPureSuite(Suite):
 
     def test_blob_building_makes_no_totf_or_mts_seam_calls(self) -> None:
         from mypy.build import _native_ctor_blob
-        from mypy.nodes import Block, FuncDef, MDEF, SymbolTableNode
+        from mypy.nodes import MDEF, Block, FuncDef, SymbolTableNode
 
         info = self.fx.make_type_info("mod.BlobPure")
         # A metaclass fallback avoids the stdlib typeinfo lookup, which
@@ -26232,8 +26231,11 @@ class NativeConditionalTypesSuite(Suite):
         # A variadic proposed type: the erased instance carries one arg per
         # defn.type_vars slot (2), not per arg (3), with the TVT slot
         # becoming Unpack(tuple[Any]) (typevartuples.py:28-35).
-        from mypy.checker import _serialize_type_for_checker, _serialize_type_ranges
-        from mypy.checker import conditional_types
+        from mypy.checker import (
+            _serialize_type_for_checker,
+            _serialize_type_ranges,
+            conditional_types,
+        )
 
         current = self.fx.str_type
         three = [self.fx.o, self.fx.o, self.fx.o]
@@ -26536,6 +26538,27 @@ class NativeDangerousComparisonSuite(Suite):
         self.bytesi = self.fx.make_type_info("builtins.bytes")
         self.bytearrayi = self.fx.make_type_info("builtins.bytearray")
         self.memoryviewi = self.fx.make_type_info("builtins.memoryview")
+        # AbstractSet / Mapping fixtures for the container recursions: the
+        # shim resolves their fullnames so Rust maps set/dict instances
+        # through the typing supertypes without crossing back to Python.
+        self.abstract_seti = self.fx.make_type_info("typing.AbstractSet", typevars=["T"])
+        self.seti = self.fx.make_type_info(
+            "builtins.set", mro=[self.abstract_seti, self.fx.oi], typevars=["T"]
+        )
+        self.seti.bases = [Instance(self.abstract_seti, [self.seti.defn.type_vars[0]])]
+        self.abstract_mapi = self.fx.make_type_info("typing.Mapping", typevars=["K", "V"])
+        self.dicti = self.fx.make_type_info(
+            "builtins.dict", mro=[self.abstract_mapi, self.fx.oi], typevars=["K", "V"]
+        )
+        self.dicti.bases = [Instance(self.abstract_mapi, list(self.dicti.defn.type_vars))]
+        # Production class typevars bind TypeVarId(raw_id, namespace=<class
+        # fullname>) (types.py:554); make_type_info leaves namespace empty,
+        # so stamp it for the fixtures the native mapping walks.
+        from mypy.types import TypeVarId
+
+        for info in (self.abstract_seti, self.seti, self.abstract_mapi, self.dicti):
+            for tv in info.defn.type_vars:
+                tv.id = TypeVarId(tv.id.raw_id, namespace=info.fullname)
 
         type_infos = []
         for name in dir(self.fx):
@@ -26556,6 +26579,10 @@ class NativeDangerousComparisonSuite(Suite):
                 self.bytesi,
                 self.bytearrayi,
                 self.memoryviewi,
+                self.abstract_seti,
+                self.seti,
+                self.abstract_mapi,
+                self.dicti,
             ]
         )
         self._infos = type_infos
@@ -26574,11 +26601,15 @@ class NativeDangerousComparisonSuite(Suite):
         chk = _types.SimpleNamespace(
             options=options,
             binder=ConditionalTypeBinder(options),
+            # Dict subscript raises KeyError on a miss, mirroring the real
+            # TypeChecker.lookup_typeinfo so the shim defers cleanly.
             lookup_typeinfo=lambda name: {
                 "builtins.bytes": self.bytesi,
                 "builtins.bytearray": self.bytearrayi,
                 "builtins.memoryview": self.memoryviewi,
-            }.get(name),
+                "typing.AbstractSet": self.abstract_seti,
+                "typing.Mapping": self.abstract_mapi,
+            }[name],
         )
         self.method = ExpressionChecker.__new__(ExpressionChecker)
         self.method.chk = chk  # type: ignore[assignment]
@@ -26726,6 +26757,36 @@ class NativeDangerousComparisonSuite(Suite):
         left = TypeAliasType(alias, [])
         self._assert_par(left, self.fx.d)
         assert self._seam(left, self.fx.d) is None
+
+    def test_set_same_elem_not_dangerous(self) -> None:
+        # set[A] vs set[A]: item A/A overlaps -> not dangerous.
+        sa = Instance(self.seti, [self.fx.a])
+        self._assert_par(sa, sa)
+        self._assert_engages(sa, sa)
+
+    def test_set_disjoint_elem_dangerous(self) -> None:
+        # set[A] vs set[D]: AbstractSet item recursion sees A/D disjoint.
+        sa = Instance(self.seti, [self.fx.a])
+        sd = Instance(self.seti, [self.fx.d])
+        self._assert_par(sa, sd)
+        result = self._with_gate(True, lambda: self.method.dangerous_comparison(sa, sd))
+        assert_equal(result, True)
+        self._assert_engages(sa, sd)
+
+    def test_dict_value_disjoint_dangerous(self) -> None:
+        # dict[str, A] vs dict[str, D]: keys overlap, values are disjoint,
+        # so the Mapping recursion flags the comparison.
+        da = Instance(self.dicti, [self.fx.str_type, self.fx.a])
+        dd = Instance(self.dicti, [self.fx.str_type, self.fx.d])
+        self._assert_par(da, dd)
+        result = self._with_gate(True, lambda: self.method.dangerous_comparison(da, dd))
+        assert_equal(result, True)
+        self._assert_engages(da, dd)
+
+    def test_dict_same_value_not_dangerous(self) -> None:
+        da = Instance(self.dicti, [self.fx.str_type, self.fx.a])
+        self._assert_par(da, da)
+        self._assert_engages(da, da)
 
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")

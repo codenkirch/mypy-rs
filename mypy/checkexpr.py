@@ -5662,12 +5662,15 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
             return False
 
         # Native seam: Rust reruns the branch-for-branch decision tree on
-        # wire types and returns Some(bool), or None to defer. The
-        # recursion guard `(left, right) in seen_types` and the
+        # wire types and returns Some(bool), or None to defer.
 
-        # AbstractSet/Mapping/list-tuple item recursion use live type
-        # identities the wire cannot carry, so Rust defers there and the
-        # pure-Python body (with the live guard) runs unchanged.
+        # The recursion guard `(left, right) in seen_types` uses live type
+        # identities the wire cannot carry, so Rust sees it as a
+        # pre-computed bool only.
+
+        # The AbstractSet/Mapping recursion maps through the typing
+        # supertypes; the shim resolves their fullnames so the Rust
+        # recursion decides item pairs without crossing back.
         if (
             _CHECKEXPR_HAS_TYPE_KERNEL
             and _native_checkexpr_active
@@ -5682,6 +5685,22 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
                     orig_bytes = None
                 else:
                     orig_bytes = _serialize_type_for_checkexpr(original_container)
+                if isinstance(
+                    get_proper_type(left), Instance
+                ) and isinstance(get_proper_type(right), Instance):
+                    try:
+                        abstract_set_ref = self.chk.lookup_typeinfo(
+                            "typing.AbstractSet"
+                        ).fullname
+                        abstract_map_ref = self.chk.lookup_typeinfo("typing.Mapping").fullname
+                    except KeyError:
+                        # Broken fixture without the typing symbols: defer so
+                        # the pure-Python body reports the real error.
+                        abstract_set_ref = None
+                        abstract_map_ref = None
+                else:
+                    abstract_set_ref = None
+                    abstract_map_ref = None
                 result = _rust_dangerous_comparison(
                     _serialize_type_for_checkexpr(left),
                     _serialize_type_for_checkexpr(right),
@@ -5694,8 +5713,8 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
                     custom_special_method(left, "__eq__"),
                     custom_special_method(right, "__eq__"),
                     self.chk.options.strict_optional,
-                    None,
-                    None,
+                    abstract_set_ref,
+                    abstract_map_ref,
                     _native_checkexpr_resolver,
                 )
                 if result is not None:

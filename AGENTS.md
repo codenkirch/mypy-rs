@@ -2550,6 +2550,24 @@ including:
   76, `ap-target` 74 / `apply-defer` 77 (applytypes tail),
   `gt-bound-fail` 59 (needs a subtype-callback channel).
 
+- `rust_dangerous_comparison` alias + container-ref round (issue #1342) —
+  the seam mirrors the branch-for-branch decision head of
+  `ExpressionChecker.dangerous_comparison` (checkexpr.py) on wire types;
+  covered by `NativeDangerousComparisonSuite` in
+  `mypy/test/testtypes.py` (gate-off vs gate-on parity plus direct seam
+  calls). Two extension ports from the #1342 defer audit: (a) alias
+  operands expand through the alias snapshot at entry and again after
+  `remove_optional`, which is an alias-aware port of
+  `types_utils.remove_optional` (dc-alias 61 -> 0, dc-remove-opt 8 -> 0);
+  (b) the Python shim resolves the `typing.AbstractSet` /
+  `typing.Mapping` fullnames via `chk.lookup_typeinfo` (KeyError defers)
+  and passes them into the seam so the Rust set/Mapping item recursions
+  decide without crossing back to Python (dc-setref 63 -> 0, dc-mapref
+  19 -> 0). The suite's fixture Infos stamp their `TypeVarId` namespaces
+  (`make_type_info` leaves them empty and the native mapping keys on the
+  namespace). Remaining buckets: dc-final-overlap 67 (overlap kernel,
+  tracked elsewhere), dc-lit 2, dc-map 1.
+
 ## Pull Requests
 
 The default branch on this fork is `main` (not `master`). Always target
