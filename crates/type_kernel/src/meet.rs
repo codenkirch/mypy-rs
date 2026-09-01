@@ -2277,4 +2277,3 @@ mod tests {
         assert_eq!(decode_type(&bytes).as_ref(), Some(&g_obj));
     }
 }
-
