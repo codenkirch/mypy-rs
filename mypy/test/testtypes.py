@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 import re
 import sys
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from types import SimpleNamespace
 from typing import Any, TypeVar, cast
@@ -5468,6 +5468,210 @@ class NativeExpandTypeAliasSuite(Suite):
             self._assert_par(alias_t)
         finally:
             set_wire_alias_map({self.alias.fullname: self.alias})
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeExpandParamSpecSpliceSuite(Suite):
+    """Parity for the Rust `expand_type` ParamSpec splice (wave29 #1343).
+
+    `visit_callable_type`'s Concatenate splice (expandtype.py:1149-1195)
+    and `visit_param_spec` (:963-996) run natively when the env maps the
+    ParamSpec to a Parameters and no ParamSpecType occurs in the result.
+    Shapes the port defers (a fresh meta substitute keyed only at a
+    nonzero meta level, an unpack it cannot normalize, an ARGS/KWARGS
+    leaf with a Parameters replacement, and any splice or leaf result
+    that embeds a ParamSpecType -- the wire drops meta_level, so a
+    fresh origin would round-trip at meta level 0) fall back to the
+    pure Python body, so gate-on == gate-off everywhere.
+    """
+
+    def setUp(self) -> None:
+        from mypy.expandtype import (
+            _set_native_expand_type_active,
+            _set_native_expand_type_resolver,
+            _set_native_expand_type_typeinfo_map,
+        )
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        self.fx = TypeFixture(INVARIANT)
+        self._set_active = _set_native_expand_type_active
+        self._set_resolver = _set_native_expand_type_resolver
+        self._set_map = _set_native_expand_type_typeinfo_map
+        type_infos = []
+        for name in dir(self.fx):
+            if not name.endswith("i"):
+                continue
+            value = getattr(self.fx, name)
+            if _is_type_info(value):
+                type_infos.append(value)
+        self._resolver = _type_kernel.build_native_resolver(type_infos, [])
+        self._set_resolver(self._resolver)
+        self._set_map({info.fullname: info for info in type_infos})
+        set_wire_typeinfo_map({info.fullname: info for info in type_infos})
+        self._set_active(True)
+
+    def tearDown(self) -> None:
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        self._set_active(False)
+        self._set_resolver(None)
+        self._set_map(None)
+        set_wire_typeinfo_map(None)
+
+    def _with_gate(self, active: bool, fn: Callable[[], Any]) -> Any:
+        self._set_active(active)
+        try:
+            return fn()
+        finally:
+            self._set_active(True)
+
+    def _expand(self, typ: Type, env: Mapping[TypeVarId, Type]) -> Any:
+        from mypy.expandtype import expand_type
+
+        return expand_type(typ, env)
+
+    def _assert_par(self, typ: Type, env: Mapping[TypeVarId, Type]) -> None:
+        off = str(self._with_gate(False, lambda: self._expand(typ, env)))
+        on = str(self._with_gate(True, lambda: self._expand(typ, env)))
+        assert_equal(on, off, f"expand_type(ps splice) parity {typ}")
+
+    def _param_spec(
+        self, raw_id: int = 1, name: str = "P", fullname: str = "mod.P"
+    ) -> ParamSpecType:
+        return ParamSpecType(
+            name, fullname, TypeVarId(raw_id), 0, self.fx.o, AnyType(TypeOfAny.special_form)
+        )
+
+    def _splice_callable(
+        self, ps: ParamSpecType, lead: Sequence[Type], ret: Type | None = None
+    ) -> CallableType:
+        # Concatenate[*lead, P.args, **P.kwargs]: the trailing ARGS and
+        # KWARGS occurrences occupy the last two arg slots; Python's
+        # CallableType.param_spec() canonicalizes the head likewise.
+        arg_types = [*lead, ps.with_flavor(ParamSpecFlavor.ARGS), ps.with_flavor(ParamSpecFlavor.KWARGS)]
+        arg_kinds = [ARG_POS] * len(lead) + [ARG_STAR, ARG_STAR2]
+        return CallableType(
+            arg_types,
+            arg_kinds,
+            [None] * len(arg_types),
+            ret if ret is not None else self.fx.anyt,
+            self.fx.function,
+        )
+
+    def _engaged(self, typ: Type, env: Mapping[TypeVarId, Type]) -> bool:
+        from mypy.expandtype import _serialize_env, _serialize_type
+
+        result = _type_kernel.rust_expand_type(
+            self._resolver,
+            _serialize_type(typ),
+            _serialize_env(env),
+            state.strict_optional,
+        )
+        return result is not None
+
+    def test_splice_with_parameters_repl(self) -> None:
+        # Concatenate[int, P] with P -> Parameters[str]: natively spliced
+        # (args + kinds + names concat), the repl's prefix rides in.
+        from mypy.types import Parameters
+
+        ps = self._param_spec()
+        callee = self._splice_callable(ps, [self.fx.a])
+        repl = Parameters([self.fx.str_type], [ARG_POS], [None])
+        env = {ps.id: repl}
+        assert self._engaged(callee, env), "paramspec splice deferred"
+        self._assert_par(callee, env)
+
+    def test_splice_with_paramspec_repl_defers(self) -> None:
+        # P -> Q with a prefix: the splice output embeds clean
+        # Q.args/**Q.kwargs ParamSpecTypes the wire would flatten
+        # (meta_level dropped). Defer to Python (issue #1343).
+        from mypy.types import Parameters
+
+        ps = self._param_spec()
+        repl = ParamSpecType(
+            "Q",
+            "mod.Q",
+            TypeVarId(2),
+            0,
+            self.fx.o,
+            AnyType(TypeOfAny.special_form),
+            prefix=Parameters([self.fx.str_type], [ARG_POS], [None]),
+        )
+        callee = self._splice_callable(ps, [self.fx.a])
+        env = {ps.id: repl}
+        assert not self._engaged(callee, env), "paramspec splice engaged"
+        self._assert_par(callee, env)
+
+    def test_splice_without_repl_defers(self) -> None:
+        # Empty env: the splice arm falls through and the generic path
+        # keeps the occurrences, but the output embeds ParamSpecTypes
+        # the wire cannot round-trip; the kernel defers to Python.
+        ps = self._param_spec()
+        callee = self._splice_callable(ps, [self.fx.a])
+        assert not self._engaged(callee, {}), "occurrence keeper engaged"
+        self._assert_par(callee, {})
+
+    def test_splice_fresh_key_defers(self) -> None:
+        # A fresh (meta level 1) env entry keyed raw_id+namespace masks
+        # the bare key: the kernel defers and Python answers.
+        ps = self._param_spec()
+        fresh = ParamSpecType(
+            "Q", "mod.Q", TypeVarId(ps.id.raw_id, 1), 0, self.fx.o,
+            AnyType(TypeOfAny.special_form),
+        )
+        callee = self._splice_callable(ps, [self.fx.a])
+        env = {fresh.id: self.fx.a}
+        assert not self._engaged(callee, env), "fresh-key splice engaged"
+        self._assert_par(callee, env)
+
+    def test_splice_unpack_repl_defers(self) -> None:
+        # An unpack in the splice result needs Python's
+        # normalize_trivial_unpack (expandtype.py:1173-1176); defer.
+        from mypy.types import Parameters, UnpackType
+
+        ps = self._param_spec()
+        callee = self._splice_callable(ps, [self.fx.a])
+        unpacked = UnpackType(Instance(self.fx.std_tuplei, [self.fx.anyt]))
+        env = {ps.id: Parameters([unpacked], [ARG_STAR], [None])}
+        assert not self._engaged(callee, env), "unpack splice engaged"
+        self._assert_par(callee, env)
+
+    def test_leaf_bare_parameters_repl(self) -> None:
+        # A bare P occurrence expands to the Parameters replacement
+        # (prefix concat, occurrence flavor preserved per Python).
+        from mypy.types import Parameters
+
+        ps = self._param_spec()
+        repl = Parameters([self.fx.str_type], [ARG_POS], [None])
+        env = {ps.id: repl}
+        typ = Instance(self.fx.gi, [ps])
+        assert self._engaged(typ, env), "bare leaf deferred"
+        self._assert_par(typ, env)
+
+    def test_leaf_args_flavor_defers(self) -> None:
+        # An ARGS occurrence with a Parameters replacement rides the
+        # unported _possible_callable_varargs arm; defer -> Python parity.
+        from mypy.types import Parameters
+
+        ps = self._param_spec()
+        env = {ps.id: Parameters([self.fx.str_type], [ARG_POS], [None])}
+        typ = Instance(self.fx.gi, [ps.with_flavor(ParamSpecFlavor.ARGS)])
+        assert not self._engaged(typ, env), "ARGS leaf engaged"
+        self._assert_par(typ, env)
+
+    def test_leaf_missing_env_prefix_defers(self) -> None:
+        # No repl for P: Python's default expands only P's own prefix
+        # and keeps the occurrence, but the output is a ParamSpecType
+        # whose meta_level the wire would flatten; the kernel defers.
+        from mypy.types import Parameters
+
+        ps = ParamSpecType(
+            "P", "mod.P", TypeVarId(1), 0, self.fx.o, AnyType(TypeOfAny.special_form),
+            prefix=Parameters([self.fx.bool_type], [ARG_POS], [None]),
+        )
+        typ = Instance(self.fx.gi, [ps])
+        assert not self._engaged(typ, {}), "prefix-expansion leaf engaged"
+        self._assert_par(typ, {})
 
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
@@ -48149,6 +48353,10 @@ class NativeSolveGenericCallSuite(Suite):
         self._set_active(True)
         self._set_resolver(self.resolver_for(self.fx))
         typeinfo_map = {info.fullname: info for info in self._type_infos(self.fx)}
+        # The wire join echoes actual arg Instances (builtins.str) into
+        # the solution; the _type_infos scan only sees attrs ending in
+        # "i", so the str fixture must be registered explicitly.
+        typeinfo_map[self.fx.str_type_info.fullname] = self.fx.str_type_info
         set_wire_typeinfo_map(typeinfo_map)
         self._callcall_active = _set_native_checkcall_active
         self._callcall_active(True)
@@ -48206,19 +48414,30 @@ class NativeSolveGenericCallSuite(Suite):
         )
 
     def _seam_raw(
-        self, callee: CallableType, arg_types: list[Type], formal_to_actual: list[list[int]]
+        self,
+        callee: CallableType,
+        arg_types: list[Type],
+        formal_to_actual: list[list[int]],
+        arg_kinds: list[Any] | None = None,
+        iterable_type: Any | None = None,
+        mapping_type: Any | None = None,
     ) -> bytes | None:
         from mypy.checkexpr import _serialize_type_for_checkexpr
 
         blobs = [_serialize_type_for_checkexpr(t) for t in arg_types]
+        if arg_kinds is None:
+            arg_kinds = [ARG_POS] * len(arg_types)
         result = _type_kernel.rust_solve_generic_call(
             self.resolver_for(self.fx),
             _serialize_type_for_checkexpr(callee),
             blobs,
+            [int(k.value) for k in arg_kinds],
             formal_to_actual,
             True,
             False,
             True,
+            _serialize_type_for_checkexpr(iterable_type) if iterable_type is not None else None,
+            _serialize_type_for_checkexpr(mapping_type) if mapping_type is not None else None,
         )
         if result is None:
             return None
@@ -48379,6 +48598,282 @@ class NativeSolveGenericCallSuite(Suite):
         assert raw == _serialize_type_for_checkexpr(
             py
         ), f"solve parity: native={raw!r} python={py!r}"
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeStarExpansionSuite(Suite):
+    """Parity for the ArgTypeExpander star-expansion port (piece 1, #1343).
+
+    The sgc / ifta seams previously gated every call that carried a star
+    actual Python-side (checkexpr.py ``any(k.is_star() ...)``). The
+    ArgTypeExpander port (argmap.py:278-432, expanded per (formal,
+    actual) pair at constraints.py:751-758) now decides natively inside
+    rust_solve_generic_call / rust_infer_function_type_arguments, fed
+    the Iterable/Mapping argument-infer context (checkexpr.py:3725-3730)
+    as blobs with the per-actual ArgKind ints and the shared
+    tuple_index / kwargs_used state.
+
+    Differential: each case runs the seam and a pure-Python reference
+    (native constraints + solve gates off) with the same context and
+    asserts equal resolved callables. Direct calls prove which star
+    shapes engage and which still defer (missing context blob,
+    TypedDict key miss, TypedDict **kwargs formal).
+    """
+
+    def setUp(self) -> None:
+        from mypy.checkexpr import (
+            _set_native_checkcall_active,
+            _set_native_checkexpr_active,
+            _set_native_checkexpr_resolver,
+        )
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        self.fx = TypeFixture(INVARIANT)
+        self._set_active = _set_native_checkexpr_active
+        self._set_resolver = _set_native_checkexpr_resolver
+        self._aliases: list[Any] = []
+        self._set_active(True)
+        self._set_resolver(self.resolver_for(self.fx))
+        typeinfo_map = {info.fullname: info for info in self._type_infos(self.fx)}
+        # The wire join echoes actual arg Instances (builtins.str) into
+        # the solution; the _type_infos scan only sees attrs ending in
+        # "i", so the str fixture must be registered explicitly.
+        typeinfo_map[self.fx.str_type_info.fullname] = self.fx.str_type_info
+        set_wire_typeinfo_map(typeinfo_map)
+        self._callcall_active = _set_native_checkcall_active
+        self._callcall_active(True)
+
+    def tearDown(self) -> None:
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        self._set_active(False)
+        self._set_resolver(None)
+        self._callcall_active(False)
+        set_wire_typeinfo_map(None)
+
+    def _type_infos(self, fx: TypeFixture) -> list[TypeInfo]:
+        infos = []
+        for name in dir(fx):
+            if not name.endswith("i"):
+                continue
+            value = getattr(fx, name)
+            if _is_type_info(value):
+                infos.append(value)
+        return infos
+
+    def resolver_for(self, fx: TypeFixture) -> Any:
+        return _type_kernel.build_native_resolver(self._type_infos(fx), [])
+
+    def _generic_t(self) -> Any:
+        return TypeVarType(
+            "T",
+            "mod.T",
+            TypeVarId(1),
+            values=[],
+            upper_bound=self.fx.o,
+            default=AnyType(TypeOfAny.special_form),
+        )
+
+    def _callee_of(self, formals: list[Type], ret: TypeVarType) -> CallableType:
+        return CallableType(
+            formals,
+            [ARG_POS] * len(formals),
+            ["x", "y"][: len(formals)],
+            ret,
+            self.fx.function,
+            variables=[ret],
+        )
+
+    def _seam(
+        self,
+        callee: CallableType,
+        arg_types: list[Type],
+        arg_kinds: list[Any],
+        formal_to_actual: list[list[int]],
+        iterable_ctx: Any | None = None,
+        mapping_ctx: Any | None = None,
+    ) -> Any:
+        from mypy.checkexpr import (
+            _deserialize_type_from_checkexpr,
+            _serialize_type_for_checkexpr,
+        )
+
+        result = _type_kernel.rust_solve_generic_call(
+            self.resolver_for(self.fx),
+            _serialize_type_for_checkexpr(callee),
+            [_serialize_type_for_checkexpr(t) for t in arg_types],
+            [int(k.value) for k in arg_kinds],
+            formal_to_actual,
+            True,
+            False,
+            True,
+            _serialize_type_for_checkexpr(iterable_ctx) if iterable_ctx else None,
+            _serialize_type_for_checkexpr(mapping_ctx) if mapping_ctx else None,
+        )
+        if result is None:
+            return None
+        return _deserialize_type_from_checkexpr(bytes(result))
+
+    def _python_reference(
+        self,
+        callee: CallableType,
+        arg_types: list[Type],
+        arg_kinds: list[Any],
+        formal_to_actual: list[list[int]],
+        iterable_ctx: Any | None = None,
+        mapping_ctx: Any | None = None,
+    ) -> CallableType:
+        from mypy.applytype import apply_generic_arguments
+        from mypy.constraints import _set_native_constraints_active
+        from mypy.infer import ArgumentInferContext, infer_function_type_arguments
+        from mypy.nodes import TempNode
+        from mypy.solve import _set_native_solve_active
+        from mypy.types import TypeOfAny
+
+        _set_native_constraints_active(False)
+        _set_native_solve_active(False)
+        try:
+            ctx = ArgumentInferContext(mapping_ctx, iterable_ctx)  # type: ignore[arg-type]
+            inferred, _ = infer_function_type_arguments(
+                callee, arg_types, arg_kinds, ["x", "y"], formal_to_actual, ctx, strict=True
+            )
+            return apply_generic_arguments(
+                callee,
+                inferred,
+                lambda *a: None,
+                TempNode(AnyType(TypeOfAny.special_form)),
+                skip_unsatisfied=False,
+            )
+        finally:
+            _set_native_constraints_active(True)
+            _set_native_solve_active(True)
+
+    def _assert_star_parity(
+        self,
+        callee: CallableType,
+        arg_types: list[Type],
+        arg_kinds: list[Any],
+        formal_to_actual: list[list[int]],
+        iterable_ctx: Any | None = None,
+        mapping_ctx: Any | None = None,
+    ) -> None:
+        native = self._seam(
+            callee, arg_types, arg_kinds, formal_to_actual, iterable_ctx, mapping_ctx
+        )
+        assert native is not None, f"Rust deferred on {arg_types!r} kinds={arg_kinds!r}"
+        py = self._python_reference(
+            callee, arg_types, arg_kinds, formal_to_actual, iterable_ctx, mapping_ctx
+        )
+        assert str(native) == str(py), f"star parity: native={native} python={py}"
+
+    def test_star_tuple_two_actuals_shared_tuple_index(self) -> None:
+        # Two *x actuals of the same tuple[A, D] feed x and y: the shared
+        # tuple_index state resumes across actuals (argmap.py:379-396),
+        # so the lowers are A then D (T joins to object via the solver).
+        t = self._generic_t()
+        callee = self._callee_of([t, t], t)
+        tup = TupleType([self.fx.a, self.fx.d], self.fx.std_tuple)
+        self._assert_star_parity(callee, [tup, tup], [ARG_STAR, ARG_STAR], [[0], [1]])
+
+    def test_star_iterable_instance_same_args(self) -> None:
+        # *x where x: G[A] against context G[A]: identical-args subtype
+        # decides true, the same-ref map yields args[0] = A
+        # (argmap.py:363-369).
+        t = self._generic_t()
+        callee = self._callee_of([t], t)
+        ctx = Instance(self.fx.gi, [self.fx.a])
+        self._assert_star_parity(callee, [ctx], [ARG_STAR], [[0]], iterable_ctx=ctx)
+
+    def test_star_iterable_instance_not_a_subtype(self) -> None:
+        # *x where x: G[B] against context G[A] (invariant): not a
+        # subtype, so the expander answers the improper-use tail
+        # AnyType(from_error) (argmap.py:370-376, 402).
+        t = self._generic_t()
+        callee = self._callee_of([t], t)
+        actual = Instance(self.fx.gi, [self.fx.b])
+        ctx = Instance(self.fx.gi, [self.fx.a])
+        self._assert_star_parity(callee, [actual], [ARG_STAR], [[0]], iterable_ctx=ctx)
+
+    def test_star_kwargs_typeddict_named_key(self) -> None:
+        # **x where x is a TypedDict feeds the named formal's value type;
+        # kwargs_used records the consumed key (argmap.py:405-416).
+        t = self._generic_t()
+        callee = CallableType(
+            [t],
+            [ARG_NAMED],
+            ["a"],
+            t,
+            self.fx.function,
+            variables=[t],
+        )
+        td = TypedDictType(
+            {"a": self.fx.a}, set(["a"]), set(), Instance(self.fx.ai, [])
+        )
+        self._assert_star_parity(callee, [td], [ARG_STAR2], [[0]])
+
+    def test_star_kwargs_mapping_instance_same_args(self) -> None:
+        # **x where x: H[D, A] against context H[D, A]: subtype decides
+        # true, the mapped args[1] is the value type A
+        # (argmap.py:417-424).
+        t = self._generic_t()
+        callee = self._callee_of([t], t)
+        ctx = Instance(self.fx.hi, [self.fx.d, self.fx.a])
+        self._assert_star_parity(callee, [ctx], [ARG_STAR2], [[0]], mapping_ctx=ctx)
+
+    def test_star_kwargs_mapping_instance_not_a_subtype(self) -> None:
+        # **x where x: G[A] cannot be unpacked with **: the expander
+        # answers AnyType(from_error) (argmap.py:420-424, 428-429).
+        t = self._generic_t()
+        callee = self._callee_of([t], t)
+        actual = Instance(self.fx.gi, [self.fx.a])
+        mapping_ctx = Instance(self.fx.hi, [self.fx.d, self.fx.a])
+        self._assert_star_parity(
+            callee, [actual], [ARG_STAR2], [[0]], mapping_ctx=mapping_ctx
+        )
+
+    def test_star_tvt_upper_bound_shared_tuple_index(self) -> None:
+        # *x where x is a TypeVarTuple with upper_bound tuple[A, D]: the
+        # expander continues with the upper bound (argmap.py:358-362)
+        # and the tuple walk resumes across actuals (x: A, y: D).
+        t = self._generic_t()
+        callee = self._callee_of([t, t], t)
+        tvt = TypeVarTupleType(
+            "Ts",
+            "mod.Ts",
+            TypeVarId(3),
+            upper_bound=TupleType([self.fx.a, self.fx.d], self.fx.std_tuple),
+            tuple_fallback=Instance(self.fx.std_tuplei, [self.fx.anyt]),
+            default=AnyType(TypeOfAny.special_form),
+        )
+        self._assert_star_parity(
+            callee, [tvt, tvt], [ARG_STAR, ARG_STAR], [[0], [1]]
+        )
+
+    def test_missing_iterable_context_defers(self) -> None:
+        # A star Instance actual without an Iterable context blob defers
+        # the whole seam to Python (no context, no guess).
+        t = self._generic_t()
+        callee = self._callee_of([t], t)
+        actual = Instance(self.fx.gi, [self.fx.a])
+        assert (
+            self._seam(callee, [actual], [ARG_STAR], [[0]]) is None
+        ), "missing Iterable context must defer"
+
+    def test_star_kwargs_key_miss_defers(self) -> None:
+        # A TypedDict ** actual whose named formal has no matching item
+        # defers (argmap.py:407-410 unreachable-name tail is checker-side).
+        t = self._generic_t()
+        callee = CallableType(
+            [t],
+            [ARG_NAMED],
+            ["z"],
+            t,
+            self.fx.function,
+            variables=[t],
+        )
+        td = TypedDictType({"a": self.fx.a}, set(["a"]), set(), Instance(self.fx.ai, []))
+        assert self._seam(callee, [td], [ARG_STAR2], [[0]]) is None
+
 
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")

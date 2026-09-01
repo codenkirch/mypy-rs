@@ -733,10 +733,13 @@ pub fn rust_solve_generic_call(
     resolver: &crate::typeinfo::NativeTypeResolver,
     callee_bytes: &[u8],
     arg_types_bytes: Vec<Vec<u8>>,
+    arg_kinds: Vec<i64>,
     formal_to_actual: Vec<Vec<i64>>,
     strict: bool,
     infer_unions: bool,
     strict_optional: bool,
+    iterable_type: Option<Vec<u8>>,
+    mapping_type: Option<Vec<u8>>,
 ) -> Option<Vec<u8>> {
     // Decode the callee.
     let mut buf = crate::wire::ReadBuffer::new(callee_bytes);
@@ -748,7 +751,7 @@ pub fn rust_solve_generic_call(
 
     // Step 1: Normalize (with_unpacked_kwargs + with_normalized_var_args).
     let normalized = normalize_callable(&callee).ok()?;
-    let (formal_arg_types, _formal_arg_kinds, _formal_arg_names, variables) = match &normalized {
+    let (formal_arg_types, formal_arg_kinds, formal_arg_names, variables) = match &normalized {
         Type::CallableType {
             arg_types,
             arg_kinds,
@@ -779,11 +782,25 @@ pub fn rust_solve_generic_call(
         })
         .collect::<Option<Vec<_>>>()?;
 
+    // ArgTypeExpander per-call state shared across all (formal, actual)
+    // pairs, mirroring the single `mapper` instance Python builds
+    // (constraints.py:627) plus its Iterable/Mapping context (checkexpr.py:3725).
+    let mut tuple_index: i64 = 0;
+    let mut kwargs_used: Option<Vec<String>> = None;
+    let iterable_type = iterable_type
+        .as_ref()
+        .and_then(|b| crate::solve::decode_type(b));
+    let mapping_type = mapping_type
+        .as_ref()
+        .and_then(|b| crate::solve::decode_type(b));
+
     for (fi, actual_indices) in formal_to_actual.iter().enumerate() {
         if actual_indices.is_empty() {
             continue;
         }
         let formal_type = formal_arg_types.get(fi)?;
+        let formal_kind = *formal_arg_kinds.get(fi)?;
+        let formal_name = formal_arg_names.get(fi).and_then(|o| o.as_deref());
 
         // Handle UnpackType formals (*args: *Tuple[...], etc.)
         if let Type::UnpackType {
@@ -843,12 +860,30 @@ pub fn rust_solve_generic_call(
                 }
                 t => get_proper_or_none(t)?,
             };
-            // Star actuals (TupleType against `*args`) are gated Python-side
-            // (checkexpr.py `any(k.is_star() ...)`), so a TupleType actual
-            // here is positional; ArgTypeExpander passes it 1:1.
+            // Star actuals (TupleType against `*args`) now expand through
+            // the ArgTypeExpander port (constraints.py:751-758) instead of
+            // being gated Python-side; a positional TupleType rides passthrough.
             if matches!(actual_proper, Type::UninhabitedType { .. }) {
                 return None;
             }
+            let actual_kind = *arg_kinds.get(ai as usize)?;
+            let expanded = crate::solve::expand_actual_arg(
+                &mut tuple_index,
+                &mut kwargs_used,
+                actual_proper,
+                actual_kind,
+                formal_name,
+                formal_kind,
+                // UnpackType formals take the dead star-unpack branch
+                // above (a TVT unpack formal implies a TVT variable,
+                // which defers at the top): allow_unpack is False.
+                false,
+                iterable_type.as_ref(),
+                mapping_type.as_ref(),
+                resolver.alias_resolver(),
+                resolver.resolver(),
+                strict_optional,
+            )?;
             let formal_expanded;
             let formal_proper = match formal_type {
                 Type::TypeAliasType { .. } => {
@@ -862,7 +897,7 @@ pub fn rust_solve_generic_call(
             };
             let constraints = crate::constraints::infer_constraints_full_inner(
                 formal_proper,
-                actual_proper,
+                &expanded,
                 crate::constraints::SUPERTYPE_OF, // mirrors constraints.py:641
                 resolver.resolver(),
                 resolver.alias_resolver(),
@@ -1027,6 +1062,7 @@ fn contains_function_like(t: &Type) -> bool {
         | Type::DeletedType { .. } => false,
     }
 }
+
 /// A solved type-var entry: `(raw_id, meta_level, namespace)` key plus the
 /// substituted type (None when the solver left it unsolved).
 type SolveEntry = ((i64, i64, String), Option<Type>);
@@ -2221,10 +2257,14 @@ mod tests {
                 resolver,
                 &cb.into_bytes(),
                 arg_blobs,
+                // ARG_POS for each actual (plain positional actuals in tests).
+                arg_types.iter().map(|_| 0).collect(),
                 formal_to_actual,
                 true,
                 false,
                 true,
+                None,
+                None,
             )
         })
     }
@@ -2287,12 +2327,16 @@ mod tests {
         let mut two = generic_identity();
         if let Type::CallableType {
             arg_types,
+            ref mut arg_kinds,
             variables,
             ..
         } = &mut two
         {
             let tv = variables[0].clone();
             arg_types.push(tv.clone());
+            // Keep kinds in sync: sgc now consumes formal kinds
+            // (piece-1 star-expansion port).
+            arg_kinds.push(ARG_POS);
             variables.push(tv);
         }
         let out = solve_generic_bytes(
@@ -2315,12 +2359,16 @@ mod tests {
         let mut two = generic_identity();
         if let Type::CallableType {
             arg_types,
+            ref mut arg_kinds,
             variables,
             ..
         } = &mut two
         {
             let tv = variables[0].clone();
             arg_types.push(tv.clone());
+            // Keep kinds in sync: sgc now consumes formal kinds
+            // (piece-1 star-expansion port).
+            arg_kinds.push(ARG_POS);
             variables.push(tv);
         }
         let f = callable(0);

@@ -2270,7 +2270,7 @@ fn visit_callable_native(
 /// `CallableType.param_spec()` (types.py:2696-2712), returning the real
 /// ParamSpecType: flavor forced to BARE and prefix rebuilt as
 /// `Parameters(arg_types[:-2], arg_kinds[:-2], arg_names[:-2])`.
-fn param_spec_of(
+pub(crate) fn param_spec_of(
     arg_types: &[Type],
     arg_kinds: &[i64],
     arg_names: &[Option<String>],
