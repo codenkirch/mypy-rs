@@ -3852,6 +3852,7 @@ try:
         rust_find_self_type_live as _rust_find_self_type_live,
         rust_has_any_from_unimported_type as _rust_has_any_from_unimported_type,
         rust_has_any_from_unimported_type_live as _rust_has_any_from_unimported_type_live,
+        rust_has_any_from_unimported_type_live_noresolver as _rust_has_any_from_unimported_type_live_noresolver,
         rust_has_explicit_any as _rust_has_explicit_any,
         rust_has_explicit_any_live as _rust_has_explicit_any_live,
         rust_instantiate_type_alias as _rust_instantiate_type_alias,
@@ -3873,6 +3874,7 @@ except ImportError:
     _rust_has_explicit_any_live = None  # type: ignore[assignment]
     _rust_has_any_from_unimported_type = None  # type: ignore[assignment]
     _rust_has_any_from_unimported_type_live = None  # type: ignore[assignment]
+    _rust_has_any_from_unimported_type_live_noresolver = None  # type: ignore[assignment]
     _rust_collect_all_inner_types = None  # type: ignore[assignment]
     _rust_collect_all_inner_types_live = None  # type: ignore[assignment]
     _rust_make_optional_type = None  # type: ignore[assignment]
@@ -4315,7 +4317,10 @@ def has_any_from_unimported_type(t: Type) -> bool:
                     _native_typeanal_resolver, _serialize_typeanal_type(t)
                 )
             else:
-                result = _rust_has_any_from_unimported_type(_serialize_typeanal_type(t))
+                # No-resolver window (pre-first-SCC semanal): the byte-only
+                # seam defers on alias-bearing trees and cannot serialize
+                # PlaceholderType, so walk the live objects instead (#1342).
+                result = _rust_has_any_from_unimported_type_live_noresolver(t)
             if result is not None:
                 return result
         except (AssertionError, NotImplementedError):

@@ -1737,6 +1737,12 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         typeanal_queries::rust_has_any_from_unimported_type_live,
         module
     )?)?;
+    // Issue #1342: no-resolver variant for the pre-first-SCC semanal
+    // window; live-object walk shared with rust_find_self_type.
+    module.add_function(wrap_pyfunction!(
+        typeanal_queries::rust_has_any_from_unimported_type_live_noresolver,
+        module
+    )?)?;
     module.add_function(wrap_pyfunction!(
         typeanal_queries::rust_collect_all_inner_types_live,
         module

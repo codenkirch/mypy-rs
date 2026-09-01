@@ -7380,7 +7380,6 @@ class NativeCtorBlobPureSuite(Suite):
         set_wire_typeinfo_map({info.fullname: info for info in type_infos})
 
     def tearDown(self) -> None:
-        from mypy.typeops import _set_native_typeops_active, _set_native_typeops_resolver
         from mypy.wirefixup import set_wire_typeinfo_map
 
         self._set_active(False)
@@ -7389,7 +7388,7 @@ class NativeCtorBlobPureSuite(Suite):
 
     def test_blob_building_makes_no_totf_or_mts_seam_calls(self) -> None:
         from mypy.build import _native_ctor_blob
-        from mypy.nodes import Block, FuncDef, MDEF, SymbolTableNode
+        from mypy.nodes import MDEF, Block, FuncDef, SymbolTableNode
 
         info = self.fx.make_type_info("mod.BlobPure")
         # A metaclass fallback avoids the stdlib typeinfo lookup, which
@@ -16644,6 +16643,11 @@ class NativeTypeanalAliasQuerySuite(Suite):
     the gate-off (pure Python) and gate-on (Rust) paths and asserts they
     agree; direct seam calls prove the live path engages where the byte
     seam defers.
+
+    The `test_hafu_window_*` tests simulate the no-resolver semanal window
+    (issue #1342): gate-on runs with NO resolver installed, so the shim
+    routes through the live no-resolver seam, which must decide alias-,
+    placeholder-, and unbound-bearing trees that the byte seams defer on.
     """
 
     def setUp(self) -> None:
@@ -16842,6 +16846,118 @@ class NativeTypeanalAliasQuerySuite(Suite):
         actual, expected = self._par(unknown_unpack, t)
         assert_equal(actual, expected)
         assert actual is False
+
+    def _par_noresolver(self, fn: Any, t: Type) -> tuple[Any, Any]:
+        # Gate-on with NO resolver installed: the pre-first-SCC semanal
+        # window (#1342) routes has_any_from_unimported_type through the
+        # live no-resolver seam; gate-off runs the pure-Python visitor.
+        from mypy.typeanal import _set_native_typeanal_active, _set_native_typeanal_resolver
+
+        _set_native_typeanal_active(False)
+        expected = fn(t)
+        _set_native_typeanal_active(True)
+        _set_native_typeanal_resolver(None)
+        try:
+            actual = fn(t)
+        finally:
+            _set_native_typeanal_resolver(self.resolver)
+        return actual, expected
+
+    def _assert_hafu_window(self, t: Type, expected: bool) -> None:
+        from type_kernel import rust_has_any_from_unimported_type_live_noresolver
+
+        from mypy.typeanal import has_any_from_unimported_type
+
+        seam = rust_has_any_from_unimported_type_live_noresolver(t)
+        assert seam is expected, f"no-resolver seam deferred on {t!r}"
+        actual, exp = self._par_noresolver(has_any_from_unimported_type, t)
+        assert_equal(actual, exp)
+        assert actual is expected
+
+    def test_hafu_window_alias_to_unimported(self) -> None:
+        alias = self._make_alias("mod.UnimportedAlias", AnyType(TypeOfAny.from_unimported_type))
+        self._install_aliases([alias])
+        self._assert_hafu_window(TypeAliasType(alias, []), True)
+
+    def test_hafu_window_alias_to_explicit(self) -> None:
+        alias = self._make_alias("mod.ExplicitAlias", AnyType(TypeOfAny.explicit))
+        self._install_aliases([alias])
+        self._assert_hafu_window(TypeAliasType(alias, []), False)
+
+    def test_hafu_window_alias_nested_in_instance(self) -> None:
+        alias = self._make_alias("mod.ListAlias", AnyType(TypeOfAny.from_unimported_type))
+        self._install_aliases([alias])
+        t = Instance(self.fx.std_listi, [TypeAliasType(alias, [])])
+        self._assert_hafu_window(t, True)
+
+    def test_hafu_window_alias_substituted_tvar(self) -> None:
+        from mypy.nodes import TypeAlias
+
+        alias = TypeAlias(
+            Instance(self.fx.std_listi, [self.fx.t]),
+            "mod.G",
+            "mod",
+            1,
+            1,
+            alias_tvars=[self.fx.t],
+        )
+        t = TypeAliasType(alias, [AnyType(TypeOfAny.from_unimported_type)])
+        self._assert_hafu_window(t, True)
+
+    def test_hafu_window_alias_recursive(self) -> None:
+        alias = self._make_alias("mod.RecAlias", self.fx.b)
+        alias.target = Instance(self.fx.std_listi, [TypeAliasType(alias, [])])
+        self._install_aliases([alias])
+        self._assert_hafu_window(TypeAliasType(alias, []), False)
+
+    def test_hafu_window_alias_py312_args_tail(self) -> None:
+        from mypy.nodes import TypeAlias
+
+        # Unused alias tvar: the visitor still queries t.args for
+        # new-style aliases after the expansion found nothing.
+        alias = TypeAlias(
+            self.fx.o,
+            "mod.Y312",
+            "mod",
+            1,
+            1,
+            alias_tvars=[self.fx.t],
+            python_3_12_type_alias=True,
+        )
+        t = TypeAliasType(alias, [AnyType(TypeOfAny.from_unimported_type)])
+        self._assert_hafu_window(t, True)
+
+    def test_hafu_window_alias_py312_plain_args(self) -> None:
+        from mypy.nodes import TypeAlias
+
+        # Expansion found nothing and the args carry no unimported Any.
+        alias = TypeAlias(
+            self.fx.o,
+            "mod.P312",
+            "mod",
+            1,
+            1,
+            alias_tvars=[self.fx.t],
+            python_3_12_type_alias=True,
+        )
+        t = TypeAliasType(alias, [AnyType(TypeOfAny.explicit)])
+        self._assert_hafu_window(t, False)
+
+    def test_hafu_window_placeholder_type(self) -> None:
+        from mypy.types import PlaceholderType
+
+        t = PlaceholderType(
+            "mod.ph", [AnyType(TypeOfAny.from_unimported_type)], line=-1
+        )
+        self._assert_hafu_window(t, True)
+        self._assert_hafu_window(PlaceholderType("mod.ph", [], line=-1), False)
+
+    def test_hafu_window_unbound_args(self) -> None:
+        # HasAnyFromUnimportedType never resolves unbound names: the
+        # default visit queries t.args only.
+        t = UnboundType("Undefined", [AnyType(TypeOfAny.from_unimported_type)])
+        self._assert_hafu_window(t, True)
+        self._assert_hafu_window(UnboundType("Undefined"), False)
 
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
@@ -26232,8 +26348,11 @@ class NativeConditionalTypesSuite(Suite):
         # A variadic proposed type: the erased instance carries one arg per
         # defn.type_vars slot (2), not per arg (3), with the TVT slot
         # becoming Unpack(tuple[Any]) (typevartuples.py:28-35).
-        from mypy.checker import _serialize_type_for_checker, _serialize_type_ranges
-        from mypy.checker import conditional_types
+        from mypy.checker import (
+            _serialize_type_for_checker,
+            _serialize_type_ranges,
+            conditional_types,
+        )
 
         current = self.fx.str_type
         three = [self.fx.o, self.fx.o, self.fx.o]

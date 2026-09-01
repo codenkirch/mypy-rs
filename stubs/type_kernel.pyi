@@ -124,6 +124,7 @@ __all__ = [
     "rust_unknown_unpack",
     "rust_has_explicit_any_live",
     "rust_has_any_from_unimported_type_live",
+    "rust_has_any_from_unimported_type_live_noresolver",
     "rust_collect_all_inner_types_live",
     "rust_make_optional_type_live",
     "rust_unknown_unpack_live",
@@ -730,6 +731,7 @@ def rust_has_explicit_any_live(resolver: NativeTypeResolver, type_bytes: bytes) 
 def rust_has_any_from_unimported_type_live(
     resolver: NativeTypeResolver, type_bytes: bytes
 ) -> bool | None: ...
+def rust_has_any_from_unimported_type_live_noresolver(typ: Any) -> bool | None: ...
 def rust_collect_all_inner_types_live(
     resolver: NativeTypeResolver, type_bytes: bytes
 ) -> list[bytes] | None: ...
