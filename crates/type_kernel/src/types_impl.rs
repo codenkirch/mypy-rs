@@ -543,6 +543,7 @@ fn bool_value_is_true(value: &crate::wire::LiteralValue) -> bool {
     use crate::wire::LiteralValue;
     match value {
         LiteralValue::Int(i) => *i != 0,
+        LiteralValue::BigInt(i) => !i.is_zero(),
         LiteralValue::Str(s) => !s.is_empty(),
         LiteralValue::Bytes(b) => !b.is_empty(),
         LiteralValue::Bool(b) => *b,

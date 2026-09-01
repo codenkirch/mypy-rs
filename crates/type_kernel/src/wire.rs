@@ -227,11 +227,20 @@ pub(crate) fn read_short_int(buf: &mut ReadBuffer<'_>, first: u8) -> Result<i64,
 /// then a short-int encoding `(size << 1) | sign`, then `size` bytes of
 /// little-endian unsigned magnitude.
 fn read_long_int(buf: &mut ReadBuffer<'_>) -> Result<i64, WireError> {
+    let big = read_long_int_big(buf)?;
+    // Non-literal int fields (lengths, ids, kinds) are bounded far below
+    // i64 in every real serialized tree, so an overflow here is corrupt
+    // input: fail fast instead of silently wrapping.
+    i64::try_from(big).map_err(|_| WireError::invalid("int exceeds i64 range"))
+}
+
+/// Read an arbitrary-precision long-int into a `BigInt`. The encoded
+/// magnitude is unbounded, so this is the primitive shared by
+/// `read_long_int` (i64 fail-fast for non-literal fields) and the
+/// literal reader, which carries the full value (issue #1329).
+fn read_long_int_big(buf: &mut ReadBuffer<'_>) -> Result<BigInt, WireError> {
     // Short-int encoding: (size << 1) | sign.
     // read_short_int returns raw value, so we extract directly:
-
-    // sign = size_and_sign & 1
-    //   size = size_and_sign >> 1
     let first = buf.read_u8()?;
     let size_and_sign = read_short_int(buf, first)?;
     if size_and_sign < 0 {
@@ -240,16 +249,7 @@ fn read_long_int(buf: &mut ReadBuffer<'_>) -> Result<i64, WireError> {
     let sign = size_and_sign & 1;
     let size = (size_and_sign >> 1) as usize;
     let magnitude_bytes = buf.read_slice(size)?;
-    // Reconstruct little-endian unsigned magnitude.
-    let mut value: i128 = 0;
-    for &b in magnitude_bytes.iter().rev() {
-        value = (value << 8) | (b as i128);
-    }
-    let signed = if sign == 1 { -value } else { value };
-    // Stage 3a only supports values that fit in i64 (the test corpus does not
-    // use arbitrary-precision literals in serialized Types). Larger values
-    // would require a BigInt; we return an error rather than silently wrap.
-    i64::try_from(signed).map_err(|_| WireError::invalid("int exceeds i64 range"))
+    Ok(BigInt::from_le_bytes(magnitude_bytes, sign == 1))
 }
 
 /// Read a bare integer (the librt `read_int` / `read_int_bare` primitive).
@@ -416,6 +416,129 @@ fn read_flags(buf: &mut ReadBuffer<'_>, num_flags: usize) -> Result<Vec<bool>, W
     Ok(out)
 }
 
+/// An arbitrary-precision signed integer, carried by `LiteralValue` for
+/// literal ints whose magnitude exceeds i64 (issue #1329). Canonical form:
+/// little-endian magnitude with no leading (trailing) zero bytes; the value
+/// 0 is an empty magnitude with `neg == false`. `PartialEq`/`Eq`/`Hash` are
+/// therefore value-equality on the canonical form.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct BigInt {
+    neg: bool,
+    magnitude: Vec<u8>,
+}
+
+impl BigInt {
+    /// Build from raw little-endian unsigned magnitude bytes plus a sign,
+    /// normalizing zero and any non-canonical leading zero bytes (the
+    /// C writer never emits them, but defensive parity is cheap).
+    fn from_le_bytes(bytes: &[u8], neg: bool) -> BigInt {
+        let mut magnitude = bytes.to_vec();
+        while let Some(&0) = magnitude.last() {
+            magnitude.pop();
+        }
+        BigInt {
+            neg: neg && !magnitude.is_empty(),
+            magnitude,
+        }
+    }
+
+    pub(crate) fn is_zero(&self) -> bool {
+        self.magnitude.is_empty()
+    }
+
+    /// Narrow to i64 when the value fits; `None` otherwise.
+    fn to_i64(&self) -> Option<i64> {
+        if self.magnitude.len() > 8 {
+            return None;
+        }
+        let mut value: u128 = 0;
+        for &b in self.magnitude.iter().rev() {
+            value = (value << 8) | (b as u128);
+        }
+        if self.neg {
+            if value <= (i64::MAX as u128) + 1 {
+                Some(-(value as i128) as i64)
+            } else {
+                None
+            }
+        } else if value <= i64::MAX as u128 {
+            Some(value as i64)
+        } else {
+            None
+        }
+    }
+
+    /// Magnitude for the wire writer: at least one byte, matching the C
+    /// writer's `[0]` byte for value 0 and canonical minimal LE otherwise.
+    fn wire_magnitude(&self) -> Vec<u8> {
+        if self.magnitude.is_empty() {
+            vec![0]
+        } else {
+            self.magnitude.clone()
+        }
+    }
+
+    /// Decimal digits, most significant first. Mirrors `str(int)` in
+    /// Python (`LiteralValue::Display` renders int literals as decimal).
+    fn decimal_digits(&self) -> Vec<u8> {
+        const CHUNK: u128 = 10_000_000_000_000_000_000; // 10^19
+        let mut work = self.magnitude.clone();
+        let mut chunks: Vec<u128> = Vec::new();
+        while !work.is_empty() {
+            chunks.push(divmod_in_place(&mut work, CHUNK));
+        }
+        if chunks.is_empty() {
+            return vec![b'0'];
+        }
+        let mut digits = Vec::new();
+        let mut last = chunks.len() - 1;
+        digits.extend_from_slice(chunks[last].to_string().as_bytes());
+        while last > 0 {
+            last -= 1;
+            // Zero-pad each lower chunk to the full 19 digits.
+            let text = chunks[last].to_string();
+            digits.extend(std::iter::repeat_n(b'0', 19 - text.len()));
+            digits.extend_from_slice(text.as_bytes());
+        }
+        digits
+    }
+}
+
+impl fmt::Display for BigInt {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.neg && !self.is_zero() {
+            write!(f, "-")?;
+        }
+        for d in self.decimal_digits() {
+            write!(f, "{}", d as char)?;
+        }
+        Ok(())
+    }
+}
+
+impl TryFrom<BigInt> for i64 {
+    type Error = ();
+
+    fn try_from(big: BigInt) -> Result<i64, ()> {
+        big.to_i64().ok_or(())
+    }
+}
+
+/// Divide a little-endian magnitude by `divisor` in place, returning the
+/// remainder. Schoolbook short division, most significant byte first.
+fn divmod_in_place(magnitude: &mut Vec<u8>, divisor: u128) -> u128 {
+    let mut carry: u128 = 0;
+    for byte in magnitude.iter_mut().rev() {
+        carry = (carry << 8) | (*byte as u128);
+        *byte = (carry / divisor) as u8;
+        carry %= divisor;
+    }
+    while let Some(&0) = magnitude.last() {
+        magnitude.pop();
+    }
+    carry
+}
+
 /// A literal value as stored by `write_literal` (cache.py:347-364): the tag
 /// byte is already consumed by the caller (it was the discriminator), and
 /// this reads the body.
@@ -423,6 +546,10 @@ fn read_flags(buf: &mut ReadBuffer<'_>, num_flags: usize) -> Result<Vec<bool>, W
 #[allow(dead_code)]
 pub(crate) enum LiteralValue {
     Int(i64),
+    /// Int literal whose magnitude exceeds i64 (issue #1329). Small ints
+    /// stay in `Int(i64)`; the variant a value takes is a pure function of
+    /// the value, so same-value equality never crosses variants.
+    BigInt(BigInt),
     Str(String),
     Bytes(Vec<u8>),
     Bool(bool),
@@ -431,13 +558,28 @@ pub(crate) enum LiteralValue {
 
 fn read_literal(buf: &mut ReadBuffer<'_>, tag: u8) -> Result<LiteralValue, WireError> {
     match tag {
-        LITERAL_INT => Ok(LiteralValue::Int(read_int_bare(buf)?)),
+        LITERAL_INT => Ok(read_int_literal(buf)?),
         LITERAL_STR => Ok(LiteralValue::Str(read_str_bare(buf)?)),
         LITERAL_BYTES => Ok(LiteralValue::Bytes(read_bytes_bare(buf)?)),
         LITERAL_FALSE => Ok(LiteralValue::Bool(false)),
         LITERAL_TRUE => Ok(LiteralValue::Bool(true)),
         LITERAL_FLOAT => Ok(LiteralValue::Float(read_float_bare(buf)?)),
         _ => Err(WireError::invalid(format!("unknown literal tag {tag}"))),
+    }
+}
+
+/// Read an `LITERAL_INT` body: a short int when the value fits i64 (the
+/// overwhelmingly common case, kept on the zero-alloc `Int(i64)` path) and
+/// a `BigInt` long int otherwise (issue #1329).
+fn read_int_literal(buf: &mut ReadBuffer<'_>) -> Result<LiteralValue, WireError> {
+    let first = buf.read_u8()?;
+    if first != LONG_INT_TRAILER {
+        return Ok(LiteralValue::Int(read_short_int(buf, first)?));
+    }
+    let big = read_long_int_big(buf)?;
+    match i64::try_from(big.clone()) {
+        Ok(v) => Ok(LiteralValue::Int(v)),
+        Err(_) => Ok(LiteralValue::BigInt(big)),
     }
 }
 
@@ -1188,6 +1330,7 @@ impl fmt::Display for LiteralValue {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             LiteralValue::Int(v) => write!(f, "{v}"),
+            LiteralValue::BigInt(v) => write!(f, "{v}"),
             // Mirror Python `repr(str)`: single-quoted unless the string
             // contains a single quote (then double-quoted). Rust's `{:?}`
             // always double-quotes, so we replicate Python's preference here.
@@ -1798,7 +1941,6 @@ pub(crate) fn write_int_bare(buf: &mut WriteBuffer, value: i64) -> Result<(), Wi
         // Long-int form (LONG_INT_TRAILER): sentinel, then a short-int
         // size_and_sign header (size << 1 | sign), then LE magnitude bytes.
         // Mirrors `_write_long_int` (librt_internal.c:764-827).
-        buf.push(LONG_INT_TRAILER);
         let neg = value < 0;
         let mut magnitude = (value as i128).unsigned_abs();
         let mut bytes = Vec::new();
@@ -1809,10 +1951,28 @@ pub(crate) fn write_int_bare(buf: &mut WriteBuffer, value: i64) -> Result<(), Wi
             bytes.push((magnitude & 0xFF) as u8);
             magnitude >>= 8;
         }
-        let size_and_sign = ((bytes.len() as i64) << 1) | if neg { 1 } else { 0 };
-        write_int_bare(buf, size_and_sign)?;
-        buf.extend(&bytes);
+        return write_long_int_bytes(buf, &bytes, neg);
     }
+    Ok(())
+}
+
+/// Emit the long-int encoding (sentinel, header, magnitude) for a
+/// little-endian unsigned magnitude. The header is written as a short int,
+/// exactly like `_write_long_int`; a magnitude whose size header would
+/// exceed `MAX_FOUR_BYTES_INT` raises the same "int too long to
+/// serialize" error as the C writer (librt_internal.c:813-816).
+fn write_long_int_bytes(
+    buf: &mut WriteBuffer,
+    magnitude: &[u8],
+    neg: bool,
+) -> Result<(), WireError> {
+    let size_and_sign = ((magnitude.len() as i64) << 1) | if neg { 1 } else { 0 };
+    if size_and_sign > MAX_FOUR_BYTES_INT {
+        return Err(WireError::invalid("int too long to serialize"));
+    }
+    buf.push(LONG_INT_TRAILER);
+    write_int_bare(buf, size_and_sign)?;
+    buf.extend(magnitude);
     Ok(())
 }
 
@@ -1896,6 +2056,10 @@ fn write_literal_value(buf: &mut WriteBuffer, value: &LiteralValue) -> Result<()
         LiteralValue::Int(i) => {
             write_tag(buf, LITERAL_INT);
             write_int_bare(buf, *i)
+        }
+        LiteralValue::BigInt(big) => {
+            write_tag(buf, LITERAL_INT);
+            write_long_int_bytes(buf, &big.wire_magnitude(), big.neg)
         }
         LiteralValue::Str(s) => {
             write_tag(buf, LITERAL_STR);
@@ -2546,6 +2710,128 @@ mod tests {
         assert_eq!(round_trip_int(-10001), -10001);
         assert_eq!(round_trip_int(1_000_000), 1_000_000);
         assert_eq!(round_trip_int(-1_000_000), -1_000_000);
+    }
+
+    // ----- Big-int literals (issue #1329) -----
+
+    /// Serialize a `BigInt` literal through the production writer path and
+    /// read it back through `read_int_literal`.
+    fn round_trip_big(value: &BigInt) -> BigInt {
+        let mut buf = WriteBuffer::new();
+        write_literal_value(&mut buf, &LiteralValue::BigInt(value.clone())).unwrap();
+        let bytes = buf.into_bytes();
+        let mut rb = ReadBuffer::new(&bytes);
+        let tag = read_tag(&mut rb).unwrap();
+        match read_literal(&mut rb, tag).unwrap() {
+            LiteralValue::BigInt(b) => b,
+            other => panic!("expected BigInt variant, got {other:?}"),
+        }
+    }
+
+    /// LE magnitude bytes of a u128 value (test helper).
+    fn decimal_from_u128(v: u128) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut x = v;
+        if x == 0 {
+            out.push(0);
+        }
+        while x > 0 {
+            out.push((x & 0xFF) as u8);
+            x >>= 8;
+        }
+        out
+    }
+
+    #[test]
+    fn big_int_round_trips_beyond_i64() {
+        // 2**80 is the issue's regression value: well beyond i64 in both
+        // directions.
+        let pos = BigInt::from_le_bytes(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1], false);
+        let neg = BigInt::from_le_bytes(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1], true);
+        assert_eq!(pos.to_string(), "1208925819614629174706176");
+        assert_eq!(neg.to_string(), "-1208925819614629174706176");
+        assert_eq!(round_trip_big(&pos), pos);
+        assert_eq!(round_trip_big(&neg), neg);
+        // Wider magnitudes, including a >i128-scale value.
+        let huge = BigInt::from_le_bytes(
+            &(0..25).map(|i| (i * 17 + 3) as u8).collect::<Vec<u8>>(),
+            false,
+        );
+        assert_eq!(round_trip_big(&huge), huge);
+        // Zero is canonical: empty magnitude, and decodes as the i64 variant.
+        assert_eq!(
+            write_read_literal_value(LiteralValue::BigInt(BigInt {
+                neg: false,
+                magnitude: vec![]
+            })),
+            LiteralValue::Int(0)
+        );
+    }
+
+    #[test]
+    fn big_int_decimal_digits_chunk_padding() {
+        // Chunk boundary at 10**19: lower chunks must zero-pad to 19 digits.
+        let mag = decimal_from_u128(10_u128.pow(19) + 5);
+        let big = BigInt::from_le_bytes(&mag, false);
+        assert_eq!(big.to_string(), "10000000000000000005");
+        let all_nines = BigInt::from_le_bytes(&decimal_from_u128(u128::MAX), false);
+        assert_eq!(all_nines.to_string(), u128::MAX.to_string());
+        // Negative zero is canonical zero.
+        let zero = BigInt::from_le_bytes(&[0u8, 0], true);
+        assert_eq!(zero.to_string(), "0");
+    }
+
+    #[test]
+    fn big_int_canonical_equality() {
+        // Leading zero bytes in the magnitude must not affect equality.
+        let a = BigInt::from_le_bytes(&[0x42], false);
+        let b = BigInt::from_le_bytes(&[0x42, 0x00, 0x00], false);
+        assert_eq!(a, b);
+        let neg_zero = BigInt::from_le_bytes(&[0x00], true);
+        assert!(neg_zero.is_zero());
+        assert_eq!(
+            neg_zero,
+            BigInt {
+                neg: false,
+                magnitude: vec![]
+            }
+        );
+    }
+
+    #[test]
+    fn small_int_literal_keeps_i64_variant() {
+        // A long-int-encoded value that still fits i64 (e.g. 10**12, which
+        // the C writer emits in long form) must decode as `Int`, not
+        // `BigInt`: the variant is a pure function of the value.
+        let decoded = write_read_literal_value(LiteralValue::Int(1_000_000_000_000));
+        assert_eq!(decoded, LiteralValue::Int(1_000_000_000_000));
+
+        // i64 extremes through the same path.
+        for edge in [i64::MAX, i64::MIN, 117, -10000] {
+            let decoded = write_read_literal_value(LiteralValue::Int(edge));
+            assert_eq!(decoded, LiteralValue::Int(edge), "edge {edge}");
+        }
+    }
+
+    /// Tagged-literal round-trip through the production writer + reader.
+    fn write_read_literal_value(value: LiteralValue) -> LiteralValue {
+        let mut buf = WriteBuffer::new();
+        write_literal_value(&mut buf, &value).unwrap();
+        let bytes = buf.into_bytes();
+        let mut rb = ReadBuffer::new(&bytes);
+        let tag = read_tag(&mut rb).unwrap();
+        read_literal(&mut rb, tag).unwrap()
+    }
+
+    #[test]
+    fn long_int_header_cap_mirrors_c_writer() {
+        // A magnitude of 268_435_456 bytes makes the size header exceed
+        // MAX_FOUR_BYTES_INT; the C writer raises ValueError there
+        // (librt_internal.c:813-816), so the Rust writer must error too.
+        let huge = vec![0xAB; 268_435_456];
+        let mut buf = WriteBuffer::new();
+        let err = write_long_int_bytes(&mut buf, &huge, false);
+        assert!(matches!(err, Err(WireError::Invalid(_))));
     }
 
     // ----- Truncation -----

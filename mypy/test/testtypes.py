@@ -1713,6 +1713,20 @@ class NativeTypeWireSuite(Suite):
         self.assert_wire_par(self.fx.lit2)
         self.assert_wire_par(self.fx.lit4)
 
+    def test_literal_big_int(self) -> None:
+        # Python ints beyond i64 must survive the wire reader (issue #1329).
+        # Each `assert_wire_par` serializes with the Python writer (librt
+        # long-int encoding) and reads back in Rust.
+        int_type = Instance(self.fx.make_type_info("builtins.int"), [])
+        self.assert_wire_par(LiteralType(2**80, int_type))
+        self.assert_wire_par(LiteralType(-(2**80), int_type))
+        self.assert_wire_par(LiteralType(2**130, int_type))
+        self.assert_wire_par(
+            UnionType(
+                [LiteralType(2**80, int_type), NoneType(), self.fx.str_type]
+            )
+        )
+
     def test_literal_str(self) -> None:
         self.assert_wire_par(self.fx.lit_str1)
         self.assert_wire_par(self.fx.lit_str2)
@@ -7732,6 +7746,26 @@ class NativeTryGettingLiteralSuite(Suite):
         result = self._with_gate(True, lambda: try_getting_literal(self.fx.lit_str1_inst))
         assert_equal(str(result), "Literal['x']")
         self._assert_engages(self.fx.lit_str1_inst)
+
+    def test_unwraps_big_int_last_known_value(self) -> None:
+        # int(2**80) exceeds i64: the wire long-int encoding must survive
+        # both directions of the live seam (issue #1329); the Python shim
+        # decodes the Rust-written blob, so this is a full round-trip.
+        from mypy.checkexpr import try_getting_literal
+
+        int_type = Instance(self.fx.make_type_info("builtins.int"), [])
+        big = 2**80
+        inst = Instance(int_type.type, [], last_known_value=LiteralType(big, int_type))
+        self._assert_par(inst)
+        result = self._with_gate(True, lambda: try_getting_literal(inst))
+        assert_equal(str(result), f"Literal[{big}]")
+        self._assert_engages(inst)
+
+        neg = -(2**80)
+        inst = Instance(int_type.type, [], last_known_value=LiteralType(neg, int_type))
+        self._assert_par(inst)
+        result = self._with_gate(True, lambda: try_getting_literal(inst))
+        assert_equal(str(result), f"Literal[{neg}]")
 
     def test_plain_instance_unchanged(self) -> None:
         from mypy.checkexpr import try_getting_literal
