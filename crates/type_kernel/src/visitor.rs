@@ -334,6 +334,7 @@ pub(crate) fn is_literal_type_inner(
 fn literal_value_matches(value: &LiteralValue, kind: &str, payload: &str) -> bool {
     match (kind, value) {
         ("int", LiteralValue::Int(v)) => v.to_string() == payload,
+        ("int", LiteralValue::BigInt(v)) => v.to_string() == payload,
         ("str", LiteralValue::Str(s)) => s == payload,
         ("bytes", LiteralValue::Bytes(b)) => {
             // Encode bytes as latin-1 string for transport.
