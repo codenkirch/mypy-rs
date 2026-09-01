@@ -51,7 +51,13 @@ Discovered during the waves, not yet fixed:
   need a subtype-callback channel, same wall as #1260; ndt
   ovl-disjoint/ovl-pair need Python overload context; oc buckets all
   SKIP by prior decision).
-- #1281 (open): join_type_list round 3 (74 @ 28%).
+- #1281 (closed 2026-09-01): join_type_list round 3. No-action verdict
+  (see the #1266 entry below); first blocker for any revisit is #1335
+  (filed from the audit, below).
+- #1335 (filed): rru lkv survivor rule diverges from Python when the
+  dedup item has no last_known_value (remove_redundant.rs
+  find_subtype_index vs typeops.py:1432-1442; setops.rs has the correct
+  formulation). Differential probe reproduces it; fix first.
 
 ## Residual ranking (survey17, post-wave16, `/tmp/survey17.txt`)
 
@@ -76,7 +82,7 @@ Total 5,155,526 seam calls. By absolute fallbacks (calls x (1 - native%)):
 - analyze_instance_member_access 335 @ 34% (~221; #1309 wave17)
 - map_instance_to_supertype 5,521 @ 96% (~221)
 - infer_constraints_full 21,459 @ 99% (~214)
-- join_instances 316 @ 36% (~202; #1281-adjacent)
+- join_instances 316 @ 36% (~202; #1281 closed, no active issue owns it)
 - conditional_types 8,959 @ 98% (~179; subtype-callback wall on #1298)
 - remove_redundant_union_items 5,831 @ 97% (~174)
 - get_type_vars 1,894 @ 91% (~170)
@@ -126,6 +132,32 @@ Closed not-planned with evidence (negative results, the loop working):
   with `ValueError: invalid bool value`); audit instrumentation is
   env-gated and stripped pre-commit; a clobbered shared `.so` is the
   first suspect for END_TAG/bool asserts in parity runs.
+- **#1281** (join_type_list round 3): CLOSED 2026-09-01, not-planned
+  (wave27 Lane B, branch `audit/join-r3-w27b` at e5a369c8d). The three
+  residual walls (lkv 39, join_instances_core-declined pairs 9,
+  arg_disc-4 4; 0.001% of the survey12 corpus) all fail the
+  composition bar:
+  - lkv 39: guard-drop requires the union dedup and callable-combine
+    arms to be lkv-complete. The audit found the already-shipped lkv
+    survivor rule in `find_subtype_index` (remove_redundant.rs:236-252)
+    diverges from typeops.py:1432-1442 when the dedup item has no lkv:
+    Python collapses `[I(A,lkv=1), I(A)]` to `[A]` via pass 2; the
+    production `rust_remove_redundant_union_items` seam keeps
+    `[Literal[1]?]` (gate-off vs gate-on differential, fresh .so from
+    HEAD). setops.rs:3565-3585 implements the rule correctly, so the
+    two Rust copies disagree with each other. Filed as **#1335**; a
+    port would need that fix, a dedup-implementation unification, an
+    audit of the can_be_true/can_be_false survivor restore
+    (typeops.py:1443-1455; wire Instance carries no flags, see
+    `_has_mutated_truthiness` typeops.py:164-186), and a full
+    differential, all for 39 defers.
+  - declined pairs 9: both-generic combine_similar_callables shapes;
+    `TypeVarId.new` is a global counter Rust cannot replicate without
+    breaking wire-equal `CallableType.__eq__` parity (mypy/join.py:188,
+    joinfns.rs:150). Structural wall.
+  - arg_disc-4 4: shim pick (mypy/join.py:615-629) has no plain
+    AnyType operand; fixing means a new wire-emitting path for the
+    SameTypeWithArgs arm. Adjacent cleanup on #1280.
 
 ## Open backlog (next waves; dispatch max ~2 port agents)
 
@@ -141,9 +173,7 @@ Closed not-planned with evidence (negative results, the loop working):
 4. **#342**: analyze_class_attribute_access mega-port (owns the
    member_access CallableType/Overloaded tail; audit-first).
 5. **#1280**: disc-4 helper convergence (cleanup PR, not a port).
-6. **#1281**: join_type_list round 3 (74 @ 28%); join_instances 316 @
-   36% is adjacent.
-7. Next-wave queue (file issues with fresh survey17 numbers, then
+6. Next-wave queue (file issues with fresh survey17 numbers, then
    dispatch ~2): solve_generic_call ~246, expand_and_bind_callable
    ~222, map_instance_to_supertype ~221, remove_redundant_union_items
    ~174, get_type_vars ~170, has_any_from_unimported_type ~156,
