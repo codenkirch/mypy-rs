@@ -219,11 +219,31 @@ fn encode_fallback_key(t: &Type) -> Option<Vec<u8>> {
     Some(buf.into_bytes())
 }
 
+/// The survivor rule of `_remove_redundant_union_items` (typeops.py:1420-1428):
+/// a kept Instance with a `last_known_value` removes `ti` only when `ti` is an
+/// Instance carrying the same lkv; a plain `ti` is never removed (issue #1335).
+pub(crate) fn lkv_blocks_removal(tj: &Type, ti: &Type) -> bool {
+    let tj_lkv = match tj {
+        Type::Instance {
+            last_known_value: Some(lkv),
+            ..
+        } => lkv.as_ref(),
+        _ => return false,
+    };
+    let ti_lkv = match ti {
+        Type::Instance {
+            last_known_value, ..
+        } => last_known_value.as_deref(),
+        _ => None,
+    };
+    ti_lkv != Some(tj_lkv)
+}
+
 /// The subtype scan against the surviving items (typeops.py:1429-1448).
 /// Returns the position in `surv` of the first survivor that is a proper
-/// supertype of `ti`, skipping any survivor with a `last_known_value`
-/// differing from `ti`'s. Deferred when the subtype engine cannot decide
-/// a pair.
+/// supertype of `ti`, skipping any survivor whose `last_known_value`
+/// blocks the removal (see `lkv_blocks_removal`). Deferred when the
+/// subtype engine cannot decide a pair.
 fn find_subtype_index(
     items: &[Type],
     surv: &[usize],
@@ -238,22 +258,8 @@ fn find_subtype_index(
         if matches!(tj, Type::ErasedType) {
             continue;
         }
-        if let Type::Instance {
-            last_known_value: Some(tj_lkv),
-            ..
-        } = tj
-        {
-            if let Type::Instance {
-                last_known_value: Some(ti_lkv),
-                ..
-            } = ti
-            {
-                // A previous instance carrying a differing literal value
-                // is not a supertype of this item (typeops.py:1432-1442).
-                if ti_lkv != tj_lkv {
-                    continue;
-                }
-            }
+        if lkv_blocks_removal(tj, ti) {
+            continue;
         }
         match is_subtype(ti, tj, ctx, resolver) {
             Some(true) => return ScanOutcome::Found(j),
@@ -424,6 +430,52 @@ mod tests {
         let l2 = literal(2, fb);
         let out = dedup(&[l1, l2], false).unwrap();
         assert_eq!(out.len(), 2);
+    }
+
+    fn lkv_instance(type_ref: &str, value: i64) -> Type {
+        let fallback = instance(type_ref, vec![]);
+        Type::Instance {
+            type_ref: type_ref.to_string(),
+            args: vec![],
+            // mypy Instance.last_known_value holds the LiteralType.
+            last_known_value: Some(Box::new(literal(value, fallback))),
+            extra_attrs: None,
+        }
+    }
+
+    #[test]
+    fn lkv_item_then_plain_collapses_to_plain() {
+        // typeops.py:1420-1428: an Instance with a last_known_value must
+        // not remove a plain Instance of the same class (ti has no lkv);
+        // pass 1 keeps both, the reversed pass 2 drops the lkv item.
+        let lkv = lkv_instance("builtins.int", 1);
+        let plain = instance("builtins.int", vec![]);
+        let out = dedup(&[lkv, plain], false).unwrap();
+        assert_eq!(out.len(), 1);
+        assert!(matches!(
+            &out[0],
+            Type::Instance {
+                last_known_value: None,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn plain_then_lkv_collapses_to_plain() {
+        // Same rule, second ordering: the plain instance survives, the
+        // lkv item is a subtype of it and drops in pass 1.
+        let plain = instance("builtins.int", vec![]);
+        let lkv = lkv_instance("builtins.int", 1);
+        let out = dedup(&[plain, lkv], false).unwrap();
+        assert_eq!(out.len(), 1);
+        assert!(matches!(
+            &out[0],
+            Type::Instance {
+                last_known_value: None,
+                ..
+            }
+        ));
     }
 
     #[test]

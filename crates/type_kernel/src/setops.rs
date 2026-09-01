@@ -3561,25 +3561,11 @@ fn remove_redundant_union_items(
             }
             let mut duplicate_index = None;
             for (j, tj) in new_items.iter().enumerate() {
-                // An Instance with a last_known_value never removes
-                // another item, unless it is an Instance with the same
-                // last_known_value (typeops.py:878-890). Without this,
-
-                // `Literal[1]? | Literal[2]?` collapses to `Literal[1]?`.
-                if let Type::Instance {
-                    last_known_value: Some(tj_lkv),
-                    ..
-                } = tj
-                {
-                    let ti_lkv = match &ti {
-                        Type::Instance {
-                            last_known_value, ..
-                        } => last_known_value.as_deref(),
-                        _ => None,
-                    };
-                    if ti_lkv != Some(tj_lkv.as_ref()) {
-                        continue;
-                    }
+                // An Instance with a last_known_value never removes another
+                // item unless it carries the same lkv (typeops.py:878-890),
+                // shared with remove_redundant.rs (issue #1335).
+                if crate::remove_redundant::lkv_blocks_removal(tj, &ti) {
+                    continue;
                 }
                 if is_subtype(&ti, tj, &dedup_ctx, resolver)? {
                     duplicate_index = Some(j);
