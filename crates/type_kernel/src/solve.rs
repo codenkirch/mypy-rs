@@ -1671,7 +1671,12 @@ pub(crate) fn rust_infer_function_type_arguments(
     strict_optional: bool,
 ) -> Option<Vec<u8>> {
     let mut buf = ReadBuffer::new(callee_bytes);
-    let callee = wire::read_type(&mut buf, None).ok()?;
+    let callee = match wire::read_type(&mut buf, None) {
+        Ok(t) => t,
+        Err(_) => {
+            return None;
+        }
+    };
     let Type::CallableType {
         arg_types: formal_types,
         arg_kinds: formal_kinds,
@@ -1680,7 +1685,9 @@ pub(crate) fn rust_infer_function_type_arguments(
         ..
     } = &callee
     else {
-        return None;
+        {
+            return None;
+        };
     };
     // ParamSpec/TypeVarTuple variables use the deferred constraint paths
     // (constraints.py:475-494, filter_imprecise_kinds): defer.
@@ -1690,14 +1697,18 @@ pub(crate) fn rust_infer_function_type_arguments(
             Type::ParamSpecType { .. } | Type::TypeVarTupleType { .. }
         )
     }) {
-        return None;
+        {
+            return None;
+        };
     }
     // UnpackType formals use the star-unpack branch (constraints.py:388-438): defer.
     if formal_types
         .iter()
         .any(|t| matches!(t, Type::UnpackType { .. }))
     {
-        return None;
+        {
+            return None;
+        };
     }
     let vars_types = variables.clone();
     let mut arg_types_vec: Vec<Option<Type>> = Vec::with_capacity(arg_types.len());
@@ -1706,7 +1717,12 @@ pub(crate) fn rust_infer_function_type_arguments(
             None => arg_types_vec.push(None),
             Some(b2) => {
                 let mut b3 = ReadBuffer::new(b2);
-                arg_types_vec.push(Some(wire::read_type(&mut b3, None).ok()?));
+                match wire::read_type(&mut b3, None) {
+                    Ok(t) => arg_types_vec.push(Some(t)),
+                    Err(_) => {
+                        return None;
+                    }
+                }
             }
         }
     }
@@ -1722,8 +1738,13 @@ pub(crate) fn rust_infer_function_type_arguments(
                 Some(Some(t)) => t,
                 _ => continue, // None actual (deferred pass) or OOB.
             };
-            let actual_kind = *arg_kinds.get(ai as usize)?;
-            let expanded = expand_actual_arg(
+            let actual_kind = match arg_kinds.get(ai as usize) {
+                Some(k) => *k,
+                None => {
+                    return None;
+                }
+            };
+            let expanded = match expand_actual_arg(
                 &mut tuple_index,
                 &mut kwargs_used,
                 actual_arg,
@@ -1731,8 +1752,13 @@ pub(crate) fn rust_infer_function_type_arguments(
                 formal_name,
                 formal_kind,
                 resolver.alias_resolver(),
-            )?;
-            constraints.extend(crate::constraints::infer_constraints_full_inner(
+            ) {
+                Some(e) => e,
+                None => {
+                    return None;
+                }
+            };
+            let icr = crate::constraints::infer_constraints_full_inner(
                 formal_type,
                 &expanded,
                 crate::constraints::SUPERTYPE_OF,
@@ -1743,13 +1769,14 @@ pub(crate) fn rust_infer_function_type_arguments(
                 false,
                 // Python `infer_constraints` wrapper default (constraints.py:802).
                 true,
-            )?);
+            );
+            constraints.extend(icr?);
         }
     }
     // Empty constraints fall through to `solve_constraints_native`:
     // Python has no fast path either; its empty-cmap fill yields strict
     // Never / lax Any defaults per variable, which native solve mirrors.
-    let (sol_blob, _free_blob) = solve_constraints_native(
+    let (sol_blob, _free_blob) = match solve_constraints_native(
         &vars_types,
         &vars_types,
         &constraints,
@@ -1758,11 +1785,20 @@ pub(crate) fn rust_infer_function_type_arguments(
         strict_optional,
         false,
         resolver,
-    )
-    .ok()?;
+    ) {
+        Ok(s) => s,
+        Err(_) => {
+            return None;
+        }
+    };
     // Re-encode in `variables` order as an optional-type list. The Python
     // shim decodes this with `read_int` + `read_type` (count per var).
-    let solutions = decode_solve_solutions_here(&sol_blob)?;
+    let solutions = match decode_solve_solutions_here(&sol_blob) {
+        Some(s) => s,
+        None => {
+            return None;
+        }
+    };
     let tvids: Vec<TvId> = vars_types
         .iter()
         .map(|t| tv_id(t).ok_or(()))

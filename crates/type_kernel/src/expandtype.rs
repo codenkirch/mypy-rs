@@ -238,7 +238,12 @@ pub(crate) fn expand_type_with_env_inner(
     if is_leaf_type(typ) {
         return Some(typ.clone());
     }
-    let expanded = expand_type_inner(typ, env, strict_optional)?;
+    let expanded = match expand_type_inner(typ, env, strict_optional) {
+        Some(t) => t,
+        None => {
+            return None;
+        }
+    };
     if !allow_free && !relink_ok && result_has_typevar(&expanded) {
         return None;
     }
