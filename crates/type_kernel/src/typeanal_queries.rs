@@ -28,6 +28,9 @@
 //! Live-object queries (Stage 18):
 //! - `find_self_type` — BoolTypeQuery with lookup callback, checks SELF_TYPE_NAMES.
 //!   `TypeAliasType` expands through the alias snapshot (issue #1157).
+//! - `has_any_from_unimported_type` no-resolver variant — same live walk
+//!   for the pre-first-SCC semanal window (issue #1342); the AnyType leaf
+//!   compares `type_of_any` and UnboundType keeps the default args query.
 //! - `check_vec_type_args` — vec type argument validation.
 //! - `is_typevar_default_recursive` — BFS over `default_depends` graph.
 //! - `detect_diverging_alias` — DivergingAliasDetector visitor.
@@ -158,6 +161,41 @@ pub(crate) fn rust_has_any_from_unimported_type_live(
             resolver.alias_resolver(),
         )),
         None => Ok(None),
+    }
+}
+
+/// No-resolver `rust_has_any_from_unimported_type` (issue #1342): during
+/// the pre-first-SCC semanal window the shim has no resolver installed, so
+/// the byte-only seam would defer on every alias-bearing tree. This seam
+/// reuses the live-object walk behind `rust_find_self_type` (issue #1311)
+/// with a query mode that mirrors `HasAnyFromUnimportedType` instead of
+/// `HasSelfType`: the AnyType leaf compares `type_of_any` against the
+/// `from_unimported_type` constant, UnboundType keeps the default args
+/// query (no symbol lookup), TypedDict short-circuits to False, and the
+/// remaining BoolTypeQuery defaults (PlaceholderType args, CallableArgument
+/// typ, Partial/Erased as False leaves) decide. A `TypeAliasType` expands
+/// over live objects. Any unreadable fact or unhandled kind defers
+/// (`None`) to the pure-Python visitor.
+#[pyfunction]
+pub(crate) fn rust_has_any_from_unimported_type_live_noresolver(
+    py: Python<'_>,
+    typ: &PyAny,
+) -> PyResult<Option<bool>> {
+    let refs = match TypeRefs::try_new(py) {
+        Ok(r) => r,
+        Err(_) => return Ok(None),
+    };
+    let mut ctx = SelfTypeCtx {
+        refs: &refs,
+        lookup: &SelfLookup::None,
+        aliases: None,
+        seen_aliases: Vec::new(),
+        subst: Vec::new(),
+        kind: QueryKind::HasUnimportedAny,
+    };
+    match find_self_type_inner(py, typ, &mut ctx) {
+        Ok(b) => Ok(Some(b)),
+        Err(DeferError) => Ok(None),
     }
 }
 
@@ -679,6 +717,7 @@ pub(crate) fn rust_find_self_type(
     let mut ctx = SelfTypeCtx {
         refs: &refs,
         lookup: &SelfLookup::Py(lookup),
+        kind: QueryKind::FindSelf,
         aliases: None,
         seen_aliases: Vec::new(),
         subst: Vec::new(),
@@ -708,6 +747,7 @@ pub(crate) fn rust_find_self_type_live(
     let mut ctx = SelfTypeCtx {
         refs: &refs,
         lookup: &SelfLookup::Py(lookup),
+        kind: QueryKind::FindSelf,
         aliases: Some(resolver.alias_resolver()),
         seen_aliases: Vec::new(),
         subst: Vec::new(),
@@ -729,9 +769,22 @@ fn run_find_self_type(
 #[derive(Debug, PartialEq)]
 pub(crate) struct DeferError;
 
+/// Which live BoolTypeQuery a `SelfTypeCtx` walk mirrors. The shared walk
+/// keeps `HasSelfType` (#1311) and `HasAnyFromUnimportedType` (#1342)
+/// arm-for-arm; only the mode branches below differ.
+#[derive(Clone, Copy, PartialEq)]
+enum QueryKind {
+    /// `HasSelfType`: unbound names resolve through the lookup callback.
+    FindSelf,
+    /// `HasAnyFromUnimportedType`: AnyType leaf compares `type_of_any`.
+    HasUnimportedAny,
+}
+
 struct SelfTypeCtx<'a> {
     refs: &'a TypeRefs<'a>,
     lookup: &'a SelfLookup<'a>,
+    /// Which query this walk mirrors (see `QueryKind`).
+    kind: QueryKind,
     /// Alias snapshots for the resolver-backed `TypeAliasType` expansion;
     /// `None` (the pre-first-SCC semanal window) takes the live expansion.
     aliases: Option<&'a TypeAliasResolver>,
@@ -745,8 +798,11 @@ struct SelfTypeCtx<'a> {
 
 /// `HasSelfType.lookup` shim: the production seam takes a live Python
 /// callable; the cfg(test) unit tests use a plain name-to-fullname table.
+/// `None` marks a query without a lookup callback (HasAnyFromUnimportedType
+/// never resolves unbound names).
 enum SelfLookup<'a> {
     Py(&'a PyAny),
+    None,
     #[cfg(test)]
     Table(std::collections::HashMap<String, String>),
 }
@@ -772,6 +828,7 @@ impl SelfLookup<'_> {
             }
             #[cfg(test)]
             SelfLookup::Table(table) => Ok(table.get(name).cloned()),
+            SelfLookup::None => Ok(None),
         }
     }
 }
@@ -786,8 +843,14 @@ fn find_self_type_inner(
     obj: &PyAny,
     ctx: &mut SelfTypeCtx<'_>,
 ) -> Result<bool, DeferError> {
-    // UnboundType: lookup name, check SELF_TYPE_NAMES, then descend args.
+    // UnboundType: HasSelfType looks the name up and checks
+    // SELF_TYPE_NAMES; HasAnyFromUnimportedType keeps the default
+    // BoolTypeQuery visit (query_types(t.args), no symbol lookup).
     if class_name_is(obj, "UnboundType") {
+        if matches!(ctx.kind, QueryKind::HasUnimportedAny) {
+            let args = get_attr_or_defer(obj, "args")?;
+            return self_type_any_seq(py, args, ctx);
+        }
         return self_type_visit_unbound(py, obj, ctx);
     }
     // TypeVar-like types: query the Python child lists (issue #1122),
@@ -843,8 +906,15 @@ fn find_self_type_inner(
         let default = get_attr_or_defer(obj, "default")?;
         return find_self_type_inner(py, default, ctx);
     }
-    // AnyType: no Self type.
+    // AnyType: HasSelfType has no Self type; HasAnyFromUnimportedType
+    // compares the int `type_of_any` against the constant
+    // (TypeOfAny is a plain class of Final ints, not an Enum).
     if is_instance(obj, ctx.refs.any_type) {
+        if matches!(ctx.kind, QueryKind::HasUnimportedAny) {
+            let toa = obj.getattr("type_of_any").map_err(|_| DeferError)?;
+            let v: i64 = toa.extract().map_err(|_| DeferError)?;
+            return Ok(v == FROM_UNIMPORTED_TYPE);
+        }
         return Ok(false);
     }
     // NoneType, UninhabitedType, DeletedType, LiteralType: no children.
@@ -860,9 +930,12 @@ fn find_self_type_inner(
         let typ = get_attr_or_defer(obj, "type")?;
         return find_self_type_inner(py, typ, ctx);
     }
-    // Instance: recurse into args + last_known_value.
+    // Instance: recurse into args; HasSelfType also probes
+    // last_known_value, HasAnyFromUnimportedType mirrors
+    // BoolTypeQuery.visit_instance (args only).
     if is_instance(obj, ctx.refs.instance) {
-        return self_type_any_children(py, obj, &["args"], ctx, true);
+        let check_lkv = matches!(ctx.kind, QueryKind::FindSelf);
+        return self_type_any_children(py, obj, &["args"], ctx, check_lkv);
     }
     // CallableType: recurse arg_types, ret_type, instance_type.
     if is_instance(obj, ctx.refs.callable_type) {
@@ -884,7 +957,12 @@ fn find_self_type_inner(
     }
     // TypedDictType: recurse items values only (visit_typeddict_type in
     // type_visitor.py does not descend into the fallback; #1122).
+    // HasAnyFromUnimportedType overrides visit_typeddict_type to False
+    // (a TypedDict is checked during its own declaration, not here).
     if is_instance(obj, ctx.refs.typed_dict_type) {
+        if matches!(ctx.kind, QueryKind::HasUnimportedAny) {
+            return Ok(false);
+        }
         let items = get_attr_or_defer(obj, "items")?;
         let dict: &PyDict = items.downcast().map_err(|_| DeferError)?;
         for (_, v) in dict.iter() {
@@ -906,9 +984,11 @@ fn find_self_type_inner(
     }
     // TypeAliasType: expand through the alias snapshot (issue #1157);
     // with no snapshot (the pre-first-SCC semanal window) take the live
-    // expansion instead (see self_type_visit_alias_live).
+    // expansion instead (see self_type_visit_alias_live). The snapshot
+    // path's wire walk answers HasSelfType semantics, so HAFU mode
+    // always takes the live expansion.
     if is_instance(obj, ctx.refs.type_alias_type) {
-        if ctx.aliases.is_some() {
+        if ctx.aliases.is_some() && matches!(ctx.kind, QueryKind::FindSelf) {
             return self_type_visit_alias(py, obj, ctx);
         }
         return self_type_visit_alias_live(py, obj, ctx);
@@ -931,6 +1011,24 @@ fn find_self_type_inner(
     // RawExpressionType: strategy([]) -> False (invalid type literals).
     if class_name_is(obj, "RawExpressionType") {
         return Ok(false);
+    }
+    // HAFU-only kinds (HasSelfType defers on them as unknown): the
+    // HasAnyFromUnimportedType BoolTypeQuery defaults are defined.
+    if matches!(ctx.kind, QueryKind::HasUnimportedAny) {
+        if class_name_is(obj, "PlaceholderType") {
+            // visit_placeholder_type: query_types(t.args).
+            let args = get_attr_or_defer(obj, "args")?;
+            return self_type_any_seq(py, args, ctx);
+        }
+        if class_name_is(obj, "CallableArgument") {
+            // visit_callable_argument: t.typ.accept(self).
+            let typ = get_attr_or_defer(obj, "typ")?;
+            return find_self_type_inner(py, typ, ctx);
+        }
+        if class_name_is(obj, "PartialType") || class_name_is(obj, "ErasedType") {
+            // Leaf defaults: strategy([]) -> False.
+            return Ok(false);
+        }
     }
     // Unknown type variant: defer.
     Err(DeferError)
