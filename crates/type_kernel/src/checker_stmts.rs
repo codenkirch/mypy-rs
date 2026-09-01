@@ -587,7 +587,7 @@ fn invalid_inferred_children(typ: &Type) -> Vec<&Type> {
     let mut out = Vec::new();
     match typ {
         Type::UnboundType { args, .. } => out.extend(args.iter()),
-        Type::UnpackType { typ } => out.push(typ),
+        Type::UnpackType { typ, .. } => out.push(typ),
         Type::Instance {
             args,
             last_known_value,
@@ -1410,6 +1410,9 @@ mod tests {
             uses_pep604_syntax: false,
             can_be_true: true,
             can_be_false: true,
+            is_evaluated: true,
+            original_str_expr: None,
+            original_str_fallback: None,
         };
         let types = try_handler_union_inner(&t, true);
         assert_eq!(types.len(), 2);
@@ -1422,6 +1425,9 @@ mod tests {
             uses_pep604_syntax: false,
             can_be_true: true,
             can_be_false: true,
+            is_evaluated: true,
+            original_str_expr: None,
+            original_str_fallback: None,
         };
         let types_strict = try_handler_union_inner(&t, true);
         assert_eq!(types_strict.len(), 2);
@@ -1462,6 +1468,9 @@ mod tests {
             uses_pep604_syntax: false,
             can_be_true: true,
             can_be_false: true,
+            is_evaluated: true,
+            original_str_expr: None,
+            original_str_fallback: None,
         };
         let types = try_handler_union_inner(&t, true);
         assert_eq!(
@@ -1522,6 +1531,9 @@ mod tests {
             uses_pep604_syntax: false,
             can_be_true: true,
             can_be_false: true,
+            is_evaluated: true,
+            original_str_expr: None,
+            original_str_fallback: None,
         };
         assert_eq!(
             try_handler_union_inner(&t, true),
@@ -1593,6 +1605,9 @@ mod tests {
             uses_pep604_syntax: false,
             can_be_true: true,
             can_be_false: true,
+            is_evaluated: true,
+            original_str_expr: None,
+            original_str_fallback: None,
         };
         assert_eq!(
             is_valid_inferred_type_inner(&t, false, false, false),
@@ -1619,6 +1634,9 @@ mod tests {
             uses_pep604_syntax: false,
             can_be_true: true,
             can_be_false: true,
+            is_evaluated: true,
+            original_str_expr: None,
+            original_str_fallback: None,
         };
         assert_eq!(
             is_valid_inferred_type_inner(&t, false, false, false),
@@ -1739,6 +1757,9 @@ mod tests {
             uses_pep604_syntax: false,
             can_be_true: true,
             can_be_false: true,
+            is_evaluated: true,
+            original_str_expr: None,
+            original_str_fallback: None,
         };
         let mut seen: Vec<String> = Vec::new();
         assert_eq!(
@@ -1936,6 +1957,7 @@ mod tests {
             variables: Vec::new(),
             type_guard: None,
             type_is: None,
+            special_sig: None,
         };
         assert_eq!(
             is_valid_inferred_type_inner(&t, false, false, false),
@@ -1999,6 +2021,7 @@ mod tests {
             variables: vec![],
             type_guard: None,
             type_is: None,
+            special_sig: None,
         }
     }
 

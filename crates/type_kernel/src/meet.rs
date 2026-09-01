@@ -912,7 +912,7 @@ fn expand_tuple_if_possible(tup: &Type, target: usize) -> Option<Type> {
             new_items.push(it.clone());
             continue;
         }
-        let Type::UnpackType { typ } = it else {
+        let Type::UnpackType { typ, .. } = it else {
             unreachable!()
         };
         let unpacked = get_proper(typ)?;
@@ -971,7 +971,7 @@ fn tuple_fallback(t: &Type, res: &TypeResolver) -> Option<Type> {
             items.push(item.clone());
             continue;
         }
-        let Type::UnpackType { typ } = item else {
+        let Type::UnpackType { typ, .. } = item else {
             unreachable!()
         };
         let unpacked = match get_proper(typ)? {
@@ -1948,6 +1948,9 @@ mod tests {
             uses_pep604_syntax: false,
             can_be_true: true,
             can_be_false: true,
+            is_evaluated: true,
+            original_str_expr: None,
+            original_str_fallback: None,
         };
         let out = narrow_rec(&n, &instance("builtins.int"), true, None, &r).unwrap();
         assert!(matches!(out, Type::Instance { ref type_ref, .. } if type_ref == "builtins.int"));
@@ -2083,6 +2086,9 @@ mod tests {
             uses_pep604_syntax: false,
             can_be_true: true,
             can_be_false: true,
+            is_evaluated: true,
+            original_str_expr: None,
+            original_str_fallback: None,
         };
         aliases.insert("mod.U".to_string(), alias_snap("mod.U", &target));
         let alias = alias_ref("mod.U");

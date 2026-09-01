@@ -673,9 +673,17 @@ pub(crate) enum Type {
         args: Vec<Type>,
         original_str_expr: Option<String>,
         original_str_fallback: Option<String>,
+        // Plain data mypy.types carries but the wire never serializes
+        // (Phase F0, #1349): the reader fills Python defaults, the
+        // writer never emits them. See doc/f0_coverage.md.
+        optional: bool,
+        empty_tuple_index: bool,
     },
     UnpackType {
         typ: Box<Type>,
+        /// `UnboundType.from_star_syntax` on the unpacked target side; see
+        /// the plain-data note on `UnboundType`.
+        from_star_syntax: bool,
     },
     AnyType {
         type_of_any: i64,
@@ -710,6 +718,10 @@ pub(crate) enum Type {
         variables: Vec<Type>,
         type_guard: Option<Box<Type>>,
         type_is: Option<Box<Type>>,
+        /// `CallableType.special_sig` ("tuple" or None) — plain data the
+        /// Python class carries but the wire format never serializes; see
+        /// the plain-data note on `UnboundType`.
+        special_sig: Option<String>,
     },
     Overloaded {
         items: Vec<Type>,
@@ -735,6 +747,11 @@ pub(crate) enum Type {
         uses_pep604_syntax: bool,
         can_be_true: bool,
         can_be_false: bool,
+        // Plain-data fields `mypy.types.UnionType` carries but the wire
+        // format does not serialize (Phase F0, #1349). Rust-resident only.
+        is_evaluated: bool,
+        original_str_expr: Option<String>,
+        original_str_fallback: Option<String>,
     },
     TypeType {
         item: Box<Type>,
@@ -1032,6 +1049,10 @@ fn read_unbound_type(buf: &mut ReadBuffer<'_>) -> Result<Type, WireError> {
         args,
         original_str_expr,
         original_str_fallback,
+        // Plain-data fields the wire format does not carry (Phase F0,
+        // #1349): fill from defaults so Rust-side trees still model them.
+        optional: false,
+        empty_tuple_index: false,
     })
 }
 
@@ -1039,7 +1060,11 @@ fn read_unbound_type(buf: &mut ReadBuffer<'_>) -> Result<Type, WireError> {
 fn read_unpack_type(buf: &mut ReadBuffer<'_>) -> Result<Type, WireError> {
     let typ = read_type(buf, None)?;
     expect_end_tag(buf)?;
-    Ok(Type::UnpackType { typ: Box::new(typ) })
+    Ok(Type::UnpackType {
+        typ: Box::new(typ),
+        // Wire format does not carry `from_star_syntax` (Phase F0, #1349).
+        from_star_syntax: false,
+    })
 }
 
 /// Read an `AnyType` (tag already consumed).
@@ -1144,6 +1169,8 @@ fn read_callable_type(buf: &mut ReadBuffer<'_>) -> Result<Type, WireError> {
         variables,
         type_guard: type_guard.map(Box::new),
         type_is: type_is.map(Box::new),
+        // Wire format does not carry `special_sig` (Phase F0, #1349).
+        special_sig: None,
     })
 }
 
@@ -1249,6 +1276,11 @@ fn read_union_type(buf: &mut ReadBuffer<'_>) -> Result<Type, WireError> {
         uses_pep604_syntax,
         can_be_true,
         can_be_false,
+        // Plain-data fields the wire format does not carry (Phase F0,
+        // #1349): fill from defaults so Rust-side trees still model them.
+        is_evaluated: true,
+        original_str_expr: None,
+        original_str_fallback: None,
     })
 }
 
@@ -1436,7 +1468,7 @@ impl fmt::Display for Type {
                 }
                 Ok(())
             }
-            Type::UnpackType { typ } => write!(f, "*{typ}"),
+            Type::UnpackType { typ, .. } => write!(f, "*{typ}"),
             Type::LiteralType { value, .. } => write!(f, "Literal[{value}]"),
             Type::TypeAliasType { args, .. } => {
                 // The wire format carries `type_ref: String` but no resolved
@@ -2294,9 +2326,12 @@ pub(crate) fn write_type(buf: &mut WriteBuffer, t: &Type) -> Result<(), WireErro
             variables,
             type_guard,
             type_is,
+            ..
         } => {
             write_tag(buf, CALLABLE_TYPE);
             // fallback is always an Instance (Python asserts the tag).
+            // `special_sig` is Rust-resident only (Phase F0, #1349); the
+            // wire format matches `CallableType.write` in types.py.
             write_type(buf, fallback)?;
             write_type_opt(buf, instance_type.as_deref())?;
             write_flags(
@@ -2333,8 +2368,12 @@ pub(crate) fn write_type(buf: &mut WriteBuffer, t: &Type) -> Result<(), WireErro
             uses_pep604_syntax,
             can_be_true,
             can_be_false,
+            ..
         } => {
             write_tag(buf, UNION_TYPE);
+            // `is_evaluated` / `original_str_*` are Rust-resident only
+            // (Phase F0, #1349); the wire format matches
+            // `UnionType.write` in types.py.
             write_type_list(buf, items)?;
             write_bool(buf, *uses_pep604_syntax);
             // Truthiness flags (cache wire layout >= 11): must mirror
@@ -2470,8 +2509,10 @@ pub(crate) fn write_type(buf: &mut WriteBuffer, t: &Type) -> Result<(), WireErro
             write_tag(buf, END_TAG);
             Ok(())
         }
-        Type::UnpackType { typ } => {
+        Type::UnpackType { typ, .. } => {
             write_tag(buf, UNPACK_TYPE);
+            // `from_star_syntax` is Rust-resident only (Phase F0, #1349);
+            // the wire format matches `UnpackType.write` in types.py.
             write_type(buf, typ)?;
             write_tag(buf, END_TAG);
             Ok(())
@@ -2492,8 +2533,12 @@ pub(crate) fn write_type(buf: &mut WriteBuffer, t: &Type) -> Result<(), WireErro
             args,
             original_str_expr,
             original_str_fallback,
+            ..
         } => {
             write_tag(buf, UNBOUND_TYPE);
+            // `optional` / `empty_tuple_index` are Rust-resident only
+            // (Phase F0, #1349); the wire format matches
+            // `UnboundType.write` in types.py.
             write_str(buf, name)?;
             write_type_list(buf, args)?;
             write_str_opt(buf, original_str_expr.as_deref())?;
@@ -3181,6 +3226,7 @@ mod tests {
             variables: Vec::new(),
             type_guard: None,
             type_is: None,
+            special_sig: None,
         };
         assert_eq!(round_trip(&t), t);
     }
@@ -3232,6 +3278,7 @@ mod tests {
             variables: Vec::new(),
             type_guard: None,
             type_is: None,
+            special_sig: None,
         };
         assert_eq!(round_trip(&t), t);
     }
@@ -3275,5 +3322,204 @@ mod tests {
         let mut rbuf = ReadBuffer::new(&bytes);
         let back = read_type(&mut rbuf, None).expect("ParamSpecType must round-trip");
         assert!(matches!(back, Type::ParamSpecType { .. }));
+    }
+
+    // ----- Phase F0 (#1349): Rust-resident plain-data fields -----
+    // Wire never serializes these (writer arms match types.py *.write);
+    // readers fill the Python class defaults. See doc/f0_coverage.md.
+
+    fn f0_minimal_instance() -> Type {
+        Type::Instance {
+            type_ref: "builtins.int".to_string(),
+            args: Vec::new(),
+            last_known_value: None,
+            extra_attrs: None,
+        }
+    }
+
+    fn f0_unbound(name: &str, optional: bool, empty_tuple_index: bool) -> Type {
+        Type::UnboundType {
+            name: name.to_string(),
+            args: Vec::new(),
+            original_str_expr: None,
+            original_str_fallback: None,
+            optional,
+            empty_tuple_index,
+        }
+    }
+
+    #[test]
+    fn f0_unbound_type_reader_fills_defaults() {
+        let back = round_trip(&f0_unbound("A", false, false));
+        match back {
+            Type::UnboundType {
+                optional,
+                empty_tuple_index,
+                ..
+            } => {
+                assert!(!optional);
+                assert!(!empty_tuple_index);
+            }
+            _ => panic!("expected UnboundType"),
+        }
+    }
+
+    #[test]
+    fn f0_unbound_type_nondefault_fields_are_wire_dropped() {
+        let back = round_trip(&f0_unbound("A", true, true));
+        match back {
+            Type::UnboundType {
+                optional,
+                empty_tuple_index,
+                ..
+            } => {
+                // Wire bytes carry no representation for these fields, so
+                // the reader re-derives the Python defaults.
+                assert!(!optional);
+                assert!(!empty_tuple_index);
+            }
+            _ => panic!("expected UnboundType"),
+        }
+    }
+
+    #[test]
+    fn f0_unpack_type_reader_fills_from_star_syntax_default() {
+        let t = Type::UnpackType {
+            typ: Box::new(f0_minimal_instance()),
+            from_star_syntax: false,
+        };
+        match round_trip(&t) {
+            Type::UnpackType {
+                from_star_syntax, ..
+            } => assert!(!from_star_syntax),
+            _ => panic!("expected UnpackType"),
+        }
+    }
+
+    #[test]
+    fn f0_unpack_type_nondefault_field_is_wire_dropped() {
+        let t = Type::UnpackType {
+            typ: Box::new(f0_minimal_instance()),
+            from_star_syntax: true,
+        };
+        match round_trip(&t) {
+            Type::UnpackType {
+                from_star_syntax, ..
+            } => {
+                // Encodes the PEP 695 star syntax side flag only; not
+                // serializable on the current wire layout.
+                assert!(!from_star_syntax);
+            }
+            _ => panic!("expected UnpackType"),
+        }
+    }
+
+    #[test]
+    fn f0_callable_type_reader_fills_special_sig_default() {
+        let t = Type::CallableType {
+            fallback: Box::new(Type::Instance {
+                type_ref: "builtins.function".to_string(),
+                args: Vec::new(),
+                last_known_value: None,
+                extra_attrs: None,
+            }),
+            instance_type: None,
+            is_ellipsis_args: false,
+            implicit: false,
+            is_bound: false,
+            from_concatenate: false,
+            imprecise_arg_kinds: false,
+            unpack_kwargs: false,
+            from_type_type: false,
+            arg_types: Vec::new(),
+            arg_kinds: Vec::new(),
+            arg_names: Vec::new(),
+            ret_type: Box::new(Type::NoneType),
+            name: None,
+            variables: Vec::new(),
+            type_guard: None,
+            type_is: None,
+            special_sig: None,
+        };
+        match round_trip(&t) {
+            Type::CallableType { special_sig, .. } => assert_eq!(special_sig, None),
+            _ => panic!("expected CallableType"),
+        }
+    }
+
+    #[test]
+    fn f0_union_type_reader_fills_defaults() {
+        let t = Type::UnionType {
+            items: vec![f0_minimal_instance()],
+            uses_pep604_syntax: false,
+            can_be_true: true,
+            can_be_false: true,
+            is_evaluated: true,
+            original_str_expr: None,
+            original_str_fallback: None,
+        };
+        match round_trip(&t) {
+            Type::UnionType {
+                is_evaluated,
+                original_str_expr,
+                original_str_fallback,
+                ..
+            } => {
+                // Python default `is_evaluated = True`; original_str_* start
+                // unpopulated until `make_union` records them.
+                assert!(is_evaluated);
+                assert_eq!(original_str_expr, None);
+                assert_eq!(original_str_fallback, None);
+            }
+            _ => panic!("expected UnionType"),
+        }
+    }
+
+    #[test]
+    fn f0_coverage_doc_lists_every_wire_variant() {
+        // The full-fidelity audit lives in doc/f0_coverage.md. If a variant
+        // is added to `Type` without a doc section, this fails — the doc is
+        // the class/field audit table the issue requires.
+        let doc = include_str!("../doc/f0_coverage.md");
+        for name in [
+            "Instance",
+            "TypeAliasType",
+            "TypeVarType",
+            "ParamSpecType",
+            "TypeVarTupleType",
+            "UnboundType",
+            "UnpackType",
+            "AnyType",
+            "UninhabitedType",
+            "NoneType",
+            "ErasedType",
+            "DeletedType",
+            "CallableType",
+            "Overloaded",
+            "TupleType",
+            "TypedDictType",
+            "LiteralType",
+            "UnionType",
+            "TypeType",
+            "Parameters",
+        ] {
+            assert!(
+                doc.contains(name),
+                "doc/f0_coverage.md is missing wire variant `{name}`"
+            );
+        }
+        // The Rust-resident fields must be documented as wire gaps too.
+        for field in [
+            "optional",
+            "empty_tuple_index",
+            "from_star_syntax",
+            "special_sig",
+            "is_evaluated",
+        ] {
+            assert!(
+                doc.contains(field),
+                "doc/f0_coverage.md is missing F0 field `{field}`"
+            );
+        }
     }
 }

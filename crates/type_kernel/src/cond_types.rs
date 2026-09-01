@@ -219,6 +219,7 @@ fn shallow_erase_for_equality(t: &Type, resolver: &TypeResolver) -> Option<Type>
                     }
                     args.push(Type::UnpackType {
                         typ: Box::new(fallback),
+                        from_star_syntax: false,
                     });
                 } else {
                     args.push(any_special_form());
@@ -666,7 +667,7 @@ mod tests {
             Type::Instance { args, .. } => {
                 assert_eq!(args.len(), 2, "slot count, not len(args)");
                 match &args[0] {
-                    Type::UnpackType { typ } => match &**typ {
+                    Type::UnpackType { typ, .. } => match &**typ {
                         Type::Instance {
                             type_ref,
                             args: fargs,
@@ -720,6 +721,9 @@ mod tests {
             uses_pep604_syntax: false,
             can_be_true: true,
             can_be_false: true,
+            is_evaluated: true,
+            original_str_expr: None,
+            original_str_fallback: None,
         };
         let out = shallow_erase_for_equality(&union, &r).unwrap();
         match out {

@@ -190,7 +190,7 @@ fn tuple_fallback(t: &Type, strict_optional: bool, res: &TypeResolver) -> Option
     let mut new_items = Vec::with_capacity(items.len());
     for item in items {
         match item {
-            Type::UnpackType { typ: inner } => {
+            Type::UnpackType { typ: inner, .. } => {
                 // get_proper_type(item.type) (typeops.py:201).
                 let unpacked = get_proper_or_defer(inner)?;
                 let unpacked = match unpacked {
@@ -277,6 +277,7 @@ pub(crate) fn erase_type(t: &Type, strict_optional: bool, res: &TypeResolver) ->
             variables: vec![],
             type_guard: None,
             type_is: None,
+            special_sig: None,
         }),
         // visit_overloaded (erasetype.py:218-219): `t.fallback.accept(self)`.
         // The wire `Overloaded` carries no fallback, so defer.

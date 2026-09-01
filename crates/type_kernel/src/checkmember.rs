@@ -205,7 +205,7 @@ fn contains_erased(typ: &Type) -> bool {
                 || contains_erased(default)
         }
         Type::UnboundType { args, .. } => args.iter().any(contains_erased),
-        Type::UnpackType { typ } => contains_erased(typ),
+        Type::UnpackType { typ, .. } => contains_erased(typ),
         Type::AnyType { source_any, .. } => source_any.as_deref().is_some_and(contains_erased),
         Type::CallableType {
             fallback,
@@ -287,6 +287,7 @@ fn bind_self_fast_inner(typ: &Type) -> Option<Type> {
             variables,
             type_guard,
             type_is,
+            ..
         } => {
             if arg_types.is_empty() {
                 // Nothing to strip — Python returns the method unchanged.
@@ -317,6 +318,7 @@ fn bind_self_fast_inner(typ: &Type) -> Option<Type> {
                     variables: variables.clone(),
                     type_guard: type_guard.clone(),
                     type_is: type_is.clone(),
+                    special_sig: None,
                 }),
                 None => Some(typ.clone()),
             }
@@ -927,7 +929,7 @@ fn for_each_child<F: FnMut(&Type)>(typ: &Type, f: &mut F) {
             f(upper_bound);
             f(default);
         }
-        Type::UnpackType { typ } => f(typ),
+        Type::UnpackType { typ, .. } => f(typ),
         Type::CallableType {
             fallback,
             instance_type,
@@ -1057,7 +1059,7 @@ fn freeze_children<F: FnMut(&mut Type)>(typ: &mut Type, f: &mut F) {
             f(upper_bound);
             f(default);
         }
-        Type::UnpackType { typ } => f(typ),
+        Type::UnpackType { typ, .. } => f(typ),
         Type::CallableType {
             fallback,
             instance_type,
@@ -1339,7 +1341,7 @@ fn contains_tvar_like(typ: &Type) -> bool {
             items, fallback, ..
         } => items.iter().any(|(_, t)| contains_tvar_like(t)) || contains_tvar_like(fallback),
         Type::TypeType { item, .. } => contains_tvar_like(item),
-        Type::UnpackType { typ } => contains_tvar_like(typ),
+        Type::UnpackType { typ, .. } => contains_tvar_like(typ),
         Type::Parameters(p) => p.arg_types.iter().any(contains_tvar_like),
         _ => false,
     }
@@ -1501,7 +1503,7 @@ fn collect_bind_self_ids(typ: &Type, out: &mut HashSet<BindTVarKey>) {
             }
         }
         Type::TypeType { item, .. } => collect_bind_self_ids(item, out),
-        Type::UnpackType { typ } => collect_bind_self_ids(typ, out),
+        Type::UnpackType { typ, .. } => collect_bind_self_ids(typ, out),
         Type::Parameters(p) => {
             for a in &p.arg_types {
                 collect_bind_self_ids(a, out);
@@ -1587,7 +1589,7 @@ fn subst_tvar_keys(typ: &mut Type, keys: &[BindTVarKey], val: &Type) {
             }
         }
         Type::TypeType { item, .. } => subst_tvar_keys(item, keys, val),
-        Type::UnpackType { typ } => subst_tvar_keys(typ, keys, val),
+        Type::UnpackType { typ, .. } => subst_tvar_keys(typ, keys, val),
         Type::Parameters(p) => {
             for a in &mut p.arg_types {
                 subst_tvar_keys(a, keys, val);
@@ -3133,6 +3135,7 @@ fn analyze_none_bool_type() -> Type {
         variables: vec![],
         type_guard: None,
         type_is: None,
+        special_sig: None,
     }
 }
 
@@ -3198,6 +3201,7 @@ fn analyze_typeddict_access_inner(
             variables: vec![],
             type_guard: None,
             type_is: None,
+            special_sig: None,
         })
     } else {
         // __setitem__ needs checker state; fallback branch recurses on
@@ -3627,6 +3631,7 @@ fn make_type_type_normalized(item: &Type) -> Type {
             uses_pep604_syntax,
             can_be_true,
             can_be_false,
+            ..
         } => {
             let mapped: Vec<Type> = items.iter().map(make_type_type_normalized).collect();
             Type::UnionType {
@@ -3634,6 +3639,9 @@ fn make_type_type_normalized(item: &Type) -> Type {
                 uses_pep604_syntax: *uses_pep604_syntax,
                 can_be_true: *can_be_true,
                 can_be_false: *can_be_false,
+                is_evaluated: true,
+                original_str_expr: None,
+                original_str_fallback: None,
             }
         }
         other => Type::TypeType {
@@ -4181,6 +4189,7 @@ fn add_class_tvars_inner(
                     variables: new_vars,
                     type_guard: etg.clone(),
                     type_is: eti.clone(),
+                    special_sig: None,
                 },
                 _ => {
                     return None;
@@ -4837,6 +4846,7 @@ mod tests {
             variables: vec![],
             type_guard: None,
             type_is: None,
+            special_sig: None,
         }
     }
 
@@ -5112,6 +5122,7 @@ mod tests {
             variables: vec![],
             type_guard: None,
             type_is: None,
+            special_sig: None,
         };
         let result = bind_self_fast_inner(&method).expect("empty-arg method returned unchanged");
         match result {
@@ -5170,6 +5181,9 @@ mod tests {
             uses_pep604_syntax: false,
             can_be_true: true,
             can_be_false: true,
+            is_evaluated: true,
+            original_str_expr: None,
+            original_str_fallback: None,
         };
         assert_eq!(classify_member_access_inner(&union, &resolver), MA_UNION);
     }
@@ -5288,6 +5302,9 @@ mod tests {
             uses_pep604_syntax: false,
             can_be_true: true,
             can_be_false: true,
+            is_evaluated: true,
+            original_str_expr: None,
+            original_str_fallback: None,
         }
     }
 
@@ -5559,6 +5576,7 @@ mod tests {
         if let Type::CallableType { ret_type, .. } = &mut sig {
             **ret_type = Type::UnpackType {
                 typ: Box::new(Type::NoneType {}),
+                from_star_syntax: false,
             };
         }
         let inst = make_instance("builtins.int");
@@ -6012,6 +6030,7 @@ mod tests {
             variables: vec![],
             type_guard: None,
             type_is: None,
+            special_sig: None,
         }
     }
 
@@ -6072,6 +6091,7 @@ mod tests {
             variables: vec![],
             type_guard: None,
             type_is: None,
+            special_sig: None,
         };
         // Empty arg_types -> Python reports no_formal_self -> defer.
         assert!(check_self_arg_inner(
@@ -6154,6 +6174,7 @@ mod tests {
             variables: vec![tvar],
             type_guard: None,
             type_is: None,
+            special_sig: None,
         };
         let itype = make_instance("builtins.int");
         let result =
@@ -6190,6 +6211,7 @@ mod tests {
             variables: vec![],
             type_guard: None,
             type_is: None,
+            special_sig: None,
         };
         let itype = make_instance("builtins.int");
         let result = expand_and_bind_callable_inner(&callable, &itype, false, 100, true, &resolver)
@@ -6231,6 +6253,7 @@ mod tests {
             variables: vec![],
             type_guard: None,
             type_is: None,
+            special_sig: None,
         };
         let result = add_class_tvars_inner(
             &callable,
@@ -6397,6 +6420,7 @@ mod tests {
             variables: vec![],
             type_guard: None,
             type_is: None,
+            special_sig: None,
         }
     }
 
@@ -6470,6 +6494,7 @@ mod tests {
             variables: vec![],
             type_guard: None,
             type_is: None,
+            special_sig: None,
         };
         let result = member_method_inner(
             &make_ga_instance(),
@@ -6506,6 +6531,7 @@ mod tests {
             variables: vec![],
             type_guard: None,
             type_is: None,
+            special_sig: None,
         };
         let result = member_method_inner(
             &make_ga_instance(),
@@ -6635,6 +6661,7 @@ mod tests {
             variables,
             type_guard: None,
             type_is: None,
+            special_sig: None,
         }
     }
 

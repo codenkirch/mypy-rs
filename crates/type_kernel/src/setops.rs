@@ -1072,6 +1072,7 @@ fn meet_similar_callables_impl(
         variables: t_variables.to_vec(),
         type_guard: None,
         type_is: None,
+        special_sig: None,
     };
 
     encode_callable(new_callable)
@@ -1606,11 +1607,11 @@ pub(crate) fn safe_join(
     }
     if t_unpack && s_unpack {
         let t_inner = match t {
-            Type::UnpackType { typ } => typ.as_ref(),
+            Type::UnpackType { typ, .. } => typ.as_ref(),
             _ => unreachable!(),
         };
         let s_inner = match s {
-            Type::UnpackType { typ } => typ.as_ref(),
+            Type::UnpackType { typ, .. } => typ.as_ref(),
             _ => unreachable!(),
         };
         let joined = setop_result_to_type(
@@ -1620,6 +1621,7 @@ pub(crate) fn safe_join(
         )?;
         return Some(Type::UnpackType {
             typ: Box::new(joined),
+            from_star_syntax: false,
         });
     }
     // Mixed UnpackType / non-UnpackType: object_or_any_from_type fallback.
@@ -1660,11 +1662,11 @@ fn safe_meet(t: &Type, s: &Type, ctx: &SubtypeContext, resolver: &TypeResolver) 
     }
     if t_unpack && s_unpack {
         let t_inner = match t {
-            Type::UnpackType { typ } => typ.as_ref(),
+            Type::UnpackType { typ, .. } => typ.as_ref(),
             _ => unreachable!(),
         };
         let s_inner = match s {
-            Type::UnpackType { typ } => typ.as_ref(),
+            Type::UnpackType { typ, .. } => typ.as_ref(),
             _ => unreachable!(),
         };
         let fallback_ref = match t_inner {
@@ -1700,9 +1702,13 @@ fn safe_meet(t: &Type, s: &Type, ctx: &SubtypeContext, resolver: &TypeResolver) 
                     last_known_value: None,
                     extra_attrs: None,
                 }),
+                from_star_syntax: false,
             });
         }
-        return Some(Type::UnpackType { typ: Box::new(met) });
+        return Some(Type::UnpackType {
+            typ: Box::new(met),
+            from_star_syntax: false,
+        });
     }
     // Mixed: join.py:1073-1074 -> UninhabitedType().
     Some(Type::UninhabitedType { ambiguous: false })
@@ -1814,6 +1820,7 @@ fn join_similar_callables_impl(
         variables: t_variables.to_vec(),
         type_guard,
         type_is,
+        special_sig: None,
     };
     encode_callable(new_callable)
 }
@@ -1889,6 +1896,7 @@ fn combine_similar_callables(
         variables: Vec::new(),
         type_guard,
         type_is,
+        special_sig: None,
     };
     let _ = t;
     let _ = s;
@@ -2162,6 +2170,7 @@ fn visit_join(
             name,
             type_guard,
             type_is,
+            ..
         } => {
             if let Type::CallableType {
                 fallback: s_fallback,
@@ -2181,6 +2190,7 @@ fn visit_join(
                 name: s_name,
                 type_guard: s_type_guard,
                 type_is: s_type_is,
+                ..
             } = s
             {
                 // join.py:620-622: is_similar_callables(t, self.s) &&
@@ -3019,7 +3029,7 @@ fn visit_join(
                         // isinstance(item, UnpackType) and
                         // isinstance(unpacked, Instance): return unpacked.
                         if items.len() == 1 {
-                            if let Type::UnpackType { typ } = &items[0] {
+                            if let Type::UnpackType { typ, .. } = &items[0] {
                                 if let Type::Instance { .. } = typ.as_ref() {
                                     let mut wbuf = WriteBuffer::new();
                                     wire::write_type(&mut wbuf, typ.as_ref()).ok()?;
@@ -3978,6 +3988,9 @@ pub(crate) fn union_make_union(items: Vec<Type>) -> Type {
                 uses_pep604_syntax: false,
                 can_be_true,
                 can_be_false,
+                is_evaluated: true,
+                original_str_expr: None,
+                original_str_fallback: None,
             }
         }
     }
@@ -4081,6 +4094,9 @@ fn visit_union_join(
                 uses_pep604_syntax: false,
                 can_be_true: items.iter().any(union_item_can_be_true),
                 can_be_false: items.iter().any(union_item_can_be_false),
+                is_evaluated: true,
+                original_str_expr: None,
+                original_str_fallback: None,
             },
         ],
         ctx,
@@ -4285,11 +4301,12 @@ fn visit_instance_with_args(
                 Type::Instance { type_ref, .. } if type_ref == "builtins.tuple" => {
                     Type::UnpackType {
                         typ: Box::new(new_type),
+                        from_star_syntax: false,
                     }
                 }
                 Type::TupleType { items, .. } => {
                     if items.len() == 1 {
-                        if let Type::UnpackType { typ } = &items[0] {
+                        if let Type::UnpackType { typ, .. } = &items[0] {
                             if let Type::Instance { type_ref, .. } = typ.as_ref() {
                                 if type_ref == "builtins.tuple" {
                                     return Some(SetOpResult::Encoded({
@@ -5232,6 +5249,7 @@ pub(crate) fn join_instances_core(
                                 &mut wbuf,
                                 &Type::UnpackType {
                                     typ: Box::new(new_type),
+                                    from_star_syntax: false,
                                 },
                             )
                             .ok()?;
@@ -5241,7 +5259,7 @@ pub(crate) fn join_instances_core(
                             // join.py:238-241: single-item TupleType ->
                             // UnpackType(tuple[item]) if the item is
                             // Instance(tuple); else Instance(tuple, [i]).
-                            if let Type::UnpackType { typ } = &items[0] {
+                            if let Type::UnpackType { typ, .. } = &items[0] {
                                 if let Type::Instance { type_ref: tr, .. } = typ.as_ref() {
                                     if tr == "builtins.tuple" {
                                         let mut wbuf = WriteBuffer::new();
@@ -5532,6 +5550,7 @@ fn join_both_variadic(
         // pass it through directly rather than destructuring partial fields.
         items.push(Type::UnpackType {
             typ: Box::new(joined_inner),
+            from_star_syntax: false,
         });
 
         // Join suffix items.
@@ -5595,6 +5614,7 @@ fn join_both_variadic(
         };
         return Some(vec![Type::UnpackType {
             typ: Box::new(tuple_inst),
+            from_star_syntax: false,
         }]);
     }
 
@@ -5673,6 +5693,7 @@ fn join_one_variadic(
             last_known_value: None,
             extra_attrs: None,
         }),
+        from_star_syntax: false,
     });
 
     // Join suffix items.
@@ -5812,6 +5833,7 @@ fn meet_both_variadic(
             last_known_value,
             extra_attrs,
         }),
+        from_star_syntax: false,
     });
 
     // Meet suffix items.
@@ -5912,7 +5934,7 @@ fn find_unpack(items: &[Type]) -> Option<usize> {
 /// Extract the inner type of an `UnpackType`.
 fn get_unpack_type(unpack: &Type) -> &Type {
     match unpack {
-        Type::UnpackType { typ } => typ.as_ref(),
+        Type::UnpackType { typ, .. } => typ.as_ref(),
         _ => unreachable!(),
     }
 }
@@ -6086,6 +6108,7 @@ mod tests {
             variables: Vec::new(),
             type_guard: None,
             type_is: None,
+            special_sig: None,
         }
     }
 
@@ -6119,6 +6142,7 @@ mod tests {
             variables,
             type_guard: None,
             type_is: None,
+            special_sig: None,
         }
     }
 
@@ -6445,6 +6469,9 @@ mod tests {
             uses_pep604_syntax: false,
             can_be_true: true,
             can_be_false: true,
+            is_evaluated: true,
+            original_str_expr: None,
+            original_str_fallback: None,
         };
         assert_eq!(join_types(&s, &t, &ctx(true), &r), Some(SetOpResult::SameT));
     }
@@ -6473,6 +6500,9 @@ mod tests {
             uses_pep604_syntax: false,
             can_be_true: true,
             can_be_false: true,
+            is_evaluated: true,
+            original_str_expr: None,
+            original_str_fallback: None,
         };
         assert_eq!(join_types(&s, &t, &ctx(true), &r), Some(SetOpResult::SameS));
     }
@@ -6497,6 +6527,9 @@ mod tests {
             uses_pep604_syntax: false,
             can_be_true: true,
             can_be_false: true,
+            is_evaluated: true,
+            original_str_expr: None,
+            original_str_fallback: None,
         };
         assert_eq!(join_types(&s, &t, &ctx(true), &r), Some(SetOpResult::SameT));
     }
@@ -6519,6 +6552,9 @@ mod tests {
             uses_pep604_syntax: false,
             can_be_true: true,
             can_be_false: true,
+            is_evaluated: true,
+            original_str_expr: None,
+            original_str_fallback: None,
         };
         let result = join_types(&s, &t, &ctx(true), &r);
         assert!(
@@ -6538,6 +6574,9 @@ mod tests {
                 uses_pep604_syntax: false,
                 can_be_true: true,
                 can_be_false: true,
+                is_evaluated: true,
+                original_str_expr: None,
+                original_str_fallback: None,
             };
             assert_eq!(decoded, expected);
         }
@@ -6591,6 +6630,9 @@ mod tests {
             uses_pep604_syntax: false,
             can_be_true: true,
             can_be_false: true,
+            is_evaluated: true,
+            original_str_expr: None,
+            original_str_fallback: None,
         };
         let result = join_types(&s, &t, &ctx(true), &r);
         assert!(
@@ -6606,6 +6648,9 @@ mod tests {
                 uses_pep604_syntax: false,
                 can_be_true: true,
                 can_be_false: true,
+                is_evaluated: true,
+                original_str_expr: None,
+                original_str_fallback: None,
             };
             assert_eq!(decoded, expected);
         }
@@ -6640,6 +6685,9 @@ mod tests {
             uses_pep604_syntax: false,
             can_be_true: true,
             can_be_false: true,
+            is_evaluated: true,
+            original_str_expr: None,
+            original_str_fallback: None,
         };
         let result = join_types(&s, &t, &ctx(true), &r);
         assert!(
@@ -6655,6 +6703,9 @@ mod tests {
                 uses_pep604_syntax: false,
                 can_be_true: true,
                 can_be_false: true,
+                is_evaluated: true,
+                original_str_expr: None,
+                original_str_fallback: None,
             };
             assert_eq!(decoded, expected);
         }
@@ -6686,6 +6737,9 @@ mod tests {
             uses_pep604_syntax: false,
             can_be_true: true,
             can_be_false: true,
+            is_evaluated: true,
+            original_str_expr: None,
+            original_str_fallback: None,
         };
         // Partial enum coverage does not contract; Python returns the
         // union unchanged. Rust emits the same union (no contraction).
@@ -6707,6 +6761,9 @@ mod tests {
                 uses_pep604_syntax: false,
                 can_be_true: true,
                 can_be_false: true,
+                is_evaluated: true,
+                original_str_expr: None,
+                original_str_fallback: None,
             };
             assert_eq!(decoded, expected);
         }
@@ -6792,6 +6849,9 @@ mod tests {
             uses_pep604_syntax: false,
             can_be_true: true,
             can_be_false: true,
+            is_evaluated: true,
+            original_str_expr: None,
+            original_str_fallback: None,
         };
         let result = join_types(&s, &t, &ctx(true), &r);
         assert!(
@@ -6807,6 +6867,9 @@ mod tests {
                 uses_pep604_syntax: false,
                 can_be_true: true,
                 can_be_false: true,
+                is_evaluated: true,
+                original_str_expr: None,
+                original_str_fallback: None,
             };
             assert_eq!(decoded, expected);
         }
@@ -6829,12 +6892,18 @@ mod tests {
             uses_pep604_syntax: false,
             can_be_true: true,
             can_be_false: true,
+            is_evaluated: true,
+            original_str_expr: None,
+            original_str_fallback: None,
         };
         let t = Type::UnionType {
             items: vec![instance("a.B", vec![])],
             uses_pep604_syntax: false,
             can_be_true: true,
             can_be_false: true,
+            is_evaluated: true,
+            original_str_expr: None,
+            original_str_fallback: None,
         };
         let result = join_types(&s, &t, &ctx(true), &r);
         assert!(
@@ -6850,6 +6919,9 @@ mod tests {
                 uses_pep604_syntax: false,
                 can_be_true: true,
                 can_be_false: true,
+                is_evaluated: true,
+                original_str_expr: None,
+                original_str_fallback: None,
             };
             assert_eq!(decoded, expected);
         }
@@ -7319,6 +7391,8 @@ mod tests {
             args: Vec::new(),
             original_str_expr: None,
             original_str_fallback: None,
+            empty_tuple_index: false,
+            optional: false,
         }
     }
 
@@ -7811,6 +7885,8 @@ mod tests {
             args: vec![],
             original_str_expr: None,
             original_str_fallback: None,
+            empty_tuple_index: false,
+            optional: false,
         };
         let t = instance("a.A", vec![]);
         // visit_instance with s=UnboundType -> not Instance -> defer.
@@ -8122,6 +8198,8 @@ mod tests {
                 args: Vec::new(),
                 original_str_expr: None,
                 original_str_fallback: None,
+                empty_tuple_index: false,
+                optional: false,
             },
         );
         let t = type_var(1, "~", Type::NoneType);
@@ -8646,6 +8724,9 @@ mod tests {
             uses_pep604_syntax: false,
             can_be_true: true,
             can_be_false: true,
+            is_evaluated: true,
+            original_str_expr: None,
+            original_str_fallback: None,
         };
         let t = instance("a.A", vec![]);
         assert_eq!(meet_types(&s, &t, &ctx(true), &r), Some(SetOpResult::SameT));
@@ -8662,12 +8743,18 @@ mod tests {
             uses_pep604_syntax: false,
             can_be_true: true,
             can_be_false: true,
+            is_evaluated: true,
+            original_str_expr: None,
+            original_str_fallback: None,
         };
         let t = Type::UnionType {
             items: vec![instance("a.A", vec![])],
             uses_pep604_syntax: false,
             can_be_true: true,
             can_be_false: true,
+            is_evaluated: true,
+            original_str_expr: None,
+            original_str_fallback: None,
         };
         assert!(matches!(
             meet_types(&s, &t, &ctx(true), &r),
@@ -8693,6 +8780,9 @@ mod tests {
             uses_pep604_syntax: false,
             can_be_true: true,
             can_be_false: true,
+            is_evaluated: true,
+            original_str_expr: None,
+            original_str_fallback: None,
         };
         match meet_types(&s, &t, &ctx(true), &r) {
             Some(SetOpResult::Encoded(bytes)) => {
@@ -9779,6 +9869,9 @@ mod tests {
                 uses_pep604_syntax: false,
                 can_be_true: true,
                 can_be_false: true,
+                is_evaluated: true,
+                original_str_expr: None,
+                original_str_fallback: None,
             };
             assert_eq!(decoded, expected);
         }
@@ -10013,6 +10106,7 @@ mod tests {
                     partial_fallback: Box::new(instance("builtins.tuple", vec![])),
                     implicit: false,
                 }),
+                from_star_syntax: false,
             }],
         ))
         .unwrap()];
@@ -10032,6 +10126,7 @@ mod tests {
                     partial_fallback: Box::new(instance("builtins.tuple", vec![])),
                     implicit: false,
                 }),
+                from_star_syntax: false,
             }],
         );
         assert_eq!(join_diff(&tuple_i, &nt_i, &r), None);
@@ -10169,6 +10264,7 @@ mod tests {
                 variables: Vec::new(),
                 type_guard: None,
                 type_is: None,
+                special_sig: None,
             }
         }
 

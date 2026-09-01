@@ -170,7 +170,7 @@ fn plan_for_formal(
                 for a in actuals.iter().skip(1) {
                     actual_types.push(arg_types.get(*a)?.clone());
                 }
-                if let Type::UnpackType { typ } = &orig_callee_arg_type {
+                if let Type::UnpackType { typ, .. } = &orig_callee_arg_type {
                     let p_callee_type = get_proper_type_owned(typ, aliases)?;
                     if let Type::TupleType { items, .. } = &p_callee_type {
                         if items.is_empty() {
@@ -185,7 +185,7 @@ fn plan_for_formal(
                 }
             }
         }
-    } else if let Type::UnpackType { typ } = &orig_callee_arg_type {
+    } else if let Type::UnpackType { typ, .. } = &orig_callee_arg_type {
         // len(actuals) == 1: Python's expanded_tuple arm does not
         // trigger (needs >1), so the unpack expands as if it were the
         // sole formal. Expand any alias in the unpack target.
@@ -203,7 +203,7 @@ fn plan_for_formal(
         for &a in &actuals {
             actual_types.push(arg_types.get(a)?.clone());
         }
-        if let Type::UnpackType { typ } = &orig_callee_arg_type {
+        if let Type::UnpackType { typ, .. } = &orig_callee_arg_type {
             let unpacked_type = get_proper_type_owned(typ, aliases)?;
             match unpacked_type {
                 Type::TupleType { items, .. } => {
@@ -213,7 +213,7 @@ fn plan_for_formal(
                         callee_kinds = vec![ARG_POS; actuals.len()];
                     } else {
                         let inner = inner_unpack_index as usize;
-                        let Type::UnpackType { typ: inner_typ } = items.get(inner)? else {
+                        let Type::UnpackType { typ: inner_typ, .. } = items.get(inner)? else {
                             // Python asserts UnpackType; defer.
                             return None;
                         };
@@ -381,7 +381,10 @@ mod tests {
     }
 
     fn unpack(t: Type) -> Type {
-        Type::UnpackType { typ: Box::new(t) }
+        Type::UnpackType {
+            typ: Box::new(t),
+            from_star_syntax: false,
+        }
     }
 
     fn callable(arg_types: Vec<Type>, arg_kinds: Vec<i64>) -> Type {
@@ -403,6 +406,7 @@ mod tests {
             variables: vec![],
             type_guard: None,
             type_is: None,
+            special_sig: None,
         }
     }
 

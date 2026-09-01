@@ -126,7 +126,7 @@ fn builtin_item_type_inner(
             let mut normalized = Vec::with_capacity(items.len());
             for it in items {
                 let item = match it {
-                    Type::UnpackType { typ } => {
+                    Type::UnpackType { typ, .. } => {
                         let unpacked = get_proper_or_defer(typ)?;
                         // TypeVarTuple unpacks through its upper_bound.
                         let unpacked = match unpacked {

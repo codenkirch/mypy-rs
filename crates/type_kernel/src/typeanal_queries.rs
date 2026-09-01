@@ -252,7 +252,7 @@ fn query_children_bool(t: &Type) -> Vec<&Type> {
     let mut out = Vec::new();
     match t {
         Type::UnboundType { args, .. } => out.extend(args.iter()),
-        Type::UnpackType { typ } => out.push(typ),
+        Type::UnpackType { typ, .. } => out.push(typ),
         Type::TypeVarType {
             values,
             upper_bound,
@@ -415,7 +415,7 @@ fn query_children_type(t: &Type) -> Vec<&Type> {
     let mut out = Vec::new();
     match t {
         Type::UnboundType { args, .. } => out.extend(args.iter()),
-        Type::UnpackType { typ } => out.push(typ),
+        Type::UnpackType { typ, .. } => out.push(typ),
         Type::TypeVarType {
             values,
             upper_bound,
@@ -541,6 +541,9 @@ fn make_optional_type_inner(t: &Type) -> Option<Type> {
             uses_pep604_syntax: *uses_pep604_syntax,
             can_be_true,
             can_be_false,
+            is_evaluated: true,
+            original_str_expr: None,
+            original_str_fallback: None,
         });
     }
     // else: wrap Non-None-type values in a UnionType.
@@ -552,6 +555,9 @@ fn make_optional_type_inner(t: &Type) -> Option<Type> {
         uses_pep604_syntax: false,
         can_be_true,
         can_be_false,
+        is_evaluated: true,
+        original_str_expr: None,
+        original_str_fallback: None,
     })
 }
 
@@ -607,6 +613,9 @@ fn make_optional_type_live_inner(t: &Type, aliases: &TypeAliasResolver) -> Optio
             uses_pep604_syntax: *uses_pep604_syntax,
             can_be_true,
             can_be_false,
+            is_evaluated: true,
+            original_str_expr: None,
+            original_str_fallback: None,
         });
     }
     // else: wrap Non-None-type values in a UnionType.
@@ -618,6 +627,9 @@ fn make_optional_type_live_inner(t: &Type, aliases: &TypeAliasResolver) -> Optio
         uses_pep604_syntax: false,
         can_be_true,
         can_be_false,
+        is_evaluated: true,
+        original_str_expr: None,
+        original_str_fallback: None,
     })
 }
 
@@ -640,7 +652,7 @@ pub(crate) fn rust_unknown_unpack(type_bytes: &[u8]) -> PyResult<Option<bool>> {
 }
 
 fn unknown_unpack_inner(t: &Type) -> Option<bool> {
-    let Type::UnpackType { typ } = t else {
+    let Type::UnpackType { typ, .. } = t else {
         return Some(false);
     };
     // get_proper_type(UnpackType.typ): non-alias wire types are already
@@ -669,7 +681,7 @@ pub(crate) fn rust_unknown_unpack_live(
 }
 
 fn unknown_unpack_live_inner(t: &Type, aliases: &TypeAliasResolver) -> Option<bool> {
-    let Type::UnpackType { typ } = t else {
+    let Type::UnpackType { typ, .. } = t else {
         return Some(false);
     };
     match typ.as_ref() {
@@ -1425,7 +1437,7 @@ fn find_self_type_wire(
             find_self_type_wire_seq(items, lookup, aliases, seen)
         }
         Type::TypeType { item, .. } => find_self_type_wire(item, lookup, aliases, seen),
-        Type::UnpackType { typ } => find_self_type_wire(typ, lookup, aliases, seen),
+        Type::UnpackType { typ , ..} => find_self_type_wire(typ, lookup, aliases, seen),
         Type::TypeVarType {
             values,
             upper_bound,
@@ -2538,6 +2550,7 @@ mod tests {
             variables: Vec::new(),
             type_guard: None,
             type_is: None,
+            special_sig: None,
         }
     }
 
@@ -2547,6 +2560,9 @@ mod tests {
             uses_pep604_syntax: false,
             can_be_true: true,
             can_be_false: true,
+            is_evaluated: true,
+            original_str_expr: None,
+            original_str_fallback: None,
         }
     }
 
@@ -2825,6 +2841,7 @@ mod tests {
     fn test_unknown_unpack_matches_special_form_any() {
         let unpacked = Type::UnpackType {
             typ: Box::new(make_any(SPECIAL_FORM)),
+            from_star_syntax: false,
         };
         assert_eq!(unknown_unpack_inner(&unpacked), Some(true));
     }
@@ -2833,6 +2850,7 @@ mod tests {
     fn test_unknown_unpack_other_any_is_false() {
         let unpacked = Type::UnpackType {
             typ: Box::new(make_any(EXPLICIT)),
+            from_star_syntax: false,
         };
         assert_eq!(unknown_unpack_inner(&unpacked), Some(false));
     }
@@ -2844,6 +2862,7 @@ mod tests {
                 args: Vec::new(),
                 type_ref: "m.T".to_string(),
             }),
+            from_star_syntax: false,
         };
         assert_eq!(unknown_unpack_inner(&unpacked), None);
     }
@@ -2878,6 +2897,7 @@ mod tests {
         // defer to Python's error path.
         let unpacked = Type::UnpackType {
             typ: Box::new(make_instance("builtins.int", vec![])),
+            from_star_syntax: false,
         };
         let t = make_union(vec![make_instance("builtins.str", vec![]), unpacked]);
         assert_eq!(analyze_type_inner(&t, false, false, true), None);
@@ -2925,6 +2945,8 @@ mod tests {
             args: Vec::new(),
             original_str_expr: None,
             original_str_fallback: None,
+            empty_tuple_index: false,
+            optional: false,
         }
     }
 
@@ -3250,7 +3272,7 @@ fn analyze_type_inner(
             })
         }
 
-        Type::UnpackType { typ } => {
+        Type::UnpackType { typ, .. } => {
             // Unpack analysis needs allow_unpack context and nesting_level tracking.
             // Defer to Python unless allow_unpack is set.
             if !allow_unpack {
@@ -3262,7 +3284,10 @@ fn analyze_type_inner(
                 allow_param_spec_literals,
                 true,
             )?);
-            Some(Type::UnpackType { typ })
+            Some(Type::UnpackType {
+                typ,
+                from_star_syntax: false,
+            })
         }
 
         Type::Parameters(p) => Some(Type::Parameters(Parameters {
@@ -3347,6 +3372,7 @@ fn analyze_type_inner(
             variables,
             type_guard,
             type_is,
+            ..
         } => {
             // Callable analysis: mirror visit_callable_type (typeanal.py:1873).
             // Re-analyze arg_types, ret_type, variables, type guards.
@@ -3434,6 +3460,7 @@ fn analyze_type_inner(
                 variables,
                 type_guard,
                 type_is,
+                special_sig: None,
             })
         }
 
@@ -3536,6 +3563,7 @@ fn analyze_type_inner(
             uses_pep604_syntax,
             can_be_true,
             can_be_false,
+            ..
         } => {
             // visit_union_type analyzes items with allow_unpack=False
             // (anal_array default) regardless of the outer flag, so an
@@ -3547,6 +3575,9 @@ fn analyze_type_inner(
                 uses_pep604_syntax: *uses_pep604_syntax,
                 can_be_true: *can_be_true,
                 can_be_false: *can_be_false,
+                is_evaluated: true,
+                original_str_expr: None,
+                original_str_fallback: None,
             })
         }
 

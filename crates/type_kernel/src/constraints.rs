@@ -1225,7 +1225,7 @@ fn visit_instance_tail_native(
                 let constrained = match item {
                     // Python: `unpacked = get_proper_type(item.type)`; an
                     // alias expands through the resolver (constraints.py:1459).
-                    Type::UnpackType { typ } => match typ.as_ref() {
+                    Type::UnpackType { typ, .. } => match typ.as_ref() {
                         Type::TypeVarTupleType { .. } => None,
                         Type::Instance { args, .. } if get_type_ref(typ)? == "builtins.tuple" => {
                             args.first().cloned()
@@ -1391,7 +1391,7 @@ fn visit_tuple_native(
             // get_proper_type(rhs): expand a top-level alias through the
             // resolver; an unresolvable alias (missing snapshot) defers.
             let unmapped_inner = match unpack_type {
-                Type::UnpackType { typ } => match typ.as_ref() {
+                Type::UnpackType { typ, .. } => match typ.as_ref() {
                     Type::TypeAliasType { .. } => get_proper_or_expand(typ, aliases)?,
                     other => other.clone(),
                 },
@@ -1515,7 +1515,7 @@ fn visit_tuple_native(
     }
     let a_unpack = &a_items[a_unpack_index as usize];
     let a_unpacked = match a_unpack {
-        Type::UnpackType { typ } => typ.as_ref(),
+        Type::UnpackType { typ, .. } => typ.as_ref(),
         _ => return None,
     };
     if a_items.len() + 1 > t_items.len() {
@@ -1712,7 +1712,7 @@ fn simple_unpack_native(
             // messages; otherwise return the empty list.
             let t_unpack_item = &template_args[template_unpack as usize];
             let inner = match t_unpack_item {
-                Type::UnpackType { typ } => typ.as_ref(),
+                Type::UnpackType { typ, .. } => typ.as_ref(),
                 _ => return None,
             };
             return match inner {
@@ -1761,7 +1761,7 @@ fn simple_unpack_native(
         // set from the template item (constraints.py:2079).
         t_unpack = Some(&template_args[template_unpack as usize]);
         let inner = match t_unpack.unwrap() {
-            Type::UnpackType { typ } => typ.as_ref(),
+            Type::UnpackType { typ, .. } => typ.as_ref(),
             _ => return None,
         };
         match inner {
@@ -1833,7 +1833,7 @@ fn simple_unpack_native(
     }
     if let Some(tu) = t_unpack {
         let inner = match tu {
-            Type::UnpackType { typ } => typ.as_ref(),
+            Type::UnpackType { typ, .. } => typ.as_ref(),
             _ => return None,
         };
         match inner {
@@ -1869,7 +1869,7 @@ fn simple_unpack_native(
         // Tuple[..., *tuple[X, ...], ...] (constraints.py:2131-2142).
         let actual_unpack_type = &actual_args[actual_unpack as usize];
         let a_unpacked = match actual_unpack_type {
-            Type::UnpackType { typ } => typ.as_ref(),
+            Type::UnpackType { typ, .. } => typ.as_ref(),
             _ => return None,
         };
         // Only a *tuple[A, ...] actual unpack produces constraints.
@@ -1887,7 +1887,7 @@ fn simple_unpack_native(
         };
         let t_unpack_item = &template_args[template_unpack as usize];
         let t_inner = match t_unpack_item {
-            Type::UnpackType { typ } => typ.as_ref(),
+            Type::UnpackType { typ, .. } => typ.as_ref(),
             _ => return None,
         };
         let t_inner_args: Option<Vec<Type>> = match t_inner {
@@ -1934,7 +1934,7 @@ fn constrain_homogeneous_middle(
     let mut res = Vec::new();
     for a in middle {
         match a {
-            Type::UnpackType { typ } => {
+            Type::UnpackType { typ, .. } => {
                 // *tuple[T, ...] <: *tuple[A, ...].
                 let a_inner = match typ.as_ref() {
                     Type::Instance { type_ref, args, .. } if type_ref == "builtins.tuple" => {
@@ -2322,7 +2322,7 @@ fn param_spec_of(
 /// form: only the shapes whose fallback is decidable without the live MRO.
 fn tuple_fallback_ref_from_unpack(t: &Type) -> Option<String> {
     match t {
-        Type::UnpackType { typ } => match typ.as_ref() {
+        Type::UnpackType { typ, .. } => match typ.as_ref() {
             Type::Instance { type_ref, .. } if type_ref == "builtins.tuple" => {
                 Some(type_ref.clone())
             }
@@ -2361,7 +2361,7 @@ fn repack_callable_args_wire(
     };
     let mut out: Vec<Type> = arg_types[..star_index].to_vec();
     let star_out: Type = match &arg_types[star_index] {
-        Type::UnpackType { typ } => match typ.as_ref() {
+        Type::UnpackType { typ, .. } => match typ.as_ref() {
             Type::TupleType { items, .. } => {
                 // Python asserts the first item is itself an UnpackType,
                 // splices it as the middle and keeps the rest as the suffix.
@@ -2385,6 +2385,7 @@ fn repack_callable_args_wire(
                 last_known_value: None,
                 extra_attrs: None,
             }),
+            from_star_syntax: false,
         },
     };
     out.push(star_out);
@@ -2717,7 +2718,7 @@ fn infer_against_any_native(
     let mut res = Vec::new();
     for t in flat {
         match t {
-            Type::UnpackType { typ } => match typ.as_ref() {
+            Type::UnpackType { typ, .. } => match typ.as_ref() {
                 Type::TypeVarTupleType { .. } => {
                     res.push(Constraint {
                         origin_type_var: typ.as_ref().clone(),
@@ -3137,6 +3138,7 @@ mod tests {
             variables: vec![type_var(1, "T")],
             type_guard: None,
             type_is: None,
+            special_sig: None,
         }
     }
 
@@ -3235,6 +3237,7 @@ mod tests {
         let resolver = crate::typeinfo::TypeResolver::new();
         let unpack = Type::UnpackType {
             typ: Box::new(type_var(1, "T")),
+            from_star_syntax: false,
         };
         let template = Type::CallableType {
             fallback: Box::new(instance_builtins_object()),
@@ -3254,6 +3257,7 @@ mod tests {
             variables: vec![type_var(1, "T")],
             type_guard: None,
             type_is: None,
+            special_sig: None,
         };
         assert!(visit_callable_native(
             &template,
@@ -3306,6 +3310,7 @@ mod tests {
             }],
             type_guard: None,
             type_is: None,
+            special_sig: None,
         };
         assert!(visit_callable_native(
             &template,
@@ -3414,6 +3419,9 @@ mod tests {
             uses_pep604_syntax: false,
             can_be_true: true,
             can_be_false: true,
+            is_evaluated: true,
+            original_str_expr: None,
+            original_str_fallback: None,
         }
     }
 
@@ -3771,6 +3779,7 @@ mod tests {
             partial_fallback: Box::new(instance_builtins_object()),
             items: vec![Type::UnpackType {
                 typ: Box::new(alias_type("mod.TAlias")),
+                from_star_syntax: false,
             }],
             implicit: false,
         };
@@ -3892,6 +3901,7 @@ mod tests {
             variables: Vec::new(),
             type_guard: None,
             type_is: None,
+            special_sig: None,
         }
     }
 
@@ -4076,6 +4086,7 @@ mod tests {
             variables,
             type_guard: None,
             type_is: None,
+            special_sig: None,
         }
     }
 
@@ -4208,6 +4219,7 @@ mod tests {
                 last_known_value: None,
                 extra_attrs: None,
             }),
+            from_star_syntax: false,
         };
         let template = cb_callable(
             vec![instance_int(), tuple_unpack(tv.clone())],
@@ -4575,6 +4587,7 @@ mod tests {
             variables: Vec::new(),
             type_guard: None,
             type_is: None,
+            special_sig: None,
         }
     }
 

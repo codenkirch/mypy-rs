@@ -244,6 +244,7 @@ mod tests {
             variables,
             type_guard: None,
             type_is: None,
+            special_sig: None,
         }
     }
 

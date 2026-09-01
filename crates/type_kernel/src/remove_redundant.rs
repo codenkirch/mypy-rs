@@ -80,7 +80,7 @@ fn tree_has_alias(t: &Type) -> bool {
                 || tree_has_alias(default)
         }
         Type::UnboundType { args, .. } => args.iter().any(tree_has_alias),
-        Type::UnpackType { typ } => tree_has_alias(typ),
+        Type::UnpackType { typ, .. } => tree_has_alias(typ),
         Type::AnyType { source_any, .. } => source_any.as_deref().is_some_and(tree_has_alias),
         Type::CallableType {
             fallback,

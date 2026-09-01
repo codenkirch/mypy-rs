@@ -177,7 +177,10 @@ fn refine_tuple_type_with_len(
         return Some((Type::UninhabitedType { ambiguous: false }, typ.clone()));
     };
 
-    let Some(Type::UnpackType { typ: unpack_type }) = items.get(unpack_index).cloned() else {
+    let Some(Type::UnpackType {
+        typ: unpack_type, ..
+    }) = items.get(unpack_index).cloned()
+    else {
         return None;
     };
     let unpacked = get_proper_type(&unpack_type)?;
@@ -219,6 +222,7 @@ fn refine_tuple_type_with_len(
                 };
                 let new_unpack = Type::UnpackType {
                     typ: Box::new(new_tvt),
+                    from_star_syntax: false,
                 };
                 let new_items = [&prefix[..], &[new_unpack]].concat();
                 let new_items = [new_items, suffix].concat();
@@ -280,6 +284,7 @@ fn refine_tuple_type_with_len(
             // Reconstruct the original unpack for the no_type.
             no_items.push(Type::UnpackType {
                 typ: Box::new(unpacked.clone()),
+                from_star_syntax: false,
             });
             no_items.extend(suffix.clone());
             let no_type = Type::TupleType {
@@ -372,6 +377,7 @@ fn refine_instance_type_with_len(
             };
             let unpack = Type::UnpackType {
                 typ: Box::new(tuple_inst),
+                from_star_syntax: false,
             };
             let mut no_items = std::iter::repeat_n(arg.clone(), size as usize).collect::<Vec<_>>();
             no_items.push(unpack);
@@ -578,6 +584,7 @@ mod tests {
                     missing_import_name: None,
                 }],
             )),
+            from_star_syntax: false,
         };
         let t = make_tuple("builtins.tuple", vec![unpack]);
         assert_eq!(can_be_narrowed_with_len(&t, &r), Some(true));
@@ -600,6 +607,7 @@ mod tests {
                     missing_import_name: None,
                 }],
             )),
+            from_star_syntax: false,
         };
         let t = make_tuple("mymod.Fake", vec![unpack]);
         assert_eq!(can_be_narrowed_with_len(&t, &r), Some(false));
@@ -658,6 +666,9 @@ mod tests {
             uses_pep604_syntax: false,
             can_be_true: false,
             can_be_false: false,
+            is_evaluated: true,
+            original_str_expr: None,
+            original_str_fallback: None,
         };
         assert_eq!(can_be_narrowed_with_len(&t, &r), Some(true));
     }
@@ -678,6 +689,9 @@ mod tests {
             uses_pep604_syntax: false,
             can_be_true: false,
             can_be_false: false,
+            is_evaluated: true,
+            original_str_expr: None,
+            original_str_fallback: None,
         };
         // AnyType is treated as custom-__len__ (uncertain) -> False.
         assert_eq!(can_be_narrowed_with_len(&t, &r), Some(false));

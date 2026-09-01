@@ -599,6 +599,9 @@ pub(crate) fn is_subtype(
                     uses_pep604_syntax: false,
                     can_be_true: true,
                     can_be_false: true,
+                    is_evaluated: true,
+                    original_str_expr: None,
+                    original_str_fallback: None,
                 };
                 if is_subtype(&union, right, ctx, resolver) == Some(true) {
                     return Some(true);
@@ -615,6 +618,9 @@ pub(crate) fn is_subtype(
                 uses_pep604_syntax: false,
                 can_be_true: true,
                 can_be_false: true,
+                is_evaluated: true,
+                original_str_expr: None,
+                original_str_fallback: None,
             };
             if is_subtype(&union, right, ctx, resolver) == Some(true) {
                 return Some(true);
@@ -734,7 +740,7 @@ pub(crate) fn is_subtype(
                 // subtypes.py:968-978: each left item must be a subtype of
                 // iter_type; UnpackType items unwrap to their element type.
                 for li in left_items {
-                    let li = if let Type::UnpackType { typ: inner } = li {
+                    let li = if let Type::UnpackType { typ: inner, .. } = li {
                         // get_proper_type(li.type): aliases defer;
                         // TypeVarTuple unwraps to upper_bound.
                         let unpacked = get_proper_type_or_defer(inner.as_ref(), resolver)?;
@@ -1323,7 +1329,7 @@ fn variadic_tuple_subtype(
         return Some(None);
     };
     let right_unpack = right_items.get(right_unpack_index)?;
-    let Type::UnpackType { typ: r_unpack } = right_unpack else {
+    let Type::UnpackType { typ: r_unpack, .. } = right_unpack else {
         return None;
     };
     // get_proper_type(right_unpack.type) must be a builtins.tuple
@@ -1380,7 +1386,7 @@ fn variadic_tuple_subtype(
     let left_prefix = left_unpack_index.unwrap();
     let left_suffix = left_items.len() - left_prefix - 1;
     let left_unpack = &left_items[left_prefix];
-    let Type::UnpackType { typ: l_unpack } = left_unpack else {
+    let Type::UnpackType { typ: l_unpack, .. } = left_unpack else {
         return None;
     };
     let left_unpacked = match get_proper_type_or_defer(l_unpack.as_ref(), resolver)? {
@@ -1617,7 +1623,7 @@ fn visit_instance_noninstance_right(
         // subtypes.py:597-604: single-item non-normalized tuple with an
         // UnpackType item wrapping an Instance.
         if items.len() == 1 {
-            if let Type::UnpackType { typ } = &items[0] {
+            if let Type::UnpackType { typ, .. } = &items[0] {
                 let unpacked = get_proper_type_or_defer(typ.as_ref(), resolver)?;
                 if matches!(unpacked, Type::Instance { .. }) {
                     return is_subtype(left, unpacked, ctx, resolver);
@@ -2062,6 +2068,9 @@ fn expand_type_by_instance(typ: &Type, left_ref: &str, left_args: &[Type]) -> Op
                 uses_pep604_syntax: *uses_pep604_syntax,
                 can_be_true,
                 can_be_false,
+                is_evaluated: true,
+                original_str_expr: None,
+                original_str_fallback: None,
             })
         }
         Type::NoneType | Type::UninhabitedType { .. } => Some(typ.clone()),
@@ -2086,6 +2095,7 @@ fn expand_type_by_instance(typ: &Type, left_ref: &str, left_args: &[Type]) -> Op
             variables,
             type_guard,
             type_is,
+            ..
         } => {
             // visit_callable_type (expandtype.py:870-918). Defer when a
             // declared ParamSpec means Python's param_spec() takes the
@@ -2140,6 +2150,7 @@ fn expand_type_by_instance(typ: &Type, left_ref: &str, left_args: &[Type]) -> Op
                 variables: variables.clone(),
                 type_guard: new_guard,
                 type_is: new_type_is,
+                special_sig: None,
             })
         }
         Type::Overloaded { items } => {
@@ -2199,12 +2210,13 @@ fn expand_type_by_instance(typ: &Type, left_ref: &str, left_args: &[Type]) -> Op
                 is_type_form: *is_type_form,
             })
         }
-        Type::UnpackType { typ } => {
+        Type::UnpackType { typ, .. } => {
             // visit_unpack_type (expandtype.py:370-380): expand the inner
             // type and rewrap (the variadic splice happens in the caller).
             let new_typ = expand_type_by_instance(typ, left_ref, left_args)?;
             Some(Type::UnpackType {
                 typ: Box::new(new_typ),
+                from_star_syntax: false,
             })
         }
         // Unsupported variants in the tree: fall through to Python.
@@ -2940,6 +2952,7 @@ fn expand_aliases_depth(
             uses_pep604_syntax,
             can_be_true,
             can_be_false,
+            ..
         } => {
             let new_items = items
                 .iter()
@@ -2952,6 +2965,9 @@ fn expand_aliases_depth(
                 uses_pep604_syntax: *uses_pep604_syntax,
                 can_be_true: *can_be_true,
                 can_be_false: *can_be_false,
+                is_evaluated: true,
+                original_str_expr: None,
+                original_str_fallback: None,
             })
         }
         Type::CallableType {
@@ -2972,6 +2988,7 @@ fn expand_aliases_depth(
             variables,
             type_guard,
             type_is,
+            ..
         } => {
             let fb =
                 expand_aliases_depth(fallback, alias_resolver, strict_optional, depth + 1, active)?;
@@ -3036,6 +3053,7 @@ fn expand_aliases_depth(
                 variables: variables.clone(),
                 type_guard: tg,
                 type_is: ti,
+                special_sig: None,
             })
         }
         Type::Overloaded { items } => {
@@ -3206,7 +3224,7 @@ fn expand_aliases_depth(
                 min_len: *min_len,
             })
         }
-        Type::UnpackType { typ } => {
+        Type::UnpackType { typ, .. } => {
             let inner = Box::new(expand_aliases_depth(
                 typ,
                 alias_resolver,
@@ -3214,7 +3232,10 @@ fn expand_aliases_depth(
                 depth + 1,
                 active,
             )?);
-            Some(Type::UnpackType { typ: inner })
+            Some(Type::UnpackType {
+                typ: inner,
+                from_star_syntax: false,
+            })
         }
         Type::TypedDictType {
             fallback,
@@ -3370,7 +3391,7 @@ fn is_erased_instance(t: &Type) -> Option<bool> {
 /// otherwise.
 fn is_erased_arg(arg: &Type) -> Option<bool> {
     match arg {
-        Type::UnpackType { typ } => {
+        Type::UnpackType { typ, .. } => {
             // get_proper_type(arg.type) — UnpackType wraps an Instance.
             let inner = typ.as_ref();
             if !matches!(inner, Type::Instance { .. }) {
@@ -3453,6 +3474,7 @@ fn erase_return_self_types_wire(typ: &Type, self_type: &Type) -> Option<Type> {
             variables,
             type_guard,
             type_is,
+            ..
         } => {
             if !match ret_type.as_ref() {
                 Type::Instance { .. } => ret_type.as_ref() == self_type,
@@ -3483,6 +3505,7 @@ fn erase_return_self_types_wire(typ: &Type, self_type: &Type) -> Option<Type> {
                 variables: variables.clone(),
                 type_guard: type_guard.clone(),
                 type_is: type_is.clone(),
+                special_sig: None,
             })
         }
         Type::Overloaded { items } => {
@@ -4356,6 +4379,7 @@ mod tests {
             variables: vec![],
             type_guard: None,
             type_is: None,
+            special_sig: None,
         }
     }
 
@@ -4439,6 +4463,9 @@ mod tests {
             uses_pep604_syntax: false,
             can_be_true: true,
             can_be_false: true,
+            is_evaluated: true,
+            original_str_expr: None,
+            original_str_fallback: None,
         };
         assert_eq!(is_subtype(&left, &right, &ctx_nominal(), &r), Some(true));
     }
@@ -4462,6 +4489,7 @@ mod tests {
         let r = make_resolver(vec![snap("a.A", "A")]);
         let left = Type::UnpackType {
             typ: Box::new(instance("a.A", vec![])),
+            from_star_syntax: false,
         };
         assert_eq!(
             is_subtype(&left, &Type::ErasedType, &ctx_nominal(), &r),
@@ -4628,6 +4656,7 @@ mod tests {
         let left = instance("a.A", vec![]);
         let unpack = Type::UnpackType {
             typ: Box::new(instance("a.Other", vec![])),
+            from_star_syntax: false,
         };
         let right = tuple_type(vec![unpack]);
         assert_eq!(is_subtype(&left, &right, &ctx_nominal(), &r), Some(false));
@@ -4688,6 +4717,7 @@ mod tests {
                     partial_fallback: Box::new(instance("builtins.tuple", vec![])),
                     items: vec![Type::UnpackType {
                         typ: Box::new(tvt.clone()),
+                        from_star_syntax: false,
                     }],
                     implicit: false,
                 }],
@@ -4841,6 +4871,7 @@ mod tests {
         // normalization is not ported, so defer.
         let unpack = Type::UnpackType {
             typ: Box::new(instance("builtins.tuple", vec![any_type()])),
+            from_star_syntax: false,
         };
         let t = tuple_type(vec![unpack]);
         assert_eq!(expand_type_by_instance(&t, "a.Sub", &[any_type()]), None);
@@ -4918,6 +4949,7 @@ mod tests {
                 name,
                 type_guard,
                 type_is,
+                ..
             } => Type::CallableType {
                 variables: vec![paramspec],
                 fallback,
@@ -4936,6 +4968,7 @@ mod tests {
                 name,
                 type_guard,
                 type_is,
+                special_sig: None,
             },
             _ => unreachable!(),
         };
@@ -4951,6 +4984,7 @@ mod tests {
         // (expandtype.py:840-868), which is not ported; defer.
         let unpack = Type::UnpackType {
             typ: Box::new(instance("builtins.tuple", vec![any_type()])),
+            from_star_syntax: false,
         };
         let t = callable_type(vec![], any_type(), None);
         let with_star = match t {
@@ -4972,6 +5006,7 @@ mod tests {
                 name,
                 type_guard,
                 type_is,
+                ..
             } => {
                 arg_types.push(unpack);
                 arg_kinds.push(ARG_STAR);
@@ -4994,6 +5029,7 @@ mod tests {
                     name,
                     type_guard,
                     type_is,
+                    special_sig: None,
                 }
             }
             _ => unreachable!(),
@@ -5077,6 +5113,9 @@ mod tests {
                 uses_pep604_syntax: false,
                 can_be_true: true,
                 can_be_false: true,
+                is_evaluated: true,
+                original_str_expr: None,
+                original_str_fallback: None,
             }),
             is_type_form: false,
         };
@@ -5100,6 +5139,7 @@ mod tests {
         };
         let t = Type::UnpackType {
             typ: Box::new(instance("a.Gen", vec![tvar])),
+            from_star_syntax: false,
         };
         let left_arg = instance("a.A", vec![]);
         let expanded = expand_type_by_instance(&t, "a.Sub", std::slice::from_ref(&left_arg));
@@ -5107,6 +5147,7 @@ mod tests {
             expanded,
             Some(Type::UnpackType {
                 typ: Box::new(instance("a.Gen", vec![left_arg])),
+                from_star_syntax: false,
             })
         );
     }
@@ -5188,6 +5229,7 @@ mod tests {
         let r = make_resolver(vec![snap("a.A", "A")]);
         let unpack = Type::UnpackType {
             typ: Box::new(instance("builtins.tuple", vec![instance("a.A", vec![])])),
+            from_star_syntax: false,
         };
         let left = tuple_type(vec![unpack]);
         let right = tuple_type(vec![instance("a.A", vec![])]);
@@ -5201,6 +5243,7 @@ mod tests {
         let r = make_resolver(vec![snap("a.A", "A")]);
         let unpack = Type::UnpackType {
             typ: Box::new(instance("builtins.tuple", vec![instance("a.A", vec![])])),
+            from_star_syntax: false,
         };
         let left = tuple_type(vec![unpack]);
         let right = instance("typing.Iterable", vec![instance("a.A", vec![])]);
@@ -5880,6 +5923,8 @@ mod tests {
             args: vec![],
             original_str_expr: None,
             original_str_fallback: None,
+            empty_tuple_index: false,
+            optional: false,
         };
         assert_eq!(is_subtype(&left, &right, &ctx_proper(), &r), Some(true));
     }
@@ -5926,6 +5971,7 @@ mod tests {
             variables: vec![],
             type_guard: None,
             type_is: None,
+            special_sig: None,
         };
         let left = Type::Overloaded {
             items: vec![ctor.clone()],
@@ -5995,6 +6041,7 @@ mod tests {
             variables: vec![],
             type_guard: None,
             type_is: None,
+            special_sig: None,
         }
     }
 
@@ -6123,6 +6170,8 @@ mod tests {
             args: vec![],
             original_str_expr: None,
             original_str_fallback: None,
+            empty_tuple_index: false,
+            optional: false,
         };
         assert_eq!(is_subtype(&left, &right, &ctx_proper(), &r), Some(false));
     }
@@ -6373,6 +6422,9 @@ mod tests {
             uses_pep604_syntax: false,
             can_be_true: false,
             can_be_false: false,
+            is_evaluated: true,
+            original_str_expr: None,
+            original_str_fallback: None,
         };
         assert_eq!(
             erase_return_self_types_wire(&union, &self_t).unwrap(),
@@ -6732,6 +6784,9 @@ mod tests {
             uses_pep604_syntax: false,
             can_be_true: true,
             can_be_false: false,
+            is_evaluated: true,
+            original_str_expr: None,
+            original_str_fallback: None,
         };
         let result = expand_aliases(&input, &ar, true);
         assert_eq!(
@@ -6745,6 +6800,9 @@ mod tests {
                 uses_pep604_syntax: false,
                 can_be_true: true,
                 can_be_false: false,
+                is_evaluated: true,
+                original_str_expr: None,
+                original_str_fallback: None,
             })
         );
     }
@@ -6768,6 +6826,9 @@ mod tests {
             uses_pep604_syntax: false,
             can_be_true: true,
             can_be_false: false,
+            is_evaluated: true,
+            original_str_expr: None,
+            original_str_fallback: None,
         };
         let result = expand_aliases(&input, &ar, true);
         assert_eq!(
@@ -6780,6 +6841,9 @@ mod tests {
                 uses_pep604_syntax: false,
                 can_be_true: true,
                 can_be_false: false,
+                is_evaluated: true,
+                original_str_expr: None,
+                original_str_fallback: None,
             })
         );
     }
@@ -6876,6 +6940,9 @@ mod tests {
             uses_pep604_syntax: false,
             can_be_true: true,
             can_be_false: true,
+            is_evaluated: true,
+            original_str_expr: None,
+            original_str_fallback: None,
         };
         TypeAliasSnapshot {
             fullname: fullname.to_string(),
@@ -6903,6 +6970,9 @@ mod tests {
                 uses_pep604_syntax: false,
                 can_be_true: true,
                 can_be_false: true,
+                is_evaluated: true,
+                original_str_expr: None,
+                original_str_fallback: None,
             })
         );
     }
@@ -6956,6 +7026,9 @@ mod tests {
             uses_pep604_syntax: false,
             can_be_true: true,
             can_be_false: true,
+            is_evaluated: true,
+            original_str_expr: None,
+            original_str_fallback: None,
         };
         let result = expand_aliases(&input, &ar, true);
         assert_eq!(
@@ -6968,6 +7041,9 @@ mod tests {
                 uses_pep604_syntax: false,
                 can_be_true: true,
                 can_be_false: true,
+                is_evaluated: true,
+                original_str_expr: None,
+                original_str_fallback: None,
             })
         );
     }
@@ -6989,6 +7065,9 @@ mod tests {
             uses_pep604_syntax: false,
             can_be_true: true,
             can_be_false: true,
+            is_evaluated: true,
+            original_str_expr: None,
+            original_str_fallback: None,
         };
         let result = expand_aliases(&input, &ar, true);
         assert_eq!(
@@ -7001,6 +7080,9 @@ mod tests {
                 uses_pep604_syntax: false,
                 can_be_true: true,
                 can_be_false: true,
+                is_evaluated: true,
+                original_str_expr: None,
+                original_str_fallback: None,
             })
         );
     }

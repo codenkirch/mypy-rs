@@ -117,6 +117,7 @@ fn apply_generic_arguments_inner(
         ref variables,
         ref type_guard,
         ref type_is,
+        ..
     } = callable
     else {
         unreachable!()
@@ -263,6 +264,7 @@ fn apply_generic_arguments_inner(
         variables: remaining_tvars,
         type_guard: new_type_guard,
         type_is: new_type_is,
+        special_sig: None,
     })
 }
 
@@ -882,6 +884,7 @@ mod tests {
     fn test_has_unpack_var_arg_true() {
         let arg_types = vec![Type::UnpackType {
             typ: Box::new(make_instance("builtins.tuple", vec![])),
+            from_star_syntax: false,
         }];
         let arg_kinds = vec![ARG_STAR];
         assert!(has_unpack_var_arg(&arg_types, &arg_kinds));

@@ -436,6 +436,7 @@ mod tests {
             variables: Vec::new(),
             type_guard: None,
             type_is: None,
+            special_sig: None,
         }
     }
 
@@ -705,6 +706,9 @@ mod tests {
             uses_pep604_syntax: false,
             can_be_true: true,
             can_be_false: true,
+            is_evaluated: true,
+            original_str_expr: None,
+            original_str_fallback: None,
         };
         let bytes = encode_type(&t);
         let value = encode_type_list(&[any_type(), any_type()]);

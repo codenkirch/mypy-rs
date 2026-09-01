@@ -135,6 +135,7 @@ fn rebuild_callable(
             variables: variables.unwrap_or_else(|| base_variables.clone()),
             type_guard: type_guard.clone(),
             type_is: type_is.clone(),
+            special_sig: None,
         })
     } else {
         None
@@ -203,6 +204,7 @@ fn set_callable_variables(typ: Type, variables: Vec<Type>) -> Type {
             variables,
             type_guard,
             type_is,
+            special_sig: None,
         }
     } else {
         typ

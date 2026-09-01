@@ -459,7 +459,10 @@ fn contract_with_unpack(
     resolver: Option<&TypeResolver>,
     aliases: Option<&crate::aliases::TypeAliasResolver>,
 ) -> Option<Vec<Vec<u8>>> {
-    let Type::UnpackType { typ: unpack_typ } = &types[unpack_index] else {
+    let Type::UnpackType {
+        typ: unpack_typ, ..
+    } = &types[unpack_index]
+    else {
         return None;
     };
     // Python: unpacked = get_proper_type(unpack.type). A top-level alias
@@ -606,6 +609,7 @@ pub(crate) fn rust_expand_starred_pattern_types(
                         last_known_value: None,
                         extra_attrs: None,
                     }),
+                    from_star_syntax: false,
                 });
             }
         }
@@ -1052,6 +1056,7 @@ mod tests {
     fn unpack(item: Type) -> Type {
         Type::UnpackType {
             typ: Box::new(instance("builtins.tuple", vec![item])),
+            from_star_syntax: false,
         }
     }
 
@@ -1111,6 +1116,7 @@ mod tests {
                     "builtins.tuple",
                     vec![instance("builtins.str", vec![])]
                 )),
+                from_star_syntax: false,
             }
         );
         // Non-star items pass through untouched.
@@ -1291,6 +1297,7 @@ mod tests {
             instance("builtins.int", vec![]),
             Type::UnpackType {
                 typ: Box::new(type_alias("mod.Tup")),
+                from_star_syntax: false,
             },
             instance("builtins.str", vec![]),
         ];
@@ -1313,6 +1320,7 @@ mod tests {
             instance("builtins.int", vec![]),
             Type::UnpackType {
                 typ: Box::new(type_alias("mod.Tup")),
+                from_star_syntax: false,
             },
             instance("builtins.str", vec![]),
         ];
@@ -1344,6 +1352,7 @@ mod tests {
             star,
             Type::UnpackType {
                 typ: Box::new(instance("builtins.tuple", vec![type_alias("mod.Str")])),
+                from_star_syntax: false,
             }
         );
         assert_eq!(decode_one(&res[0]), types[0]);
@@ -1442,6 +1451,7 @@ mod tests {
             variables: vec![],
             type_guard: None,
             type_is: None,
+            special_sig: None,
         }
     }
 
@@ -1456,6 +1466,9 @@ mod tests {
             uses_pep604_syntax: false,
             can_be_true: true,
             can_be_false: true,
+            is_evaluated: true,
+            original_str_expr: None,
+            original_str_fallback: None,
         }
     }
 

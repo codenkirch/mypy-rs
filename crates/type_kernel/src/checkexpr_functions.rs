@@ -410,7 +410,7 @@ fn children(typ: &Type) -> Vec<&Type> {
     let mut out = Vec::new();
     match typ {
         Type::UnboundType { args, .. } => out.extend(args.iter()),
-        Type::UnpackType { typ } => out.push(typ),
+        Type::UnpackType { typ, .. } => out.push(typ),
         Type::Instance {
             args,
             last_known_value,
@@ -2039,6 +2039,9 @@ fn conditional_join_inner(
                 uses_pep604_syntax: false,
                 can_be_true: true,
                 can_be_false: true,
+                is_evaluated: true,
+                original_str_expr: None,
+                original_str_fallback: None,
             })
         }
         Some(crate::setops::SetOpResult::Any) => {
@@ -2109,6 +2112,9 @@ fn conditional_join_inner(
                 uses_pep604_syntax: false,
                 can_be_true: true,
                 can_be_false: true,
+                is_evaluated: true,
+                original_str_expr: None,
+                original_str_fallback: None,
             })
         }
     }
@@ -2318,6 +2324,9 @@ fn join_one_pair(
             uses_pep604_syntax: false,
             can_be_true: true,
             can_be_false: true,
+            is_evaluated: true,
+            original_str_expr: None,
+            original_str_fallback: None,
         }),
         Some(crate::setops::SetOpResult::Any) => Some(Type::AnyType {
             type_of_any: TYPE_OF_ANY_SPECIAL_FORM,
@@ -2557,7 +2566,7 @@ fn unpack_expand_updated(result: &Type) -> Option<Type> {
     };
     if items.len() == 1 {
         let item = &items[0];
-        if let Type::UnpackType { typ: inner } = item {
+        if let Type::UnpackType { typ: inner, .. } = item {
             match inner.as_ref() {
                 Type::Instance { type_ref, args, .. } if type_ref == "builtins.tuple" => {
                     // Normalize Tuple[*tuple[X, ...]] -> tuple[X, ...].
@@ -2880,7 +2889,7 @@ fn visit_tuple_index_helper_inner(
 
     let unpack_index = unpack_index.unwrap();
     let unpack = &items[unpack_index];
-    let Type::UnpackType { typ } = unpack else {
+    let Type::UnpackType { typ, .. } = unpack else {
         return None;
     };
     let unpacked = get_proper_or_none(typ.as_ref())?;
@@ -2927,6 +2936,9 @@ fn visit_tuple_index_helper_inner(
             uses_pep604_syntax: false,
             can_be_true: true,
             can_be_false: true,
+            is_evaluated: true,
+            original_str_expr: None,
+            original_str_fallback: None,
         };
         encode_type(&result)
     } else {
@@ -2949,6 +2961,9 @@ fn visit_tuple_index_helper_inner(
             uses_pep604_syntax: false,
             can_be_true: true,
             can_be_false: true,
+            is_evaluated: true,
+            original_str_expr: None,
+            original_str_fallback: None,
         };
         encode_type(&result)
     }
@@ -3051,6 +3066,9 @@ fn visit_tuple_slice_helper_inner(
         uses_pep604_syntax: false,
         can_be_true: true,
         can_be_false: true,
+        is_evaluated: true,
+        original_str_expr: None,
+        original_str_fallback: None,
     };
     encode_type(&result)
 }
@@ -3306,6 +3324,9 @@ mod tests {
             uses_pep604_syntax: false,
             can_be_true: true,
             can_be_false: true,
+            is_evaluated: true,
+            original_str_expr: None,
+            original_str_fallback: None,
         }
     }
 
@@ -3725,6 +3746,9 @@ mod tests {
             uses_pep604_syntax: false,
             can_be_true: true,
             can_be_false: true,
+            is_evaluated: true,
+            original_str_expr: None,
+            original_str_fallback: None,
         };
         resolver.insert(
             "mod.A".to_string(),
@@ -4378,6 +4402,9 @@ mod tests {
             uses_pep604_syntax: false,
             can_be_true: true,
             can_be_false: true,
+            is_evaluated: true,
+            original_str_expr: None,
+            original_str_fallback: None,
         };
         assert_eq!(has_bytes_component_inner(&u, &aliases), Some(true));
     }
@@ -4692,6 +4719,9 @@ mod tests {
             uses_pep604_syntax: false,
             can_be_true: true,
             can_be_false: true,
+            is_evaluated: true,
+            original_str_expr: None,
+            original_str_fallback: None,
         };
         assert_eq!(is_type_type_context_inner(&t, &aliases), Some(true));
     }
@@ -4977,6 +5007,7 @@ mod tests {
             variables: vec![],
             type_guard: None,
             type_is: None,
+            special_sig: None,
         }
     }
 
@@ -5084,6 +5115,7 @@ mod tests {
             variables: vec![],
             type_guard: None,
             type_is: None,
+            special_sig: None,
         };
         assert_eq!(method_fullname_inner(&t, "foo", &empty_resolver()), None);
     }
@@ -5126,6 +5158,7 @@ mod tests {
             make_instance("builtins.tuple", vec![]),
             vec![Type::UnpackType {
                 typ: Box::new(make_instance("builtins.tuple", vec![])),
+                from_star_syntax: false,
             }],
         );
         assert_eq!(method_fullname_inner(&t, "foo", &empty_resolver()), None);
@@ -5325,6 +5358,7 @@ mod tests {
                 make_instance("int", vec![]),
                 Type::UnpackType {
                     typ: Box::new(make_instance("builtins.tuple", vec![])),
+                    from_star_syntax: false,
                 },
                 make_instance("int", vec![]),
             ],
@@ -5338,6 +5372,7 @@ mod tests {
             make_instance("builtins.tuple", vec![]),
             vec![Type::UnpackType {
                 typ: Box::new(make_instance("builtins.tuple", vec![])),
+                from_star_syntax: false,
             }],
         );
         assert_eq!(tuple_context_matches_inner(&[1, 1], &ctx), Some(false));
@@ -5368,6 +5403,7 @@ mod tests {
             make_instance("int", vec![]),
             Type::UnpackType {
                 typ: Box::new(make_instance("builtins.tuple", vec![])),
+                from_star_syntax: false,
             },
         ];
         assert_eq!(find_unpack_in_list_inner(&items), Some(1));
@@ -5665,6 +5701,7 @@ mod tests {
         let inner_items = make_instance("builtins.int", vec![]);
         let star = Type::UnpackType {
             typ: Box::new(make_instance("builtins.tuple", vec![inner_items.clone()])),
+            from_star_syntax: false,
         };
         let result = Type::TupleType {
             partial_fallback: Box::new(make_instance("builtins.tuple", vec![])),
@@ -5691,6 +5728,7 @@ mod tests {
                 "builtins.list",
                 vec![make_instance("builtins.int", vec![])],
             )),
+            from_star_syntax: false,
         };
         let result = Type::TupleType {
             partial_fallback: Box::new(make_instance("builtins.tuple", vec![])),
@@ -5721,7 +5759,10 @@ mod tests {
             default: Box::new(make_any(TYPE_OF_ANY_FROM_OMITTED_GENERICS)),
             min_len: 0,
         };
-        let star = Type::UnpackType { typ: Box::new(ts) };
+        let star = Type::UnpackType {
+            typ: Box::new(ts),
+            from_star_syntax: false,
+        };
         let tuple = Type::TupleType {
             partial_fallback: Box::new(make_instance("builtins.tuple", vec![])),
             items: vec![star],
@@ -6615,6 +6656,7 @@ mod is_valid_var_arg_tests {
             var_arg(
                 &Type::UnpackType {
                     typ: Box::new(instance("builtins.list")),
+                    from_star_syntax: false,
                 },
                 false
             ),
@@ -7839,6 +7881,9 @@ mod classify_check_boolean_op_tests {
             uses_pep604_syntax: false,
             can_be_true: true,
             can_be_false: true,
+            is_evaluated: true,
+            original_str_expr: None,
+            original_str_fallback: None,
         };
         let r = with_py(|py| {
             classify_check_boolean_op(
@@ -7923,6 +7968,9 @@ mod classify_check_boolean_op_tests {
             uses_pep604_syntax: false,
             can_be_true: true,
             can_be_false: true,
+            is_evaluated: true,
+            original_str_expr: None,
+            original_str_fallback: None,
         }
     }
 

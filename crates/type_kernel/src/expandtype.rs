@@ -639,6 +639,9 @@ pub(crate) fn expand_type_inner(
                     uses_pep604_syntax: *uses_pep604_syntax,
                     can_be_true: can_t,
                     can_be_false: can_f,
+                    is_evaluated: true,
+                    original_str_expr: None,
+                    original_str_fallback: None,
                 });
             }
             let flat = match flatten_union_expanding_aliases(&expanded) {
@@ -675,7 +678,7 @@ pub(crate) fn expand_type_inner(
             let new_items = expand_type_list_with_unpack(items, env, strict_optional)?;
             // Normalize Tuple[*Tuple[X, ...]] -> Tuple[X, ...].
             if new_items.len() == 1 {
-                if let Type::UnpackType { typ: inner } = &new_items[0] {
+                if let Type::UnpackType { typ: inner, .. } = &new_items[0] {
                     // Python checks: not (TypeAliasType and is_recursive).
                     // Rust defers TypeAliasType entirely, so inner is never
                     // a TypeAliasType here.
@@ -747,6 +750,7 @@ pub(crate) fn expand_type_inner(
             variables,
             type_guard,
             type_is,
+            ..
         } => {
             // (expandtype.py:435-502). The ParamSpec branch
             // (expandtype.py:436-480) is deferred to Python: if any
@@ -805,16 +809,18 @@ pub(crate) fn expand_type_inner(
                 variables: variables.clone(),
                 type_guard: new_type_guard,
                 type_is: new_type_is,
+                special_sig: None,
             })
         }
 
-        Type::UnpackType { typ } => {
+        Type::UnpackType { typ, .. } => {
             // (expandtype.py:370-380). visit_unpack_type carries a variadic
             // tuple over. We expand the inner type. The expand_unpack
             // list-expansion path is handled at the tuple/instance level.
             let new_typ = expand_type_inner(typ, env, strict_optional)?;
             Some(Type::UnpackType {
                 typ: Box::new(new_typ),
+                from_star_syntax: false,
             })
         }
 
@@ -923,7 +929,7 @@ fn expand_type_tuple_with_unpack(
 ) -> Option<Vec<Type>> {
     let mut items = Vec::with_capacity(typs.len());
     for item in typs {
-        if let Type::UnpackType { typ: inner } = item {
+        if let Type::UnpackType { typ: inner, .. } = item {
             if let Type::TypeVarTupleType { .. } = inner.as_ref() {
                 // expand_unpack (expandtype.py:382-400).
                 let spliced = expand_unpack(inner, env)?;
@@ -1055,7 +1061,7 @@ fn expand_unpack(tvt: &Type, env: &HashMap<EnvKey, Type>) -> Option<Vec<Type>> {
     };
     // If the replacement is itself an UnpackType, unwrap once
     // (expandtype.py:385-386).
-    let repl = if let Type::UnpackType { typ: inner } = tvt {
+    let repl = if let Type::UnpackType { typ: inner, .. } = tvt {
         inner.as_ref()
     } else {
         tvt
@@ -1065,10 +1071,12 @@ fn expand_unpack(tvt: &Type, env: &HashMap<EnvKey, Type>) -> Option<Vec<Type>> {
         Type::Instance { type_ref, .. } if type_ref == "builtins.tuple" => {
             Some(vec![Type::UnpackType {
                 typ: Box::new(repl.clone()),
+                from_star_syntax: false,
             }])
         }
         Type::TypeVarTupleType { .. } => Some(vec![Type::UnpackType {
             typ: Box::new(repl.clone()),
+            from_star_syntax: false,
         }]),
         Type::AnyType { .. } | Type::UninhabitedType { .. } => {
             // (expandtype.py:395-398) Replace *Ts = Any/Never with
@@ -1097,6 +1105,7 @@ fn expand_unpack(tvt: &Type, env: &HashMap<EnvKey, Type>) -> Option<Vec<Type>> {
             };
             Some(vec![Type::UnpackType {
                 typ: Box::new(new_fallback),
+                from_star_syntax: false,
             }])
         }
         _ => {
@@ -1184,7 +1193,7 @@ pub(crate) fn result_has_typevar(typ: &Type) -> bool {
                 stack.extend(params.variables.iter());
             }
             Type::TypeType { item, .. } => stack.push(item),
-            Type::UnpackType { typ } => stack.push(typ),
+            Type::UnpackType { typ, .. } => stack.push(typ),
             Type::LiteralType { fallback, .. } => stack.push(fallback),
             _ => {}
         }
@@ -1241,7 +1250,7 @@ pub(crate) fn result_contains_typealias(typ: &Type) -> bool {
                 stack.extend(params.variables.iter());
             }
             Type::TypeType { item, .. } => stack.push(item),
-            Type::UnpackType { typ } => stack.push(typ),
+            Type::UnpackType { typ, .. } => stack.push(typ),
             Type::LiteralType { fallback, .. } => stack.push(fallback),
             _ => {}
         }
@@ -1254,7 +1263,7 @@ pub(crate) fn result_contains_typealias(typ: &Type) -> bool {
 /// (expandtype.py:536-551) which returns the unpacked Instance directly.
 /// Returns None otherwise.
 fn normalize_tuple_unpack_to_instance(arg: &Type) -> Option<Type> {
-    if let Type::UnpackType { typ: inner } = arg {
+    if let Type::UnpackType { typ: inner, .. } = arg {
         if let Type::Instance { type_ref, .. } = inner.as_ref() {
             if type_ref == "builtins.tuple" {
                 return Some((**inner).clone());
@@ -1425,6 +1434,7 @@ mod tests {
             partial_fallback: Box::new(tuple_instance()),
             items: vec![Type::UnpackType {
                 typ: Box::new(type_var_tuple(42)),
+                from_star_syntax: false,
             }],
             implicit: false,
         };
@@ -1483,6 +1493,7 @@ mod tests {
             partial_fallback: Box::new(tuple_instance()),
             items: vec![Type::UnpackType {
                 typ: Box::new(type_var_tuple(42)),
+                from_star_syntax: false,
             }],
             implicit: false,
         };
@@ -1680,6 +1691,9 @@ mod tests {
             uses_pep604_syntax: false,
             can_be_true,
             can_be_false,
+            is_evaluated: true,
+            original_str_expr: None,
+            original_str_fallback: None,
         }
     }
 
