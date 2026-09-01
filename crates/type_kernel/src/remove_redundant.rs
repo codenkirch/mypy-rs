@@ -9,7 +9,7 @@ use pyo3::prelude::*;
 
 use crate::subtypes::{is_subtype, SubtypeContext};
 use crate::typeinfo::{NativeTypeResolver, TypeResolver};
-use crate::wire::{self, LiteralValue, ReadBuffer, Type, WriteBuffer};
+use crate::wire::{self, ReadBuffer, Type, WriteBuffer};
 
 /// Why a `find_subtype_index` scan produced no duplicate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -29,9 +29,9 @@ fn encode_type_list(items: &[Type]) -> Option<Vec<u8>> {
     Some(buf.into_bytes())
 }
 
-/// True when any `TypeAliasType` survives in the tree. The pass re-encodes
-/// its result as wire bytes, and the Python side's wire fixup defers on a
-/// decoded alias, so a surviving alias makes the whole result undecodable.
+/// True when any `TypeAliasType` survives in the tree. Used as a cheap
+/// pre-check to decide whether an item needs deep alias expansion before
+/// the dedup scan (the scan itself defers on any surviving alias node).
 fn tree_has_alias(t: &Type) -> bool {
     match t {
         Type::TypeAliasType { .. } => true,
@@ -119,111 +119,49 @@ fn tree_has_alias(t: &Type) -> bool {
     }
 }
 
-/// `Type.can_be_true_default()` for the wire variants, for the
-/// truthiness merge in `remove_redundant_pass`. Mirrors
-/// `types.py:295-3459` restricted to the forms that can appear as
-/// flattened union items. Enum literals, tuples, aliases, and the
-/// numeric builtins defer (their defaults need live `TypeInfo` reads).
-fn wire_can_be_true_default(t: &Type) -> Option<bool> {
-    match t {
-        Type::UninhabitedType { .. } => Some(false),
-        Type::NoneType => Some(false),
-        Type::LiteralType { value, fallback } => {
-            let Type::Instance { type_ref, .. } = fallback.as_ref() else {
-                return Some(true);
-            };
-            // Enum literals need the snapshot's is_enum + fallback
-            // truthiness; defer rather than guess.
-            if type_ref.starts_with("builtins.") {
-                Some(match value {
-                    LiteralValue::Int(v) => *v != 0,
-                    LiteralValue::Str(v) => !v.is_empty(),
-                    LiteralValue::Bool(v) => *v,
-                    LiteralValue::Bytes(v) => !v.is_empty(),
-                    LiteralValue::Float(v) => *v != 0.0,
-                })
-            } else {
-                None
-            }
-        }
-        Type::UnionType { items, .. } => {
-            for item in items {
-                match wire_can_be_true_default(item) {
-                    Some(true) => return Some(true),
-                    Some(false) => {}
-                    None => return None,
-                }
-            }
-            Some(false)
-        }
-        _ => Some(true),
-    }
-}
-
-/// `Type.can_be_false_default()` for the wire variants; see
-/// `wire_can_be_true_default` for the deferral policy.
-fn wire_can_be_false_default(t: &Type) -> Option<bool> {
-    match t {
-        Type::UninhabitedType { .. } => Some(false),
-        Type::NoneType => Some(true),
-        Type::LiteralType { value, fallback } => {
-            let Type::Instance { type_ref, .. } = fallback.as_ref() else {
-                return Some(true);
-            };
-            if type_ref.starts_with("builtins.") {
-                Some(match value {
-                    LiteralValue::Int(v) => *v == 0,
-                    LiteralValue::Str(v) => v.is_empty(),
-                    LiteralValue::Bool(v) => !*v,
-                    LiteralValue::Bytes(v) => v.is_empty(),
-                    LiteralValue::Float(v) => *v == 0.0,
-                })
-            } else {
-                None
-            }
-        }
-        Type::UnionType { items, .. } => {
-            for item in items {
-                match wire_can_be_false_default(item) {
-                    Some(true) => return Some(true),
-                    Some(false) => {}
-                    None => return None,
-                }
-            }
-            Some(false)
-        }
-        _ => Some(true),
-    }
-}
-
-/// `true_or_false(t)` (typeops.py:1336-1358): widen a type so both
-/// truthiness values are possible. Python's `copy_type` + default flag
-/// reset is a no-op on the wire (defaults are not carried).
-fn true_or_false(t: &Type) -> Type {
-    t.clone()
-}
-
-/// One pass of `_remove_redundant_union_items` (typeops.py:1098-1167):
+/// One pass of `_remove_redundant_union_items` (typeops.py:1399-1468):
 /// scan `items`, build `new_items` dropping UninhabitedType,
 /// exact-duplicates (via a seen map), and subtypes of earlier items.
 /// Mirrors the pure-Python loop including the LiteralType fallback-set
-/// optimization and the last_known_value guard.
 pub(crate) fn remove_redundant_pass(
     items: &[Type],
     ctx: &SubtypeContext,
     resolver: &TypeResolver,
     keep_erased: bool,
 ) -> Option<Vec<Type>> {
-    let mut new_items: Vec<Type> = Vec::new();
-    // seen maps a type to its index in new_items. Since wire `Type` is
-    // not `Hash`, resolve exact duplicates by a linear equality scan;
-    // Python's `seen` dict does the same membership test.
-    let mut seen: Vec<(Type, usize)> = Vec::new();
+    Some(
+        remove_redundant_pass_indices(items, ctx, resolver, keep_erased)?
+            .into_iter()
+            .map(|i| items[i].clone())
+            .collect(),
+    )
+}
+
+/// The same pass, returning the *indices* into `items` that survived.
+/// The rru entry maps these onto the deep-expanded scan tree, which
+/// becomes the alias-free, round-trip-safe output (the wire fixup
+/// decode defers on a surviving `TypeAliasType`).
+///
+/// Python's truthiness-widening write (`true_or_false` on a duplicate's
+/// survivor, typeops.py:1449-1455) is a content no-op here: the wire
+/// seam only engages when every item has unmutated truthiness flags
+/// (`_has_mutated_truthiness` gate in typeops.py), so resetting a
+/// survivor to its default flags never changes content.
+pub(crate) fn remove_redundant_pass_indices(
+    items: &[Type],
+    ctx: &SubtypeContext,
+    resolver: &TypeResolver,
+    keep_erased: bool,
+) -> Option<Vec<usize>> {
+    // Survivors, as indices into `items` in output order. Since wire
+    // `Type` is not `Hash`, resolve exact duplicates by a linear
+    // equality scan (Python's `seen` dict: identical content membership).
+    let mut surv: Vec<usize> = Vec::new();
     // unduplicated_literal_fallbacks: wire bytes of the fallback
     // Instances already added without a supertype found.
     let mut unduplicated_literal_fallbacks: Option<Vec<Vec<u8>>> = None;
-    for ti in items {
-        // UninhabitedType is always redundant (typeops.py:1107-1108).
+    for (i, ti) in items.iter().enumerate() {
+        // UninhabitedType is always redundant (typeops.py:1407-1408).
         if matches!(ti, Type::UninhabitedType { .. }) {
             continue;
         }
@@ -234,61 +172,41 @@ pub(crate) fn remove_redundant_pass(
             if !keep_erased {
                 continue;
             }
-            seen.push((ti.clone(), new_items.len()));
-            new_items.push(ti.clone());
+            surv.push(i);
             continue;
         }
-        let mut duplicate_index: Option<usize> = None;
-        // Exact-duplicate fast path (typeops.py:1112-1113): Python keys
+        // Exact-duplicate fast path (typeops.py:1412-1414): Python keys
         // `seen` on structural equality; mirror it with a linear scan.
-        let exact_dup = seen.iter().any(|(t, _)| t == ti);
-        if exact_dup {
-            duplicate_index = seen.iter().find(|(t, _)| t == ti).map(|(_, j)| *j);
-        } else {
+        let mut duplicate = surv.iter().position(|&k| items[k] == *ti);
+        if duplicate.is_none() {
             // A LiteralType whose fallback already failed the subtype
             // scan is a known non-duplicate; skip the scan (typeops.py:
-            // 1114-1126).
+            // 1415-1427).
             let skip_scan = matches!(ti, Type::LiteralType { .. })
                 && unduplicated_literal_fallbacks
                     .as_ref()
                     .is_some_and(|fbs| encode_fallback_key(ti).is_some_and(|k| fbs.contains(&k)));
             if !skip_scan {
-                match find_subtype_index(&new_items, ti, ctx, resolver) {
-                    ScanOutcome::Found(j) => duplicate_index = Some(j),
+                match find_subtype_index(items, &surv, ti, ctx, resolver) {
+                    ScanOutcome::Found(j) => duplicate = Some(j),
                     ScanOutcome::NoneFound => {}
                     ScanOutcome::Deferred => return None,
                 }
             }
         }
-        match duplicate_index {
-            Some(j) => {
-                // If the deleted subtype had more general truthiness,
-                // widen the surviving item (typeops.py:1148-1154).
-                let orig = &new_items[j];
-                let orig_can_be_true = wire_can_be_true_default(orig);
-                let ti_can_be_true = wire_can_be_true_default(ti);
-                let orig_can_be_false = wire_can_be_false_default(orig);
-                let ti_can_be_false = wire_can_be_false_default(ti);
-                if (orig_can_be_true == Some(false) && ti_can_be_true == Some(true))
-                    || (orig_can_be_false == Some(false) && ti_can_be_false == Some(true))
-                {
-                    new_items[j] = true_or_false(orig);
-                }
+        if duplicate.is_some() {
+            continue;
+        }
+        surv.push(i);
+        if let Type::LiteralType { .. } = ti {
+            let key = encode_fallback_key(ti)?;
+            if unduplicated_literal_fallbacks.is_none() {
+                unduplicated_literal_fallbacks = Some(Vec::new());
             }
-            None => {
-                seen.push((ti.clone(), new_items.len()));
-                new_items.push(ti.clone());
-                if let Type::LiteralType { .. } = ti {
-                    let key = encode_fallback_key(ti)?;
-                    if unduplicated_literal_fallbacks.is_none() {
-                        unduplicated_literal_fallbacks = Some(Vec::new());
-                    }
-                    unduplicated_literal_fallbacks.as_mut().unwrap().push(key);
-                }
-            }
+            unduplicated_literal_fallbacks.as_mut().unwrap().push(key);
         }
     }
-    Some(new_items)
+    Some(surv)
 }
 
 /// Serialize a LiteralType's fallback Instance to a stable byte key.
@@ -301,18 +219,20 @@ fn encode_fallback_key(t: &Type) -> Option<Vec<u8>> {
     Some(buf.into_bytes())
 }
 
-/// The subtype scan against `new_items` (typeops.py:1128-1147).
-/// Returns the index of the first earlier item that is a proper
-/// supertype of `ti`, skipping any previous item that has a
-/// `last_known_value` differing from `ti`'s. Deferred when the
-/// subtype engine cannot decide a pair.
+/// The subtype scan against the surviving items (typeops.py:1429-1448).
+/// Returns the position in `surv` of the first survivor that is a proper
+/// supertype of `ti`, skipping any survivor with a `last_known_value`
+/// differing from `ti`'s. Deferred when the subtype engine cannot decide
+/// a pair.
 fn find_subtype_index(
-    new_items: &[Type],
+    items: &[Type],
+    surv: &[usize],
     ti: &Type,
     ctx: &SubtypeContext,
     resolver: &TypeResolver,
 ) -> ScanOutcome {
-    for (j, tj) in new_items.iter().enumerate() {
+    for (j, &k) in surv.iter().enumerate() {
+        let tj = &items[k];
         // An ErasedType item is never a supertype (subtypes.py
         // visit_erased_type returns False unless keep_erased_types).
         if matches!(tj, Type::ErasedType) {
@@ -329,7 +249,7 @@ fn find_subtype_index(
             } = ti
             {
                 // A previous instance carrying a differing literal value
-                // is not a supertype of this item (typeops.py:1131-1141).
+                // is not a supertype of this item (typeops.py:1432-1442).
                 if ti_lkv != tj_lkv {
                     continue;
                 }
@@ -363,40 +283,39 @@ pub(crate) fn rust_remove_redundant_union_items(
         Ok(items) => items,
         Err(_) => return None,
     };
-    // Python computes `proper_ti = get_proper_type(ti)` per item
-    // (typeops.py:1148): an alias-backed item dedups as its expanded
-    // target. Expand alias items up front (raw target); defer on `?`.
+    // Alias-backed items dedup as their expanded target (typeops.py:1405):
+    // root-expand, scan deep-expanded copies, output deep-expanded survivors,
+    // the #774 contract extended to nested aliases (`str(aliastyp)` == target).
     let mut current = Vec::with_capacity(items.len());
     for ti in items {
-        match ti {
+        let root = match ti {
             Type::TypeAliasType { .. } => {
-                let target = crate::checkexpr_functions::expand_alias_target_raw(
-                    &ti,
-                    resolver.alias_resolver(),
-                )?;
-                current.push(target);
+                crate::checkexpr_functions::expand_alias_target_raw(&ti, resolver.alias_resolver())?
             }
-            _ => {
-                // Python only expands alias roots per item, so a nested
-                // alias may survive here; the sweep below fixes that.
-                current.push(ti);
-            }
-        }
-    }
-    // Post-root-expansion sweep, covering chain aliases whose raw target
-    // still carries an alias node.
-    for ti in &current {
-        if tree_has_alias(ti) {
-            return None;
+            _ => ti,
+        };
+        if tree_has_alias(&root) {
+            let deep =
+                crate::subtypes::expand_aliases(&root, resolver.alias_resolver(), strict_optional)?;
+            current.push(deep);
+        } else {
+            current.push(root);
         }
     }
     let ctx = SubtypeContext::new(false, false, false, true, true, strict_optional);
     for _direction in 0..2 {
-        current = remove_redundant_pass(&current, &ctx, resolver.resolver(), keep_erased)?;
+        let surv = remove_redundant_pass_indices(&current, &ctx, resolver.resolver(), keep_erased)?;
+        current = surv.iter().map(|&i| current[i].clone()).collect();
         if current.len() <= 1 {
             break;
         }
         current.reverse();
+    }
+    // An alias the snapshot could not fully expand (missing, variadic,
+    // substitution wall) may survive both passes: prefer the shim's
+    // fallback over bytes the Python side cannot decode.
+    if current.iter().any(tree_has_alias) {
+        return None;
     }
     encode_type_list(&current)
 }
@@ -404,6 +323,7 @@ pub(crate) fn rust_remove_redundant_union_items(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::wire::LiteralValue;
 
     fn snap(fullname: &str, name: &str) -> crate::typeinfo::TypeInfoSnapshot {
         let mut s = crate::typeinfo::TypeInfoSnapshot {
