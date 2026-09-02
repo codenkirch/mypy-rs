@@ -1241,6 +1241,18 @@ class BuildManager:
         from mypy.plugins.dataclasses import _set_native_dataclasses_active
 
         _set_native_dataclasses_active(self.options.native_type_kernel)
+        # Phase F1 (#1370): activate the dual-write shadow mirror. This is
+        # independent of the type-kernel gate: the mirror wraps live Python
+        # classes, so it works with the kernel on or off.
+        if self.options.native_type_mirror:
+            import os as _os_mirror
+
+            from mypy import types_mirror
+
+            types_mirror.activate(
+                strict=_os_mirror.environ.get("MYPY_TK_MIRROR") == "1",
+                audit=_os_mirror.environ.get("MYPY_TK_MIRROR_AUDIT") == "1",
+            )
         # Stage 3c/4 production wiring (M8bb): the resolver is built per
         # SCC in `process_stale_scc` (after semantic analysis populates
         # the TypeInfo graph). See `_build_native_resolvers` for status.
@@ -1712,6 +1724,13 @@ class BuildManager:
         build starts from an empty snapshot instead of accumulating into a
         stale one.
         """
+        if self.options.native_type_mirror:
+            # Mirror state pins live objects and caches wire bytes; a
+            # stale graph must never survive a build boundary even when
+            # the type-kernel gate is off (mirror runs standalone).
+            from mypy import types_mirror
+
+            types_mirror.reset()
         if not self.options.native_type_kernel:
             return
         self._native_resolver = None

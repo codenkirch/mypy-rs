@@ -468,6 +468,8 @@ def parse_options(
     options.native_parser = _env_gate("TEST_NATIVE_PARSER")
     options.native_resolver = _env_gate("TEST_NATIVE_RESOLVER")
     options.native_type_kernel = _env_gate("TEST_NATIVE_TYPE_KERNEL")
+    # Mirror is capture-only; a missing extension degrades to a no-op.
+    options.native_type_mirror = _env_gate("TEST_NATIVE_TYPE_MIRROR")
     _ensure_native_modules_available()
 
     # Allow custom python version to override testfile_pyversion.
