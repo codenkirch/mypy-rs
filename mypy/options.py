@@ -410,6 +410,10 @@ class Options:
         # testcheck) was proven green. Use `--no-native-type-kernel`
         # to force the pure-Python path for differential testing.
         self.native_type_kernel = True
+        # Phase F1 (#1370): dual-write shadow mirror of the four family
+        # classes into Rust storage, asserted at wire-serializer seams.
+        # Capture-only in F1 (no consumer reads the mirror); default off.
+        self.native_type_mirror = False
         # Some behaviors are changed when using Bazel (https://bazel.build).
         self.bazel = False
         # If True, export inferred types for all expressions as BuildResult.types
