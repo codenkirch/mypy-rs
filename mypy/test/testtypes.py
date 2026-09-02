@@ -9057,6 +9057,119 @@ class NativeProtocolImplementationSuite(Suite):
             del _PROTOCOL_PAIRS_IN_FLIGHT[key]
         assert result is True, f"in-flight pair must cut True, got {result!r}"
 
+    def test_flush_returns_but_never_caches_cut_answers(self) -> None:
+        """A true answer sampled through a registry-consult cut is correct
+        only for the derivation that took the cut: `_flush_subtype_batch`
+        must hand it to the triggering call but never persist it into
+        `_subtype_answers`. Without this, a later fresh derivation of the
+        same pair reads the poisoned True cache
+        (testProtocolIncompatibilityWithUnionType, batch poisoning)."""
+        import mypy.subtypes as subtypes_mod
+        from mypy.subtypes import (
+            _PROTOCOL_PAIRS_IN_FLIGHT,
+            _clear_subtype_batch,
+            _set_native_subtype_active,
+            _set_native_subtype_resolver,
+        )
+        from mypy.types import Instance
+
+        self._live_info = {}
+        # left f -> object vs right f -> A: the member loop alone says
+        # False, so a True answer can only come from the consult cut.
+        p1 = self._protocol("mod.FlushCutP1", ["f"])
+        p2 = self._protocol("mod.FlushCutP2", ["f"])
+        fnode = p1.names["f"].node
+        assert isinstance(fnode, FuncDef)
+        fnode.type = self._method_with_return(p1, self.fx.o)
+        self._build_resolver()
+        _set_native_subtype_active(True)
+        _set_native_subtype_resolver(self.resolver)
+        left, right = Instance(p1, []), Instance(p2, [])
+        left_b, right_b = self._serialize(left), self._serialize(right)
+        ctx_key = (False, False, False, False, False, True, False, False)
+        pair_key = (left_b, right_b, False)
+        assert pair_key not in _PROTOCOL_PAIRS_IN_FLIGHT
+        _PROTOCOL_PAIRS_IN_FLIGHT[pair_key] = 1
+        flushed_key = (left_b, right_b, ctx_key)
+        try:
+            _clear_subtype_batch()
+            # Sibling pair (any instance <: object) rides the same batch;
+            # its code-1 answer must still be cached.
+            sibling = (self._serialize(right), self._serialize(Instance(self.fx.oi, [])), ctx_key)
+            subtypes_mod._subtype_batch.append((left_b, right_b, ctx_key))
+            subtypes_mod._subtype_batch.append(sibling)
+            answers = subtypes_mod._flush_subtype_batch()
+            assert answers.get(flushed_key) is True, f"cut answer must reach the caller: {answers!r}"
+            # (_clear_subtype_batch wipes _subtype_answers too, so every
+            # cache assertion must run before the cleanup.)
+            assert (
+                flushed_key not in subtypes_mod._subtype_answers
+            ), "cut answer must not persist into _subtype_answers"
+            assert (
+                sibling in subtypes_mod._subtype_answers
+                and subtypes_mod._subtype_answers[sibling] is True
+            ), "plain decided pair must still cache"
+            assert (
+                _PROTOCOL_PAIRS_IN_FLIGHT.get(pair_key) == 1
+            ), "flush must not touch the registry"
+        finally:
+            _PROTOCOL_PAIRS_IN_FLIGHT.pop(pair_key, None)
+            _clear_subtype_batch()
+            _set_native_subtype_active(False)
+            _set_native_subtype_resolver(None)
+
+    def test_flush_fresh_derivation_runs_member_loop(self) -> None:
+        """End-to-end poisoning pin: after a consult-cut `True` has been
+        flushed for an in-flight pair, a later flush of the identical
+        bytes under the same flags (registry now empty) must NOT be
+        answered True from any cache; its slot defers so Python re-derives
+        via the single-pair path and the member loop decides."""
+        import mypy.subtypes as subtypes_mod
+        from mypy.subtypes import (
+            _PROTOCOL_PAIRS_IN_FLIGHT,
+            _clear_subtype_batch,
+            _flush_subtype_batch,
+            _set_native_subtype_active,
+            _set_native_subtype_resolver,
+        )
+        from mypy.types import Instance
+
+        self._live_info = {}
+        p1 = self._protocol("mod.FreshCutP1", ["f"])
+        p2 = self._protocol("mod.FreshCutP2", ["f"])
+        fnode = p1.names["f"].node
+        assert isinstance(fnode, FuncDef)
+        fnode.type = self._method_with_return(p1, self.fx.o)
+        self._build_resolver()
+        _set_native_subtype_active(True)
+        _set_native_subtype_resolver(self.resolver)
+        left, right = Instance(p1, []), Instance(p2, [])
+        left_b, right_b = self._serialize(left), self._serialize(right)
+        ctx_key = (False, False, False, False, False, True, False, False)
+        pair_key = (left_b, right_b, False)
+        try:
+            _clear_subtype_batch()
+            _PROTOCOL_PAIRS_IN_FLIGHT[pair_key] = 1
+            try:
+                subtypes_mod._subtype_batch.append((left_b, right_b, ctx_key))
+                answers = _flush_subtype_batch()
+            finally:
+                del _PROTOCOL_PAIRS_IN_FLIGHT[pair_key]
+            # The cut answer reaches the first derivation...
+            assert answers.get((left_b, right_b, ctx_key)) is True
+            # ...and the second derivation of the identical pair must not
+            # see a cached True: a fresh flush (registry empty) must
+            # re-derive and answer False instead.
+            subtypes_mod._subtype_batch.append((left_b, right_b, ctx_key))
+            second = _flush_subtype_batch()
+            assert (
+                second.get((left_b, right_b, ctx_key)) is False
+            ), f"poisoned cache re-answered cut True without re-derivation: {second!r}"
+        finally:
+            _clear_subtype_batch()
+            _set_native_subtype_active(False)
+            _set_native_subtype_resolver(None)
+
     def test_protocol_left_defers_on_undecidable_member(self) -> None:
         """Protocol-left still defers when a member fetch cannot decide
         (here a @staticmethod member, whose analyze_var shape the bind
