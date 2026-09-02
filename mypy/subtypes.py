@@ -413,7 +413,10 @@ def _flush_subtype_batch() -> dict[tuple[bytes, bytes, tuple[bool, ...]], bool]:
     buffer even when the Rust call raises (the caller re-runs those pairs
     singly). Also folds every decided answer into the build-global
     `_subtype_answers` so an identical later pair under the same flags is
-    answered from the dict.
+    answered from the dict — except code 3 answers (true via a registry
+    consult cut): those hold only for the derivation that took the cut,
+    so they are returned to the caller but never persisted, mirroring
+    Python's assuming-matrix hit which is likewise not cached.
     """
     global _subtype_batch, _subtype_answers
     if not _subtype_batch:
@@ -455,12 +458,19 @@ def _flush_subtype_batch() -> dict[tuple[bytes, bytes, tuple[bool, ...]], bool]:
         # answered, fall through per-pair.
         return {}
     result: dict[tuple[bytes, bytes, tuple[bool, ...]], bool] = {}
+    cacheable: dict[tuple[bytes, bytes, tuple[bool, ...]], bool] = {}
     for (left_b, right_b, k), answer in zip(pairs, answers):
         if answer == 1:
             result[(left_b, right_b, k)] = True
+            cacheable[(left_b, right_b, k)] = True
         elif answer == 0:
             result[(left_b, right_b, k)] = False
-    _subtype_answers.update(result)
+            cacheable[(left_b, right_b, k)] = False
+        elif answer == 3:
+            # True via a consult cut: valid only for this derivation,
+            # returned to the caller but never persisted.
+            result[(left_b, right_b, k)] = True
+    _subtype_answers.update(cacheable)
     return result
 
 

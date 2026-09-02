@@ -259,27 +259,44 @@ fn left_ref(t: &Type) -> Option<&str> {
     }
 }
 
-/// Consult the Python-side in-flight registry (`mypy.subtypes`.
-/// `protocol_pair_in_flight`). Python holds recursive-protocol check
-/// pairs on `right.type.assuming` while a member loop runs; when that
-/// loop defers a sub-check into Rust, the fresh Rust derivation must cut
-/// the re-derived pair exactly where Python's matrix scan would. Keyed
-/// on the same wire bytes Python registered with (the builtin-instance
-/// short-circuit is shared through `write_type`), plus the proper flag.
-/// Any failure (undecodable, import, call) is a silent miss: a missing
-/// cut only costs re-derivation, never a wrong verdict.
+// A consult hit is a *transient* cut: true only while the pair is in
+// flight; Python never caches it. The batch driver clears
+// CONSULT_CUT_OCCURRED per pair and sees such answers as code 3.
+thread_local! {
+    pub(crate) static CONSULT_CUT_OCCURRED: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+/// Clear the consult-cut marker for one pair's evaluation.
+pub(crate) fn consult_cut_reset() {
+    CONSULT_CUT_OCCURRED.with(|c| c.set(false));
+}
+
+/// Whether a registry consult hit fired since the last reset.
+pub(crate) fn consult_cut_taken() -> bool {
+    CONSULT_CUT_OCCURRED.with(std::cell::Cell::get)
+}
+
+/// Consult `mypy.subtypes.protocol_pair_in_flight` so a fresh Rust
+/// derivation cuts where Python's assuming-matrix scan would; any
+/// failure is a silent miss (a missing cut only costs re-derivation).
 fn protocol_pair_in_flight(py: Python<'_>, left: &Type, right: &Type, proper: bool) -> bool {
     let (Some(left_bytes), Some(right_bytes)) = (encode_type(left), encode_type(right)) else {
         return false;
     };
     let py_left = PyBytes::new(py, &left_bytes);
     let py_right = PyBytes::new(py, &right_bytes);
-    py.import("mypy.subtypes")
+    let hit = py
+        .import("mypy.subtypes")
         .ok()
         .and_then(|m| m.getattr("protocol_pair_in_flight").ok())
         .and_then(|f| f.call1((py_left, py_right, proper)).ok())
         .and_then(|o| o.extract::<bool>().ok())
-        .unwrap_or(false)
+        .unwrap_or(false);
+    if hit {
+        CONSULT_CUT_OCCURRED.with(|c| c.set(true));
+    }
+    hit
 }
 
 fn right_ref(t: &Type) -> Option<&str> {
