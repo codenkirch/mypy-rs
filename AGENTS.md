@@ -2572,6 +2572,35 @@ including:
   namespace). Remaining buckets: dc-final-overlap 67 (overlap kernel,
   tracked elsewhere), dc-lit 2, dc-map 1.
 
+- `rust_analyze_instance_member_access` survivors-gate widening +
+  `narrow_declared_type` TypeType/Callable tails (wave32, issue #1346).
+  The static-tail survivors gate now lets receiver-argument tvars ride
+  through at any meta level: `collect_tvar_keys` seeds the allowed-key
+  set from the mapped receiver's arguments, and the four IAMA decode
+  sinks (plain, callsite, generic, union-member paths in
+  `mypy/checkmember.py`) re-link decoded rider occurrences onto the
+  live mapped-arg variables via the new `resync_receiver_arg_tvars`
+  pass (wirefixup), restoring Python's identity semantics across the
+  wire round-trip (wave32 equivalent of the #1286 trivial-self
+  repair). Variables-entry leftovers still defer. `narrow_declared_
+  type` retires the blanket TypeType and CallableType defers:
+  both-TypeType pairs meet their items and re-normalize through
+  `make_normalized_typetype` (TypeForm flags AND, union items split
+  per item), the TypeType-vs-metaclass-Instance arm consults the
+  resolver snapshot (`has_base("builtins.type")`, `abc.ABCMeta`,
+  `fallback_to_any`), and tvar-carrying callable ret pairs narrow the
+  ret through `narrow_rec` while plain-ret pairs hit the meet.py:420
+  default. Covered by six new parity + seam-engage pins in
+  `NativeMeetDeferralSuite` (TypeType pair, TypeForm-vs-metaclass,
+  callable ret G[A] vs G[B]) plus 6 Rust unit tests in `meet.rs`.
+  Measured vs baseline probe: IAMA 331 calls / 217 fallbacks (66%
+  defer) -> 124 / 6 (5%), `narrow_declared_type` 28934 / 224 (1%) ->
+  29050 / 136 (0.5%). Residual audited ndt buckets are meet-kernel
+  decisions tracked elsewhere (db-final-overlap 67, dc-lit 2,
+  dc-map 1); the fifth IAMA decode sink (top-level ama decode) was
+  deliberately not relinked, its recipients are Rust-created fallback
+  Instances.
+
 ## Pull Requests
 
 The default branch on this fork is `main` (not `master`). Always target

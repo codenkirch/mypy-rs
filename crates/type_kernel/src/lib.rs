@@ -3080,10 +3080,9 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         module
     )?)?;
 
-    // checker_functions: check_final decision-head port. Rust classifies the
-    // final_without_value gate and the per-lvalue final-assignment
-    // arbitration (MRO walk + is_final flags); the message emissions stay
-    // in Python.
+    // checker_functions: check_final decision-head port. Rust classifies
+    // the final_without_value gate and the per-lvalue MRO/is_final
+    // arbitration; the message emissions stay in Python.
     module.add_function(wrap_pyfunction!(
         checker_functions::rust_classify_check_final,
         module
@@ -3174,6 +3173,7 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
     // Issue #1079: infer_operator_assignment_method decision. Rust reads
     // the live proper type via PyO3 and returns the (is_inplace, method)
     // pair; get_proper_type and the ops_with_inplace_method membership
+
     // stay shim-side.
     module.add_function(wrap_pyfunction!(
         checker_functions::rust_infer_operator_assignment_method,

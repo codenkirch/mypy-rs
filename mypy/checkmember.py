@@ -789,6 +789,14 @@ def analyze_instance_member_access(
                     TypeVarId.next_raw_id = next_raw_id
                 decoded = _deserialize_type_for_checkmember(bytes(wire_bytes))
                 if decoded is not None and isinstance(decoded, ProperType):
+                    from mypy.wirefixup import resync_receiver_arg_tvars
+
+                    # Wave32 survivor gate: re-link decoded receiver-arg tvar
+                    # occurrences onto the live mapped-argument variables,
+                    # restoring Python's identity semantics (#1286).
+                    decoded = resync_receiver_arg_tvars(
+                        decoded, map_instance_to_supertype(typ, method.info).args
+                    )
                     decoded.line = typ.line
                     decoded.column = typ.column
                     if isinstance(decoded, CallableType):
@@ -870,6 +878,14 @@ def analyze_instance_member_access(
 
                     # call site instead of a phantom line 0/-1.
                     if decoded is not None and isinstance(decoded, ProperType):
+                        from mypy.wirefixup import resync_receiver_arg_tvars
+
+                        # Wave32 survivor gate: re-link decoded receiver-arg
+                        # tvar occurrences onto the live mapped-argument
+                        # variables (#1286).
+                        decoded = resync_receiver_arg_tvars(
+                            decoded, map_instance_to_supertype(typ, method.info).args
+                        )
                         decoded.line = typ.line
                         decoded.column = typ.column
                         if isinstance(decoded, CallableType):
@@ -925,6 +941,14 @@ def analyze_instance_member_access(
                     if result is not None:
                         decoded = _deserialize_type_for_checkmember(bytes(result))
                         if decoded is not None and isinstance(decoded, ProperType):
+                            from mypy.wirefixup import resync_receiver_arg_tvars
+
+                            # Wave32 survivor gate: re-link decoded
+                            # receiver-arg tvar occurrences onto the live
+                            # mapped-argument variables (#1286).
+                            decoded = resync_receiver_arg_tvars(
+                                decoded, map_instance_to_supertype(typ, method.info).args
+                            )
                             decoded.line = typ.line
                             decoded.column = typ.column
                             if isinstance(decoded, CallableType):
@@ -1169,6 +1193,17 @@ def analyze_union_member_access(name: str, typ: UnionType, mx: MemberContext) ->
                                     and not isinstance(method, Decorator)
                                     and method.type is not None
                                 ):
+                                    from mypy.wirefixup import resync_receiver_arg_tvars
+
+                                    # Wave32 survivor gate: re-link decoded
+                                    # receiver-arg tvar occurrences onto the
+                                    # live mapped-argument variables (#1286).
+                                    decoded = resync_receiver_arg_tvars(
+                                        decoded,
+                                        map_instance_to_supertype(
+                                            subtype_proper, method.info
+                                        ).args,
+                                    )
                                     decoded = _restore_definition(method.type, decoded)
                             if isinstance(decoded, ProperType):
                                 decoded.line = typ.line
