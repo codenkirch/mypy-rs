@@ -763,21 +763,37 @@ fn tuple_special_map(
 /// round-trip breaks object sharing, so we rewrite by id instead. Meta
 /// typevars that appear only outside `variables` (the caller's own
 /// unification variables in the receiver args) stay untouched, exactly like
-/// Python.
+/// Python. Wave32: ParamSpec / TypeVarTuple variables are collected too
+/// (keyed with the -1 meta sentinel, the wire has no meta for them);
+/// `apply_freeze` only rewrites TypeVarType nodes, so those keys can only
+/// flip the survivor-gate verdict.
 fn collect_freeze_ids(typ: &mut Type, ids: &mut Vec<(i64, i64, String)>) {
     if let Type::CallableType { variables, .. } = typ {
         for v in variables.iter_mut() {
-            if let Type::TypeVarType {
-                raw_id,
-                namespace,
-                meta_level,
-                ..
-            } = v
-            {
-                let key = (*raw_id, *meta_level, namespace.clone());
-                if !ids.contains(&key) {
-                    ids.push(key);
+            match v {
+                Type::TypeVarType {
+                    raw_id,
+                    namespace,
+                    meta_level,
+                    ..
+                } => {
+                    let key = (*raw_id, *meta_level, namespace.clone());
+                    if !ids.contains(&key) {
+                        ids.push(key);
+                    }
                 }
+                Type::ParamSpecType {
+                    raw_id, namespace, ..
+                }
+                | Type::TypeVarTupleType {
+                    raw_id, namespace, ..
+                } => {
+                    let key = (*raw_id, -1, namespace.clone());
+                    if !ids.contains(&key) {
+                        ids.push(key);
+                    }
+                }
+                _ => {}
             }
         }
     }
@@ -828,17 +844,89 @@ fn collect_tvar_keys(typ: &Type, keys: &mut Vec<BindTVarKey>) {
     for_each_child(typ, &mut |c| collect_tvar_keys(c, keys));
 }
 
+/// TEMPORARY w32 audit: describe the nodes that fail the survivor gate.
+#[allow(dead_code)]
+fn describe_survivor_failures(
+    typ: &Type,
+    ids: &[BindTVarKey],
+    recv: &[BindTVarKey],
+) -> Vec<String> {
+    let mut out = Vec::new();
+    walk_survivor_failures(typ, ids, recv, &mut out, 0);
+    out.truncate(6);
+    out
+}
+
+fn walk_survivor_failures(
+    typ: &Type,
+    ids: &[BindTVarKey],
+    recv: &[BindTVarKey],
+    out: &mut Vec<String>,
+    depth: usize,
+) {
+    if out.len() >= 6 || depth > 8 {
+        return;
+    }
+    match typ {
+        Type::TypeVarType {
+            raw_id,
+            meta_level,
+            namespace,
+            name,
+            ..
+        } => {
+            let good = key_in(ids, *raw_id, *meta_level, namespace)
+                || (key_in(recv, *raw_id, *meta_level, namespace) && *meta_level == 0);
+            if !good {
+                out.push(format!(
+                    "TV:{}:m{}:ns{}:r{}[ids={},recv={}]",
+                    name,
+                    meta_level,
+                    namespace,
+                    raw_id,
+                    key_in(ids, *raw_id, *meta_level, namespace),
+                    key_in(recv, *raw_id, *meta_level, namespace)
+                ));
+            }
+        }
+        Type::ParamSpecType {
+            raw_id, namespace, ..
+        }
+        | Type::TypeVarTupleType {
+            raw_id, namespace, ..
+        } => {
+            if !key_in(recv, *raw_id, -1, namespace) {
+                out.push(format!("TVL:m-1:ns{}:r{}", namespace, raw_id));
+            }
+        }
+        Type::UnpackType { .. } => {
+            out.push("unpack".to_string());
+            for_each_child(typ, &mut |c| {
+                walk_survivor_failures(c, ids, recv, out, depth + 1)
+            });
+            return;
+        }
+        _ => {}
+    }
+    for_each_child(typ, &mut |c| {
+        walk_survivor_failures(c, ids, recv, out, depth + 1)
+    });
+}
+
 /// Narrowed survivor gate (issue #1277): a tvar leftover in the expanded tree
 /// rides through only when it is a `variables` entry or an occurrence among
 /// the mapped receiver's args; anything else, or an UnpackType, defers.
 ///
-/// A receiver-arg residual must additionally be bound (`meta_level == 0`):
-/// Python returns the caller's fresh (meta_level > 0) unification variable
-/// object itself, and downstream solve-freshening fuses var identities that
-/// live in one object; the wire round-trip can re-share identity only inside
-/// one decoded tree, never across seams, so a bare fresh var decoded from the
-/// IAMA tail arrives as a doppelganger and the callee solve collapses the
-/// inference target to `Never` (issue #1286). Defer those to Python.
+/// Wave32: the bound-only restriction (`meta_level == 0`) on receiver-arg
+/// riders is dropped. Python's tail returns the LIVE receiver-arg variable
+/// objects for every rider, and the Python-side relink
+/// (`mypy/wirefixup.py:resync_receiver_arg_tvars`) re-links decoded
+/// occurrences onto those live objects at every decode sink, so a fresh
+/// (meta_level > 0) rider no longer escapes as a cross-seam doppelganger
+/// that collapsed downstream solve inference to `Never` (issue #1286).
+/// The gate now accepts `ids` hits for ParamSpec / TypeVarTuple variables
+/// entries as well (`collect_freeze_ids` keys them with the -1 meta
+/// sentinel).
 fn survivors_allowed(typ: &Type, ids: &[BindTVarKey], recv: &[BindTVarKey]) -> bool {
     let ok = match typ {
         Type::TypeVarType {
@@ -848,14 +936,14 @@ fn survivors_allowed(typ: &Type, ids: &[BindTVarKey], recv: &[BindTVarKey]) -> b
             ..
         } => {
             key_in(ids, *raw_id, *meta_level, namespace)
-                || (key_in(recv, *raw_id, *meta_level, namespace) && *meta_level == 0)
+                || key_in(recv, *raw_id, *meta_level, namespace)
         }
         Type::ParamSpecType {
             raw_id, namespace, ..
         }
         | Type::TypeVarTupleType {
             raw_id, namespace, ..
-        } => key_in(recv, *raw_id, -1, namespace),
+        } => key_in(ids, *raw_id, -1, namespace) || key_in(recv, *raw_id, -1, namespace),
         Type::UnpackType { .. } => false,
         _ => true,
     };
@@ -1164,12 +1252,15 @@ fn freeze_children<F: FnMut(&mut Type)>(typ: &mut Type, f: &mut F) {
 /// mutation freezes all occurrences. The wire round-trip breaks sharing, so
 /// the tail rewrites by id: collect the ids of every callable's `variables`,
 /// then set `meta_level = 0` on the matching occurrences. Leftover tvars
-/// ride through only when they are bound (`meta_level == 0`) occurrences in
-/// the mapped receiver's args (the caller-tvar substitution class the cold
+/// ride through only when they are `variables` entries or occurrences in the
+/// mapped receiver's args (the caller-tvar substitution class the cold
 /// corpus showed); the narrowed survivor gate (#1277) defers everything
 /// else, whose decoded round-trip broke downstream inference in 28 testcheck
-/// defenses, and a bare fresh var decoded from the tail cannot be re-linked
-/// to the caller's live unification variable across seams (#1286).
+/// defenses. Wave32: receiver-arg riders of any meta level ride through,
+/// because the Python shim re-links each decoded rider occurrence onto the
+/// caller's live mapped-arg variable (`resync_receiver_arg_tvars`), which is
+/// exactly what Python returns; without that relink a fresh rider collapsed
+/// downstream solve inference to `Never` (issue #1286).
 #[allow(clippy::too_many_arguments)]
 fn static_member_tail(
     instance: &Type,
@@ -1242,8 +1333,8 @@ fn static_member_tail(
         }
     };
     // checkmember.py:503 `freeze_all_type_vars(member_type)`. First the
-    // narrowed survivor gate (#1277): bound receiver-arg tvars ride through,
-    // any other leftover defers (fresh riders cannot cross seams, #1286).
+    // survivor gate (#1277): receiver-arg tvars ride through at any meta
+    // level (the shim relinks riders), other leftovers defer.
     let mut recv_keys: Vec<BindTVarKey> = Vec::new();
     if let Type::Instance { args, .. } = &mapped_instance {
         for a in args {
@@ -1257,10 +1348,9 @@ fn static_member_tail(
     }
     apply_freeze(&mut expanded, &ids);
     if is_trivial {
-        bind_self_fast_inner(&expanded)
-    } else {
-        Some(expanded)
+        return bind_self_fast_inner(&expanded);
     }
+    Some(expanded)
 }
 
 /// Legacy M20 seam for a static or trivial-self `FuncDef` method
@@ -1630,7 +1720,9 @@ fn remove_self_vars(item: &mut Type, keys: &[BindTVarKey]) {
 /// Freeze the freshened method typevars of one item (typeops.py:2102
 /// `freeze_all_type_vars` mirror): collect the `variables`-declared ids,
 /// zero their meta levels everywhere in the tree; leftovers are gated by
-/// `survivors_allowed` against the mapped receiver's args.
+/// `survivors_allowed` against the mapped receiver's args (wave32: riders
+/// of any meta level pass, the Python shim relinks their decoded
+/// occurrences onto the live mapped-arg variables).
 fn freeze_item(mut item: Type, recv_keys: &[BindTVarKey]) -> Option<Type> {
     let mut freeze_ids: Vec<(i64, i64, String)> = Vec::new();
     collect_freeze_ids(&mut item, &mut freeze_ids);
@@ -5539,10 +5631,14 @@ mod tests {
     }
 
     #[test]
-    fn test_static_member_tail_defers_meta1_receiver_arg_tvar() {
-        // A caller's fresh (meta_level > 0) unification variable must not
-        // ride through the decoded IAMA tail: the wire round-trip loses the
-        // identity link, so the declared-var association breaks (#1286).
+    fn test_static_member_tail_passes_fresh_receiver_arg_tvar() {
+        // A caller's fresh (meta_level > 0) unification variable rides
+        // through the decoded IAMA tail when it occurs among the mapped
+        // receiver's args (wave32).
+
+        // The shim re-links the decoded occurrence onto the live
+        // mapped-arg variable (`resync_receiver_arg_tvars`), mirror of
+        // the Python tail; no cross-seam doppelganger escapes (#1286).
         let resolver = snap_resolver();
         let mut sig = make_callable(vec![], false);
         if let Type::CallableType { ret_type, .. } = &mut sig {
@@ -5554,6 +5650,117 @@ mod tests {
             last_known_value: None,
             extra_attrs: None,
         };
+        let result = static_member_tail(
+            &inst,
+            &sig,
+            "builtins.int",
+            false,
+            &resolver,
+            false,
+            false,
+            None,
+        )
+        .expect("fresh receiver-arg rider must pass");
+        match result {
+            Type::CallableType { ret_type, .. } => match *ret_type {
+                Type::TypeVarType {
+                    raw_id, meta_level, ..
+                } => {
+                    // Frozen untouched: not a `variables` entry, so the
+                    // freeze keeps the rider's original meta level.
+                    assert_eq!(raw_id, 7);
+                    assert_eq!(meta_level, 1);
+                }
+                other => panic!("expected TypeVarType ret, got {other:?}"),
+            },
+            other => panic!("expected callable result, got {other:?}"),
+        }
+    }
+
+    fn make_param_spec(raw_id: i64, namespace: &str) -> Type {
+        Type::ParamSpecType {
+            prefix: Box::new(crate::wire::Parameters {
+                arg_types: vec![],
+                arg_kinds: vec![],
+                arg_names: vec![],
+                variables: vec![],
+                imprecise_arg_kinds: false,
+                is_ellipsis_args: false,
+            }),
+            name: "P".to_string(),
+            fullname: "P".to_string(),
+            raw_id,
+            namespace: namespace.to_string(),
+            flavor: 0,
+            upper_bound: Box::new(Type::AnyType {
+                type_of_any: 1,
+                source_any: None,
+                missing_import_name: None,
+            }),
+            default: Box::new(Type::AnyType {
+                type_of_any: 1,
+                source_any: None,
+                missing_import_name: None,
+            }),
+        }
+    }
+
+    #[test]
+    fn test_static_member_tail_passes_tvl_variables_entry() {
+        // A ParamSpec `variables` entry surviving the expand rides
+        // through via the ids gate (wave32).
+
+        // collect_freeze_ids keys TVL variables with the -1 meta
+        // sentinel; apply_freeze leaves them untouched, only
+        // TypeVarType nodes carry a meta level.
+        let resolver = snap_resolver();
+        let ps = make_param_spec(11, "__main__.B@3");
+        let mut sig = make_callable(vec![], false);
+        if let Type::CallableType {
+            ret_type,
+            variables,
+            ..
+        } = &mut sig
+        {
+            **ret_type = ps.clone();
+            variables.push(ps);
+        }
+        let inst = make_instance("builtins.int");
+        let result = static_member_tail(
+            &inst,
+            &sig,
+            "builtins.int",
+            false,
+            &resolver,
+            false,
+            false,
+            None,
+        )
+        .expect("ParamSpec variables entry must pass");
+        match result {
+            Type::CallableType {
+                ret_type,
+                variables,
+                ..
+            } => {
+                assert!(matches!(*ret_type, Type::ParamSpecType { .. }));
+                assert_eq!(variables.len(), 1);
+                assert!(matches!(variables[0], Type::ParamSpecType { .. }));
+            }
+            other => panic!("expected callable result, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_static_member_tail_defers_foreign_tvl() {
+        // A ParamSpec outside `variables` and outside the receiver's args
+        // still defers (#1277 gate unchanged for foreign survivors).
+        let resolver = snap_resolver();
+        let mut sig = make_callable(vec![], false);
+        if let Type::CallableType { ret_type, .. } = &mut sig {
+            **ret_type = make_param_spec(13, "__main__.B@3");
+        }
+        let inst = make_instance("builtins.int");
         assert!(static_member_tail(
             &inst,
             &sig,

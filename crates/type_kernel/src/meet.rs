@@ -1276,6 +1276,42 @@ fn relevant_items_with_none(
     Some(out)
 }
 
+/// `TypeType.make_normalized` (types.py:3963-3977): unwrap the item's
+/// proper form; a non-TypeForm union item splits into a union of
+/// recursively-normalized `type[u]` parts; everything else re-wraps
+/// verbatim. Wire types carry no line/column (Python defaults -1).
+fn make_normalized_typetype(
+    item: Type,
+    is_type_form: bool,
+    strict_optional: bool,
+    aliases: Option<&crate::aliases::TypeAliasResolver>,
+    res: &TypeResolver,
+) -> Option<Type> {
+    let item_p_owned;
+    let item_p: &Type = match aliases {
+        Some(a) => {
+            item_p_owned = crate::checkexpr_functions::get_proper_or_expand(&item, a)?;
+            &item_p_owned
+        }
+        None => get_proper(&item)?,
+    };
+    if !is_type_form {
+        if let Type::UnionType { items, .. } = item_p {
+            let ctx = SubtypeContext::new(false, false, false, false, false, strict_optional);
+            let parts = items
+                .iter()
+                .cloned()
+                .map(|u| make_normalized_typetype(u, false, strict_optional, aliases, res))
+                .collect::<Option<Vec<_>>>()?;
+            return make_simplified_union(&parts, &ctx, res, true, false);
+        }
+    }
+    Some(Type::TypeType {
+        item: Box::new(item_p.clone()),
+        is_type_form,
+    })
+}
+
 /// `mypy.meet.narrow_declared_type` (meet.py:216-348), Rust subset.
 ///
 /// The Python shim resolves the `declared == narrowed` top-level equality
@@ -1284,9 +1320,8 @@ fn relevant_items_with_none(
 /// the alias resolver (mirroring `get_proper_type` at the top of the Python
 /// body) and mirrors the meet.py body after that equality check. Returns
 /// `None` (defer to Python) for any case that needs a live `TypeInfo`
-/// outside our snapshot (TypeForm-normalization special cases) or that we
-/// simply did not port; the Python shim re-runs the pure-Python visitor
-/// unchanged.
+/// outside our snapshot (e.g. TypedDictType) or that we simply did not
+/// port; the Python shim re-runs the pure-Python visitor unchanged.
 ///
 /// Cross-branch recursion mirrors Python's mutual recursion through
 /// `narrow_declared_type` -> `is_overlapping_types`/`is_subtype`/`meet_types`
@@ -1474,11 +1509,68 @@ pub(crate) fn narrow_rec(
         }
     }
 
-    // meet.py:287-295: TypeType both sides -> Python's
-    // TypeType.make_normalized (union-splitting); 296-306 declared +
-    // narrowed metaclass -> TypeForm conversion; defer both.
-    if matches!(declared_p, Type::TypeType { .. }) {
-        return None;
+    // meet.py:287-295: TypeType both sides -> TypeType.make_normalized
+    // (types.py:3963-3977) on the recursively narrowed item, splitting
+    // a non-TypeForm union item into a union of `type[u]` parts.
+
+    // meet.py:247's structural entry check returns the raw item; the
+    // shim runs it for the outer pair only, so mirror it here.
+    if let (
+        Type::TypeType {
+            item: d_item,
+            is_type_form: d_is_tf,
+        },
+        Type::TypeType {
+            item: n_item,
+            is_type_form: n_is_tf,
+        },
+    ) = (declared_p, narrowed_p)
+    {
+        let narrowed_item = if d_item == n_item {
+            Some((**d_item).clone())
+        } else {
+            narrow_rec(d_item, n_item, strict_optional, aliases, res)
+        }?;
+        return make_normalized_typetype(
+            narrowed_item,
+            *d_is_tf && *n_is_tf,
+            strict_optional,
+            aliases,
+            res,
+        );
+    }
+
+    // meet.py:296-306: declared TypeType + narrowed metaclass Instance.
+    // `is_metaclass()` is called with precise=False (nodes.py:4278-4300):
+    // has_base(builtins.type) or abc.ABCMeta name or fallback_to_any.
+    if let Type::TypeType {
+        item: d_item,
+        is_type_form: d_is_tf,
+    } = declared_p
+    {
+        if let Type::Instance {
+            type_ref: n_ref, ..
+        } = narrowed_p
+        {
+            let n_snap = res.get(n_ref)?;
+            if n_snap.has_base("builtins.type")
+                || n_snap.fullname == "abc.ABCMeta"
+                || n_snap.fallback_to_any
+            {
+                if *d_is_tf {
+                    // meet.py:379-385: a TypeForm[T] declared type narrows
+                    // like the plain TypeType[T] class object; line/column
+                    // have no wire representation (defaults -1).
+                    let plain_tt = Type::TypeType {
+                        item: d_item.clone(),
+                        is_type_form: false,
+                    };
+                    return narrow_rec(&plain_tt, narrowed, strict_optional, aliases, res);
+                }
+                // meet.py:388: would need intersection types; unchanged.
+                return Some(declared.clone());
+            }
+        }
     }
 
     // meet.py:307-317: declared Instance.
@@ -1509,18 +1601,17 @@ pub(crate) fn narrow_rec(
         return materialize_meet_result(r, declared, narrowed, strict_optional, res);
     }
 
-    // meet.py:318-320: declared (TupleType, TypeType, LiteralType) -> meet.
-    if matches!(declared_p, Type::TupleType { .. })
-        || matches!(declared_p, Type::LiteralType { .. })
-    {
+    // meet.py:318-320 + 402-403: declared (TupleType, TypeType,
+    // LiteralType) -> meet. For a declared TypeType that survived the two
+    // arms above, Python reaches the same meet arm (402).
+    if matches!(
+        declared_p,
+        Type::TupleType { .. } | Type::TypeType { .. } | Type::LiteralType { .. }
+    ) {
         let ctx = SubtypeContext::new(false, false, false, false, false, strict_optional);
         let r = meet_types(declared, narrowed, &ctx, res)?;
         return materialize_meet_result(r, declared, narrowed, strict_optional, res);
     }
-
-    // meet.py:322-329: declared TypedDictType + narrowed `builtins.dict`
-    // with all-Any args -> original_declared. Rust defers (TypedDictType
-    // needs live TypeInfo); fall through.
 
     // meet.py:322-329: declared TypedDictType + narrowed `builtins.dict`
     // with all-Any args -> original_declared. TypedDictType carries callsite
@@ -1529,11 +1620,34 @@ pub(crate) fn narrow_rec(
         return None;
     }
 
-    // meet.py:331-334: both CallableType + type vars in declared ret_type
-    // -> copy_modified(ret_type=narrow(...)). Rust is_subtype returns None
-    // for CallableType pairs; defer to Python rather than mis-narrowing.
-    if matches!(declared_p, Type::CallableType { .. }) {
-        return None;
+    // meet.py:411-418: both CallableType + type vars in declared ret_type
+    // -> narrowed copy with the narrowed ret_type (same inner-entry
+    // structural-equality mirror as Tail A).
+
+    // Without ret_type type vars Python falls through to
+    // `return original_narrowed` at meet.py:420, which the default arm
+    // below reproduces.
+    if let (
+        Type::CallableType {
+            ret_type: d_ret, ..
+        },
+        Type::CallableType {
+            ret_type: n_ret, ..
+        },
+    ) = (declared_p, narrowed_p)
+    {
+        if has_type_vars_inner(d_ret) {
+            let narrowed_ret = if d_ret == n_ret {
+                Some((**d_ret).clone())
+            } else {
+                narrow_rec(d_ret, n_ret, strict_optional, aliases, res)
+            }?;
+            let mut t = narrowed_p.clone();
+            if let Type::CallableType { ret_type, .. } = &mut t {
+                **ret_type = narrowed_ret;
+            }
+            return Some(t);
+        }
     }
 
     // meet.py:335-337: default -> original_narrowed.
@@ -2068,6 +2182,199 @@ mod tests {
         // decoder the wrapper calls first. Assert that path directly.
         assert!(decode_type(b"\xff\xff").is_none());
         assert!(decode_type(&[]).is_none());
+    }
+
+    // ------------------------------------------------------------------
+    // Tail A/B/C: TypeType pair, metaclass, Callable ret (wave32)
+    // ------------------------------------------------------------------
+
+    fn typetype(item: Type, is_type_form: bool) -> Type {
+        Type::TypeType {
+            item: Box::new(item),
+            is_type_form,
+        }
+    }
+
+    fn callable(ret: Type) -> Type {
+        Type::CallableType {
+            fallback: Box::new(instance("builtins.function")),
+            instance_type: None,
+            is_ellipsis_args: false,
+            implicit: false,
+            is_bound: false,
+            from_concatenate: false,
+            imprecise_arg_kinds: false,
+            unpack_kwargs: false,
+            from_type_type: false,
+            arg_types: Vec::new(),
+            arg_kinds: Vec::new(),
+            arg_names: Vec::new(),
+            ret_type: Box::new(ret),
+            name: None,
+            variables: Vec::new(),
+            type_guard: None,
+            type_is: None,
+            special_sig: None,
+        }
+    }
+
+    fn type_var() -> Type {
+        Type::TypeVarType {
+            name: "T".to_string(),
+            fullname: "mod.T".to_string(),
+            raw_id: 1,
+            namespace: "mod".to_string(),
+            values: Vec::new(),
+            upper_bound: Box::new(instance("builtins.object")),
+            default: Box::new(Type::NoneType),
+            variance: crate::subtypes::INVARIANT,
+            meta_level: 0,
+        }
+    }
+
+    fn metaclass_resolver() -> TypeResolver {
+        let mut r = make_resolver();
+        let mut meta_snap = TypeInfoSnapshot {
+            fullname: "builtins.type".to_string(),
+            name: "type".to_string(),
+            ..Default::default()
+        };
+        meta_snap.has_base.insert("builtins.type".to_string());
+        meta_snap.has_base.insert("builtins.object".to_string());
+        meta_snap.mro = vec!["builtins.type".to_string(), "builtins.object".to_string()];
+        r.insert("builtins.type".to_string(), meta_snap);
+        let mut fn_snap = TypeInfoSnapshot {
+            fullname: "builtins.function".to_string(),
+            name: "function".to_string(),
+            ..Default::default()
+        };
+        fn_snap.has_base.insert("builtins.function".to_string());
+        fn_snap.has_base.insert("builtins.object".to_string());
+        fn_snap.mro = vec![
+            "builtins.function".to_string(),
+            "builtins.object".to_string(),
+        ];
+        r.insert("builtins.function".to_string(), fn_snap);
+        r
+    }
+
+    #[test]
+    fn ndt_typetype_pair_normalizes_item_and_ands_type_form() {
+        // meet.py:368-372 + the meet.py:247 equality mirror: equal inner
+        // items return the raw item, then make_normalized wraps it with
+        // is_type_form=d.tf and n.tf (false and true -> false here).
+        let r = make_resolver();
+        let item = instance("builtins.int");
+        let d = typetype(item.clone(), false);
+        let n = typetype(item.clone(), true);
+        assert_eq!(
+            narrow_rec(&d, &n, true, None, &r),
+            Some(typetype(item, false))
+        );
+        let d = typetype(instance("builtins.int"), true);
+        let n = typetype(instance("builtins.int"), true);
+        assert_eq!(
+            narrow_rec(&d, &n, true, None, &r),
+            Some(typetype(instance("builtins.int"), true))
+        );
+    }
+
+    #[test]
+    fn ndt_typetype_pair_union_item_splits_without_type_form() {
+        // types.py:3971-3976: make_normalized on a non-TypeForm union item
+        // builds Union[type[u] for u in items] via make_simplified_union;
+        // duplicate parts simplify to one.
+        let r = make_resolver();
+        let union = Type::UnionType {
+            items: vec![instance("builtins.int"), instance("builtins.int")],
+            uses_pep604_syntax: false,
+            can_be_true: true,
+            can_be_false: true,
+            is_evaluated: true,
+            original_str_expr: None,
+            original_str_fallback: None,
+        };
+        let out = make_normalized_typetype(union, false, true, None, &r)
+            .expect("duplicate union item splits to a single type[int]");
+        assert_eq!(out, typetype(instance("builtins.int"), false));
+        // A TypeForm union item is not split (types.py:3967-3969).
+        let union2 = Type::UnionType {
+            items: vec![instance("builtins.int"), instance("builtins.int")],
+            uses_pep604_syntax: false,
+            can_be_true: true,
+            can_be_false: true,
+            is_evaluated: true,
+            original_str_expr: None,
+            original_str_fallback: None,
+        };
+        let out = make_normalized_typetype(union2, true, true, None, &r).unwrap();
+        assert!(matches!(
+            out,
+            Type::TypeType {
+                is_type_form: true,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn ndt_typetype_metaclass_instance_returns_declared() {
+        // meet.py:373-388, non-TypeForm: narrowed metaclass Instance ->
+        // unchanged (no intersection types). The metaclass tie reads the
+        // precise=False is_metaclass() verdict off the snapshot.
+        let r = metaclass_resolver();
+        let d = typetype(instance("builtins.int"), false);
+        let out = narrow_rec(&d, &instance("builtins.type"), true, None, &r).unwrap();
+        assert_eq!(out, d);
+    }
+
+    #[test]
+    fn ndt_typetype_metaclass_typeform_recurses_plain() {
+        // meet.py:379-385: TypeForm[...] narrows like the plain class object
+        // (is_type_form=False); the recursion re-enters the metaclass arm,
+        // which returns the plain TypeType verbatim.
+        let r = metaclass_resolver();
+        let d = typetype(instance("builtins.int"), true);
+        let out = narrow_rec(&d, &instance("builtins.type"), true, None, &r).unwrap();
+        assert_eq!(out, typetype(instance("builtins.int"), false));
+    }
+
+    #[test]
+    fn ndt_callable_ret_tvars_narrow_ret_type() {
+        // meet.py:411-418: both CallableType + has_type_vars(ret_Type) ->
+        // narrowed soln copy_modified(ret_type=narrow(...)). Equal rets
+        // exercise the structural-equality mirror.
+        let r = metaclass_resolver();
+        let d = callable(type_var());
+        let n = callable(type_var());
+        let out = narrow_rec(&d, &n, true, None, &r).unwrap();
+        assert_eq!(out, n);
+    }
+
+    #[test]
+    fn ndt_callable_plain_ret_falls_to_original_narrowed() {
+        // Without ret type vars Python returns original_narrowed (meet.py:420);
+        // previously the blanket Callable defer swallowed this pair.
+        let r = metaclass_resolver();
+        let tvar_d = callable(type_var());
+        // The tvar/instance ret pair narrows through the ret seam (also
+        // worth pinning): declared ret T narrowed by int -> T(bound=int).
+        let n = callable(instance("builtins.int"));
+        let out = narrow_rec(&tvar_d, &n, true, None, &r).unwrap();
+        match out {
+            Type::CallableType { ret_type, .. } => match *ret_type {
+                Type::TypeVarType { upper_bound, .. } => {
+                    assert_eq!(*upper_bound, instance("builtins.int"));
+                }
+                other => panic!("expected TypeVarType ret, got {other:?}"),
+            },
+            other => panic!("expected CallableType, got {other:?}"),
+        }
+        // Identical plain rets: has_type_vars(fail) -> original_narrowed.
+        let d = callable(instance("builtins.int"));
+        let n = callable(instance("builtins.int"));
+        let out = narrow_rec(&d, &n, true, None, &r).unwrap();
+        assert_eq!(out, n);
     }
 
     // ------------------------------------------------------------------

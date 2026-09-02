@@ -23,7 +23,7 @@ Instance would get a FakeInfo, leaking into the type graph.
 from __future__ import annotations
 
 from collections.abc import Sequence
-from typing import Any
+from typing import Any, TypeVar, cast
 
 from librt.internal import ReadBuffer
 
@@ -283,6 +283,7 @@ class _FreshVarCanonicalizer(TypeTranslator):
         # Fresh vars also occur as alias arguments (e.g. Pairs[Self] in a
         # method signature); re-unify them with the seed/tree occurrences
         # so freeze-in-place and id-keyed substitution see one object.
+
         # Never descends into ``t.alias.target`` (recursive-alias safe),
         # matching the alias handling of the identity canonicalizer below.
         if not t.args:
@@ -542,6 +543,136 @@ def resync_var_identities(typ: Type, decoded: Type, env_values: Sequence[Type]) 
     if cand.missing_seed:
         return None
     return result
+
+
+class _ReceiverTvarResyncer(TypeTranslator):
+    """Re-link decoded receiver-arg tvar occurrences to the live objects.
+
+    Python's pure IAMA tail substitutes receiver-argument tvars by
+    returning the mapped receiver's variable objects themselves
+    (ExpandTypeVisitor returns the env value), so the result shares
+    object identity with the caller's receiver. The survivors-gate
+    widening (wave32) rides fresh (meta_level > 0) receiver-arg vars
+    through the wire; without a relink each decoded occurrence is a
+    doppelganger, and downstream solve-freshening that fuses identities
+    in one object collapses the inference target to `Never` (issue
+    #1286 regression). This pass seeds from the mapped receiver's
+    arguments — the same `recv` keys the Rust gate consults — and
+    replaces key-matching occurrences with the live objects.
+
+    Keys: full (raw_id, meta_level, namespace) for TypeVarType, and
+    (raw_id, namespace) for ParamSpecType / TypeVarTupleType, whose wire
+    form drops `id.meta_level` entirely (a decoded ParamSpec carries
+    meta 0 regardless of the live var). This ignores meta for TVLs on
+    purpose, mirroring the -1 sentinel in `collect_tvar_keys`.
+    Variables-entry leftovers are deliberately NOT relinked (they are
+    frozen method tvars whose decoded-copy status is the pre-widening
+    status quo). Unmatched ids pass through: the Rust gate guarantees
+    every decoded tvar survivor is a variables entry or a key-matched
+    receiver-arg rider.
+    """
+
+    def __init__(self, receiver_args: Sequence[Type]) -> None:
+        super().__init__()
+        self._vars: dict[tuple[int, int, str], TypeVarType] = {}
+        self._tvls: dict[tuple[int, str], TypeVarLikeType] = {}
+        stack: list[Type] = list(receiver_args)
+        while stack:
+            cur = stack.pop()
+            if isinstance(cur, TypeVarLikeType):
+                if isinstance(cur, TypeVarType):
+                    self._vars.setdefault(
+                        (cur.id.raw_id, cur.id.meta_level, cur.id.namespace), cur
+                    )
+                else:
+                    self._tvls.setdefault((cur.id.raw_id, cur.id.namespace), cur)
+                stack.append(cur.upper_bound)
+                stack.append(cur.default)
+                if isinstance(cur, TypeVarType):
+                    stack.extend(cur.values)
+                elif isinstance(cur, ParamSpecType):
+                    stack.append(cur.prefix)
+                elif isinstance(cur, TypeVarTupleType):
+                    stack.append(cur.tuple_fallback)
+            elif isinstance(cur, CallableType):  # type: ignore[misc]
+                stack.extend(cur.arg_types)
+                stack.append(cur.ret_type)
+                stack.append(cur.fallback)
+                stack.extend(cur.variables)
+                if cur.instance_type is not None:
+                    stack.append(cur.instance_type)
+            elif isinstance(cur, Parameters):
+                stack.extend(cur.arg_types)
+                stack.extend(cur.variables)
+            elif isinstance(cur, Overloaded):  # type: ignore[misc]
+                stack.extend(cur.items)
+            elif isinstance(cur, Instance):  # type: ignore[misc]
+                stack.extend(cur.args)
+            elif isinstance(cur, UnionType):  # type: ignore[misc]
+                stack.extend(cur.items)
+            elif isinstance(cur, TupleType):  # type: ignore[misc]
+                stack.extend(cur.items)
+                stack.append(cur.partial_fallback)
+            elif isinstance(cur, TypedDictType):  # type: ignore[misc]
+                stack.extend(cur.items.values())
+                stack.append(cur.fallback)
+            elif isinstance(cur, TypeType):  # type: ignore[misc]
+                stack.append(cur.item)
+            elif isinstance(cur, UnpackType):
+                stack.append(cur.type)
+            elif isinstance(cur, TypeAliasType):
+                stack.extend(cur.args)
+
+    def _var(self, t: TypeVarLikeType) -> Type:
+        if isinstance(t, TypeVarType):
+            return self._vars.get((t.id.raw_id, t.id.meta_level, t.id.namespace), t)
+        return self._tvls.get((t.id.raw_id, t.id.namespace), t)
+
+    def visit_type_var(self, t: TypeVarType, /) -> Type:
+        return self._var(t)
+
+    def visit_param_spec(self, t: ParamSpecType, /) -> Type:
+        return self._var(t)
+
+    def visit_type_var_tuple(self, t: TypeVarTupleType, /) -> Type:
+        return self._var(t)
+
+    def visit_type_alias_type(self, t: TypeAliasType, /) -> Type:
+        # Receiver-arg riders also occur as alias arguments (e.g.
+        # Pairs[Self]-shaped signatures); descend into alias args but
+        # never into t.alias.target (recursive-alias safe).
+        if not t.args:
+            return t
+        return t.copy_modified(args=[arg.accept(self) for arg in t.args])
+
+    def visit_callable_type(self, t: CallableType, /) -> Type:
+        # Base translator leaves `variables`, `type_guard`, `type_is`
+        # untranslated; traverse them so riders inside are relinked.
+        result = get_proper_type(super().visit_callable_type(t))
+        if not isinstance(result, CallableType):
+            return result
+        new_variables = [v.accept(self) for v in result.variables]
+        type_guard = t.type_guard.accept(self) if t.type_guard is not None else None
+        type_is = t.type_is.accept(self) if t.type_is is not None else None
+        return result.copy_modified(
+            variables=new_variables, type_guard=type_guard, type_is=type_is  # type: ignore[arg-type]
+        )
+
+
+_T = TypeVar("_T", bound="Type")
+
+
+def resync_receiver_arg_tvars(decoded: _T, receiver_args: Sequence[Type]) -> _T:
+    """Re-link decoded receiver-arg tvar occurrences to the live objects.
+
+    Pairs with the wave32 IAMA survivors-gate widening: at every IAMA
+    decode sink the Python shim seeds this pass with the mapped
+    receiver's arguments so decoded riders regain Python's identity
+    semantics. Cheap when the decoded tree carries no tvar at all.
+    """
+    if not contains_typevar_like(decoded):
+        return decoded
+    return cast("_T", decoded.accept(_ReceiverTvarResyncer(receiver_args)))
 
 
 class _TypeRefFixer(TypeTranslator):

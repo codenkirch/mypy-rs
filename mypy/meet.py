@@ -236,7 +236,7 @@ def narrow_declared_type(declared: Type, narrowed: Type) -> Type:
 
     # Stage 3d (M9) type-kernel seam: native narrow_declared_type handles
     # alias-free, non-recursive proper types; None on unsupported cases
-    # (aliases/recursion/TypeType/TypedDict/Callable) -> fall through.
+    # (recursive pairs/TypedDict/some callable pairs) -> fall through.
     if (
         join._HAS_TYPE_KERNEL
         and join._native_join_active

@@ -1761,9 +1761,7 @@ class NativeTypeWireSuite(Suite):
         self.assert_wire_par(LiteralType(-(2**80), int_type))
         self.assert_wire_par(LiteralType(2**130, int_type))
         self.assert_wire_par(
-            UnionType(
-                [LiteralType(2**80, int_type), NoneType(), self.fx.str_type]
-            )
+            UnionType([LiteralType(2**80, int_type), NoneType(), self.fx.str_type])
         )
 
     def test_literal_str(self) -> None:
@@ -5548,7 +5546,11 @@ class NativeExpandParamSpecSpliceSuite(Suite):
         # Concatenate[*lead, P.args, **P.kwargs]: the trailing ARGS and
         # KWARGS occurrences occupy the last two arg slots; Python's
         # CallableType.param_spec() canonicalizes the head likewise.
-        arg_types = [*lead, ps.with_flavor(ParamSpecFlavor.ARGS), ps.with_flavor(ParamSpecFlavor.KWARGS)]
+        arg_types = [
+            *lead,
+            ps.with_flavor(ParamSpecFlavor.ARGS),
+            ps.with_flavor(ParamSpecFlavor.KWARGS),
+        ]
         arg_kinds = [ARG_POS] * len(lead) + [ARG_STAR, ARG_STAR2]
         return CallableType(
             arg_types,
@@ -5562,10 +5564,7 @@ class NativeExpandParamSpecSpliceSuite(Suite):
         from mypy.expandtype import _serialize_env, _serialize_type
 
         result = _type_kernel.rust_expand_type(
-            self._resolver,
-            _serialize_type(typ),
-            _serialize_env(env),
-            state.strict_optional,
+            self._resolver, _serialize_type(typ), _serialize_env(env), state.strict_optional
         )
         return result is not None
 
@@ -5616,8 +5615,7 @@ class NativeExpandParamSpecSpliceSuite(Suite):
         # the bare key: the kernel defers and Python answers.
         ps = self._param_spec()
         fresh = ParamSpecType(
-            "Q", "mod.Q", TypeVarId(ps.id.raw_id, 1), 0, self.fx.o,
-            AnyType(TypeOfAny.special_form),
+            "Q", "mod.Q", TypeVarId(ps.id.raw_id, 1), 0, self.fx.o, AnyType(TypeOfAny.special_form)
         )
         callee = self._splice_callable(ps, [self.fx.a])
         env = {fresh.id: self.fx.a}
@@ -5666,7 +5664,12 @@ class NativeExpandParamSpecSpliceSuite(Suite):
         from mypy.types import Parameters
 
         ps = ParamSpecType(
-            "P", "mod.P", TypeVarId(1), 0, self.fx.o, AnyType(TypeOfAny.special_form),
+            "P",
+            "mod.P",
+            TypeVarId(1),
+            0,
+            self.fx.o,
+            AnyType(TypeOfAny.special_form),
             prefix=Parameters([self.fx.bool_type], [ARG_POS], [None]),
         )
         typ = Instance(self.fx.gi, [ps])
@@ -6257,7 +6260,9 @@ class NativeMapTypeFromSupertypeSuite(Suite):
             off = self._with_gate(
                 False, lambda: map_type_from_supertype(typ, self.fx.bi, self.fx.ai)
             )
-            on = self._with_gate(True, lambda: map_type_from_supertype(typ, self.fx.bi, self.fx.ai))
+            on = self._with_gate(
+                True, lambda: map_type_from_supertype(typ, self.fx.bi, self.fx.ai)
+            )
             assert_equal(str(on), str(off), "map_type_from_supertype parity (alias)")
             assert isinstance(on, TypeAliasType), "decoded type must be the alias"
             assert on.alias is alias, "decoded alias must re-link to the live TypeAlias node"
@@ -7573,9 +7578,7 @@ class NativeTypeopsDeferralSuite(Suite):
         on = str(self._type_vars_on(alias))
         assert_equal(on, off, "get_type_vars alias parity")
         assert_equal(on, f"[{self.fx.t}]", "get_type_vars collects the alias tvar")
-        raw = _type_kernel.rust_get_type_vars_live(
-            self._resolver, _serialize_type(alias), False
-        )
+        raw = _type_kernel.rust_get_type_vars_live(self._resolver, _serialize_type(alias), False)
         assert raw is not None, "live get_type_vars deferred on a resolvable alias"
 
     def test_get_type_vars_alias_arg_substituted(self) -> None:
@@ -7590,9 +7593,7 @@ class NativeTypeopsDeferralSuite(Suite):
         on = str(self._type_vars_on(alias))
         assert_equal(on, off, "get_type_vars alias arg parity")
         assert_equal(on, "[]")
-        raw = _type_kernel.rust_get_type_vars_live(
-            self._resolver, _serialize_type(alias), False
-        )
+        raw = _type_kernel.rust_get_type_vars_live(self._resolver, _serialize_type(alias), False)
         assert raw is not None, "live get_type_vars deferred on a resolvable alias"
 
     def test_get_type_vars_alias_in_union(self) -> None:
@@ -9099,7 +9100,9 @@ class NativeProtocolImplementationSuite(Suite):
             subtypes_mod._subtype_batch.append((left_b, right_b, ctx_key))
             subtypes_mod._subtype_batch.append(sibling)
             answers = subtypes_mod._flush_subtype_batch()
-            assert answers.get(flushed_key) is True, f"cut answer must reach the caller: {answers!r}"
+            assert (
+                answers.get(flushed_key) is True
+            ), f"cut answer must reach the caller: {answers!r}"
             # (_clear_subtype_batch wipes _subtype_answers too, so every
             # cache assertion must run before the cleanup.)
             assert (
@@ -16040,15 +16043,84 @@ class NativeMeetDeferralSuite(Suite):
 
         f_int, f_str = self._cc([self.fx.a], [self.fx.d])
         r = _type_kernel.rust_is_overlapping_types(
-            _serialize_type(f_int),
-            _serialize_type(f_str),
-            False,
-            False,
-            True,
-            self.resolver,
+            _serialize_type(f_int), _serialize_type(f_str), False, False, True, self.resolver
         )
         assert r is not None, "seam deferred on a plain callable pair"
         self.assertFalse(r)
+
+    # -- ndt TypeType / callable tails (wave32: retire the blanket defers) --
+
+    def test_narrow_typetype_pair_parity(self) -> None:
+        # type[A] declared, type[C] narrowed: both sides are TypeType, so
+        # the pair rides the item-meet tail instead of a blanket defer.
+        off = self._narrow(False, self.fx.type_a, self.fx.type_c)
+        on = self._narrow(True, self.fx.type_a, self.fx.type_c)
+        self.assertEqual(on, off)
+        self.assertEqual(on, str(self.fx.type_c))
+
+    def test_narrow_typetype_pair_seam_engages(self) -> None:
+        from mypy.join import _deserialize_type, _serialize_type
+
+        r = _type_kernel.rust_narrow_declared_type(
+            _serialize_type(self.fx.type_a), _serialize_type(self.fx.type_c), True, self.resolver
+        )
+        assert r is not None, "seam deferred on a TypeType pair with overlapping items"
+        decoded = _deserialize_type(bytes(r))
+        assert decoded is not None
+        self.assertEqual(str(decoded), str(self.fx.type_c))
+
+    def test_narrow_typetype_metaclass_parity(self) -> None:
+        from mypy.types import TypeType
+
+        # TypeForm[A] declared, Instance(builtins.type) narrowed: the
+        # metaclass tail reconstructs the plain type[A].
+        declared = TypeType(self.fx.a, is_type_form=True)
+        off = self._narrow(False, declared, self.fx.type_type)
+        on = self._narrow(True, declared, self.fx.type_type)
+        self.assertEqual(on, off)
+        self.assertEqual(on, str(self.fx.type_a))
+        # Plain type[A] versus the metaclass instance hits the same tail's
+        # non-typeform arm (declared passthrough).
+        off2 = self._narrow(False, self.fx.type_a, self.fx.type_type)
+        on2 = self._narrow(True, self.fx.type_a, self.fx.type_type)
+        self.assertEqual(on2, off2)
+        self.assertEqual(on2, str(self.fx.type_a))
+
+    def test_narrow_typetype_metaclass_seam_engages(self) -> None:
+        from mypy.join import _deserialize_type, _serialize_type
+        from mypy.types import TypeType
+
+        declared = TypeType(self.fx.a, is_type_form=True)
+        r = _type_kernel.rust_narrow_declared_type(
+            _serialize_type(declared), _serialize_type(self.fx.type_type), True, self.resolver
+        )
+        assert r is not None, "seam deferred on TypeForm versus metaclass instance"
+        decoded = _deserialize_type(bytes(r))
+        assert decoded is not None
+        self.assertEqual(str(decoded), str(self.fx.type_a))
+
+    def test_narrow_callable_ret_tvars_parity(self) -> None:
+        # Callable with a type-var-carrying ret: the ret-meet tail replaces
+        # the declared ret (G[A] narrowed to G[B]) instead of deferring.
+        declared = CallableType([], [], [], self.fx.ga, self.fx.function, name="f")
+        narrowed = CallableType([], [], [], self.fx.gb, self.fx.function, name="f")
+        off = self._narrow(False, declared, narrowed)
+        on = self._narrow(True, declared, narrowed)
+        self.assertEqual(on, off)
+        self.assertEqual(on, "def () -> G[B]")
+
+    def test_narrow_callable_ret_tvars_seam_engages(self) -> None:
+        from mypy.join import _deserialize_type, _serialize_type
+
+        declared = CallableType([], [], [], self.fx.ga, self.fx.function, name="f")
+        narrowed = CallableType([], [], [], self.fx.gb, self.fx.function, name="f")
+        r = _type_kernel.rust_narrow_declared_type(
+            _serialize_type(declared), _serialize_type(narrowed), True, self.resolver
+        )
+        assert r is not None, "seam deferred on callables with a tvar-carrying ret"
+        decoded = _deserialize_type(bytes(r))
+        assert decoded is not None
+        self.assertEqual(str(decoded), "def () -> G[B]")
 
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
@@ -17429,12 +17501,7 @@ class NativeTypeanalAliasQuerySuite(Suite):
         from mypy.nodes import TypeAlias
 
         alias = TypeAlias(
-            Instance(self.fx.std_listi, [self.fx.t]),
-            "mod.G",
-            "mod",
-            1,
-            1,
-            alias_tvars=[self.fx.t],
+            Instance(self.fx.std_listi, [self.fx.t]), "mod.G", "mod", 1, 1, alias_tvars=[self.fx.t]
         )
         t = TypeAliasType(alias, [AnyType(TypeOfAny.from_unimported_type)])
         self._assert_hafu_window(t, True)
@@ -17481,9 +17548,7 @@ class NativeTypeanalAliasQuerySuite(Suite):
     def test_hafu_window_placeholder_type(self) -> None:
         from mypy.types import PlaceholderType
 
-        t = PlaceholderType(
-            "mod.ph", [AnyType(TypeOfAny.from_unimported_type)], line=-1
-        )
+        t = PlaceholderType("mod.ph", [AnyType(TypeOfAny.from_unimported_type)], line=-1)
         self._assert_hafu_window(t, True)
         self._assert_hafu_window(PlaceholderType("mod.ph", [], line=-1), False)
 
@@ -37758,9 +37823,7 @@ class NativeIsRecursivePairSuite(Suite):
         from mypy.typeops import _serialize_type
 
         return _type_kernel.rust_is_recursive_pair(
-            _serialize_type(s),
-            _serialize_type(t),
-            self._resolver,
+            _serialize_type(s), _serialize_type(t), self._resolver
         )
 
     def test_neither_alias_false(self) -> None:
@@ -41927,8 +41990,7 @@ class NativeMissingAnnotationsSuite(Suite):
 
         alias = TypeAlias(self.fx.a, "mod.RA", "mod", -1, -1)
         fdef = self._fdef(
-            self._callable(TypeAliasType(alias, []), [AnyType(TypeOfAny.unannotated)]),
-            ("x",),
+            self._callable(TypeAliasType(alias, []), [AnyType(TypeOfAny.unannotated)]), ("x",)
         )
         res = self._seam_alias(fdef, alias)
         assert res == (0, True)
@@ -41940,8 +42002,7 @@ class NativeMissingAnnotationsSuite(Suite):
 
         alias = TypeAlias(self.fx.a, "mod.RA", "mod", -1, -1)
         fdef = self._fdef(
-            self._callable(TypeAliasType(alias, []), [AnyType(TypeOfAny.unannotated)]),
-            ("x",),
+            self._callable(TypeAliasType(alias, []), [AnyType(TypeOfAny.unannotated)]), ("x",)
         )
         self._assert_par(
             fdef,
@@ -41959,8 +42020,7 @@ class NativeMissingAnnotationsSuite(Suite):
         from mypy.checker import _serialize_type_for_checker
 
         resolver = _type_kernel.build_native_resolver(
-            [self.fx.ai, self.fx.bi, self.fx.oi, self.fx.str_type_info],
-            [alias],
+            [self.fx.ai, self.fx.bi, self.fx.oi, self.fx.str_type_info], [alias]
         )
         type_tag = 1
         assert isinstance(fdef.type, CallableType)
@@ -48468,7 +48528,9 @@ class NativeFindSelfTypeSuite(Suite):
     def test_seam_resolverless_alias_noargs(self) -> None:
         # no_args aliases copy t.args over the target Instance's args;
         # the query runs over t.args directly.
-        alias_lst = TypeAlias(Instance(self.fx.std_listi, []), "mod.Lst", "mod", 1, 1, no_args=True)
+        alias_lst = TypeAlias(
+            Instance(self.fx.std_listi, []), "mod.Lst", "mod", 1, 1, no_args=True
+        )
         t = TypeAliasType(alias_lst, [UnboundType("Self")])
         self._assert_seam(t, {"Self": "typing.Self"}, True)
 
@@ -48504,20 +48566,10 @@ class NativeFindSelfTypeSuite(Suite):
         # list[Self] -> True (nested alias args resolve via the outer
         # subst, InstantiateAliasVisitor semantics).
         alias_b = TypeAlias(
-            Instance(self.fx.std_listi, [self.fx.t]),
-            "mod.B",
-            "mod",
-            1,
-            1,
-            alias_tvars=[self.fx.t],
+            Instance(self.fx.std_listi, [self.fx.t]), "mod.B", "mod", 1, 1, alias_tvars=[self.fx.t]
         )
         alias_a = TypeAlias(
-            TypeAliasType(alias_b, [self.fx.t]),
-            "mod.A",
-            "mod",
-            1,
-            1,
-            alias_tvars=[self.fx.t],
+            TypeAliasType(alias_b, [self.fx.t]), "mod.A", "mod", 1, 1, alias_tvars=[self.fx.t]
         )
         t = TypeAliasType(alias_a, [UnboundType("Self")])
         self._assert_seam(t, {"Self": "typing.Self"}, True)
@@ -48928,10 +48980,7 @@ class NativeStarExpansionSuite(Suite):
         iterable_ctx: Any | None = None,
         mapping_ctx: Any | None = None,
     ) -> Any:
-        from mypy.checkexpr import (
-            _deserialize_type_from_checkexpr,
-            _serialize_type_for_checkexpr,
-        )
+        from mypy.checkexpr import _deserialize_type_from_checkexpr, _serialize_type_for_checkexpr
 
         result = _type_kernel.rust_solve_generic_call(
             self.resolver_for(self.fx),
@@ -49033,17 +49082,8 @@ class NativeStarExpansionSuite(Suite):
         # **x where x is a TypedDict feeds the named formal's value type;
         # kwargs_used records the consumed key (argmap.py:405-416).
         t = self._generic_t()
-        callee = CallableType(
-            [t],
-            [ARG_NAMED],
-            ["a"],
-            t,
-            self.fx.function,
-            variables=[t],
-        )
-        td = TypedDictType(
-            {"a": self.fx.a}, set(["a"]), set(), Instance(self.fx.ai, [])
-        )
+        callee = CallableType([t], [ARG_NAMED], ["a"], t, self.fx.function, variables=[t])
+        td = TypedDictType({"a": self.fx.a}, {"a"}, set(), Instance(self.fx.ai, []))
         self._assert_star_parity(callee, [td], [ARG_STAR2], [[0]])
 
     def test_star_kwargs_mapping_instance_same_args(self) -> None:
@@ -49062,9 +49102,7 @@ class NativeStarExpansionSuite(Suite):
         callee = self._callee_of([t], t)
         actual = Instance(self.fx.gi, [self.fx.a])
         mapping_ctx = Instance(self.fx.hi, [self.fx.d, self.fx.a])
-        self._assert_star_parity(
-            callee, [actual], [ARG_STAR2], [[0]], mapping_ctx=mapping_ctx
-        )
+        self._assert_star_parity(callee, [actual], [ARG_STAR2], [[0]], mapping_ctx=mapping_ctx)
 
     def test_star_tvt_upper_bound_shared_tuple_index(self) -> None:
         # *x where x is a TypeVarTuple with upper_bound tuple[A, D]: the
@@ -49080,9 +49118,7 @@ class NativeStarExpansionSuite(Suite):
             tuple_fallback=Instance(self.fx.std_tuplei, [self.fx.anyt]),
             default=AnyType(TypeOfAny.special_form),
         )
-        self._assert_star_parity(
-            callee, [tvt, tvt], [ARG_STAR, ARG_STAR], [[0], [1]]
-        )
+        self._assert_star_parity(callee, [tvt, tvt], [ARG_STAR, ARG_STAR], [[0], [1]])
 
     def test_missing_iterable_context_defers(self) -> None:
         # A star Instance actual without an Iterable context blob defers
@@ -49098,17 +49134,9 @@ class NativeStarExpansionSuite(Suite):
         # A TypedDict ** actual whose named formal has no matching item
         # defers (argmap.py:407-410 unreachable-name tail is checker-side).
         t = self._generic_t()
-        callee = CallableType(
-            [t],
-            [ARG_NAMED],
-            ["z"],
-            t,
-            self.fx.function,
-            variables=[t],
-        )
-        td = TypedDictType({"a": self.fx.a}, set(["a"]), set(), Instance(self.fx.ai, []))
+        callee = CallableType([t], [ARG_NAMED], ["z"], t, self.fx.function, variables=[t])
+        td = TypedDictType({"a": self.fx.a}, {"a"}, set(), Instance(self.fx.ai, []))
         assert self._seam(callee, [td], [ARG_STAR2], [[0]]) is None
-
 
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
