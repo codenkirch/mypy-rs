@@ -8958,8 +8958,11 @@ class NativeProtocolImplementationSuite(Suite):
         result = self._seam_call(Instance(i, []), Instance(p, []))
         assert result is False, f"missing member must be False, got {result!r}"
 
-    def test_protocol_left_defers(self) -> None:
-        """Protocol-left (recursion-prone) must defer (None)."""
+    def test_protocol_left_symmetric_pair_decides(self) -> None:
+        """Protocol-left engages (#1344): a symmetric member-set pair
+        with matching member signatures is decided True natively through
+        the same member loop Python runs (trivial check, assuming guard,
+        flags)."""
         from mypy.types import Instance
 
         self._live_info = {}
@@ -8967,7 +8970,7 @@ class NativeProtocolImplementationSuite(Suite):
         p2 = self._protocol("mod.P2", ["f"])
         self._build_resolver()
         result = self._seam_call(Instance(p1, []), Instance(p2, []))
-        assert result is None, f"protocol-left must defer, got {result!r}"
+        assert result is True, f"protocol-left pair must decide natively, got {result!r}"
 
     def test_non_protocol_right_defers(self) -> None:
         """Non-protocol right must defer (None), matching the assert in
@@ -8980,14 +8983,13 @@ class NativeProtocolImplementationSuite(Suite):
         result = self._seam_call(Instance(i, []), Instance(i, []))
         assert result is None, f"non-protocol right must defer, got {result!r}"
 
-    def test_protocol_left_defers_with_member_miss(self) -> None:
-        """Protocol-left defers even when the left member set provably
-        misses a required member of the right protocol. The
-        subtypes.py:1906-1911 fast path (return False on set miss) is
-        intentionally NOT mirrored: deciding the probe False lets the
-        join kernel's via-supertype walk proceed solo, and it diverges
-        from Python under --no-strict-optional
-        (testMeetOfIncompatibleProtocols, #1356)."""
+    def test_protocol_left_subset_miss_decides_false(self) -> None:
+        """Protocol-left member-set miss decides False natively: the
+        subtypes.py:1906-1911 fast path fires only when the LEFT side is
+        a protocol, before the assuming scan. The earlier wholesale
+        defer was pure caution (a naive right-side-only probe diverged
+        under --no-strict-optional, testMeetOfIncompatibleProtocols,
+        #1356)."""
         from mypy.types import Instance
 
         self._live_info = {}
@@ -8997,7 +8999,201 @@ class NativeProtocolImplementationSuite(Suite):
         self._build_resolver()
         left, right = Instance(p1, []), Instance(p2, [])
         result = self._seam_call(left, right)
-        assert result is None, f"member-set-miss pair must still defer, got {result!r}"
+        assert result is False, f"member-set-miss pair must decide False, got {result!r}"
+
+    def test_protocol_left_python_body_agreement(self) -> None:
+        """The new native protocol-left decisions must match the
+        pure-Python `is_protocol_implementation` body on the same
+        fixtures (gate-off Python member loop vs the seam)."""
+        from mypy.subtypes import is_protocol_implementation
+        from mypy.types import Instance
+
+        self._live_info = {}
+        p1 = self._protocol("mod.P1", ["f"])
+        p2 = self._protocol("mod.P2", ["f"])
+        p3 = self._protocol("mod.P3", ["f"])
+        p4 = self._protocol("mod.P4", ["f", "g"])
+        # mismatched-ret pair: left f -> object, right f -> A
+        p5 = self._protocol("mod.P5", ["f"])
+        fnode = p5.names["f"].node
+        assert isinstance(fnode, FuncDef)
+        fnode.type = self._method_with_return(p5, self.fx.o)
+        p6 = self._protocol("mod.P6", ["f"])
+        self._build_resolver()
+        for left, right, expected in [
+            (Instance(p1, []), Instance(p2, []), True),
+            (Instance(p3, []), Instance(p4, []), False),
+            (Instance(p5, []), Instance(p6, []), False),
+        ]:
+            py_result = is_protocol_implementation(left, right)
+            rust_result = self._seam_call(left, right)
+            assert py_result == expected == rust_result, (expected, py_result, rust_result)
+
+    def test_protocol_left_registry_cut(self) -> None:
+        """A pair registered in flight on the Python side cuts the
+        native protocol-left check to True exactly where the `assuming`
+        matrix scan would, even though the member loop itself would
+        decide False (the cut carries Python's coinductive recursion
+        semantics across the defer boundary, #1344)."""
+        from mypy.subtypes import _PROTOCOL_PAIRS_IN_FLIGHT, _serialize_type
+        from mypy.types import Instance
+
+        self._live_info = {}
+        p1 = self._protocol("mod.P1", ["f"])
+        p2 = self._protocol("mod.P2", ["f"])
+        # left f -> object vs right f -> A: the member loop alone says False.
+        fnode = p1.names["f"].node
+        assert isinstance(fnode, FuncDef)
+        fnode.type = self._method_with_return(p1, self.fx.o)
+        self._build_resolver()
+        left, right = Instance(p1, []), Instance(p2, [])
+        key = (_serialize_type(left), _serialize_type(right), False)
+        assert key not in _PROTOCOL_PAIRS_IN_FLIGHT
+        _PROTOCOL_PAIRS_IN_FLIGHT[key] = 1
+        try:
+            result = self._seam_call(left, right)
+        finally:
+            assert _PROTOCOL_PAIRS_IN_FLIGHT[key] == 1, "seam must not touch the registry"
+            del _PROTOCOL_PAIRS_IN_FLIGHT[key]
+        assert result is True, f"in-flight pair must cut True, got {result!r}"
+
+    def test_flush_returns_but_never_caches_cut_answers(self) -> None:
+        """A true answer sampled through a registry-consult cut is correct
+        only for the derivation that took the cut: `_flush_subtype_batch`
+        must hand it to the triggering call but never persist it into
+        `_subtype_answers`. Without this, a later fresh derivation of the
+        same pair reads the poisoned True cache
+        (testProtocolIncompatibilityWithUnionType, batch poisoning)."""
+        import mypy.subtypes as subtypes_mod
+        from mypy.subtypes import (
+            _PROTOCOL_PAIRS_IN_FLIGHT,
+            _clear_subtype_batch,
+            _set_native_subtype_active,
+            _set_native_subtype_resolver,
+        )
+        from mypy.types import Instance
+
+        self._live_info = {}
+        # left f -> object vs right f -> A: the member loop alone says
+        # False, so a True answer can only come from the consult cut.
+        p1 = self._protocol("mod.FlushCutP1", ["f"])
+        p2 = self._protocol("mod.FlushCutP2", ["f"])
+        fnode = p1.names["f"].node
+        assert isinstance(fnode, FuncDef)
+        fnode.type = self._method_with_return(p1, self.fx.o)
+        self._build_resolver()
+        _set_native_subtype_active(True)
+        _set_native_subtype_resolver(self.resolver)
+        left, right = Instance(p1, []), Instance(p2, [])
+        left_b, right_b = self._serialize(left), self._serialize(right)
+        ctx_key = (False, False, False, False, False, True, False, False)
+        pair_key = (left_b, right_b, False)
+        assert pair_key not in _PROTOCOL_PAIRS_IN_FLIGHT
+        _PROTOCOL_PAIRS_IN_FLIGHT[pair_key] = 1
+        flushed_key = (left_b, right_b, ctx_key)
+        try:
+            _clear_subtype_batch()
+            # Sibling pair (any instance <: object) rides the same batch;
+            # its code-1 answer must still be cached.
+            sibling = (self._serialize(right), self._serialize(Instance(self.fx.oi, [])), ctx_key)
+            subtypes_mod._subtype_batch.append((left_b, right_b, ctx_key))
+            subtypes_mod._subtype_batch.append(sibling)
+            answers = subtypes_mod._flush_subtype_batch()
+            assert answers.get(flushed_key) is True, f"cut answer must reach the caller: {answers!r}"
+            # (_clear_subtype_batch wipes _subtype_answers too, so every
+            # cache assertion must run before the cleanup.)
+            assert (
+                flushed_key not in subtypes_mod._subtype_answers
+            ), "cut answer must not persist into _subtype_answers"
+            assert (
+                sibling in subtypes_mod._subtype_answers
+                and subtypes_mod._subtype_answers[sibling] is True
+            ), "plain decided pair must still cache"
+            assert (
+                _PROTOCOL_PAIRS_IN_FLIGHT.get(pair_key) == 1
+            ), "flush must not touch the registry"
+        finally:
+            _PROTOCOL_PAIRS_IN_FLIGHT.pop(pair_key, None)
+            _clear_subtype_batch()
+            _set_native_subtype_active(False)
+            _set_native_subtype_resolver(None)
+
+    def test_flush_fresh_derivation_runs_member_loop(self) -> None:
+        """End-to-end poisoning pin: after a consult-cut `True` has been
+        flushed for an in-flight pair, a later flush of the identical
+        bytes under the same flags (registry now empty) must NOT be
+        answered True from any cache; its slot defers so Python re-derives
+        via the single-pair path and the member loop decides."""
+        import mypy.subtypes as subtypes_mod
+        from mypy.subtypes import (
+            _PROTOCOL_PAIRS_IN_FLIGHT,
+            _clear_subtype_batch,
+            _flush_subtype_batch,
+            _set_native_subtype_active,
+            _set_native_subtype_resolver,
+        )
+        from mypy.types import Instance
+
+        self._live_info = {}
+        p1 = self._protocol("mod.FreshCutP1", ["f"])
+        p2 = self._protocol("mod.FreshCutP2", ["f"])
+        fnode = p1.names["f"].node
+        assert isinstance(fnode, FuncDef)
+        fnode.type = self._method_with_return(p1, self.fx.o)
+        self._build_resolver()
+        _set_native_subtype_active(True)
+        _set_native_subtype_resolver(self.resolver)
+        left, right = Instance(p1, []), Instance(p2, [])
+        left_b, right_b = self._serialize(left), self._serialize(right)
+        ctx_key = (False, False, False, False, False, True, False, False)
+        pair_key = (left_b, right_b, False)
+        try:
+            _clear_subtype_batch()
+            _PROTOCOL_PAIRS_IN_FLIGHT[pair_key] = 1
+            try:
+                subtypes_mod._subtype_batch.append((left_b, right_b, ctx_key))
+                answers = _flush_subtype_batch()
+            finally:
+                del _PROTOCOL_PAIRS_IN_FLIGHT[pair_key]
+            # The cut answer reaches the first derivation...
+            assert answers.get((left_b, right_b, ctx_key)) is True
+            # ...and the second derivation of the identical pair must not
+            # see a cached True: a fresh flush (registry empty) must
+            # re-derive and answer False instead.
+            subtypes_mod._subtype_batch.append((left_b, right_b, ctx_key))
+            second = _flush_subtype_batch()
+            assert (
+                second.get((left_b, right_b, ctx_key)) is False
+            ), f"poisoned cache re-answered cut True without re-derivation: {second!r}"
+        finally:
+            _clear_subtype_batch()
+            _set_native_subtype_active(False)
+            _set_native_subtype_resolver(None)
+
+    def test_protocol_left_defers_on_undecidable_member(self) -> None:
+        """Protocol-left still defers when a member fetch cannot decide
+        (here a @staticmethod member, whose analyze_var shape the bind
+        tail cannot mirror; same defer closure as
+        NativeProtocolMemberDeferSuite)."""
+        from mypy.nodes import Block, Decorator, FuncDef, Var
+        from mypy.types import CallableType, Instance
+
+        self._live_info = {}
+        p1 = self._protocol("mod.P1", ["f"])
+        p2 = self._protocol("mod.P2", ["f"])
+        fd = FuncDef("f", [], Block([]))
+        fd.info = p2
+        v = Var("f")
+        v.info = p2
+        v.is_staticmethod = True
+        v.is_initialized_in_class = True
+        v.is_ready = True
+        v.is_inferred = False
+        v.type = CallableType([Instance(p2, [])], [ARG_POS], [None], self.fx.a, self.fx.function)
+        p2.names["f"] = SymbolTableNode(MDEF, Decorator(fd, [], v))
+        self._build_resolver()
+        result = self._seam_call(Instance(p1, []), Instance(p2, []))
+        assert result is None, f"undecidable member fetch must defer, got {result!r}"
 
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")

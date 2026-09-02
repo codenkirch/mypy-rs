@@ -30,12 +30,15 @@
 //!     by the caller (`subtypes.rs:protocol_right_decision`) with a
 //!     thread-local stack keyed by the proper-subtype dimension.
 //!
-//! Deferral is the safe default: a protocol left (the recursion-prone
-//! `assuming` consumer itself) still defers wholesale, as does any member
-//! the lookups cannot decide (descriptors, extra_attrs/module instances,
-//! base-class-defined members behind the same-class guard).
+//! Deferral is the safe default: a protocol left now runs the full
+//! ported path (#1344: the subtypes.py:1906-1911 trivial member-set
+//! check, a cut on a pair held in flight in a Python frame, then the
+//! member loop), and any member the lookups cannot decide still defers
+//! (descriptors, extra_attrs/module instances, base-class-defined
+//! members behind the same-class guard).
 
 use crate::checker_helpers::{get_protocol_member_inner, GetProtocolMemberResult};
+use crate::checkmember::encode_type;
 use crate::member_flags::{
     get_member_flags_inner_pub, IS_CLASSVAR, IS_CLASS_OR_STATIC, IS_EXPLICIT_SETTER, IS_SETTABLE,
 };
@@ -43,6 +46,7 @@ use crate::subtypes::{is_subtype, SubtypeContext};
 use crate::typeinfo::{NativeTypeResolver, TypeResolver};
 use crate::wire::{read_type, ReadBuffer, Type};
 use pyo3::prelude::*;
+use pyo3::types::PyBytes;
 
 fn decode_type(bytes: &[u8]) -> Option<Type> {
     let mut buf = ReadBuffer::new(bytes);
@@ -73,13 +77,24 @@ pub(crate) fn is_protocol_implementation_inner(
         // Non-protocol right must defer to SubtypeVisitor.
         return None;
     }
-    // Protocol-left: recursion-prone (`assuming` guard not mirrored).
-    // The subtypes.py:1906-1911 member-set fast path is NOT portable: it
-    // changes callers' via-supertype walks (#1356, testMeetOfIncompatible-
-    // Protocols). Defer to Python's guarded loop.
-    let left_snap = resolver.get(left_ref(left)?);
-    if left_snap.is_some_and(|s| s.is_protocol) {
-        return None;
+    let left_snap = left_ref(left).and_then(|r| resolver.get(r));
+    // Protocol-left mirrors two Python facts (#1344): the trivial
+    // member-set fast path below, and the Python-frame assuming matrix
+    // this thread cannot see (registry consult, see helper below).
+    let left_is_protocol = left_snap.is_some_and(|s| s.is_protocol);
+    if left_is_protocol {
+        let left_members = &left_snap.unwrap().protocol_members;
+        if !right_snap
+            .protocol_members
+            .iter()
+            .filter(|m| !member_is_skipped(m, skip))
+            .all(|m| left_members.iter().any(|l| l == m))
+        {
+            return Some(false);
+        }
+        if protocol_pair_in_flight(py, left, right, ctx.proper_subtype) {
+            return Some(true);
+        }
     }
     // Recursion guard (subtypes.py:1972-1976): the member loop always runs
     // under `pop_on_exit(assuming, left, right)`, so a re-entered pair is
@@ -242,6 +257,46 @@ fn left_ref(t: &Type) -> Option<&str> {
         Type::Instance { type_ref, .. } => Some(type_ref),
         _ => None,
     }
+}
+
+// A consult hit is a *transient* cut: true only while the pair is in
+// flight; Python never caches it. The batch driver clears
+// CONSULT_CUT_OCCURRED per pair and sees such answers as code 3.
+thread_local! {
+    pub(crate) static CONSULT_CUT_OCCURRED: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+/// Clear the consult-cut marker for one pair's evaluation.
+pub(crate) fn consult_cut_reset() {
+    CONSULT_CUT_OCCURRED.with(|c| c.set(false));
+}
+
+/// Whether a registry consult hit fired since the last reset.
+pub(crate) fn consult_cut_taken() -> bool {
+    CONSULT_CUT_OCCURRED.with(std::cell::Cell::get)
+}
+
+/// Consult `mypy.subtypes.protocol_pair_in_flight` so a fresh Rust
+/// derivation cuts where Python's assuming-matrix scan would; any
+/// failure is a silent miss (a missing cut only costs re-derivation).
+fn protocol_pair_in_flight(py: Python<'_>, left: &Type, right: &Type, proper: bool) -> bool {
+    let (Some(left_bytes), Some(right_bytes)) = (encode_type(left), encode_type(right)) else {
+        return false;
+    };
+    let py_left = PyBytes::new(py, &left_bytes);
+    let py_right = PyBytes::new(py, &right_bytes);
+    let hit = py
+        .import("mypy.subtypes")
+        .ok()
+        .and_then(|m| m.getattr("protocol_pair_in_flight").ok())
+        .and_then(|f| f.call1((py_left, py_right, proper)).ok())
+        .and_then(|o| o.extract::<bool>().ok())
+        .unwrap_or(false);
+    if hit {
+        CONSULT_CUT_OCCURRED.with(|c| c.set(true));
+    }
+    hit
 }
 
 fn right_ref(t: &Type) -> Option<&str> {

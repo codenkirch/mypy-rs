@@ -205,7 +205,16 @@ fn materialize_meet(
     match r {
         SetOpResult::SameS => Some(s.clone()),
         SetOpResult::SameT => Some(t.clone()),
-        SetOpResult::Bottom => Some(Type::UninhabitedType { ambiguous: true }),
+        SetOpResult::Bottom => {
+            // meet.py:1143-1146 (unrelated Instances): Bottom materially
+            // means NoneType when state.strict_optional is False,
+            // UninhabitedType otherwise.
+            if ctx.strict_optional {
+                Some(Type::UninhabitedType { ambiguous: true })
+            } else {
+                Some(Type::NoneType)
+            }
+        }
         SetOpResult::Any => Some(any_type()),
         _ => None, // meet never produces these; defer if it ever does.
     }
@@ -3242,5 +3251,26 @@ mod tests {
         )
         .unwrap();
         assert_eq!(second, str_item);
+    }
+
+    #[test]
+    fn materialize_meet_bottom_honors_strict_optional() {
+        // meet.py:1143-1146 (unrelated Instances): Bottom is NoneType
+        // under no strict-optional, UninhabitedType otherwise; the solve
+        // fold materializes in Rust, so the branch must live there too.
+        let r = make_resolver(vec![snap("a.A"), snap("b.B")]);
+        let s = instance("a.A", vec![]);
+        let t = instance("b.B", vec![]);
+        let strict = SubtypeContext::new(false, false, false, false, false, true);
+        let non_strict = SubtypeContext::new(false, false, false, false, false, false);
+        let meet = materialize_meet(&s, &t, &strict, &r).unwrap();
+        match &meet {
+            Type::UninhabitedType { ambiguous, .. } => assert!(*ambiguous),
+            other => panic!("expected UninhabitedType, got {other:?}"),
+        }
+        assert_eq!(
+            materialize_meet(&s, &t, &non_strict, &r).unwrap(),
+            Type::NoneType
+        );
     }
 }

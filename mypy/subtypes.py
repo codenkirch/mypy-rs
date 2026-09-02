@@ -413,7 +413,10 @@ def _flush_subtype_batch() -> dict[tuple[bytes, bytes, tuple[bool, ...]], bool]:
     buffer even when the Rust call raises (the caller re-runs those pairs
     singly). Also folds every decided answer into the build-global
     `_subtype_answers` so an identical later pair under the same flags is
-    answered from the dict.
+    answered from the dict — except code 3 answers (true via a registry
+    consult cut): those hold only for the derivation that took the cut,
+    so they are returned to the caller but never persisted, mirroring
+    Python's assuming-matrix hit which is likewise not cached.
     """
     global _subtype_batch, _subtype_answers
     if not _subtype_batch:
@@ -455,12 +458,19 @@ def _flush_subtype_batch() -> dict[tuple[bytes, bytes, tuple[bool, ...]], bool]:
         # answered, fall through per-pair.
         return {}
     result: dict[tuple[bytes, bytes, tuple[bool, ...]], bool] = {}
+    cacheable: dict[tuple[bytes, bytes, tuple[bool, ...]], bool] = {}
     for (left_b, right_b, k), answer in zip(pairs, answers):
         if answer == 1:
             result[(left_b, right_b, k)] = True
+            cacheable[(left_b, right_b, k)] = True
         elif answer == 0:
             result[(left_b, right_b, k)] = False
-    _subtype_answers.update(result)
+            cacheable[(left_b, right_b, k)] = False
+        elif answer == 3:
+            # True via a consult cut: valid only for this derivation,
+            # returned to the caller but never persisted.
+            result[(left_b, right_b, k)] = True
+    _subtype_answers.update(cacheable)
     return result
 
 
@@ -1865,6 +1875,29 @@ def pop_on_exit(stack: list[tuple[T, T]], left: T, right: T) -> Iterator[None]:
     stack.pop()
 
 
+# In-flight recursive-protocol pairs, keyed by the wire bytes both sides
+# already share plus the proper-subtype flag; see protocol_pair_in_flight.
+# Refcounted, since nested frames can legally hold the same pair twice.
+_PROTOCOL_PAIRS_IN_FLIGHT: Final[dict[tuple[bytes, bytes, bool], int]] = {}
+
+
+def protocol_pair_in_flight(left: bytes, right: bytes, proper: bool) -> bool:
+    """Registry consult used by the Rust protocol kernel (no Python callers).
+
+    Mirrors the `assuming` matrix lifetime of is_protocol_implementation
+    for the Rust kernel (#1344): when a Python member loop defers a
+    sub-check into a native chain that re-derives the same pair, the Rust
+    thread-local assuming stack is empty, and this registry is what lets
+    the kernel cut exactly where the matrix scan would. Keys are the wire
+    bytes both sides already share (see _serialize_type, including the
+    builtin-instance short-circuit) plus the proper flag.
+
+    A miss is always safe: it only costs re-derivation, never a wrong
+    verdict (a missing cut defers to the actual member loop).
+    """
+    return (left, right, proper) in _PROTOCOL_PAIRS_IN_FLIGHT
+
+
 def is_protocol_implementation(
     left: Instance | TupleType,
     right: Instance,
@@ -1913,71 +1946,90 @@ def is_protocol_implementation(
     for l, r in reversed(assuming):
         if l == left and r == right:
             return True
-    with pop_on_exit(assuming, left, right):
-        for member in right.type.protocol_members:
-            if member in members_not_to_check:
-                continue
-            ignore_names = member != "__call__"  # __call__ can be passed kwargs
-            # The third argument below indicates to what self type is bound.
-            # We always bind self to the subtype. (Similarly to nominal types).
-            supertype = find_member(member, right, original_left)
-            assert supertype is not None
+    # Register the in-flight pair for the Rust kernel (#1344): key on the
+    # post-fallback left (the Instance natively re-derived). A
+    # serialization failure just skips registration.
+    pair_key: tuple[bytes, bytes, bool] | None = None
+    if _native_subtype_active:
+        try:
+            pair_key = (_serialize_type(left), _serialize_type(right), proper_subtype)
+            count = _PROTOCOL_PAIRS_IN_FLIGHT.get(pair_key, 0)
+            _PROTOCOL_PAIRS_IN_FLIGHT[pair_key] = count + 1
+        except (AssertionError, NotImplementedError):
+            pair_key = None
+    try:
+        with pop_on_exit(assuming, left, right):
+            for member in right.type.protocol_members:
+                if member in members_not_to_check:
+                    continue
+                ignore_names = member != "__call__"  # __call__ can be passed kwargs
+                # The third argument below indicates to what self type is bound.
+                # We always bind self to the subtype. (Similarly to nominal types).
+                supertype = find_member(member, right, original_left)
+                assert supertype is not None
 
-            subtype = get_protocol_member(left, original_left, member, class_obj)
-            # Useful for debugging:
-            # print(member, 'of', left, 'has type', subtype)
-            # print(member, 'of', right, 'has type', supertype)
-            if not subtype:
-                return False
-            if not proper_subtype:
-                # Nominal check currently ignores arg names
-                # NOTE: If we ever change this, be sure to also change the call to
-                # SubtypeVisitor.build_subtype_kind(...) down below.
-                is_compat = is_subtype(
-                    subtype, supertype, ignore_pos_arg_names=ignore_names, options=options
-                )
-            else:
-                is_compat = is_proper_subtype(subtype, supertype)
-            if not is_compat:
-                return False
-            if isinstance(get_proper_type(subtype), NoneType) and isinstance(
-                get_proper_type(supertype), CallableType
-            ):
-                # We want __hash__ = None idiom to work even without --strict-optional
-                return False
-            subflags = get_member_flags(member, left, class_obj=class_obj)
-            superflags = get_member_flags(member, right)
-            if IS_SETTABLE in superflags:
-                # Check opposite direction for settable attributes.
-                if IS_EXPLICIT_SETTER in superflags:
-                    supertype = find_member(member, right, original_left, is_lvalue=True)
-                if IS_EXPLICIT_SETTER in subflags:
-                    subtype = get_protocol_member(
-                        left, original_left, member, class_obj, is_lvalue=True
+                subtype = get_protocol_member(left, original_left, member, class_obj)
+                # Useful for debugging:
+                # print(member, 'of', left, 'has type', subtype)
+                # print(member, 'of', right, 'has type', supertype)
+                if not subtype:
+                    return False
+                if not proper_subtype:
+                    # Nominal check currently ignores arg names
+                    # NOTE: If we ever change this, be sure to also change the call to
+                    # SubtypeVisitor.build_subtype_kind(...) down below.
+                    is_compat = is_subtype(
+                        subtype, supertype, ignore_pos_arg_names=ignore_names, options=options
                     )
-                # At this point we know attribute is present on subtype, otherwise we
-                # would return False above.
-                assert supertype is not None and subtype is not None
-                if not is_subtype(supertype, subtype, options=options):
+                else:
+                    is_compat = is_proper_subtype(subtype, supertype)
+                if not is_compat:
                     return False
-            if IS_SETTABLE in superflags and IS_SETTABLE not in subflags:
-                return False
-            if not class_obj:
-                if IS_SETTABLE not in superflags:
-                    if IS_CLASSVAR in superflags and IS_CLASSVAR not in subflags:
+                if isinstance(get_proper_type(subtype), NoneType) and isinstance(
+                    get_proper_type(supertype), CallableType
+                ):
+                    # We want __hash__ = None idiom to work even without --strict-optional
+                    return False
+                subflags = get_member_flags(member, left, class_obj=class_obj)
+                superflags = get_member_flags(member, right)
+                if IS_SETTABLE in superflags:
+                    # Check opposite direction for settable attributes.
+                    if IS_EXPLICIT_SETTER in superflags:
+                        supertype = find_member(member, right, original_left, is_lvalue=True)
+                    if IS_EXPLICIT_SETTER in subflags:
+                        subtype = get_protocol_member(
+                            left, original_left, member, class_obj, is_lvalue=True
+                        )
+                    # At this point we know attribute is present on subtype, otherwise we
+                    # would return False above.
+                    assert supertype is not None and subtype is not None
+                    if not is_subtype(supertype, subtype, options=options):
                         return False
-                elif (IS_CLASSVAR in subflags) != (IS_CLASSVAR in superflags):
+                if IS_SETTABLE in superflags and IS_SETTABLE not in subflags:
                     return False
+                if not class_obj:
+                    if IS_SETTABLE not in superflags:
+                        if IS_CLASSVAR in superflags and IS_CLASSVAR not in subflags:
+                            return False
+                    elif (IS_CLASSVAR in subflags) != (IS_CLASSVAR in superflags):
+                        return False
+                else:
+                    if IS_VAR in superflags and IS_CLASSVAR not in subflags:
+                        # Only class variables are allowed for class object access.
+                        return False
+                    if IS_CLASSVAR in superflags:
+                        # This can be never matched by a class object.
+                        return False
+                # This rule is copied from nominal check in checker.py
+                if IS_CLASS_OR_STATIC in superflags and IS_CLASS_OR_STATIC not in subflags:
+                    return False
+    finally:
+        if pair_key is not None:
+            count = _PROTOCOL_PAIRS_IN_FLIGHT[pair_key] - 1
+            if count:
+                _PROTOCOL_PAIRS_IN_FLIGHT[pair_key] = count
             else:
-                if IS_VAR in superflags and IS_CLASSVAR not in subflags:
-                    # Only class variables are allowed for class object access.
-                    return False
-                if IS_CLASSVAR in superflags:
-                    # This can be never matched by a class object.
-                    return False
-            # This rule is copied from nominal check in checker.py
-            if IS_CLASS_OR_STATIC in superflags and IS_CLASS_OR_STATIC not in subflags:
-                return False
+                del _PROTOCOL_PAIRS_IN_FLIGHT[pair_key]
 
     if not proper_subtype:
         # Nominal check currently ignores arg names, but __call__ is special for protocols

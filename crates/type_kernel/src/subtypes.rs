@@ -3901,10 +3901,9 @@ pub(crate) fn rust_is_subtype(
 /// only batches pairs whose resolved flags are identical). Each entry is
 /// decoded and answered with the same `is_subtype` engine as the
 /// single-pair entry; the output is one i8 per pair, position-aligned:
-/// 1 = true, 0 = false, -1 = defer (decode error or the engine returned
+/// 1 = true, 0 = false, 3 = true-via-consult-cut (uncachable), -1 =
+/// defer (decode error or the engine returned
 /// `None`). A deferring entry only marks its own slot: the remaining
-/// pairs still get their answers, matching the single-pair fallthrough
-/// semantics so the Python shim re-runs exactly the deferred pairs.
 #[pyfunction]
 #[allow(clippy::too_many_arguments, dead_code)]
 pub(crate) fn rust_is_subtype_batch(
@@ -3950,11 +3949,16 @@ pub(crate) fn rust_is_subtype_batch(
                         continue;
                     }
                 };
+                crate::protocols::consult_cut_reset();
                 is_subtype(&left, &right, &ctx, type_resolver)
             }
             _ => None,
         };
         out.push(match answer {
+            // 3 = true via a registry-consult cut: correct for this
+            // derivation but never cacheable — the Python accumulator
+            // returns code 3 without persisting it into _subtype_answers.
+            Some(true) if crate::protocols::consult_cut_taken() => 3,
             Some(true) => 1,
             Some(false) => 0,
             None => -1,
