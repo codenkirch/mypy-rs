@@ -5342,6 +5342,18 @@ mod tests {
     }
 
     #[test]
+    fn alias_hand_encoder_matches_canonical_writer() {
+        // Drift guard (issue #1362): the hand encoder must stay
+        // byte-identical to the canonical writer for the unflagged form.
+        let hand = encode_alias_bytes_with_flag("A", false);
+        let canonical = encode_type(&recursive_alias("A")).unwrap();
+        assert_eq!(hand, canonical);
+        // And the hand bytes decode back to the plain alias fixture.
+        let decoded = wire::read_type(&mut ReadBuffer::new(&hand), None).unwrap();
+        assert_eq!(decoded, recursive_alias("A"));
+    }
+
+    #[test]
     fn is_recursive_pair_neither_alias_false() {
         let s = plain_instance("A");
         let t = plain_instance("B");
