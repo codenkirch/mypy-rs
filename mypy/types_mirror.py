@@ -22,9 +22,14 @@ Design notes (see crates/type_kernel/doc/f1_mirror.md):
   baseline and are invisible in F1, exactly like mutations of
   non-family objects.
 - Mirrored objects are pinned strongly until ``reset`` so a recycled
-  ``id()`` cannot adopt a stale handle; escaped mutations (list ops,
-  ``TypeVarId.meta_level``) are detected at the next serialization funnel
-  instead of at ``__setattr__``.
+  ``id()`` cannot adopt a stale handle; escaped mutations (raw list ops
+  on family fields) are detected at the next serialization funnel
+  instead of at ``__setattr__``. TypeVarId writes are captured through
+  their own shim plus a reverse map from tvid to carrier handles, and
+  family leaves behind a non-family Type (e.g. a tuple fallback
+  Instance under a TypeVarType's TupleType upper_bound) are closed
+  over by `_HIDDEN_EMBED`, so a captured leaf write re-serializes the
+  hidden family container too (issue #1372).
 """
 
 from __future__ import annotations
@@ -37,7 +42,7 @@ from collections import deque
 from collections.abc import Iterator
 from typing import Any, Final, cast
 
-from mypy.types import CallableType, Instance, Type, TypeVarType, UnionType
+from mypy.types import CallableType, Instance, Type, TypeVarId, TypeVarType, UnionType
 
 FAMILY_CLASSES: Final = (Instance, CallableType, TypeVarType, UnionType)
 FAMILY_NAME: Final[dict[type, str]] = {
@@ -46,6 +51,10 @@ FAMILY_NAME: Final[dict[type, str]] = {
     TypeVarType: "tvar",
     UnionType: "union",
 }
+# TypeVarId is not a Type: embedded in TypeVarLikeType.id, invisible to the
+# family parents graph, and a meta_level write fires no family __setattr__.
+# It gets its own capture shim plus a reverse map (TypeVarId -> carriers).
+TVID_CLASSES: Final = (TypeVarId,)
 # Attributes written by hashing or lazy truthiness init never affect the
 # wire bytes of any family class; skipping them keeps the mirror quiet.
 SKIP_ATTRS: Final = frozenset(
@@ -84,6 +93,38 @@ _ADOPT_STRIKE_Q: deque[int] = deque()
 _ADOPT_STRIKE_CAP: Final = 65536
 _audit: dict[str, int] = {}
 _mismatch_examples: dict[str, str] = {}
+# TypeVarId capture state (see TVID_CLASSES). `_TVID_CONSTRUCTION` counts
+# TypeVarId.__init__ calls in flight so construction writes are never captured;
+# `_TVID_REVERSE` pins the tvid (id() stays valid until reset() per build).
+_TVID_CONSTRUCTION: int = 0
+_TVID_REVERSE: dict[int, tuple[TypeVarId, set[int]]] = {}
+# Hidden-parent closure: a family leaf behind a non-family Type (e.g. TupleType
+# upper_bound) has no parents-graph edge, so `_HIDDEN_EMBED[id(leaf)]` -> (leaf,
+# container handles) pins the leaf and supplies ancestors hidden from cascades.
+_HIDDEN_EMBED: dict[int, tuple[Any, set[int]]] = {}
+# Slots whose captured replacement can introduce or orphan hidden embeds: these
+# setattrs re-index the root (parents are not: a same-slot subtree swap cannot
+# hide a visible ancestor chain); other setattrs skip it, funnels keep full walk.
+_REINDEX_SLOTS: Final[frozenset[str]] = frozenset(
+    {
+        "args",
+        "items",
+        "variables",
+        "arg_types",
+        "ret_type",
+        "upper_bound",
+        "values",
+        "default",
+        "fallback",
+        "last_known_value",
+        "original_str_expr",
+        "original_str_fallback",
+        "extra_attrs",
+        "instance_type",
+        "type_guard",
+        "type_is",
+    }
+)
 
 
 def _note_failed_adoption(obj: Any) -> None:
@@ -98,11 +139,15 @@ def _note_failed_adoption(obj: Any) -> None:
 
 
 def _short_stack() -> str:
-    # Only called on a mismatch, so formatting cost is bounded; keep the
-    # last frames up to (and including) the caller of the funnel.
+    # Only called on a mismatch, so formatting cost is bounded. Keep both
+    # ends: the shallow frames name the mutation origin, the deepest
+    # frames name the funnel that detected the drift.
     import traceback as _tb
 
-    return "".join(_tb.format_stack()[:-2])[-1600:]
+    frames = _tb.format_stack()[:-2]
+    if len(frames) <= 24:
+        return "".join(frames)
+    return "".join([*frames[:12], "\n    ...\n", *frames[-12:]])
 
 
 def _count(key: str, n: int = 1) -> None:
@@ -167,6 +212,102 @@ def _child_types_in_value(value: Any, site: str) -> Iterator[tuple[str, Type]]:
         yield from _child_types_in_value(value.attrs, f"{site}.attrs")
 
 
+def _tvids_in_value(value: Any, seen: set[int]) -> Iterator[TypeVarId]:
+    """Descend any slot value, yielding every TypeVarId reachable.
+
+    Unlike the child-types walk this descends into every Type (family or
+    not): a TypeVarId can hide inside a ParamSpecType, a TypeVarTupleType
+    fallback, or a plain list of variables, never touching a family slot.
+    `seen` cuts cycles (recursive alias trees) and is per-walk, so id()
+    stability is guaranteed while the root keeps the tree alive.
+    """
+    if value is None or isinstance(value, (str, bytes, bool, int, float)):
+        return
+    if isinstance(value, TypeVarId):
+        yield value
+        return
+    if isinstance(value, Type):
+        yield from _tvids_in(value, seen)
+        return
+    if isinstance(value, (list, tuple)):
+        seen.add(id(value))
+        for item in value:
+            yield from _tvids_in_value(item, seen)
+        return
+    if isinstance(value, dict):
+        seen.add(id(value))
+        for item in value.values():
+            yield from _tvids_in_value(item, seen)
+        return
+    if type(value).__name__ == "ExtraAttrs":
+        yield from _tvids_in_value(value.attrs, seen)
+
+
+def _tvids_in(t: Type, seen: set[int]) -> Iterator[TypeVarId]:
+    if id(t) in seen:
+        return
+    seen.add(id(t))
+    for name in _type_names(type(t)):
+        if name.startswith("_") or name in _SKIP_SLOTS:
+            continue
+        try:
+            value = object.__getattribute__(t, name)
+        except AttributeError:
+            continue
+        yield from _tvids_in_value(value, seen)
+
+
+def _record_tvid_carriers(root: Type, handle: int) -> None:
+    """Index every TypeVarId reachable from `root` to its carrier handle."""
+    for tvid in _tvids_in(root, set()):
+        entry = _TVID_REVERSE.get(id(tvid))
+        if entry is None:
+            _TVID_REVERSE[id(tvid)] = (tvid, {handle})
+        else:
+            entry[1].add(handle)
+
+
+def _family_embeds(t: Type, seen: set[int]) -> Iterator[Type]:
+    """Yield every family Type reachable from `t` (excluding `t` itself).
+
+    Unlike `_child_types` this does NOT stop at non-family Types: the
+    chain tvar -> TupleType -> Instance fallback must stay visible so a
+    captured write on the Instance can cascade into the tvar.
+    """
+    if id(t) in seen:
+        return
+    seen.add(id(t))
+    for name in _type_names(type(t)):
+        if name.startswith("_") or name in _SKIP_SLOTS:
+            continue
+        try:
+            value = object.__getattribute__(t, name)
+        except AttributeError:
+            continue
+        yield from _family_embeds_in_value(value, seen)
+
+
+def _family_embeds_in_value(value: Any, seen: set[int]) -> Iterator[Type]:
+    if value is None or isinstance(value, (str, bytes, bool, int, float)):
+        return
+    if isinstance(value, Type):
+        if id(value) not in seen:
+            if type(value) in FAMILY_NAME:
+                yield value
+            yield from _family_embeds(value, seen)
+        return
+    if isinstance(value, (list, tuple)):
+        for item in value:
+            yield from _family_embeds_in_value(item, seen)
+        return
+    if isinstance(value, dict):
+        for item in value.values():
+            yield from _family_embeds_in_value(item, seen)
+        return
+    if type(value).__name__ == "ExtraAttrs":
+        yield from _family_embeds_in_value(value.attrs, seen)
+
+
 # ---- fresh serialization ----
 
 
@@ -221,14 +362,69 @@ def _register_tree(t: Type) -> int | None:
         return None
     handle = _kernel_mod.rust_mirror_register(t, fam, fresh, child_handles)
     _BY_HANDLE[handle] = t
+    _record_tvid_carriers(t, handle)
+    _add_hidden_embeds(t, handle)
     return handle  # type: ignore[no-any-return]
 
 
-def _update_and_cascade(handle: int, fresh: bytes) -> None:
-    """Write `fresh` for `handle`, then re-sync parents containing it."""
+def _add_hidden_embeds(obj: Type, handle: int) -> None:
+    """Index every family descendant reachable through non-family Types.
+
+    Registered both at `_register_tree` time and after every cascade sync:
+    a captured setattr can replace a subtree (`tv.upper_bound = ...`),
+    whose new chain is invisible to any earlier fill, so containers must
+    be re-indexed whenever their bytes are re-serialized. Which objects
+    get the re-index walk is gated by `replaced_slot` in
+    `_update_and_cascade`; this helper itself always walks the full
+    `_family_embeds` set of the container it is given.
+    """
+    for embed in _family_embeds(obj, set()):
+        entry = _HIDDEN_EMBED.get(id(embed))
+        if entry is None:
+            _HIDDEN_EMBED[id(embed)] = (embed, {handle})
+        else:
+            entry[1].add(handle)
+
+
+def _sync_seed_handles(obj: Type) -> Iterator[int]:
+    """Container handles beyond the kernel parents graph.
+
+    Kernel parents cover family-child containment; `_HIDDEN_EMBED` also
+    handles family containers that embed `obj`'s bytes through a
+    non-family Type, invisible to the kernel graph.
+    """
+    entry = _HIDDEN_EMBED.get(id(obj))
+    if entry is not None and entry[0] is obj:
+        yield from entry[1]
+
+
+def _update_and_cascade(handle: int, fresh: bytes, replaced_slot: str | None = None) -> None:
+    """Write `fresh` for `handle`, then re-sync parents containing it.
+
+    `replaced_slot` controls the hidden-embed re-index: `None` means the
+    callers' unknown path (funnel or splice mismatch) and re-indexes the
+    root and every loop parent, the blind mode; a slot name means a
+    captured setattr through `_mirror_setattr`; a same-slot subtree
+    cannot hide a previously visible chain in an ancestor, so the root
+    gets the re-index only for `_REINDEX_SLOTS` slots and loop parents
+    are skipped entirely. `""` (the TypeVarId carrier path) saw no slot
+    replacement and re-indexes nothing.
+    """
+    # A captured family setattr may have swapped an id slot, introducing
+    # TypeVarIds no funnel ever adopted; re-index the root when the slot could
+    # carry embeds (`_add_hidden_embeds` keeps replaced subtrees reachable too).
+    skip_all = replaced_slot == ""
+    root_reindex = replaced_slot is None or (not skip_all and replaced_slot in _REINDEX_SLOTS)
     stack = list(_kernel_mod.rust_mirror_parents(handle))
+    obj = _BY_HANDLE.get(handle)
+    if obj is not None:
+        stack.extend(_sync_seed_handles(obj))
     seen = {handle}
     _kernel_mod.rust_mirror_update(handle, fresh)
+    if obj is not None:
+        _record_tvid_carriers(obj, handle)
+        if root_reindex:
+            _add_hidden_embeds(obj, handle)
     while stack:
         ph = stack.pop()
         if ph in seen:
@@ -239,13 +435,17 @@ def _update_and_cascade(handle: int, fresh: bytes) -> None:
             _count("cascade_missing_parent")
             continue
         _count("cascade_sync")
+        _record_tvid_carriers(parent, ph)
         try:
             pfresh = _fresh_bytes(parent)
         except Exception:
             _count("cascade_unserializable")
             continue
         _kernel_mod.rust_mirror_update(ph, pfresh)
+        if replaced_slot is None:
+            _add_hidden_embeds(parent, ph)
         stack.extend(_kernel_mod.rust_mirror_parents(ph))
+        stack.extend(_sync_seed_handles(parent))
 
 
 def _assert_fresh(t: Type, site: str) -> None:
@@ -422,8 +622,60 @@ def _mirror_setattr(self: Type, name: str, value: Any) -> None:
         return
     # A write through __setattr__ is a captured mutation, not an escape:
     # mirror it and re-sync any parent wire blobs that embed these bytes.
+    # The slot name gates the blind re-index walk (see _REINDEX_SLOTS).
     _count(f"setattr_captured.{fam}.{name}")
-    _update_and_cascade(h, fresh)
+    _update_and_cascade(h, fresh, name)
+
+
+def _make_tvid_init_wrapper(orig_init: Any) -> Any:
+    def init(self: TypeVarId, *args: Any, **kwargs: Any) -> None:
+        global _TVID_CONSTRUCTION
+        _TVID_CONSTRUCTION += 1
+        try:
+            orig_init(self, *args, **kwargs)
+        finally:
+            _TVID_CONSTRUCTION -= 1
+
+    init.__name__ = "mirror_tvid_init"
+    return init
+
+
+def _mirror_tvid_setattr(self: TypeVarId, name: str, value: Any) -> None:
+    # A TypeVarId write changes the wire bytes of every family carrier
+    # embedding it (nested funnels, e.g. freeze_all_type_vars), so capture at
+    # the source and re-sync each registered carrier through the normal cascade.
+    hook = _active and not _in_serialize and _construction == 0 and _TVID_CONSTRUCTION == 0
+    old = getattr(self, name, None)
+    _ORIG_SETATTR(self, name, value)
+    if not hook:
+        return
+    if old == value:
+        _count(f"tvid_setattr_equal.{name}")
+        return
+    entry = _TVID_REVERSE.get(id(self))
+    if entry is None:
+        # The tvid was never reachable from a registered tree at any
+        # adoption point; its carriers will surface at their funnels.
+        _count(f"tvid_orphan.{name}")
+        return
+    _count(f"tvid_captured.{name}")
+    for h in entry[1]:
+        obj = _BY_HANDLE.get(h)
+        if obj is None:
+            _count("cascade_missing_parent")
+            continue
+        fam = FAMILY_NAME[type(obj)]
+        try:
+            fresh = _fresh_bytes(obj)
+        except Exception:
+            _count(f"unserializable.{fam}.tvid:{name}")
+            continue
+        if not _mirror_expect_ok(h, fresh):
+            # No slot replacement on the TypeVarId itself, so neither the
+            # root nor any parent needs the hidden-embed re-index.
+            _update_and_cascade(h, fresh, "")
+        else:
+            _count(f"tvid_cascade_ok.{name}")
 
 
 def activate(*, strict: bool = False, audit: bool = False) -> None:
@@ -446,6 +698,13 @@ def activate(*, strict: bool = False, audit: bool = False) -> None:
         cls.__init__ = _make_init_wrapper(saved["init"], FAMILY_NAME[cls])  # type: ignore[method-assign]
         cls.write = _make_write_wrapper(saved["write"], FAMILY_NAME[cls])  # type: ignore[method-assign]
         cls.__setattr__ = _mirror_setattr  # type: ignore[method-assign, assignment]
+    for cls in TVID_CLASSES:
+        saved_tvid: dict[str, Any] = {
+            "init": cls.__dict__["__init__"],
+        }
+        _originals[cls] = saved_tvid
+        cls.__init__ = _make_tvid_init_wrapper(saved_tvid["init"])  # type: ignore[method-assign]
+        cls.__setattr__ = _mirror_tvid_setattr  # type: ignore[method-assign, assignment]
     _active = True
     _count("activate")
     # Wire-cache splice funnel (see _check_splice): the splice path in
@@ -487,6 +746,8 @@ def reset(*, clear_counts: bool = False) -> None:
     _BY_HANDLE.clear()
     _ADOPT_STRIKE.clear()
     _ADOPT_STRIKE_Q.clear()
+    _TVID_REVERSE.clear()
+    _HIDDEN_EMBED.clear()
     if clear_counts:
         _audit.clear()
         _mismatch_examples.clear()
