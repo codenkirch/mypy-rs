@@ -521,9 +521,9 @@ fn encode_type(typ: &Type) -> Option<Vec<u8>> {
     Some(wbuf.into_bytes())
 }
 
-/// Fresh-var parity guard for ParamSpec env lookups (shared by the
-/// ParamSpec splice arms in `param_spec_callable_arm` and
-/// `param_spec_leaf`). The wire drops meta_level on ParamSpecType
+/// Fresh-var parity guard for ParamSpec env lookups in the
+/// `param_spec_callable_arm` splice (the leaf defers on any env miss,
+/// issue #1359). The wire drops meta_level on ParamSpecType
 /// occurrences, so a fresh (meta-level 1) substitute is invisible here;
 /// meta vars allocate their own raw ids (types.py:645-648), so any env
 /// key matching the raw id + namespace at a nonzero meta level can only
@@ -546,16 +546,8 @@ fn has_fresh_param_spec_key(raw_id: i64, namespace: &str, env: &HashMap<EnvKey, 
 /// of answering with the flattened id.
 fn contains_param_spec(t: &Type) -> bool {
     match t {
-        Type::ParamSpecType {
-            prefix,
-            upper_bound,
-            default,
-            ..
-        } => {
-            // The node itself is an occurrence: always true.
-            let _ = (prefix, upper_bound, default);
-            true
-        }
+        // The node itself is an occurrence: always true.
+        Type::ParamSpecType { .. } => true,
         Type::Parameters(p) => contains_param_spec_in_params(p),
         Type::Instance {
             args,
@@ -631,10 +623,11 @@ fn contains_param_spec_in_params(p: &crate::wire::Parameters) -> bool {
 }
 
 /// `ExpandTypeVisitor.visit_param_spec` (expandtype.py:963-996). Returns
-/// `None` when the leaf defers to Python (ARGS/KWARGS flavors, a
-/// non-Instance upper bound, an unpack in the expanded prefix, a fresh
-/// meta var substitute the wire cannot key, or a result embedding a
-/// ParamSpecType whose meta_level the wire drops).
+/// `None` when the leaf defers to Python (no meta-level-0 env entry:
+/// Python's get(t.id, default) answer embeds a ParamSpecType, ARGS/
+/// KWARGS flavors, a non-Instance upper bound, an unpack in the
+/// expanded prefix, or a result embedding a ParamSpecType whose
+/// meta_level the wire drops).
 fn param_spec_leaf(t: &Type, env: &HashMap<EnvKey, Type>, strict_optional: bool) -> Option<Type> {
     let Type::ParamSpecType {
         prefix,
@@ -642,42 +635,15 @@ fn param_spec_leaf(t: &Type, env: &HashMap<EnvKey, Type>, strict_optional: bool)
         namespace,
         flavor,
         upper_bound,
-        default,
         ..
     } = t
     else {
         return None;
     };
-    // Python's `get(t.id, default)` default (expandtype.py:965): t itself
-    // with an empty prefix, which only ever expands the prefix arg types.
-    let default_repl = Type::ParamSpecType {
-        prefix: Box::new(crate::wire::Parameters {
-            arg_types: Vec::new(),
-            arg_kinds: Vec::new(),
-            arg_names: Vec::new(),
-            variables: Vec::new(),
-            imprecise_arg_kinds: false,
-            is_ellipsis_args: false,
-        }),
-        name: String::new(),
-        fullname: String::new(),
-        raw_id: *raw_id,
-        namespace: namespace.clone(),
-        flavor: *flavor,
-        upper_bound: upper_bound.clone(),
-        default: default.clone(),
-    };
-    let repl: &Type = match env.get(&(*raw_id, 0, namespace.to_string())) {
-        Some(r) => r,
-        None => {
-            // Distinguish "no env entry" (use the Python default) from the
-            // fresh-var guard above (defer).
-            if has_fresh_param_spec_key(*raw_id, namespace, env) {
-                return None;
-            }
-            &default_repl
-        }
-    };
+    // No meta-level-0 env entry: both the fresh-key substitute and the
+    // get(t.id, default) fallback embed a ParamSpecType the wire drops
+    // meta_level on (issue #1359). Parity: expandtype.py:963-996.
+    let repl: &Type = env.get(&(*raw_id, 0, namespace.to_string()))?;
     let res = match repl {
         Type::ParamSpecType {
             prefix: repl_prefix,
@@ -763,9 +729,11 @@ fn param_spec_leaf(t: &Type, env: &HashMap<EnvKey, Type>, strict_optional: bool)
 /// (expandtype.py:1149-1195). Returns `Some(Some(t))` when the splice
 /// ran, `Some(None)` when the case defers to Python (an UnpackType in
 /// the splice result, a fresh meta var substitute the wire cannot
-/// key, or a splice result embedding a ParamSpecType whose meta_level
-/// the wire drops), and `None` when there is no ParamSpec replacement
-/// in the env (the caller continues with the generic expansion path).
+/// key, a splice result embedding a ParamSpecType whose meta_level
+/// the wire drops, or a ParamSpec substituted by another ParamSpec:
+/// the arg-splice construction always fails the contains_param_spec
+/// tail guard), and `None` when there is no ParamSpec replacement in
+/// the env (the caller continues with the generic expansion path).
 fn param_spec_callable_arm(
     t: &Type,
     env: &HashMap<EnvKey, Type>,
@@ -859,78 +827,10 @@ fn param_spec_callable_arm(
             }
             Some(Some(res))
         }
-        Type::ParamSpecType {
-            prefix: repl_prefix,
-            name: repl_name,
-            fullname: repl_fullname,
-            raw_id: repl_raw_id,
-            namespace: repl_namespace,
-            flavor: _,
-            upper_bound: repl_upper_bound,
-            default: repl_default,
-        } => {
-            // Substituting one ParamSpec for another (e.g. Concatenate[int,
-            // P] for Q): the prefix merges and the last two args become
-            // P.args/**P.kwargs of the clean replacement (expandtype.py:1178).
-            let n = arg_types.len();
-            let mut new_arg_types = Vec::with_capacity(n - 2 + 2 + repl_prefix.arg_types.len());
-            for at in &arg_types[..n - 2] {
-                new_arg_types.push(expand_type_inner(at, env, strict_optional)?);
-            }
-            new_arg_types.extend(repl_prefix.arg_types.iter().cloned());
-            let clean_prefix = crate::wire::Parameters {
-                arg_types: Vec::new(),
-                arg_kinds: Vec::new(),
-                arg_names: Vec::new(),
-                variables: Vec::new(),
-                imprecise_arg_kinds: false,
-                is_ellipsis_args: false,
-            };
-            let clean_repl = |flavor: i64| Type::ParamSpecType {
-                prefix: Box::new(clean_prefix.clone()),
-                name: repl_name.clone(),
-                fullname: repl_fullname.clone(),
-                raw_id: *repl_raw_id,
-                namespace: repl_namespace.clone(),
-                flavor,
-                upper_bound: repl_upper_bound.clone(),
-                default: repl_default.clone(),
-            };
-            new_arg_types.push(clean_repl(1)); // ParamSpecFlavor.ARGS
-            new_arg_types.push(clean_repl(2)); // ParamSpecFlavor.KWARGS
-            let mut new_arg_kinds = arg_kinds[..n - 2].to_vec();
-            new_arg_kinds.extend(repl_prefix.arg_kinds.iter().copied());
-            new_arg_kinds.extend(arg_kinds[n - 2..].to_vec());
-            let mut new_arg_names = arg_names[..n - 2].to_vec();
-            new_arg_names.extend(repl_prefix.arg_names.iter().cloned());
-            new_arg_names.extend(arg_names[n - 2..].to_vec());
-            let new_ret = expand_type_inner(ret_type, env, strict_optional)?;
-            let mut res = t.clone();
-            if let Type::CallableType {
-                arg_types,
-                arg_kinds,
-                arg_names,
-                ret_type,
-                from_concatenate,
-                imprecise_arg_kinds,
-                ..
-            } = &mut res
-            {
-                *arg_types = new_arg_types;
-                *arg_kinds = new_arg_kinds;
-                *arg_names = new_arg_names;
-                *ret_type = new_ret.into();
-                *from_concatenate = *from_concatenate || !repl_prefix.arg_types.is_empty();
-                *imprecise_arg_kinds = *imprecise_arg_kinds || repl_prefix.imprecise_arg_kinds;
-            }
-            // The clean ARGS/KWARGS nodes are ParamSpecTypes; the wire
-            // cannot carry their meta_level, so this splice never
-            // round-trips. Defer to the live Python tree.
-            if contains_param_spec(&res) {
-                return Some(None);
-            }
-            Some(Some(res))
-        }
+        // Substituting one ParamSpec for another (expandtype.py:1178-1195):
+        // the clean ARGS/KWARGS nodes embed ParamSpecTypes the wire drops
+        // meta_level on, so defer before building (issue #1359).
+        Type::ParamSpecType { .. } => Some(None),
         // An env replacement of another shape (e.g. Any): Python falls
         // through to the generic expansion path too.
         _ => None,
