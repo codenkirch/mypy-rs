@@ -3515,8 +3515,9 @@ pub(crate) fn is_disjoint_base_inner(info: &PyAny) -> PyResult<bool> {
 /// `mypy.typeops.is_recursive_pair` (typeops.py:249-274): pure bool
 /// predicate, hot path in `join_types` / `meet_types` / `is_subtype`.
 ///
-/// Rust classifies two wire Type bytes plus the live `is_recursive` flags
-/// (which the wire format does not carry). The alias-chain expansion
+/// Rust classifies two wire Type bytes plus the `is_recursive` flags
+/// (a top-level alias carries its flag on the wire; the decoder lands
+/// it in the variant's `is_recursive` field). The alias-chain expansion
 /// (`get_proper_type`) runs through the snapshot alias resolver; when a
 /// snapshot is missing or an alias cycle is detected, the corresponding
 /// branch defers (returns `None`) and the Python caller falls back.
@@ -3536,20 +3537,22 @@ pub(crate) fn rust_is_recursive_pair(
     let aliases = resolver.alias_resolver();
 
     // The recursion flag rides the wire as a tagged conditional int on
-    // each TypeAliasType (see types.py write); read it from raw bytes.
-    // Non-alias operands carry no flag; undecodable flags defer (None).
-    let s_rec_opt = if matches!(s, Type::TypeAliasType { .. }) {
-        crate::wire::read_alias_recursion_flag(s_bytes)
-    } else {
-        Some(false)
-    };
-    let t_rec_opt = if matches!(t, Type::TypeAliasType { .. }) {
-        crate::wire::read_alias_recursion_flag(t_bytes)
-    } else {
-        Some(false)
-    };
-    let s_rec = s_rec_opt?;
-    let t_rec = t_rec_opt?;
+    // each TypeAliasType; the decode already landed it in the variant's
+    // `is_recursive` field, so no byte re-walk is needed.
+    let s_rec = matches!(
+        s,
+        Type::TypeAliasType {
+            is_recursive: true,
+            ..
+        }
+    );
+    let t_rec = matches!(
+        t,
+        Type::TypeAliasType {
+            is_recursive: true,
+            ..
+        }
+    );
 
     if s_rec {
         // Branch b: t is a recursive alias (resolver-free).

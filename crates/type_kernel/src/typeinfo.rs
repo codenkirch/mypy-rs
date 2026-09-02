@@ -231,7 +231,9 @@ pub(crate) struct TypeResolver {
 }
 
 /// Native counterpart of the `TypeVarId.new(meta_level=0)` counter.
-pub(crate) struct TvarIdAllocator {
+/// Private: only the renumber path (via `alloc_fresh_tvar_ids`) touches
+/// it, all inside `typeinfo.rs`.
+struct TvarIdAllocator {
     next_raw_id: i64,
 }
 

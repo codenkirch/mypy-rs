@@ -2243,9 +2243,9 @@ fn visit_join_inner(
                 // is_equivalent(t, s) -> combine. In the identical case
                 // combine(t, t) returns t (all joins identity, fallback kept).
 
-                // So SameS is right without building a CallableType. A
-                // both-generic pair renumbers to one shared id space
-                // (ids in result: originals; id-only diff, accepted).
+                // So SameS is right without building a CallableType: after
+                // renumber_generic_pair the compared ids are the shared
+                // native-registry batch, so an id-only diff accepts.
                 let identical = arg_kinds == s_arg_kinds
                     && arg_names == s_arg_names
                     && arg_types == s_arg_types
