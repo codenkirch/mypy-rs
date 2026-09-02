@@ -23,6 +23,14 @@
 //!    pair-identity registry and the Phase F graph-ownership stages; the
 //!    `allow(dead_code)` here is deliberate, matching `wire.rs`'s Stage-3a
 //!    posture (parity-tested, not yet wired to production paths).
+//! 5. **Stable layer survives `reset`.** `handle_for_stable` keys on a
+//!    `weakref.ref` pinned to the live object instead of the raw `id()`, so
+//!    a handle survives daemon-style rebuilds that call `reset` (which now
+//!    clears only the raw layer). Entries whose weakref died are swept on
+//!    every lookup, so a recycled `id()` can never adopt a stale handle.
+//!    A non-weakref-able object (e.g. a plain `int`) defers to `None`, the
+//!    same shape the raw layer's seam fallbacks expect. The raw layer stays
+//!    untouched for seams that only need within-build identity.
 
 #![allow(dead_code)]
 
@@ -41,6 +49,11 @@ struct Registry {
     next_handle: u64,
     /// Raw object pointer (`id()`-equivalent) -> minted handle.
     by_id: HashMap<usize, u64>,
+    /// Stable layer: raw pointer -> handle and handle -> `weakref.ref`.
+    /// Entries are swept when the weakref's target dies, so the pointer
+    /// key can never outlive the object it names.
+    stable_by_id: HashMap<usize, u64>,
+    stable_by_handle: HashMap<u64, Py<PyAny>>,
     /// Bumped by `reset` so callers can detect stale handles.
     generation: u64,
 }
@@ -50,8 +63,18 @@ impl Registry {
         Registry {
             next_handle: 1,
             by_id: HashMap::new(),
+            stable_by_id: HashMap::new(),
+            stable_by_handle: HashMap::new(),
             generation: 1,
         }
+    }
+
+    /// Minted-handle counter shared by both layers so a handle is
+    /// unambiguous whichever layer a caller consulted.
+    fn mint(&mut self) -> u64 {
+        let h = self.next_handle;
+        self.next_handle += 1;
+        h
     }
 }
 
@@ -91,9 +114,12 @@ pub(crate) fn retire(obj: &PyAny) {
     });
 }
 
-/// Clear the thread-local registry and bump the generation. Returns the new
-/// generation. Call at the same lifecycle boundary the enclosing build
-/// clears its per-build resolvers (guarantee 3).
+/// Clear the raw layer of the thread-local registry and bump the
+/// generation. Returns the new generation. Call at the same lifecycle
+/// boundary the enclosing build clears its per-build resolvers
+/// (guarantee 3). The stable layer survives untouched so weakref-pinned
+/// handles keep their identity across a daemon-style rebuild
+/// (guarantee 5).
 #[allow(dead_code)]
 pub(crate) fn reset() -> u64 {
     with_registry(|reg| {
@@ -103,6 +129,8 @@ pub(crate) fn reset() -> u64 {
         *reg = Registry {
             next_handle: reg.next_handle,
             by_id: HashMap::new(),
+            stable_by_id: std::mem::take(&mut reg.stable_by_id),
+            stable_by_handle: std::mem::take(&mut reg.stable_by_handle),
             generation,
         };
         generation
@@ -113,6 +141,70 @@ pub(crate) fn reset() -> u64 {
 #[allow(dead_code)]
 pub(crate) fn generation() -> u64 {
     with_registry(|reg| reg.generation)
+}
+
+/// Drop every stable-layer entry whose weakref target is dead. Broken or
+/// dead weakrefs can occur at any point (refcount-collected objects
+/// vanish without a callback pre-run), so sweeping on access is what
+/// keeps a recycled `id()` from adopting a stale handle.
+fn sweep_stable_locked(reg: &mut Registry, py: Python<'_>) {
+    let dead: Vec<u64> = reg
+        .stable_by_handle
+        .iter()
+        .filter(|(_, wr)| {
+            // `weakref.ref()` is itself the callable: `call0` returns the
+            // live object, or `None` once its target is collected.
+            wr.as_ref(py).call0().map_or(true, |live| live.is_none())
+        })
+        .map(|(h, _)| *h)
+        .collect();
+    if dead.is_empty() {
+        return;
+    }
+    let dead: std::collections::HashSet<u64> = dead.into_iter().collect();
+    reg.stable_by_handle.retain(|h, _| !dead.contains(h));
+    reg.stable_by_id.retain(|_, h| !dead.contains(h));
+}
+
+/// Mint (or return the existing) stable handle for a live Python object.
+///
+/// Unlike the raw layer, the handle survives `reset` (guarantee 5) and is
+/// swept against dead entries before every mint, so no recycled `id()`
+/// can adopt a stale handle. Returns `None` when the object does not
+/// support weakrefs (the seam should fall back to the raw layer then).
+#[allow(dead_code)]
+pub(crate) fn handle_for_stable(obj: &PyAny) -> Option<u64> {
+    let py = obj.py();
+    with_registry(|reg| {
+        sweep_stable_locked(reg, py);
+        let key = obj.as_ptr() as usize;
+        if let Some(&h) = reg.stable_by_id.get(&key) {
+            return Some(h);
+        }
+        // `weakref.ref` rejects non-weakref-able objects with TypeError;
+        // defer to `None` instead of risking a raw-key alias here.
+        let fresh: &PyAny = py
+            .import("weakref")
+            .ok()?
+            .getattr("ref")
+            .ok()?
+            .call1((obj,))
+            .ok()?;
+        let h = reg.mint();
+        reg.stable_by_id.insert(key, h);
+        reg.stable_by_handle.insert(h, Py::from(fresh));
+        Some(h)
+    })
+}
+
+/// Look up an existing stable handle without minting one.
+#[allow(dead_code)]
+pub(crate) fn handle_of_stable(obj: &PyAny) -> Option<u64> {
+    let py = obj.py();
+    with_registry(|reg| {
+        sweep_stable_locked(reg, py);
+        reg.stable_by_id.get(&(obj.as_ptr() as usize)).copied()
+    })
 }
 
 #[cfg(test)]
@@ -127,6 +219,13 @@ mod identity_tests {
 
     fn fresh_object(py: Python<'_>) -> &PyAny {
         py.eval("object()", None, None).unwrap()
+    }
+
+    /// Weakref-able stand-in: plain `object()` instances are not
+    /// weakref-able, but instances of a synthesized class (whose instances
+    /// get a `__weakref__` slot by default) are.
+    fn fresh_weakrefable(py: Python<'_>) -> &PyAny {
+        py.eval("type('Weak', (), {})()", None, None).unwrap()
     }
 
     #[test]
@@ -184,6 +283,80 @@ mod identity_tests {
             assert!(g2 > g1);
             assert_eq!(handle_of(obj), None);
             assert_ne!(handle_for(obj).unwrap(), h1);
+        });
+    }
+
+    #[cfg(test)]
+    pub(crate) fn stable_entry_count() -> usize {
+        with_registry(|reg| reg.stable_by_handle.len())
+    }
+
+    #[test]
+    fn test_stable_layer_survives_reset() {
+        with_py(|py| {
+            reset();
+            let obj = fresh_weakrefable(py);
+            let h = handle_for_stable(obj).unwrap();
+            // Raw layer gets a different key class, but must be
+            // idempotent independently of the stable entry.
+            assert_eq!(handle_for_stable(obj).unwrap(), h);
+            let raw = handle_for(obj).unwrap();
+            let g1 = generation();
+            reset();
+            assert!(generation() > g1);
+            // Raw layer cleared, stable layer intact (guarantee 5).
+            assert_eq!(handle_of(obj), None);
+            assert_eq!(handle_for_stable(obj).unwrap(), h);
+            // And sharing the monotonic counter means no collision with
+            // the fresh raw handle minted after the reset.
+            assert_ne!(handle_for(obj).unwrap(), h);
+            assert_ne!(raw, h);
+        });
+    }
+
+    #[test]
+    fn test_stable_layer_sweeps_dead_entries() {
+        reset();
+        // The mint runs in an inner GIL scope: at scope exit the pool
+        // flush drops the last owning reference, so the weakref target
+        // dies deterministically at the end of `with_gil`.
+        let dead_handle = Python::with_gil(|py| handle_for_stable(fresh_weakrefable(py)).unwrap());
+        assert_eq!(stable_entry_count(), 1);
+        // Next access sweeps: the pruned entry can never be adopted
+        // through a recycled id.
+        with_py(|py| {
+            let other = fresh_weakrefable(py);
+            assert_eq!(handle_of_stable(other), None);
+            assert_eq!(stable_entry_count(), 0);
+            let other_handle = handle_for_stable(other).unwrap();
+            assert_ne!(other_handle, dead_handle);
+            assert_eq!(stable_entry_count(), 1);
+        });
+    }
+
+    #[test]
+    fn test_stable_handles_distinct_and_raw_separate() {
+        with_py(|py| {
+            reset();
+            let a = fresh_weakrefable(py);
+            let b = fresh_weakrefable(py);
+            let ha = handle_for_stable(a).unwrap();
+            let hb = handle_for_stable(b).unwrap();
+            assert_ne!(ha, hb);
+            // Raw and stable layers are independent namespaces.
+            assert_eq!(handle_of(a), None);
+        });
+    }
+
+    #[test]
+    fn test_stable_layer_defers_on_non_weakref_object() {
+        with_py(|py| {
+            reset();
+            // A plain small int does not support weakrefs.
+            let n = py.eval("5", None, None).unwrap();
+            assert_eq!(handle_for_stable(n), None);
+            // And the raw layer still answers for it.
+            assert!(handle_for(n).is_some());
         });
     }
 

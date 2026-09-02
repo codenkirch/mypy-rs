@@ -899,6 +899,7 @@ mod tests {
         let alias = Type::TypeAliasType {
             args: vec![],
             type_ref: "mod.Alias".to_string(),
+            is_recursive: false,
         };
         assert_eq!(has_recursive_types_inner(&alias), None);
     }
@@ -1028,6 +1029,7 @@ mod tests {
         let alias = Type::TypeAliasType {
             args: vec![],
             type_ref: "mod.A".to_string(),
+            is_recursive: false,
         };
         let result = flatten_nested_unions_inner(&[alias], true, true);
         assert!(result.is_none());
@@ -1038,6 +1040,7 @@ mod tests {
         let alias = Type::TypeAliasType {
             args: vec![],
             type_ref: "mod.A".to_string(),
+            is_recursive: false,
         };
         let result = flatten_nested_unions_inner(&[alias], false, true);
         assert!(result.is_some());

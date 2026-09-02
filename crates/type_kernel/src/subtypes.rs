@@ -2822,7 +2822,11 @@ fn expand_aliases_depth(
         return None;
     }
     match typ {
-        Type::TypeAliasType { args, type_ref } => {
+        Type::TypeAliasType {
+            args,
+            type_ref,
+            is_recursive: _,
+        } => {
             // Issue #1149: cut an alias already active on this descent (the
             // `_expand_once` fixpoint). Keyed on args identity, so a sibling
             // same-alias-different-args occurrence still expands in place.
@@ -6657,6 +6661,7 @@ mod tests {
         Type::TypeAliasType {
             args,
             type_ref: type_ref.to_string(),
+            is_recursive: false,
         }
     }
 

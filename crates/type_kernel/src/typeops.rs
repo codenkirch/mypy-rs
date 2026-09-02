@@ -3918,6 +3918,7 @@ mod tests {
         let t = Type::TypeAliasType {
             args: vec![],
             type_ref: "mod.Alias".to_string(),
+            is_recursive: false,
         };
         assert_eq!(is_literal_type_like(&t), None);
     }
@@ -4106,6 +4107,7 @@ mod tests {
         let t = Type::TypeAliasType {
             args: vec![],
             type_ref: "mod.Alias".to_string(),
+            is_recursive: false,
         };
         assert_eq!(
             try_getting_literals(&t, "builtins.str", LiteralKind::Str),
@@ -4128,6 +4130,7 @@ mod tests {
         Type::TypeAliasType {
             args: vec![],
             type_ref: fullname.to_string(),
+            is_recursive: false,
         }
     }
 
@@ -4405,6 +4408,7 @@ mod tests {
         let alias = Type::TypeAliasType {
             type_ref: "mod.Alias".to_string(),
             args: vec![],
+            is_recursive: false,
         };
         assert_eq!(
             try_getting_instance_fallback(&alias, &empty_aliases()),
@@ -4424,6 +4428,7 @@ mod tests {
         let alias = Type::TypeAliasType {
             type_ref: "mod.Alias".to_string(),
             args: vec![],
+            is_recursive: false,
         };
         assert_eq!(
             try_getting_instance_fallback(&alias, &aliases),
@@ -4445,6 +4450,7 @@ mod tests {
         let alias = Type::TypeAliasType {
             type_ref: "mod.Pair".to_string(),
             args: vec![],
+            is_recursive: false,
         };
         assert_eq!(
             try_getting_instance_fallback(&alias, &aliases),
@@ -4466,6 +4472,7 @@ mod tests {
         let alias = Type::TypeAliasType {
             type_ref: "mod.A".to_string(),
             args: vec![],
+            is_recursive: false,
         };
         let result: Option<Type> =
             Python::with_gil(|py| coerce_to_literal_inner(py, &alias, &resolver));
@@ -4483,6 +4490,7 @@ mod tests {
         let alias = Type::TypeAliasType {
             type_ref: "mod.A".to_string(),
             args: vec![],
+            is_recursive: false,
         };
         let result: Option<Type> =
             Python::with_gil(|py| coerce_to_literal_inner(py, &alias, &resolver));
@@ -4650,6 +4658,7 @@ mod tests {
         let alias = Type::TypeAliasType {
             type_ref: "mod.Alias".to_string(),
             args: vec![],
+            is_recursive: false,
         };
         assert_eq!(
             try_expanding_sum_type_to_union_inner(&alias, None, true, &TypeResolver::new()),
@@ -4735,6 +4744,7 @@ mod tests {
         let alias = Type::TypeAliasType {
             args: vec![],
             type_ref: "mod.Alias".to_string(),
+            is_recursive: false,
         };
         let i = plain_instance("builtins.int");
         let union = union_of(vec![alias, i]);
@@ -4882,6 +4892,7 @@ mod tests {
         let alias = Type::TypeAliasType {
             args: vec![tv_type(1, "T")],
             type_ref: "mod.Alias".to_string(),
+            is_recursive: false,
         };
         // The wire now carries alias-bearing types (args + type_ref), so
         // extraction succeeds at the encode boundary but still defers in
@@ -4911,6 +4922,7 @@ mod tests {
         let t = Type::TypeAliasType {
             args: vec![],
             type_ref: "mod.Lst".to_string(),
+            is_recursive: false,
         };
         let mut out = Vec::new();
         collect_type_vars(&t, false, Some(&aliases), &mut Vec::new(), &mut out).unwrap();
@@ -4936,6 +4948,7 @@ mod tests {
         let t = Type::TypeAliasType {
             args: vec![tv_type(5, "U")],
             type_ref: "mod.Pair".to_string(),
+            is_recursive: false,
         };
         let mut out = Vec::new();
         collect_type_vars(&t, false, Some(&aliases), &mut Vec::new(), &mut out).unwrap();
@@ -4951,6 +4964,7 @@ mod tests {
             Type::TypeAliasType {
                 args: vec![],
                 type_ref: "mod.R".to_string(),
+                is_recursive: false,
             },
             tv_type(1, "T"),
         ]);
@@ -4958,6 +4972,7 @@ mod tests {
         let t = Type::TypeAliasType {
             args: vec![],
             type_ref: "mod.R".to_string(),
+            is_recursive: false,
         };
         let mut out = Vec::new();
         collect_type_vars(&t, false, Some(&aliases), &mut Vec::new(), &mut out).unwrap();
@@ -5036,6 +5051,7 @@ mod tests {
         let alias = Type::TypeAliasType {
             args: vec![],
             type_ref: "mod.Alias".to_string(),
+            is_recursive: false,
         };
         // Round-trip succeeds (args + type_ref), but erase_to_bound's
         // expansion needs the resolver, so the erasure still defers.
@@ -5264,6 +5280,7 @@ mod tests {
         Type::TypeAliasType {
             args: vec![],
             type_ref: name.to_string(),
+            is_recursive: false,
         }
     }
 

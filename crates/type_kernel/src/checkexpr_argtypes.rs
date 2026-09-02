@@ -562,6 +562,7 @@ mod tests {
         let alias = Type::TypeAliasType {
             args: vec![],
             type_ref: "m.A".to_string(),
+            is_recursive: false,
         };
         let aliases = crate::aliases::TypeAliasResolver::new();
         assert!(get_proper_type_owned(&alias, &aliases).is_none());
@@ -589,6 +590,7 @@ mod tests {
         let alias = Type::TypeAliasType {
             args: vec![],
             type_ref: "m.A".to_string(),
+            is_recursive: false,
         };
         let expanded = get_proper_type_owned(&alias, &aliases).expect("no-args alias must expand");
         assert!(matches!(
@@ -626,6 +628,7 @@ mod tests {
         let alias = Type::TypeAliasType {
             args: vec![any_type()],
             type_ref: "m.A".to_string(),
+            is_recursive: false,
         };
         let aliases_ref = &aliases;
         // Whole-call defer: the shim falls back to Python which expands

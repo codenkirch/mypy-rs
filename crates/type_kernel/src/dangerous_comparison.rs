@@ -531,6 +531,7 @@ mod tests {
         Type::TypeAliasType {
             args: Vec::new(),
             type_ref: type_ref.to_owned(),
+            is_recursive: false,
         }
     }
 

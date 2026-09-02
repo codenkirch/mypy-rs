@@ -408,7 +408,11 @@ fn expand_frame(typ: &Type, left_ref: &str, left_args: &[Type]) -> Option<Type> 
                 extra_attrs: extra_attrs.clone(),
             })
         }
-        Type::TypeAliasType { type_ref, args } => {
+        Type::TypeAliasType {
+            type_ref,
+            args,
+            is_recursive: _,
+        } => {
             // Target of a type alias cannot contain typevars bound by the
             // frame; only the args expand (expandtype.py:1321-1328).
             if args.is_empty() {
@@ -425,6 +429,7 @@ fn expand_frame(typ: &Type, left_ref: &str, left_args: &[Type]) -> Option<Type> 
             Some(Type::TypeAliasType {
                 type_ref: type_ref.clone(),
                 args: new_args,
+                is_recursive: false,
             })
         }
         Type::TypeVarType {
@@ -824,6 +829,7 @@ mod tests {
         Type::TypeAliasType {
             type_ref: type_ref.to_string(),
             args,
+            is_recursive: false,
         }
     }
 

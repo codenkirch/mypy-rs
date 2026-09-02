@@ -1185,6 +1185,7 @@ fn self_type_visit_alias(
     let bare = Type::TypeAliasType {
         args: Vec::new(),
         type_ref: type_ref.clone(),
+        is_recursive: false,
     };
     let (target, _, py312) = match expanded_alias_target(&bare, aliases) {
         Some(t) => t,
@@ -1358,7 +1359,7 @@ fn find_self_type_wire(
     seen: &mut Vec<String>,
 ) -> Result<bool, DeferError> {
     match t {
-        Type::TypeAliasType { args, type_ref } => {
+        Type::TypeAliasType { args, type_ref, is_recursive: _ } => {
             if seen.contains(type_ref) {
                 return Ok(false);
             }
@@ -2643,6 +2644,7 @@ mod tests {
         let t = Type::TypeAliasType {
             args: vec![make_any(EXPLICIT)],
             type_ref: "m.T".to_string(),
+            is_recursive: false,
         };
         assert_eq!(has_explicit_any_inner(&t, EXPLICIT), None);
         // Alias nested inside a union propagates the deferral.
@@ -2702,6 +2704,7 @@ mod tests {
             Type::TypeAliasType {
                 args: Vec::new(),
                 type_ref: "m.T".to_string(),
+                is_recursive: false,
             },
         ]);
         assert_eq!(collect_all_inner_types_inner(&t), None);
@@ -2779,6 +2782,7 @@ mod tests {
             Type::TypeAliasType {
                 args: Vec::new(),
                 type_ref: "m.T".to_string(),
+                is_recursive: false,
             },
         ]);
         assert_eq!(make_optional_type_inner(&t), None);
@@ -2791,6 +2795,7 @@ mod tests {
         let t = Type::TypeAliasType {
             args: Vec::new(),
             type_ref: "m.T".to_string(),
+            is_recursive: false,
         };
         let result = make_optional_type_inner(&t).unwrap();
         match result {
@@ -2811,6 +2816,7 @@ mod tests {
         let t = Type::TypeAliasType {
             args: Vec::new(),
             type_ref: "m.T".to_string(),
+            is_recursive: false,
         };
         let result = make_optional_type_inner(&t).unwrap();
         match result {
@@ -2861,6 +2867,7 @@ mod tests {
             typ: Box::new(Type::TypeAliasType {
                 args: Vec::new(),
                 type_ref: "m.T".to_string(),
+                is_recursive: false,
             }),
             from_star_syntax: false,
         };
@@ -2954,6 +2961,7 @@ mod tests {
         Type::TypeAliasType {
             args,
             type_ref: type_ref.to_string(),
+            is_recursive: false,
         }
     }
 
@@ -3128,13 +3136,18 @@ fn analyze_type_inner(
             })
         }
 
-        Type::TypeAliasType { args, type_ref } => {
+        Type::TypeAliasType {
+            args,
+            type_ref,
+            is_recursive: _,
+        } => {
             // Mirror `visit_type_alias_type` (typeanal.py): a pure
             // passthrough returning the alias unchanged, not an
             // expansion (needs the live target) nor arg re-analysis.
             Some(Type::TypeAliasType {
                 args: args.clone(),
                 type_ref: type_ref.clone(),
+                is_recursive: false,
             })
         }
 

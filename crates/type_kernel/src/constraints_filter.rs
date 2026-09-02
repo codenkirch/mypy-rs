@@ -556,6 +556,7 @@ mod tests {
         let alias = Type::TypeAliasType {
             args: vec![],
             type_ref: "mod.Alias".to_string(),
+            is_recursive: false,
         };
         let cs = vec![wc(t, SUBTYPE_OF, alias)];
         assert!(skip_reverse_union_inner(&cs).is_none());
@@ -652,6 +653,7 @@ mod tests {
         let alias = Type::TypeAliasType {
             args: vec![],
             type_ref: "mod.Alias".to_string(),
+            is_recursive: false,
         };
         let cs = vec![wc(t, SUBTYPE_OF, alias)];
         assert!(filter_imprecise_kinds_indices(&cs).is_none());

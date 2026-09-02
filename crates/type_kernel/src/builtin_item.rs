@@ -285,6 +285,7 @@ mod tests {
         let alias = Type::TypeAliasType {
             args: Vec::new(),
             type_ref: "mymod.Alias".to_string(),
+            is_recursive: false,
         };
         let t = make_instance("builtins.list", vec![alias]);
         assert_eq!(builtin_item_type_inner(&t, &r, true), None);

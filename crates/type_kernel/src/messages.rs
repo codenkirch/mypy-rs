@@ -462,7 +462,12 @@ fn format_type_inner(
     use_star_unpack: bool,
 ) -> Option<String> {
     // TypeAliasType recursive case (messages.py:2698-2708).
-    if let Type::TypeAliasType { type_ref, args } = typ {
+    if let Type::TypeAliasType {
+        type_ref,
+        args,
+        is_recursive: _,
+    } = typ
+    {
         // The wire format carries type_ref but no resolved alias node.
         // messages.py checks `typ.is_recursive` and `typ.alias`.
         // Without the resolved alias, we can't determine is_recursive

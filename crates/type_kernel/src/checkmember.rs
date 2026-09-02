@@ -6051,6 +6051,7 @@ mod tests {
         let alias = Type::TypeAliasType {
             args: vec![],
             type_ref: "some.Alias".to_string(),
+            is_recursive: false,
         };
         assert!(analyze_descriptor_access_inner(&alias, true, true, &resolver).is_none());
     }

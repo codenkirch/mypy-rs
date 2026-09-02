@@ -1720,6 +1720,7 @@ mod tests {
         Type::TypeAliasType {
             args: vec![],
             type_ref: type_ref.to_string(),
+            is_recursive: false,
         }
     }
 
@@ -2007,6 +2008,7 @@ mod tests {
         let alias = Type::TypeAliasType {
             args: Vec::new(),
             type_ref: "mod.Alias".to_string(),
+            is_recursive: false,
         };
         assert_eq!(calibrate_bytes(&callee, &alias), None);
     }
@@ -2136,6 +2138,7 @@ mod tests {
         let alias = Type::TypeAliasType {
             args: Vec::new(),
             type_ref: "mod.Alias".to_string(),
+            is_recursive: false,
         };
         assert_eq!(check_callable_call_tail(&callee, &[alias]), None);
     }
@@ -2746,6 +2749,7 @@ mod tests {
         let alias = Type::TypeAliasType {
             args: vec![],
             type_ref: "mod.IntAlias".to_string(),
+            is_recursive: false,
         };
         let out = solve_generic_bytes_with(&resolver, &callee, &[alias], vec![vec![0]]);
         let bytes = out.expect("expected successful solve, got deferral");
@@ -2792,6 +2796,7 @@ mod tests {
         let mut callee = callable_with_args(vec![Type::TypeAliasType {
             args: vec![],
             type_ref: "mod.TAlias".to_string(),
+            is_recursive: false,
         }]);
         let Type::CallableType { variables, .. } = &mut callee else {
             panic!("expected callable");

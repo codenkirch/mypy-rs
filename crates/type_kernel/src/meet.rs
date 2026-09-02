@@ -1979,6 +1979,7 @@ mod tests {
         Type::TypeAliasType {
             args: Vec::new(),
             type_ref: "mod.A".to_string(),
+            is_recursive: false,
         }
     }
 
@@ -2005,6 +2006,7 @@ mod tests {
         Type::TypeAliasType {
             type_ref: name.to_string(),
             args: Vec::new(),
+            is_recursive: false,
         }
     }
 

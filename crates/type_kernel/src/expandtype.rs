@@ -1248,7 +1248,11 @@ pub(crate) fn expand_type_inner(
         // TypeAliasType: Python's visit_type_alias_type expands the
         // arguments (expandtype.py:911-918). Target cannot contain typevars
         // (not bound by the alias itself), so we just expand the args.
-        Type::TypeAliasType { args, type_ref } => {
+        Type::TypeAliasType {
+            args,
+            type_ref,
+            is_recursive: _,
+        } => {
             if args.is_empty() {
                 return Some(typ.clone());
             }
@@ -1256,6 +1260,7 @@ pub(crate) fn expand_type_inner(
             Some(Type::TypeAliasType {
                 args: new_args,
                 type_ref: type_ref.clone(),
+                is_recursive: false,
             })
         }
 
@@ -2023,6 +2028,7 @@ mod tests {
         Type::TypeAliasType {
             args,
             type_ref: type_ref.to_string(),
+            is_recursive: false,
         }
     }
 
@@ -2036,7 +2042,11 @@ mod tests {
             Some(bytes) => {
                 let out = decode_type(&bytes).unwrap();
                 match out {
-                    Type::TypeAliasType { args, type_ref } => {
+                    Type::TypeAliasType {
+                        args,
+                        type_ref,
+                        is_recursive: _,
+                    } => {
                         assert_eq!(type_ref, "foo.Alias");
                         assert!(matches!(args.as_slice(), [Type::AnyType { .. }]));
                     }
@@ -2055,7 +2065,11 @@ mod tests {
         let env: HashMap<EnvKey, Type> = HashMap::new();
         match expand_with_env(&typ, &env, false, true) {
             Some(bytes) => match decode_type(&bytes).unwrap() {
-                Type::TypeAliasType { args, type_ref } => {
+                Type::TypeAliasType {
+                    args,
+                    type_ref,
+                    is_recursive: _,
+                } => {
                     assert!(args.is_empty());
                     assert_eq!(type_ref, "foo.Alias");
                 }
@@ -2074,7 +2088,11 @@ mod tests {
         let env: HashMap<EnvKey, Type> = HashMap::new();
         match expand_with_env(&typ, &env, false, true) {
             Some(bytes) => match decode_type(&bytes).unwrap() {
-                Type::TypeAliasType { args, type_ref } => {
+                Type::TypeAliasType {
+                    args,
+                    type_ref,
+                    is_recursive: _,
+                } => {
                     assert_eq!(type_ref, "foo.Alias");
                     assert!(matches!(args.as_slice(), [Type::TypeVarType { .. }]));
                 }
@@ -2196,7 +2214,11 @@ mod tests {
         with_alias_map(map, || {
             let out = flatten_union_expanding_aliases(&[alias_type("testmod.A", vec![])]).unwrap();
             match out.as_slice() {
-                [Type::TypeAliasType { type_ref, args }] => {
+                [Type::TypeAliasType {
+                    type_ref,
+                    args,
+                    is_recursive: _,
+                }] => {
                     assert_eq!(type_ref, "testmod.A");
                     assert!(args.is_empty());
                 }
@@ -2399,6 +2421,7 @@ mod tests {
                     [Type::TypeAliasType {
                         args: alias_args,
                         type_ref,
+                        is_recursive: _,
                     }] => {
                         // The tvar env key is (0, meta 0, "foo.Box"), so the
                         // written alias arg expands from T to int in Rust.

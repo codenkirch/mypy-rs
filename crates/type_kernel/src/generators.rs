@@ -594,6 +594,7 @@ mod tests {
         Type::TypeAliasType {
             args: Vec::new(),
             type_ref: "mod.A".to_string(),
+            is_recursive: false,
         }
     }
 

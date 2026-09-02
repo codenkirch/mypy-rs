@@ -2271,6 +2271,7 @@ mod tests {
         let t = Type::TypeAliasType {
             args: vec![],
             type_ref: "mymod.Alias".to_string(),
+            is_recursive: false,
         };
         assert_eq!(custom_special_method_inner(&t, "__eq__", false, &r), None);
     }
@@ -3293,6 +3294,7 @@ info.mro = [Cls()]
         Type::TypeAliasType {
             args: vec![],
             type_ref: type_ref.to_string(),
+            is_recursive: false,
         }
     }
 

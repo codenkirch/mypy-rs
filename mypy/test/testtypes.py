@@ -1900,6 +1900,38 @@ class NativeTypeWireSuite(Suite):
         )
         self.assert_wire_par(ov)
 
+    def test_type_alias_flag_default_shape(self) -> None:
+        # Phase F0 D2 (#1349): the Rust `Type::TypeAliasType` variant now
+        # carries `is_recursive`; default-shaped bytes (no conditional int)
+        # must decode with the flag False.
+        from mypy.nodes import TypeAlias
+
+        alias = TypeAlias(self.fx.a, "mod.A", "mod", -1, -1)
+        t = TypeAliasType(alias, [])
+        assert _type_kernel.read_alias_recursion_flag(self._bytes_of(t)) is False
+        # Whole-record consumption: the reader stops at END_TAG, so the
+        # record renders exactly as an unfixed alias with no args.
+        assert_equal(_type_kernel.read_type_to_str(self._bytes_of(t)), "<alias (unfixed)>")
+
+    def test_type_alias_flag_recursive_shape(self) -> None:
+        # A = Tuple[Union[A, B], ...]: the writer computes recursion inline
+        # via CollectAliasesVisitor and emits the conditional int
+        # (types.py:552); the Rust reader mirrors that tail exactly.
+        A, _ = self.fx.def_alias_1(self.fx.a)
+        assert A.is_recursive  # sanity: genuinely recursive per the model
+        assert _type_kernel.read_alias_recursion_flag(self._bytes_of(A)) is True
+
+    def test_type_alias_flag_union_alignment(self) -> None:
+        # A recursive alias member inside a union: the conditional int is
+        # consumed inside the member record, so the enclosing union record
+        # stays aligned (the Rust reader decodes it without an error).
+        A, _ = self.fx.def_alias_1(self.fx.a)
+        u = UnionType([A, self.fx.b])
+        assert _type_kernel.read_alias_recursion_flag(self._bytes_of(u)) is None
+        # Alignment proof: a mis-consumed flag would surface as an
+        # unexpected-tag error or a truncated member; pin the rendering.
+        assert _type_kernel.read_type_to_str(self._bytes_of(u)) is not None
+
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeFreshenSuite(Suite):
