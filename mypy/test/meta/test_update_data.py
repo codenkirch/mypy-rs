@@ -91,8 +91,7 @@ class UpdateDataSuite(Suite):
 
         [case testMissingMultiline]
         s: str = 42;  i: int = 'foo'  # E: Incompatible types in assignment (expression has type "int", variable has type "str") \\
-                                      # E: Incompatible types in assignment (expression
-                                      # has type "str", variable has type "int")
+                                      # E: Incompatible types in assignment (expression has type "str", variable has type "int")
 
         [case testExtraneous]
         s: str = 'foo'
