@@ -221,6 +221,13 @@ pub(crate) struct TypeResolver {
     /// reference; borrows are scoped (each allocation returns owned
     /// data), so a join re-entering the allocator cannot double-borrow.
     tvar_ids: RefCell<TvarIdAllocator>,
+    /// Shared alias-snapshot view, re-installed by `NativeTypeResolver`
+    /// whenever its `TypeAliasResolver` changes (build + each `update`
+    /// that adds aliases). All setops / typeops engine functions receive
+    /// only a `&TypeResolver`; this lets the join seam expand
+    /// `TypeAliasType` wire nodes without threading a second resolver
+    /// argument through the engine's call sites.
+    aliases: RefCell<Option<std::sync::Arc<HashMap<String, crate::aliases::TypeAliasSnapshot>>>>,
 }
 
 /// Native counterpart of the `TypeVarId.new(meta_level=0)` counter.
@@ -250,7 +257,26 @@ impl TypeResolver {
             live_info_map: None,
             ctor_types: HashMap::new(),
             tvar_ids: RefCell::new(TvarIdAllocator::new()),
+            aliases: RefCell::new(None),
         }
+    }
+
+    /// Current shared alias-snapshot view (`None` until the first
+    /// install). Callers defer when absent: no alias data is installed
+    /// yet, so any `TypeAliasType` is unexpansible.
+    pub(crate) fn aliases(
+        &self,
+    ) -> Option<std::sync::Arc<HashMap<String, crate::aliases::TypeAliasSnapshot>>> {
+        self.aliases.borrow().clone()
+    }
+
+    /// Replace the shared alias-snapshot view (called by
+    /// `NativeTypeResolver` at build time and after each alias insert).
+    pub(crate) fn install_aliases(
+        &self,
+        map: std::sync::Arc<HashMap<String, crate::aliases::TypeAliasSnapshot>>,
+    ) {
+        *self.aliases.borrow_mut() = Some(map);
     }
 
     /// Allocate `count` fresh `(raw_id, meta_level)` pairs from the
@@ -1231,6 +1257,12 @@ impl NativeTypeResolver {
             self.alias_resolver.insert(fullname, snap);
             added_aliases += 1;
         }
+        // Keep the shared alias view on the inner resolver current: ops
+        // behind `&TypeResolver` read aliases through it.
+        if added_aliases > 0 {
+            let shared = self.alias_resolver.shared();
+            self.resolver.install_aliases(shared);
+        }
         // Module snapshots: first seal wins (a module's symbol table is
         // final once its own SCC sealed it; later SCCs must not overwrite
         // it). Fresh-cache / dependency modules are already final here.
@@ -1447,12 +1479,15 @@ impl NativeTypeResolver {
         resolver: TypeResolver,
         alias_resolver: crate::aliases::TypeAliasResolver,
     ) -> Self {
-        Self {
+        let self_ = Self {
             resolver,
             alias_resolver,
             cached_dict: None,
             seen_modules: HashSet::new(),
-        }
+        };
+        let shared = self_.alias_resolver.shared();
+        self_.resolver.install_aliases(shared);
+        self_
     }
 
     /// Borrow the inner `TypeResolver` so Stage 3c `is_subtype` can look

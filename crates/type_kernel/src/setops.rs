@@ -251,14 +251,35 @@ fn decode_type(bytes: &[u8]) -> Option<Type> {
 /// - Parameters (needs live callable normalization).
 /// - Instance/etc right (full visitor).
 ///
-/// The Python shim is responsible for `get_proper_type` expansion
-/// BEFORE calling this, matching `join.py:303-304`.
+/// One `get_proper_type`-style chain step for a join operand: expand a
+/// top-level `TypeAliasType` to its substituted target, pass everything
+/// else through. `None` defers (snapshot miss / cycle / bad shape).
+fn proper_top(t: &Type, aliases: &dyn crate::aliases::AliasLookup) -> Option<Type> {
+    match t {
+        Type::TypeAliasType { .. } => {
+            let (target, _, _) = crate::checkexpr_functions::expanded_alias_target(t, aliases)?;
+            Some(target)
+        }
+        _ => Some(t.clone()),
+    }
+}
+
 pub(crate) fn join_types(
     s: &Type,
     t: &Type,
     ctx: &SubtypeContext,
     resolver: &TypeResolver,
 ) -> Option<SetOpResult> {
+    // join.py:505: s = get_proper_type(s). A top-level `TypeAliasType`
+    // operand expands through the alias snapshot (chain-resolving +
+    // substituting); snapshot miss / cycle / bad shape defers to Python.
+    if matches!(s, Type::TypeAliasType { .. }) || matches!(t, Type::TypeAliasType { .. }) {
+        let aliases = resolver.aliases()?;
+        let s_p = proper_top(s, &aliases)?;
+        let t_p = proper_top(t, &aliases)?;
+        return join_types(&s_p, &t_p, ctx, resolver);
+    }
+
     // join.py:311-312: if s is UnionType and t is not, swap so s is
     // the non-union. If both are unions, merge all items and call
     // make_simplified_union — it handles flattening and dedup.
@@ -2966,15 +2987,7 @@ fn visit_join_inner(
                 // 5. Else: TupleType(items, fallback).
                 let s_fb = crate::typeops::tuple_fallback(s, resolver)?;
                 let t_fb = crate::typeops::tuple_fallback(t, resolver)?;
-                let joined_fb =
-                    match rust_join_types_inner(&s_fb, &t_fb, ctx.strict_optional, resolver) {
-                        Some(v) => v,
-                        None => {
-                            {
-                                return None;
-                            };
-                        }
-                    };
+                let joined_fb = rust_join_types_inner(&s_fb, &t_fb, ctx.strict_optional, resolver)?;
 
                 let items = join_tuples_inner(s_items, t_items, ctx.strict_optional, resolver);
 
@@ -2987,9 +3000,7 @@ fn visit_join_inner(
                             || find_unpack(t_items).is_some()
                             || s_items.len() == t_items.len()
                         {
-                            {
-                                return None;
-                            };
+                            return None;
                         }
                         // items is None -> fallback (join.py:862-868):
                         // is_proper_subtype(s,t) -> t; (t,s) -> s; else
@@ -3038,9 +3049,8 @@ fn visit_join_inner(
             } = t_pf.as_ref()
             {
                 // Case 2: s is not TupleType. join_types(s, tuple_fallback(t)).
-                // For a builtins.tuple partial_fallback, tuple_fallback(t)
-                // builds Instance(builtins.tuple, [union of items]) (#1356);
-                // non-tuple fallbacks come back as-is, so join t_pf directly.
+                // tuple_fallback(t) builds Instance(builtins.tuple, [union of
+                // items]) (#1356); other fallbacks come back as-is, join t_pf.
                 let pf_owned;
                 let pf: &Type = if fb_ref == "builtins.tuple" {
                     let v = crate::typeops::tuple_fallback(t, resolver);
@@ -3904,6 +3914,53 @@ fn erase_extra_attrs_in_union(items: &[Type], result: &mut Type) {
     }
 }
 
+/// Alias-aware recursive union flatten for the `make_simplified_union`
+/// step-1 fallback: expands `TypeAliasType` items to their raw targets
+/// and flattens nested unions (both the live ones and the union-shaped
+/// alias targets), in item order. Returns `false` to defer on a missing
+/// snapshot, an alias cycle, or an unsubstitutable shape.
+fn flatten_alias_union_items(
+    items: &[Type],
+    aliases: &dyn crate::aliases::AliasLookup,
+    out: &mut Vec<Type>,
+    active: &mut Vec<String>,
+) -> bool {
+    for t in items {
+        match t {
+            Type::TypeAliasType { type_ref, .. } => {
+                // Recursive alias cut (#1149): an alias already on the
+                // active path would re-expand itself forever; Python's
+                // get_proper_type is lazy, so defer the whole call.
+                if active.contains(type_ref) {
+                    return false;
+                }
+                let Some(target) = crate::checkexpr_functions::expand_alias_target_raw(t, aliases)
+                else {
+                    return false;
+                };
+                active.push(type_ref.clone());
+                let ok = if let Type::UnionType { items: inner, .. } = &target {
+                    flatten_alias_union_items(inner, aliases, out, active)
+                } else {
+                    out.push(target);
+                    true
+                };
+                active.pop();
+                if !ok {
+                    return false;
+                }
+            }
+            Type::UnionType { items: inner, .. } => {
+                if !flatten_alias_union_items(inner, aliases, out, active) {
+                    return false;
+                }
+            }
+            _ => out.push(t.clone()),
+        }
+    }
+    true
+}
+
 /// `make_simplified_union` (typeops.py:605-692), Rust subset.
 ///
 /// Steps ported: flatten nested unions (step 1), single-item fast
@@ -3911,6 +3968,10 @@ fn erase_extra_attrs_in_union(items: &[Type], result: &mut Type) {
 /// (step 4, bool + enum cases), extra-attrs erasure (step 5),
 /// `make_union` (final). Returns `None` (defer to Python) when any
 /// step can't be completed.
+///
+/// Shorthand for the `expand_aliases=true` shape every Python call
+/// site except `tuple_fallback` uses (`handle_recursive` defaults to
+/// true).
 pub(crate) fn make_simplified_union(
     items: &[Type],
     ctx: &SubtypeContext,
@@ -3918,8 +3979,42 @@ pub(crate) fn make_simplified_union(
     contract_literals: bool,
     keep_erased: bool,
 ) -> Option<Type> {
-    // Step 1: flatten nested unions. TypeAliasType defers.
-    let flat = flatten_nested_unions(items)?;
+    make_simplified_union_expanded(items, ctx, resolver, contract_literals, keep_erased, true)
+}
+
+/// `make_simplified_union` with the caller's Python `handle_recursive`
+/// flag threaded through as `expand_aliases`. `false` (only
+/// `typeops.py:392`, the `tuple_fallback` union) restores the pre-w33
+/// defer: Python keeps a recursive alias item UNexpanded in step 1
+/// (types.py:5109), so expanding it here re-creates the
+/// `make_simplified_union` <-> `is_subtype` <-> `tuple_fallback` loop
+/// that segfaulted parity. Alias-bearing inputs defer to Python.
+pub(crate) fn make_simplified_union_expanded(
+    items: &[Type],
+    ctx: &SubtypeContext,
+    resolver: &TypeResolver,
+    contract_literals: bool,
+    keep_erased: bool,
+    expand_aliases: bool,
+) -> Option<Type> {
+    // Step 1: flatten nested unions. A top-level alias item expands to
+    // its raw target; union targets recurse, missing snapshot or cycle
+    // defers; under expand_aliases=false the fallback must not engage.
+    let flat = match flatten_nested_unions(items) {
+        Some(f) => f,
+        None if expand_aliases => {
+            let aliases = resolver.aliases()?;
+            let mut flat: Vec<Type> = Vec::with_capacity(items.len());
+            let mut active: std::vec::Vec<String> = Vec::new();
+            if !flatten_alias_union_items(items, &aliases, &mut flat, &mut active) {
+                return None;
+            }
+            flat
+        }
+        None => {
+            return None;
+        }
+    };
     // Step 2: single-item fast path.
     if flat.len() == 1 {
         return Some(flat.into_iter().next().unwrap());
@@ -3933,12 +4028,17 @@ pub(crate) fn make_simplified_union(
         dedup_ctx.proper_subtype = true;
         let mut current = flat;
         for _direction in 0..2 {
-            current = crate::remove_redundant::remove_redundant_pass(
+            current = match crate::remove_redundant::remove_redundant_pass(
                 &current,
                 &dedup_ctx,
                 resolver,
                 keep_erased,
-            )?;
+            ) {
+                Some(c) => c,
+                None => {
+                    return None;
+                }
+            };
             if current.len() <= 1 {
                 break;
             }
@@ -3946,7 +4046,12 @@ pub(crate) fn make_simplified_union(
         }
         current
     } else {
-        remove_redundant_union_items(flat, ctx, resolver)?
+        match remove_redundant_union_items(flat, ctx, resolver) {
+            Some(d) => d,
+            None => {
+                return None;
+            }
+        }
     };
     // Step 4: contract literals (bool + enum) sharing a fallback
     // whose full value set is covered. Gated on >1 LiteralType item,
@@ -3962,7 +4067,12 @@ pub(crate) fn make_simplified_union(
             .count()
             > 1
     {
-        try_contracting_literals_in_union(deduped, resolver)?
+        match try_contracting_literals_in_union(deduped, resolver) {
+            Some(c) => c,
+            None => {
+                return None;
+            }
+        }
     } else {
         deduped
     };
@@ -6032,15 +6142,13 @@ fn rust_join_types_inner(
     strict_optional: bool,
     resolver: &TypeResolver,
 ) -> Option<Type> {
-    match join_types(
+    join_types(
         s,
         t,
         &SubtypeContext::new(false, false, false, false, false, strict_optional),
         resolver,
-    ) {
-        Some(r) => materialize_join(s, t, r, resolver),
-        None => None,
-    }
+    )
+    .and_then(|r| materialize_join(s, t, r, resolver))
 }
 
 /// Inner meet_types dispatcher — returns `None` (defer) when Rust
@@ -8456,8 +8564,7 @@ mod tests {
     fn join_tuple_bare_tuple_instance_inner_args_defers() {
         // visit_tuple_type case 2: s is Instance, t=Tuple with
         // partial_fallback=builtins.tuple. The tuplefb port (#1356) builds
-        // tuple_fallback(t) = Instance(tuple,[int]) and recurses, but the
-        // inner same-ref join hits a 1-vs-0 arg arity mismatch and defers.
+        // tuple_fallback(t) and the inner join defers on an arity mismatch.
         let o = snap("builtins.object", "object");
         let tuple = snap_with_bases("builtins.tuple", "tuple", &["builtins.object"]);
         let r = make_resolver(vec![o, tuple]);
@@ -10371,6 +10478,289 @@ mod tests {
             // kernel does not model the is_var_arg swap branch); Python
             // answers `def (Any, a: Any =) -> Any` there, i.e. SameS.
             assert_eq!(join_types(&c2, &cv, &cc, &r), None);
+        }
+
+        // --- wave33: alias-aware join / union-flatten entry ---
+
+        use crate::wire::write_type as write_wire_type;
+
+        fn union(items: Vec<Type>) -> Type {
+            let can_be_true = items.iter().any(union_item_can_be_true);
+            let can_be_false = items.iter().any(union_item_can_be_false);
+            Type::UnionType {
+                items,
+                uses_pep604_syntax: false,
+                can_be_true,
+                can_be_false,
+                is_evaluated: true,
+                original_str_expr: None,
+                original_str_fallback: None,
+            }
+        }
+
+        fn alias_type(type_ref: &str, args: Vec<Type>) -> Type {
+            Type::TypeAliasType {
+                type_ref: type_ref.to_string(),
+                args,
+                is_recursive: false,
+            }
+        }
+
+        fn encode_itest(t: &Type) -> Vec<u8> {
+            let mut wbuf = WriteBuffer::new();
+            write_wire_type(&mut wbuf, t).unwrap();
+            wbuf.into_bytes()
+        }
+
+        fn alias_snap(fullname: &str, target: &Type) -> crate::aliases::TypeAliasSnapshot {
+            crate::aliases::TypeAliasSnapshot {
+                fullname: fullname.to_owned(),
+                target: encode_itest(target),
+                alias_tvars: vec![],
+                tvar_tuple_index: None,
+                no_args: false,
+                python_3_12_type_alias: false,
+            }
+        }
+
+        fn install(res: &TypeResolver, snaps: Vec<crate::aliases::TypeAliasSnapshot>) {
+            let mut map = std::collections::HashMap::new();
+            for s in snaps {
+                map.insert(s.fullname.clone(), s);
+            }
+            res.install_aliases(std::sync::Arc::new(map));
+        }
+
+        fn join_resolver(extra: Vec<crate::aliases::TypeAliasSnapshot>) -> TypeResolver {
+            let r = make_resolver(vec![
+                snap("builtins.object", "object"),
+                snap("builtins.int", "int"),
+                snap("builtins.str", "str"),
+                snap("builtins.bytes", "bytes"),
+            ]);
+            let mut a = extra;
+            a.push(alias_snap(
+                "u.IntStr",
+                &union(vec![
+                    instance("builtins.int", vec![]),
+                    instance("builtins.str", vec![]),
+                ]),
+            ));
+            install(&r, a);
+            r
+        }
+
+        fn int_inst() -> Type {
+            instance("builtins.int", vec![])
+        }
+
+        fn str_inst() -> Type {
+            instance("builtins.str", vec![])
+        }
+
+        #[test]
+        fn join_types_alias_operand_expands_like_proper_operand() {
+            // join.py:505-506 mirroring: the top-level alias expands
+            // through the snapshot before the dispatch, so the result
+            // matches joining the expanded operands directly.
+            let r = join_resolver(vec![alias_snap("a.A", &instance("builtins.int", vec![]))]);
+            let expanded = join_types(&int_inst(), &str_inst(), &ctx(true), &r);
+            let via_alias = join_types(&alias_type("a.A", vec![]), &str_inst(), &ctx(true), &r);
+            assert_eq!(expanded, via_alias);
+            let both_int = join_types(&int_inst(), &int_inst(), &ctx(true), &r).unwrap();
+            let alias_int =
+                join_types(&alias_type("a.A", vec![]), &int_inst(), &ctx(true), &r).unwrap();
+            assert_eq!(both_int, alias_int);
+        }
+
+        #[test]
+        fn join_types_alias_chain_resolves() {
+            // B = A, A = int: the chain loop lands on int, matching
+            // Python's get_proper_type repeated expansion.
+            let r = join_resolver(vec![
+                alias_snap("testmod.A", &int_inst()),
+                alias_snap("testmod.B", &alias_type("testmod.A", vec![])),
+            ]);
+            let plain = join_types(&int_inst(), &int_inst(), &ctx(true), &r).unwrap();
+            let via_chain = join_types(
+                &alias_type("testmod.B", vec![]),
+                &int_inst(),
+                &ctx(true),
+                &r,
+            )
+            .unwrap();
+            assert_eq!(plain, via_chain);
+        }
+
+        #[test]
+        fn join_types_alias_operand_without_alias_map_defers() {
+            // No alias snapshot installed: a TypeAliasType operand is
+            // unexpansible, defer to the Python body.
+            let r = TypeResolver::new();
+            assert_eq!(
+                join_types(
+                    &alias_type("testmod.A", vec![]),
+                    &int_inst(),
+                    &ctx(true),
+                    &r
+                ),
+                None
+            );
+        }
+
+        #[test]
+        fn join_types_recursive_alias_defers() {
+            // A = A (self-recursive alias target): the chain guard
+            // catches the cycle before joining.
+            let r = join_resolver(vec![alias_snap(
+                "testmod.Self",
+                &alias_type("testmod.Self", vec![]),
+            )]);
+            assert_eq!(
+                join_types(
+                    &alias_type("testmod.Self", vec![]),
+                    &int_inst(),
+                    &ctx(true),
+                    &r
+                ),
+                None
+            );
+        }
+
+        #[test]
+        fn msu_flattens_alias_union_item_recursively() {
+            // Step-1 fallback: [u.IntStr, bytes] flattens the alias
+            // target's union recursively alongside the plain item.
+            let r = join_resolver(vec![]);
+            let items = vec![
+                alias_type("u.IntStr", vec![]),
+                instance("builtins.bytes", vec![]),
+            ];
+            let got = make_simplified_union(&items, &ctx(true), &r, false, false).unwrap();
+            assert_eq!(
+                got,
+                union(vec![
+                    int_inst(),
+                    str_inst(),
+                    instance("builtins.bytes", vec![])
+                ])
+            );
+        }
+
+        #[test]
+        fn msu_flattens_alias_inside_nested_union_item() {
+            // A nested live union whose item is an alias: the recursion
+            // enters both the union and the alias target (the wave33
+            // tfn_nested defer wall).
+            let r = join_resolver(vec![alias_snap(
+                "testmod.A",
+                &instance("builtins.int", vec![]),
+            )]);
+            let items = vec![
+                union(vec![alias_type("testmod.A", vec![]), str_inst()]),
+                instance("builtins.bytes", vec![]),
+            ];
+            let got = make_simplified_union(&items, &ctx(true), &r, false, false).unwrap();
+            assert_eq!(
+                got,
+                union(vec![
+                    int_inst(),
+                    str_inst(),
+                    instance("builtins.bytes", vec![])
+                ])
+            );
+        }
+
+        #[test]
+        fn msu_alias_flatten_defers_on_cycle() {
+            let r = join_resolver(vec![alias_snap(
+                "testmod.Self",
+                &alias_type("testmod.Self", vec![]),
+            )]);
+            let items = vec![alias_type("testmod.Self", vec![]), int_inst()];
+            assert_eq!(
+                make_simplified_union(&items, &ctx(true), &r, false, false),
+                None
+            );
+        }
+
+        #[test]
+        fn msu_alias_flatten_defers_on_union_of_self_regress() {
+            // Regression for the wave33 parity segfault: a recursive
+            // alias whose target is a union containing the same alias
+            // re-enters flatten; the active-path cut defers to Python.
+            let r = join_resolver(vec![alias_snap(
+                "testmod.Self",
+                &union(vec![alias_type("testmod.Self", vec![]), int_inst()]),
+            )]);
+            let items = vec![alias_type("testmod.Self", vec![]), int_inst()];
+            assert_eq!(
+                make_simplified_union(&items, &ctx(true), &r, false, false),
+                None
+            );
+        }
+
+        #[test]
+        fn msu_expand_aliases_false_defers_on_alias_item() {
+            // The tuple_fallback shape (handle_recursive=False): Python
+            // keeps even a plain alias item in its step-1 flat list, so
+            // the kernel defers instead of substituting the target.
+            let r = join_resolver(vec![alias_snap(
+                "testmod.A",
+                &instance("builtins.int", vec![]),
+            )]);
+            let items = vec![alias_type("testmod.A", vec![]), int_inst()];
+            assert_eq!(
+                make_simplified_union_expanded(&items, &ctx(true), &r, false, false, false),
+                None
+            );
+        }
+
+        #[test]
+        fn msu_expand_aliases_false_still_flattens_plain_unions() {
+            // expand_aliases=false only gates alias expansion; nested
+            // live unions flatten as before.
+            let r = join_resolver(vec![]);
+            let items = vec![union(vec![int_inst(), str_inst()]), int_inst()];
+            let got = make_simplified_union_expanded(&items, &ctx(true), &r, false, false, false)
+                .unwrap();
+            assert_eq!(got, union(vec![int_inst(), str_inst()]));
+        }
+
+        #[test]
+        fn tuple_fallback_recursive_alias_tuple_defers() {
+            // Regression for the wave33 parity segfault through the
+            // join path: recursive union alias in tuple items looped
+            // join -> tuple_fallback -> msu -> is_subtype; gate defers.
+            let r = join_resolver(vec![alias_snap(
+                "testmod.Self",
+                &union(vec![alias_type("testmod.Self", vec![]), int_inst()]),
+            )]);
+            let tup = Type::TupleType {
+                partial_fallback: Box::new(instance("builtins.tuple", vec![])),
+                items: vec![alias_type("testmod.Self", vec![]), int_inst()],
+                implicit: false,
+            };
+            assert_eq!(crate::typeops::tuple_fallback(&tup, &r), None);
+            // Non-recursive alias tuple items defer too (hr=false):
+            // plain-item tuples still join natively and answer the
+            // union fallback.
+            let r2 = join_resolver(vec![]);
+            let tup2 = Type::TupleType {
+                partial_fallback: Box::new(instance("builtins.tuple", vec![])),
+                items: vec![int_inst(), str_inst()],
+                implicit: false,
+            };
+            let got = crate::typeops::tuple_fallback(&tup2, &r2).unwrap();
+            assert_eq!(
+                got,
+                Type::Instance {
+                    type_ref: "builtins.tuple".to_string(),
+                    args: vec![union(vec![int_inst(), str_inst()])],
+                    last_known_value: None,
+                    extra_attrs: None,
+                }
+            );
         }
     }
 }
