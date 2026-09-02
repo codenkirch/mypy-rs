@@ -699,6 +699,29 @@ fn check_callable_call_tail(callee: &Type, arg_types: &[Type]) -> Option<Type> {
     Some(base.into_type())
 }
 
+/// Entry marshalling validation for `rust_solve_generic_call` (issue
+/// #1360): a length mismatch between caller-supplied `arg_kinds` and
+/// `arg_types_bytes`, or a `formal_to_actual` index outside the actuals
+/// array, used to be absorbed by `?` deep inside the solve loop as a
+/// benign deferral. Returns false to reject up front; the entry point
+/// defers to Python on false exactly as the old absorbed path did, and
+/// panics under `debug_assert!` so producer bugs surface in test and
+/// debug builds.
+fn validate_solve_call_entry(
+    arg_kinds_len: usize,
+    arg_types_len: usize,
+    formal_to_actual: &[Vec<i64>],
+) -> bool {
+    if arg_kinds_len != arg_types_len {
+        return false;
+    }
+    formal_to_actual.iter().all(|actual_indices| {
+        actual_indices
+            .iter()
+            .all(|&ai| ai >= 0 && (ai as usize) < arg_types_len)
+    })
+}
+
 /// `rust_solve_generic_call`: normalize + map + infer + solve + apply.
 ///
 /// Takes a generic callable (serialized), actual arg types (serialized),
@@ -741,6 +764,17 @@ pub fn rust_solve_generic_call(
     iterable_type: Option<Vec<u8>>,
     mapping_type: Option<Vec<u8>>,
 ) -> Option<Vec<u8>> {
+    // Reject producer bugs up front (issue #1360) instead of absorbing
+    // them as a mid-loop deferral; see validate_solve_call_entry.
+    if !validate_solve_call_entry(arg_kinds.len(), arg_types_bytes.len(), &formal_to_actual) {
+        debug_assert!(
+            false,
+            "rust_solve_generic_call: arg_kinds length or formal_to_actual index \
+             inconsistent with arg_types_bytes"
+        );
+        return None;
+    }
+
     // Decode the callee.
     let mut buf = crate::wire::ReadBuffer::new(callee_bytes);
     let callee = crate::wire::read_type(&mut buf, None).ok()?;
@@ -2234,13 +2268,21 @@ mod tests {
         arg_types: &[Type],
         formal_to_actual: Vec<Vec<i64>>,
     ) -> Option<Vec<u8>> {
-        solve_generic_bytes_with(&test_resolver(), callee, arg_types, formal_to_actual)
+        solve_generic_bytes_with(
+            &test_resolver(),
+            callee,
+            arg_types,
+            // ARG_POS for each actual (plain positional actuals in tests).
+            arg_types.iter().map(|_| 0).collect(),
+            formal_to_actual,
+        )
     }
 
     fn solve_generic_bytes_with(
         resolver: &crate::typeinfo::NativeTypeResolver,
         callee: &Type,
         arg_types: &[Type],
+        arg_kinds: Vec<i64>,
         formal_to_actual: Vec<Vec<i64>>,
     ) -> Option<Vec<u8>> {
         let mut cb = WriteBuffer::new();
@@ -2260,8 +2302,7 @@ mod tests {
                 resolver,
                 &cb.into_bytes(),
                 arg_blobs,
-                // ARG_POS for each actual (plain positional actuals in tests).
-                arg_types.iter().map(|_| 0).collect(),
+                arg_kinds,
                 formal_to_actual,
                 true,
                 false,
@@ -2295,6 +2336,58 @@ mod tests {
             solved_typevar(&resolved),
             "expected fully-resolved callable"
         );
+    }
+
+    #[test]
+    fn solve_generic_entry_rejects_and_defers() {
+        // issue #1360: arg_kinds length mismatch or an out-of-range/
+        // negative formal_to_actual index must not be absorbed by `?`
+        // mid-solve; validate at the entry (debug panic, release defer).
+        fn rejects(f: impl FnOnce() -> Option<Vec<u8>>) -> bool {
+            let prev = std::panic::take_hook();
+            std::panic::set_hook(Box::new(|_| {}));
+            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+            std::panic::set_hook(prev);
+            matches!(r, Err(_) | Ok(None))
+        }
+        let callee = generic_identity();
+        let arg = int_instance();
+        // (a) two arg_kinds vs one arg blob
+        assert!(rejects(|| {
+            solve_generic_bytes_with(
+                &test_resolver(),
+                &callee,
+                std::slice::from_ref(&arg),
+                vec![0, 0],
+                vec![vec![0]],
+            )
+        }));
+        // (b) formal_to_actual index past the real actual
+        assert!(rejects(|| {
+            solve_generic_bytes_with(
+                &test_resolver(),
+                &callee,
+                std::slice::from_ref(&arg),
+                vec![0],
+                vec![vec![5]],
+            )
+        }));
+        // (c) negative formal_to_actual index
+        assert!(rejects(|| {
+            solve_generic_bytes_with(
+                &test_resolver(),
+                &callee,
+                std::slice::from_ref(&arg),
+                vec![0],
+                vec![vec![-1]],
+            )
+        }));
+        // Sanitizer pass: validate_solve_call_entry itself covers the same
+        // three cases directly, inclusive of a matching-index accept.
+        assert!(validate_solve_call_entry(1, 1, &[vec![0], vec![]]));
+        assert!(!validate_solve_call_entry(2, 1, &[vec![0]]));
+        assert!(!validate_solve_call_entry(1, 1, &[vec![5]]));
+        assert!(!validate_solve_call_entry(1, 1, &[vec![-1]]));
     }
 
     #[test]
@@ -2751,7 +2844,7 @@ mod tests {
             type_ref: "mod.IntAlias".to_string(),
             is_recursive: false,
         };
-        let out = solve_generic_bytes_with(&resolver, &callee, &[alias], vec![vec![0]]);
+        let out = solve_generic_bytes_with(&resolver, &callee, &[alias], vec![0], vec![vec![0]]);
         let bytes = out.expect("expected successful solve, got deferral");
         let mut rb = ReadBuffer::new(&bytes);
         let resolved = read_type(&mut rb, None).unwrap();
@@ -2803,7 +2896,13 @@ mod tests {
         };
         variables.push(tv);
 
-        let out = solve_generic_bytes_with(&resolver, &callee, &[int_instance()], vec![vec![0]]);
+        let out = solve_generic_bytes_with(
+            &resolver,
+            &callee,
+            &[int_instance()],
+            vec![0],
+            vec![vec![0]],
+        );
         let bytes = out.expect("expected successful solve, got deferral");
         let mut rb = ReadBuffer::new(&bytes);
         let resolved = read_type(&mut rb, None).unwrap();
