@@ -37,13 +37,7 @@ from collections import deque
 from collections.abc import Iterator
 from typing import Any, Final, cast
 
-from mypy.types import (
-    CallableType,
-    Instance,
-    Type,
-    TypeVarType,
-    UnionType,
-)
+from mypy.types import CallableType, Instance, Type, TypeVarType, UnionType
 
 FAMILY_CLASSES: Final = (Instance, CallableType, TypeVarType, UnionType)
 FAMILY_NAME: Final[dict[type, str]] = {
@@ -297,6 +291,51 @@ def _mirror_expect_ok(handle: int, fresh: bytes) -> bool:
         return False
 
 
+def _check_splice(t: Type, blob: bytes) -> None:
+    """Funnel for wire-cache splice hits: the splice never reaches t.write.
+
+    In-place mutations between caching and a splice would serve stale
+    bytes silently. Compare the spliced blob to the family object's live
+    bytes; on drift count (and, strict mode, raise), resync the mirror,
+    and drop the stale cache entry so the next serialization re-caches
+    fresh bytes and each escape fires once.
+    """
+    if not _rules_ok(t):
+        return
+    fam = FAMILY_NAME[type(t)]
+    try:
+        fresh = _fresh_bytes(t)
+    except Exception:
+        _count(f"unserializable.{fam}.cachedsplice")
+        return
+    h = _handle_of(t)
+    if h is None:
+        _count(f"adopt.{fam}.cachedsplice")
+        _register_tree(t)
+    elif not _mirror_expect_ok(h, fresh):
+        key = f"mismatch.{fam}.cachedsplice"
+        _count(key)
+        if _audit_mode:
+            _note_mismatch(key, _short_stack())
+        if _strict:
+            raise AssertionError(f"native-type-mirror ({fam}, cachedsplice) drifted")
+        _update_and_cascade(h, fresh)
+    elif fresh == blob:
+        _count(f"assert_ok.{fam}.cachedsplice")
+        return
+    if fresh == blob:
+        return
+    key = f"stale.{fam}.cachedsplice"
+    _count(key)
+    if _audit_mode:
+        _note_mismatch(key, _short_stack())
+    if _strict:
+        raise AssertionError(f"native-type-mirror ({fam}, cachedsplice) stale spliced bytes")
+    from mypy.types import _type_wire_cache
+
+    _type_wire_cache.pop(id(t), None)
+
+
 def _note_mismatch_key(handle: int, fresh: bytes, msg: str) -> None:
     obj = _BY_HANDLE.get(handle)
     fam = FAMILY_NAME[type(obj)] if obj is not None and type(obj) in FAMILY_NAME else "?"
@@ -402,16 +441,19 @@ def activate(*, strict: bool = False, audit: bool = False) -> None:
     _audit_mode = audit
     _ORIG_SETATTR = object.__setattr__
     for cls in FAMILY_CLASSES:
-        saved: dict[str, Any] = {
-            "init": cls.__dict__["__init__"],
-            "write": cls.__dict__["write"],
-        }
+        saved: dict[str, Any] = {"init": cls.__dict__["__init__"], "write": cls.__dict__["write"]}
         _originals[cls] = saved
         cls.__init__ = _make_init_wrapper(saved["init"], FAMILY_NAME[cls])  # type: ignore[method-assign]
         cls.write = _make_write_wrapper(saved["write"], FAMILY_NAME[cls])  # type: ignore[method-assign]
         cls.__setattr__ = _mirror_setattr  # type: ignore[method-assign, assignment]
     _active = True
     _count("activate")
+    # Wire-cache splice funnel (see _check_splice): the splice path in
+    # types._write_type_cached bypasses the patched t.write. reset() leaves
+    # it installed on purpose: there is no mid-run deactivation.
+    import mypy.types as _types_mod
+
+    _types_mod._type_mirror_splice_check = _check_splice
     if audit:
         atexit.register(_dump_audit)
 

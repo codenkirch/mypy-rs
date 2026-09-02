@@ -49543,3 +49543,184 @@ class NativeTryGettingStrLiteralsSuite(Suite):
                 True, lambda: try_getting_literals_from_type(typ, bool, "builtins.bool")
             )
             assert off == on == expected
+
+
+try:
+    import type_kernel as _splice_kernel
+
+    _SPLICE_EXT_OK = True
+except ImportError:
+    _splice_kernel = None  # type: ignore[assignment]
+    _SPLICE_EXT_OK = False
+
+
+def _splice_funnel_active() -> bool:
+    """write_raw_bytes is new in the librt fork; with PyPI librt the
+    wire-cache splice path is inert and the splice-hit tests skip."""
+    from mypy.types import write_raw_bytes  # type: ignore[attr-defined]
+
+    return _SPLICE_EXT_OK and bool(write_raw_bytes)
+
+
+_SPLICE_ACTIVE = _splice_funnel_active()
+
+
+@skipUnless(_splice_kernel is not None, "requires the type_kernel extension")
+class NativeMirrorSpliceSuite(Suite):
+    """Unit tests for the wire-cache splice funnel of the F1 mirror.
+
+    `_write_type_cached`'s splice hit serves cached bytes without calling
+    `t.write`, so no family write funnel ever sees it (issue #1372 item 2).
+    `types_mirror._check_splice` is installed into
+    `types._type_mirror_splice_check` by `activate()` and re-verifies each
+    splice hit against the object's live bytes: mirror drift counts
+    `mismatch.<fam>.cachedsplice`, a stale spliced blob counts
+    `stale.<fam>.cachedsplice` and is resynced by dropping the cache
+    entry, and strict mode raises on either.
+
+    The splice funnel only exists with the librt fork's
+    `write_raw_bytes`; with PyPI librt the wire cache is inert, the
+    splice-hit tests skip, and the degraded-fallback test covers the
+    plain-write reality.
+    """
+
+    def setUp(self) -> None:
+        from mypy import types_mirror
+        from mypy.types import _clear_type_wire_cache, _set_type_wire_cache_enabled
+
+        types_mirror.activate(audit=True)
+        _clear_type_wire_cache()
+        _set_type_wire_cache_enabled(True)
+        types_mirror.reset(clear_counts=True)
+        # Activation is one-shot process-wide (no mid-run deactivation):
+        # re-entering activate() with _active False would re-read already-wrapped
+        # __dict__ entries and stack wrappers, so isolation is reset() + strict off.
+        self._m = types_mirror
+        self.fx = TypeFixture()
+
+    def tearDown(self) -> None:
+        from mypy.types import _clear_type_wire_cache, _set_type_wire_cache_enabled
+
+        _set_type_wire_cache_enabled(False)
+        _clear_type_wire_cache()
+        self._m._strict = False
+        self._m.reset(clear_counts=True)
+
+    def _callable(self) -> CallableType:
+        return CallableType(
+            [self.fx.o, self.fx.o],
+            [ARG_POS, ARG_POS],
+            [None, None],
+            self.fx.o,
+            self.fx.function,
+            name="f",
+        )
+
+    def _delta(self, before: dict[str, int]) -> dict[str, int]:
+        after = self._m.report()
+        return {
+            k: v - before.get(k, 0)
+            for k, v in after.items()
+            if v != before.get(k, 0) and "init." not in k
+        }
+
+    @skipUnless(_SPLICE_ACTIVE, "splice funnel needs librt write_raw_bytes")
+    def test_clean_hit_counts_assert_ok(self) -> None:
+        from librt.internal import WriteBuffer
+
+        from mypy.types import _write_type_cached
+
+        c = self._callable()
+        _write_type_cached(c, WriteBuffer())  # cache fill adopts via the funnel
+        before = dict(self._m.report())
+        _write_type_cached(c, WriteBuffer())  # splice hit
+        delta = self._delta(before)
+        assert delta.get("assert_ok.callable.cachedsplice") == 1, delta
+        assert not any(k.startswith(("mismatch.", "stale.")) for k in delta), delta
+
+    @skipUnless(_SPLICE_ACTIVE, "splice funnel needs librt write_raw_bytes")
+    def test_inplace_mutation_is_counted_and_self_heals(self) -> None:
+        from librt.internal import WriteBuffer
+
+        from mypy import types_mirror
+        from mypy.types import _type_wire_cache, _write_type_cached
+
+        c = self._callable()
+        _write_type_cached(c, WriteBuffer())  # cache fill
+        c.arg_types[0] = self.fx.std_tuple  # in-place list splice, no setattr
+        before = dict(self._m.report())
+        _write_type_cached(c, WriteBuffer())  # splice hit on a stale entry
+        delta = self._delta(before)
+        assert delta.get("stale.callable.cachedsplice") == 1, delta
+        assert delta.get("mismatch.callable.cachedsplice") == 1, delta
+        assert id(c) not in _type_wire_cache, delta
+        # Next write re-caches fresh bytes through the funnel; the splice
+        # then serves them cleanly.
+        _write_type_cached(c, WriteBuffer())
+        fresh = types_mirror._fresh_bytes(c)
+        assert _type_wire_cache[id(c)][1] == fresh
+        before = dict(self._m.report())
+        _write_type_cached(c, WriteBuffer())
+        delta = self._delta(before)
+        assert delta.get("assert_ok.callable.cachedsplice") == 1, delta
+        assert not any(k.startswith(("mismatch.", "stale.")) for k in delta), delta
+
+    def test_strict_mode_raises_on_drifted_live_bytes(self) -> None:
+        from librt.internal import WriteBuffer
+
+        from mypy.types import _write_type_cached
+
+        c = self._callable()
+        _write_type_cached(c, WriteBuffer())  # cache fill
+        c.arg_types[0] = self.fx.std_tuple  # in-place mutation escapes capture
+        self._m._strict = True
+        try:
+            with self.assertRaises(AssertionError):
+                _write_type_cached(c, WriteBuffer())
+        finally:
+            self._m._strict = False
+
+    @skipUnless(_SPLICE_ACTIVE, "splice funnel needs librt write_raw_bytes")
+    def test_strict_mode_raises_on_stale_spliced_bytes(self) -> None:
+        # Mirror synced (captured setattr), cache still stale: isolates the
+        # pure splice-staleness class from the mirror-drift class.
+        from librt.internal import WriteBuffer
+
+        from mypy.types import _write_type_cached
+
+        c = self._callable()
+        _write_type_cached(c, WriteBuffer())  # cache fill
+        c.arg_types[0] = self.fx.std_tuple  # in-place mutation escapes capture
+        c.name = "g"  # captured setattr resyncs the mirror, not the cache
+        self._m._strict = True
+        try:
+            with self.assertRaises(AssertionError):
+                _write_type_cached(c, WriteBuffer())
+        finally:
+            self._m._strict = False
+
+    def test_degraded_env_serves_plain_write(self) -> None:
+        """Without librt's write_raw_bytes (CI installs PyPI librt) the
+        wire-cache splice funnel is inert: _write_type_cached serves plain
+        t.write, the wire cache stays empty, and only write-funnel counters
+        fire. Monkeypatched so this runs under both librts."""
+        from librt.internal import WriteBuffer
+
+        from mypy import types as types_mod, types_mirror
+        from mypy.types import _type_wire_cache, _write_type_cached
+
+        saved = types_mod.__dict__["write_raw_bytes"]
+        types_mod.__dict__["write_raw_bytes"] = None
+        try:
+            c = self._callable()
+            before = dict(self._m.report())
+            buf = WriteBuffer()
+            _write_type_cached(c, buf)
+            delta = self._delta(before)
+            assert not any("splice" in k for k in delta), delta
+            expected = WriteBuffer()
+            types_mirror._originals[CallableType]["write"](c, expected)
+            assert buf.getvalue() == expected.getvalue()
+            assert not _type_wire_cache, _type_wire_cache
+        finally:
+            types_mod.__dict__["write_raw_bytes"] = saved
