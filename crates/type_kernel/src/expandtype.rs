@@ -645,46 +645,11 @@ fn param_spec_leaf(t: &Type, env: &HashMap<EnvKey, Type>, strict_optional: bool)
     // meta_level on (issue #1359). Parity: expandtype.py:963-996.
     let repl: &Type = env.get(&(*raw_id, 0, namespace.to_string()))?;
     let res = match repl {
-        Type::ParamSpecType {
-            prefix: repl_prefix,
-            ..
-        } => {
-            // (expandtype.py:966-974): repl.copy_modified(flavor=t.flavor,
-            // prefix=...); everything else comes from the replacement, and
-            // the new prefix is t's prefix concat'd with the replacement's.
-            let new_kinds = [prefix.arg_kinds.clone(), repl_prefix.arg_kinds.clone()].concat();
-            let new_names = [prefix.arg_names.clone(), repl_prefix.arg_names.clone()].concat();
-            let occ_vars = prefix.variables.clone();
-            let occ_imprecise = prefix.imprecise_arg_kinds;
-            let occ_ellipsis = prefix.is_ellipsis_args;
-            let occ_flavor = *flavor;
-            let mut new_arg_types = Vec::with_capacity(prefix.arg_types.len());
-            for at in &prefix.arg_types {
-                new_arg_types.push(expand_type_inner(at, env, strict_optional)?);
-            }
-            new_arg_types.extend(repl_prefix.arg_types.iter().cloned());
-            if new_arg_types
-                .iter()
-                .any(|at| matches!(at, Type::UnpackType { .. }))
-            {
-                // Expanded prefix can produce unpacks Python handles via
-                // its own fuller normalization; defer instead.
-                return None;
-            }
-            let mut res = repl.clone();
-            if let Type::ParamSpecType { prefix, flavor, .. } = &mut res {
-                *prefix = crate::wire::Parameters {
-                    arg_types: new_arg_types,
-                    arg_kinds: new_kinds,
-                    arg_names: new_names,
-                    variables: occ_vars,
-                    imprecise_arg_kinds: occ_imprecise,
-                    is_ellipsis_args: occ_ellipsis,
-                }
-                .into();
-                *flavor = occ_flavor;
-            }
-            Some(res)
+        Type::ParamSpecType { .. } => {
+            // Defer before building (issue #1368): the result is a clone of
+            // the ParamSpecType repl, so the tail contains_param_spec guard
+            // always defers anyway (ps_leaf_paramspec_repl_defers pins it).
+            return None;
         }
         Type::Parameters(repl_params) => {
             if *flavor != 0 {
