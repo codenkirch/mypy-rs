@@ -1220,6 +1220,7 @@ mod tests {
         let alias = Type::TypeAliasType {
             args: vec![],
             type_ref: "m.Alias".to_string(),
+            is_recursive: false,
         };
         let wire = unpack_wire(&alias).unwrap();
         assert_eq!(

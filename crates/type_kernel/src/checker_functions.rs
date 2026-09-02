@@ -1573,6 +1573,7 @@ mod match_args_tests {
         let alias = Type::TypeAliasType {
             args: vec![],
             type_ref: "A".to_string(),
+            is_recursive: false,
         };
         let t = make_tuple(vec![alias]);
         assert_eq!(check_match_args_inner(&t), None);
@@ -1583,6 +1584,7 @@ mod match_args_tests {
         let alias = Type::TypeAliasType {
             args: vec![],
             type_ref: "T".to_string(),
+            is_recursive: false,
         };
         assert_eq!(check_match_args_inner(&alias), None);
     }
@@ -5055,6 +5057,7 @@ mod classify_simple_assignment_tests {
         Type::TypeAliasType {
             type_ref: type_ref.to_string(),
             args: vec![],
+            is_recursive: false,
         }
     }
 

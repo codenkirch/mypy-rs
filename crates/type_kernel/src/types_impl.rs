@@ -959,6 +959,7 @@ mod tests {
         let t = Type::TypeAliasType {
             args: vec![],
             type_ref: "my.alias".to_string(),
+            is_recursive: false,
         };
         let bytes = encode(&t);
         // encode returns empty for TypeAliasType without target.
@@ -1571,6 +1572,7 @@ mod tests {
         let a = Type::TypeAliasType {
             type_ref: "mod.A".to_string(),
             args: vec![],
+            is_recursive: false,
         };
         assert_eq!(
             chain_resolve_alias_target(&a, &aliases),
@@ -1586,6 +1588,7 @@ mod tests {
         let a = Type::TypeAliasType {
             type_ref: "mod.A".to_string(),
             args: vec![],
+            is_recursive: false,
         };
         assert_eq!(chain_resolve_alias_target(&a, &aliases), None);
     }
@@ -1598,6 +1601,7 @@ mod tests {
         let a = Type::TypeAliasType {
             type_ref: "mod.A".to_string(),
             args: vec![],
+            is_recursive: false,
         };
         assert_eq!(chain_resolve_alias_target(&a, &aliases), None);
     }
@@ -1617,6 +1621,7 @@ mod tests {
         let a = Type::TypeAliasType {
             type_ref: "mod.A".to_string(),
             args: vec![],
+            is_recursive: false,
         };
         assert_eq!(
             chain_resolve_alias_target(&a, &aliases),
@@ -1634,6 +1639,7 @@ mod tests {
         let a = Type::TypeAliasType {
             type_ref: "mod.A".to_string(),
             args: vec![],
+            is_recursive: false,
         };
         assert_eq!(chain_resolve_alias_target(&a, &aliases), None);
     }

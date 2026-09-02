@@ -2346,6 +2346,7 @@ mod tests {
         let alias = Type::TypeAliasType {
             args: vec![],
             type_ref: "mod.IntAlias".to_string(),
+            is_recursive: false,
         };
         assert_eq!(is_trivial_bound_inner(&alias, false), None);
     }
@@ -2854,6 +2855,7 @@ mod tests {
         Type::TypeAliasType {
             args,
             type_ref: type_ref.to_string(),
+            is_recursive: false,
         }
     }
 

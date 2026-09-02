@@ -195,6 +195,7 @@ mod tests {
         Type::TypeAliasType {
             args: vec![],
             type_ref: type_ref.to_string(),
+            is_recursive: false,
         }
     }
 

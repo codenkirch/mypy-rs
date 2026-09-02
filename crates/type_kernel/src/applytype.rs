@@ -901,6 +901,7 @@ mod tests {
         let alias = Type::TypeAliasType {
             args: vec![],
             type_ref: "mod.Alias".to_string(),
+            is_recursive: false,
         };
         assert!(get_proper_type(&alias).is_none());
     }
@@ -932,6 +933,7 @@ mod tests {
         let alias = Type::TypeAliasType {
             args: vec![],
             type_ref: "mod.Alias".to_string(),
+            is_recursive: false,
         };
         assert_eq!(has_no_typevars_inner(&alias), Some(true));
     }
@@ -1304,6 +1306,7 @@ mod tests {
         let alias = Type::TypeAliasType {
             args: vec![],
             type_ref: "mod.Alias".to_string(),
+            is_recursive: false,
         };
         assert_eq!(
             tags(&tvar, &alias, true, None, Some(true), None, None),

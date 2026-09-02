@@ -75,9 +75,14 @@ fn make_any_non_explicit_inner(t: Type) -> Type {
                 missing_import_name,
             }
         }
-        Type::TypeAliasType { args, type_ref } => Type::TypeAliasType {
+        Type::TypeAliasType {
+            args,
+            type_ref,
+            is_recursive: _,
+        } => Type::TypeAliasType {
             args: args.into_iter().map(make_any_non_explicit_inner).collect(),
             type_ref,
+            is_recursive: false,
         },
         // Delegate to default traversal for all other variants.
         other => transform_children(other, make_any_non_explicit_inner),
@@ -130,12 +135,17 @@ fn make_any_non_unimported_inner(t: Type) -> Type {
                 }
             }
         }
-        Type::TypeAliasType { args, type_ref } => Type::TypeAliasType {
+        Type::TypeAliasType {
+            args,
+            type_ref,
+            is_recursive: _,
+        } => Type::TypeAliasType {
             args: args
                 .into_iter()
                 .map(make_any_non_unimported_inner)
                 .collect(),
             type_ref,
+            is_recursive: false,
         },
         other => transform_children(other, make_any_non_unimported_inner),
     }
@@ -278,9 +288,14 @@ fn transform_children<F: Fn(Type) -> Type>(t: Type, f: F) -> Type {
                 missing_import_name,
             }
         }
-        Type::TypeAliasType { args, type_ref } => Type::TypeAliasType {
+        Type::TypeAliasType {
+            args,
+            type_ref,
+            is_recursive: _,
+        } => Type::TypeAliasType {
             args: args.into_iter().map(&f).collect(),
             type_ref,
+            is_recursive: false,
         },
         Type::Instance {
             type_ref,
@@ -555,6 +570,7 @@ mod tests {
         let t = Type::TypeAliasType {
             args: vec![make_any(EXPLICIT)],
             type_ref: "my_alias".to_string(),
+            is_recursive: false,
         };
         let result = make_any_non_explicit_inner(t);
         match result {
@@ -654,6 +670,7 @@ mod tests {
         let t = Type::TypeAliasType {
             args: vec![make_any_with_import(FROM_UNIMPORTED_TYPE, "mod")],
             type_ref: "alias".to_string(),
+            is_recursive: false,
         };
         let result = make_any_non_unimported_inner(t);
         match result {

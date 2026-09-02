@@ -415,6 +415,7 @@ mod tests {
         let types = vec![Type::TypeAliasType {
             args: Vec::new(),
             type_ref: "mod.Alias".to_string(),
+            is_recursive: false,
         }];
         assert_eq!(
             run(
@@ -436,6 +437,7 @@ mod tests {
         let types = vec![Type::TypeAliasType {
             args: Vec::new(),
             type_ref: "mod.Alias".to_string(),
+            is_recursive: false,
         }];
         assert_eq!(
             run(&[1], &[flags(true)], &types, &aliases, &TypeResolver::new()),
@@ -462,6 +464,7 @@ mod tests {
         let types = vec![Type::TypeAliasType {
             args: Vec::new(),
             type_ref: "mod.Alias".to_string(),
+            is_recursive: false,
         }];
         assert_eq!(
             run(&[1], &[flags(true)], &types, &aliases, &resolver),
@@ -479,6 +482,7 @@ mod tests {
             Type::TypeAliasType {
                 args: Vec::new(),
                 type_ref: "mod.Evil".to_string(),
+                is_recursive: false,
             },
             "builtins.function",
         )];
@@ -496,6 +500,7 @@ mod tests {
             Type::TypeAliasType {
                 args: Vec::new(),
                 type_ref: "mod.Missing".to_string(),
+                is_recursive: false,
             },
             "builtins.function",
         )];

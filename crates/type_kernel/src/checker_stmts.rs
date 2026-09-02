@@ -553,7 +553,11 @@ fn invalid_query_alias_node(
     seen: &mut Vec<String>,
 ) -> Option<bool> {
     let (args, type_ref) = match typ {
-        Type::TypeAliasType { args, type_ref } => (args, type_ref),
+        Type::TypeAliasType {
+            args,
+            type_ref,
+            is_recursive: _,
+        } => (args, type_ref),
         _ => return None,
     };
     if seen.iter().any(|r| r == type_ref) {
@@ -1088,6 +1092,7 @@ mod tests {
         Type::TypeAliasType {
             args: Vec::new(),
             type_ref: "mod.A".to_string(),
+            is_recursive: false,
         }
     }
 
@@ -1509,6 +1514,7 @@ mod tests {
         let alias = Type::TypeAliasType {
             type_ref: "mod.Alias".to_string(),
             args: vec![instance("builtins.ValueError")],
+            is_recursive: false,
         };
         assert_eq!(try_handler_union_inner(&alias, true), vec![alias.clone()]);
         // encode_type_owned defers TypeAliasType to avoid alias=None poisoning.
@@ -1526,6 +1532,7 @@ mod tests {
                 Type::TypeAliasType {
                     type_ref: "mod.Alias".to_string(),
                     args: Vec::new(),
+                    is_recursive: false,
                 },
             ],
             uses_pep604_syntax: false,
@@ -1542,6 +1549,7 @@ mod tests {
                 Type::TypeAliasType {
                     type_ref: "mod.Alias".to_string(),
                     args: Vec::new(),
+                    is_recursive: false
                 },
             ]
         );
@@ -1776,6 +1784,7 @@ mod tests {
         let t = Type::TypeAliasType {
             args: Vec::new(),
             type_ref: "mod.A".to_string(),
+            is_recursive: false,
         };
         let mut aliases = crate::aliases::TypeAliasResolver::default();
         aliases.insert(
@@ -1798,6 +1807,7 @@ mod tests {
         let t = Type::TypeAliasType {
             args: Vec::new(),
             type_ref: "mod.A".to_string(),
+            is_recursive: false,
         };
         let mut aliases = crate::aliases::TypeAliasResolver::default();
         aliases.insert(
@@ -1837,6 +1847,7 @@ mod tests {
                 meta_level: 1,
             }],
             type_ref: "mod.A".to_string(),
+            is_recursive: false,
         };
         let mut aliases = crate::aliases::TypeAliasResolver::default();
         aliases.insert(
@@ -1883,6 +1894,7 @@ mod tests {
                 meta_level: 1,
             }],
             type_ref: "mod.A".to_string(),
+            is_recursive: false,
         };
         let mut aliases = crate::aliases::TypeAliasResolver::default();
         aliases.insert(
@@ -2075,6 +2087,7 @@ mod tests {
         let t = Type::TypeAliasType {
             type_ref: "mod.Alias".to_string(),
             args: vec![],
+            is_recursive: false,
         };
         assert!(classify_except_handler_test_inner(&t, &TypeResolver::new()).is_none());
     }
@@ -2190,6 +2203,7 @@ mod tests {
             item: Box::new(Type::TypeAliasType {
                 type_ref: "mod.Aliased".to_string(),
                 args: vec![],
+                is_recursive: false,
             }),
             is_type_form: true,
         };

@@ -398,6 +398,7 @@ mod tests {
         assert!(unknown_unpack_inner(&make_unpack(Type::TypeAliasType {
             args: vec![],
             type_ref: "m.A".to_string(),
+            is_recursive: false
         })));
     }
 }

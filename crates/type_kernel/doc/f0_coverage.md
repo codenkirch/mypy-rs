@@ -43,7 +43,7 @@ cards `_can_be_true` / `_can_be_false` are cached properties, not slots.
 | `alias`    | via `type_ref` | via `type_ref` | live `TypeAlias` node ref; `_wire_alias_map` re-links after fixup |
 | `args`     | yes  | yes  | `read_type_list`                         |
 | `type_ref` | yes  | yes  | stable ID                                |
-| `is_recursive` | no | no  | derived from the alias node, never serialized (#1341) |
+| `is_recursive` | conditional | yes | wave31 (#1361): the Python writer emits a tagged int only when `True`; the reader consumes it via `read_alias_recursion_flag`; since this issue the variant carries the field and the Rust writer re-emits it only when `True` |
 
 ### TypeVarType (`TYPE_VAR_TYPE`)
 
@@ -161,6 +161,7 @@ lists them in Python write order.
 | field    | wire | enum | note                                     |
 | -------- | ---- | ---- | ---------------------------------------- |
 | `_items` | yes  | yes  | list of inline items                     |
+| `fallback` | no | no  | `FunctionLike.__slots__` field set from `items[0].fallback`; the wire never emits it; Rust defers (argapprox.rs) |
 
 ### TupleType (`TUPLE_TYPE`)
 
@@ -258,6 +259,41 @@ Live-object fields deliberately absent from this list (carried as plain
 data instead): `ExtraAttrs.attrs` value objects, `LiteralType.value`
 scalars, `UnionType.can_be_*` bools, `TypeOfAny` ints.
 
+## Kernel and seam identity inventory
+
+Where live-object identity is tracked or reconstructed at the seam, with
+its disposition:
+
+- (a) **Wire-cache placeholder.** A wire seam's `read_type` can populate
+  `instance_cache` with a `NOT_READY` placeholder (`type_ref` set, `.type`
+  a `FakeInfo`). `mypy/wirefixup.py:fixup_instance_cache` evicts those
+  NOT_READY placeholders, and `TypeChecker.named_type` re-validates every
+  cache primitive through `_validated_named_type`, which rebuilds from the
+  live `TypeInfo` when the cached entry is absent or still a `FakeInfo`.
+  Live-object keyed; consumed by the checker, not by a Rust seam.
+- (b) **Native decode caches (identity-free, bytes/type_ref keyed).**
+  `_map_supertype_decode_cache` (`maptype.py`), `_narrow_decode_cache`,
+  and `_wire_alias_map` are per-build caches keyed by wire bytes or
+  `type_ref` string; they never hold a live-object identity across
+  builds. The Rust decode side mirrors this with `SeenInstances` keyed on
+  `(type_ref, encoded-args)`. Bytes-keyed; no identity jurisdiction.
+- (c) **`assuming` recursion guard.** The protocol-impl engine guards
+  recursive calls with a thread-local stack: Rust `ASSUMING`
+  (`subtypes.rs`, `AssumingPush` RAII) mirrors `subtypes.py`'s
+  `assuming_contains` / `pop_on_exit`. Call-scoped, never cross-call;
+  the keyed object is the `(left, right)` proper-subtype pair, swept on
+  scope exit.
+- (d) **Stable-ID mint (`identity.rs`, this issue).** The `handle_for` /
+  `handle_for_stable` registry is live-object keyed (raw id and
+  weakref-pinned layers) and is the future consumer for seams that need a
+  handle stable across calls. Reserved by contract; no production callers
+  yet (guarantee 4 in `identity.rs`). The wave30 pair-identity registry
+  (unmerged branch `perf/wave30-proto-left`, `fca5e1864`) is not on
+  `main`; its design is preserved in the `identity.rs` doc block.
+
+Classification: (a) and (d) are live-object keyed; (b) and (c) are
+identity-free or call-scoped and need no registry entry.
+
 ## Rust-side invariants for Phase F0
 
 1. The wire format is unchanged in this issue: no `CACHE_VERSION` bump, no
@@ -269,6 +305,10 @@ scalars, `UnionType.can_be_*` bools, `TypeOfAny` ints.
    never emits the Rust-resident fields; Python always reads back exactly
    what Python wrote (`typeops.py:_serialize_type` and
    `_deserialize_type` contract).
-4. `TypeAliasType.is_recursive` stays wire-invisible; it is derived from
-   the live `alias` node and modeled in Rust expansion code, not
-   serialized (#1341).
+4. `TypeAliasType.is_recursive` crossed the wire as wave31's conditional
+   int (#1361): Python's writer emits a tagged LITERAL_INT only when
+   `True` and the reader consumes it. Since this scope the kernel's
+   `Type::TypeAliasType` variant carries the field, so the Rust round trip
+   preserves the flag and the Rust writer re-emits the conditional int
+   only when `True`, keeping Python-formatted bytes unchanged. On
+   legacy/default-shaped bytes (no tag) the reader fills `false`.

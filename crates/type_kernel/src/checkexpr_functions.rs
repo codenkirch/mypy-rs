@@ -162,7 +162,11 @@ pub(crate) fn expand_alias_target_raw(
     let mut seen: Vec<String> = Vec::new();
     loop {
         let type_ref = match &current {
-            Type::TypeAliasType { type_ref, args } => {
+            Type::TypeAliasType {
+                type_ref,
+                args,
+                is_recursive: _,
+            } => {
                 if !args.is_empty() {
                     return None;
                 }
@@ -208,7 +212,11 @@ pub(crate) fn expanded_alias_target(
     let mut seen: Vec<String> = Vec::new();
     loop {
         let (type_ref, cur_args) = match &current {
-            Type::TypeAliasType { type_ref, args } => (type_ref.clone(), args.clone()),
+            Type::TypeAliasType {
+                type_ref,
+                args,
+                is_recursive: _,
+            } => (type_ref.clone(), args.clone()),
             _ => return Some((current, args, python_3_12)),
         };
         if seen.contains(&type_ref) {
@@ -3376,6 +3384,7 @@ mod tests {
         let alias = Type::TypeAliasType {
             args: vec![],
             type_ref: "mod.A".to_string(),
+            is_recursive: false,
         };
         // No snapshot in the resolver -> expanded_alias_target defers.
         assert_eq!(
@@ -3427,6 +3436,7 @@ mod tests {
         let alias_app = Type::TypeAliasType {
             type_ref: "mod.A".to_string(),
             args: vec![make_any(2)],
+            is_recursive: false,
         };
         assert_eq!(has_any_type_inner(&alias_app, false, &resolver), Some(true));
     }
@@ -3475,6 +3485,7 @@ mod tests {
         let alias_app = Type::TypeAliasType {
             type_ref: "mod.A".to_string(),
             args: vec![make_instance("int", vec![])],
+            is_recursive: false,
         };
         assert_eq!(
             has_any_type_inner(&alias_app, false, &resolver),
@@ -3512,6 +3523,7 @@ mod tests {
         let alias_app = Type::TypeAliasType {
             type_ref: "mod.A".to_string(),
             args: vec![make_any(2)],
+            is_recursive: false,
         };
         // New-style alias: `res or query_types(args)` -> args=[Any] -> true.
         assert_eq!(has_any_type_inner(&alias_app, false, &resolver), Some(true));
@@ -3544,6 +3556,7 @@ mod tests {
         let alias_app = Type::TypeAliasType {
             type_ref: "mod.A".to_string(),
             args: vec![make_any(2)],
+            is_recursive: false,
         };
         assert_eq!(
             has_any_type_inner(&alias_app, false, &resolver),
@@ -3598,6 +3611,7 @@ mod tests {
         let alias_app = Type::TypeAliasType {
             type_ref: "mod.A".to_string(),
             args: vec![],
+            is_recursive: false,
         };
         assert_eq!(
             has_any_type_inner(&alias_app, false, &resolver),
@@ -3625,6 +3639,7 @@ mod tests {
         let alias_app = Type::TypeAliasType {
             type_ref: "mod.A".to_string(),
             args: vec![],
+            is_recursive: false,
         };
         assert_eq!(
             has_any_type_inner(&alias_app, false, &resolver),
@@ -3659,6 +3674,7 @@ mod tests {
         let alias_app = Type::TypeAliasType {
             type_ref: "mod.A".to_string(),
             args: vec![],
+            is_recursive: false,
         };
         assert_eq!(has_any_type_inner(&alias_app, false, &resolver), None);
     }
@@ -3710,6 +3726,7 @@ mod tests {
         let alias_app = Type::TypeAliasType {
             type_ref: "mod.A".to_string(),
             args: vec![make_instance("int", vec![])],
+            is_recursive: false,
         };
         assert_eq!(
             has_any_type_inner(&alias_app, false, &resolver),
@@ -3763,6 +3780,7 @@ mod tests {
         let alias_app = Type::TypeAliasType {
             type_ref: "mod.A".to_string(),
             args: vec![make_any(2)],
+            is_recursive: false,
         };
         assert_eq!(has_any_type_inner(&alias_app, false, &resolver), Some(true));
     }
@@ -3788,6 +3806,7 @@ mod tests {
         let alias_app = Type::TypeAliasType {
             type_ref: "mod.B".to_string(),
             args: vec![],
+            is_recursive: false,
         };
         // B's target is a TypeAliasType to A with no args; the chain
         // loop rewrites current = target until a non-alias target.
@@ -4049,6 +4068,7 @@ mod tests {
         let alias = Type::TypeAliasType {
             args: vec![],
             type_ref: "mod.A".to_string(),
+            is_recursive: false,
         };
         assert_eq!(
             has_ambiguous_uninhabited_component_inner(&alias, &empty_alias_resolver()),
@@ -4121,6 +4141,7 @@ mod tests {
         let alias_app = Type::TypeAliasType {
             type_ref: "mod.A".to_string(),
             args: vec![Type::UninhabitedType { ambiguous: false }],
+            is_recursive: false,
         };
         assert_eq!(
             has_uninhabited_component_inner(&alias_app, &resolver),
@@ -4309,6 +4330,7 @@ mod tests {
         let alias = Type::TypeAliasType {
             args: vec![],
             type_ref: "mod.A".to_string(),
+            is_recursive: false,
         };
         assert_eq!(
             allow_fast_container_literal_inner(&alias, &crate::aliases::TypeAliasResolver::new()),
@@ -4549,6 +4571,7 @@ mod tests {
         let alias = Type::TypeAliasType {
             args: vec![],
             type_ref: "mod.A".to_string(),
+            is_recursive: false,
         };
         assert_eq!(is_async_def_inner(&alias), None);
     }
@@ -4664,6 +4687,7 @@ mod tests {
         Type::TypeAliasType {
             type_ref: type_ref.to_string(),
             args: vec![],
+            is_recursive: false,
         }
     }
 
@@ -4949,6 +4973,7 @@ mod tests {
         let alias = Type::TypeAliasType {
             args: vec![],
             type_ref: "mod.A".to_string(),
+            is_recursive: false,
         };
         let kinds = vec![ARG_POS, ARG_POS];
         let types = vec![make_instance("int", vec![]), alias];
@@ -4965,6 +4990,7 @@ mod tests {
         let alias = Type::TypeAliasType {
             args: vec![],
             type_ref: "mod.A".to_string(),
+            is_recursive: false,
         };
         let kinds = vec![ARG_STAR2, ARG_STAR2];
         let types = vec![make_instance("int", vec![]), alias];
@@ -5198,6 +5224,7 @@ mod tests {
         let alias = Type::TypeAliasType {
             args: vec![],
             type_ref: "mod.A".to_string(),
+            is_recursive: false,
         };
         assert_eq!(
             method_fullname_inner(&alias, "foo", &empty_resolver()),
@@ -5302,6 +5329,7 @@ mod tests {
         let alias = Type::TypeAliasType {
             args: vec![],
             type_ref: "mod.A".to_string(),
+            is_recursive: false,
         };
         // has_any_type_inner(alias) returns None -> defer to Python.
         assert_eq!(
@@ -5391,6 +5419,7 @@ mod tests {
         let alias = Type::TypeAliasType {
             args: vec![],
             type_ref: "mod.A".to_string(),
+            is_recursive: false,
         };
         assert_eq!(tuple_context_matches_inner(&[0], &alias), None);
     }
@@ -5488,6 +5517,7 @@ mod tests {
         let alias = Type::TypeAliasType {
             args: vec![],
             type_ref: "mod.A".to_string(),
+            is_recursive: false,
         };
         let i = make_instance("builtins.int", vec![]);
         // Python's join expands aliases via get_proper_type; the wire
@@ -5525,6 +5555,7 @@ mod tests {
         let alias = Type::TypeAliasType {
             args: vec![],
             type_ref: "mod.A".to_string(),
+            is_recursive: false,
         };
         let bytes = encode_type(&alias).unwrap();
         assert!(alias_matches(&decode_type(&bytes).unwrap()));
@@ -6644,6 +6675,7 @@ mod is_valid_var_arg_tests {
         Type::TypeAliasType {
             args: vec![],
             type_ref: "m.A".to_string(),
+            is_recursive: false,
         }
     }
 
@@ -7942,6 +7974,7 @@ mod classify_check_boolean_op_tests {
         let alias = Type::TypeAliasType {
             type_ref: "mod.TA".to_string(),
             args: vec![],
+            is_recursive: false,
         };
         let r = with_py(|py| {
             classify_check_boolean_op(

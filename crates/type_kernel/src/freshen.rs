@@ -464,7 +464,11 @@ pub(crate) fn freshen_type(
         // visit_type_alias_type (expandtype.py:640-642): only the alias's
         // args are translated; the alias node itself is kept, so the wire
         // format's missing alias target is harmless (no recursion).
-        Type::TypeAliasType { args, type_ref } => {
+        Type::TypeAliasType {
+            args,
+            type_ref,
+            is_recursive: _,
+        } => {
             let mut new_args = Vec::with_capacity(args.len());
             for arg in args {
                 new_args.push(freshen_type(arg, next_raw_id, changed, strict_optional)?);
@@ -472,6 +476,7 @@ pub(crate) fn freshen_type(
             Some(Type::TypeAliasType {
                 args: new_args,
                 type_ref: type_ref.clone(),
+                is_recursive: false,
             })
         }
 
@@ -1170,13 +1175,18 @@ mod tests {
                 extra_attrs: None,
             }],
             type_ref: "m.Alias".to_string(),
+            is_recursive: false,
         };
         let mut next_raw_id = 100;
         let mut changed = false;
         let out = freshen_type(&alias, &mut next_raw_id, &mut changed, true)
             .expect("TypeAliasType engages");
         match out {
-            Type::TypeAliasType { args, type_ref } => {
+            Type::TypeAliasType {
+                args,
+                type_ref,
+                is_recursive: _,
+            } => {
                 assert_eq!(type_ref, "m.Alias");
                 assert_eq!(args.len(), 1);
                 match &args[0] {
@@ -1205,6 +1215,7 @@ mod tests {
                 is_ellipsis_args: false,
             })],
             type_ref: "m.Alias".to_string(),
+            is_recursive: false,
         };
         let mut next_raw_id = 7;
         let mut changed = false;

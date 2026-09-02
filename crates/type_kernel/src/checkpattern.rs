@@ -907,6 +907,7 @@ mod tests {
         Type::TypeAliasType {
             type_ref: type_ref.to_string(),
             args: vec![],
+            is_recursive: false,
         }
     }
 

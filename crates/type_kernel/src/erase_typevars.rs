@@ -466,7 +466,11 @@ pub(crate) fn erase_typevars_inner(
             Some(Type::Parameters(new_params))
         }
 
-        Type::TypeAliasType { args, type_ref } => {
+        Type::TypeAliasType {
+            args,
+            type_ref,
+            is_recursive: _,
+        } => {
             // Mirrors TypeVarEraser.visit_type_alias_type (erasetype.py:423-426):
             // the alias target cannot carry type vars unbound by the alias, so
             // erasing the written args is safe; decode re-links via resolve_aliases.
@@ -474,6 +478,7 @@ pub(crate) fn erase_typevars_inner(
             Some(Type::TypeAliasType {
                 args: new_args,
                 type_ref: type_ref.clone(),
+                is_recursive: false,
             })
         }
         // Deferred: UnboundType needs defn.type_vars for erasure.
@@ -796,7 +801,11 @@ fn erase_typevars_with_meta_check(typ: &Type, target: &Type) -> Option<Type> {
         | Type::UninhabitedType { .. }
         | Type::DeletedType { .. } => Some(typ.clone()),
         // Deferred (mirror main's wire deferral contract).
-        Type::TypeAliasType { args, type_ref } => {
+        Type::TypeAliasType {
+            args,
+            type_ref,
+            is_recursive: _,
+        } => {
             // Same erasetype.py:423-426 semantics as the ids-based arm above,
             // recursing with the meta-var-only predicate.
             let new_args: Vec<Type> = args
@@ -806,6 +815,7 @@ fn erase_typevars_with_meta_check(typ: &Type, target: &Type) -> Option<Type> {
             Some(Type::TypeAliasType {
                 args: new_args,
                 type_ref: type_ref.clone(),
+                is_recursive: false,
             })
         }
         Type::UnboundType { .. } => None,
@@ -966,11 +976,16 @@ mod tests {
         let alias = Type::TypeAliasType {
             args: vec![make_typevar_meta(1, "ns")],
             type_ref: "mod.A".to_string(),
+            is_recursive: false,
         };
         let target = make_instance("builtins.int", vec![]);
         let result = replace_meta_vars_inner(&alias, &target).unwrap();
         match result {
-            Type::TypeAliasType { args, type_ref } => {
+            Type::TypeAliasType {
+                args,
+                type_ref,
+                is_recursive: _,
+            } => {
                 assert_eq!(type_ref, "mod.A");
                 assert!(
                     matches!(&args[0], Type::Instance { type_ref, .. } if type_ref == "builtins.int")
@@ -987,10 +1002,15 @@ mod tests {
         let alias = Type::TypeAliasType {
             args: vec![make_typevar(1, "ns")],
             type_ref: "mod.A".to_string(),
+            is_recursive: false,
         };
         let result = erase_typevars_inner(&alias, None, &make_any()).unwrap();
         match result {
-            Type::TypeAliasType { args, type_ref } => {
+            Type::TypeAliasType {
+                args,
+                type_ref,
+                is_recursive: _,
+            } => {
                 assert_eq!(type_ref, "mod.A");
                 assert!(matches!(args[0], Type::AnyType { .. }));
             }

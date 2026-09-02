@@ -3383,6 +3383,7 @@ mod tests {
         Type::TypeAliasType {
             args: vec![],
             type_ref: type_ref.to_string(),
+            is_recursive: false,
         }
     }
 
@@ -3801,6 +3802,7 @@ mod tests {
                 Type::TypeAliasType {
                     args: vec![type_var(1, "T")],
                     type_ref: "mod.Tree".to_string(),
+                    is_recursive: false,
                 },
             )],
             required_keys: std::collections::HashSet::new(),
@@ -3821,10 +3823,12 @@ mod tests {
         let template = Type::TypeAliasType {
             args: vec![type_var(1, "T")],
             type_ref: "mod.Tree".to_string(),
+            is_recursive: false,
         };
         let actual = Type::TypeAliasType {
             args: vec![instance_int()],
             type_ref: "mod.Tree".to_string(),
+            is_recursive: false,
         };
         let res = infer_constraints_full_inner(
             &template,

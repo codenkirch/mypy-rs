@@ -633,9 +633,13 @@ pub(crate) enum Type {
         extra_attrs: Option<ExtraAttrs>,
     },
     /// `mypy.types.TypeAliasType` — `type_ref` is the unresolved `alias.fullname`.
+    /// `is_recursive` rides the wire as a tagged conditional int emitted only
+    /// when True (wave31, #1361); here it is a plain field, defaulting to the
+    /// `false` shape kernel-constructed aliases carry.
     TypeAliasType {
         args: Vec<Type>,
         type_ref: String,
+        is_recursive: bool,
     },
     TypeVarType {
         name: String,
@@ -1299,9 +1303,9 @@ fn read_type_type(buf: &mut ReadBuffer<'_>) -> Result<Type, WireError> {
 ///
 /// Mirrors `TypeAliasType.write` in types.py: the recursion flag is a
 /// tagged conditional int appended only when True (same pattern as
-/// `TypeVarType.meta_level`). The decoded variant drops the flag (the
-/// Rust `Type::TypeAliasType` has no `is_recursive` field); the
-/// `is_recursive_pair` seam reads it back via `read_alias_recursion_flag`.
+/// `TypeVarType.meta_level`). The flag lands in the variant's
+/// `is_recursive` field; the `is_recursive_pair` seam also reads it back
+/// via `read_alias_recursion_flag`.
 fn read_type_alias_type(buf: &mut ReadBuffer<'_>) -> Result<Type, WireError> {
     let (t, _is_rec) = read_type_alias_type_flagged(buf)?;
     Ok(t)
@@ -1334,13 +1338,23 @@ fn read_type_alias_type_flagged(buf: &mut ReadBuffer<'_>) -> Result<(Type, bool)
             )));
         }
     };
-    Ok((Type::TypeAliasType { args, type_ref }, is_rec))
+    // Mirror the Python reader: the LITERAL_INT flag is consumed before
+    // END_TAG, so it is never seen again after this helper returns.
+    Ok((
+        Type::TypeAliasType {
+            args,
+            type_ref,
+            is_recursive: is_rec,
+        },
+        is_rec,
+    ))
 }
 
 /// Read ONLY the trailing recursion flag of a serialized
 /// `TypeAliasType` without decoding into a `Type`. `None` when the
 /// bytes do not carry a `TypeAliasType` at the top level or do not
 /// parse (the caller defers to Python).
+#[pyfunction]
 pub(crate) fn read_alias_recursion_flag(bytes: &[u8]) -> Option<bool> {
     let mut buf = ReadBuffer::new(bytes);
     let tag = read_tag(&mut buf).ok()?;
@@ -2561,12 +2575,20 @@ pub(crate) fn write_type(buf: &mut WriteBuffer, t: &Type) -> Result<(), WireErro
             Ok(())
         }
 
-        Type::TypeAliasType { args, type_ref } => {
+        Type::TypeAliasType {
+            args,
+            type_ref,
+            is_recursive,
+        } => {
             write_tag(buf, TYPE_ALIAS_TYPE);
             write_type_list(buf, args)?;
             write_str(buf, type_ref)?;
-            // Kernel-constructed aliases are never recursive: write the
-            // `is_recursive=False` shape, byte-identical to Python's writer.
+            // Byte-lockstep with the types.py writer (types.py:553): the
+            // flag rides as a tagged conditional int only when True, so
+            // kernel-constructed aliases keep the default `false` shape.
+            if *is_recursive {
+                write_int(buf, 1)?;
+            }
             write_tag(buf, END_TAG);
             Ok(())
         }
@@ -3241,6 +3263,47 @@ mod tests {
             is_type_form: false,
         };
         assert_eq!(round_trip(&t), t);
+    }
+
+    #[test]
+    fn write_then_read_alias_default_shape_round_trips() {
+        // Default shape: no trailing flag int at all, matching Python's
+        // writer for a non-recursive alias.
+        let t = Type::TypeAliasType {
+            args: vec![],
+            type_ref: "m.A".to_string(),
+            is_recursive: false,
+        };
+        assert_eq!(round_trip(&t), t);
+        let buf = type_alias_bytes(&t);
+        // END_TAG == 255 directly after the alias name: no flag record.
+        assert_eq!(buf.last().copied(), Some(END_TAG));
+        assert_eq!(read_alias_recursion_flag(&buf), Some(false));
+    }
+
+    #[test]
+    fn write_then_read_alias_recursive_shape_round_trips() {
+        // Recursive shape: the LITERAL_INT flag record rides before END_TAG
+        // exactly as Python writes it (types.py:write, wave31 #1361).
+        let t = Type::TypeAliasType {
+            args: vec![Type::TypeAliasType {
+                args: vec![],
+                type_ref: "m.A".to_string(),
+                is_recursive: false,
+            }],
+            type_ref: "m.A".to_string(),
+            is_recursive: true,
+        };
+        let round = round_trip(&t);
+        assert_eq!(round, t);
+        assert_eq!(read_alias_recursion_flag(&type_alias_bytes(&t)), Some(true));
+    }
+
+    /// Serialize a top-level `TypeAliasType` and return the raw bytes.
+    fn type_alias_bytes(t: &Type) -> Vec<u8> {
+        let mut buf = WriteBuffer::new();
+        write_type(&mut buf, t).expect("write_type failed");
+        buf.into_bytes()
     }
 
     #[test]
