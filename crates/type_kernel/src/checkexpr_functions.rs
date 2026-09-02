@@ -209,7 +209,7 @@ pub(crate) fn expanded_alias_target(
     let mut current = typ.clone();
     let mut args: Vec<Type> = Vec::new();
     let mut python_3_12 = false;
-    let mut seen: Vec<String> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
     loop {
         let (type_ref, cur_args) = match &current {
             Type::TypeAliasType {
@@ -219,10 +219,10 @@ pub(crate) fn expanded_alias_target(
             } => (type_ref.clone(), args.clone()),
             _ => return Some((current, args, python_3_12)),
         };
-        if seen.contains(&type_ref) {
+        // Set-based cycle guard: a revisit defers (None).
+        if !seen.insert(type_ref.clone()) {
             return None;
         }
-        seen.push(type_ref.clone());
         let snap = aliases.get(&type_ref)?;
         // The outermost TypeAliasType's args + python_3_12 flag drive the
         // substitution and the args-visit below.
