@@ -840,7 +840,7 @@ mod tests {
             unpack_kwargs: false,
             from_type_type: false,
             arg_types: vec![t.clone()],
-            arg_kinds: vec![1], // ARG_POS
+            arg_kinds: vec![1], // ARG_OPT (kind 1; ARG_POS is 0)
             arg_names: vec![None],
             ret_type: Box::new(t.clone()),
             name: None,
