@@ -1391,9 +1391,10 @@ including:
 - `rust_is_recursive_pair` (issue #966) — mirrors
   `mypy.typeops.is_recursive_pair` (typeops.py:249-274), the pure bool
   predicate gating `join_types` / `meet_types` / `is_subtype` against
-  infinite recursion. Rust classifies two wire Type bytes plus the live
-  `is_recursive` flags (the wire `TypeAliasType` has no `is_recursive`
-  field; it needs the live `TypeAlias` node). The alias-chain expansion
+  infinite recursion. Rust classifies two wire Type bytes plus the
+  `is_recursive` flags (carried in the wire blob since wave31 #1361 as
+  a tagged conditional int, mirrored on the Rust `Type` enum since F0
+  #1349). The alias-chain expansion
   (`get_proper_type`) runs through the snapshot alias resolver
   (`expand_alias_shape`); a missing snapshot or an alias cycle defers
   (`None`) and the Python caller falls back. `or`-chain short-circuit is
