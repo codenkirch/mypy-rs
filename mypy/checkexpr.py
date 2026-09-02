@@ -694,9 +694,7 @@ def _deserialize_solved_callable_from_checkexpr(b: bytes) -> ProperType | None:
     """
     from mypy.wirefixup import fixup_wire_type
 
-    fixed = fixup_wire_type(
-        _checkexpr_read_type(_CheckExprReadBuffer(b)), resolve_aliases=True
-    )
+    fixed = fixup_wire_type(_checkexpr_read_type(_CheckExprReadBuffer(b)), resolve_aliases=True)
     if fixed is None:
         return None
     return cast(ProperType, fixed)
@@ -2989,16 +2987,18 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
                             _pt = get_proper_type(_at)
                             arg_types_bytes.append(_serialize_type_for_checkexpr(_pt))
                             arg_pts.append(_pt)
-                        # Star actuals need the Iterable/Mapping context
-                        # (checkexpr.py:3725-3730); feed both even without
-                        # star actuals, the blobs decode lazily Rust-side.
-                        context_type = self.argument_infer_context()
-                        iterable_blob = _serialize_type_for_checkexpr(
-                            context_type.iterable_type
-                        )
-                        mapping_blob = _serialize_type_for_checkexpr(
-                            context_type.mapping_type
-                        )
+                        # Star actuals reach the expander's Iterable/Mapping
+                        # context (checkexpr.py:3725-3730); only the star arms
+                        # consume the blobs, so pass None without one.
+                        if any(k.is_star() for k in arg_kinds):
+                            context_type = self.argument_infer_context()
+                            iterable_blob = _serialize_type_for_checkexpr(
+                                context_type.iterable_type
+                            )
+                            mapping_blob = _serialize_type_for_checkexpr(context_type.mapping_type)
+                        else:
+                            iterable_blob = None
+                            mapping_blob = None
                         resolved_bytes = _rust_solve_generic_call(
                             _native_checkexpr_resolver,
                             _serialize_type_for_checkexpr(callee),
@@ -3024,9 +3024,7 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
                                 # A solved value may carry an outer-context
                                 # type var; re-link its wire copy to the
                                 # live object (#1215 pattern). None defers.
-                                relinked = resync_var_identities(
-                                    callee, resolved_callee, arg_pts
-                                )
+                                relinked = resync_var_identities(callee, resolved_callee, arg_pts)
                                 if relinked is None:
                                     resolved_callee = None
                                 else:
@@ -3550,19 +3548,20 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
                 and 2 not in arg_pass_nums
             ):
                 try:
-                    # Star-arm context blobs; decode failures leave them None.
+                    # Star-arm context blobs (checkexpr.py:3725-3730); only
+                    # star arms consume them, so gate construction on a star
+                    # kind, and decode failures leave them None.
                     iterable_blob: bytes | None = None
                     mapping_blob: bytes | None = None
-                    try:
-                        context_type = self.argument_infer_context()
-                        iterable_blob = _serialize_type_for_checkexpr(
-                            context_type.iterable_type
-                        )
-                        mapping_blob = _serialize_type_for_checkexpr(
-                            context_type.mapping_type
-                        )
-                    except (AssertionError, NotImplementedError, ValueError, TypeError):
-                        pass
+                    if any(k.is_star() for k in arg_kinds):
+                        try:
+                            context_type = self.argument_infer_context()
+                            iterable_blob = _serialize_type_for_checkexpr(
+                                context_type.iterable_type
+                            )
+                            mapping_blob = _serialize_type_for_checkexpr(context_type.mapping_type)
+                        except (AssertionError, NotImplementedError, ValueError, TypeError):
+                            pass
                     raw = _rust_infer_function_type_arguments(
                         _native_checkexpr_resolver,
                         _serialize_type_for_checkexpr(callee_type),
@@ -5714,13 +5713,11 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
                     orig_bytes = None
                 else:
                     orig_bytes = _serialize_type_for_checkexpr(original_container)
-                if isinstance(
-                    get_proper_type(left), Instance
-                ) and isinstance(get_proper_type(right), Instance):
+                if isinstance(get_proper_type(left), Instance) and isinstance(
+                    get_proper_type(right), Instance
+                ):
                     try:
-                        abstract_set_ref = self.chk.lookup_typeinfo(
-                            "typing.AbstractSet"
-                        ).fullname
+                        abstract_set_ref = self.chk.lookup_typeinfo("typing.AbstractSet").fullname
                         abstract_map_ref = self.chk.lookup_typeinfo("typing.Mapping").fullname
                     except KeyError:
                         # Broken fixture without the typing symbols: defer so
@@ -8913,11 +8910,9 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
         chk_sem = mypy.checker.TypeCheckerAsSemanticAnalyzer(self.chk, sym_for_name)
         tpan = TypeAnalyser(
             chk_sem,
-            # NOTE: Will never need to lookup type vars in this scope because
-            #       SemanticAnalyzer.try_parse_as_type_expression() will have
-            #       already recognized any type var referenced in a NameExpr.
-            #       String annotations (which may also reference type vars)
-            #       can't be resolved in the TypeChecker pass anyway.
+            # NOTE: Never needs to lookup type vars in this scope, because
+            #       try_parse_as_type_expression() already recognized any type var
+            #       referenced in a NameExpr; string annotations resolve elsewhere.
             TypeVarLikeScope(),  # empty scope
             self.plugin,
             self.chk.options,
@@ -9068,9 +9063,8 @@ def is_duplicate_mapping(
     return (
         len(mapping) > 1
         # Multiple actuals can map to the same formal if they both come from
-        # varargs (*args and **kwargs); in this case at runtime it is possible
-        # that here are no duplicates. We need to allow this, as the convention
-        # f(..., *args, **kwargs) is common enough.
+        # varargs (*args and **kwargs); then at runtime there may be no
+        # duplicates, and this convention is common enough to allow.
         and not (
             len(mapping) == 2
             and actual_kinds[mapping[0]] == nodes.ARG_STAR
