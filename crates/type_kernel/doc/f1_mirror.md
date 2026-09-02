@@ -52,7 +52,8 @@ read.
   audit (`MYPY_TK_MIRROR_AUDIT=1`) counts, captures one example plus a
   short traceback per mismatch class, and resyncs so each escape fires
   once. JSON dumps to `$MYPY_TK_MIRROR_AUDIT_OUT` at atexit; use `{pid}`
-  in the path for per-pytest-worker files.
+  in the path for per-pytest-worker files (spliced-serve mismatch and
+  stale-splice records land in those same `{pid}` files).
 
 ## Gate plumbing
 
@@ -95,21 +96,29 @@ same in-place-drift class as the table below (tvar 588, callable 135,
 instance 16, union 0); the higher rates over testcheck reflect the
 self-check corpus' heavier in-place checker/semantic-analyzer mutation
 of mypy's own source, reached through `names.write`/`fill_typevars`
-serialization funnels.
+serialization funnels. Post-splice-funnel runs (fork librt wheel on
+PYTHONPATH, wire cache active) shift those write-path counts to tvar
+590 / callable 87 / instance 12 / union 0 and add splice counters:
+`adopt.instance.cachedsplice` 343,
+`assert_ok.instance/union/callable.cachedsplice`
+341,694/33,197/5,987, plus zero `stale_splice.*` and zero
+`mismatch.<fam>.cachedsplice`: no spliced serve carried drifted bytes.
 
 | counter class | meaning | result |
 | ------------- | ------- | ------ |
 | `init.<fam>` | family constructions seen | 3.57M instances, 1.68M tvars, 2.05M callables, 186k unions per full testcheck |
 | `adopt.<fam>.write` | lazy registrations at first funnel | ~21k instances, ~15k callables, ~700 tvars/unions |
-| `assert_ok.<fam>.<site>` | funnel asserts that matched stored bytes | the overwhelming majority |
+| `adopt.<fam>.cachedsplice` | mirror registrations through a wire-cache splice hit (object unregistered at splice time; kernel-on runs only) | scc: 343 instances; testcheck: 436 instances |
+| `assert_ok.<fam>.<site>` | funnel asserts that matched stored bytes | the overwhelming majority (`cachedsplice` site: scc 342k instances, 33k unions, 6k callables) |
 | `setattr_captured.<fam>.<attr>` | mutations through `__setattr__`, mirrored + cascaded | e.g. `instance.args` 706k, `instance.end_line` 671k, `tvar.default` 305k, `callable.definition` 18k |
 | `setattr_noop.*` | attribute writes that changed no wire byte | cache/tuple identity writes |
 | `setattr_gagged.<fam>` | setattr on an object the wire cannot yet bind (bounded retry memo) | 241k callables ("fallback can't be filled out until semanal"), ~7k instances, ~100 tvars |
-| `mismatch.<fam>.write` | funnel-detected escapes, counted then resynced | see below |
+| `mismatch.<fam>.write` / `mismatch.<fam>.cachedsplice` | funnel-detected escapes (write serve / splice serve), counted then resynced | see below; `cachedsplice` 0 in every audited corpus |
+| `stale_splice.<fam>` | splice served bytes that drifted from the live type (strict raise; audit pops the cache entry so the next write re-caches) | 0 in every audited corpus |
 | `unserializable.*` | partial objects the wire cannot serialize (counted, deferred to funnel) | semanal-phase objects only |
 
-Funnel-detected escapes (audit counts, resynced after each; full
-testcheck at kernel-off):
+Escapes are audit counts, resynced after each, full testcheck at
+kernel-off:
 
 | family | count | cause |
 | ------ | ----- | ----- |
@@ -118,14 +127,41 @@ testcheck at kernel-off):
 | `callable` | 0 | (pre-lazy-registration runs showed 191 `normalize_trivial_unpack` splices; they were artifacts of a dropped-write bug in the gagged-setattr path, fixed: a setattr on an object the mirror cannot bind now applies the write and only skips capture) |
 | `union` | 0 | - |
 
+With the fork librt wheel on PYTHONPATH the wire cache becomes active
+(the venv's stock librt lacks `write_raw_bytes`, so the cache was inert
+in the numbers above). That alone moves the testcheck write-path counts
+to tvar 188 / instance 2 / callable 0 / union 0 (a cache-inert rerun
+reproduces 176/2/0/0, i.e. baseline within one count), so the delta is
+cache activation rather than the splice hook; the exact per-event
+mechanism was not traced. Splice asserts
+(`assert_ok.<fam>.cachedsplice`) fire in both kernel-off and kernel-on
+fork-librt runs; the `adopt.<fam>.cachedsplice` row appears only in
+kernel-on runs (436 instances at full testcheck).
+
 ## Explicitly not captured in F1
 
 - Mutations before an object's first funnel write (adoption baseline).
-- A family write served fully from the wire cache via
-  `_write_type_cached`'s `write_raw_bytes` splice: it never calls
-  `t.write`, so no funnel fires. Cache staleness is a Python-side
-  concern and cannot mask a mirror assert (the assert computes its own
-  fresh bytes with the cache disabled).
+- (Was not captured before #1372.) A family write served fully from the
+  wire cache via `_write_type_cached`'s `write_raw_bytes` splice never
+  called `t.write`, so no funnel fired. This is now funneled:
+  `_write_type_cached`'s cache-hit branch calls
+  `_type_mirror_splice_check(t, blob)` (mirroring in
+  `mypy/types.py`, implementation `_check_splice` in
+  `mypy/types_mirror.py`) right before `write_raw_bytes`.
+  `_check_splice` fresh-serializes `t` with the cache disabled and
+  compares: an unregistered object is adopted
+  (`adopt.<fam>.cachedsplice`); a registered object whose bytes drifted
+  is a `mismatch.<fam>.cachedsplice` escape with resync and cascade
+  (strict mode raises); a match counts `assert_ok.<fam>.cachedsplice`;
+  and when the *spliced* blob itself differs from the live bytes the
+  serve is stale: `stale_splice.<fam>` counts, strict mode raises, and
+  audit mode pops the cache entry so the next write re-caches instead
+  of serving drifted bytes again. The hook is only installed by
+  `types_mirror.activate`, so mirror-off runs pay nothing. Perf note:
+  an active mirror re-serializes on every splice hit regardless of
+  mode (audit mode additionally records examples and stacks), so a
+  cached serialization under `native_type_mirror` costs one extra
+  fresh `Type.write`.
 - Mutations of non-family objects (`Overloaded.items`,
   `TypeVarId.meta_level` fields other than through the funnel,
   `ExtraAttrs.attrs` rewrites in place) are visible only through the

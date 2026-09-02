@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import sys
 from abc import abstractmethod
-from collections.abc import Iterable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from typing import (
     Any,
     ClassVar,
@@ -147,6 +147,11 @@ _type_wire_cache_enabled: bool = False
 # the cache for lookups, never stores.
 _type_wire_cache_saw_tvar: int = 0
 _type_wire_cache_session_depth: int = 0
+
+# Installed by types_mirror.activate when the F1 mirror is on: verifies a
+# wire-cache splice still matches the object's live bytes (the splice
+# bypasses every Type.write funnel). None keeps the splice hot path bare.
+_type_mirror_splice_check: Callable[[Type, bytes], None] | None = None
 
 
 def _clear_type_wire_cache() -> None:
@@ -5449,6 +5454,8 @@ def _write_type_cached(t: Type, data: WriteBuffer) -> None:
     key = id(t)
     entry = _type_wire_cache.get(key)
     if entry is not None and entry[0] is t:
+        if _type_mirror_splice_check is not None:
+            _type_mirror_splice_check(t, entry[1])
         write_raw_bytes(data, entry[1])
         return
     global _type_wire_cache_saw_tvar, _type_wire_cache_session_depth
