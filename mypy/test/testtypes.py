@@ -49724,3 +49724,267 @@ class NativeMirrorSpliceSuite(Suite):
             assert not _type_wire_cache, _type_wire_cache
         finally:
             types_mod.__dict__["write_raw_bytes"] = saved
+
+
+class NativeMirrorTypeVarIdSuite(Suite):
+    """Unit tests for the TypeVarId capture shim of the F1 mirror.
+
+    A TypeVarId is embedded in TypeVarLikeType.id, so a meta_level write
+    changes the wire bytes of every carrier embedding it without firing
+    any family __setattr__ (the measured `mismatch.tvar.write` escapes).
+    `_mirror_tvid_setattr` captures the write at the source and resyncs
+    each registered carrier through the reverse map
+    `_TVID_REVERSE[id(tvid)] -> (tvid, carrier handles)`.
+
+    Activation is one-shot process-wide: isolation is reset() + strict
+    off, same as NativeMirrorSpliceSuite.
+    """
+
+    def setUp(self) -> None:
+        from mypy import types_mirror
+
+        types_mirror.activate(audit=True)
+        types_mirror.reset(clear_counts=True)
+        self._m = types_mirror
+        self.fx = TypeFixture()
+
+    def tearDown(self) -> None:
+        self._m._strict = False
+        self._m.reset(clear_counts=True)
+
+    def _callable(self, name: str) -> CallableType:
+        return CallableType(
+            [self.fx.o],
+            [ARG_POS],
+            [None],
+            self.fx.o,
+            self.fx.function,
+            name=name,
+            variables=[self.fx.t],
+        )
+
+    def _tvar_id(self) -> TypeVarId:
+        return self.fx.t.id
+
+    def _delta(self, before: dict[str, int]) -> dict[str, int]:
+        after = self._m.report()
+        return {
+            k: v - before.get(k, 0)
+            for k, v in after.items()
+            if v != before.get(k, 0) and "init." not in k
+        }
+
+    def test_adopt_counts_captured_and_cascades_carrier(self) -> None:
+        from librt.internal import WriteBuffer
+
+        ct = self._callable("f")
+        ct.write(WriteBuffer())  # adoption funnel indexes tvid -> ct
+        before = dict(self._m.report())
+        self._tvar_id().meta_level = 1
+        delta = self._delta(before)
+        assert delta.get("tvid_captured.meta_level") == 1, delta
+        assert delta.get("cascade_sync") == 1, delta
+        assert not any(k.startswith(("mismatch.", "tvid_orphan.")) for k in delta), delta
+        before = dict(self._m.report())
+        ct.write(WriteBuffer())  # mirror already caught up: must assert clean
+        delta = self._delta(before)
+        assert delta.get("assert_ok.callable.write") == 1, delta
+        assert not any(k.startswith("mismatch.") for k in delta), delta
+
+    def test_equal_write_counts_equal_and_skips_cascade(self) -> None:
+        from librt.internal import WriteBuffer
+
+        ct = self._callable("f")
+        ct.write(WriteBuffer())
+        self._tvar_id().meta_level = 1  # establish a non-default value
+        before = dict(self._m.report())
+        self._tvar_id().meta_level = 1  # equal-value write
+        delta = self._delta(before)
+        assert delta.get("tvid_setattr_equal.meta_level") == 1, delta
+        assert not any(
+            k.startswith(("tvid_captured.", "tvid_orphan.", "cascade_sync")) for k in delta
+        ), delta
+
+    def test_orphan_tvid_counts_orphan(self) -> None:
+        self._callable("f")
+        self._tvar_id().meta_level = 1
+        before = dict(self._m.report())
+        orphan = TypeVarId(99)
+        orphan.meta_level = 3
+        delta = self._delta(before)
+        assert delta.get("tvid_orphan.meta_level") == 1, delta
+        assert not any(k.startswith(("tvid_captured.", "cascade_sync")) for k in delta), delta
+
+    def test_shared_tvid_cascades_both_carriers(self) -> None:
+        from librt.internal import WriteBuffer
+
+        ct = self._callable("f")
+        ct.write(WriteBuffer())
+        ct2 = ct.copy_modified(name="g")  # shares the same id object
+        ct2.write(WriteBuffer())
+        handles = self._m._TVID_REVERSE[id(self._tvar_id())]
+        assert ct.variables[0] is ct2.variables[0]
+        # The tvar carriers include the tvar itself and each callable that
+        # adopted it.
+        assert self._m._handle_of(ct) in handles[1], handles
+        assert self._m._handle_of(ct2) in handles[1], handles
+        before = dict(self._m.report())
+        self._tvar_id().meta_level = 1
+        delta = self._delta(before)
+        assert delta.get("tvid_captured.meta_level") == 1, delta
+        assert delta.get("cascade_sync") == 2, delta
+        before = dict(self._m.report())
+        ct.write(WriteBuffer())
+        ct2.write(WriteBuffer())
+        delta = self._delta(before)
+        assert delta.get("assert_ok.callable.write") == 2, delta
+        assert not any(k.startswith("mismatch.") for k in delta), delta
+
+    def test_id_swap_via_family_setattr_roadmaps_new_tvid(self) -> None:
+        from librt.internal import WriteBuffer
+
+        ct = self._callable("f")
+        ct.write(WriteBuffer())
+        self.fx.t.id = TypeVarId(42, 0, namespace="mod.C")  # captured family setattr
+        before = dict(self._m.report())
+        self.fx.t.id.meta_level = 1  # the new tvid must be captured, not orphaned
+        delta = self._delta(before)
+        assert delta.get("tvid_captured.meta_level") == 1, delta
+        assert delta.get("tvid_orphan.meta_level", 0) == 0, delta
+
+    def test_strict_mode_does_not_raise_on_captured_mutation(self) -> None:
+        from librt.internal import WriteBuffer
+
+        ct = self._callable("f")
+        ct.write(WriteBuffer())
+        self._m._strict = True
+        try:
+            self._tvar_id().meta_level = 1  # captured at the source
+            ct.write(WriteBuffer())  # was the measured escape: must pass now
+        finally:
+            self._m._strict = False
+
+
+class NativeMirrorHiddenParentSuite(Suite):
+    """Unit tests for the hidden-parent cascade of the F1 mirror.
+
+    A family leaf nested behind a non-family intermediate Type (TupleType,
+    Parameters, ...) has no edge in the kernel parents graph, so a captured
+    leaf write (for example calculate_tuple_fallback's
+    ``fallback.args = (union,)`` through semantic_shared) re-syncs the leaf
+    only, and the embedding TypeVarType drifts until its own funnel: the
+    measured ``mismatch.tvar.write`` escape class over named-tuple synthetic
+    self-type tvars. `_register_tree` additionally indexes every family
+    descendant reachable through non-family Types into
+    `_HIDDEN_EMBED[id] -> (obj, container handles)`, and
+    `_update_and_cascade` re-serializes those containers like family
+    parents.
+
+    Activation is one-shot process-wide: isolation is reset() + strict
+    off, same as NativeMirrorTypeVarIdSuite.
+    """
+
+    def setUp(self) -> None:
+        from mypy import types_mirror
+
+        types_mirror.activate(audit=True)
+        types_mirror.reset(clear_counts=True)
+        self._m = types_mirror
+        self.fx = TypeFixture()
+
+    def tearDown(self) -> None:
+        self._m._strict = False
+        self._m.reset(clear_counts=True)
+
+    def _tuple_meta(self) -> tuple[Instance, TupleType, TypeVarType]:
+        # A named-tuple-shaped hidden chain: TypeVarType -upper_bound->
+        # TupleType (non-family) -partial_fallback-> Instance (family).
+        fallback = Instance(self.fx.std_tuplei, [self.fx.anyt])
+        tup = TupleType([self.fx.a], fallback)
+        tv = TypeVarType("_NT", "m.C._NT", TypeVarId(-1, namespace="m.C.f"), [], tup, self.fx.a)
+        return fallback, tup, tv
+
+    def _delta(self, before: dict[str, int]) -> dict[str, int]:
+        after = self._m.report()
+        return {
+            k: v - before.get(k, 0)
+            for k, v in after.items()
+            if v != before.get(k, 0) and "init." not in k
+        }
+
+    def test_hidden_embed_index_records_chain(self) -> None:
+        from librt.internal import WriteBuffer
+
+        _fallback, _tup, tv = self._tuple_meta()
+        tv.write(WriteBuffer())  # adoption funnel registers tv's tree
+        entry = self._m._HIDDEN_EMBED.get(id(_fallback))
+        assert entry is not None, entry
+        assert self._m._handle_of(tv) in entry[1], entry
+
+    def test_captured_leaf_write_cascades_into_hidden_parent(self) -> None:
+        from librt.internal import WriteBuffer
+
+        fallback, _tup, tv = self._tuple_meta()
+        tv.write(WriteBuffer())  # register the tvar with the Any fallback arg
+        before = dict(self._m.report())
+        fallback.args = (UnionType([self.fx.a, self.fx.std_tuple]),)  # captured leaf write
+        delta = self._delta(before)
+        assert delta.get("setattr_captured.instance.args") == 1, delta
+        assert not any(k.startswith("mismatch.") for k in delta), delta
+        before = dict(self._m.report())
+        tv.write(WriteBuffer())  # mirror already caught up: must assert clean
+        delta = self._delta(before)
+        assert delta.get("assert_ok.tvar.write") == 1, delta
+        assert not any(k.startswith("mismatch.") for k in delta), delta
+
+    def test_cascade_transitive_through_callable(self) -> None:
+        from librt.internal import WriteBuffer
+
+        fallback, _tup, tv = self._tuple_meta()
+        ct = CallableType(
+            [self.fx.o], [ARG_POS], [None], self.fx.o, self.fx.function, variables=[tv]
+        )
+        ct.write(WriteBuffer())  # registers callable -> (tvar family child)
+        tv.write(WriteBuffer())  # registers the hidden chain into the tvar
+        before = dict(self._m.report())
+        fallback.args = (UnionType([self.fx.a, self.fx.std_tuple]),)
+        delta = self._delta(before)
+        assert not any(k.startswith("mismatch.") for k in delta), delta
+        before = dict(self._m.report())
+        tv.write(WriteBuffer())
+        ct.write(WriteBuffer())
+        delta = self._delta(before)
+        # tv asserts clean twice: its own write funnel plus the re-assert
+        # triggered through ct's write path.
+        assert delta.get("assert_ok.tvar.write") == 2, delta
+        assert delta.get("assert_ok.callable.write") == 1, delta
+        assert not any(k.startswith("mismatch.") for k in delta), delta
+
+    def test_strict_mode_does_not_raise_on_hidden_parent_capture(self) -> None:
+        from librt.internal import WriteBuffer
+
+        fallback, _tup, tv = self._tuple_meta()
+        tv.write(WriteBuffer())
+        self._m._strict = True
+        try:
+            fallback.args = (UnionType([self.fx.a, self.fx.std_tuple]),)  # captured write
+            tv.write(WriteBuffer())  # was the measured escape: must pass now
+        finally:
+            self._m._strict = False
+
+    def test_replaced_upper_bound_rereaches_new_embeds(self) -> None:
+        from librt.internal import WriteBuffer
+
+        fallback, _tup, tv = self._tuple_meta()
+        tv.write(WriteBuffer())  # indexes the original chain
+        new_inst = Instance(self.fx.std_tuplei, [self.fx.a])
+        tv.upper_bound = TupleType([self.fx.o], new_inst)  # captured replace
+        # The new chain is invisible to every earlier `_HIDDEN_EMBED` fill
+        # (registration time only). Until cascade re-indexes the tvar, the
+        # captured write below has no container to re-sync.
+        new_inst.args = (UnionType([self.fx.a, self.fx.std_tuple]),)  # captured write
+        before = dict(self._m.report())
+        tv.write(WriteBuffer())  # must already be fresh: assert_ok, no mismatch
+        delta = self._delta(before)
+        assert delta.get("assert_ok.tvar.write") == 1, delta
+        assert not any(k.startswith("mismatch.") for k in delta), delta

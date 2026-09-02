@@ -15,8 +15,7 @@ read.
 - Capture is class-level monkeypatching of `__init__`, `__setattr__`, and
   `write` on the four family classes (`mypy/types_mirror.py`). Class
   identity is never swapped, so `type(t) is Instance` keeps working.
-  When the gate is off nothing is patched: off-path cost is zero.
-- Registration is lazy. `__init__` capture only counts; an object enters
+  When the gate is off nothing is patched: off-path cost is zero.- Registration is lazy. `__init__` capture only counts; an object enters
   the mirror at its first serialization funnel (the wrapped `write`),
   because semanal constructs partial objects whose wire bytes cannot
   exist yet ("fallback can't be filled out until semanal",
@@ -40,20 +39,75 @@ read.
   serialization still fails are put on a bounded failed-adoption memo
   (`_ADOPT_STRIKE`, 64k ids, FIFO) so per-setattr retries stop; the
   write funnel remains the authoritative registration point either way.
+- `TypeVarId` writes are captured through their own shim
+  (`_mirror_tvid_setattr`, issue #1372 item 3): a tvid is embedded in
+  `TypeVarLikeType.id`, so a `meta_level`/`raw_id`/`namespace` write
+  changes the wire bytes of every carrier embedding it without firing
+  any family `__setattr__`. The shim is skipped during construction
+  (`_TVID_CONSTRUCTION` counts in-flight `TypeVarId.__init__` calls);
+  an equal-value write counts `tvid_setattr_equal.<attr>` and stops;
+  an index miss counts `tvid_orphan.<attr>` and stops. Capture
+  (`tvid_captured.<attr>`) fresh-serializes each carrier handle from
+  the reverse map `_TVID_REVERSE[id(tvid)] -> (tvid, carrier
+  handles)`: a match counts `tvid_cascade_ok.<attr>`, a divergence
+  routes through the normal `_update_and_cascade`. The map is
+  populated at registration (`_record_tvid_carriers` walks the full
+  subtree through non-family types, lists, dicts, and ExtraAttrs, with
+  a seen-set cycle cut) and re-indexed on every mirror sync, so a
+  family setattr that swaps an `id` slot roadmaps the new tvid too.
+  Construction writes bypass capture because a freshly constructed
+  tvid belongs to a family object whose own `__init__` wrapper is
+  still in flight (no funnel can see the blob yet).
+- Hidden-parent closure (issue #1372): a family leaf behind a
+  non-family Type (the motivating shape is a `TupleType` upper_bound
+  between a `TypeVarType` and its tuple-fallback `Instance`) has no
+  edge in the kernel parents graph, so a captured leaf write cannot
+  reach the embedding family ancestor via `rust_mirror_parents` alone.
+  `_add_hidden_embeds` walks `_family_embeds` (container registrations
+  through ALL Types) and fills `_HIDDEN_EMBED[id(leaf)] -> (leaf,
+  container handles)`; `_sync_seed_handles` feeds those handles into
+  every cascade. Two bugs found during the fixture suite drove fixes:
+  (1) the original `_family_embeds(t, {id(t)})` pre-seeded call was a
+  no-op (a pre-seeded id counts as visited, so the embed set was
+  never walked; extraction into `_add_hidden_embeds` fixed it), and
+  (2) a captured *replace* of a subtree (`tv.upper_bound = ...`) left
+  the new chain unindexed, so later writes inside it could not
+  cascade; re-indexing after every sync of the root (and, in the
+  unknown escape path, every loop parent) fixed it. The re-index is
+  slot-gated for cost: `_update_and_cascade` takes `replaced_slot`,
+  set by `_mirror_setattr` to the written attribute name. A same-slot
+  subtree replacement cannot hide a previously visible chain in an
+  ancestor, so a captured setattr in `_REINDEX_SLOTS` re-indexes the
+  root only and skips loop parents; unknown-path funnels
+  (`_assert_fresh` / `_check_splice` mismatches) keep the full walk;
+  the TypeVarId carrier path passes `""` and re-indexes nothing.
+  Perf: the original unconditional re-index on every sync walked
+  ~600k family-embed sets per full testcheck (~47s); the gate brings
+  the mirror-on testcheck runtime from 188s back to 112s (baseline
+  no-mirror 78s; 141s with the hidden-parent capture but before the
+  re-index; all under the same `-n4` setup). The gate also tightened
+  detection: the blind loop walk masked funnel escapes (a parent whose
+  blob was silently repaired by the re-serialization pass never
+  reached a counted funnel); the gated version detects strictly more.
 - Live objects are pinned strongly in `_BY_HANDLE` until `reset()`
   (types carry no `__weakref__`), so a recycled `id()` cannot adopt a
   stale handle. Handles come from the type kernel's raw identity layer
   (`handle_for` mints, `handle_of` never mints); `reset()` clears the
-  Rust registry and the identity generation together.
+  Rust registry and the identity generation together. `_TVID_REVERSE`
+  pins each seen TypeVarId in the same way; entries die only at
+  `reset()`.
 - Cascade parents are stored Rust-side (`parents_of` child -> parents);
   re-registration of a parent replaces its child list (no dangling
   parent entries).
 - Modes: strict (`MYPY_TK_MIRROR=1`) raises on the first divergence;
   audit (`MYPY_TK_MIRROR_AUDIT=1`) counts, captures one example plus a
   short traceback per mismatch class, and resyncs so each escape fires
-  once. JSON dumps to `$MYPY_TK_MIRROR_AUDIT_OUT` at atexit; use `{pid}`
-  in the path for per-pytest-worker files (spliced-serve mismatch and
-  stale-splice records land in those same `{pid}` files).
+  once. `_short_stack` keeps both ends of the traceback (first 12 +
+  last 12 frames past 24) so the captured stack names the mutation
+  origin as well as the funnel that detected the drift. JSON dumps to
+  `$MYPY_TK_MIRROR_AUDIT_OUT` at atexit; use `{pid}` in the path for
+  per-pytest-worker files (spliced-serve mismatch and stale-splice
+  records land in those same `{pid}` files).
 
 ## Gate plumbing
 
@@ -113,6 +167,10 @@ PYTHONPATH, wire cache active) shift those write-path counts to tvar
 | `setattr_captured.<fam>.<attr>` | mutations through `__setattr__`, mirrored + cascaded | e.g. `instance.args` 706k, `instance.end_line` 671k, `tvar.default` 305k, `callable.definition` 18k |
 | `setattr_noop.*` | attribute writes that changed no wire byte | cache/tuple identity writes |
 | `setattr_gagged.<fam>` | setattr on an object the wire cannot yet bind (bounded retry memo) | 241k callables ("fallback can't be filled out until semanal"), ~7k instances, ~100 tvars |
+| `tvid_setattr_equal.<attr>` | equal-value TypeVarId writes (no wire byte changes) | e.g. `meta_level` freeze no-ops; never cascades |
+| `tvid_captured.<attr>` | TypeVarId writes captured at the source and cascaded into every registered carrier | meta_level freeze writes (`mypy/typeops.py` `FreezeTypeVarsVisitor`) |
+| `tvid_cascade_ok.<attr>` | carrier blobs that were already fresh at capture time | - |
+| `tvid_orphan.<attr>` | TypeVarId writes with no registered carrier (mirror stays exact; the tvid was never reachable from an adopted tree) | - |
 | `mismatch.<fam>.write` / `mismatch.<fam>.cachedsplice` | funnel-detected escapes (write serve / splice serve), counted then resynced | see below; `cachedsplice` 0 in every audited corpus |
 | `stale.<fam>.cachedsplice` | splice served bytes that drifted from the live type (strict raise; audit pops the cache entry so the next write re-caches) | 0 in every audited corpus |
 | `unserializable.*` | partial objects the wire cannot serialize (counted, deferred to funnel) | semanal-phase objects only |
@@ -137,6 +195,49 @@ mechanism was not traced. Splice asserts
 (`assert_ok.<fam>.cachedsplice`) fire in both kernel-off and kernel-on
 fork-librt runs; the `adopt.<fam>.cachedsplice` row appears only in
 kernel-on runs (436 instances at full testcheck).
+
+## Hidden-parent closure audit (issue #1372)
+
+Escape = a captured-but-uncascadable hidden-parent write: a family leaf
+behind a non-family Type (a TupleType upper_bound between a TypeVarType
+and its tuple-fallback Instance) mutates through a legal channel the
+kernel parents graph cannot see, so until #1372 only the blind funnel
+resyncs caught it. Aggregate audit counts over full testcheck at -n4
+(4 workers, per-pid JSONs):
+
+| stage | tvar | callable | instance | union |
+| ----- | ---- | -------- | -------- | ----- |
+| pre-#1372 | 820 | 109 | 59 | 2 |
+| post-#1372, blind loop re-index | 106 | 2 | 43 | 2 |
+| post-#1372, slot-gated re-index | 0 | 0 | 2 | 0 |
+
+The slot gate closes more than the blind walk: re-indexing every loop
+parent after every captured setattr added new `_HIDDEN_EMBED` entries
+whose cascade re-serialization silently repaired drifted ancestors
+without a funnel ever asserting them (funnel-masking). With the gate,
+every remaining drift surfaces at a real funnel. Cascade volume drops
+with it: `cascade_sync` 107,345 -> 3,587 per testcheck; the
+TypeVarId carrier map follows (`tvid_captured.meta_level` 646 -> 67,
+`tvid_orphan.meta_level` 189 -> 2,106, i.e. writes whose carriers are
+registered later now surface at the carrier's funnel instead of an
+eager cascade). Residual, self-healing at the funnels, counted above:
+
+- `instance` 2: uncaptured in-place mutation during stale-SCC
+  incremental cache building in `testSelfRefNTIncremental1/2`
+  (self-referential NamedTuple fallback whose union/args lists are
+  spliced below any capture path), pre-existing since the F0 mirror
+  (#1370 strict-mode verified). Strict mode raises on it, which is
+  faithful to the F1 contract; those two parity tests are the known
+  strict-mode failures.
+- Non-mismatch counters (`tvid_captured.meta_level` ~67 per testcheck)
+  are the capture working as designed.
+
+Perf on full testcheck at -n4: no-mirror 78s; mirror with hidden-parent
+capture + unconditional (blind) re-index 188s; slot-gated re-index
+112s (the two mirror runs above ran under the same contention). The
+gate is sound because a same-slot subtree replacement cannot hide a
+previously visible chain in an ancestor (see the `replaced_slot`
+contract on `_update_and_cascade`).
 
 ## Explicitly not captured in F1
 
@@ -164,7 +265,10 @@ kernel-on runs (436 instances at full testcheck).
   cached serialization under `native_type_mirror` costs one extra
   fresh `Type.write`.
 - Mutations of non-family objects (`Overloaded.items`,
-  `TypeVarId.meta_level` fields other than through the funnel,
   `ExtraAttrs.attrs` rewrites in place) are visible only through the
-  funnel of a family object that embeds them.
+  funnel of a family object that embeds them. (`TypeVarId` used to sit
+  in this list; its writes are captured through
+  `_mirror_tvid_setattr` since issue #1372 item 3, so a `meta_level`
+  write resyncs its carriers instead of waiting for a funnel to
+  protest.)
 - Objects that never reach a `write` funnel before process exit.
