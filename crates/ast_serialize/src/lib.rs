@@ -3848,6 +3848,9 @@ mod tests {
         .unwrap();
         assert!(imports.is_empty());
         assert!(errors.is_empty());
+        // Blob regenerated from actual writer output; it pins the STR_EXPR wire
+        // contract including the corrupted-surrogate flag byte, which stays in
+        // lockstep with the STR_EXPR reader arm in mypy/nativeparse.py.
         assert_eq!(
             bytes,
             [
@@ -3879,6 +3882,7 @@ mod tests {
                 b'l',
                 b'l',
                 b'o',
+                0, // corrupted-surrogate flag byte; read by nativeparse.py
                 LOCATION,
                 22,
                 32,
