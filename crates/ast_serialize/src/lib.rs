@@ -1491,8 +1491,7 @@ fn serialize_t_string_expr(
                 }
                 ast::InterpolatedStringElement::Literal(literal) => {
                     let range = literal.range;
-                    let raw = &serializer.source[range.start().to_usize()
-                        ..range.end().to_usize()];
+                    let raw = &serializer.source[range.start().to_usize()..range.end().to_usize()];
                     let corrupted = !is_raw && has_surrogate_escape(raw);
                     serializer.writer.bool(false);
                     serializer.writer.string(&literal.value);
@@ -1569,8 +1568,7 @@ fn serialize_f_string_items(
         match element {
             ast::InterpolatedStringElement::Literal(literal) => {
                 let range = literal.range;
-                let raw =
-                    &serializer.source[range.start().to_usize()..range.end().to_usize()];
+                let raw = &serializer.source[range.start().to_usize()..range.end().to_usize()];
                 let corrupted = !is_raw && has_surrogate_escape(raw);
                 let loc = serializer.loc(literal);
                 serializer.writer.string(&literal.value);
