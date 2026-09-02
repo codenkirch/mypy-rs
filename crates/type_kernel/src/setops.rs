@@ -2211,9 +2211,22 @@ fn visit_join_inner(
             // Both-generic operands must share one id space before the
             // structural comparisons (join.py match_generic_callables).
             // Renumber once, run renumbered=true to prevent recursion.
+
+            // Python renumbers only inside combine/join_similar_
+            // callables, both behind is_similar_callables, so a
+            // dissimilar pair skips the renumber (cost pre-bail).
             if !renumbered
                 && !variables.is_empty()
-                && matches!(s, Type::CallableType { variables: s_variables, .. } if !s_variables.is_empty())
+                && matches!(
+                    s,
+                    Type::CallableType {
+                        arg_types: s_arg_types,
+                        arg_kinds: s_arg_kinds,
+                        variables: s_variables,
+                        ..
+                    } if !s_variables.is_empty()
+                        && is_similar_callables(arg_types, arg_kinds, s_arg_types, s_arg_kinds)
+                )
             {
                 let (t2, s2) = renumber_generic_pair(t, s, resolver)?;
                 return visit_join_inner(&s2, &t2, ctx, resolver, true);
@@ -2243,9 +2256,9 @@ fn visit_join_inner(
                 // is_equivalent(t, s) -> combine. In the identical case
                 // combine(t, t) returns t (all joins identity, fallback kept).
 
-                // So SameS is right without building a CallableType. A
-                // both-generic pair renumbers to one shared id space
-                // (ids in result: originals; id-only diff, accepted).
+                // So SameS is right without building a CallableType: after
+                // renumber_generic_pair the compared ids are the shared
+                // native-registry batch, so an id-only diff accepts.
                 let identical = arg_kinds == s_arg_kinds
                     && arg_names == s_arg_names
                     && arg_types == s_arg_types
@@ -7920,6 +7933,111 @@ mod tests {
         // callable t.
         let t = Type::NoneType;
         assert_eq!(join_types(&s, &t, &ctx(true), &r), Some(SetOpResult::SameS));
+    }
+
+    fn join_tvar(name: &str, raw_id: i64, meta_level: i64) -> Type {
+        Type::TypeVarType {
+            name: name.to_string(),
+            fullname: name.to_string(),
+            raw_id,
+            namespace: String::new(),
+            values: Vec::new(),
+            upper_bound: Box::new(instance("builtins.object", vec![])),
+            default: Box::new(Type::AnyType {
+                type_of_any: 4, // from_omitted_generics
+                source_any: None,
+                missing_import_name: None,
+            }),
+            variance: 0,
+            meta_level,
+        }
+    }
+
+    #[test]
+    fn join_types_generic_dissimilar_callables_skip_renumber() {
+        // Issue #1362: Python renumbers generic pairs only inside
+        // combine/join_similar_callables, both behind
+        // is_similar_callables; a dissimilar pair must not renumber.
+        let r = TypeResolver::new();
+        let tv = join_tvar("T", 1, 0);
+        let t = callable_with_vars(
+            "builtins.function",
+            vec![tv.clone()],
+            tv,
+            vec![join_tvar("T", 1, 0)],
+        );
+        let u = join_tvar("U", 2, 0);
+        let v = join_tvar("V", 3, 0);
+        let s = callable_with_vars(
+            "builtins.function",
+            vec![u, v.clone()],
+            v,
+            vec![join_tvar("U", 2, 0), join_tvar("V", 3, 0)],
+        );
+        // Dissimilar (1 vs 2 args): the kernel defers (the swap while
+        // arms need is_subtype on generic callables; join.py runs them
+        // on raw operands either way).
+        assert_eq!(join_types(&s, &t, &ctx(true), &r), None);
+        // No batch was consumed: a direct renumber starts at the base.
+        let (t2, _) = crate::freshen::renumber_generic_pair(&t, &s, &r).unwrap();
+        let vars = match t2 {
+            Type::CallableType { variables, .. } => variables,
+            other => panic!("expected CallableType, got {other:?}"),
+        };
+        let shared_ns = crate::freshen::NATIVE_TVAR_NAMESPACE.to_string();
+        match &vars[0] {
+            Type::TypeVarType {
+                raw_id, namespace, ..
+            } => {
+                assert_eq!(*raw_id, crate::typeinfo::NATIVE_TVAR_RAW_ID_BASE);
+                assert_eq!(namespace, &shared_ns);
+            }
+            other => panic!("expected renumbered tvar, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn join_types_generic_similar_callables_renumber() {
+        // Positive control: a similar both-generic pair still renumbers
+        // onto one shared native id space before the structural compare
+        // (join.py combine_similar_callables worth of behavior).
+        let r = TypeResolver::new();
+        let a = join_tvar("A", 1, 0);
+        let t = callable_with_vars(
+            "builtins.function",
+            vec![a.clone()],
+            a,
+            vec![join_tvar("A", 1, 0)],
+        );
+        let b = join_tvar("B", 2, 0);
+        let s = callable_with_vars(
+            "builtins.function",
+            vec![b.clone()],
+            b,
+            vec![join_tvar("B", 2, 0)],
+        );
+        // The join is a fresh combined callable (tvar names differ, so
+        // not the identical arm); its variable carries the shared batch
+        // id + namespace, proving renumber_generic_pair ran.
+        let res = join_types(&s, &t, &ctx(true), &r).unwrap();
+        let bytes = match &res {
+            SetOpResult::Encoded(bytes) => bytes,
+            other => panic!("expected Encoded combined callable, got {other:?}"),
+        };
+        let dec = read_type(&mut ReadBuffer::new(bytes), None).unwrap();
+        let shared_ns = crate::freshen::NATIVE_TVAR_NAMESPACE;
+        match dec {
+            Type::CallableType { arg_types, .. } => match &arg_types[0] {
+                Type::TypeVarType {
+                    raw_id, namespace, ..
+                } => {
+                    assert_eq!(*raw_id, crate::typeinfo::NATIVE_TVAR_RAW_ID_BASE);
+                    assert_eq!(*namespace, shared_ns);
+                }
+                other => panic!("expected renumbered tvar, got {other:?}"),
+            },
+            other => panic!("expected CallableType, got {other:?}"),
+        }
     }
 
     // ---- visit_instance nominal join (M8f) ----

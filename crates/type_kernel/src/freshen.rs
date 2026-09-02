@@ -874,6 +874,35 @@ mod tests {
         }
     }
 
+    /// `tvar` stamped with the renumber sentinel namespace: the fixture
+    /// an operand carries after `renumber_generic_pair` (issue #1362).
+    fn native_tvar(name: &str, meta_level: i64) -> Type {
+        match tvar(name, NATIVE_TVAR_RAW_ID_BASE, meta_level) {
+            Type::TypeVarType {
+                name,
+                fullname,
+                raw_id,
+                values,
+                upper_bound,
+                default,
+                variance,
+                meta_level,
+                ..
+            } => Type::TypeVarType {
+                name,
+                fullname,
+                raw_id,
+                namespace: NATIVE_TVAR_NAMESPACE.to_string(),
+                values,
+                upper_bound,
+                default,
+                variance,
+                meta_level,
+            },
+            other => other,
+        }
+    }
+
     fn decode(bytes: &[u8]) -> Type {
         read_type(&mut ReadBuffer::new(bytes), None).expect("valid wire type")
     }
@@ -1007,31 +1036,7 @@ mod tests {
         let t = generic(&tvar("T", 1, 0));
         let s = generic(&tvar("U", 2, 0));
         let (t_out, s_out) = renumber_generic_pair(&t, &s, &r).expect("engages");
-        // The fixture helper uses namespace ""; stamp the sentinel in.
-        let expected = match tvar("T", NATIVE_TVAR_RAW_ID_BASE, 0) {
-            Type::TypeVarType {
-                name,
-                fullname,
-                raw_id,
-                values,
-                upper_bound,
-                default,
-                variance,
-                meta_level,
-                ..
-            } => Type::TypeVarType {
-                name,
-                fullname,
-                raw_id,
-                namespace: NATIVE_TVAR_NAMESPACE.to_string(),
-                values,
-                upper_bound,
-                default,
-                variance,
-                meta_level,
-            },
-            other => other,
-        };
+        let expected = native_tvar("T", 0);
         let (t_vars, s_vars) = match (&t_out, &s_out) {
             (
                 Type::CallableType { variables: tv, .. },
@@ -1041,30 +1046,7 @@ mod tests {
         };
         assert_eq!(t_vars[0], expected);
         // Both operands must share the same (raw_id, namespace) id.
-        let s_expected = match tvar("U", NATIVE_TVAR_RAW_ID_BASE, 0) {
-            Type::TypeVarType {
-                ref name,
-                ref fullname,
-                raw_id,
-                ref values,
-                ref upper_bound,
-                ref default,
-                variance,
-                meta_level,
-                ..
-            } => Type::TypeVarType {
-                name: name.clone(),
-                fullname: fullname.clone(),
-                raw_id,
-                namespace: NATIVE_TVAR_NAMESPACE.to_string(),
-                values: values.clone(),
-                upper_bound: upper_bound.clone(),
-                default: default.clone(),
-                variance,
-                meta_level,
-            },
-            other => other,
-        };
+        let s_expected = native_tvar("U", 0);
         assert_eq!(s_vars[0], s_expected);
         // The substitution reached the arg and ret positions too.
         let (t_args, t_ret) = match &t_out {
@@ -1077,6 +1059,14 @@ mod tests {
         };
         assert_eq!(t_args[0], expected);
         assert_eq!(t_ret, &expected);
+    }
+
+    #[test]
+    fn native_tvar_fixture_roundtrips_through_wire() {
+        // Drift guard (issue #1362): the sentinel-namespace fixture must
+        // stay byte-identical through the canonical writer + reader.
+        let bytes = encode_type(&native_tvar("T", 0)).unwrap();
+        assert_eq!(decode(&bytes), native_tvar("T", 0));
     }
 
     #[test]

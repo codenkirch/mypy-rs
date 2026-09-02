@@ -1304,8 +1304,8 @@ fn read_type_type(buf: &mut ReadBuffer<'_>) -> Result<Type, WireError> {
 /// Mirrors `TypeAliasType.write` in types.py: the recursion flag is a
 /// tagged conditional int appended only when True (same pattern as
 /// `TypeVarType.meta_level`). The flag lands in the variant's
-/// `is_recursive` field; the `is_recursive_pair` seam also reads it back
-/// via `read_alias_recursion_flag`.
+/// `is_recursive` field, which consumers like the `is_recursive_pair`
+/// seam read directly.
 fn read_type_alias_type(buf: &mut ReadBuffer<'_>) -> Result<Type, WireError> {
     let (t, _is_rec) = read_type_alias_type_flagged(buf)?;
     Ok(t)
