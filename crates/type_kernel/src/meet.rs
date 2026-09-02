@@ -737,21 +737,31 @@ fn typed_dict_mapping_overlap(
     let items_map: HashMap<&String, &Type> = td_items.iter().map(|(k, v)| (k, v)).collect();
 
     if td_required.is_empty() {
-        // No required keys: at least one non-required key must overlap with value_type
-        let has_overlap = td_items
-            .iter()
-            .filter(|(k, _)| !td_required.contains(k))
-            .any(|(_, item)| overlapping(item, value_type) == Some(true));
-        Some(has_overlap)
+        // No required keys: at least one non-required key must overlap with value_type.
+        // A deferred (None) item propagates: Some(true) short-circuits,
+        // Some(false) only when every item decided false (meet.py:1632-1639).
+        let mut has_defer = false;
+        for (_, item) in td_items.iter().filter(|(k, _)| !td_required.contains(k)) {
+            match overlapping(item, value_type) {
+                Some(true) => return Some(true),
+                Some(false) => {}
+                None => has_defer = true,
+            }
+        }
+        if has_defer {
+            return None;
+        }
+        Some(false)
     } else {
         // All required keys must overlap with value_type
         for k in td_required.iter() {
-            if let Some(item) = items_map.get(k) {
-                if overlapping(item, value_type) != Some(true) {
-                    return Some(false);
-                }
-            } else {
+            let Some(item) = items_map.get(k) else {
                 return Some(false);
+            };
+            match overlapping(item, value_type) {
+                Some(true) => {}
+                Some(false) => return Some(false),
+                None => return None,
             }
         }
         Some(true)
@@ -2590,5 +2600,151 @@ mod tests {
             other => panic!("expected Encoded, got {other:?}"),
         };
         assert_eq!(decode_type(&bytes).as_ref(), Some(&g_obj));
+    }
+
+    // ------------------------------------------------------------------
+    // typed_dict_mapping_overlap: deferred sub-overlap propagation (#1351)
+    // ------------------------------------------------------------------
+
+    /// Resolver with a `typing.Mapping` snapshot so the mapped-args fast
+    /// path (`left_ref == right_ref`) succeeds for a `typing.Mapping`
+    /// Instance operand.
+    fn tdict_resolver() -> TypeResolver {
+        let mut r = make_resolver();
+        let mut m = TypeInfoSnapshot {
+            fullname: "typing.Mapping".to_string(),
+            name: "Mapping".to_string(),
+            ..Default::default()
+        };
+        m.mro.push("typing.Mapping".to_string());
+        r.insert("typing.Mapping".to_string(), m);
+        r
+    }
+
+    fn tdict(items: &[(&str, &str)], required: &[&str]) -> Type {
+        Type::TypedDictType {
+            // Anonymous fallback: Mapping[str, object], str_type = args[0].
+            fallback: Box::new(Type::Instance {
+                type_ref: "typing._TypedDict".to_string(),
+                args: vec![instance("builtins.str"), instance("builtins.object")],
+                last_known_value: None,
+                extra_attrs: None,
+            }),
+            items: items
+                .iter()
+                .map(|(k, t)| (k.to_string(), instance(t)))
+                .collect(),
+            required_keys: required.iter().map(|k| k.to_string()).collect(),
+            readonly_keys: Default::default(),
+            is_closed: false,
+        }
+    }
+
+    fn mapping_instance(key: &str, value: &str) -> Type {
+        Type::Instance {
+            type_ref: "typing.Mapping".to_string(),
+            args: vec![instance(key), instance(value)],
+            last_known_value: None,
+            extra_attrs: None,
+        }
+    }
+
+    /// Stubbed responder chain: items tagged `probe.yes` / `probe.no`
+    /// decide, anything else defers. Injects undecidable pairs exactly the
+    /// way the live `overlapping_inner` chain defers (None = defer).
+    fn probe_overlap(probe: &Type, _value: &Type) -> Option<bool> {
+        match probe {
+            Type::Instance { type_ref, .. } => match type_ref.as_str() {
+                "probe.yes" => Some(true),
+                "probe.no" => Some(false),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn tdict_mapping_no_required_defer_propagates() {
+        // meet.py:1639 `any(...)`: a None sub-overlap used to collapse into
+        // Some(false). It must defer to the Python fallback instead.
+        let r = tdict_resolver();
+        let td = tdict(&[("x", "probe.defer")], &[]);
+        assert_eq!(
+            typed_dict_mapping_overlap(
+                &td,
+                &mapping_instance("probe.yes", "v"),
+                &probe_overlap,
+                &r
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn tdict_mapping_no_required_decided_unchanged() {
+        let r = tdict_resolver();
+        // All items Some(false) -> Some(false) (pre-fix behavior kept).
+        let td = tdict(&[("x", "probe.no")], &[]);
+        assert_eq!(
+            typed_dict_mapping_overlap(
+                &td,
+                &mapping_instance("probe.yes", "v"),
+                &probe_overlap,
+                &r
+            ),
+            Some(false)
+        );
+        // Any item Some(true) -> Some(true), still short-circuiting ahead
+        // of a later None.
+        let td = tdict(
+            &[("x", "probe.no"), ("y", "probe.yes"), ("z", "probe.defer")],
+            &[],
+        );
+        assert_eq!(
+            typed_dict_mapping_overlap(
+                &td,
+                &mapping_instance("probe.yes", "v"),
+                &probe_overlap,
+                &r
+            ),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn tdict_mapping_required_keys_defer_propagates() {
+        let r = tdict_resolver();
+        // meet.py:1636 `all(...)`: a None sub-overlap defers, Some(false)
+        // and Some(true) keep their pre-fix decisions.
+        let td = tdict(&[("x", "probe.defer")], &["x"]);
+        assert_eq!(
+            typed_dict_mapping_overlap(
+                &td,
+                &mapping_instance("probe.yes", "v"),
+                &probe_overlap,
+                &r
+            ),
+            None
+        );
+        let td = tdict(&[("x", "probe.no")], &["x"]);
+        assert_eq!(
+            typed_dict_mapping_overlap(
+                &td,
+                &mapping_instance("probe.yes", "v"),
+                &probe_overlap,
+                &r
+            ),
+            Some(false)
+        );
+        let td = tdict(&[("x", "probe.yes")], &["x"]);
+        assert_eq!(
+            typed_dict_mapping_overlap(
+                &td,
+                &mapping_instance("probe.yes", "v"),
+                &probe_overlap,
+                &r
+            ),
+            Some(true)
+        );
     }
 }
