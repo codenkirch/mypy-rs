@@ -24,6 +24,8 @@
 //! real simplification hot path stays native via `typeops`, and re-running
 //! it here with an empty resolver would always defer).
 
+use std::collections::HashSet;
+
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyList, PyTuple};
 
@@ -472,12 +474,15 @@ fn is_valid_inferred_type_with_aliases(
     allow_redefinition: bool,
     aliases: &crate::aliases::TypeAliasResolver,
 ) -> Option<bool> {
-    // get_proper_type: a top-level TypeAliasType expands via the alias
-    // snapshot (chain-resolve + substitution, mirroring _expand_once).
-    let proper: Type = match typ {
-        Type::TypeAliasType { .. } => expanded_alias_target(typ, aliases)?.0,
-        t => t.clone(),
+    // get_proper_type: a top-level TypeAliasType chain-expands via the alias
+    // snapshot (mirrors _expand_once). For a non-alias input the original
+    // `typ` IS the proper type, so no whole-tree clone is needed anywhere.
+    let expanded: Option<Type> = if matches!(typ, Type::TypeAliasType { .. }) {
+        Some(expanded_alias_target(typ, aliases)?.0)
+    } else {
+        None
     };
+    let proper: &Type = expanded.as_ref().unwrap_or(typ);
     // Top-level NoneType short-circuit (evaluated on the expanded type).
     if matches!(proper, Type::NoneType) {
         return Some(is_lvalue_final || (!is_lvalue_member && allow_redefinition));
@@ -487,7 +492,8 @@ fn is_valid_inferred_type_with_aliases(
         return Some(false);
     }
     // not typ.accept(InvalidInferredTypes()) — on the ORIGINAL typ.
-    let mut seen: Vec<String> = Vec::new();
+    // Set-based seen-guard, mirroring type_visitor.py:604-608.
+    let mut seen: HashSet<String> = HashSet::new();
     let invalid = invalid_inferred_types_query(typ, aliases, &mut seen)?;
     Some(!invalid)
 }
@@ -499,7 +505,7 @@ fn is_valid_inferred_type_with_aliases(
 fn invalid_inferred_types_query(
     typ: &Type,
     aliases: &crate::aliases::TypeAliasResolver,
-    seen: &mut Vec<String>,
+    seen: &mut HashSet<String>,
 ) -> Option<bool> {
     // Per-variant overrides mirror InvalidInferredTypes.visit_*.
     match typ {
@@ -550,7 +556,7 @@ fn invalid_inferred_types_query(
 fn invalid_query_alias_node(
     typ: &Type,
     aliases: &crate::aliases::TypeAliasResolver,
-    seen: &mut Vec<String>,
+    seen: &mut HashSet<String>,
 ) -> Option<bool> {
     let (args, type_ref) = match typ {
         Type::TypeAliasType {
@@ -560,11 +566,10 @@ fn invalid_query_alias_node(
         } => (args, type_ref),
         _ => return None,
     };
-    if seen.iter().any(|r| r == type_ref) {
+    if !seen.insert(type_ref.clone()) {
         // Already visited: simple-minded cache, default (False).
         return Some(false);
     }
-    seen.push(type_ref.clone());
     // res = get_proper_type(t).accept(self)
     let (target, _, _) = expanded_alias_target(typ, aliases)?;
     let res = invalid_inferred_types_query(&target, aliases, seen)?;
@@ -1769,7 +1774,7 @@ mod tests {
             original_str_expr: None,
             original_str_fallback: None,
         };
-        let mut seen: Vec<String> = Vec::new();
+        let mut seen: HashSet<String> = HashSet::new();
         assert_eq!(
             invalid_inferred_types_query(&t, &Default::default(), &mut seen),
             None
@@ -1799,6 +1804,64 @@ mod tests {
         assert_eq!(
             is_valid_inferred_type_with_aliases(&t, false, false, false, &aliases),
             Some(false)
+        );
+    }
+
+    #[test]
+    fn valid_inferred_alias_top_expands_before_uninhabited_branch() {
+        // Same ordering pin as the NoneType branch above, but for the second
+        // short-circuit: an alias expanding to a (non-ambiguous) proper-type
+        // UninhabitedType takes the Uninhabited branch, not the nested walk.
+        let t = Type::TypeAliasType {
+            args: Vec::new(),
+            type_ref: "mod.A".to_string(),
+            is_recursive: false,
+        };
+        let mut aliases = crate::aliases::TypeAliasResolver::default();
+        aliases.insert(
+            "mod.A".to_string(),
+            crate::aliases::TypeAliasSnapshot {
+                fullname: "mod.A".to_string(),
+                target: encode_type(&Type::UninhabitedType { ambiguous: false }),
+                no_args: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            is_valid_inferred_type_with_aliases(&t, false, false, false, &aliases),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn valid_inferred_chained_alias_seen_guard_defaults_on_revisit() {
+        // Two no_args aliases whose targets reference each other (A -> B ->
+        // A). The set-based seen-guard must catch the revisit and answer the
+        // default (False = valid) instead of looping; not PEP-695, no edge.
+        let alias_node = |type_ref: &str| -> Type {
+            Type::TypeAliasType {
+                args: Vec::new(),
+                type_ref: type_ref.to_string(),
+                is_recursive: false,
+            }
+        };
+        let t = alias_node("mod.A");
+        let mut aliases = crate::aliases::TypeAliasResolver::default();
+        for name in ["mod.A", "mod.B"] {
+            let other: String = if name == "mod.A" { "mod.B" } else { "mod.A" }.into();
+            aliases.insert(
+                name.to_string(),
+                crate::aliases::TypeAliasSnapshot {
+                    fullname: name.to_string(),
+                    target: encode_type(&alias_node(&other)),
+                    no_args: true,
+                    ..Default::default()
+                },
+            );
+        }
+        assert_eq!(
+            is_valid_inferred_type_with_aliases(&t, false, false, false, &aliases),
+            Some(true)
         );
     }
 
@@ -1935,18 +1998,16 @@ mod tests {
 
     #[test]
     fn valid_inferred_garbage_bytes_defers() {
-        pyo3::prepare_freethreaded_python();
-        Python::with_gil(|_py| {
-            let mut resolver = crate::typeinfo::NativeTypeResolver::new(
-                crate::typeinfo::TypeResolver::default(),
-                crate::aliases::TypeAliasResolver::default(),
-            );
-            assert_eq!(
-                rust_is_valid_inferred_type(b"\xff\xff", false, false, false, &mut resolver)
-                    .unwrap(),
-                None
-            );
-        });
+        // Pure decode-defer: no pyo3 init needed, the pyfunction never
+        // consults Python on an undecodable blob.
+        let mut resolver = crate::typeinfo::NativeTypeResolver::new(
+            crate::typeinfo::TypeResolver::default(),
+            crate::aliases::TypeAliasResolver::default(),
+        );
+        assert_eq!(
+            rust_is_valid_inferred_type(b"\xff\xff", false, false, false, &mut resolver).unwrap(),
+            None
+        );
     }
 
     #[test]
