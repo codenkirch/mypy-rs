@@ -94,6 +94,7 @@ mod freshen;
 mod generators;
 // Phase F0 (#1349): identity service for future graph-owner phases.
 mod identity;
+// Phase F1 (#1370): dual-write shadow storage behind the mirror gate.
 mod infer_variance;
 mod joinfns;
 mod lennarrow;
@@ -105,6 +106,7 @@ mod member_flags;
 mod message_registry;
 mod messages;
 mod messages_find_overlaps;
+mod mirror;
 mod modulefinder;
 mod mro;
 mod operators;
@@ -3354,6 +3356,17 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         checker_functions::rust_classify_find_isinstance_head,
         module
     )?)?;
+
+    // Phase F1 mirror: dual-write shadow storage + assert surface.
+    module.add_function(wrap_pyfunction!(mirror::rust_mirror_register, module)?)?;
+    module.add_function(wrap_pyfunction!(mirror::rust_mirror_update, module)?)?;
+    module.add_function(wrap_pyfunction!(mirror::rust_mirror_expect, module)?)?;
+    module.add_function(wrap_pyfunction!(mirror::rust_mirror_bytes, module)?)?;
+    module.add_function(wrap_pyfunction!(mirror::rust_mirror_family, module)?)?;
+    module.add_function(wrap_pyfunction!(mirror::rust_mirror_parents, module)?)?;
+    module.add_function(wrap_pyfunction!(mirror::rust_mirror_reset, module)?)?;
+    module.add_function(wrap_pyfunction!(mirror::rust_mirror_entry_count, module)?)?;
+    module.add_function(wrap_pyfunction!(mirror::rust_mirror_handle_of, module)?)?;
 
     Ok(())
 }
