@@ -101,7 +101,7 @@ PYTHONPATH, wire cache active) shift those write-path counts to tvar
 590 / callable 87 / instance 12 / union 0 and add splice counters:
 `adopt.instance.cachedsplice` 343,
 `assert_ok.instance/union/callable.cachedsplice`
-341,694/33,197/5,987, plus zero `stale_splice.*` and zero
+341,694/33,197/5,987, plus zero `stale.<fam>.cachedsplice` and zero
 `mismatch.<fam>.cachedsplice`: no spliced serve carried drifted bytes.
 
 | counter class | meaning | result |
@@ -114,7 +114,7 @@ PYTHONPATH, wire cache active) shift those write-path counts to tvar
 | `setattr_noop.*` | attribute writes that changed no wire byte | cache/tuple identity writes |
 | `setattr_gagged.<fam>` | setattr on an object the wire cannot yet bind (bounded retry memo) | 241k callables ("fallback can't be filled out until semanal"), ~7k instances, ~100 tvars |
 | `mismatch.<fam>.write` / `mismatch.<fam>.cachedsplice` | funnel-detected escapes (write serve / splice serve), counted then resynced | see below; `cachedsplice` 0 in every audited corpus |
-| `stale_splice.<fam>` | splice served bytes that drifted from the live type (strict raise; audit pops the cache entry so the next write re-caches) | 0 in every audited corpus |
+| `stale.<fam>.cachedsplice` | splice served bytes that drifted from the live type (strict raise; audit pops the cache entry so the next write re-caches) | 0 in every audited corpus |
 | `unserializable.*` | partial objects the wire cannot serialize (counted, deferred to funnel) | semanal-phase objects only |
 
 Escapes are audit counts, resynced after each, full testcheck at
@@ -154,7 +154,8 @@ kernel-on runs (436 instances at full testcheck).
   is a `mismatch.<fam>.cachedsplice` escape with resync and cascade
   (strict mode raises); a match counts `assert_ok.<fam>.cachedsplice`;
   and when the *spliced* blob itself differs from the live bytes the
-  serve is stale: `stale_splice.<fam>` counts, strict mode raises, and
+  serve is stale: `stale.<fam>.cachedsplice` counts, strict mode
+  raises, and
   audit mode pops the cache entry so the next write re-caches instead
   of serving drifted bytes again. The hook is only installed by
   `types_mirror.activate`, so mirror-off runs pay nothing. Perf note:

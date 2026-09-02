@@ -37,13 +37,7 @@ from collections import deque
 from collections.abc import Iterator
 from typing import Any, Final, cast
 
-from mypy.types import (
-    CallableType,
-    Instance,
-    Type,
-    TypeVarType,
-    UnionType,
-)
+from mypy.types import CallableType, Instance, Type, TypeVarType, UnionType
 
 FAMILY_CLASSES: Final = (Instance, CallableType, TypeVarType, UnionType)
 FAMILY_NAME: Final[dict[type, str]] = {
@@ -331,7 +325,7 @@ def _check_splice(t: Type, blob: bytes) -> None:
         return
     if fresh == blob:
         return
-    key = f"stale_splice.{fam}"
+    key = f"stale.{fam}.cachedsplice"
     _count(key)
     if _audit_mode:
         _note_mismatch(key, _short_stack())
@@ -447,10 +441,7 @@ def activate(*, strict: bool = False, audit: bool = False) -> None:
     _audit_mode = audit
     _ORIG_SETATTR = object.__setattr__
     for cls in FAMILY_CLASSES:
-        saved: dict[str, Any] = {
-            "init": cls.__dict__["__init__"],
-            "write": cls.__dict__["write"],
-        }
+        saved: dict[str, Any] = {"init": cls.__dict__["__init__"], "write": cls.__dict__["write"]}
         _originals[cls] = saved
         cls.__init__ = _make_init_wrapper(saved["init"], FAMILY_NAME[cls])  # type: ignore[method-assign]
         cls.write = _make_write_wrapper(saved["write"], FAMILY_NAME[cls])  # type: ignore[method-assign]
