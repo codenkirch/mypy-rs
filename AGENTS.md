@@ -2602,6 +2602,58 @@ including:
   deliberately not relinked, its recipients are Rust-created fallback
   Instances.
 
+- setops join-kernel alias closure plus the `handle_recursive` gate
+  (wave33, issue #1356). The join seam expands a top-level
+  `TypeAliasType` operand at `join_types` entry: `proper_top`
+  chain-resolves one proper-type step through the alias snapshot
+  (snapshot miss, cycle, or bad shape defers the whole call,
+  mirroring join.py:505 `get_proper_type`). To feed that walk the
+  `TypeResolver` carries a shared alias-snapshot view
+  (`install_aliases` / `aliases`), re-installed by
+  `NativeTypeResolver` at build time and after each alias insert, so
+  engine functions reached with only `&TypeResolver` can expand
+  alias nodes without a second resolver argument. The tuple-vs-tuple
+  join no longer yields `fbNone` when both fallbacks join
+  (vj_fbnone:Ttuple+Ttuple 13 -> 0; rjt_defer 7 -> 1, py_jt_defer
+  7 -> 1, jt:fix:2:2 288 -> 296). `setops` gains an alias-aware
+  step-1 union flatten (`flatten_alias_union_items`, recursive-alias
+  cut in item order; defers on missing snapshot, cycle, or an
+  unsubstitutable shape), gated behind the new 6th `expand_aliases`
+  parameter of `make_simplified_union_expanded`: the only Python
+  caller passing `handle_recursive=False` (`tuple_fallback`,
+  typeops.py:392) defers alias-bearing lists to Python at the
+  Rust-internal call site instead of expanding a recursive alias
+  inside the kernel. That gate is the wave33 parity regression fix:
+  the ungated fallback expanded a recursive tuple alias inside
+  `join_types -> tuple_fallback -> make_simplified_union ->
+  is_subtype`, an msu/is_subtype/tuple_fallback cross-entry loop
+  with no active cut, segfaulting the fine-grained
+  `testRecursiveTupleFallback*` and
+  `testTypeAliasUpdateNonRecursiveToRecursiveCoarse/Fine` cases and
+  the cold self-check (lldb repro script kept at `/tmp/w33_lldb.cmd`).
+  Regression unit tests in setops.rs:
+  `msu_expand_aliases_false_defers_on_alias_item`,
+  `msu_expand_aliases_false_still_flattens_plain_unions`,
+  `tuple_fallback_recursive_alias_tuple_defers`,
+  `msu_alias_flatten_defers_on_union_of_self_regress`. Ground rule:
+  the msu seam boundary keeps the wave32 always-expand shape
+  (`expand_alias_items`) because Python expands non-recursive
+  aliases in both `handle_recursive` modes (types.py:5109 exempts
+  only `t.is_recursive`); the three committed
+  `NativeAliasExpansionSuite` calls caught the first, over-broad
+  draft of the gate. Audit buckets (before -> after3, instrumented
+  cold self-check): vj_fbnone:Ttuple+Ttuple 13 -> 0, rjt_defer 7 ->
+  1, py_jt_defer 7 -> 1, vj_tupdef 2 -> 2, jt:fix:2:2 288 -> 296;
+  the tfn pool re-partitions, tfn_union 107 -> 44 plus new tfn_flat
+  81 / tfn_dedup 96 / tfn_dedupk 43, so the tuple-fallback defers
+  are now named per step-1/step-3 shape instead of one blob.
+  py_jtl_rdefer 35 / py_jtl_nat 22 unchanged. Remaining walls:
+  jl_rec and join_one_variadic, semantics-checked as equivalent to
+  their Python callers, leftover defers stay in Python. Noted, not
+  new and not fixed here: the ast_serialize
+  `serializes_trivial_call_like_existing_binary_contract` failure
+  is a baseline item tracked in #1273.
+
 ## Pull Requests
 
 The default branch on this fork is `main` (not `master`). Always target

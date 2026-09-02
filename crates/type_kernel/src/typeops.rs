@@ -557,10 +557,13 @@ pub(crate) fn rust_make_simplified_union(
     // items_bytes is a LIST_GEN-tagged list of serialized types.
     let mut buf = ReadBuffer::new(items_bytes);
     let items = wire::read_type_list(&mut buf).ok()?;
-    let _ = (line, column, handle_recursive);
+    let _ = (line, column);
     // Step 1 mirror (typeops.py:1057): expand each alias item to its
-    // chain-resolved raw target (flatten_nested_unions parity; arg
-    // substitution skipped); missing snapshot or cycle defers.
+    // chain-resolved raw target; missing snapshot or cycle defers. Python
+    // expands non-recursive aliases under both hr modes (types.py:5109);
+
+    // recursive aliases defer at expand_alias_items' cycle guard, so the
+    // flag only matters for make_simplified_union_expanded's step-1 gate.
     let expanded = expand_alias_items(&items, resolver.alias_resolver())?;
     // Match Python's _remove_redundant_union_items which calls
     // is_proper_subtype, reading state.strict_optional live
@@ -570,12 +573,13 @@ pub(crate) fn rust_make_simplified_union(
     // preserved; strict_optional must flow from the caller so that
     // --no-strict-optional drops NoneType items (None <: T is true then).
     let ctx = SubtypeContext::new(false, false, false, true, true, strict_optional);
-    let result = setops::make_simplified_union(
+    let result = setops::make_simplified_union_expanded(
         &expanded,
         &ctx,
         resolver.resolver(),
         contract_literals,
         keep_erased,
+        handle_recursive,
     )?;
     encode_type(&result)
 }
@@ -1074,6 +1078,7 @@ pub(crate) fn tuple_fallback(typ: &Type, resolver: &TypeResolver) -> Option<Type
     else {
         // Fallback isn't an Instance: defer (Python would crash too in
         // practice, but the wire form can't represent it).
+
         return None;
     };
     if type_ref != "builtins.tuple" {
@@ -1105,6 +1110,7 @@ pub(crate) fn tuple_fallback(typ: &Type, resolver: &TypeResolver) -> Option<Type
                         collected.push(args[0].clone());
                     } else {
                         // Python raises NotImplementedError; defer.
+
                         return None;
                     }
                 } else {
@@ -1114,14 +1120,24 @@ pub(crate) fn tuple_fallback(typ: &Type, resolver: &TypeResolver) -> Option<Type
             _ => collected.push(item.clone()),
         }
     }
-    // make_simplified_union(items, handle_recursive=False). The Rust
-    // make_simplified_union ignores handle_recursive (it always flattens
-    // with recursive=False semantics via flatten_nested_unions), so the
-
-    // behavior matches the Python handle_recursive=False call.
+    // make_simplified_union(items, handle_recursive=False)
+    // (typeops.py:392). expand_aliases=false defers any alias-bearing
+    // list to Python; its step-1 flatten keeps recursive aliases put.
     let ctx = SubtypeContext::new(false, false, false, true, true, true);
-    let union_type = crate::setops::make_simplified_union(&collected, &ctx, resolver, true, false)?;
-    let union_type = get_proper_type_or_none(&union_type)?;
+    let union_type = match crate::setops::make_simplified_union_expanded(
+        &collected, &ctx, resolver, true, false, false,
+    ) {
+        Some(t) => t,
+        None => {
+            return None;
+        }
+    };
+    let union_type = match get_proper_type_or_none(&union_type) {
+        Some(t) => t,
+        None => {
+            return None;
+        }
+    };
     Some(Type::Instance {
         type_ref: type_ref.clone(),
         args: vec![union_type],
