@@ -8958,8 +8958,11 @@ class NativeProtocolImplementationSuite(Suite):
         result = self._seam_call(Instance(i, []), Instance(p, []))
         assert result is False, f"missing member must be False, got {result!r}"
 
-    def test_protocol_left_defers(self) -> None:
-        """Protocol-left (recursion-prone) must defer (None)."""
+    def test_protocol_left_symmetric_pair_decides(self) -> None:
+        """Protocol-left engages (#1344): a symmetric member-set pair
+        with matching member signatures is decided True natively through
+        the same member loop Python runs (trivial check, assuming guard,
+        flags)."""
         from mypy.types import Instance
 
         self._live_info = {}
@@ -8967,7 +8970,7 @@ class NativeProtocolImplementationSuite(Suite):
         p2 = self._protocol("mod.P2", ["f"])
         self._build_resolver()
         result = self._seam_call(Instance(p1, []), Instance(p2, []))
-        assert result is None, f"protocol-left must defer, got {result!r}"
+        assert result is True, f"protocol-left pair must decide natively, got {result!r}"
 
     def test_non_protocol_right_defers(self) -> None:
         """Non-protocol right must defer (None), matching the assert in
@@ -8980,14 +8983,13 @@ class NativeProtocolImplementationSuite(Suite):
         result = self._seam_call(Instance(i, []), Instance(i, []))
         assert result is None, f"non-protocol right must defer, got {result!r}"
 
-    def test_protocol_left_defers_with_member_miss(self) -> None:
-        """Protocol-left defers even when the left member set provably
-        misses a required member of the right protocol. The
-        subtypes.py:1906-1911 fast path (return False on set miss) is
-        intentionally NOT mirrored: deciding the probe False lets the
-        join kernel's via-supertype walk proceed solo, and it diverges
-        from Python under --no-strict-optional
-        (testMeetOfIncompatibleProtocols, #1356)."""
+    def test_protocol_left_subset_miss_decides_false(self) -> None:
+        """Protocol-left member-set miss decides False natively: the
+        subtypes.py:1906-1911 fast path fires only when the LEFT side is
+        a protocol, before the assuming scan. The earlier wholesale
+        defer was pure caution (a naive right-side-only probe diverged
+        under --no-strict-optional, testMeetOfIncompatibleProtocols,
+        #1356)."""
         from mypy.types import Instance
 
         self._live_info = {}
@@ -8997,7 +8999,88 @@ class NativeProtocolImplementationSuite(Suite):
         self._build_resolver()
         left, right = Instance(p1, []), Instance(p2, [])
         result = self._seam_call(left, right)
-        assert result is None, f"member-set-miss pair must still defer, got {result!r}"
+        assert result is False, f"member-set-miss pair must decide False, got {result!r}"
+
+    def test_protocol_left_python_body_agreement(self) -> None:
+        """The new native protocol-left decisions must match the
+        pure-Python `is_protocol_implementation` body on the same
+        fixtures (gate-off Python member loop vs the seam)."""
+        from mypy.subtypes import is_protocol_implementation
+        from mypy.types import Instance
+
+        self._live_info = {}
+        p1 = self._protocol("mod.P1", ["f"])
+        p2 = self._protocol("mod.P2", ["f"])
+        p3 = self._protocol("mod.P3", ["f"])
+        p4 = self._protocol("mod.P4", ["f", "g"])
+        # mismatched-ret pair: left f -> object, right f -> A
+        p5 = self._protocol("mod.P5", ["f"])
+        fnode = p5.names["f"].node
+        assert isinstance(fnode, FuncDef)
+        fnode.type = self._method_with_return(p5, self.fx.o)
+        p6 = self._protocol("mod.P6", ["f"])
+        self._build_resolver()
+        for left, right, expected in [
+            (Instance(p1, []), Instance(p2, []), True),
+            (Instance(p3, []), Instance(p4, []), False),
+            (Instance(p5, []), Instance(p6, []), False),
+        ]:
+            py_result = is_protocol_implementation(left, right)
+            rust_result = self._seam_call(left, right)
+            assert py_result == expected == rust_result, (expected, py_result, rust_result)
+
+    def test_protocol_left_registry_cut(self) -> None:
+        """A pair registered in flight on the Python side cuts the
+        native protocol-left check to True exactly where the `assuming`
+        matrix scan would, even though the member loop itself would
+        decide False (the cut carries Python's coinductive recursion
+        semantics across the defer boundary, #1344)."""
+        from mypy.subtypes import _PROTOCOL_PAIRS_IN_FLIGHT, _serialize_type
+        from mypy.types import Instance
+
+        self._live_info = {}
+        p1 = self._protocol("mod.P1", ["f"])
+        p2 = self._protocol("mod.P2", ["f"])
+        # left f -> object vs right f -> A: the member loop alone says False.
+        fnode = p1.names["f"].node
+        assert isinstance(fnode, FuncDef)
+        fnode.type = self._method_with_return(p1, self.fx.o)
+        self._build_resolver()
+        left, right = Instance(p1, []), Instance(p2, [])
+        key = (_serialize_type(left), _serialize_type(right), False)
+        assert key not in _PROTOCOL_PAIRS_IN_FLIGHT
+        _PROTOCOL_PAIRS_IN_FLIGHT[key] = 1
+        try:
+            result = self._seam_call(left, right)
+        finally:
+            assert _PROTOCOL_PAIRS_IN_FLIGHT[key] == 1, "seam must not touch the registry"
+            del _PROTOCOL_PAIRS_IN_FLIGHT[key]
+        assert result is True, f"in-flight pair must cut True, got {result!r}"
+
+    def test_protocol_left_defers_on_undecidable_member(self) -> None:
+        """Protocol-left still defers when a member fetch cannot decide
+        (here a @staticmethod member, whose analyze_var shape the bind
+        tail cannot mirror; same defer closure as
+        NativeProtocolMemberDeferSuite)."""
+        from mypy.nodes import Block, Decorator, FuncDef, Var
+        from mypy.types import CallableType, Instance
+
+        self._live_info = {}
+        p1 = self._protocol("mod.P1", ["f"])
+        p2 = self._protocol("mod.P2", ["f"])
+        fd = FuncDef("f", [], Block([]))
+        fd.info = p2
+        v = Var("f")
+        v.info = p2
+        v.is_staticmethod = True
+        v.is_initialized_in_class = True
+        v.is_ready = True
+        v.is_inferred = False
+        v.type = CallableType([Instance(p2, [])], [ARG_POS], [None], self.fx.a, self.fx.function)
+        p2.names["f"] = SymbolTableNode(MDEF, Decorator(fd, [], v))
+        self._build_resolver()
+        result = self._seam_call(Instance(p1, []), Instance(p2, []))
+        assert result is None, f"undecidable member fetch must defer, got {result!r}"
 
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
