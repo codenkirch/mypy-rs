@@ -50201,3 +50201,112 @@ class NativeMirrorHiddenParentSuite(Suite):
         delta = self._delta(before)
         assert delta.get("assert_ok.tvar.write") == 1, delta
         assert not any(k.startswith("mismatch.") for k in delta), delta
+
+
+class NativeMirrorReadSuite(Suite):
+    """Unit tests for the Phase F2 (#1393) mirror-read flip at checkexpr.
+
+    `_serialize_type_for_checkexpr` swaps its expensive cache-miss wire walk
+    for `types_mirror.read_fresh_bytes` when the flip is wired in: the read
+    returns the blob from Rust mirror storage, kept fresh by the F1 capture
+    invariant. Gate-off (funnel None / read mode off) keeps the pure-Python
+    wire-cache behavior. Every deferred path returns None and the funnel
+    serializes exactly as before.
+    """
+
+    def setUp(self) -> None:
+        from mypy import types_mirror
+
+        types_mirror.activate(audit=True)
+        types_mirror.reset(clear_counts=True)
+        self._m = types_mirror
+        self.fx = TypeFixture()
+
+    def tearDown(self) -> None:
+        from mypy.checkexpr import _set_native_mirror_read
+
+        _set_native_mirror_read(None)
+        self._m._read_mode = False
+        self._m._strict = False
+        self._m.reset(clear_counts=True)
+
+    def _generic_callable(self) -> CallableType:
+        """A CallableType carrying a TypeVar: the taint check never caches it.
+
+        This is the funnel's heaviest cached-miss block: no builtin fast
+        path, no no-arg encode, always the full taint-checking walk.
+        """
+        return CallableType(
+            [self.fx.o],
+            [ARG_POS],
+            [None],
+            self.fx.o,
+            self.fx.function,
+            name="f",
+            variables=[self.fx.t],
+        )
+
+    def test_read_returns_mirror_bytes_equal_to_fresh(self) -> None:
+        from librt.internal import WriteBuffer
+
+        from mypy.checkexpr import (
+            _serialize_type_for_checkexpr,
+            _set_native_mirror_read,
+        )
+
+        ct = self._generic_callable()
+        ct.write(WriteBuffer())  # adoption funnel registers the tree
+        self._m._read_mode = True
+        _set_native_mirror_read(self._m.read_fresh_bytes)
+        fresh = self._m._fresh_bytes(ct)
+        got = _serialize_type_for_checkexpr(ct)
+        assert got == fresh
+
+    def test_gate_off_keeps_pure_python_behavior(self) -> None:
+        from librt.internal import WriteBuffer
+
+        from mypy.checkexpr import (
+            _serialize_type_for_checkexpr,
+            _set_native_mirror_read,
+        )
+
+        ct = self._generic_callable()
+        ct.write(WriteBuffer())
+        _set_native_mirror_read(None)
+        got = _serialize_type_for_checkexpr(ct)
+        assert got == self._m._fresh_bytes(ct)
+
+    def test_unregistered_object_defers(self) -> None:
+        from mypy.checkexpr import _serialize_type_for_checkexpr, _set_native_mirror_read
+
+        self._m._read_mode = True
+        _set_native_mirror_read(self._m.read_fresh_bytes)
+        ct = self._generic_callable()  # never written: no handle
+        assert self._m.read_fresh_bytes(ct) is None
+        assert _serialize_type_for_checkexpr(ct) == self._m._fresh_bytes(ct)
+
+    def test_captured_mutation_is_served_fresh(self) -> None:
+        from librt.internal import WriteBuffer
+
+        from mypy.checkexpr import (
+            _serialize_type_for_checkexpr,
+            _set_native_mirror_read,
+        )
+
+        ct = self._generic_callable()
+        ct.write(WriteBuffer())
+        self._m._read_mode = True
+        _set_native_mirror_read(self._m.read_fresh_bytes)
+        # A plain setattr goes through the patched __setattr__ (captured):
+        # the blob resyncs, so the read serves fresh bytes. Raw list splices
+        # like arg_types[0] = ... are F1 escapes; batteries guard those.
+        ct.ret_type = self.fx.std_tuple  # captured setattr
+        assert _serialize_type_for_checkexpr(ct) == self._m._fresh_bytes(ct)
+
+    def test_read_mode_off_returns_none(self) -> None:
+        from librt.internal import WriteBuffer
+
+        ct = self._generic_callable()
+        ct.write(WriteBuffer())  # registered tree, but the gate is off
+        self._m._read_mode = False
+        assert self._m.read_fresh_bytes(ct) is None

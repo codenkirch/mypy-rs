@@ -1139,6 +1139,14 @@ class BuildManager:
 
         _set_native_checkexpr_active(self.options.native_type_kernel)
         _set_native_checkexpr_resolver(None)
+        # Phase F2 (#1393): wire the checkexpr funnel's mirror-read flip when
+        # both the mirror and read gates are on. read_fresh_bytes checks the
+        # activation state itself, so an early call defers to the wire cache.
+        if self.options.native_type_mirror and self.options.native_type_mirror_read:
+            from mypy import types_mirror
+            from mypy.checkexpr import _set_native_mirror_read
+
+            _set_native_mirror_read(types_mirror.read_fresh_bytes)
         _set_native_checkcall_active(self.options.native_type_kernel)
         _set_native_checker_active(self.options.native_type_kernel)
         _set_native_checker_types_active(self.options.native_type_kernel)
@@ -1252,6 +1260,7 @@ class BuildManager:
             types_mirror.activate(
                 strict=_os_mirror.environ.get("MYPY_TK_MIRROR") == "1",
                 audit=_os_mirror.environ.get("MYPY_TK_MIRROR_AUDIT") == "1",
+                read=self.options.native_type_mirror_read,
             )
         # Stage 3c/4 production wiring (M8bb): the resolver is built per
         # SCC in `process_stale_scc` (after semantic analysis populates

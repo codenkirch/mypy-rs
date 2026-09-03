@@ -414,6 +414,10 @@ class Options:
         # classes into Rust storage, asserted at wire-serializer seams.
         # Capture-only in F1 (no consumer reads the mirror); default off.
         self.native_type_mirror = False
+        # Phase F2 (#1393): when the mirror is on, kernel wire-seam funnels
+        # read a registered family's blob from mirror storage instead of
+        # re-serializing it (slice 1: checkexpr). Default off until parity.
+        self.native_type_mirror_read = False
         # Some behaviors are changed when using Bazel (https://bazel.build).
         self.bazel = False
         # If True, export inferred types for all expressions as BuildResult.types
