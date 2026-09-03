@@ -230,7 +230,7 @@ fn write_type_list(buf: &mut WriteBuffer, items: &[Type]) -> Result<(), crate::w
 /// Re-encode a modified `Type` (discarding truthiness flags, which the
 /// caller re-applies in Python). `None` when the wire writer cannot encode
 /// the result.
-fn reencode(t: &Type) -> Option<Vec<u8>> {
+fn re_encode(t: &Type) -> Option<Vec<u8>> {
     let mut buf = WriteBuffer::new();
     write_type(&mut buf, t).ok()?;
     Some(buf.into_bytes())
@@ -388,7 +388,7 @@ pub(crate) fn rust_copy_modified(
     if swap_field(&mut typ, field, value_bytes).is_none() {
         return Ok(None);
     }
-    Ok(reencode(&typ))
+    Ok(re_encode(&typ))
 }
 // ---------------------------------------------------------------------------
 // Unit tests

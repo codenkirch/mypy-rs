@@ -69,9 +69,7 @@ class EnvGateSuite(unittest.TestCase):
         for val in ("1", "true", "YES", "on"):
             with (
                 self.subTest(val=val),
-                mock.patch.dict(
-                    os.environ, {"TEST_NATIVE_TYPE_KERNEL": val}, clear=False
-                ),
+                mock.patch.dict(os.environ, {"TEST_NATIVE_TYPE_KERNEL": val}, clear=False),
             ):
                 self.assertTrue(_env_gate("TEST_NATIVE_TYPE_KERNEL"))
 
@@ -102,7 +100,9 @@ class NativeGateOffPropagationSuite(unittest.TestCase):
         import importlib
 
         return {
-            path: bool(getattr(importlib.import_module(path.rsplit(".", 1)[0]), path.rsplit(".", 1)[1]))
+            path: bool(
+                getattr(importlib.import_module(path.rsplit(".", 1)[0]), path.rsplit(".", 1)[1])
+            )
             for path in self._FLAG_MODULES
         }
 

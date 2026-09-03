@@ -1008,9 +1008,7 @@ def activate(*, strict: bool = False, audit: bool = False) -> None:
         cls.write = _make_write_wrapper(saved["write"], FAMILY_NAME[cls])  # type: ignore[method-assign]
         cls.__setattr__ = _mirror_setattr  # type: ignore[method-assign, assignment]
     for cls in TVID_CLASSES:
-        saved_tvid: dict[str, Any] = {
-            "init": cls.__dict__["__init__"],
-        }
+        saved_tvid: dict[str, Any] = {"init": cls.__dict__["__init__"]}
         _originals[cls] = saved_tvid
         cls.__init__ = _make_tvid_init_wrapper(saved_tvid["init"])  # type: ignore[method-assign]
         cls.__setattr__ = _mirror_tvid_setattr  # type: ignore[method-assign, assignment]

@@ -37,6 +37,7 @@ _map_supertype_decode_cache: dict[bytes, Instance] = {}
 def _clear_map_supertype_decode_cache() -> None:
     _map_supertype_decode_cache.clear()
 
+
 try:
     import type_kernel as _type_kernel
     from librt.internal import ReadBuffer as _ReadBuffer, WriteBuffer as _WriteBuffer

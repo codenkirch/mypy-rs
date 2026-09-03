@@ -49963,8 +49963,7 @@ class NativeMirrorTypeAliasFlagSuite(Suite):
         delta = self._delta(before)
         assert delta.get("alias_setattr_equal._is_recursive") == 1, delta
         assert not any(
-            k.startswith(("alias_captured.", "alias_orphan.", "cascade_sync"))
-            for k in delta
+            k.startswith(("alias_captured.", "alias_orphan.", "cascade_sync")) for k in delta
         ), delta
 
     def test_orphan_node_counts_orphan(self) -> None:

@@ -266,9 +266,9 @@ mod mirror_tests {
             reset();
             let obj = fresh(py);
             let h1 = register(obj, "instance", b"abc".to_vec(), vec![]).unwrap();
-            let h2 = register(obj, "instance", b"abd".to_vec(), vec![]).unwrap();
+            let h2 = register(obj, "instance", b"abz".to_vec(), vec![]).unwrap();
             assert_eq!(h1, h2);
-            assert_eq!(entry_bytes(h1), Some(b"abd".to_vec()));
+            assert_eq!(entry_bytes(h1), Some(b"abz".to_vec()));
         });
     }
 

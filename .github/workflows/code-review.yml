@@ -5,6 +5,9 @@ name: AI Code Review
 # check fails on any finding or failed review. No PR file is ever executed.
 
 on:
+  # zizmor: ignore[dangerous-triggers] — never executes PR code: only ocr
+  # diff review of the checked-out head SHA (persist-credentials: false),
+  # gated to same-repo heads and the ENABLE_AI_CODE_REVIEW var.
   pull_request_target:
     branches: [main]
 

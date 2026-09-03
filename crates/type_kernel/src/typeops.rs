@@ -4720,9 +4720,9 @@ mod tests {
         let lit = lit_str("x");
         let inst = plain_instance("builtins.int");
         let union = union_of(vec![lit.clone(), inst.clone()]);
-        let (lits, nonlits) = rust_separate_union_literals(&encode(&union)).unwrap();
-        assert_eq!(lits.len(), 1);
-        assert_eq!(super::decode_type(&lits[0]).unwrap(), lit);
+        let (lit_types, nonlits) = rust_separate_union_literals(&encode(&union)).unwrap();
+        assert_eq!(lit_types.len(), 1);
+        assert_eq!(super::decode_type(&lit_types[0]).unwrap(), lit);
         assert_eq!(nonlits.len(), 1);
         assert_eq!(super::decode_type(&nonlits[0]).unwrap(), inst);
     }
@@ -4732,11 +4732,11 @@ mod tests {
         let a = lit_str("a");
         let b = lit_str("b");
         let union = union_of(vec![a.clone(), b.clone()]);
-        let (lits, nonlits) = rust_separate_union_literals(&encode(&union)).unwrap();
-        assert_eq!(lits.len(), 2);
+        let (lit_types, nonlits) = rust_separate_union_literals(&encode(&union)).unwrap();
+        assert_eq!(lit_types.len(), 2);
         assert_eq!(nonlits.len(), 0);
-        assert_eq!(super::decode_type(&lits[0]).unwrap(), a);
-        assert_eq!(super::decode_type(&lits[1]).unwrap(), b);
+        assert_eq!(super::decode_type(&lit_types[0]).unwrap(), a);
+        assert_eq!(super::decode_type(&lit_types[1]).unwrap(), b);
     }
 
     #[test]
@@ -4744,8 +4744,8 @@ mod tests {
         let s = plain_instance("builtins.str");
         let i = plain_instance("builtins.int");
         let union = union_of(vec![s, i]);
-        let (lits, nonlits) = rust_separate_union_literals(&encode(&union)).unwrap();
-        assert_eq!(lits.len(), 0);
+        let (lit_types, nonlits) = rust_separate_union_literals(&encode(&union)).unwrap();
+        assert_eq!(lit_types.len(), 0);
         assert_eq!(nonlits.len(), 2);
     }
 

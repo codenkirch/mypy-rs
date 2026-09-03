@@ -2744,8 +2744,8 @@ info.mro = [Cls()]
         };
         r.insert("builtins.int".to_string(), snap);
         let inst = make_instance("builtins.int", vec![]);
-        let ans = join_type_list_inner(&[inst.clone(), inst.clone()], true, &r);
-        assert_eq!(ans, Some(inst));
+        let joined = join_type_list_inner(&[inst.clone(), inst.clone()], true, &r);
+        assert_eq!(joined, Some(inst));
     }
 
     #[test]
@@ -2766,8 +2766,8 @@ info.mro = [Cls()]
         }
         let int_t = make_instance("builtins.int", vec![]);
         let obj_t = make_instance("builtins.object", vec![]);
-        let ans = join_type_list_inner(&[int_t, obj_t.clone()], true, &r);
-        assert_eq!(ans, Some(obj_t));
+        let joined = join_type_list_inner(&[int_t, obj_t.clone()], true, &r);
+        assert_eq!(joined, Some(obj_t));
     }
 
     #[test]

@@ -1682,9 +1682,10 @@ class TypeAnalyser(SyntheticTypeVisitor[Type], TypeAnalyzerPluginInterface):
                     and isinstance(var_typ, TypeType)
                     and isinstance(var_typ.item, AnyType)
                 )
-                is_unbound_tvar = isinstance(
-                    node, (TypeVarExpr, TypeVarTupleExpr)
-                ) and self.tvar_scope.get_binding(sym) is None
+                is_unbound_tvar = (
+                    isinstance(node, (TypeVarExpr, TypeVarTupleExpr))
+                    and self.tvar_scope.get_binding(sym) is None
+                )
                 is_new_style = False
                 if is_unbound_tvar and isinstance(node, (TypeVarExpr, TypeVarTupleExpr)):
                     is_new_style = node.is_new_style
@@ -1735,18 +1736,14 @@ class TypeAnalyser(SyntheticTypeVisitor[Type], TypeAnalyzerPluginInterface):
                     if tag == 5:
                         assert isinstance(var_typ, TypeType)
                         assert isinstance(var_typ.item, AnyType)
-                        return AnyType(
-                            TypeOfAny.from_another_any, source_any=var_typ.item
-                        )
+                        return AnyType(TypeOfAny.from_another_any, source_any=var_typ.item)
                     if tag == 3:
                         return t
                     if tag == 4:
                         assert isinstance(node, Var)
                         return LiteralType(
                             value=node.name,
-                            fallback=Instance(
-                                node.info, [], line=t.line, column=t.column
-                            ),
+                            fallback=Instance(node.info, [], line=t.line, column=t.column),
                             line=t.line,
                             column=t.column,
                         )
@@ -1765,11 +1762,7 @@ class TypeAnalyser(SyntheticTypeVisitor[Type], TypeAnalyzerPluginInterface):
                         error_code = codes.VALID_TYPE
                         if tag == 6:
                             short = name.split(".")[-1]
-                            self.fail(
-                                f'Type variable "{name}" is unbound',
-                                t,
-                                code=error_code,
-                            )
+                            self.fail(f'Type variable "{name}" is unbound', t, code=error_code)
                             self.note(
                                 f'(Hint: Use "Generic[{short}]" or '
                                 f'"Protocol[{short}]" base class to bind '
@@ -1792,9 +1785,7 @@ class TypeAnalyser(SyntheticTypeVisitor[Type], TypeAnalyzerPluginInterface):
                             )
                         elif tag == 9:
                             self.fail(
-                                f'Variable "{name}" is not valid as a type',
-                                t,
-                                code=error_code,
+                                f'Variable "{name}" is not valid as a type', t, code=error_code
                             )
                             self.note(
                                 "See https://mypy.readthedocs.io/en/"
@@ -1805,15 +1796,12 @@ class TypeAnalyser(SyntheticTypeVisitor[Type], TypeAnalyzerPluginInterface):
                             )
                         elif tag == 10:
                             self.fail(
-                                f'Function "{name}" is not valid as a type',
-                                t,
-                                code=error_code,
+                                f'Function "{name}" is not valid as a type', t, code=error_code
                             )
                             for note_tag in note_tags:
                                 if note_tag == 1:
                                     self.note(
-                                        'Perhaps you meant "typing.Any" '
-                                        'instead of "any"?',
+                                        'Perhaps you meant "typing.Any" instead of "any"?',
                                         t,
                                         code=error_code,
                                     )
@@ -1826,16 +1814,14 @@ class TypeAnalyser(SyntheticTypeVisitor[Type], TypeAnalyzerPluginInterface):
                                     )
                                 else:
                                     self.note(
-                                        "Perhaps you need \"Callable[...]\" "
+                                        'Perhaps you need "Callable[...]" '
                                         "or a callback protocol?",
                                         t,
                                         code=error_code,
                                     )
                         elif tag == 11:
                             self.fail(
-                                f'Module "{name}" is not valid as a type',
-                                t,
-                                code=error_code,
+                                f'Module "{name}" is not valid as a type', t, code=error_code
                             )
                             self.note(
                                 "Perhaps you meant to use a protocol "

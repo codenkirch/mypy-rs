@@ -26,7 +26,10 @@ repos:
     hooks:
       - id: codespell
         args:
-          - --ignore-words-list=HAX,Nam,ccompiler,ot,statics,whet,zar
+          # alo/ahi/blo/bhi mirror difflib param names; apend is difflib
+          # test data; NotIn is ruff's ast::CmpOp variant; Disjointness is
+          # standard type-theory vocabulary in the planning docs.
+          - --ignore-words-list=HAX,Nam,ccompiler,ot,statics,whet,zar,alo,apend,NotIn,Disjointness
         exclude: ^(mypy/test/|mypy/typeshed/|mypyc/test-data/|test-data/).+$
   - repo: https://github.com/rhysd/actionlint
     rev: v1.7.7
