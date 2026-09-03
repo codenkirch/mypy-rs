@@ -50460,3 +50460,80 @@ class NativeInstanceWriteSuite(Suite):
         delta = self._delta(before)
         assert delta.get("setattr_noop.instance.args") == 1, delta
         self._blob_matches_fresh(inst)
+
+    def test_spliced_type_write_matches_fresh_bytes(self) -> None:
+        from librt.internal import WriteBuffer
+
+        inst = self._list_instance(self.fx.str_type)
+        inst.write(WriteBuffer())  # adoption funnel registers the object
+        self._m._write_flip = True
+        before = dict(self._m.report())
+        inst.type = self.fx.bool_type_info
+        delta = self._delta(before)
+        assert delta.get("setattr_spliced.instance.type") == 1, delta
+        assert not any(k.startswith(("mismatch.", "unserializable.")) for k in delta), delta
+        # The splice only swaps the fallback fullname ref; a full fresh
+        # re-serialize must produce the same bytes.
+        handle = self._m._handle_of(inst)
+        assert handle is not None
+        blob = bytes(self._m._kernel_mod.rust_mirror_bytes(handle))
+        assert blob == self._m._fresh_bytes(inst)
+        # The fallback name changed, so the decoded sanity check greps for
+        # the new class instead of tuple.
+        assert "bool" in _type_kernel.read_type_to_str(blob)
+
+    def test_noop_type_write_counts_noop(self) -> None:
+        from librt.internal import WriteBuffer
+
+        inst = self._list_instance(self.fx.str_type)
+        inst.write(WriteBuffer())
+        self._m._write_flip = True
+        before = dict(self._m.report())
+        inst.type = self.fx.std_tuplei  # same fullname: bytes unchanged
+        delta = self._delta(before)
+        assert delta.get("setattr_noop.instance.type") == 1, delta
+        self._blob_matches_fresh(inst)
+
+    def test_spliced_lkv_write_and_clear_match_fresh(self) -> None:
+        from librt.internal import WriteBuffer
+
+        from mypy.types import LiteralType
+
+        bool_inst = Instance(self.fx.bool_type_info, [])
+        inst = self._list_instance(self.fx.o)
+        inst.write(WriteBuffer())
+        self._m._write_flip = True
+        before = dict(self._m.report())
+        inst.last_known_value = LiteralType(True, bool_inst)
+        delta = self._delta(before)
+        assert delta.get("setattr_spliced.instance.last_known_value") == 1, delta
+        self._blob_matches_fresh(inst)
+        before = dict(self._m.report())
+        inst.last_known_value = None  # the write_type_opt LITERAL_NONE clear
+        delta = self._delta(before)
+        assert delta.get("setattr_spliced.instance.last_known_value") == 1, delta
+        self._blob_matches_fresh(inst)
+
+    def test_gate_off_type_and_lkv_keep_full_capture_path(self) -> None:
+        from librt.internal import WriteBuffer
+
+        from mypy.types import LiteralType
+
+        bool_inst = Instance(self.fx.bool_type_info, [])
+        inst = self._list_instance(self.fx.o)
+        inst.write(WriteBuffer())
+        self._m._write_flip = False
+        before = dict(self._m.report())
+        inst.type = self.fx.bool_type_info
+        delta = self._delta(before)
+        assert delta.get("setattr_captured.instance.type") == 1, delta
+        before = dict(self._m.report())
+        inst.type = self.fx.std_tuplei
+        delta = self._delta(before)
+        assert delta.get("setattr_captured.instance.type") == 1, delta
+        before = dict(self._m.report())
+        inst.last_known_value = LiteralType(True, bool_inst)
+        delta = self._delta(before)
+        assert delta.get("setattr_captured.instance.last_known_value") == 1, delta
+        assert "setattr_spliced.instance.last_known_value" not in delta, delta
+        self._blob_matches_fresh(inst)
