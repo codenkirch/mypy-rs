@@ -351,10 +351,18 @@ pub(crate) fn patch_instance_lkv(handle: u64, lkv_blob: Option<&[u8]>) -> Option
         let mut buf = ReadBuffer::new(&old);
         read_type(&mut buf, None).ok()?
     };
-    let new_lkv = lkv_blob.and_then(|b| {
-        let mut buf = ReadBuffer::new(b);
-        read_type(&mut buf, None).ok().map(Box::new)
-    });
+    // Distinguish the legitimate `None` clear from a failed decode: a
+    // garbage `lkv_blob` must defer (None), not collapse into a noop.
+    let new_lkv = match lkv_blob {
+        None => None,
+        Some(b) => {
+            let mut buf = ReadBuffer::new(b);
+            match read_type(&mut buf, None) {
+                Ok(t) => Some(Box::new(t)),
+                Err(_) => return None,
+            }
+        }
+    };
     let Type::Instance {
         type_ref,
         args,
@@ -725,6 +733,15 @@ mod mirror_tests {
             let blob = w.into_bytes();
             assert_eq!(patch_instance_type(h + 7, "builtins.dict"), None);
             assert_eq!(patch_instance_lkv(h + 7, Some(&blob)), None);
+            // A GOOD stored blob with no lkv plus a garbage lkv payload
+            // must defer, not collapse into the None clear (silent noop
+            // success for a real dropped write).
+            let obj3 = fresh(py);
+            let h3 = register(obj3, "instance", lkv_instance_blob(None), vec![]).unwrap();
+            assert_eq!(patch_instance_lkv(h3, Some(&[9])), None);
+            let obj4 = fresh(py);
+            let h4 = register(obj4, "instance", lkv_instance_blob(None), vec![]).unwrap();
+            assert_eq!(patch_instance_lkv(h4, Some(b"garbage")), None);
         });
     }
 }
