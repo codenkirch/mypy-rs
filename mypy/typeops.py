@@ -325,9 +325,7 @@ def is_recursive_pair(s: Type, t: Type) -> bool:
         if isinstance(s, TypeAliasType) or isinstance(t, TypeAliasType):
             try:
                 result = _type_kernel.rust_is_recursive_pair(
-                    _serialize_type(s),
-                    _serialize_type(t),
-                    _native_typeops_resolver,
+                    _serialize_type(s), _serialize_type(t), _native_typeops_resolver
                 )
                 if result is not None:
                     return result
@@ -672,10 +670,9 @@ def type_object_type_from_function(
                     # identities to the live originals. A resync defer (None)
                     # falls back to the pure-Python body.
                     resynced = resync_var_identities(signature, decoded, [default_ret_seam])
-                    if (
-                        resynced is not None
-                        and isinstance(resynced, FunctionLike)  # type: ignore[misc]
-                    ):
+                    if resynced is not None and isinstance(
+                        resynced, FunctionLike
+                    ):  # type: ignore[misc]
                         fixed = _restamp_composite_definitions(signature, resynced)
                         if fixed is not None:
                             if isinstance(fixed, CallableType):

@@ -974,9 +974,9 @@ fn topsort(
         for item in &ready {
             if let Some(dependents) = rev.get(item) {
                 for dependent in dependents {
-                    let nd = in_degree.get_mut(dependent).unwrap();
-                    *nd -= 1;
-                    if *nd == 0 {
+                    let deg = in_degree.get_mut(dependent).unwrap();
+                    *deg -= 1;
+                    if *deg == 0 {
                         new_ready.insert(dependent.clone());
                     }
                 }
@@ -1523,7 +1523,7 @@ fn solve_constraints_native(
             }
             // Python's `is_subtype` applies `get_proper_type` at entry
             // (subtypes.py:905); mirror it by expanding alias nodes here
-            // instead of defering on every alias-bearing bound/solution.
+            // instead of deferring on every alias-bearing bound/solution.
             if let Some(sol) = &s.1 {
                 let sol = subtypes::expand_aliases(sol, alr, strict_optional).ok_or(())?;
                 let ub_e = subtypes::expand_aliases(&ub, alr, strict_optional).ok_or(())?;

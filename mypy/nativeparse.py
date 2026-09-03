@@ -1722,15 +1722,7 @@ def decode_string_segment(raw: str) -> str:
     escapes keep their backslash, as CPython does.
     """
     out: list[str] = []
-    simple = {
-        "a": "\a",
-        "b": "\b",
-        "f": "\f",
-        "n": "\n",
-        "r": "\r",
-        "t": "\t",
-        "v": "\v",
-    }
+    simple = {"a": "\a", "b": "\b", "f": "\f", "n": "\n", "r": "\r", "t": "\t", "v": "\v"}
     i = 0
     n = len(raw)
     while i < n:
