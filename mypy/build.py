@@ -1261,6 +1261,7 @@ class BuildManager:
                 strict=_os_mirror.environ.get("MYPY_TK_MIRROR") == "1",
                 audit=_os_mirror.environ.get("MYPY_TK_MIRROR_AUDIT") == "1",
                 read=self.options.native_type_mirror_read,
+                instance_write=self.options.native_type_instance_write,
             )
         # Stage 3c/4 production wiring (M8bb): the resolver is built per
         # SCC in `process_stale_scc` (after semantic analysis populates

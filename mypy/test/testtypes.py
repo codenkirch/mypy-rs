@@ -50363,3 +50363,100 @@ class NativeMirrorReadSuite(Suite):
         self._m._read_mode = True
         # Never written: no handle. The funnel serializes exactly as before.
         assert _serialize_type_for_checker(ct) == self._m._fresh_bytes(ct)
+
+
+class NativeInstanceWriteSuite(Suite):
+    """Unit tests for the Phase F3 (#1397) instance-write splice of the mirror.
+
+    With the write flip on, a captured Instance 'args' setattr serializes
+    only the new args list (write_type_list framing) and lets the Rust
+    splice op decode / swap args / re-encode the stored blob, instead of a
+    full Python re-serialize of the root. The stored blob must stay
+    byte-identical to `_fresh_bytes`: the serialization funnels assert that
+    differential after every write, so a drifting splice surfaces at the
+    next funnel. Gate-off keeps the F1 full re-serialize path.
+    """
+
+    def setUp(self) -> None:
+        from mypy import types_mirror
+
+        types_mirror.activate(audit=True)
+        types_mirror.reset(clear_counts=True)
+        self._m = types_mirror
+        self.fx = TypeFixture()
+
+    def tearDown(self) -> None:
+        self._m._write_flip = False
+        self._m._strict = False
+        self._m.reset(clear_counts=True)
+
+    def _list_instance(self, *args: Type, lkv: LiteralType | None = None) -> Instance:
+        return Instance(self.fx.std_tuplei, list(args), last_known_value=lkv)
+
+    def _delta(self, before: dict[str, int]) -> dict[str, int]:
+        after = self._m.report()
+        return {
+            k: v - before.get(k, 0)
+            for k, v in after.items()
+            if v != before.get(k, 0) and "init." not in k
+        }
+
+    def _blob_matches_fresh(self, inst: Instance) -> None:
+        handle = self._m._handle_of(inst)
+        assert handle is not None
+        blob = bytes(self._m._kernel_mod.rust_mirror_bytes(handle))
+        assert blob == self._m._fresh_bytes(inst)
+        # Decoded sanity: the blob still parses and names the right class.
+        assert "tuple" in _type_kernel.read_type_to_str(blob)
+
+    def test_spliced_write_matches_fresh_bytes(self) -> None:
+        from librt.internal import WriteBuffer
+
+        inst = self._list_instance(self.fx.o)
+        inst.write(WriteBuffer())  # adoption funnel registers the object
+        self._m._write_flip = True
+        before = dict(self._m.report())
+        inst.args = (self.fx.str_type, self.fx.anyt)
+        delta = self._delta(before)
+        assert delta.get("setattr_spliced.instance.args") == 1, delta
+        assert not any(k.startswith(("mismatch.", "unserializable.")) for k in delta), delta
+        self._blob_matches_fresh(inst)
+
+    def test_spliced_write_preserves_lkv_bytes(self) -> None:
+        from librt.internal import WriteBuffer
+
+        from mypy.types import LiteralType
+
+        bool_inst = Instance(self.fx.bool_type_info, [])
+        inst = self._list_instance(self.fx.o, lkv=LiteralType(True, bool_inst))
+        inst.write(WriteBuffer())
+        self._m._write_flip = True
+        inst.args = (self.fx.anyt,)
+        # If the splice had dropped or mangled last_known_value, the stored
+        # blob would drift from a full fresh serialization.
+        self._blob_matches_fresh(inst)
+
+    def test_gate_off_keeps_full_capture_path(self) -> None:
+        from librt.internal import WriteBuffer
+
+        inst = self._list_instance(self.fx.o)
+        inst.write(WriteBuffer())
+        self._m._write_flip = False
+        before = dict(self._m.report())
+        inst.args = (self.fx.str_type,)
+        delta = self._delta(before)
+        assert delta.get("setattr_captured.instance.args") == 1, delta
+        assert "setattr_spliced.instance.args" not in delta, delta
+        self._blob_matches_fresh(inst)
+
+    def test_noop_write_counts_noop(self) -> None:
+        from librt.internal import WriteBuffer
+
+        inst = self._list_instance(self.fx.o)
+        inst.write(WriteBuffer())
+        self._m._write_flip = True
+        before = dict(self._m.report())
+        inst.args = (self.fx.o,)  # identical args: the splice round-trips
+        delta = self._delta(before)
+        assert delta.get("setattr_noop.instance.args") == 1, delta
+        self._blob_matches_fresh(inst)
