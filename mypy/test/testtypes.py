@@ -50280,6 +50280,287 @@ class NativeMirrorHiddenParentSuite(Suite):
         assert not any(k.startswith("mismatch.") for k in delta), delta
 
 
+class NativeMirrorWalkIndicesSuite(Suite):
+    """Differential tests for the fused F3 slice-5 tree walk.
+
+    `_walk_indices` fuses the former `_tvids_in` / `_alias_nodes_in` /
+    `_family_embeds` triple into one traversal with a shared `seen`. The
+    fused walk is an intentional per-intent superset: TypeAlias targets
+    and container slots are descended for all three intents where the
+    separate walkers each only descended one of them, and container ids
+    share one seen set. These tests pin that exact contract:
+
+    - alias nodes: fused list equals the old alias walk verbatim.
+    - tvids and family embeds: the old walk's list is a subsequence of
+      the fused list (content superset with pre-order preserved), with
+      the expected extras only at alias-target or previously
+      double-visited container positions.
+
+    Independence caveat: these walk raw object trees offline from the
+    activation machinery (no wrappers), so no family setattr hooks are
+    in play and id() stability holds while the fixtures are referenced
+    by locals.
+    """
+
+    def setUp(self) -> None:
+        from mypy import types_mirror
+
+        self._m = types_mirror
+        self.fx = TypeFixture()
+
+    # Old-style independent walkers, verbatim from the pre-fusion code.
+
+    def _tvids_in_value(self, value: Any, seen: set[int]) -> Iterator[TypeVarId]:
+        if value is None or isinstance(value, (str, bytes, bool, int, float)):
+            return
+        if isinstance(value, TypeVarId):
+            yield value
+            return
+        if isinstance(value, Type):
+            yield from self._tvids_in(value, seen)
+            return
+        if isinstance(value, (list, tuple)):
+            seen.add(id(value))
+            for item in value:
+                yield from self._tvids_in_value(item, seen)
+            return
+        if isinstance(value, dict):
+            seen.add(id(value))
+            for item in value.values():
+                yield from self._tvids_in_value(item, seen)
+            return
+        if type(value).__name__ == "ExtraAttrs":
+            yield from self._tvids_in_value(value.attrs, seen)
+
+    def _tvids_in(self, t: Type, seen: set[int]) -> Iterator[TypeVarId]:
+        if id(t) in seen:
+            return
+        seen.add(id(t))
+        for name in self._m._type_names(type(t)):
+            if name.startswith("_") or name in self._m._SKIP_SLOTS:
+                continue
+            try:
+                value = object.__getattribute__(t, name)
+            except AttributeError:
+                continue
+            yield from self._tvids_in_value(value, seen)
+
+    def _alias_nodes_in_value(self, value: Any, seen: set[int]) -> Iterator[Any]:
+        if value is None or isinstance(value, (str, bytes, bool, int, float)):
+            return
+        if type(value).__name__ == "TypeAlias":
+            if id(value) not in seen:
+                seen.add(id(value))
+                yield value
+                target = getattr(value, "target", None)
+                if target is not None:
+                    yield from self._alias_nodes_in_value(target, seen)
+            return
+        if isinstance(value, Type):
+            yield from self._alias_nodes_in(value, seen)
+            return
+        if isinstance(value, (list, tuple)):
+            seen.add(id(value))
+            for item in value:
+                yield from self._alias_nodes_in_value(item, seen)
+            return
+        if isinstance(value, dict):
+            seen.add(id(value))
+            for item in value.values():
+                yield from self._alias_nodes_in_value(item, seen)
+            return
+        if type(value).__name__ == "ExtraAttrs":
+            yield from self._alias_nodes_in_value(value.attrs, seen)
+
+    def _alias_nodes_in(self, t: Type, seen: set[int]) -> Iterator[Any]:
+        if id(t) in seen:
+            return
+        seen.add(id(t))
+        for name in self._m._type_names(type(t)):
+            if name.startswith("_") or name in self._m._SKIP_SLOTS:
+                continue
+            try:
+                value = object.__getattribute__(t, name)
+            except AttributeError:
+                continue
+            yield from self._alias_nodes_in_value(value, seen)
+
+    def _family_embeds_in_value(self, value: Any, seen: set[int]) -> Iterator[Type]:
+        m = self._m
+        if value is None or isinstance(value, (str, bytes, bool, int, float)):
+            return
+        if isinstance(value, Type):
+            if id(value) not in seen:
+                if type(value) in m.FAMILY_NAME:
+                    yield value
+                yield from self._family_embeds(value, seen)
+            return
+        if isinstance(value, (list, tuple)):
+            for item in value:
+                yield from self._family_embeds_in_value(item, seen)
+            return
+        if isinstance(value, dict):
+            for item in value.values():
+                yield from self._family_embeds_in_value(item, seen)
+            return
+        if type(value).__name__ == "ExtraAttrs":
+            yield from self._family_embeds_in_value(value.attrs, seen)
+
+    def _family_embeds(self, t: Type, seen: set[int]) -> Iterator[Type]:
+        if id(t) in seen:
+            return
+        seen.add(id(t))
+        for name in self._m._type_names(type(t)):
+            if name.startswith("_") or name in self._m._SKIP_SLOTS:
+                continue
+            try:
+                value = object.__getattribute__(t, name)
+            except AttributeError:
+                continue
+            yield from self._family_embeds_in_value(value, seen)
+
+    # Differential helpers.
+
+    def _walk(self, root: Type) -> tuple[list[TypeVarId], list[Any], list[Type]]:
+        return self._m._walk_indices(root)
+
+    @staticmethod
+    def _subseq(old: list[Any], new: list[Any]) -> bool:
+        """True when `old` appears in `new` in order (ids, repetition kept)."""
+        i = 0
+        for item in new:
+            if i < len(old) and id(item) == id(old[i]):
+                i += 1
+        return i == len(old)
+
+    # Fixtures.
+
+    def _hidden_chain(self) -> tuple[Instance, TupleType, TypeVarType]:
+        fallback = Instance(self.fx.std_tuplei, [self.fx.anyt])
+        tup = TupleType([self.fx.a], fallback)
+        tv = TypeVarType("_NT", "m.C._NT", TypeVarId(-1, namespace="m.C.f"), [], tup, self.fx.a)
+        return fallback, tup, tv
+
+    def _extra_attrs_stub(self, attrs: dict[str, Any]) -> Any:
+        class ExtraAttrs:  # matches the duck-typed name check
+            pass
+
+        node = ExtraAttrs()
+        node.__dict__["attrs"] = attrs
+        return node
+
+    def test_alias_list_matches_old_walk_exactly(self) -> None:
+        fallback, _tup, tv = self._hidden_chain()
+        alias = TypeAlias(self.fx.a, "mod.A", "mod", -1, -1)
+        att = TypeAliasType(alias, [tv])
+        t = CallableType(
+            [self.fx.o, att], [ARG_POS, ARG_POS], [None, None], fallback, self.fx.function
+        )
+        old = list(self._alias_nodes_in(t, set()))
+        new = self._walk(t)[1]
+        assert [id(x) for x in old] == [id(x) for x in new], (old, new)
+
+    def test_tvids_are_superset_in_order(self) -> None:
+        fallback, _tup, tv = self._hidden_chain()
+        # A tvid hidden behind a TypeAlias target: the fused walk descends alias
+        # targets for every intent, the old tvids walk did not. The variables
+        # tvar (reached through plain Type descent) is the prefix both report.
+        alias = TypeAlias(tv, "mod.B", "mod", -1, -1)
+        att = TypeAliasType(alias, [])
+        t = CallableType(
+            [self.fx.o, att],
+            [ARG_POS, ARG_POS],
+            [None, None],
+            self.fx.o,
+            self.fx.function,
+            variables=[self.fx.u],
+        )
+        old = list(self._tvids_in(t, set()))
+        new_tvids = self._walk(t)[0]
+        assert self._subseq(old, new_tvids), (old, new_tvids)
+        assert [id(x) for x in old] == [id(self.fx.u.id)], old
+        assert id(tv.id) in {id(x) for x in new_tvids} and len(new_tvids) == len(old) + 1, (
+            old,
+            new_tvids,
+        )
+
+    def test_tvids_inside_alias_target_are_extra_coverage(self) -> None:
+        fallback, _tup, tv = self._hidden_chain()
+        alias = TypeAlias(tv, "mod.C", "mod", -1, -1)
+        t = TypeAliasType(alias, [])
+        old = list(self._tvids_in(t, set()))
+        new_tvids = self._walk(t)[0]
+        # Old walk gives up at the alias node; fused reaches the tvar via
+        # target descent, and rescues the hidden leaf for cascade sync.
+        assert not old, old
+        assert [id(tv.id)] == [id(x) for x in new_tvids], new_tvids
+
+    def test_embeds_match_old_walk_without_alias_targets(self) -> None:
+        fallback, tup, _tv = self._hidden_chain()
+        t = CallableType(
+            [self.fx.o, tup], [ARG_POS, ARG_POS], [None, None], self.fx.o, self.fx.function
+        )
+        old = list(self._family_embeds(t, set()))
+        new_embeds = self._walk(t)[2]
+        # No alias nodes in the tree: the fused walk must match the old
+        # family walk exactly (Type-level dedup subsumes the missing
+        # container seen-set of the old walker).
+        assert id(fallback) in {id(x) for x in old}, old
+        assert [id(x) for x in old] == [id(x) for x in new_embeds], (old, new_embeds)
+
+    def test_recursive_union_cycles_are_cut(self) -> None:
+        u = UnionType([self.fx.a])
+        u.items.append(u)  # cycle back to root
+        old_a = list(self._alias_nodes_in(u, set()))
+        old_t = list(self._tvids_in(u, set()))
+        old_e = list(self._family_embeds(u, set()))
+        new_tvids, new_aliases, new_embeds = self._walk(u)
+        # The aliased family item (fx.a) surfaces identically; the root
+        # cycle back through items cuts identically in all walkers.
+        assert not new_tvids and not new_aliases
+        assert [id(x) for x in old_t] == [id(x) for x in new_tvids], (old_t, new_tvids)
+        assert [id(x) for x in old_a] == [id(x) for x in new_aliases], (old_a, new_aliases)
+        assert [id(x) for x in old_e] == [id(x) for x in new_embeds], (old_e, new_embeds)
+
+    def test_extra_attrs_stub_is_walked(self) -> None:
+        alias = TypeAlias(self.fx.a, "mod.A", "mod", -1, -1)
+        stub = self._extra_attrs_stub({"x": alias})
+        t = CallableType(
+            [self.fx.o, stub], [ARG_POS, ARG_POS], [None, None], self.fx.o, self.fx.function
+        )
+        old = list(self._alias_nodes_in(t, set()))
+        new_aliases = self._walk(t)[1]
+        assert [id(x) for x in old] == [id(x) for x in new_aliases], (old, new_aliases)
+
+    def test_shared_container_aliasing_keeps_order(self) -> None:
+        fallback, _tup, _tv = self._hidden_chain()
+        shared = [fallback]
+        c1 = CallableType([self.fx.o], [ARG_POS], [None], fallback, self.fx.function)
+        # Same list object under two slots of one tree: the old family walk
+        # (no container seen-set) iterated it twice but never duplicated the
+        # family item (Type-level seen dedup); the fused walk must agree.
+        c1.arg_types = shared  # type: ignore[assignment]
+        c1.ret_type = shared[0]
+        old = list(self._family_embeds(c1, set()))
+        new_embeds = self._walk(c1)[2]
+        assert [id(x) for x in old] == [id(x) for x in new_embeds], (old, new_embeds)
+        assert len(old) == 2 and id(old[0]) == id(fallback), old
+
+    def test_hidden_chain_full_differential(self) -> None:
+        fallback, tup, tv = self._hidden_chain()
+        t = CallableType([tv, tup], [ARG_POS, ARG_POS], [None, None], fallback, self.fx.function)
+        old_t = list(self._tvids_in(t, set()))
+        old_a = list(self._alias_nodes_in(t, set()))
+        old_e = list(self._family_embeds(t, set()))
+        new_tvids, new_aliases, new_embeds = self._walk(t)
+        assert self._subseq(old_t, new_tvids) and len(new_tvids) >= len(old_t), (old_t, new_tvids)
+        assert [id(x) for x in old_a] == [id(x) for x in new_aliases], (old_a, new_aliases)
+        assert self._subseq(old_e, new_embeds) and len(new_embeds) >= len(old_e), (
+            old_e,
+            new_embeds,
+        )
+
+
 class NativeMirrorReadSuite(Suite):
     """Unit tests for the Phase F2 (#1393) mirror-read flip at checkexpr.
 

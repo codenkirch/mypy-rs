@@ -326,7 +326,7 @@ def _drain_pending_captures() -> None:
     """
     for key in list(_PENDING_CAPTURE):
         # A re-entrant flush (`_flush_pending_embed` through a cascade's
-        # `_add_hidden_embeds`) may have drained this entry already.
+        # `_apply_hidden_embeds`) may have drained this entry already.
         obj = _PENDING_CAPTURE.pop(key, None)
         if obj is None:
             continue
@@ -437,41 +437,14 @@ def _child_types_in_value(value: Any, site: str) -> Iterator[tuple[str, Type]]:
         yield from _child_types_in_value(value.attrs, f"{site}.attrs")
 
 
-def _tvids_in_value(value: Any, seen: set[int]) -> Iterator[TypeVarId]:
-    """Descend any slot value, yielding every TypeVarId reachable.
-
-    Unlike the child-types walk this descends into every Type (family or
-    not): a TypeVarId can hide inside a ParamSpecType, a TypeVarTupleType
-    fallback, or a plain list of variables, never touching a family slot.
-    `seen` cuts cycles (recursive alias trees) and is per-walk, so id()
-    stability is guaranteed while the root keeps the tree alive.
-    """
-    if value is None or isinstance(value, (str, bytes, bool, int, float)):
-        return
-    if isinstance(value, TypeVarId):
-        yield value
-        return
-    if isinstance(value, Type):
-        yield from _tvids_in(value, seen)
-        return
-    if isinstance(value, (list, tuple)):
-        seen.add(id(value))
-        for item in value:
-            yield from _tvids_in_value(item, seen)
-        return
-    if isinstance(value, dict):
-        seen.add(id(value))
-        for item in value.values():
-            yield from _tvids_in_value(item, seen)
-        return
-    if type(value).__name__ == "ExtraAttrs":
-        yield from _tvids_in_value(value.attrs, seen)
-
-
-def _tvids_in(t: Type, seen: set[int]) -> Iterator[TypeVarId]:
-    if id(t) in seen:
-        return
-    seen.add(id(t))
+def _walk_slots(
+    t: Type,
+    seen: set[int],
+    tvids: list[TypeVarId],
+    aliases: list[Any],
+    embeds: list[Type],
+) -> None:
+    """Slot-scan one Type node once for every reverse index."""
     for name in _type_names(type(t)):
         if name.startswith("_") or name in _SKIP_SLOTS:
             continue
@@ -479,12 +452,79 @@ def _tvids_in(t: Type, seen: set[int]) -> Iterator[TypeVarId]:
             value = object.__getattribute__(t, name)
         except AttributeError:
             continue
-        yield from _tvids_in_value(value, seen)
+        _walk_value(value, seen, tvids, aliases, embeds)
 
 
-def _record_tvid_carriers(root: Type, handle: int) -> None:
-    """Index every TypeVarId reachable from `root` to its carrier handle."""
-    for tvid in _tvids_in(root, set()):
+def _walk_value(
+    value: Any,
+    seen: set[int],
+    tvids: list[TypeVarId],
+    aliases: list[Any],
+    embeds: list[Type],
+) -> None:
+    """Descend a slot value collecting TypeVarIds, TypeAlias nodes, and
+    family Types (the walk root is pre-seeded in `seen`, so it is never
+    a member).
+
+    Fuses the former `_tvids_in` / `_alias_nodes_in` / `_family_embeds`
+    triple: all three descend the same slots of the same Types, so the
+    fused walk pays `_type_names` plus `object.__getattribute__` once per
+    node instead of three times. Container ids and Type nodes share one
+    `seen` set; a node reached by any intent is visited once and
+    collects for all three intents, which covers everything each
+    separate walk visited (each walker's own `seen` already pruned
+    repeat visits within its own pass).
+    """
+    if value is None or isinstance(value, (str, bytes, bool, int, float)):
+        return
+    if isinstance(value, TypeVarId):
+        tvids.append(value)
+        return
+    if isinstance(value, Type):
+        if id(value) not in seen:
+            seen.add(id(value))
+            if type(value) in FAMILY_NAME:
+                embeds.append(value)
+            _walk_slots(value, seen, tvids, aliases, embeds)
+        return
+    if type(value).__name__ == "TypeAlias":
+        if id(value) not in seen:
+            seen.add(id(value))
+            aliases.append(value)
+            target = getattr(value, "target", None)
+            if target is not None:
+                _walk_value(target, seen, tvids, aliases, embeds)
+        return
+    if isinstance(value, (list, tuple)):
+        seen.add(id(value))
+        for item in value:
+            _walk_value(item, seen, tvids, aliases, embeds)
+        return
+    if isinstance(value, dict):
+        seen.add(id(value))
+        for item in value.values():
+            _walk_value(item, seen, tvids, aliases, embeds)
+        return
+    if type(value).__name__ == "ExtraAttrs":
+        _walk_value(value.attrs, seen, tvids, aliases, embeds)
+
+
+def _walk_indices(root: Type) -> tuple[list[TypeVarId], list[Any], list[Type]]:
+    """One traversal yielding every carrier/embed index item from `root`.
+
+    Returns (tvids, alias_nodes, family_embeds_excluding_root), ordered
+    like the separate walks each produced.
+    """
+    tvids: list[TypeVarId] = []
+    aliases: list[Any] = []
+    embeds: list[Type] = []
+    _walk_slots(root, {id(root)}, tvids, aliases, embeds)
+    return tvids, aliases, embeds
+
+
+def _apply_tvid_carriers(tvids: list[TypeVarId], handle: int) -> None:
+    """Index every TypeVarId item under its carrier handle."""
+    for tvid in tvids:
         entry = _TVID_REVERSE.get(id(tvid))
         if entry is None:
             _TVID_REVERSE[id(tvid)] = (tvid, {handle})
@@ -492,60 +532,9 @@ def _record_tvid_carriers(root: Type, handle: int) -> None:
             entry[1].add(handle)
 
 
-def _alias_nodes_in_value(value: Any, seen: set[int]) -> Iterator[Any]:
-    """Descend a slot value, yielding every TypeAlias node reachable.
-
-    TypeAliasType embeds a mypy.nodes.TypeAlias by reference, and the
-    recursion flag TypeAliasType.write reads (`alias._is_recursive`) is a
-    node attribute no family __setattr__ observes. Descend through the
-    node's target too: mutually recursive aliases hang their partners'
-    nodes off the target tree. `seen` cuts cycles (both type trees and
-    target chains are recursive) and is per-walk.
-    """
-    if value is None or isinstance(value, (str, bytes, bool, int, float)):
-        return
-    if type(value).__name__ == "TypeAlias":
-        if id(value) not in seen:
-            seen.add(id(value))
-            yield value
-            target = getattr(value, "target", None)
-            if target is not None:
-                yield from _alias_nodes_in_value(target, seen)
-        return
-    if isinstance(value, Type):
-        yield from _alias_nodes_in(value, seen)
-        return
-    if isinstance(value, (list, tuple)):
-        seen.add(id(value))
-        for item in value:
-            yield from _alias_nodes_in_value(item, seen)
-        return
-    if isinstance(value, dict):
-        seen.add(id(value))
-        for item in value.values():
-            yield from _alias_nodes_in_value(item, seen)
-        return
-    if type(value).__name__ == "ExtraAttrs":
-        yield from _alias_nodes_in_value(value.attrs, seen)
-
-
-def _alias_nodes_in(t: Type, seen: set[int]) -> Iterator[Any]:
-    if id(t) in seen:
-        return
-    seen.add(id(t))
-    for name in _type_names(type(t)):
-        if name.startswith("_") or name in _SKIP_SLOTS:
-            continue
-        try:
-            value = object.__getattribute__(t, name)
-        except AttributeError:
-            continue
-        yield from _alias_nodes_in_value(value, seen)
-
-
-def _record_alias_carriers(root: Type, handle: int) -> None:
-    """Index every TypeAlias node reachable from `root` to its carrier handle."""
-    for alias_node in _alias_nodes_in(root, set()):
+def _apply_alias_carriers(alias_nodes: list[Any], handle: int) -> None:
+    """Index every TypeAlias node item under its carrier handle."""
+    for alias_node in alias_nodes:
         entry = _ALIAS_REVERSE.get(id(alias_node))
         if entry is None:
             _ALIAS_REVERSE[id(alias_node)] = (alias_node, {handle})
@@ -553,45 +542,22 @@ def _record_alias_carriers(root: Type, handle: int) -> None:
             entry[1].add(handle)
 
 
-def _family_embeds(t: Type, seen: set[int]) -> Iterator[Type]:
-    """Yield every family Type reachable from `t` (excluding `t` itself).
+def _apply_hidden_embeds(embeds: list[Type], handle: int) -> None:
+    """Index family-embed items under `handle`, flushing pending captures.
 
-    Unlike `_child_types` this does NOT stop at non-family Types: the
-    chain tvar -> TupleType -> Instance fallback must stay visible so a
-    captured write on the Instance can cascade into the tvar.
+    Flush (not collection) is the side-effectful part; callers sequence
+    it after their own `rust_mirror_update` so the flush's re-entrant
+    cascade sees the same edge state the separate-walk code produced.
     """
-    if id(t) in seen:
-        return
-    seen.add(id(t))
-    for name in _type_names(type(t)):
-        if name.startswith("_") or name in _SKIP_SLOTS:
-            continue
-        try:
-            value = object.__getattribute__(t, name)
-        except AttributeError:
-            continue
-        yield from _family_embeds_in_value(value, seen)
-
-
-def _family_embeds_in_value(value: Any, seen: set[int]) -> Iterator[Type]:
-    if value is None or isinstance(value, (str, bytes, bool, int, float)):
-        return
-    if isinstance(value, Type):
-        if id(value) not in seen:
-            if type(value) in FAMILY_NAME:
-                yield value
-            yield from _family_embeds(value, seen)
-        return
-    if isinstance(value, (list, tuple)):
-        for item in value:
-            yield from _family_embeds_in_value(item, seen)
-        return
-    if isinstance(value, dict):
-        for item in value.values():
-            yield from _family_embeds_in_value(item, seen)
-        return
-    if type(value).__name__ == "ExtraAttrs":
-        yield from _family_embeds_in_value(value.attrs, seen)
+    for embed in embeds:
+        key = id(embed)
+        entry = _HIDDEN_EMBED.get(key)
+        if entry is None:
+            _HIDDEN_EMBED[key] = (embed, {handle})
+            _flush_pending_embed(embed)
+        else:
+            entry[1].add(handle)
+            _flush_pending_embed(embed)
 
 
 # ---- fresh serialization ----
@@ -749,9 +715,10 @@ def _register_tree(t: Type) -> int | None:
     # A later successful adoption clears the failed one: the strike memo is
     # only about "cannot adopt yet", not "never capture writes again".
     _note_successful_adoption(t)
-    _record_tvid_carriers(t, handle)
-    _record_alias_carriers(t, handle)
-    _add_hidden_embeds(t, handle)
+    tvids, aliases, embeds = _walk_indices(t)
+    _apply_tvid_carriers(tvids, handle)
+    _apply_alias_carriers(aliases, handle)
+    _apply_hidden_embeds(embeds, handle)
     _flush_pending_capture(t, handle, fresh)
     if prior_adopters:
         # Late adoption cascade (issue #1385): a container adopted this
@@ -759,28 +726,6 @@ def _register_tree(t: Type) -> int | None:
         # cascade; re-sync its prior adopters now (`""` = no re-index).
         _update_and_cascade(handle, fresh, "")
     return handle  # type: ignore[no-any-return]
-
-
-def _add_hidden_embeds(obj: Type, handle: int) -> None:
-    """Index every family descendant reachable through non-family Types.
-
-    Registered both at `_register_tree` time and after every cascade sync:
-    a captured setattr can replace a subtree (`tv.upper_bound = ...`),
-    whose new chain is invisible to any earlier fill, so containers must
-    be re-indexed whenever their bytes are re-serialized. Which objects
-    get the re-index walk is gated by `replaced_slot` in
-    `_update_and_cascade`; this helper itself always walks the full
-    `_family_embeds` set of the container it is given.
-    """
-    for embed in _family_embeds(obj, set()):
-        key = id(embed)
-        entry = _HIDDEN_EMBED.get(key)
-        if entry is None:
-            _HIDDEN_EMBED[key] = (embed, {handle})
-            _flush_pending_embed(embed)
-        else:
-            entry[1].add(handle)
-            _flush_pending_embed(embed)
 
 
 def _sync_seed_handles(obj: Type) -> Iterator[int]:
@@ -809,7 +754,7 @@ def _update_and_cascade(handle: int, fresh: bytes, replaced_slot: str | None = N
     """
     # A captured family setattr may have swapped an id slot, introducing
     # TypeVarIds no funnel ever adopted; re-index the root when the slot could
-    # carry embeds (`_add_hidden_embeds` keeps replaced subtrees reachable too).
+    # carry embeds (`_apply_hidden_embeds` keeps replaced subtrees reachable).
     skip_all = replaced_slot == ""
     root_reindex = replaced_slot is None or (not skip_all and replaced_slot in _REINDEX_SLOTS)
     stack = list(_kernel_mod.rust_mirror_parents(handle))
@@ -819,10 +764,11 @@ def _update_and_cascade(handle: int, fresh: bytes, replaced_slot: str | None = N
     seen = {handle}
     _kernel_mod.rust_mirror_update(handle, fresh)
     if obj is not None:
-        _record_tvid_carriers(obj, handle)
-        _record_alias_carriers(obj, handle)
+        tvids, aliases, embeds = _walk_indices(obj)
+        _apply_tvid_carriers(tvids, handle)
+        _apply_alias_carriers(aliases, handle)
         if root_reindex:
-            _add_hidden_embeds(obj, handle)
+            _apply_hidden_embeds(embeds, handle)
     while stack:
         ph = stack.pop()
         if ph in seen:
@@ -833,8 +779,9 @@ def _update_and_cascade(handle: int, fresh: bytes, replaced_slot: str | None = N
             _count("cascade_missing_parent")
             continue
         _count("cascade_sync")
-        _record_tvid_carriers(parent, ph)
-        _record_alias_carriers(parent, ph)
+        tvids, aliases, embeds = _walk_indices(parent)
+        _apply_tvid_carriers(tvids, ph)
+        _apply_alias_carriers(aliases, ph)
         try:
             pfresh = _fresh_bytes(parent)
         except Exception:
@@ -842,7 +789,7 @@ def _update_and_cascade(handle: int, fresh: bytes, replaced_slot: str | None = N
             continue
         _kernel_mod.rust_mirror_update(ph, pfresh)
         if replaced_slot is None:
-            _add_hidden_embeds(parent, ph)
+            _apply_hidden_embeds(embeds, ph)
         stack.extend(_kernel_mod.rust_mirror_parents(ph))
         stack.extend(_sync_seed_handles(parent))
 
