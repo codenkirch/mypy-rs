@@ -239,8 +239,15 @@ def _drain_pending_captures() -> None:
     its pended ancestors before its own bytes are judged.
     """
     for key in list(_PENDING_CAPTURE):
-        obj = _PENDING_CAPTURE.pop(key)
-        _PENDING_CAPTURE_Q.remove(key)
+        # A re-entrant flush (`_flush_pending_embed` through a cascade's
+        # `_add_hidden_embeds`) may have drained this entry already.
+        obj = _PENDING_CAPTURE.pop(key, None)
+        if obj is None:
+            continue
+        try:
+            _PENDING_CAPTURE_Q.remove(key)
+        except ValueError:
+            pass
         h = _handle_of(obj)
         try:
             fresh = _fresh_bytes(obj)
