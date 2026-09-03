@@ -94,6 +94,10 @@ _construction: int = 0
 _active = False
 _strict = False
 _audit_mode = False
+# Phase F2 (#1393): when True (and the mirror is active), kernel wire-seam
+# funnels read a registered family object's blob from Rust mirror storage
+# instead of re-serializing the live object.
+_read_mode = False
 _ORIG_SETATTR: Any = None
 # family class -> saved originals (for a future multi-run protocol).
 _originals: dict[type, dict[str, Any]] = {}
@@ -534,6 +538,27 @@ def _fresh_bytes(t: Type) -> bytes:
 
 def _handle_of(t: Any) -> int | None:
     return cast("int | None", _kernel_mod.rust_mirror_handle_of(t))
+
+
+def read_fresh_bytes(t: Type) -> bytes | None:
+    """Phase F2 (#1393): mirror-blob bytes for a registered family Type.
+
+    Kernel wire-seam funnels (slice 1: checkexpr) swap their cache-miss
+    serialization for this read. Returns None (caller serializes as before)
+    when read mode is off, the mirror is not active, or the object was never
+    registered. The blob is kept fresh by the F1 capture invariant: strict
+    mode raises at the mutation funnel on any drift, so a live object leaf
+    other than a captured-mutation lag cannot be served here.
+    """
+    if not _read_mode or not _active or _in_serialize:
+        return None
+    h = _handle_of(t)
+    if h is None:
+        return None
+    blob = _kernel_mod.rust_mirror_bytes(h)
+    if blob is None:
+        return None
+    return bytes(blob)
 
 
 def _register_tree(t: Type) -> int | None:
@@ -987,7 +1012,7 @@ def _mirror_alias_setattr(self: Any, name: str, value: Any) -> None:
             _count(f"alias_cascade_ok.{name}")
 
 
-def activate(*, strict: bool = False, audit: bool = False) -> None:
+def activate(*, strict: bool = False, audit: bool = False, read: bool = False) -> None:
     """Patch family classes to mirror construction/mutation into Rust."""
     global _active, _strict, _audit_mode, _ORIG_SETATTR, _kernel_mod
     if _active:
@@ -1000,6 +1025,10 @@ def activate(*, strict: bool = False, audit: bool = False) -> None:
     _kernel_mod = _km
     _strict = strict
     _audit_mode = audit
+    # read sets the F2 (#1393) seam-read flip; only meaningful while the
+    # mirror captures (kept across reset(), like _active).
+    global _read_mode
+    _read_mode = read
     _ORIG_SETATTR = object.__setattr__
     for cls in FAMILY_CLASSES:
         saved: dict[str, Any] = {"init": cls.__dict__["__init__"], "write": cls.__dict__["write"]}

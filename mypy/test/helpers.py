@@ -470,6 +470,9 @@ def parse_options(
     options.native_type_kernel = _env_gate("TEST_NATIVE_TYPE_KERNEL")
     # Mirror is capture-only; a missing extension degrades to a no-op.
     options.native_type_mirror = _env_gate("TEST_NATIVE_TYPE_MIRROR")
+    # Phase F2 (#1393) read flip is a differential mirror gate: reads only
+    # engage when the capture mirror is on.
+    options.native_type_mirror_read = _env_gate("TEST_NATIVE_TYPE_MIRROR_READ")
     _ensure_native_modules_available()
 
     # Allow custom python version to override testfile_pyversion.

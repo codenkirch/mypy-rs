@@ -624,6 +624,17 @@ _BUILTIN_INSTANCE_BYTES: Final[dict[str, bytes]] = {
     "builtins.object": b"\x50\x57",
 }
 
+# Phase F2 (#1393): types_mirror.read_fresh_bytes when the mirror read flip
+# is enabled, else None (the pure-Python wire cache). Wired from build.py next
+# to the other _set_native_* gates so the hot funnel skips an import lookup.
+_mirror_read_bytes: Callable[[Type], bytes | None] | None = None
+
+
+def _set_native_mirror_read(fn: Callable[[Type], bytes | None] | None) -> None:
+    """Install the F2 mirror-read funnel for _serialize_type_for_checkexpr."""
+    global _mirror_read_bytes
+    _mirror_read_bytes = fn
+
 
 def _serialize_type_for_checkexpr(t: Type) -> bytes:
     if _serialize_stats_on:
@@ -654,6 +665,16 @@ def _serialize_type_for_checkexpr(t: Type) -> bytes:
                 _serialize_stats["bytes"] += len(fast)
             _type_wire_cache[key] = (t, fast)
         return fast
+    # Phase F2 (#1393): on the expensive miss path (anything the encode fast
+    # path rejects: family composites and tvar-tainted types), read the
+    # object's blob from mirror storage when the F2 flip is wired in.
+    read = _mirror_read_bytes
+    if read is not None:
+        blob = read(t)
+        if blob is not None:
+            if _serialize_stats_on:
+                _serialize_stats["mirror"] += 1
+            return blob
     buf = _CheckExprWriteBuffer()
     result, saw_tvar = _serialize_with_taint_check(t, buf)
     if saw_tvar:
