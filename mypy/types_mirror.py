@@ -30,6 +30,15 @@ Design notes (see crates/type_kernel/doc/f1_mirror.md):
   Instance under a TypeVarType's TupleType upper_bound) are closed
   over by `_HIDDEN_EMBED`, so a captured leaf write re-serializes the
   hidden family container too (issue #1372).
+- A TypeAliasType embeds a live ``mypy.nodes.TypeAlias`` node by
+  reference, whose ``_is_recursive`` flag is a wire input no family
+  ``__setattr__`` sees. The flag gets its own capture shim plus a
+  reverse map (alias node -> carriers), mirroring the TypeVarId shim.
+- Mirror serialization is side-effect-free: ``_fresh_bytes`` suppresses
+  the ``is_recursive`` None->bool lazy cache write via
+  ``_REC_CACHE_SUPPRESSED`` and saves/restores its own re-entrancy flag,
+  so a mirror read never flips a live node, and a later live flip still
+  reaches the capture shim exactly once.
 """
 
 from __future__ import annotations
@@ -98,6 +107,9 @@ _mismatch_examples: dict[str, str] = {}
 # `_TVID_REVERSE` pins the tvid (id() stays valid until reset() per build).
 _TVID_CONSTRUCTION: int = 0
 _TVID_REVERSE: dict[int, tuple[TypeVarId, set[int]]] = {}
+# TypeAlias capture state (see the module docstring). `_ALIAS_REVERSE`
+# pins the alias node (id() stays valid until reset() per build).
+_ALIAS_REVERSE: dict[int, tuple[Any, set[int]]] = {}
 # Hidden-parent closure: a family leaf behind a non-family Type (e.g. TupleType
 # upper_bound) has no parents-graph edge, so `_HIDDEN_EMBED[id(leaf)]` -> (leaf,
 # container handles) pins the leaf and supplies ancestors hidden from cascades.
@@ -136,6 +148,17 @@ def _note_failed_adoption(obj: Any) -> None:
         _ADOPT_STRIKE.discard(old)
     _ADOPT_STRIKE.add(key)
     _ADOPT_STRIKE_Q.append(key)
+
+
+def _note_successful_adoption(obj: Any) -> None:
+    key = id(obj)
+    if key in _ADOPT_STRIKE:
+        _ADOPT_STRIKE.discard(key)
+        _ADOPT_STRIKE_Q.remove(key)
+        _count("strike_cleared_on_adopt")
+
+
+# ---- _short_stack: mismatch diagnostics (production audit mode) ----
 
 
 def _short_stack() -> str:
@@ -267,6 +290,67 @@ def _record_tvid_carriers(root: Type, handle: int) -> None:
             entry[1].add(handle)
 
 
+def _alias_nodes_in_value(value: Any, seen: set[int]) -> Iterator[Any]:
+    """Descend a slot value, yielding every TypeAlias node reachable.
+
+    TypeAliasType embeds a mypy.nodes.TypeAlias by reference, and the
+    recursion flag TypeAliasType.write reads (`alias._is_recursive`) is a
+    node attribute no family __setattr__ observes. Descend through the
+    node's target too: mutually recursive aliases hang their partners'
+    nodes off the target tree. `seen` cuts cycles (both type trees and
+    target chains are recursive) and is per-walk.
+    """
+    if value is None or isinstance(value, (str, bytes, bool, int, float)):
+        return
+    if type(value).__name__ == "TypeAlias":
+        if id(value) not in seen:
+            seen.add(id(value))
+            yield value
+            target = getattr(value, "target", None)
+            if target is not None:
+                yield from _alias_nodes_in_value(target, seen)
+        return
+    if isinstance(value, Type):
+        yield from _alias_nodes_in(value, seen)
+        return
+    if isinstance(value, (list, tuple)):
+        seen.add(id(value))
+        for item in value:
+            yield from _alias_nodes_in_value(item, seen)
+        return
+    if isinstance(value, dict):
+        seen.add(id(value))
+        for item in value.values():
+            yield from _alias_nodes_in_value(item, seen)
+        return
+    if type(value).__name__ == "ExtraAttrs":
+        yield from _alias_nodes_in_value(value.attrs, seen)
+
+
+def _alias_nodes_in(t: Type, seen: set[int]) -> Iterator[Any]:
+    if id(t) in seen:
+        return
+    seen.add(id(t))
+    for name in _type_names(type(t)):
+        if name.startswith("_") or name in _SKIP_SLOTS:
+            continue
+        try:
+            value = object.__getattribute__(t, name)
+        except AttributeError:
+            continue
+        yield from _alias_nodes_in_value(value, seen)
+
+
+def _record_alias_carriers(root: Type, handle: int) -> None:
+    """Index every TypeAlias node reachable from `root` to its carrier handle."""
+    for alias_node in _alias_nodes_in(root, set()):
+        entry = _ALIAS_REVERSE.get(id(alias_node))
+        if entry is None:
+            _ALIAS_REVERSE[id(alias_node)] = (alias_node, {handle})
+        else:
+            entry[1].add(handle)
+
+
 def _family_embeds(t: Type, seen: set[int]) -> Iterator[Type]:
     """Yield every family Type reachable from `t` (excluding `t` itself).
 
@@ -313,20 +397,27 @@ def _family_embeds_in_value(value: Any, seen: set[int]) -> Iterator[Type]:
 
 def _fresh_bytes(t: Type) -> bytes:
     """Serialize `t` to fresh bytes with the wire cache disabled."""
-    global _in_serialize
+    global _in_serialize, _REC_CACHE_SUPPRESSED
     from librt.internal import WriteBuffer
 
-    from mypy.types import _set_type_wire_cache_enabled as _set
+    from mypy.types import _REC_CACHE_SUPPRESSED, _set_type_wire_cache_enabled as _set
 
     prev = _wire_cache_enabled()
     _set(False)
+    prev_serialize = _in_serialize
+    prev_cache = _REC_CACHE_SUPPRESSED
     _in_serialize = True
+    # The is_recursive property caches None -> bool on the live node:
+    # inside a mirror serialization that write would flip a node the alias
+    # capture hook treats as observed (stale-byte drift). Value-unchanged.
+    _REC_CACHE_SUPPRESSED = True
     try:
         buf = WriteBuffer()
         t.write(buf)
         return buf.getvalue()
     finally:
-        _in_serialize = False
+        _in_serialize = prev_serialize
+        _REC_CACHE_SUPPRESSED = prev_cache
         _set(prev)
 
 
@@ -362,7 +453,11 @@ def _register_tree(t: Type) -> int | None:
         return None
     handle = _kernel_mod.rust_mirror_register(t, fam, fresh, child_handles)
     _BY_HANDLE[handle] = t
+    # A later successful adoption clears the failed one: the strike memo is
+    # only about "cannot adopt yet", not "never capture writes again".
+    _note_successful_adoption(t)
     _record_tvid_carriers(t, handle)
+    _record_alias_carriers(t, handle)
     _add_hidden_embeds(t, handle)
     return handle  # type: ignore[no-any-return]
 
@@ -423,6 +518,7 @@ def _update_and_cascade(handle: int, fresh: bytes, replaced_slot: str | None = N
     _kernel_mod.rust_mirror_update(handle, fresh)
     if obj is not None:
         _record_tvid_carriers(obj, handle)
+        _record_alias_carriers(obj, handle)
         if root_reindex:
             _add_hidden_embeds(obj, handle)
     while stack:
@@ -436,6 +532,7 @@ def _update_and_cascade(handle: int, fresh: bytes, replaced_slot: str | None = N
             continue
         _count("cascade_sync")
         _record_tvid_carriers(parent, ph)
+        _record_alias_carriers(parent, ph)
         try:
             pfresh = _fresh_bytes(parent)
         except Exception:
@@ -446,6 +543,37 @@ def _update_and_cascade(handle: int, fresh: bytes, replaced_slot: str | None = N
             _add_hidden_embeds(parent, ph)
         stack.extend(_kernel_mod.rust_mirror_parents(ph))
         stack.extend(_sync_seed_handles(parent))
+
+
+def _drift_message(t: Type, fam: str, site: str, handle: int, fresh: bytes) -> str:
+    """Full diagnostic for a strict-mode drift: hex blobs and decoded forms.
+
+    Only called on a real mismatch, so its cost is irrelevant to the
+    funnels' hot paths.
+    """
+    import type_kernel as _k
+
+    old_b = _kernel_mod.rust_mirror_bytes(handle)
+    try:
+        old_s = _k.read_type_to_str(bytes(old_b))[:600]
+    except Exception as err:
+        old_s = f"<decode failed: {err}>"
+    try:
+        new_s = _k.read_type_to_str(fresh)[:600]
+    except Exception as err:
+        new_s = f"<decode failed: {err}>"
+    fields = {
+        k: repr(getattr(t, k))[:300]
+        for k in ("type_ref", "args", "line", "column")
+        if hasattr(t, k)
+    }
+    text = (
+        f"native-type-mirror ({fam}, {site}) drifted\n"
+        f"type={type(t).__name__!r} fields={fields}\n"
+        f"OLDHEX={bytes(old_b).hex()}\nNEWHEX={fresh.hex()}\n"
+        f"OLD={old_s}\nNEW={new_s}"
+    )
+    return text
 
 
 def _assert_fresh(t: Type, site: str) -> None:
@@ -475,7 +603,7 @@ def _assert_fresh(t: Type, site: str) -> None:
     key = f"mismatch.{fam}.{site}"
     _count(key)
     if _strict:
-        raise AssertionError(f"native-type-mirror ({fam}, {site}) pure-Python bytes drifted")
+        raise AssertionError(_drift_message(t, fam, site, h, fresh))
     if _audit_mode:
         _note_mismatch(key, _short_stack())
     _update_and_cascade(h, fresh)
@@ -579,12 +707,17 @@ def _make_init_wrapper(orig_init: Any, family: str) -> Any:
 
 
 def _mirror_setattr(self: Type, name: str, value: Any) -> None:
-    hook = (
-        _rules_ok(self)
-        and _construction == 0
-        and name not in SKIP_ATTRS
-        and id(self) not in _ADOPT_STRIKE
-    )
+    hook = _rules_ok(self) and _construction == 0 and name not in SKIP_ATTRS
+    if hook and id(self) in _ADOPT_STRIKE:
+        # The strike memo is per-object id: a write on an object that has
+        # since become registrable is a real mirror mutation (capture it);
+        # only still-unregistrable objects stay gagged.
+        if _handle_of(self) is not None:
+            _ADOPT_STRIKE.discard(id(self))
+            _ADOPT_STRIKE_Q.remove(id(self))
+            _count("strike_captured_late")
+        else:
+            hook = False
     h = None
     if hook:
         h = _handle_of(self)
@@ -678,6 +811,44 @@ def _mirror_tvid_setattr(self: TypeVarId, name: str, value: Any) -> None:
             _count(f"tvid_cascade_ok.{name}")
 
 
+def _mirror_alias_setattr(self: Any, name: str, value: Any) -> None:
+    # A TypeAlias._is_recursive write is a wire input of embedded TypeAliasType
+    # bytes, so capture at the source and re-sync each registered carrier
+    # through the normal cascade, like the TypeVarId shim above.
+    hook = _active and not _in_serialize and _construction == 0 and name == "_is_recursive"
+    old = getattr(self, name, None)
+    _ORIG_SETATTR(self, name, value)
+    if not hook:
+        return
+    if old == value:
+        _count(f"alias_setattr_equal.{name}")
+        return
+    entry = _ALIAS_REVERSE.get(id(self))
+    if entry is None or entry[0] is not self:
+        # The node was never reachable from a registered tree at any
+        # adoption point; its carriers will surface at their funnels.
+        _count(f"alias_orphan.{name}")
+        return
+    _count(f"alias_captured.{name}")
+    for h in entry[1]:
+        obj = _BY_HANDLE.get(h)
+        if obj is None:
+            _count("cascade_missing_parent")
+            continue
+        fam = FAMILY_NAME[type(obj)]
+        try:
+            fresh = _fresh_bytes(obj)
+        except Exception:
+            _count(f"unserializable.{fam}.alias:{name}")
+            continue
+        if not _mirror_expect_ok(h, fresh):
+            # No slot replacement on the node itself, so neither the root
+            # nor any parent needs the hidden-embed re-index.
+            _update_and_cascade(h, fresh, "")
+        else:
+            _count(f"alias_cascade_ok.{name}")
+
+
 def activate(*, strict: bool = False, audit: bool = False) -> None:
     """Patch family classes to mirror construction/mutation into Rust."""
     global _active, _strict, _audit_mode, _ORIG_SETATTR, _kernel_mod
@@ -705,6 +876,11 @@ def activate(*, strict: bool = False, audit: bool = False) -> None:
         _originals[cls] = saved_tvid
         cls.__init__ = _make_tvid_init_wrapper(saved_tvid["init"])  # type: ignore[method-assign]
         cls.__setattr__ = _mirror_tvid_setattr  # type: ignore[method-assign, assignment]
+    # The alias shim rides on the same saved __setattr__ (object.__setattr__)
+    # as the family/tvid classes; nodes classes do not define __setattr__.
+    import mypy.nodes as _nodes_mod
+
+    _nodes_mod.TypeAlias.__setattr__ = _mirror_alias_setattr  # type: ignore[method-assign]
     _active = True
     _count("activate")
     # Wire-cache splice funnel (see _check_splice): the splice path in
@@ -747,6 +923,7 @@ def reset(*, clear_counts: bool = False) -> None:
     _ADOPT_STRIKE.clear()
     _ADOPT_STRIKE_Q.clear()
     _TVID_REVERSE.clear()
+    _ALIAS_REVERSE.clear()
     _HIDDEN_EMBED.clear()
     if clear_counts:
         _audit.clear()
