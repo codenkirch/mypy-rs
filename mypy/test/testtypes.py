@@ -50190,8 +50190,10 @@ class NativeMirrorHiddenParentSuite(Suite):
         # is suspended (e.g. an in-place rewrite during serialization), so no
         # setattr lands in the mirror and the stored tvar blob drifts.
         self._m._in_serialize = True
-        fallback.args = (UnionType([self.fx.a, self.fx.std_tuple]),)
-        self._m._in_serialize = False
+        try:
+            fallback.args = (UnionType([self.fx.a, self.fx.std_tuple]),)
+        finally:
+            self._m._in_serialize = False
         # The leaf first registers here; late adoption must re-sync the tvar.
         fallback.write(WriteBuffer())
         before = dict(self._m.report())
