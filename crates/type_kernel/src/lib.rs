@@ -3367,6 +3367,11 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(mirror::rust_mirror_reset, module)?)?;
     module.add_function(wrap_pyfunction!(mirror::rust_mirror_entry_count, module)?)?;
     module.add_function(wrap_pyfunction!(mirror::rust_mirror_handle_of, module)?)?;
+    // Phase F3 write flip (#1397): field-granular splice into mirror storage.
+    module.add_function(wrap_pyfunction!(
+        mirror::rust_mirror_patch_instance_args,
+        module
+    )?)?;
 
     Ok(())
 }

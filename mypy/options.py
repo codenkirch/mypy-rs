@@ -418,6 +418,10 @@ class Options:
         # read a registered family's blob from mirror storage instead of
         # re-serializing it (slice 1: checkexpr). Default off until parity.
         self.native_type_mirror_read = False
+        # Phase F3 (#1397): when the mirror is on, a captured Instance 'args'
+        # write is pushed into the stored blob by the Rust splice op instead
+        # of a full Python re-serialize. Default off until parity.
+        self.native_type_instance_write = False
         # Some behaviors are changed when using Bazel (https://bazel.build).
         self.bazel = False
         # If True, export inferred types for all expressions as BuildResult.types

@@ -14,6 +14,8 @@ def _init(self: Options, *args: Any, **kwargs: Any) -> None:
     # both come from the environment so an audit/strict run picks the
     # mode without repository changes.
     self.native_type_mirror_read = os.environ.get("FORCE_NATIVE_TYPE_MIRROR_READ") == "1"
+    # Phase F3 (#1397) write flip tracks the mirror switch on this runner.
+    self.native_type_instance_write = os.environ.get("FORCE_NATIVE_TYPE_INSTANCE_WRITE") == "1"
 
 
 Options.__init__ = _init  # type: ignore[method-assign]

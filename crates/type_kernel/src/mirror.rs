@@ -20,6 +20,9 @@ use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 
 use crate::identity;
+use crate::wire::{
+    ReadBuffer, Type, WriteBuffer, read_type, read_type_list, write_type, write_type_list,
+};
 
 pub(crate) struct MirrorEntry {
     pub(crate) family: String,
@@ -247,6 +250,50 @@ pub(crate) fn rust_mirror_handle_of(obj: &PyAny) -> Option<u64> {
     identity::handle_of(obj)
 }
 
+/// Splice `Instance.args` into the stored blob (F3 slice 1, #1397): decode
+/// the stored blob into the F0 `Type` enum, swap in the `write_type_list`
+/// arg list from `args_blob`, re-encode, and store the result.
+///
+/// Returns the new full blob for the parent cascade; `None` defers
+/// (unregistered handle, undecodable blob, or non-Instance stored family).
+pub(crate) fn patch_instance_args(handle: u64, args_blob: &[u8]) -> Option<Vec<u8>> {
+    let old = entry_bytes(handle)?;
+    let stored = {
+        let mut buf = ReadBuffer::new(&old);
+        read_type(&mut buf, None).ok()?
+    };
+    let new_args = {
+        let mut buf = ReadBuffer::new(args_blob);
+        read_type_list(&mut buf).ok()?
+    };
+    let Type::Instance {
+        type_ref,
+        last_known_value,
+        extra_attrs,
+        ..
+    } = stored
+    else {
+        return None;
+    };
+    let patched = Type::Instance {
+        type_ref,
+        args: new_args,
+        last_known_value,
+        extra_attrs,
+    };
+    let mut wbuf = WriteBuffer::new();
+    write_type(&mut wbuf, &patched).ok()?;
+    let blob = wbuf.into_bytes();
+    update(handle, blob.clone()).ok()?;
+    Some(blob)
+}
+
+#[pyfunction]
+#[pyo3(signature = (handle, args_blob))]
+pub(crate) fn rust_mirror_patch_instance_args(handle: u64, args_blob: &[u8]) -> Option<Vec<u8>> {
+    patch_instance_args(handle, args_blob)
+}
+
 #[cfg(test)]
 mod mirror_tests {
     use super::*;
@@ -367,5 +414,71 @@ mod mirror_tests {
     fn test_diff_description_length_change() {
         let d = diff_description(b"prefix", b"prefixlong");
         assert!(d.contains("lens 6 vs 10"), "bad: {}", d);
+    }
+
+    #[test]
+    fn test_patch_instance_args_roundtrip() {
+        with_py(|py| {
+            reset();
+            let obj = fresh(py);
+            let inst = |arg: Type| Type::Instance {
+                type_ref: "builtins.list".to_string(),
+                args: vec![arg],
+                last_known_value: None,
+                extra_attrs: None,
+            };
+            let mut w = WriteBuffer::new();
+            write_type(&mut w, &inst(Type::NoneType)).unwrap();
+            let h = register(obj, "instance", w.into_bytes(), vec![]).unwrap();
+
+            let mut ab = WriteBuffer::new();
+            write_type_list(&mut ab, &[Type::AnyType { type_of_any: 2, source_any: None, missing_import_name: None }]).unwrap();
+            let new = patch_instance_args(h, &ab.into_bytes()).unwrap();
+
+            let mut rbuf = ReadBuffer::new(&new);
+            if let Type::Instance { args, .. } = read_type(&mut rbuf, None).unwrap() {
+                assert!(matches!(args[0], Type::AnyType { .. }));
+                assert_eq!(args.len(), 1);
+            } else {
+                panic!("not an Instance after patch");
+            }
+        });
+    }
+
+    #[test]
+    fn test_patch_instance_args_defers_on_non_instance() {
+        with_py(|py| {
+            reset();
+            let obj = fresh(py);
+            let tvar = Type::TypeVarType {
+                name: "T".to_string(),
+                fullname: "T".to_string(),
+                raw_id: 0,
+                namespace: "".to_string(),
+                values: vec![],
+                upper_bound: Box::new(Type::NoneType),
+                default: Box::new(Type::NoneType),
+                variance: 0,
+                meta_level: 0,
+            };
+            let mut w = WriteBuffer::new();
+            write_type(&mut w, &tvar).unwrap();
+            let h = register(obj, "tvar", w.into_bytes(), vec![]).unwrap();
+            let mut ab = WriteBuffer::new();
+            write_type_list(&mut ab, &[]).unwrap();
+            assert_eq!(patch_instance_args(h, &ab.into_bytes()), None);
+        });
+    }
+
+    #[test]
+    fn test_patch_instance_args_defers_on_bad_blob() {
+        with_py(|py| {
+            reset();
+            let obj = fresh(py);
+            let h = register(obj, "instance", b"garbage".to_vec(), vec![]).unwrap();
+            assert_eq!(patch_instance_args(h, &[9]), None);
+            // Unregistered handle also defers.
+            assert_eq!(patch_instance_args(h + 1, &[9]), None);
+        });
     }
 }

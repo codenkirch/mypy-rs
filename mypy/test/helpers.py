@@ -473,6 +473,9 @@ def parse_options(
     # Phase F2 (#1393) read flip is a differential mirror gate: reads only
     # engage when the capture mirror is on.
     options.native_type_mirror_read = _env_gate("TEST_NATIVE_TYPE_MIRROR_READ")
+    # Phase F3 (#1397) write flip is a differential mirror gate: splices
+    # only engage when the capture mirror is on.
+    options.native_type_instance_write = _env_gate("TEST_NATIVE_TYPE_INSTANCE_WRITE")
     _ensure_native_modules_available()
 
     # Allow custom python version to override testfile_pyversion.

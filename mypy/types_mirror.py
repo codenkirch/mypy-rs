@@ -53,7 +53,7 @@ import json
 import os
 import sys
 from collections import deque
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from typing import Any, Final, cast
 
 from mypy.types import CallableType, Instance, Type, TypeVarId, TypeVarType, UnionType
@@ -98,6 +98,10 @@ _audit_mode = False
 # funnels read a registered family object's blob from Rust mirror storage
 # instead of re-serializing the live object.
 _read_mode = False
+# Phase F3 (#1397): an Instance 'args' write captured by _mirror_setattr is
+# pushed into the stored blob by the Rust splice op instead of a full
+# re-serialize; a splice that drifts surfaces at the next serial funnel.
+_write_flip = False
 _ORIG_SETATTR: Any = None
 # family class -> saved originals (for a future multi-run protocol).
 _originals: dict[type, dict[str, Any]] = {}
@@ -518,15 +522,46 @@ def _fresh_bytes(t: Type) -> bytes:
     prev_serialize = _in_serialize
     prev_cache = _types_mod._REC_CACHE_SUPPRESSED
     _in_serialize = True
-    # The is_recursive property caches None -> bool on the live node:
-    # inside a mirror serialization that write would flip a node the alias
-    # capture hook treats as observed (stale-byte drift). Value-unchanged.
-    # Write through the module object: a here-imported value copy is inert.
+    # The is_recursive property caches None -> bool on the live node: inside a
+    # mirror serialization that write would flip a node the alias capture hook
+    # treats as observed (stale-byte drift). Value-unchanged, module-object write.
     _types_mod._REC_CACHE_SUPPRESSED = True
     try:
         buf = WriteBuffer()
         t.write(buf)
         return buf.getvalue()
+    finally:
+        _in_serialize = prev_serialize
+        _types_mod._REC_CACHE_SUPPRESSED = prev_cache
+        _set(prev)
+
+
+def _args_list_bytes(args: Sequence[Type]) -> bytes | None:
+    """Serialize only an Instance args tuple as `write_type_list` bytes.
+
+    Same suppression trio as `_fresh_bytes` (wire cache off, re-entrancy and
+    recursive-alias-cache guards), so each item's `write` is side-effect-free
+    and never re-enters the mirror. Returns None when an item cannot
+    serialize yet; the splice then defers to the full fresh path.
+    """
+    global _in_serialize
+    from librt.internal import WriteBuffer
+
+    import mypy.types as _types_mod
+    from mypy.types import _set_type_wire_cache_enabled as _set, write_type_list
+
+    prev = _wire_cache_enabled()
+    _set(False)
+    prev_serialize = _in_serialize
+    prev_cache = _types_mod._REC_CACHE_SUPPRESSED
+    _in_serialize = True
+    _types_mod._REC_CACHE_SUPPRESSED = True
+    try:
+        buf = WriteBuffer()
+        write_type_list(buf, args)
+        return buf.getvalue()
+    except Exception:
+        return None
     finally:
         _in_serialize = prev_serialize
         _types_mod._REC_CACHE_SUPPRESSED = prev_cache
@@ -901,6 +936,25 @@ def _mirror_setattr(self: Type, name: str, value: Any) -> None:
     if h is None:
         _count("post_setattr_unregistered." + fam)
         return
+    if _write_flip and type(self) is Instance and name == "args":
+        # F3 slice 1 (#1397): push the new args into the stored blob via the
+        # Rust splice op (decode + swap args + re-encode) instead of Python
+        # re-serialization. A None defers to the full fresh path.
+        hidden_stored = _kernel_mod.rust_mirror_bytes(h)
+        args_blob = _args_list_bytes(self.args)
+        if args_blob is not None:
+            new_blob = _kernel_mod.rust_mirror_patch_instance_args(h, args_blob)
+        else:
+            new_blob = None
+        if new_blob is not None:
+            new_bytes = bytes(new_blob)
+            if new_bytes == bytes(hidden_stored or b""):
+                _count(f"setattr_noop.{fam}.{name}")
+            else:
+                _count(f"setattr_spliced.{fam}.{name}")
+                _update_and_cascade(h, new_bytes, name)
+            return
+        _count(f"setattr_splice_defer.{fam}.{name}")
     try:
         fresh = _fresh_bytes(self)
     except Exception:
@@ -1012,7 +1066,9 @@ def _mirror_alias_setattr(self: Any, name: str, value: Any) -> None:
             _count(f"alias_cascade_ok.{name}")
 
 
-def activate(*, strict: bool = False, audit: bool = False, read: bool = False) -> None:
+def activate(
+    *, strict: bool = False, audit: bool = False, read: bool = False, instance_write: bool = False
+) -> None:
     """Patch family classes to mirror construction/mutation into Rust."""
     global _active, _strict, _audit_mode, _ORIG_SETATTR, _kernel_mod
     if _active:
@@ -1029,6 +1085,8 @@ def activate(*, strict: bool = False, audit: bool = False, read: bool = False) -
     # mirror captures (kept across reset(), like _active).
     global _read_mode
     _read_mode = read
+    global _write_flip
+    _write_flip = instance_write
     _ORIG_SETATTR = object.__setattr__
     for cls in FAMILY_CLASSES:
         saved: dict[str, Any] = {"init": cls.__dict__["__init__"], "write": cls.__dict__["write"]}
