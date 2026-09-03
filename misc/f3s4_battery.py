@@ -22,8 +22,13 @@ Options.__init__ = _init  # type: ignore[method-assign]
 import mypy.types_mirror
 from mypy.main import main
 
+# clean_exit disables fast_exit so main() raises SystemExit instead of
+# hard-killing the process before the report tail can run.
 t0 = time.perf_counter()
-main()
+try:
+    main(clean_exit=True)
+except SystemExit:
+    pass
 elapsed = time.perf_counter() - t0
 
 main_proc = sorted(mypy.types_mirror.report().items(), key=lambda kv: -kv[1])[:12]
