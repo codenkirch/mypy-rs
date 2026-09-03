@@ -141,9 +141,10 @@ read.
 ## Audit table (cold self-check + parity suites, audit mode)
 
 `TEST_NATIVE_TYPE_MIRROR=1 MYPY_TK_MIRROR_AUDIT=1` runs (see the state
-report): testtypes (unit suites), testcheck (8198 passed), counters
-aggregated across 4 pytest workers. A cold (`--cache-dir` fresh from
-empty) self-check through `misc/wf1_selfcheck_mirror.py` completes with
+report): testtypes (unit suites), testcheck (8144 tests on 6f5e804c6),
+counters aggregated across 4 pytest workers. A cold (`--cache-dir`
+fresh from empty) self-check through `misc/wf1_selfcheck_mirror.py`
+completes with
 0 errors in 347 files and non-zero counters (2.53M instance / 886k
 callable / 422k tvar / 280k union inits), with funnel escapes in the
 same in-place-drift class as the table below (tvar 588, callable 135,
@@ -225,10 +226,10 @@ eager cascade). Residual, self-healing at the funnels, counted above:
 - `instance` 2: uncaptured in-place mutation during stale-SCC
   incremental cache building in `testSelfRefNTIncremental1/2`
   (self-referential NamedTuple fallback whose union/args lists are
-  spliced below any capture path), pre-existing since the F0 mirror
-  (#1370 strict-mode verified). Strict mode raises on it, which is
-  faithful to the F1 contract; those two parity tests are the known
-  strict-mode failures.
+  spliced below any capture path), pre-existing since the F0 mirror.
+  Strict mode raises on it, which is faithful to the F1 contract; see
+  the fresh-main re-validation section for the post-#1389 strict
+  state.
 - Non-mismatch counters (`tvid_captured.meta_level` ~67 per testcheck)
   are the capture working as designed.
 
@@ -238,6 +239,42 @@ capture + unconditional (blind) re-index 188s; slot-gated re-index
 gate is sound because a same-slot subtree replacement cannot hide a
 previously visible chain in an ancestor (see the `replaced_slot`
 contract on `_update_and_cascade`).
+
+## Fresh-main re-validation (6f5e804c6, post-#1389)
+
+Full re-run on a clean checkout carrying #1386 (hidden-parent
+closure), #1388 (TypeAlias `_is_recursive` fix) and #1389 (lint
+resync), with the type-kernel extension rebuilt from that same commit.
+Every contract corpus passes under strict mode
+(`TEST_NATIVE_TYPE_MIRROR=1 MYPY_TK_MIRROR=1`, audit off, so any
+funnel divergence raises):
+
+| corpus | result |
+| ------ | ------ |
+| testtypes | 3,086 passed, 6 skipped |
+| testcheck | 8,144 passed, 69 skipped, 7 xfailed in 397 s, zero strict raises |
+| finegrained + cache + daemon | 1,333 passed, 256 skipped in 150 s |
+| cold self-check (audit mode) | 0 errors in 347 files |
+
+The two `testSelfRefNTIncremental` strict-mode failures recorded in the
+table above no longer reproduce: a full strict testcheck run and a
+`-k SelfRefNTIncremental` isolation probe (which also passes) raised
+nothing. Audit-mode escape counts on this build vary between runs of
+the same corpus (62 mismatches in one testcheck battery, 11 in
+another: instance 5, tvar 5, union 1, callable 0; all resynced,
+recorded in the `f1-tc2-{pid}` dumps), which points at
+timing-dependent escape surfacing (which funnel sees a given in-place
+drift first) rather than a deterministic capture hole. Zero
+`mismatch.<fam>.cachedsplice`, zero `stale.<fam>.cachedsplice` and
+zero `cascade_failed.*` in every corpus on this build.
+
+`pending_capture_still_unserializable` (the #1385 drain retry
+counter) reads in the tens of millions over a full testcheck battery,
+concentrated in the workers that run the build-heaviest shards: a
+pending partial is retried by `_drain_pending_captures` at every
+funnel call while it stays unserializable, so the counter measures
+retry volume, not divergence. The `mismatch.*` counters above are the
+equivalence checks.
 
 ## Explicitly not captured in F1
 
