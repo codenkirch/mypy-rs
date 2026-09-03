@@ -50223,7 +50223,7 @@ class NativeMirrorReadSuite(Suite):
         self.fx = TypeFixture()
 
     def tearDown(self) -> None:
-        from mypy.checkexpr import _set_native_mirror_read
+        from mypy.types import _set_native_mirror_read
 
         _set_native_mirror_read(None)
         self._m._read_mode = False
@@ -50249,10 +50249,8 @@ class NativeMirrorReadSuite(Suite):
     def test_read_returns_mirror_bytes_equal_to_fresh(self) -> None:
         from librt.internal import WriteBuffer
 
-        from mypy.checkexpr import (
-            _serialize_type_for_checkexpr,
-            _set_native_mirror_read,
-        )
+        from mypy.checkexpr import _serialize_type_for_checkexpr
+        from mypy.types import _set_native_mirror_read
 
         ct = self._generic_callable()
         ct.write(WriteBuffer())  # adoption funnel registers the tree
@@ -50265,10 +50263,8 @@ class NativeMirrorReadSuite(Suite):
     def test_gate_off_keeps_pure_python_behavior(self) -> None:
         from librt.internal import WriteBuffer
 
-        from mypy.checkexpr import (
-            _serialize_type_for_checkexpr,
-            _set_native_mirror_read,
-        )
+        from mypy.checkexpr import _serialize_type_for_checkexpr
+        from mypy.types import _set_native_mirror_read
 
         ct = self._generic_callable()
         ct.write(WriteBuffer())
@@ -50277,7 +50273,8 @@ class NativeMirrorReadSuite(Suite):
         assert got == self._m._fresh_bytes(ct)
 
     def test_unregistered_object_defers(self) -> None:
-        from mypy.checkexpr import _serialize_type_for_checkexpr, _set_native_mirror_read
+        from mypy.checkexpr import _serialize_type_for_checkexpr
+        from mypy.types import _set_native_mirror_read
 
         self._m._read_mode = True
         _set_native_mirror_read(self._m.read_fresh_bytes)
@@ -50288,10 +50285,8 @@ class NativeMirrorReadSuite(Suite):
     def test_captured_mutation_is_served_fresh(self) -> None:
         from librt.internal import WriteBuffer
 
-        from mypy.checkexpr import (
-            _serialize_type_for_checkexpr,
-            _set_native_mirror_read,
-        )
+        from mypy.checkexpr import _serialize_type_for_checkexpr
+        from mypy.types import _set_native_mirror_read
 
         ct = self._generic_callable()
         ct.write(WriteBuffer())
@@ -50310,3 +50305,25 @@ class NativeMirrorReadSuite(Suite):
         ct.write(WriteBuffer())  # registered tree, but the gate is off
         self._m._read_mode = False
         assert self._m.read_fresh_bytes(ct) is None
+
+    def test_checkmember_seam_reads_mirror_bytes(self) -> None:
+        from librt.internal import WriteBuffer
+
+        from mypy.checkmember import _serialize_type_for_checkmember
+        from mypy.types import _set_native_mirror_read
+
+        ct = self._generic_callable()
+        ct.write(WriteBuffer())  # adoption funnel registers the tree
+        _set_native_mirror_read(self._m.read_fresh_bytes)
+        self._m._read_mode = True
+        assert _serialize_type_for_checkmember(ct) == self._m._fresh_bytes(ct)
+
+    def test_checkmember_seam_gate_off_serializes(self) -> None:
+        from mypy.checkmember import _serialize_type_for_checkmember
+        from mypy.types import _set_native_mirror_read
+
+        ct = self._generic_callable()
+        _set_native_mirror_read(None)
+        self._m._read_mode = True
+        # Never written: no handle. The funnel serializes exactly as before.
+        assert _serialize_type_for_checkmember(ct) == self._m._fresh_bytes(ct)

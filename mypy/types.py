@@ -180,6 +180,26 @@ def _clear_serialize_stats() -> None:
         _serialize_stats[k] = 0
 
 
+# Phase F2 (#1393): types_mirror.read_fresh_bytes when the F2 mirror-read
+# flip is enabled, else None. Shared by all kernel wire-seam funnels
+# (slice 1: checkexpr; slice 2: checkmember); wired from build.py.
+_mirror_read_fn: Callable[[Type], bytes | None] | None = None
+
+
+def _set_native_mirror_read(fn: Callable[[Type], bytes | None] | None) -> None:
+    """Install the shared F2 mirror-blob read into the wire-seam funnels."""
+    global _mirror_read_fn
+    _mirror_read_fn = fn
+
+
+def _read_mirror_blob(t: Type) -> bytes | None:
+    """Serve a registered family object's blob from mirror storage."""
+    fn = _mirror_read_fn
+    if fn is None:
+        return None
+    return fn(t)
+
+
 TUPLE_NAMES: Final = ("builtins.tuple", "typing.Tuple")
 TYPE_NAMES: Final = ("builtins.type", "typing.Type")
 
