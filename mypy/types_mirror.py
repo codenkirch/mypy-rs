@@ -39,6 +39,11 @@ Design notes (see crates/type_kernel/doc/f1_mirror.md):
   ``_REC_CACHE_SUPPRESSED`` and saves/restores its own re-entrancy flag,
   so a mirror read never flips a live node, and a later live flip still
   reaches the capture shim exactly once.
+- A captured write may hit an only-later-serializable subtree (the
+  semantics of pre-semanal partial objects), so the failing setattr
+  defers its capture (``_PENDING_CAPTURE``): the next funnel that
+  serializes the object cleanly resumes the capture and refreshes every
+  stale parent blob via the normal cascade (``_flush_pending_capture``).
 """
 
 from __future__ import annotations
@@ -100,8 +105,17 @@ _BY_HANDLE: dict[int, Any] = {}
 _ADOPT_STRIKE: set[int] = set()
 _ADOPT_STRIKE_Q: deque[int] = deque()
 _ADOPT_STRIKE_CAP: Final = 65536
+# Registered objects whose captured write could not be serialized at
+# mutation time; the capture is deferred to a later funnel that drains
+# them (see `_drain_pending_captures`). Bounded FIFO like the strike memo.
+_PENDING_CAPTURE: dict[int, Any] = {}
+_PENDING_CAPTURE_Q: deque[int] = deque()
 _audit: dict[str, int] = {}
 _mismatch_examples: dict[str, str] = {}
+# Cross-reset accumulators: mirror-suite teardowns call reset(clear_counts=True)
+# mid-process, which must not erase counters not yet dumped at atexit.
+_audit_total: dict[str, int] = {}
+_mismatch_total: dict[str, str] = {}
 # TypeVarId capture state (see TVID_CLASSES). `_TVID_CONSTRUCTION` counts
 # TypeVarId.__init__ calls in flight so construction writes are never captured;
 # `_TVID_REVERSE` pins the tvid (id() stays valid until reset() per build).
@@ -156,6 +170,91 @@ def _note_successful_adoption(obj: Any) -> None:
         _ADOPT_STRIKE.discard(key)
         _ADOPT_STRIKE_Q.remove(key)
         _count("strike_cleared_on_adopt")
+
+
+def _note_failed_capture(obj: Any) -> None:
+    key = id(obj)
+    if key in _PENDING_CAPTURE:
+        _count("pending_already")
+        return
+    if len(_PENDING_CAPTURE) >= _ADOPT_STRIKE_CAP:
+        old = _PENDING_CAPTURE_Q.popleft()
+        _PENDING_CAPTURE.pop(old, None)
+    _PENDING_CAPTURE[key] = obj
+    _PENDING_CAPTURE_Q.append(key)
+
+
+def _flush_pending_capture(obj: Any, handle: int, fresh: bytes) -> None:
+    key = id(obj)
+    if key not in _PENDING_CAPTURE:
+        return
+    _PENDING_CAPTURE.pop(key, None)
+    _PENDING_CAPTURE_Q.remove(key)
+    _count("pending_capture_flushed")
+    _update_and_cascade(handle, fresh, None)
+
+
+def _flush_pending_embed(embed: Type) -> None:
+    """Close the flush-before-adoption hole (issue #1385).
+
+    A pending capture's drain-cascade only reaches the container edges
+    that exist when the drain runs. When a later registration or
+    re-index adopts a still-pending embed, the flush fired earlier (or
+    has not fired yet at an ancestor) and the adopter keeps a blob of
+    the embed's pre-drain bytes. Creating that edge therefore flushes
+    the pending capture immediately, so the cascade runs with the edge
+    already in place. The pending entry is dropped before cascading so
+    a re-entrant edge adoption cannot recurse on the same capture.
+    """
+    key = id(embed)
+    if key not in _PENDING_CAPTURE:
+        return
+    _PENDING_CAPTURE.pop(key, None)
+    _PENDING_CAPTURE_Q.remove(key)
+    h = _handle_of(embed)
+    if h is None:
+        # Unregistered (evicted): its next funnel re-registers fresh.
+        _count("pending_capture_flushed_unregistered")
+        return
+    _count("pending_capture_flushed")
+    try:
+        fresh = _fresh_bytes(embed)
+    except Exception:
+        _count("pending_capture_still_unserializable")
+        _note_failed_capture(embed)
+        return
+    _update_and_cascade(h, fresh, None)
+
+
+def _drain_pending_captures() -> None:
+    """Resume captures that once failed serialization (issue #1385).
+
+    A write on an already-registered object may mutate a subtree that is
+    still only serializable later (e.g. calculate_tuple_fallback's
+    in-place args rewrite on the shared fallback Instance). The failing
+    setattr enqueues the object; the first later funnel that serializes
+    it cleanly resyncs the stale parent blobs through the normal
+    cascade. Called at the top of `_assert_fresh` / `_check_splice`
+    while the map is non-empty, so an asserting container also drains
+    its pended ancestors before its own bytes are judged.
+    """
+    for key in list(_PENDING_CAPTURE):
+        obj = _PENDING_CAPTURE.pop(key)
+        _PENDING_CAPTURE_Q.remove(key)
+        h = _handle_of(obj)
+        try:
+            fresh = _fresh_bytes(obj)
+        except Exception:
+            # Still unserializable: keep it queued for a later funnel.
+            _count("pending_capture_still_unserializable")
+            _note_failed_capture(obj)
+            continue
+        if h is None:
+            # Evicted or never adopted; its first funnel will register it.
+            _count("pending_capture_flushed_unregistered")
+            continue
+        _count("pending_capture_flushed")
+        _update_and_cascade(h, fresh, None)
 
 
 # ---- _short_stack: mismatch diagnostics (production audit mode) ----
@@ -397,27 +496,29 @@ def _family_embeds_in_value(value: Any, seen: set[int]) -> Iterator[Type]:
 
 def _fresh_bytes(t: Type) -> bytes:
     """Serialize `t` to fresh bytes with the wire cache disabled."""
-    global _in_serialize, _REC_CACHE_SUPPRESSED
+    global _in_serialize
     from librt.internal import WriteBuffer
 
-    from mypy.types import _REC_CACHE_SUPPRESSED, _set_type_wire_cache_enabled as _set
+    import mypy.types as _types_mod
+    from mypy.types import _set_type_wire_cache_enabled as _set
 
     prev = _wire_cache_enabled()
     _set(False)
     prev_serialize = _in_serialize
-    prev_cache = _REC_CACHE_SUPPRESSED
+    prev_cache = _types_mod._REC_CACHE_SUPPRESSED
     _in_serialize = True
     # The is_recursive property caches None -> bool on the live node:
     # inside a mirror serialization that write would flip a node the alias
     # capture hook treats as observed (stale-byte drift). Value-unchanged.
-    _REC_CACHE_SUPPRESSED = True
+    # Write through the module object: a here-imported value copy is inert.
+    _types_mod._REC_CACHE_SUPPRESSED = True
     try:
         buf = WriteBuffer()
         t.write(buf)
         return buf.getvalue()
     finally:
         _in_serialize = prev_serialize
-        _REC_CACHE_SUPPRESSED = prev_cache
+        _types_mod._REC_CACHE_SUPPRESSED = prev_cache
         _set(prev)
 
 
@@ -439,6 +540,10 @@ def _register_tree(t: Type) -> int | None:
     h = _handle_of(t)
     if h is not None:
         return h
+    # Prior hidden-embed adopters: containers that already indexed `t` while
+    # it was unregistered. Their stored blobs predate any in-place mutation
+    # of `t` that happened between adoption and this registration.
+    prior_adopters = _HIDDEN_EMBED.get(id(t)) is not None
     child_handles = []
     for _site, child in _child_types(t):
         if type(child) in FAMILY_NAME:
@@ -459,6 +564,12 @@ def _register_tree(t: Type) -> int | None:
     _record_tvid_carriers(t, handle)
     _record_alias_carriers(t, handle)
     _add_hidden_embeds(t, handle)
+    _flush_pending_capture(t, handle, fresh)
+    if prior_adopters:
+        # Late adoption cascade (issue #1385): a container adopted this
+        # object while unregistered and unreachable by any earlier
+        # cascade; re-sync its prior adopters now (`""` = no re-index).
+        _update_and_cascade(handle, fresh, "")
     return handle  # type: ignore[no-any-return]
 
 
@@ -474,11 +585,14 @@ def _add_hidden_embeds(obj: Type, handle: int) -> None:
     `_family_embeds` set of the container it is given.
     """
     for embed in _family_embeds(obj, set()):
-        entry = _HIDDEN_EMBED.get(id(embed))
+        key = id(embed)
+        entry = _HIDDEN_EMBED.get(key)
         if entry is None:
-            _HIDDEN_EMBED[id(embed)] = (embed, {handle})
+            _HIDDEN_EMBED[key] = (embed, {handle})
+            _flush_pending_embed(embed)
         else:
             entry[1].add(handle)
+            _flush_pending_embed(embed)
 
 
 def _sync_seed_handles(obj: Type) -> Iterator[int]:
@@ -567,6 +681,7 @@ def _drift_message(t: Type, fam: str, site: str, handle: int, fresh: bytes) -> s
         for k in ("type_ref", "args", "line", "column")
         if hasattr(t, k)
     }
+    fields["self_id"] = f"{id(t):x}"
     text = (
         f"native-type-mirror ({fam}, {site}) drifted\n"
         f"type={type(t).__name__!r} fields={fields}\n"
@@ -583,6 +698,8 @@ def _assert_fresh(t: Type, site: str) -> None:
     re-syncs plus cascades, so an escaped mutation triggers exactly once
     here before the mirror state catches up.
     """
+    if _PENDING_CAPTURE:
+        _drain_pending_captures()
     fam = FAMILY_NAME[type(t)]
     h = _handle_of(t)
     try:
@@ -599,6 +716,7 @@ def _assert_fresh(t: Type, site: str) -> None:
     assert_passes = _mirror_expect_ok(h, fresh)
     if assert_passes:
         _count(f"assert_ok.{fam}.{site}")
+        _flush_pending_capture(t, h, fresh)
         return
     key = f"mismatch.{fam}.{site}"
     _count(key)
@@ -607,6 +725,13 @@ def _assert_fresh(t: Type, site: str) -> None:
     if _audit_mode:
         _note_mismatch(key, _short_stack())
     _update_and_cascade(h, fresh)
+    if _audit_mode and not _mirror_expect_ok(h, fresh):
+        # The parents graph cannot reach whatever embeds these bytes:
+        # an edge is missing, not just a captured mutation that ran late.
+        _count(f"cascade_failed.{fam}.{site}")
+        _mismatch_examples.setdefault(
+            f"cascade_failed.{fam}.{site}", _drift_message(t, fam, f"{site}+after", h, fresh)
+        )
 
 
 def _mirror_expect_ok(handle: int, fresh: bytes) -> bool:
@@ -628,6 +753,8 @@ def _check_splice(t: Type, blob: bytes) -> None:
     and drop the stale cache entry so the next serialization re-caches
     fresh bytes and each escape fires once.
     """
+    if _PENDING_CAPTURE:
+        _drain_pending_captures()
     if not _rules_ok(t):
         return
     fam = FAMILY_NAME[type(t)]
@@ -745,9 +872,13 @@ def _mirror_setattr(self: Type, name: str, value: Any) -> None:
     try:
         fresh = _fresh_bytes(self)
     except Exception:
-        # Serialization can legitimately fail on a partial object; count
-        # and move on so the assertion surfaces at the next funnel.
+        # Serialization can fail on a partially-built object; defer the
+        # capture to the next successful funnel, which re-syncs the stale
+        # parent blobs (tuple fallback args rewrite, issue #1385).
         _count("unserializable." + fam + ".setattr:" + name)
+        if _audit_mode:
+            _mismatch_examples.setdefault(f"unserializable.{fam}.setattr:{name}", _short_stack())
+        _note_failed_capture(self)
         return
     stored = _kernel_mod.rust_mirror_bytes(h)
     if stored == fresh:
@@ -903,9 +1034,14 @@ def _dump_audit() -> None:
     if not out:
         return
     out = out.replace("{pid}", str(os.getpid()))
+    counters = dict(_audit_total)
+    for key, n in _audit.items():
+        counters[key] = counters.get(key, 0) + n
+    examples = dict(_mismatch_total)
+    examples.update(_mismatch_examples)
     try:
         with open(out, "w") as f:
-            json.dump({"counters": _audit, "examples": _mismatch_examples}, f, indent=1)
+            json.dump({"counters": counters, "examples": examples}, f, indent=1)
     except OSError as err:
         print(f"native-type-mirror: audit dump failed: {err}", file=sys.stderr)
 
@@ -922,9 +1058,14 @@ def reset(*, clear_counts: bool = False) -> None:
     _BY_HANDLE.clear()
     _ADOPT_STRIKE.clear()
     _ADOPT_STRIKE_Q.clear()
+    _PENDING_CAPTURE.clear()
+    _PENDING_CAPTURE_Q.clear()
     _TVID_REVERSE.clear()
     _ALIAS_REVERSE.clear()
     _HIDDEN_EMBED.clear()
     if clear_counts:
+        for key, n in _audit.items():
+            _audit_total[key] = _audit_total.get(key, 0) + n
         _audit.clear()
+        _mismatch_total.update(_mismatch_examples)
         _mismatch_examples.clear()

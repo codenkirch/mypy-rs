@@ -50181,3 +50181,22 @@ class NativeMirrorHiddenParentSuite(Suite):
         delta = self._delta(before)
         assert delta.get("assert_ok.tvar.write") == 1, delta
         assert not any(k.startswith("mismatch.") for k in delta), delta
+
+    def test_late_registered_hidden_leaf_cascades_prior_adopters(self) -> None:
+        from librt.internal import WriteBuffer
+
+        fallback, _tup, tv = self._tuple_meta()
+        self._m._register_tree(tv)  # adopt; the nested leaf stays unregistered
+        # The issue-#1385 escape: the unregistered leaf mutates while capture
+        # is suspended (e.g. an in-place rewrite during serialization), so no
+        # setattr lands in the mirror and the stored tvar blob drifts.
+        self._m._in_serialize = True
+        fallback.args = (UnionType([self.fx.a, self.fx.std_tuple]),)
+        self._m._in_serialize = False
+        # The leaf first registers here; late adoption must re-sync the tvar.
+        fallback.write(WriteBuffer())
+        before = dict(self._m.report())
+        tv.write(WriteBuffer())  # strict self-check on the re-synced blob
+        delta = self._delta(before)
+        assert delta.get("assert_ok.tvar.write") == 1, delta
+        assert not any(k.startswith("mismatch.") for k in delta), delta
