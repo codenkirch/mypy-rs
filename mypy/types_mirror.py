@@ -69,8 +69,9 @@ FAMILY_NAME: Final[dict[type, str]] = {
 # family parents graph, and a meta_level write fires no family __setattr__.
 # It gets its own capture shim plus a reverse map (TypeVarId -> carriers).
 TVID_CLASSES: Final = (TypeVarId,)
-# Attributes written by hashing or lazy truthiness init never affect the
-# wire bytes of any family class; skipping them keeps the mirror quiet.
+# Attributes written by hashing, lazy truthiness init, or Context.set_line
+# never affect the wire bytes of any family class (no types.py write() body
+# reads line / column / end_line / end_column / definition); skip them.
 SKIP_ATTRS: Final = frozenset(
     {
         "_hash",
@@ -79,6 +80,12 @@ SKIP_ATTRS: Final = frozenset(
         # Derived truthiness facets; the wire recomputes them on read.
         "can_be_true",
         "can_be_false",
+        # Context bookkeeping and definition: never part of the wire bytes.
+        "line",
+        "column",
+        "end_line",
+        "end_column",
+        "definition",
     }
 )
 
@@ -1021,7 +1028,7 @@ def _mirror_setattr(self: Type, name: str, value: Any) -> None:
             _mismatch_examples.setdefault(f"unserializable.{fam}.setattr:{name}", _short_stack())
         _note_failed_capture(self)
         return
-    stored = _kernel_mod.rust_mirror_bytes(h)
+    stored = bytes(_kernel_mod.rust_mirror_bytes(h))
     if stored == fresh:
         _count(f"setattr_noop.{fam}.{name}")
         return
