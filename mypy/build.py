@@ -1139,12 +1139,12 @@ class BuildManager:
 
         _set_native_checkexpr_active(self.options.native_type_kernel)
         _set_native_checkexpr_resolver(None)
-        # Phase F2 (#1393): wire the checkexpr funnel's mirror-read flip when
-        # both the mirror and read gates are on. read_fresh_bytes checks the
-        # activation state itself, so an early call defers to the wire cache.
+        # Phase F2 (#1393): wire the kernel wire-seam funnels' mirror-read
+        # flip (slice 1: checkexpr, slice 2: checkmember) when both the
+        # mirror and read gates are on; read_fresh_bytes defers early calls.
         if self.options.native_type_mirror and self.options.native_type_mirror_read:
             from mypy import types_mirror
-            from mypy.checkexpr import _set_native_mirror_read
+            from mypy.types import _set_native_mirror_read
 
             _set_native_mirror_read(types_mirror.read_fresh_bytes)
         _set_native_checkcall_active(self.options.native_type_kernel)
