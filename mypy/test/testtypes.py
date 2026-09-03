@@ -49865,6 +49865,199 @@ class NativeMirrorTypeVarIdSuite(Suite):
             self._m._strict = False
 
 
+class NativeMirrorTypeAliasFlagSuite(Suite):
+    """Unit tests for the TypeAlias._is_recursive capture shim of the F1 mirror.
+
+    A TypeAliasType embeds a live ``mypy.nodes.TypeAlias`` node by
+    reference, and ``TypeAliasType.write`` reads ``alias._is_recursive``
+    at serialization time, so a node write changes the wire bytes of
+    every family carrier embedding the TypeAliasType without firing any
+    family ``__setattr__`` (the measured ``mismatch.instance.write``
+    escape, issue #1385). ``_mirror_alias_setattr`` captures the write at
+    the source and resyncs each registered carrier through the reverse
+    map ``_ALIAS_REVERSE[id(node)] -> (node, carrier handles)``.
+
+    Activation is one-shot process-wide: isolation is reset() + strict
+    off, same as NativeMirrorTypeVarIdSuite.
+    """
+
+    def setUp(self) -> None:
+        from mypy import types_mirror
+
+        types_mirror.activate(audit=True)
+        types_mirror.reset(clear_counts=True)
+        self._m = types_mirror
+        self.fx = TypeFixture()
+
+    def tearDown(self) -> None:
+        self._m._strict = False
+        self._m.reset(clear_counts=True)
+
+    def _carrier(self, tat: TypeAliasType) -> Instance:
+        return Instance(self.fx.std_tuplei, [tat])
+
+    def _write(self, t: Type) -> None:
+        from librt.internal import WriteBuffer
+
+        t.write(WriteBuffer())
+
+    def _delta(self, before: dict[str, int]) -> dict[str, int]:
+        after = self._m.report()
+        return {
+            k: v - before.get(k, 0)
+            for k, v in after.items()
+            if v != before.get(k, 0) and "init." not in k
+        }
+
+    def test_captured_flag_write_resyncs_carrier(self) -> None:
+        from mypy.types import TypeAliasType
+
+        node = TypeAlias(self.fx.o, "m.A", "m", 1, 0)
+        tat = TypeAliasType(node, [])
+        ct = self._carrier(tat)
+        self._write(ct)  # adoption funnel indexes node -> ct
+        before = dict(self._m.report())
+        node._is_recursive = True
+        delta = self._delta(before)
+        assert delta.get("alias_captured._is_recursive") == 1, delta
+        assert not any(k.startswith(("mismatch.", "alias_orphan.")) for k in delta), delta
+        before = dict(self._m.report())
+        self._write(ct)  # mirror already caught up: must assert clean
+        delta = self._delta(before)
+        assert delta.get("assert_ok.instance.write") == 1, delta
+        assert not any(k.startswith("mismatch.") for k in delta), delta
+
+    def test_target_descent_records_embedded_nodes(self) -> None:
+        from mypy.types import TypeAliasType
+
+        node_b = TypeAlias(self.fx.o, "m.B", "m", 1, 0)
+        tat_b = TypeAliasType(node_b, [])
+        node_a = TypeAlias(tat_b, "m.A", "m", 1, 0)
+        tat_a = TypeAliasType(node_a, [])
+        ct = self._carrier(tat_a)
+        self._write(ct)
+        entry_a = self._m._ALIAS_REVERSE[id(node_a)]
+        entry_b = self._m._ALIAS_REVERSE[id(node_b)]
+        assert self._m._handle_of(ct) in entry_a[1], entry_a
+        assert self._m._handle_of(ct) in entry_b[1], entry_b
+        before = dict(self._m.report())
+        node_b._is_recursive = True
+        delta = self._delta(before)
+        assert delta.get("alias_captured._is_recursive") == 1, delta
+        assert not any(k.startswith(("mismatch.", "alias_orphan.")) for k in delta), delta
+        before = dict(self._m.report())
+        self._write(ct)
+        delta = self._delta(before)
+        assert delta.get("assert_ok.instance.write") == 1, delta
+        assert not any(k.startswith("mismatch.") for k in delta), delta
+
+    def test_equal_write_counts_equal_and_skips_cascade(self) -> None:
+        from mypy.types import TypeAliasType
+
+        node = TypeAlias(self.fx.o, "m.A", "m", 1, 0)
+        ct = self._carrier(TypeAliasType(node, []))
+        self._write(ct)
+        node._is_recursive = True  # establish a non-default value
+        before = dict(self._m.report())
+        node._is_recursive = True  # equal-value write
+        delta = self._delta(before)
+        assert delta.get("alias_setattr_equal._is_recursive") == 1, delta
+        assert not any(
+            k.startswith(("alias_captured.", "alias_orphan.", "cascade_sync"))
+            for k in delta
+        ), delta
+
+    def test_orphan_node_counts_orphan(self) -> None:
+        from mypy.types import TypeAliasType
+
+        TypeAlias(self.fx.o, "m.A", "m", 1, 0)
+        TypeAliasType(TypeAlias(self.fx.o, "m.Y", "m", 1, 0), [])  # never in a funnel
+        orphan = TypeAlias(self.fx.o, "m.X", "m", 1, 0)
+        before = dict(self._m.report())
+        orphan._is_recursive = True
+        delta = self._delta(before)
+        assert delta.get("alias_orphan._is_recursive") == 1, delta
+        assert not any(k.startswith(("alias_captured.", "cascade_sync")) for k in delta), delta
+
+    def test_strict_mode_does_not_raise_on_captured_flag(self) -> None:
+
+        from mypy.types import TypeAliasType
+
+        node = TypeAlias(self.fx.o, "m.A", "m", 1, 0)
+        ct = self._carrier(TypeAliasType(node, []))
+        self._write(ct)
+        self._m._strict = True
+        try:
+            node._is_recursive = True  # captured at the source
+            self._write(ct)  # was the measured escape: must pass now
+        finally:
+            self._m._strict = False
+
+
+class NativeMirrorAdoptStrikeSuite(Suite):
+    """Unit tests for the adoption-strike lifecycle of the F1 mirror.
+
+    ``_note_failed_adoption`` memoizes an unregistrable family object so
+    the per-setattr adoption retry storm stops until the write funnel.
+    The memo was keyed by object id forever, so a later successful
+    adoption did not clear it and every subsequent ``__setattr__`` on the
+    object escaped capture (the measured under-strike escape drift of the
+    NamedTuple reanalysis tests, issue #1385). Both lifecycle rules are
+    tested here: a successful adoption clears the memo, and a setattr on
+    a struck-but-now-registered object is captured like any other.
+    """
+
+    def setUp(self) -> None:
+        from mypy import types_mirror
+
+        types_mirror.activate(audit=True)
+        types_mirror.reset(clear_counts=True)
+        self._m = types_mirror
+        self.fx = TypeFixture()
+
+    def tearDown(self) -> None:
+        self._m._strict = False
+        self._m.reset(clear_counts=True)
+
+    def _delta(self, before: dict[str, int]) -> dict[str, int]:
+        after = self._m.report()
+        return {
+            k: v - before.get(k, 0)
+            for k, v in after.items()
+            if v != before.get(k, 0) and "init." not in k
+        }
+
+    def test_successful_adopt_clears_strike_memo(self) -> None:
+        from librt.internal import WriteBuffer
+
+        inst = Instance(self.fx.std_tuplei, [self.fx.a])
+        self._m._note_failed_adoption(inst)  # simulate earlier failed adoption
+        self._m._strict = True
+        try:
+            before = dict(self._m.report())
+            inst.write(WriteBuffer())  # write funnel adopts successfully
+            delta = self._delta(before)
+            assert delta.get("adopt.instance.write") == 1, delta
+            assert delta.get("strike_cleared_on_adopt") == 1, delta
+            # The memo is gone: a real mutation is captured at the source.
+            before = dict(self._m.report())
+            inst.args = (self.fx.o,)
+            delta = self._delta(before)
+            assert delta.get("setattr_captured.instance.args") == 1, delta
+            assert not any(k.startswith("mismatch.") for k in delta), delta
+        finally:
+            self._m._strict = False
+
+    def test_under_strike_unregistered_setattr_stays_gagged(self) -> None:
+        inst = Instance(self.fx.std_tuplei, [self.fx.a])
+        self._m._note_failed_adoption(inst)
+        before = dict(self._m.report())
+        inst.args = (self.fx.o,)  # still unregistered in this test: no capture
+        delta = self._delta(before)
+        assert "setattr_captured.instance.args" not in delta, delta
+        assert delta.get("strike_captured_late") is None, delta
+
+
 class NativeMirrorHiddenParentSuite(Suite):
     """Unit tests for the hidden-parent cascade of the F1 mirror.
 
@@ -49985,6 +50178,25 @@ class NativeMirrorHiddenParentSuite(Suite):
         new_inst.args = (UnionType([self.fx.a, self.fx.std_tuple]),)  # captured write
         before = dict(self._m.report())
         tv.write(WriteBuffer())  # must already be fresh: assert_ok, no mismatch
+        delta = self._delta(before)
+        assert delta.get("assert_ok.tvar.write") == 1, delta
+        assert not any(k.startswith("mismatch.") for k in delta), delta
+
+    def test_late_registered_hidden_leaf_cascades_prior_adopters(self) -> None:
+        from librt.internal import WriteBuffer
+
+        fallback, _tup, tv = self._tuple_meta()
+        self._m._register_tree(tv)  # adopt; the nested leaf stays unregistered
+        # The issue-#1385 escape: the unregistered leaf mutates while capture
+        # is suspended (e.g. an in-place rewrite during serialization), so no
+        # setattr lands in the mirror and the stored tvar blob drifts.
+        self._m._in_serialize = True
+        fallback.args = (UnionType([self.fx.a, self.fx.std_tuple]),)
+        self._m._in_serialize = False
+        # The leaf first registers here; late adoption must re-sync the tvar.
+        fallback.write(WriteBuffer())
+        before = dict(self._m.report())
+        tv.write(WriteBuffer())  # strict self-check on the re-synced blob
         delta = self._delta(before)
         assert delta.get("assert_ok.tvar.write") == 1, delta
         assert not any(k.startswith("mismatch.") for k in delta), delta
