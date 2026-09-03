@@ -50246,19 +50246,33 @@ class NativeMirrorReadSuite(Suite):
             variables=[self.fx.t],
         )
 
+    def _set_read_spy(self) -> list[Type]:
+        """Wrap the read funnel in a spy so seam tests prove engagement."""
+        from mypy.types import _set_native_mirror_read
+
+        calls: list[Type] = []
+
+        def spy(t: Type) -> bytes | None:
+            calls.append(t)
+            fresh: bytes | None = self._m.read_fresh_bytes(t)
+            return fresh
+
+        _set_native_mirror_read(spy)
+        return calls
+
     def test_read_returns_mirror_bytes_equal_to_fresh(self) -> None:
         from librt.internal import WriteBuffer
 
         from mypy.checkexpr import _serialize_type_for_checkexpr
-        from mypy.types import _set_native_mirror_read
 
         ct = self._generic_callable()
         ct.write(WriteBuffer())  # adoption funnel registers the tree
         self._m._read_mode = True
-        _set_native_mirror_read(self._m.read_fresh_bytes)
+        calls = self._set_read_spy()
         fresh = self._m._fresh_bytes(ct)
         got = _serialize_type_for_checkexpr(ct)
         assert got == fresh
+        assert calls == [ct]  # the funnel consulted the mirror, not the fallback walk
 
     def test_gate_off_keeps_pure_python_behavior(self) -> None:
         from librt.internal import WriteBuffer
@@ -50310,13 +50324,13 @@ class NativeMirrorReadSuite(Suite):
         from librt.internal import WriteBuffer
 
         from mypy.checkmember import _serialize_type_for_checkmember
-        from mypy.types import _set_native_mirror_read
 
         ct = self._generic_callable()
         ct.write(WriteBuffer())  # adoption funnel registers the tree
-        _set_native_mirror_read(self._m.read_fresh_bytes)
+        calls = self._set_read_spy()
         self._m._read_mode = True
         assert _serialize_type_for_checkmember(ct) == self._m._fresh_bytes(ct)
+        assert calls == [ct]  # the funnel consulted the mirror, not the fallback walk
 
     def test_checkmember_seam_gate_off_serializes(self) -> None:
         from mypy.checkmember import _serialize_type_for_checkmember
@@ -50327,3 +50341,25 @@ class NativeMirrorReadSuite(Suite):
         self._m._read_mode = True
         # Never written: no handle. The funnel serializes exactly as before.
         assert _serialize_type_for_checkmember(ct) == self._m._fresh_bytes(ct)
+
+    def test_checker_seam_reads_mirror_bytes(self) -> None:
+        from librt.internal import WriteBuffer
+
+        from mypy.checker import _serialize_type_for_checker
+
+        ct = self._generic_callable()
+        ct.write(WriteBuffer())  # adoption funnel registers the tree
+        calls = self._set_read_spy()
+        self._m._read_mode = True
+        assert _serialize_type_for_checker(ct) == self._m._fresh_bytes(ct)
+        assert calls == [ct]  # the funnel consulted the mirror, not the fallback walk
+
+    def test_checker_seam_gate_off_serializes(self) -> None:
+        from mypy.checker import _serialize_type_for_checker
+        from mypy.types import _set_native_mirror_read
+
+        ct = self._generic_callable()
+        _set_native_mirror_read(None)
+        self._m._read_mode = True
+        # Never written: no handle. The funnel serializes exactly as before.
+        assert _serialize_type_for_checker(ct) == self._m._fresh_bytes(ct)

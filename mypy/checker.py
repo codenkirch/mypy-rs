@@ -295,6 +295,7 @@ from mypy.types import (
     UnionType,
     UnpackType,
     _encode_no_arg_instance,
+    _read_mirror_blob,
     _serialize_stats,
     _serialize_stats_on,
     _serialize_with_taint_check,
@@ -1040,6 +1041,13 @@ def _serialize_type_for_checker(t: Type) -> bytes:
                 _serialize_stats["bytes"] += len(fast)
             _type_wire_cache[key] = (t, fast)
         return fast
+    # Phase F2 (#1393, slice 3): mirror-blob read on the expensive miss path,
+    # same seam contract as the checkexpr and checkmember funnels.
+    blob = _read_mirror_blob(t)
+    if blob is not None:
+        if _serialize_stats_on:
+            _serialize_stats["mirror"] += 1
+        return blob
     buf = _CheckerWriteBuffer()
     result, saw_tvar = _serialize_with_taint_check(t, buf)
     if saw_tvar:
