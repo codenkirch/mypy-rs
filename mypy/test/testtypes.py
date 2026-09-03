@@ -50537,3 +50537,102 @@ class NativeInstanceWriteSuite(Suite):
         assert delta.get("setattr_captured.instance.last_known_value") == 1, delta
         assert "setattr_spliced.instance.last_known_value" not in delta, delta
         self._blob_matches_fresh(inst)
+
+
+class NativeInvisibleFieldSuite(Suite):
+    """Wire-invisible field writes stay outside the mirror capture funnel.
+
+    line / column / end_line / end_column / definition are not read by any
+    types.py write() body, so no write to them can change a stored blob:
+    extending SKIP_ATTRS keeps the hook (and the full fresh re-serialize
+    plus cascade of identical bytes) out of the way for set_line()-style
+    bookkeeping, the single hottest captured write shape on the self-check
+    corpus (139,894 captured Instance line writes per audited cold run).
+
+    The identical-visible-write test also pins the fresh-path noop
+    comparison fix: rust_mirror_bytes returns a list and _fresh_bytes
+    bytes, and the pre-fix list == bytes check was always False, so every
+    unchanged visible write wrongly took the capture-and-cascade path.
+    """
+
+    def setUp(self) -> None:
+        from mypy import types_mirror
+
+        types_mirror.activate(audit=True)
+        types_mirror.reset(clear_counts=True)
+        self._m = types_mirror
+        self.fx = TypeFixture()
+        types_mirror._write_flip = True
+
+    def tearDown(self) -> None:
+        self._m._write_flip = False
+        self._m._strict = False
+        self._m.reset(clear_counts=True)
+
+    def _delta(self, before: dict[str, int]) -> dict[str, int]:
+        after = self._m.report()
+        return {
+            k: v - before.get(k, 0)
+            for k, v in after.items()
+            if v != before.get(k, 0) and "init." not in k
+        }
+
+    def _blob_matches_fresh(self, t: Type) -> None:
+        handle = self._m._handle_of(t)
+        assert handle is not None
+        blob = bytes(self._m._kernel_mod.rust_mirror_bytes(handle))
+        assert blob == self._m._fresh_bytes(t)
+
+    def _registered_instance(self) -> Instance:
+        from librt.internal import WriteBuffer
+
+        inst = Instance(self.fx.std_tuplei, [self.fx.o])
+        inst.write(WriteBuffer())  # adoption funnel registers the object
+        return inst
+
+    def _registered_callable(self) -> CallableType:
+        from librt.internal import WriteBuffer
+
+        cb = CallableType([self.fx.o], [ARG_POS], [None], self.fx.o, self.fx.o)
+        cb.write(WriteBuffer())
+        return cb
+
+    def test_line_write_is_unhooked(self) -> None:
+        inst = self._registered_instance()
+        before = dict(self._m.report())
+        inst.line = 42
+        delta = self._delta(before)
+        assert delta == {}, delta
+        self._blob_matches_fresh(inst)
+
+    def test_set_line_fields_are_unhooked(self) -> None:
+        inst = self._registered_instance()
+        before = dict(self._m.report())
+        inst.set_line(31, column=5, end_line=32, end_column=6)
+        delta = self._delta(before)
+        assert delta == {}, delta
+        self._blob_matches_fresh(inst)
+
+    def test_definition_write_is_unhooked(self) -> None:
+        cb = self._registered_callable()
+        before = dict(self._m.report())
+        cb.definition = None  # the bump-timestamp fixup-style rewrite
+        delta = self._delta(before)
+        assert delta == {}, delta
+        self._blob_matches_fresh(cb)
+
+    def test_identical_visible_write_counts_noop(self) -> None:
+        cb = self._registered_callable()
+        before = dict(self._m.report())
+        cb.name = cb.name  # same value: bytes unchanged, must be a noop
+        delta = self._delta(before)
+        assert delta.get("setattr_noop.callable.name") == 1, delta
+        self._blob_matches_fresh(cb)
+
+    def test_visible_write_still_captures(self) -> None:
+        inst = self._registered_instance()
+        before = dict(self._m.report())
+        inst.args = (self.fx.str_type,)  # real change: full capture path
+        delta = self._delta(before)
+        assert delta.get("setattr_spliced.instance.args") == 1, delta
+        self._blob_matches_fresh(inst)
