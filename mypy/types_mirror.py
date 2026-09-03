@@ -115,12 +115,6 @@ _ORIG_SETATTR: Any = None
 _originals: dict[type, dict[str, Any]] = {}
 # handle -> live object (strong pin until reset).
 _BY_HANDLE: dict[int, Any] = {}
-# Objects whose adoption already failed (pre-semanal partials the wire
-# cannot serialize). Bounded FIFO by id(): a recycled id retries once
-# more later; the write funnel stays the authoritative registration point.
-_ADOPT_STRIKE: set[int] = set()
-_ADOPT_STRIKE_Q: deque[int] = deque()
-_ADOPT_STRIKE_CAP: Final = 65536
 # Registered objects whose captured write could not be serialized at
 # mutation time; the capture is deferred to a later funnel that drains
 # them (see `_drain_pending_captures`). Bounded FIFO like the strike memo.
@@ -168,23 +162,92 @@ _REINDEX_SLOTS: Final[frozenset[str]] = frozenset(
     }
 )
 
+# Objects and TypeVarId carriers: bounded FIFO with the same cap. The
+# pending-capture dict + deque pair stays cold in the battery, so it keeps
+# the simple structures (the drain walk needs the stored objects).
+_PENDING_CAPTURE_CAP: Final = 65536
+
+
+class _IdFifo:
+    """Bounded FIFO set of unique ids with O(1) membership and removal.
+
+    Replaces a ``set`` guarded by a cap-evicting ``deque``: clearing a
+    struck id dequeues with ``.remove`` which scans O(cap) on a full
+    queue, and at a 65,536-entry cap with ~450k clears per self-check
+    that scan was the mirror's dominant production cost. Membership is
+    the dict (O(1) ``in`` / remove); eviction order rides an append-only
+    (token, key) log plus a cursor that lazily skips stale entries. A
+    re-added id is inserted with a fresh token, so the evict never drops
+    a live youngest entry early, matching ``deque.remove`` + ``append``.
+    """
+
+    __slots__ = ("_cap", "_members", "_log", "_cursor", "_seq")
+
+    def __init__(self, cap: int) -> None:
+        self._cap = cap
+        # key -> token of the newest live insertion (tokens are >= 1).
+        self._members: dict[int, int] = {}
+        self._log: list[tuple[int, int]] = []
+        self._cursor = 0
+        self._seq = 0
+
+    def __contains__(self, key: object) -> bool:
+        return key in self._members
+
+    def __len__(self) -> int:
+        return len(self._members)
+
+    def __bool__(self) -> bool:
+        return bool(self._members)
+
+    def add(self, key: int) -> None:
+        if key in self._members:
+            # Duplicate insertions are guarded by the callers; free here.
+            return
+        if len(self._members) >= self._cap:
+            self._evict_oldest()
+        self._seq += 1
+        self._members[key] = self._seq
+        self._log.append((self._seq, key))
+        self._maybe_compact()
+
+    def remove(self, key: int) -> bool:
+        return self._members.pop(key, None) is not None
+
+    def _evict_oldest(self) -> None:
+        # Live members are always present in the log, so the cursor
+        # walks at most the stale entries that accumulated since.
+        while True:
+            token, key = self._log[self._cursor]
+            self._cursor += 1
+            if self._members.get(key) == token:
+                del self._members[key]
+                return
+
+    def _maybe_compact(self) -> None:
+        if self._cursor >= self._cap:
+            self._log = self._log[self._cursor :]
+            self._cursor = 0
+
+    def clear(self) -> None:
+        self._members.clear()
+        self._log = []
+        self._cursor = 0
+        self._seq = 0
+
+
+# Objects whose adoption already failed (pre-semanal partials the wire
+# cannot serialize). Bounded FIFO by id(): a recycled id retries once
+# more later; the write funnel stays the authoritative registration point.
+_ADOPT_STRIKE: _IdFifo = _IdFifo(65536)
+
 
 def _note_failed_adoption(obj: Any) -> None:
-    key = id(obj)
-    if key in _ADOPT_STRIKE:
-        return
-    if len(_ADOPT_STRIKE) >= _ADOPT_STRIKE_CAP:
-        old = _ADOPT_STRIKE_Q.popleft()
-        _ADOPT_STRIKE.discard(old)
-    _ADOPT_STRIKE.add(key)
-    _ADOPT_STRIKE_Q.append(key)
+    _ADOPT_STRIKE.add(id(obj))
 
 
 def _note_successful_adoption(obj: Any) -> None:
-    key = id(obj)
-    if key in _ADOPT_STRIKE:
-        _ADOPT_STRIKE.discard(key)
-        _ADOPT_STRIKE_Q.remove(key)
+    if _ADOPT_STRIKE.remove(id(obj)):
         _count("strike_cleared_on_adopt")
 
 
@@ -193,7 +256,7 @@ def _note_failed_capture(obj: Any) -> None:
     if key in _PENDING_CAPTURE:
         _count("pending_already")
         return
-    if len(_PENDING_CAPTURE) >= _ADOPT_STRIKE_CAP:
+    if len(_PENDING_CAPTURE) >= _PENDING_CAPTURE_CAP:
         old = _PENDING_CAPTURE_Q.popleft()
         _PENDING_CAPTURE.pop(old, None)
     _PENDING_CAPTURE[key] = obj
@@ -314,15 +377,25 @@ def _wire_cache_enabled() -> bool:
 # Slot names that never hold a Type child (positions plus private state).
 _SKIP_SLOTS: Final = frozenset({"line", "column", "end_line", "end_column"})
 
+# MRO slot-name tuples are input-invariant; the family classes plus every
+# non-family Type walked by the embed/carrier helpers hit this millions
+# of times per run, so re-collecting was a measured top cost.
+_SLOT_NAMES: dict[type, tuple[str, ...]] = {}
+
 
 def _type_names(cls: type) -> tuple[str, ...]:
     """Collect all __slots__ names across the MRO, deduplicated in order."""
-    names: list[str] = []
+    names = _SLOT_NAMES.get(cls)
+    if names is not None:
+        return names
+    collected: list[str] = []
     for klass in cls.__mro__:
         slots = getattr(klass, "__slots__", ())
         if slots:
-            names.extend(slots)
-    return tuple(dict.fromkeys(names))
+            collected.extend(slots)
+    names = tuple(dict.fromkeys(collected))
+    _SLOT_NAMES[cls] = names
+    return names
 
 
 def _child_types(t: Type) -> Iterator[tuple[str, Type]]:
@@ -948,8 +1021,7 @@ def _mirror_setattr(self: Type, name: str, value: Any) -> None:
         # since become registrable is a real mirror mutation (capture it);
         # only still-unregistrable objects stay gagged.
         if _handle_of(self) is not None:
-            _ADOPT_STRIKE.discard(id(self))
-            _ADOPT_STRIKE_Q.remove(id(self))
+            _ADOPT_STRIKE.remove(id(self))
             _count("strike_captured_late")
         else:
             hook = False
@@ -1211,7 +1283,6 @@ def reset(*, clear_counts: bool = False) -> None:
         _kernel_mod.rust_mirror_reset()
     _BY_HANDLE.clear()
     _ADOPT_STRIKE.clear()
-    _ADOPT_STRIKE_Q.clear()
     _PENDING_CAPTURE.clear()
     _PENDING_CAPTURE_Q.clear()
     _TVID_REVERSE.clear()
