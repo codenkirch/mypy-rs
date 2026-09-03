@@ -50057,6 +50057,83 @@ class NativeMirrorAdoptStrikeSuite(Suite):
         assert delta.get("strike_captured_late") is None, delta
 
 
+class NativeMirrorIdFifoSuite(Suite):
+    """Unit tests for the O(1) strike FIFO (_IdFifo).
+
+    The FIFO replaced a `set` + cap-evicting `deque` pair whose
+    `.remove` scan was the mirror's dominant production cost (131s summed
+    over 4 self-check workers). It must behave like the old model:
+    O(1) membership and remove with a truthy return, FIFO eviction by
+    live insertion order across re-adds, and eviction never dropping a
+    re-added youngest entry early.
+    """
+
+    def _fifo(self, cap: int) -> Any:
+        from mypy.types_mirror import _IdFifo
+
+        return _IdFifo(cap)
+
+    def test_membership_and_remove_return(self) -> None:
+        q = self._fifo(4)
+        assert not q
+        assert len(q) == 0
+        assert 7 not in q
+        q.add(7)
+        assert 7 in q
+        assert q
+        assert len(q) == 1
+        # remove() returns True only when the id was present, and is idempotent.
+        assert q.remove(7) is True
+        assert 7 not in q
+        assert q.remove(7) is False
+        assert not q
+
+    def test_eviction_is_fifo_by_live_insertion_order(self) -> None:
+        q = self._fifo(3)
+        for k in (1, 2, 3):
+            q.add(k)
+        assert set(q._members) == {1, 2, 3}
+        q.add(4)  # evicts 1, the oldest live insertion
+        assert set(q._members) == {2, 3, 4}
+        q.add(5)
+        assert set(q._members) == {3, 4, 5}
+
+    def test_readd_after_remove_is_not_evicted_early(self) -> None:
+        q = self._fifo(3)
+        for k in (1, 2, 3):
+            q.add(k)
+        q.remove(1)  # mid-queue strike clear frees a slot
+        q.add(1)  # re-added: youngest live insertion again
+        q.add(4)  # must evict 2 (now oldest), never the re-added 1
+        assert set(q._members) == {1, 3, 4}
+        q.add(5)
+        assert set(q._members) == {1, 4, 5}
+
+    def test_stale_log_entries_lazily_compact(self) -> None:
+        q = self._fifo(2)
+        for k in (1, 2):
+            q.add(k)
+        q.remove(1)
+        q.add(1)  # re-add: the old (1) log entry becomes stale
+        q.add(3)  # evict walks past the stale entry, evicts 2, compacts
+        assert set(q._members) == {1, 3}
+        # The log was trimmed to the live entries and the cursor reset.
+        assert q._cursor == 0 and len(q._log) == 2, (q._cursor, q._log)
+        q.add(4)  # next evict is arithmetic on the compacted log
+        assert set(q._members) == {3, 4}
+
+    def test_subcap_churn_log_stays_bounded(self) -> None:
+        q = self._fifo(64)
+        for i in range(1000):
+            # add + remove below the cap: no eviction happens, but the
+            # churn must not accumulate stale entries unboundedly (the
+            # old capped deque stayed at 64 entries).
+            q.add(i)
+            q.remove(i)
+        assert len(q._log) <= 64, len(q._log)
+        assert not q._members
+
+
 class NativeMirrorHiddenParentSuite(Suite):
     """Unit tests for the hidden-parent cascade of the F1 mirror.
 
