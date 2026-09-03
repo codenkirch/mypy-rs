@@ -98,10 +98,11 @@ _audit_mode = False
 # funnels read a registered family object's blob from Rust mirror storage
 # instead of re-serializing the live object.
 _read_mode = False
-# Phase F3 (#1397): an Instance 'args' write captured by _mirror_setattr is
-# pushed into the stored blob by the Rust splice op instead of a full
-# re-serialize; a splice that drifts surfaces at the next serial funnel.
+# Phase F3 (#1397): an Instance write for one of these field names captured
+# by _mirror_setattr is pushed into the stored blob by the per-field Rust
+# splice op; a splice that drifts surfaces at the next serial funnel.
 _write_flip = False
+_FLIP_FIELDS: Final[frozenset[str]] = frozenset({"args", "type", "last_known_value"})
 _ORIG_SETATTR: Any = None
 # family class -> saved originals (for a future multi-run protocol).
 _originals: dict[type, dict[str, Any]] = {}
@@ -568,6 +569,39 @@ def _args_list_bytes(args: Sequence[Type]) -> bytes | None:
         _set(prev)
 
 
+def _single_type_bytes(t: Type) -> bytes | None:
+    """Serialize one Type subtree (Instance lkv splice input, #1397).
+
+    Same suppression trio as `_args_list_bytes`: wire cache off,
+    re-entrancy and recursive-alias-cache guards, so the `write` is
+    side-effect-free and never re-enters the mirror. Returns None when
+    the value cannot serialize yet; the splice then defers to the full
+    fresh path.
+    """
+    global _in_serialize
+    from librt.internal import WriteBuffer
+
+    import mypy.types as _types_mod
+    from mypy.types import _set_type_wire_cache_enabled as _set
+
+    prev = _wire_cache_enabled()
+    _set(False)
+    prev_serialize = _in_serialize
+    prev_cache = _types_mod._REC_CACHE_SUPPRESSED
+    _in_serialize = True
+    _types_mod._REC_CACHE_SUPPRESSED = True
+    try:
+        buf = WriteBuffer()
+        t.write(buf)
+        return buf.getvalue()
+    except Exception:
+        return None
+    finally:
+        _in_serialize = prev_serialize
+        _types_mod._REC_CACHE_SUPPRESSED = prev_cache
+        _set(prev)
+
+
 # ---- registration / adoption / cascade ----
 
 
@@ -936,16 +970,37 @@ def _mirror_setattr(self: Type, name: str, value: Any) -> None:
     if h is None:
         _count("post_setattr_unregistered." + fam)
         return
-    if _write_flip and type(self) is Instance and name == "args":
-        # F3 slice 1 (#1397): push the new args into the stored blob via the
-        # Rust splice op (decode + swap args + re-encode) instead of Python
+    if _write_flip and type(self) is Instance and name in _FLIP_FIELDS:
+        # F3 (#1397): push the changed field into the stored blob via the
+        # Rust splice op (decode + swap + re-encode) instead of Python
         # re-serialization. A None defers to the full fresh path.
         hidden_stored = _kernel_mod.rust_mirror_bytes(h)
-        args_blob = _args_list_bytes(self.args)
-        if args_blob is not None:
-            new_blob = _kernel_mod.rust_mirror_patch_instance_args(h, args_blob)
-        else:
-            new_blob = None
+        if name == "args":
+            args_blob = _args_list_bytes(self.args)
+            if args_blob is not None:
+                new_blob = _kernel_mod.rust_mirror_patch_instance_args(h, args_blob)
+            else:
+                new_blob = None
+        elif name == "type":
+            # The wire only carries `type.fullname` (types.py:1941).
+            try:
+                new_ref = self.type.fullname
+            except Exception:
+                new_ref = None
+            if new_ref is not None:
+                new_blob = _kernel_mod.rust_mirror_patch_instance_type(h, new_ref)
+            else:
+                new_blob = None
+        else:  # last_known_value
+            if value is None:
+                # A None write is the write_type_opt LITERAL_NONE clear.
+                new_blob = _kernel_mod.rust_mirror_patch_instance_lkv(h, None)
+            else:
+                lkv_blob = _single_type_bytes(value)
+                if lkv_blob is not None:
+                    new_blob = _kernel_mod.rust_mirror_patch_instance_lkv(h, lkv_blob)
+                else:
+                    new_blob = None
         if new_blob is not None:
             new_bytes = bytes(new_blob)
             if new_bytes == bytes(hidden_stored or b""):

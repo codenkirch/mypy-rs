@@ -20,9 +20,7 @@ use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 
 use crate::identity;
-use crate::wire::{
-    ReadBuffer, Type, WriteBuffer, read_type, read_type_list, write_type, write_type_list,
-};
+use crate::wire::{read_type, read_type_list, write_type, ReadBuffer, Type, WriteBuffer};
 
 pub(crate) struct MirrorEntry {
     pub(crate) family: String,
@@ -294,10 +292,115 @@ pub(crate) fn rust_mirror_patch_instance_args(handle: u64, args_blob: &[u8]) -> 
     patch_instance_args(handle, args_blob)
 }
 
+/// Splice `Instance.type` into the stored blob (F3 slice 2, #1397). The wire
+/// only carries the `type.fullname` string (`mypy/types.py:1941`), so the
+/// op takes the new fullname and leaves args/lkv/extra_attrs untouched.
+///
+/// Returns the stored blob unchanged when the fullname already matches
+/// (Python counts that as a noop), the new blob after `update` when it
+/// differs, or `None` to defer (unregistered handle, undecodable blob,
+/// or non-Instance stored family).
+pub(crate) fn patch_instance_type(handle: u64, new_type_ref: &str) -> Option<Vec<u8>> {
+    let old = entry_bytes(handle)?;
+    let stored = {
+        let mut buf = ReadBuffer::new(&old);
+        read_type(&mut buf, None).ok()?
+    };
+    let Type::Instance {
+        type_ref,
+        args,
+        last_known_value,
+        extra_attrs,
+    } = stored
+    else {
+        return None;
+    };
+    if type_ref == new_type_ref {
+        return Some(old);
+    }
+    let patched = Type::Instance {
+        type_ref: new_type_ref.to_string(),
+        args,
+        last_known_value,
+        extra_attrs,
+    };
+    let mut wbuf = WriteBuffer::new();
+    write_type(&mut wbuf, &patched).ok()?;
+    let blob = wbuf.into_bytes();
+    update(handle, blob.clone()).ok()?;
+    Some(blob)
+}
+
+#[pyfunction]
+#[pyo3(signature = (handle, new_type_ref))]
+pub(crate) fn rust_mirror_patch_instance_type(handle: u64, new_type_ref: &str) -> Option<Vec<u8>> {
+    patch_instance_type(handle, new_type_ref)
+}
+
+/// Splice `Instance.last_known_value` into the stored blob (F3 slice 2,
+/// #1397). `lkv_blob` is a single serialized `Type` (`Some`) or `None`
+/// (the `write_type_opt` `LITERAL_NONE` clear path, types.py:1943).
+///
+/// Same return protocol as `patch_instance_type`: stored blob on noop,
+/// new blob on change, `None` to defer. Also defers on an undecodable
+/// `lkv_blob` (a garbage value would silently corrupt the blob, so it
+/// must leak to the full fresh path, which re-serializes everything).
+pub(crate) fn patch_instance_lkv(handle: u64, lkv_blob: Option<&[u8]>) -> Option<Vec<u8>> {
+    let old = entry_bytes(handle)?;
+    let stored = {
+        let mut buf = ReadBuffer::new(&old);
+        read_type(&mut buf, None).ok()?
+    };
+    // Distinguish the legitimate `None` clear from a failed decode: a
+    // garbage `lkv_blob` must defer (None), not collapse into a noop.
+    let new_lkv = match lkv_blob {
+        None => None,
+        Some(b) => {
+            let mut buf = ReadBuffer::new(b);
+            match read_type(&mut buf, None) {
+                Ok(t) => Some(Box::new(t)),
+                Err(_) => return None,
+            }
+        }
+    };
+    let Type::Instance {
+        type_ref,
+        args,
+        last_known_value,
+        extra_attrs,
+    } = stored
+    else {
+        return None;
+    };
+    if last_known_value == new_lkv {
+        return Some(old);
+    }
+    let patched = Type::Instance {
+        type_ref,
+        args,
+        last_known_value: new_lkv,
+        extra_attrs,
+    };
+    let mut wbuf = WriteBuffer::new();
+    write_type(&mut wbuf, &patched).ok()?;
+    let blob = wbuf.into_bytes();
+    update(handle, blob.clone()).ok()?;
+    Some(blob)
+}
+
+#[pyfunction]
+#[pyo3(signature = (handle, lkv_blob))]
+pub(crate) fn rust_mirror_patch_instance_lkv(
+    handle: u64,
+    lkv_blob: Option<&[u8]>,
+) -> Option<Vec<u8>> {
+    patch_instance_lkv(handle, lkv_blob)
+}
+
 #[cfg(test)]
 mod mirror_tests {
     use super::*;
-
+    use crate::wire::{write_type_list, LiteralValue};
     fn with_py<T>(f: impl FnOnce(Python<'_>) -> T) -> T {
         pyo3::prepare_freethreaded_python();
         Python::with_gil(f)
@@ -432,7 +535,15 @@ mod mirror_tests {
             let h = register(obj, "instance", w.into_bytes(), vec![]).unwrap();
 
             let mut ab = WriteBuffer::new();
-            write_type_list(&mut ab, &[Type::AnyType { type_of_any: 2, source_any: None, missing_import_name: None }]).unwrap();
+            write_type_list(
+                &mut ab,
+                &[Type::AnyType {
+                    type_of_any: 2,
+                    source_any: None,
+                    missing_import_name: None,
+                }],
+            )
+            .unwrap();
             let new = patch_instance_args(h, &ab.into_bytes()).unwrap();
 
             let mut rbuf = ReadBuffer::new(&new);
@@ -479,6 +590,158 @@ mod mirror_tests {
             assert_eq!(patch_instance_args(h, &[9]), None);
             // Unregistered handle also defers.
             assert_eq!(patch_instance_args(h + 1, &[9]), None);
+        });
+    }
+
+    /// Wire-legal `LiteralType` fallback: an Instance (NoneType is rejected
+    /// by `read_literal_type`).
+    fn int_fallback() -> Type {
+        Type::Instance {
+            type_ref: "builtins.int".to_string(),
+            args: vec![],
+            last_known_value: None,
+            extra_attrs: None,
+        }
+    }
+
+    /// An empty-args Instance whose wire form is the INSTANCE_GENERIC full
+    /// encoding with an lkv slice (lkv forces the generic path even here).
+    fn lkv_instance_blob(value: Option<LiteralValue>) -> Vec<u8> {
+        let inst = Type::Instance {
+            type_ref: "builtins.list".to_string(),
+            args: vec![],
+            last_known_value: value.map(|v| {
+                Box::new(Type::LiteralType {
+                    fallback: Box::new(int_fallback()),
+                    value: v,
+                })
+            }),
+            extra_attrs: None,
+        };
+        let mut w = WriteBuffer::new();
+        write_type(&mut w, &inst).unwrap();
+        w.into_bytes()
+    }
+
+    #[test]
+    fn test_patch_instance_type_roundtrip() {
+        with_py(|py| {
+            reset();
+            let obj = fresh(py);
+            let h = register(obj, "instance", lkv_instance_blob(None), vec![]).unwrap();
+            let new = patch_instance_type(h, "builtins.dict").unwrap();
+            let mut rbuf = ReadBuffer::new(&new);
+            if let Type::Instance { type_ref, .. } = read_type(&mut rbuf, None).unwrap() {
+                assert_eq!(type_ref, "builtins.dict");
+            } else {
+                panic!("not an Instance after patch");
+            }
+        });
+    }
+
+    #[test]
+    fn test_patch_instance_type_is_noop_on_same_fullname() {
+        with_py(|py| {
+            reset();
+            let obj = fresh(py);
+            let blob = lkv_instance_blob(None);
+            let h = register(obj, "instance", blob.clone(), vec![]).unwrap();
+            assert_eq!(patch_instance_type(h, "builtins.list"), Some(blob.clone()));
+            // Change: new blob, and the stored bytes now say builtins.dict.
+            let new = patch_instance_type(h, "builtins.dict").unwrap();
+            let mut rbuf = ReadBuffer::new(&new);
+            if let Type::Instance { type_ref, .. } = read_type(&mut rbuf, None).unwrap() {
+                assert_eq!(type_ref, "builtins.dict");
+            } else {
+                panic!("not an Instance after change");
+            }
+            assert_eq!(entry_bytes(h), Some(new));
+        });
+    }
+
+    #[test]
+    fn test_patch_instance_lkv_roundtrip_and_clear() {
+        with_py(|py| {
+            reset();
+            let obj = fresh(py);
+            let blob = lkv_instance_blob(Some(LiteralValue::Int(3)));
+            let h = register(obj, "instance", blob, vec![]).unwrap();
+            // Noop: same literal value.
+            let same = {
+                let lit = Type::LiteralType {
+                    fallback: Box::new(int_fallback()),
+                    value: LiteralValue::Int(3),
+                };
+                let mut w = WriteBuffer::new();
+                write_type(&mut w, &lit).unwrap();
+                w.into_bytes()
+            };
+            // Noop: same literal value, so the op returns the pre-call
+            // stored bytes and leaves the handle untouched.
+            let before = entry_bytes(h).unwrap();
+            let ret = patch_instance_lkv(h, Some(&same)).unwrap();
+            assert_eq!(ret, before);
+            assert_eq!(entry_bytes(h), Some(before));
+            // Clear: the wire form flips back to an INSTANCE (empty args, no
+            // lkv) whose write output is the INSTANCE singleton for str...
+            // builtins.list is not a singleton name, so it stays generic.
+            let cleared = patch_instance_lkv(h, None).unwrap();
+            let mut rbuf = ReadBuffer::new(&cleared);
+            if let Type::Instance {
+                last_known_value, ..
+            } = read_type(&mut rbuf, None).unwrap()
+            {
+                assert!(last_known_value.is_none());
+            } else {
+                panic!("not an Instance after clear");
+            }
+            // Set again on a fresh handle for the set path.
+            let obj2 = fresh(py);
+            let h2 = register(obj2, "instance", lkv_instance_blob(None), vec![]).unwrap();
+            let set = patch_instance_lkv(h2, Some(&same)).unwrap();
+            let mut rbuf2 = ReadBuffer::new(&set);
+            if let Type::Instance {
+                last_known_value, ..
+            } = read_type(&mut rbuf2, None).unwrap()
+            {
+                assert!(
+                    matches!(last_known_value, Some(b) if matches!(&*b, Type::LiteralType { value: LiteralValue::Int(3), .. }))
+                );
+            } else {
+                panic!("not an Instance after set");
+            }
+        });
+    }
+
+    #[test]
+    fn test_patch_instance_type_and_lkv_defer_on_bad_shapes() {
+        with_py(|py| {
+            reset();
+            let obj = fresh(py);
+            // Bad stored blob: both defers.
+            let h = register(obj, "instance", b"garbage".to_vec(), vec![]).unwrap();
+            assert_eq!(patch_instance_type(h, "builtins.dict"), None);
+            assert_eq!(patch_instance_lkv(h, None), None);
+            assert_eq!(patch_instance_lkv(h, Some(&[9])), None);
+            // Unregistered handle: both defers.
+            let lit = Type::LiteralType {
+                fallback: Box::new(int_fallback()),
+                value: LiteralValue::Int(1),
+            };
+            let mut w = WriteBuffer::new();
+            write_type(&mut w, &lit).unwrap();
+            let blob = w.into_bytes();
+            assert_eq!(patch_instance_type(h + 7, "builtins.dict"), None);
+            assert_eq!(patch_instance_lkv(h + 7, Some(&blob)), None);
+            // A GOOD stored blob with no lkv plus a garbage lkv payload
+            // must defer, not collapse into the None clear (silent noop
+            // success for a real dropped write).
+            let obj3 = fresh(py);
+            let h3 = register(obj3, "instance", lkv_instance_blob(None), vec![]).unwrap();
+            assert_eq!(patch_instance_lkv(h3, Some(&[9])), None);
+            let obj4 = fresh(py);
+            let h4 = register(obj4, "instance", lkv_instance_blob(None), vec![]).unwrap();
+            assert_eq!(patch_instance_lkv(h4, Some(b"garbage")), None);
         });
     }
 }

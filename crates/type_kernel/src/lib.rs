@@ -3372,6 +3372,15 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         mirror::rust_mirror_patch_instance_args,
         module
     )?)?;
+    // Phase F3 slice 2 (#1397): `type` (type_ref) and `last_known_value`.
+    module.add_function(wrap_pyfunction!(
+        mirror::rust_mirror_patch_instance_type,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        mirror::rust_mirror_patch_instance_lkv,
+        module
+    )?)?;
 
     Ok(())
 }
