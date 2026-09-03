@@ -225,8 +225,15 @@ class _IdFifo:
                 return
 
     def _maybe_compact(self) -> None:
-        if self._cursor >= self._cap:
-            self._log = self._log[self._cursor :]
+        # Live members have exactly one live log entry each, so any surplus
+        # is stale. Gating on stale count (not the cursor, which only advances
+        # during evicts at full membership) keeps sub-cap churn bounded.
+        if len(self._log) - len(self._members) >= self._cap:
+            self._log = [
+                entry
+                for entry in self._log[self._cursor :]
+                if self._members.get(entry[1]) == entry[0]
+            ]
             self._cursor = 0
 
     def clear(self) -> None:
@@ -1288,6 +1295,7 @@ def reset(*, clear_counts: bool = False) -> None:
     _TVID_REVERSE.clear()
     _ALIAS_REVERSE.clear()
     _HIDDEN_EMBED.clear()
+    _SLOT_NAMES.clear()
     if clear_counts:
         for key, n in _audit.items():
             _audit_total[key] = _audit_total.get(key, 0) + n

@@ -50122,6 +50122,17 @@ class NativeMirrorIdFifoSuite(Suite):
         q.add(4)  # next evict is arithmetic on the compacted log
         assert set(q._members) == {3, 4}
 
+    def test_subcap_churn_log_stays_bounded(self) -> None:
+        q = self._fifo(64)
+        for i in range(1000):
+            # add + remove below the cap: no eviction happens, but the
+            # churn must not accumulate stale entries unboundedly (the
+            # old capped deque stayed at 64 entries).
+            q.add(i)
+            q.remove(i)
+        assert len(q._log) <= 64, len(q._log)
+        assert not q._members
+
 
 class NativeMirrorHiddenParentSuite(Suite):
     """Unit tests for the hidden-parent cascade of the F1 mirror.
