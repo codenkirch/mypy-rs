@@ -50816,9 +50816,7 @@ class NativeMirrorWalkIndicesRustSuite(Suite):
             variables=[fx.t],
         )
         graphs["alias"] = fx.def_alias_1(fx.a)[0]
-        graphs["union"] = UnionType(
-            [fx.gb, Instance(fx.std_tuplei, [graphs["alias"]])]
-        )
+        graphs["union"] = UnionType([fx.gb, Instance(fx.std_tuplei, [graphs["alias"]])])
         inst = Instance(fx.gi, [fx.d])
         # The walk only duck-types this dict; two keys are intentionally not
         # Types (scalar flag + mixed list) to pin container recursion.
@@ -50832,7 +50830,7 @@ class NativeMirrorWalkIndicesRustSuite(Suite):
     def _assert_equal(self, key: str, t: Any, rust: Any, py: Any) -> None:
         assert rust is not None, key
         for tag, r, p in zip(("tvids", "aliases", "embeds"), rust, py, strict=True):
-            assert [id(x) for x in r] == [id(x) for x in p], (key, tag)
+            assert [id(x) for x in r] == [id(x) for x in p], (key, type(t).__name__, tag)
 
     def test_differential_over_graphs(self) -> None:
         for key, t in self._graphs().items():
@@ -50854,8 +50852,7 @@ class NativeMirrorWalkIndicesRustSuite(Suite):
         import types as _types_mod
 
         stub = _types_mod.SimpleNamespace(
-            rust_mirror_handle_of=lambda obj: None,
-            rust_mirror_walk_indices=lambda root: None,
+            rust_mirror_handle_of=lambda obj: None, rust_mirror_walk_indices=lambda root: None
         )
         graphs = self._graphs()
         saved = self._m._kernel_mod
