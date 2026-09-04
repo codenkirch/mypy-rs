@@ -69,6 +69,9 @@ from mypy.types import (
     UninhabitedType,
     UnionType,
     UnpackType,
+    _read_mirror_blob,
+    _serialize_stats,
+    _serialize_stats_on,
     _serialize_with_taint_check,
     _type_wire_cache,
     _wire_cache_enabled,
@@ -298,6 +301,13 @@ def _serialize_type(t: Type) -> bytes:
             and fn in _BUILTIN_INSTANCE_BYTES
         ):
             return _BUILTIN_INSTANCE_BYTES[fn]
+    # Phase F2 (#1393, slice 4): mirror-blob read on the expensive miss
+    # path, same seam contract as the checkexpr funnel.
+    blob = _read_mirror_blob(t)
+    if blob is not None:
+        if _serialize_stats_on:
+            _serialize_stats["mirror"] += 1
+        return blob
     buf = _WriteBuffer()
     result, saw_tvar = _serialize_with_taint_check(t, buf)
     if (
