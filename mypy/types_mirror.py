@@ -86,6 +86,10 @@ SKIP_ATTRS: Final = frozenset(
         "end_line",
         "end_column",
         "definition",
+        # Wire-invisible (Phase F0, #1349): the wire never carries it, so a
+        # recorded write can only be a noop (profile: 418 capturable writes
+        # per self-check).
+        "special_sig",
     }
 )
 
@@ -110,6 +114,34 @@ _read_mode = False
 # splice op; a splice that drifts surfaces at the next serial funnel.
 _write_flip = False
 _FLIP_FIELDS: Final[frozenset[str]] = frozenset({"args", "type", "last_known_value"})
+# Wire fields a splice op handles for CallableType (slice 8): the wire
+# write order of the seven bools matters to the flags op only.
+_MUTABLE_CALLABLE_FLAGS: Final[frozenset[str]] = frozenset(
+    {
+        "is_ellipsis_args",
+        "implicit",
+        "is_bound",
+        "from_concatenate",
+        "imprecise_arg_kinds",
+        "unpack_kwargs",
+        "from_type_type",
+    }
+)
+_CALLABLE_FLIP_FIELDS: Final[frozenset[str]] = frozenset(
+    {
+        "ret_type",
+        "arg_types",
+        "arg_kinds",
+        "arg_names",
+        "name",
+        "variables",
+        "type_guard",
+        "type_is",
+        "fallback",
+        "instance_type",
+    }
+    | _MUTABLE_CALLABLE_FLAGS
+)
 _ORIG_SETATTR: Any = None
 # family class -> saved originals (for a future multi-run protocol).
 _originals: dict[type, dict[str, Any]] = {}
@@ -1001,6 +1033,117 @@ def _make_init_wrapper(orig_init: Any, family: str) -> Any:
     return init
 
 
+def _finish_splice(fam: str, name: str, h: int, hidden_stored: Any, new_blob: Any) -> bool:
+    """Shared tail of a flipped setattr: count and stamp the splice.
+
+    Called with `hidden_stored` (the pre-splice blob bytes) and `new_blob`
+    (the op result, or None). Returns True when the splice served the
+    write and the caller must return from `_mirror_setattr`; False
+    defers the capture to the generic full-serialize path.
+    """
+    if new_blob is None:
+        _count(f"setattr_splice_defer.{fam}.{name}")
+        return False
+    new_bytes = bytes(new_blob)
+    if new_bytes == bytes(hidden_stored or b""):
+        _count(f"setattr_noop.{fam}.{name}")
+    else:
+        _count(f"setattr_spliced.{fam}.{name}")
+        _update_and_cascade(h, new_bytes, name)
+    # Either branch leaves the stored blob authoritative.
+    _kernel_mod.rust_mirror_stamp_sync(h, _UNPROT_EPOCH)
+    return True
+
+
+def _instance_splice_blob(self: Instance, h: int, name: str, value: Any) -> Any:
+    """Serialize the changed Instance field and run the matching splice op."""
+    if name == "args":
+        args_blob = _args_list_bytes(self.args)
+        if args_blob is not None:
+            return _kernel_mod.rust_mirror_patch_instance_args(h, args_blob)
+    elif name == "type":
+        # The wire only carries `type.fullname` (types.py:1941).
+        try:
+            new_ref = self.type.fullname
+        except Exception:
+            new_ref = None
+        if new_ref is not None:
+            return _kernel_mod.rust_mirror_patch_instance_type(h, new_ref)
+    else:  # last_known_value
+        if value is None:
+            # A None write is the write_type_opt LITERAL_NONE clear.
+            return _kernel_mod.rust_mirror_patch_instance_lkv(h, None)
+        lkv_blob = _single_type_bytes(value)
+        if lkv_blob is not None:
+            return _kernel_mod.rust_mirror_patch_instance_lkv(h, lkv_blob)
+    return None
+
+
+_CALLABLE_FLAGS_ORDER: Final[tuple[str, ...]] = (
+    "is_ellipsis_args",
+    "implicit",
+    "is_bound",
+    "from_concatenate",
+    "imprecise_arg_kinds",
+    "unpack_kwargs",
+    "from_type_type",
+)
+
+
+def _callable_splice_blob(self: CallableType, h: int, name: str) -> Any:
+    """Serialize the changed CallableType field and run the matching splice op."""
+    k = _kernel_mod
+    if name == "ret_type":
+        blob = _single_type_bytes(self.ret_type)
+        if blob is not None:
+            return k.rust_mirror_patch_callable_ret_type(h, blob)
+    elif name == "arg_types":
+        blob = _args_list_bytes(self.arg_types)
+        if blob is not None:
+            return k.rust_mirror_patch_callable_arg_types(h, blob)
+    elif name == "arg_kinds":
+        return k.rust_mirror_patch_callable_arg_kinds(h, [int(kd.value) for kd in self.arg_kinds])
+    elif name == "arg_names":
+        return k.rust_mirror_patch_callable_arg_names(h, list(self.arg_names))
+    elif name == "name":
+        return k.rust_mirror_patch_callable_name(h, self.name)
+    elif name == "variables":
+        blob = _args_list_bytes(self.variables)
+        if blob is not None:
+            return k.rust_mirror_patch_callable_variables(h, blob)
+    elif name == "type_guard":
+        if self.type_guard is None:
+            return k.rust_mirror_patch_callable_opt_field(h, 0, None)
+        blob = _single_type_bytes(self.type_guard)
+        if blob is not None:
+            return k.rust_mirror_patch_callable_opt_field(h, 0, blob)
+    elif name == "type_is":
+        if self.type_is is None:
+            return k.rust_mirror_patch_callable_opt_field(h, 1, None)
+        blob = _single_type_bytes(self.type_is)
+        if blob is not None:
+            return k.rust_mirror_patch_callable_opt_field(h, 1, blob)
+    elif name == "fallback":
+        blob = _single_type_bytes(self.fallback)
+        if blob is not None:
+            return k.rust_mirror_patch_callable_fallback(h, blob)
+    elif name == "instance_type":
+        if self.instance_type is None:
+            return k.rust_mirror_patch_callable_instance_type(h, None)
+        blob = _single_type_bytes(self.instance_type)
+        if blob is not None:
+            return k.rust_mirror_patch_callable_instance_type(h, blob)
+    else:
+        # One of the seven wire bools: one Rust op rewrites all seven.
+        try:
+            flags = [bool(getattr(self, flag_name)) for flag_name in _CALLABLE_FLAGS_ORDER]
+        except Exception:
+            flags = None
+        if flags is not None:
+            return k.rust_mirror_patch_callable_flags(h, flags)
+    return None
+
+
 def _mirror_setattr(self: Type, name: str, value: Any) -> None:
     hook = _rules_ok(self) and _construction == 0 and name not in SKIP_ATTRS
     if not hook and _active and type(self) in FAMILY_NAME and name not in SKIP_ATTRS:
@@ -1054,44 +1197,21 @@ def _mirror_setattr(self: Type, name: str, value: Any) -> None:
         # F3 (#1397): push the changed field into the stored blob via the
         # Rust splice op (decode + swap + re-encode) instead of Python
         # re-serialization. A None defers to the full fresh path.
-        hidden_stored = _kernel_mod.rust_mirror_bytes(h)
-        if name == "args":
-            args_blob = _args_list_bytes(self.args)
-            if args_blob is not None:
-                new_blob = _kernel_mod.rust_mirror_patch_instance_args(h, args_blob)
-            else:
-                new_blob = None
-        elif name == "type":
-            # The wire only carries `type.fullname` (types.py:1941).
-            try:
-                new_ref = self.type.fullname
-            except Exception:
-                new_ref = None
-            if new_ref is not None:
-                new_blob = _kernel_mod.rust_mirror_patch_instance_type(h, new_ref)
-            else:
-                new_blob = None
-        else:  # last_known_value
-            if value is None:
-                # A None write is the write_type_opt LITERAL_NONE clear.
-                new_blob = _kernel_mod.rust_mirror_patch_instance_lkv(h, None)
-            else:
-                lkv_blob = _single_type_bytes(value)
-                if lkv_blob is not None:
-                    new_blob = _kernel_mod.rust_mirror_patch_instance_lkv(h, lkv_blob)
-                else:
-                    new_blob = None
-        if new_blob is not None:
-            new_bytes = bytes(new_blob)
-            if new_bytes == bytes(hidden_stored or b""):
-                _count(f"setattr_noop.{fam}.{name}")
-            else:
-                _count(f"setattr_spliced.{fam}.{name}")
-                _update_and_cascade(h, new_bytes, name)
-            # Either branch leaves the stored blob authoritative.
-            _kernel_mod.rust_mirror_stamp_sync(h, _UNPROT_EPOCH)
+        if _finish_splice(
+            fam,
+            name,
+            h,
+            _kernel_mod.rust_mirror_bytes(h),
+            _instance_splice_blob(self, h, name, value),
+        ):
             return
-        _count(f"setattr_splice_defer.{fam}.{name}")
+    elif _write_flip and type(self) is CallableType and name in _CALLABLE_FLIP_FIELDS:
+        # F3 slice 8 (#1397): field-granular CallableType splices over the
+        # same wire-visible fields, running Instance-style.
+        if _finish_splice(
+            fam, name, h, _kernel_mod.rust_mirror_bytes(h), _callable_splice_blob(self, h, name)
+        ):
+            return
     try:
         fresh = _fresh_bytes(self)
     except Exception:
