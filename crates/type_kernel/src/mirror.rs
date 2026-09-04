@@ -185,9 +185,7 @@ pub(crate) fn parents(handle: u64) -> Vec<u64> {
 /// needs one call per funnel assert instead of tick + check + sync.
 pub(crate) fn write_skip(handle: u64, stamp_epoch: u64) -> bool {
     with_mirror(|m| match m.by_handle.get_mut(&handle) {
-        Some(entry) if entry.stamp == stamp_epoch => {
-            true
-        }
+        Some(entry) if entry.stamp == stamp_epoch => true,
         Some(_) => false,
         None => false,
     })
