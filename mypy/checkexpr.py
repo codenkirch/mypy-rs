@@ -625,6 +625,7 @@ _BUILTIN_INSTANCE_BYTES: Final[dict[str, bytes]] = {
     "builtins.object": b"\x50\x57",
 }
 
+
 def _serialize_type_for_checkexpr(t: Type) -> bytes:
     if _serialize_stats_on:
         _serialize_stats["calls"] += 1

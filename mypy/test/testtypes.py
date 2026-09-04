@@ -49670,13 +49670,34 @@ class NativeMirrorSpliceSuite(Suite):
 
         from mypy.types import _write_type_cached
 
+        # The in-place arg splice fires no family setattr and escapes
+        # capture, exactly like a mid-flight unprotected-window write;
+        # the bump models what any escaped setattr path leaves behind.
+        c = self._callable()
+        _write_type_cached(c, WriteBuffer())  # cache fill
+        c.arg_types[0] = self.fx.std_tuple  # in-place mutation escapes capture
+        self._m._bump_unprot()
+        self._m._strict = True
+        try:
+            with self.assertRaises(AssertionError):
+                _write_type_cached(c, WriteBuffer())
+        finally:
+            self._m._strict = False
+
+    def test_strict_mode_skips_until_unprotected_bump(self) -> None:
+        from librt.internal import WriteBuffer
+
+        from mypy.types import _write_type_cached
+
+        # Without a bump the funnel trusts the stamp; splice funnels keep
+        # their full re-serialization, so the cachedsplice path below is
+        # what still guards in-place drift when the wire cache is active.
         c = self._callable()
         _write_type_cached(c, WriteBuffer())  # cache fill
         c.arg_types[0] = self.fx.std_tuple  # in-place mutation escapes capture
         self._m._strict = True
         try:
-            with self.assertRaises(AssertionError):
-                _write_type_cached(c, WriteBuffer())
+            _write_type_cached(c, WriteBuffer())  # stamped: funnel skips
         finally:
             self._m._strict = False
 
@@ -49788,7 +49809,7 @@ class NativeMirrorTypeVarIdSuite(Suite):
         before = dict(self._m.report())
         ct.write(WriteBuffer())  # mirror already caught up: must assert clean
         delta = self._delta(before)
-        assert delta.get("assert_ok.callable.write") == 1, delta
+        assert delta.get("assert_skip.callable.write") == 1, delta
         assert not any(k.startswith("mismatch.") for k in delta), delta
 
     def test_equal_write_counts_equal_and_skips_cascade(self) -> None:
@@ -49837,7 +49858,7 @@ class NativeMirrorTypeVarIdSuite(Suite):
         ct.write(WriteBuffer())
         ct2.write(WriteBuffer())
         delta = self._delta(before)
-        assert delta.get("assert_ok.callable.write") == 2, delta
+        assert delta.get("assert_skip.callable.write") == 2, delta
         assert not any(k.startswith("mismatch.") for k in delta), delta
 
     def test_id_swap_via_family_setattr_roadmaps_new_tvid(self) -> None:
@@ -49924,7 +49945,7 @@ class NativeMirrorTypeAliasFlagSuite(Suite):
         before = dict(self._m.report())
         self._write(ct)  # mirror already caught up: must assert clean
         delta = self._delta(before)
-        assert delta.get("assert_ok.instance.write") == 1, delta
+        assert delta.get("assert_skip.instance.write") == 1, delta
         assert not any(k.startswith("mismatch.") for k in delta), delta
 
     def test_target_descent_records_embedded_nodes(self) -> None:
@@ -49948,7 +49969,7 @@ class NativeMirrorTypeAliasFlagSuite(Suite):
         before = dict(self._m.report())
         self._write(ct)
         delta = self._delta(before)
-        assert delta.get("assert_ok.instance.write") == 1, delta
+        assert delta.get("assert_skip.instance.write") == 1, delta
         assert not any(k.startswith("mismatch.") for k in delta), delta
 
     def test_equal_write_counts_equal_and_skips_cascade(self) -> None:
@@ -50203,7 +50224,7 @@ class NativeMirrorHiddenParentSuite(Suite):
         before = dict(self._m.report())
         tv.write(WriteBuffer())  # mirror already caught up: must assert clean
         delta = self._delta(before)
-        assert delta.get("assert_ok.tvar.write") == 1, delta
+        assert delta.get("assert_skip.tvar.write") == 1, delta
         assert not any(k.startswith("mismatch.") for k in delta), delta
 
     def test_cascade_transitive_through_callable(self) -> None:
@@ -50225,8 +50246,8 @@ class NativeMirrorHiddenParentSuite(Suite):
         delta = self._delta(before)
         # tv asserts clean twice: its own write funnel plus the re-assert
         # triggered through ct's write path.
-        assert delta.get("assert_ok.tvar.write") == 2, delta
-        assert delta.get("assert_ok.callable.write") == 1, delta
+        assert delta.get("assert_skip.tvar.write") == 2, delta
+        assert delta.get("assert_skip.callable.write") == 1, delta
         assert not any(k.startswith("mismatch.") for k in delta), delta
 
     def test_strict_mode_does_not_raise_on_hidden_parent_capture(self) -> None:
@@ -50255,7 +50276,7 @@ class NativeMirrorHiddenParentSuite(Suite):
         before = dict(self._m.report())
         tv.write(WriteBuffer())  # must already be fresh: assert_ok, no mismatch
         delta = self._delta(before)
-        assert delta.get("assert_ok.tvar.write") == 1, delta
+        assert delta.get("assert_skip.tvar.write") == 1, delta
         assert not any(k.startswith("mismatch.") for k in delta), delta
 
     def test_late_registered_hidden_leaf_cascades_prior_adopters(self) -> None:
@@ -50276,8 +50297,200 @@ class NativeMirrorHiddenParentSuite(Suite):
         before = dict(self._m.report())
         tv.write(WriteBuffer())  # strict self-check on the re-synced blob
         delta = self._delta(before)
-        assert delta.get("assert_ok.tvar.write") == 1, delta
+        assert delta.get("assert_skip.tvar.write") == 1, delta
         assert not any(k.startswith("mismatch.") for k in delta), delta
+
+
+class NativeWriteFunnelSkipSuite(Suite):
+    """Unit tests for the unprotected-write epoch protocol (slice 6, #1397).
+
+    Writes the mirror does not capture-and-sync on a REGISTERED target
+    bump the global unprotected epoch (suppression windows, failed syncs);
+    writes on never-registered objects bump nothing, because no stored
+    blob can embed one: embedding implies prior adoption (which
+    registers), and a derivation through a never-serializable struck
+    object cannot exist to have stored bytes from. A write funnel then
+    skips full re-serialization iff the object's blob was stamped at the
+    current epoch: `assert_ok` shrinks to adopt-time entries and
+    epoch-bust re-verifies, `assert_skip` carries the steady-state
+    traffic. Synced/captured writes restamp, SKIP_ATTRS writes bump
+    nothing, and a drift after a bump still surfaces.
+
+    TypeFixture fixtures reuse nested family Instances, and a root write
+    serializes its registered nested children through their own write
+    funnels too, so the checks below are structural (any skip, no ok)
+    rather than exact funnel counts.
+    """
+
+    def setUp(self) -> None:
+        from mypy import types_mirror
+
+        types_mirror.activate(audit=True)
+        types_mirror.reset(clear_counts=True)
+        self._m = types_mirror
+        self.fx = TypeFixture()
+
+    def tearDown(self) -> None:
+        self._m._strict = False
+        self._m.reset(clear_counts=True)
+
+    def _delta(self, before: dict[str, int]) -> dict[str, int]:
+        after = self._m.report()
+        return {
+            k: v - before.get(k, 0)
+            for k, v in after.items()
+            if v != before.get(k, 0) and "init." not in k
+        }
+
+    def _synced(self) -> Instance:
+        from librt.internal import WriteBuffer
+
+        inst = Instance(self.fx.std_tuplei, [self.fx.a])
+        inst.write(WriteBuffer())  # adopt path: registers and stamps
+        return inst
+
+    def test_adopt_registers_without_assert_then_funnel_skips(self) -> None:
+        from librt.internal import WriteBuffer
+
+        inst = Instance(self.fx.std_tuplei, [self.fx.a])
+        before = dict(self._m.report())
+        inst.write(WriteBuffer())  # first funnel: adopt, no assert yet
+        delta = self._delta(before)
+        assert delta.get("adopt.instance.write") == 1, delta
+        assert not any(k.startswith("assert_ok.") for k in delta), delta
+        before = dict(self._m.report())
+        inst.write(WriteBuffer())  # stamped at the current epoch: skip
+        delta = self._delta(before)
+        assert any(k.startswith("assert_skip.") for k in delta), delta
+        assert not any(k.startswith(("assert_ok.", "mismatch.")) for k in delta), delta
+
+    def test_bump_forces_verify_then_funnel_restamps(self) -> None:
+        from librt.internal import WriteBuffer
+
+        inst = self._synced()
+        before = dict(self._m.report())
+        inst.write(WriteBuffer())  # still stamped: skip
+        delta = self._delta(before)
+        assert any(k.startswith("assert_skip.") for k in delta), delta
+        assert not any(k.startswith(("assert_ok.", "mismatch.")) for k in delta), delta
+        self._m._bump_unprot()
+        before = dict(self._m.report())
+        inst.write(WriteBuffer())  # stamp stale: full verify, no skip
+        delta = self._delta(before)
+        assert any(k.startswith("assert_ok.") for k in delta), delta
+        assert not any(k.startswith(("assert_skip.", "mismatch.")) for k in delta), delta
+        before = dict(self._m.report())
+        inst.write(WriteBuffer())  # the verify restamped: skip again
+        delta = self._delta(before)
+        assert any(k.startswith("assert_skip.") for k in delta), delta
+        assert not any(k.startswith(("assert_ok.", "mismatch.")) for k in delta), delta
+
+    def test_uncaptured_setattr_bumps_and_next_funnel_verifies(self) -> None:
+        from librt.internal import WriteBuffer
+
+        inst = self._synced()
+        before = dict(self._m.report())
+        # Suppression-window setattr on a REGISTERED object with an
+        # unchanged value: the raw write lands uncaptured, leaving the
+        # mirrored blob still correct.
+        self._m._construction += 1
+        try:
+            inst.args = (self.fx.a,)
+        finally:
+            self._m._construction -= 1
+        delta = self._delta(before)
+        assert not any(k.startswith("setattr_captured.") for k in delta), delta
+        before = dict(self._m.report())
+        inst.write(WriteBuffer())  # bump busts the stamp: full verify
+        delta = self._delta(before)
+        assert any(k.startswith("assert_ok.") for k in delta), delta
+        assert not any(k.startswith(("assert_skip.", "mismatch.")) for k in delta), delta
+
+    def test_window_write_on_unregistered_object_bumps_nothing(self) -> None:
+        from librt.internal import WriteBuffer
+
+        before = dict(self._m.report())
+        sup = Instance(self.fx.std_tuplei, [self.fx.a])
+        # The suppression-window setattr happens on a never-registered
+        # object that no stored blob embeds: no bump, and a later funnel
+        # derives its blob fresh as the first adopt-path entry.
+        self._m._construction += 1
+        try:
+            sup.args = (self.fx.o,)
+        finally:
+            self._m._construction -= 1
+        delta = self._delta(before)
+        assert not any(k.startswith("unprot_bump") for k in delta), delta
+        before = dict(self._m.report())
+        sup.write(WriteBuffer())
+        delta = self._delta(before)
+        assert delta.get("adopt.instance.write") == 1, delta
+
+    def test_adoption_struck_write_bumps_nothing(self) -> None:
+        from librt.internal import WriteBuffer
+
+        struck = Instance(self.fx.std_tuplei, [self.fx.a])  # never registered
+        self._m._ADOPT_STRIKE.add(id(struck))
+        before = dict(self._m.report())
+        struck.args = (self.fx.o,)
+        delta = self._delta(before)
+        # The write lands raw on an adoption-struck, never-serialized
+        # object: recorded, but no epoch bump (no stored blob exists).
+        assert delta.get("strike_gag_uncaptured") == 1, delta
+        assert not any(k.startswith("unprot_bump") for k in delta), delta
+        before = dict(self._m.report())
+        struck.write(WriteBuffer())
+        delta = self._delta(before)
+        assert delta.get("adopt.instance.write") == 1, delta
+
+    def test_skip_attr_write_bumps_nothing(self) -> None:
+        from librt.internal import WriteBuffer
+
+        inst = self._synced()
+        before = dict(self._m.report())
+        inst.line = 123  # in SKIP_ATTRS: uncaptured by design, harmless
+        delta = self._delta(before)
+        assert not any(
+            k.startswith(("assert_ok.", "assert_skip.", "mismatch.")) for k in delta
+        ), delta
+        before = dict(self._m.report())
+        inst.write(WriteBuffer())  # stamp unaffected: still skips
+        delta = self._delta(before)
+        assert any(k.startswith("assert_skip.") for k in delta), delta
+        assert not any(k.startswith(("assert_ok.", "mismatch.")) for k in delta), delta
+
+    def test_captured_setattr_restamps(self) -> None:
+        from librt.internal import WriteBuffer
+
+        inst = self._synced()
+        before = dict(self._m.report())
+        inst.args = (self.fx.o,)  # captured write
+        delta = self._delta(before)
+        assert delta.get("setattr_captured.instance.args") == 1, delta
+        assert not any(k.startswith("mismatch.") for k in delta), delta
+        before = dict(self._m.report())
+        inst.write(WriteBuffer())  # capture restamped: skip, no assert
+        delta = self._delta(before)
+        assert any(k.startswith("assert_skip.") for k in delta), delta
+        assert not any(k.startswith(("assert_ok.", "mismatch.")) for k in delta), delta
+
+    def test_drift_after_bump_is_caught_and_healed(self) -> None:
+        from librt.internal import WriteBuffer
+
+        inst = self._synced()
+        self._m._bump_unprot()
+        # Raw setattr: bypasses the patched __setattr__ entirely, so the
+        # write lands uncaptured on top of an already-bumped epoch.
+        self._m._ORIG_SETATTR(inst, "args", (self.fx.o,))
+        before = dict(self._m.report())
+        inst.write(WriteBuffer())
+        delta = self._delta(before)
+        assert delta.get("mismatch.instance.write") == 1, delta
+        before = dict(self._m.report())
+        inst.write(WriteBuffer())  # the mismatch resynced the mirror
+        delta = self._delta(before)
+        assert any(k.startswith("assert_skip.") for k in delta), delta
+        assert not any(k.startswith(("mismatch.", "assert_ok.")) for k in delta), delta
 
 
 class NativeMirrorWalkIndicesSuite(Suite):
