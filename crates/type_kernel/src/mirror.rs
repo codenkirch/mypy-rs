@@ -498,7 +498,7 @@ fn callable_fields(handle: u64) -> Option<CallableFields> {
         variables,
         type_guard,
         type_is,
-        ..
+        special_sig: _,
     } = stored
     else {
         return None;
@@ -706,14 +706,16 @@ pub(crate) fn rust_mirror_patch_callable_variables(
 /// `None` is the write_type_opt LITERAL_NONE clear, `Some(blob)` is one
 /// serialized Type. Both branches route through `which` to keep the two
 /// call sites on one pyfunction each.
+const OPT_FIELD_TYPE_GUARD: u32 = 0;
+const OPT_FIELD_TYPE_IS: u32 = 1;
 fn patch_callable_opt_field(
     handle: u64,
     which: u32,
     blob: Option<&[u8]>,
 ) -> Option<Vec<u8>> {
     let slot_is_guard = match which {
-        0 => true,
-        1 => false,
+        OPT_FIELD_TYPE_GUARD => true,
+        OPT_FIELD_TYPE_IS => false,
         _ => return None,
     };
     let mut cf = callable_fields(handle)?;
@@ -727,13 +729,11 @@ fn patch_callable_opt_field(
             }
         }
     };
-    let current = if slot_is_guard {
-        cf.type_guard.as_ref()
+    let current_matches = if slot_is_guard {
+        cf.type_guard.as_deref() == new_val.as_deref()
     } else {
-        cf.type_is.as_ref()
+        cf.type_is.as_deref() == new_val.as_deref()
     };
-    let current_cloned = current.cloned();
-    let current_matches = current_cloned == new_val;
     if current_matches {
         return entry_bytes(handle);
     }
