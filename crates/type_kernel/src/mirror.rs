@@ -463,8 +463,8 @@ use std::collections::HashSet;
 use std::rc::Rc;
 
 use pyo3::exceptions::PyAttributeError;
-use pyo3::PyDowncastError;
 use pyo3::types::{PyBytes, PyDict, PyFloat, PyInt, PyList, PyString, PyTuple, PyType};
+use pyo3::PyDowncastError;
 
 /// Slots that never hold a Type child (positions; _-prefixed slot names
 /// are skipped by prefix in `collect_slot_names`).
@@ -558,11 +558,7 @@ fn collect_slot_names(ty: &PyType, py: Python) -> Result<Vec<String>, WalkErr> {
     Ok(out)
 }
 
-fn slot_names_for(
-    ctx: &mut WalkCtx,
-    py: Python,
-    t: &PyAny,
-) -> Result<Rc<Vec<String>>, WalkErr> {
+fn slot_names_for(ctx: &mut WalkCtx, py: Python, t: &PyAny) -> Result<Rc<Vec<String>>, WalkErr> {
     let ty = t.get_type();
     let key = ty.as_ptr() as usize;
     if let Some(v) = ctx.slot_cache.get(&key) {
@@ -617,12 +613,19 @@ fn is_scalar(value: &PyAny) -> bool {
 /// which diverges for classes defined in a local scope (duck-typed stubs
 /// like the ExtraAttrs test double).
 fn py_type_name(value: &PyAny) -> Result<String, WalkErr> {
-    let name = value.get_type().getattr("__name__").map_err(WalkErr::from)?;
+    let name = value
+        .get_type()
+        .getattr("__name__")
+        .map_err(WalkErr::from)?;
     let s = name.downcast::<PyString>().map_err(WalkErr::from)?;
     Ok(s.to_str().map_err(WalkErr::from)?.to_string())
-}/// Dispatch order mirrors `_walk_value` exactly. Depth cap checked here:
-/// every descent step and slot read lands in walk_value, so this one
-/// gate bounds the whole recursion.
+}
+
+/// Dispatch order mirrors `_walk_value` exactly. The cap gate here plus the
+/// `depth + 1` passed into every direct recursion bounds all descent edges,
+/// so a pure-container cycle defers at the cap instead of overflowing the
+/// native stack (Python's fallback then hits its own RecursionError, as
+/// before the port).
 fn walk_value(
     ctx: &mut WalkCtx,
     py: Python,
@@ -676,7 +679,7 @@ fn walk_value(
                     py,
                     target.as_ref(py),
                     seen,
-                    depth,
+                    depth + 1,
                     tvids,
                     aliases,
                     embeds,
@@ -689,7 +692,7 @@ fn walk_value(
         seen.insert(vptr);
         for item in value.iter().map_err(WalkErr::from)? {
             let item = item.map_err(WalkErr::from)?;
-            walk_value(ctx, py, item, seen, depth, tvids, aliases, embeds)?;
+            walk_value(ctx, py, item, seen, depth + 1, tvids, aliases, embeds)?;
         }
         return Ok(());
     }
@@ -698,7 +701,7 @@ fn walk_value(
         let values = value.call_method0("values").map_err(WalkErr::from)?;
         for item in values.iter().map_err(WalkErr::from)? {
             let item = item.map_err(WalkErr::from)?;
-            walk_value(ctx, py, item, seen, depth, tvids, aliases, embeds)?;
+            walk_value(ctx, py, item, seen, depth + 1, tvids, aliases, embeds)?;
         }
         return Ok(());
     }
@@ -709,7 +712,7 @@ fn walk_value(
                 py,
                 attrs.as_ref(py),
                 seen,
-                depth,
+                depth + 1,
                 tvids,
                 aliases,
                 embeds,
@@ -743,8 +746,17 @@ pub(crate) fn rust_mirror_walk_indices(
     let mut embeds = Vec::new();
     let mut seen = HashSet::new();
     seen.insert(root.as_ptr() as usize);
-    walk_slots(&mut ctx, py, root, &mut seen, 0, &mut tvids, &mut aliases, &mut embeds)
-        .ok()?;
+    walk_slots(
+        &mut ctx,
+        py,
+        root,
+        &mut seen,
+        0,
+        &mut tvids,
+        &mut aliases,
+        &mut embeds,
+    )
+    .ok()?;
     Some((tvids, aliases, embeds))
 }
 
@@ -1131,6 +1143,32 @@ mod mirror_tests {
             assert_eq!(h2, h);
             assert!(!write_skip(h, 9));
             assert!(write_skip(h, 0));
+        });
+    }
+
+    /// A self-referencing list must defer at the depth cap, not overflow the
+    /// native stack (Python's fallback then hits its own RecursionError).
+    #[test]
+    fn test_walk_indices_defers_on_container_cycle() {
+        with_py(|py| {
+            let l = PyList::empty(py);
+            l.append(py.None()).unwrap();
+            l.append(l).unwrap(); // self cycle
+            assert!(rust_mirror_walk_indices(py, l).is_none());
+        });
+    }
+
+    /// Acyclic but deeper than the cap defers the same way.
+    #[test]
+    fn test_walk_indices_defers_on_deep_container_nesting() {
+        with_py(|py| {
+            let mut cur: Py<PyAny> = PyList::empty(py).into();
+            for _ in 0..(WALK_DEPTH_CAP + 10) {
+                let l = PyList::empty(py);
+                l.append(cur.as_ref(py)).unwrap();
+                cur = l.into();
+            }
+            assert!(rust_mirror_walk_indices(py, cur.as_ref(py)).is_none());
         });
     }
 }
