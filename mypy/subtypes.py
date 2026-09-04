@@ -303,8 +303,8 @@ def _serialize_type(t: Type) -> bytes:
     if (
         not saw_tvar
         and _wire_cache_enabled()
-        and (not isinstance(t, Instance) or t.type_ref is None)
-    ):  # type: ignore[misc]
+        and (not isinstance(t, Instance) or t.type_ref is None)  # type: ignore[misc]
+    ):
         _type_wire_cache[key] = (t, result)
     return result
 
