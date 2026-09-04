@@ -50070,11 +50070,24 @@ class NativeMirrorAdoptStrikeSuite(Suite):
         self._m._note_failed_adoption(inst)  # simulate earlier failed adoption
         self._m._strict = True
         try:
+            # Slice 10 (#1397): within the strike window the write funnel
+            # skips the memoized root instead of re-serializing and
+            # re-failing registration on every visit.
             before = dict(self._m.report())
-            inst.write(WriteBuffer())  # write funnel adopts successfully
+            inst.write(WriteBuffer())
+            delta = self._delta(before)
+            assert delta.get("adopt_strike_skip.instance.write") == 1, delta
+            assert self._m._handle_of(inst) is None
+            # Past the bounded probe the next visit retries: the dup-add
+            # makes the very next encounter roll over into the probe, and
+            # a successful adoption then clears the memo.
+            self._m._ADOPT_STRIKE.add(id(inst), self._m._STRIKE_RETRY_INTERVAL - 1)
+            before = dict(self._m.report())
+            inst.write(WriteBuffer())
             delta = self._delta(before)
             assert delta.get("adopt.instance.write") == 1, delta
             assert delta.get("strike_cleared_on_adopt") == 1, delta
+            assert self._m._handle_of(inst) is not None
             # The memo is gone: a real mutation is captured at the source.
             before = dict(self._m.report())
             inst.args = (self.fx.o,)
@@ -50446,7 +50459,7 @@ class NativeWriteFunnelSkipSuite(Suite):
         from librt.internal import WriteBuffer
 
         struck = Instance(self.fx.std_tuplei, [self.fx.a])  # never registered
-        self._m._ADOPT_STRIKE.add(id(struck))
+        self._m._note_failed_adoption(struck)  # publish the strike memo
         before = dict(self._m.report())
         struck.args = (self.fx.o,)
         delta = self._delta(before)
@@ -50454,6 +50467,13 @@ class NativeWriteFunnelSkipSuite(Suite):
         # object: recorded, but no epoch bump (no stored blob exists).
         assert delta.get("strike_gag_uncaptured") == 1, delta
         assert not any(k.startswith("unprot_bump") for k in delta), delta
+        before = dict(self._m.report())
+        struck.write(WriteBuffer())
+        delta = self._delta(before)
+        assert delta.get("adopt_strike_skip.instance.write") == 1, delta
+        # Slice 10 (#1397): past the bounded probe the write funnel
+        # retries registration and adopts the now-valid object.
+        self._m._ADOPT_STRIKE.add(id(struck), self._m._STRIKE_RETRY_INTERVAL - 1)
         before = dict(self._m.report())
         struck.write(WriteBuffer())
         delta = self._delta(before)
@@ -51679,3 +51699,155 @@ class NativeMirrorUnionPlainDataSuite(Suite):
         assert u.is_evaluated is False
         assert u.original_str_expr == "A | B"
         assert u.original_str_fallback == "builtins.int"
+
+
+class NativeMirrorAdoptionFastPathSuite(Suite):
+    """Slice 10 funnel fast paths around the adoption strike (#1397).
+
+    Extends NativeMirrorAdoptStrikeSuite from the funnel side: a struck
+    object must skip the root serialization in both mirror funnels
+    (_assert_fresh / _check_splice), and a funnel that already
+    serialized the root hands those bytes straight to _register_tree
+    instead of paying the walk twice.
+    """
+
+    def setUp(self) -> None:
+        from mypy import types_mirror
+
+        types_mirror.activate(audit=True)
+        types_mirror.reset(clear_counts=True)
+        self._m = types_mirror
+        self.fx = TypeFixture()
+
+    def tearDown(self) -> None:
+        self._m._strict = False
+        self._m.reset(clear_counts=True)
+
+    def _delta(self, before: dict[str, int]) -> dict[str, int]:
+        after = self._m.report()
+        return {
+            k: v - before.get(k, 0)
+            for k, v in after.items()
+            if v != before.get(k, 0) and "init." not in k
+        }
+
+    def _raise_for_target(self, target: Any) -> tuple[Any, list[Any]]:
+        """Patch _fresh_bytes to raise only for `target`; returns orig, calls."""
+        orig = self._m._fresh_bytes
+        calls: list[Any] = []
+
+        def raiser(x: Any) -> bytes:
+            calls.append(x)
+            if x is target:
+                raise ValueError("pre-semanal partial")
+            return orig(x)
+
+        self._m._fresh_bytes = raiser  # type: ignore[assignment]
+        return orig, calls
+
+    def test_failed_registration_publishes_strike_and_funnel_skips(self) -> None:
+        inst = Instance(self.fx.std_tuplei, [self.fx.a])
+        orig, calls = self._raise_for_target(inst)
+        try:
+            inst.args = (self.fx.o,)  # setattr adopts -> fails -> memo
+            assert self._m._handle_of(inst) is None
+            delta = self._delta({})
+            assert delta.get("setattr_gagged.instance") == 1, delta
+            assert delta.get("register_fail_uncaptured") == 1, delta
+            assert id(inst) in self._m._ADOPT_STRIKE
+            root_calls_before = len(calls)
+            before = dict(self._m.report())
+            self._m._assert_fresh(inst, "probe")
+            delta = self._delta(before)
+            assert delta == {"adopt_strike_skip.instance.probe": 1}, delta
+            # The struck funnel visit serialized nothing.
+            assert len(calls) == root_calls_before, delta
+        finally:
+            self._m._fresh_bytes = orig
+
+    def test_splice_funnel_skips_serialization_for_struck_object(self) -> None:
+        inst = Instance(self.fx.std_tuplei, [self.fx.a])
+        self._m._note_failed_adoption(inst)
+        before = dict(self._m.report())
+        self._m._check_splice(inst, b"unused-on-strike")
+        delta = self._delta(before)
+        assert delta == {"adopt_strike_skip.instance.cachedsplice": 1}, delta
+
+    def test_register_tree_passes_precomputed_root_bytes_through(self) -> None:
+        inst = Instance(self.fx.std_tuplei, [self.fx.a])
+        fresh = self._m._fresh_bytes(inst)
+        orig = self._m._fresh_bytes
+        calls: list[Any] = []
+
+        def counter(x: Any) -> bytes:
+            calls.append(x)
+            return orig(x)
+
+        self._m._fresh_bytes = counter  # type: ignore[assignment]
+        try:
+            h = self._m._register_tree(inst, fresh)
+            assert h is not None
+            # The root was never re-serialized by registration (the child
+            # walk still serializes fx.a on its own registration).
+            assert all(c is not inst for c in calls), [id(c) for c in calls]
+            # And the stored blob is byte-identical to the funnel's bytes.
+            assert bytes(self._m._kernel_mod.rust_mirror_bytes(h)) == fresh
+        finally:
+            self._m._fresh_bytes = orig
+
+    def test_register_tree_local_walk_unchanged_without_bytes(self) -> None:
+        inst = Instance(self.fx.std_tuplei, [self.fx.a])
+        h = self._m._register_tree(inst)
+        assert h is not None
+        fresh = self._m._fresh_bytes(inst)
+        assert bytes(self._m._kernel_mod.rust_mirror_bytes(h)) == fresh
+
+    def _make_probe_due(self, obj: Any) -> None:
+        # Per-object probe cadence: refresh the stuck object's counter so
+        # its next encounter rolls over (dup add refreshes the payload).
+        self._m._ADOPT_STRIKE.add(id(obj), self._m._STRIKE_RETRY_INTERVAL - 1)
+
+    def test_gagged_setattr_probe_retries_and_adopts(self) -> None:
+        inst = Instance(self.fx.std_tuplei, [self.fx.a])
+        orig, calls = self._raise_for_target(inst)
+        try:
+            inst.args = (self.fx.o,)  # first attempt: still partial -> strike
+            assert sum(1 for c in calls if c is inst) == 1, calls
+            self._make_probe_due(inst)
+            inst.args = (self.fx.o,)  # probe due, fresh still raising -> gag
+            assert self._m._handle_of(inst) is None
+            # Exactly one probe serialization for the struck root.
+            assert sum(1 for c in calls if c is inst) == 2, calls
+            assert id(inst) in self._m._ADOPT_STRIKE
+        finally:
+            self._m._fresh_bytes = orig
+        # Registrability resolved: the probe adopts and a real mutation is
+        # captured at the source instead of escaping uncaptured.
+        self._make_probe_due(inst)
+        before = dict(self._m.report())
+        inst.args = (self.fx.b,)
+        delta = self._delta(before)
+        assert delta.get("setattr_captured.instance.args") == 1, delta
+        assert self._m._handle_of(inst) is not None
+
+    def test_write_funnel_probe_adopts_after_interval(self) -> None:
+        from librt.internal import WriteBuffer
+
+        inst = Instance(self.fx.std_tuplei, [self.fx.a])
+        orig, calls = self._raise_for_target(inst)
+        try:
+            inst.args = (self.fx.o,)  # still partial -> strike
+        finally:
+            self._m._fresh_bytes = orig
+        before = dict(self._m.report())
+        inst.write(WriteBuffer())
+        delta = self._delta(before)
+        assert delta.get("adopt_strike_skip.instance.write") == 1, delta
+        assert self._m._handle_of(inst) is None
+        self._make_probe_due(inst)
+        before = dict(self._m.report())
+        inst.write(WriteBuffer())
+        delta = self._delta(before)
+        assert delta.get("adopt.instance.write") == 1, delta
+        assert delta.get("strike_cleared_on_adopt") == 1, delta
+        assert self._m._handle_of(inst) is not None
