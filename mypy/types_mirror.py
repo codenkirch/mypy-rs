@@ -219,12 +219,15 @@ class _IdFifo:
     a live youngest entry early, matching ``deque.remove`` + ``append``.
     """
 
-    __slots__ = ("_cap", "_members", "_log", "_cursor", "_seq")
+    __slots__ = ("_cap", "_members", "_vals", "_log", "_cursor", "_seq")
 
     def __init__(self, cap: int) -> None:
         self._cap = cap
         # key -> token of the newest live insertion (tokens are >= 1).
         self._members: dict[int, int] = {}
+        # Per-member probe counter (adopt-strike keys count encounters
+        # since the strike, driving the bounded retry cadence).
+        self._vals: dict[int, int] = {}
         self._log: list[tuple[int, int]] = []
         self._cursor = 0
         self._seq = 0
@@ -238,18 +241,27 @@ class _IdFifo:
     def __bool__(self) -> bool:
         return bool(self._members)
 
-    def add(self, key: int) -> None:
+    def incr(self, key: int) -> int:
+        # Bump the per-member counter (adopt-strike hit bookkeeping).
+        val = self._vals.get(key, 0) + 1
+        self._vals[key] = val
+        return val
+
+    def add(self, key: int, val: int = 0) -> None:
         if key in self._members:
-            # Duplicate insertions are guarded by the callers; free here.
+            # Duplicate insertion: refresh the payload, membership stays.
+            self._vals[key] = val
             return
         if len(self._members) >= self._cap:
             self._evict_oldest()
         self._seq += 1
         self._members[key] = self._seq
+        self._vals[key] = val
         self._log.append((self._seq, key))
         self._maybe_compact()
 
     def remove(self, key: int) -> bool:
+        self._vals.pop(key, None)
         return self._members.pop(key, None) is not None
 
     def _evict_oldest(self) -> None:
@@ -260,6 +272,7 @@ class _IdFifo:
             self._cursor += 1
             if self._members.get(key) == token:
                 del self._members[key]
+                self._vals.pop(key, None)
                 return
 
     def _maybe_compact(self) -> None:
@@ -276,15 +289,21 @@ class _IdFifo:
 
     def clear(self) -> None:
         self._members.clear()
+        self._vals.clear()
         self._log = []
         self._cursor = 0
         self._seq = 0
 
 
 # Objects whose adoption already failed (pre-semanal partials the wire
-# cannot serialize). Bounded FIFO by id(): a recycled id retries once
-# more later; the write funnel stays the authoritative registration point.
+# cannot serialize). Bounded FIFO by id(); the payload counts each key's
+# encounters since its strike, driving the bounded probes below.
 _ADOPT_STRIKE: _IdFifo = _IdFifo(65536)
+
+# A struck object re-probes registrability once every N encounters of
+# that same object: placeholders fill in with no targeted signal, so the
+# probe caps the retry storm and adoption latency stays <=N visits.
+_STRIKE_RETRY_INTERVAL: Final = 256
 
 
 # Unprotected-write epoch (F3 slice 6, #1397) for REGISTERED family objects:
@@ -302,6 +321,8 @@ def _bump_unprot(origin: str = "") -> None:
 
 
 def _note_failed_adoption(obj: Any) -> None:
+    # Re-add resets the per-object counter (the next retry lands a full
+    # interval later, keeping the 1-in-N cadence honest).
     _ADOPT_STRIKE.add(id(obj))
 
 
@@ -743,8 +764,13 @@ def read_fresh_bytes(t: Type) -> bytes | None:
     return bytes(blob)
 
 
-def _register_tree(t: Type) -> int | None:
+def _register_tree(t: Type, fresh: bytes | None = None) -> int | None:
     """Register `t` (family only) with its family children, recursively.
+
+    `fresh` accepts precomputed root bytes from a funnel that already
+    serialized `t` (same suppression state, byte-identical), so a failed
+    registration does not pay the root walk twice. None falls back to the
+    local walk, as before.
 
     Returns the handle or None if the object could not be registered.
     """
@@ -765,7 +791,8 @@ def _register_tree(t: Type) -> int | None:
             if ch is not None:
                 child_handles.append(ch)
     try:
-        fresh = _fresh_bytes(t)
+        if fresh is None:
+            fresh = _fresh_bytes(t)
     except Exception as exc:
         _count("unserializable." + fam)
         _mismatch_examples.setdefault(f"unserializable.{fam}", f"{exc!r}")
@@ -902,12 +929,20 @@ def _assert_fresh(t: Type, site: str) -> None:
         _drain_pending_captures()
     fam = FAMILY_NAME[type(t)]
     h = _handle_of(t)
-    if h is not None and _kernel_mod.rust_mirror_write_skip(h, _UNPROT_EPOCH):
-        # Nothing unprotected has drifted this object's subtree since its
-        # blob last synced at the current epoch: the fresh walk would
-        # re-derive identical bytes.
-        _count(f"assert_skip.{fam}.{site}")
-        return
+    if h is not None:
+        if _kernel_mod.rust_mirror_write_skip(h, _UNPROT_EPOCH):
+            # Nothing unprotected has drifted this object's subtree since its
+            # blob last synced at the current epoch: the fresh walk would
+            # re-derive identical bytes.
+            _count(f"assert_skip.{fam}.{site}")
+            return
+    elif id(t) in _ADOPT_STRIKE:
+        if _ADOPT_STRIKE.incr(id(t)) % _STRIKE_RETRY_INTERVAL:
+            # Registration failed on an earlier visit (mid-semanal
+            # PlaceholderType leaves): skip, and fall through to the
+            # fresh adopt walk only when the counter rolls over.
+            _count(f"adopt_strike_skip.{fam}.{site}")
+            return
     try:
         fresh = _fresh_bytes(t)
     except Exception:
@@ -917,7 +952,10 @@ def _assert_fresh(t: Type, site: str) -> None:
         return
     if h is None:
         _count(f"adopt.{fam}.{site}")
-        _register_tree(t)
+        if _register_tree(t, fresh) is None:
+            # Memoize the failure so the per-funnel retry storm stops until
+            # the object or one of its ancestors adopts successfully.
+            _note_failed_adoption(t)
         return
     if _mirror_expect_ok(h, fresh):
         _kernel_mod.rust_mirror_stamp_sync(h, _UNPROT_EPOCH)
@@ -964,15 +1002,24 @@ def _check_splice(t: Type, blob: bytes) -> None:
     if not _rules_ok(t):
         return
     fam = FAMILY_NAME[type(t)]
+    h = _handle_of(t)
+    if h is None and id(t) in _ADOPT_STRIKE:
+        if _ADOPT_STRIKE.incr(id(t)) % _STRIKE_RETRY_INTERVAL:
+            # Failed registration on an earlier funnel visit; see
+            # _assert_fresh for the bounded-probe cadence (once per
+            # _STRIKE_RETRY_INTERVAL encounters) that keeps latency finite.
+            _count(f"adopt_strike_skip.{fam}.cachedsplice")
+            return
     try:
         fresh = _fresh_bytes(t)
     except Exception:
         _count(f"unserializable.{fam}.cachedsplice")
         return
-    h = _handle_of(t)
     if h is None:
         _count(f"adopt.{fam}.cachedsplice")
-        _register_tree(t)
+        if _register_tree(t, fresh) is None:
+            _note_failed_adoption(t)
+            return
     elif not _mirror_expect_ok(h, fresh):
         key = f"mismatch.{fam}.cachedsplice"
         _count(key)
@@ -1165,6 +1212,15 @@ def _mirror_setattr(self: Type, name: str, value: Any) -> None:
         if _handle_of(self) is not None:
             _ADOPT_STRIKE.remove(id(self))
             _count("strike_captured_late")
+        elif _ADOPT_STRIKE.incr(id(self)) % _STRIKE_RETRY_INTERVAL == 0:
+            # Bounded probe (see _assert_fresh): retest registrability.
+            # A filled-in placeholder resumes ordinary capture; a still
+            # partial object just re-strikes through the helpers.
+            probe = _register_tree(self)
+            if probe is None:
+                _note_failed_adoption(self)
+                hook = False
+                _count("strike_gag_uncaptured")
         else:
             hook = False
             # Still gagged: the raw write lands uncaptured, but no stored
@@ -1178,8 +1234,8 @@ def _mirror_setattr(self: Type, name: str, value: Any) -> None:
             h = _register_tree(self)
             if h is None:
                 # A partial object fresh serialization cannot handle yet
-                # (unfilled semanal fallback). Memo the failure so the
-                # per-setattr retry storm stops until the write funnel.
+                # (unfilled semanal fallback). Memo the failure: the bounded
+                # probe re-tests registrability every interval (see _assert_fresh).
                 fam = FAMILY_NAME[type(self)]
                 _count(f"setattr_gagged.{fam}")
                 _note_failed_adoption(self)
