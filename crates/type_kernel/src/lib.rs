@@ -3381,6 +3381,10 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         mirror::rust_mirror_patch_instance_lkv,
         module
     )?)?;
+    // Phase F3 slice 6 (#1397): unprotected-write epoch stamps for the
+    // write-funnel assert skip.
+    module.add_function(wrap_pyfunction!(mirror::rust_mirror_write_skip, module)?)?;
+    module.add_function(wrap_pyfunction!(mirror::rust_mirror_stamp_sync, module)?)?;
 
     Ok(())
 }

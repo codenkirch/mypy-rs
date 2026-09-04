@@ -172,7 +172,15 @@ def _wire_cache_enabled() -> bool:
 import os as _os
 
 _serialize_stats_on: bool = bool(_os.environ.get("MYPY_SERIALIZE_STATS"))
-_serialize_stats = {"calls": 0, "hits": 0, "builtin": 0, "writes": 0, "tvar": 0, "bytes": 0, "mirror": 0}
+_serialize_stats = {
+    "calls": 0,
+    "hits": 0,
+    "builtin": 0,
+    "writes": 0,
+    "tvar": 0,
+    "bytes": 0,
+    "mirror": 0,
+}
 
 
 def _clear_serialize_stats() -> None:

@@ -249,6 +249,20 @@ class _IdFifo:
 _ADOPT_STRIKE: _IdFifo = _IdFifo(65536)
 
 
+# Unprotected-write epoch (F3 slice 6, #1397) for REGISTERED family objects:
+# an uncaptured mutation bumps it and each handle's next funnel re-verifies.
+# Never-registered writes bump nothing: no stored blob embeds such an object.
+_UNPROT_EPOCH: int = 0
+
+
+def _bump_unprot(origin: str = "") -> None:
+    global _UNPROT_EPOCH
+    _UNPROT_EPOCH += 1
+    _count("unprot_bump")
+    if origin:
+        _count("unprot_bump." + origin)
+
+
 def _note_failed_adoption(obj: Any) -> None:
     _ADOPT_STRIKE.add(id(obj))
 
@@ -308,6 +322,7 @@ def _flush_pending_embed(embed: Type) -> None:
     except Exception:
         _count("pending_capture_still_unserializable")
         _note_failed_capture(embed)
+        _bump_unprot("pending_recover")
         return
     _update_and_cascade(h, fresh, None)
 
@@ -341,6 +356,7 @@ def _drain_pending_captures() -> None:
             # Still unserializable: keep it queued for a later funnel.
             _count("pending_capture_still_unserializable")
             _note_failed_capture(obj)
+            _bump_unprot("pending_drain")
             continue
         if h is None:
             # Evicted or never adopted; its first funnel will register it.
@@ -438,11 +454,7 @@ def _child_types_in_value(value: Any, site: str) -> Iterator[tuple[str, Type]]:
 
 
 def _walk_slots(
-    t: Type,
-    seen: set[int],
-    tvids: list[TypeVarId],
-    aliases: list[Any],
-    embeds: list[Type],
+    t: Type, seen: set[int], tvids: list[TypeVarId], aliases: list[Any], embeds: list[Type]
 ) -> None:
     """Slot-scan one Type node once for every reverse index."""
     for name in _type_names(type(t)):
@@ -456,11 +468,7 @@ def _walk_slots(
 
 
 def _walk_value(
-    value: Any,
-    seen: set[int],
-    tvids: list[TypeVarId],
-    aliases: list[Any],
-    embeds: list[Type],
+    value: Any, seen: set[int], tvids: list[TypeVarId], aliases: list[Any], embeds: list[Type]
 ) -> None:
     """Descend a slot value collecting TypeVarIds, TypeAlias nodes, and
     family Types (the walk root is pre-seeded in `seen`, so it is never
@@ -715,6 +723,7 @@ def _register_tree(t: Type) -> int | None:
     # A later successful adoption clears the failed one: the strike memo is
     # only about "cannot adopt yet", not "never capture writes again".
     _note_successful_adoption(t)
+    _kernel_mod.rust_mirror_stamp_sync(handle, _UNPROT_EPOCH)
     tvids, aliases, embeds = _walk_indices(t)
     _apply_tvid_carriers(tvids, handle)
     _apply_alias_carriers(aliases, handle)
@@ -757,12 +766,14 @@ def _update_and_cascade(handle: int, fresh: bytes, replaced_slot: str | None = N
     # carry embeds (`_apply_hidden_embeds` keeps replaced subtrees reachable).
     skip_all = replaced_slot == ""
     root_reindex = replaced_slot is None or (not skip_all and replaced_slot in _REINDEX_SLOTS)
+    stamp_epoch = _UNPROT_EPOCH
     stack = list(_kernel_mod.rust_mirror_parents(handle))
     obj = _BY_HANDLE.get(handle)
     if obj is not None:
         stack.extend(_sync_seed_handles(obj))
     seen = {handle}
     _kernel_mod.rust_mirror_update(handle, fresh)
+    _kernel_mod.rust_mirror_stamp_sync(handle, stamp_epoch)
     if obj is not None:
         tvids, aliases, embeds = _walk_indices(obj)
         _apply_tvid_carriers(tvids, handle)
@@ -786,8 +797,10 @@ def _update_and_cascade(handle: int, fresh: bytes, replaced_slot: str | None = N
             pfresh = _fresh_bytes(parent)
         except Exception:
             _count("cascade_unserializable")
+            _bump_unprot("cascade")
             continue
         _kernel_mod.rust_mirror_update(ph, pfresh)
+        _kernel_mod.rust_mirror_stamp_sync(ph, stamp_epoch)
         if replaced_slot is None:
             _apply_hidden_embeds(embeds, ph)
         stack.extend(_kernel_mod.rust_mirror_parents(ph))
@@ -837,6 +850,12 @@ def _assert_fresh(t: Type, site: str) -> None:
         _drain_pending_captures()
     fam = FAMILY_NAME[type(t)]
     h = _handle_of(t)
+    if h is not None and _kernel_mod.rust_mirror_write_skip(h, _UNPROT_EPOCH):
+        # Nothing unprotected has drifted this object's subtree since its
+        # blob last synced at the current epoch: the fresh walk would
+        # re-derive identical bytes.
+        _count(f"assert_skip.{fam}.{site}")
+        return
     try:
         fresh = _fresh_bytes(t)
     except Exception:
@@ -848,8 +867,8 @@ def _assert_fresh(t: Type, site: str) -> None:
         _count(f"adopt.{fam}.{site}")
         _register_tree(t)
         return
-    assert_passes = _mirror_expect_ok(h, fresh)
-    if assert_passes:
+    if _mirror_expect_ok(h, fresh):
+        _kernel_mod.rust_mirror_stamp_sync(h, _UNPROT_EPOCH)
         _count(f"assert_ok.{fam}.{site}")
         _flush_pending_capture(t, h, fresh)
         return
@@ -970,6 +989,12 @@ def _make_init_wrapper(orig_init: Any, family: str) -> Any:
 
 def _mirror_setattr(self: Type, name: str, value: Any) -> None:
     hook = _rules_ok(self) and _construction == 0 and name not in SKIP_ATTRS
+    if not hook and _active and type(self) in FAMILY_NAME and name not in SKIP_ATTRS:
+        # Suppression-window setattr on a REGISTERED object: blobs embedding
+        # these bytes were not captured, so force their next funnel to
+        # verify. Unregistered targets cannot corrupt storage (see below).
+        if _handle_of(self) is not None:
+            _bump_unprot("setattr_window")
     if hook and id(self) in _ADOPT_STRIKE:
         # The strike memo is per-object id: a write on an object that has
         # since become registrable is a real mirror mutation (capture it);
@@ -979,6 +1004,10 @@ def _mirror_setattr(self: Type, name: str, value: Any) -> None:
             _count("strike_captured_late")
         else:
             hook = False
+            # Still gagged: the raw write lands uncaptured, but no stored
+            # blob can embed a struck object (deriving through it fails
+            # serialization), so no epoch bump.
+            _count("strike_gag_uncaptured")
     h = None
     if hook:
         h = _handle_of(self)
@@ -991,6 +1020,10 @@ def _mirror_setattr(self: Type, name: str, value: Any) -> None:
                 fam = FAMILY_NAME[type(self)]
                 _count(f"setattr_gagged.{fam}")
                 _note_failed_adoption(self)
+                # Uncaptured write on a never-registered object: safe without
+                # an epoch bump (no stored blob derives through it until it
+                # serializes; see the `_UNPROT_EPOCH` comment).
+                _count("register_fail_uncaptured")
                 # The mirror cannot bind this object, but the mutation is
                 # real: apply it as the unpatched __setattr__ would, skipping
                 # only capture bookkeeping (a dropped write lost .name here).
@@ -1041,6 +1074,8 @@ def _mirror_setattr(self: Type, name: str, value: Any) -> None:
             else:
                 _count(f"setattr_spliced.{fam}.{name}")
                 _update_and_cascade(h, new_bytes, name)
+            # Either branch leaves the stored blob authoritative.
+            _kernel_mod.rust_mirror_stamp_sync(h, _UNPROT_EPOCH)
             return
         _count(f"setattr_splice_defer.{fam}.{name}")
     try:
@@ -1053,10 +1088,12 @@ def _mirror_setattr(self: Type, name: str, value: Any) -> None:
         if _audit_mode:
             _mismatch_examples.setdefault(f"unserializable.{fam}.setattr:{name}", _short_stack())
         _note_failed_capture(self)
+        _bump_unprot("capt_fail")
         return
     stored = bytes(_kernel_mod.rust_mirror_bytes(h))
     if stored == fresh:
         _count(f"setattr_noop.{fam}.{name}")
+        _kernel_mod.rust_mirror_stamp_sync(h, _UNPROT_EPOCH)
         return
     # A write through __setattr__ is a captured mutation, not an escape:
     # mirror it and re-sync any parent wire blobs that embed these bytes.
@@ -1086,6 +1123,10 @@ def _mirror_tvid_setattr(self: TypeVarId, name: str, value: Any) -> None:
     old = getattr(self, name, None)
     _ORIG_SETATTR(self, name, value)
     if not hook:
+        # Only tvids already pinned by adoption have embedded registered
+        # carriers whose blobs could go stale; unseen tvids are fresh trees.
+        if _active and id(self) in _TVID_REVERSE:
+            _bump_unprot("tvid_window")
         return
     if old == value:
         _count(f"tvid_setattr_equal.{name}")
@@ -1107,12 +1148,14 @@ def _mirror_tvid_setattr(self: TypeVarId, name: str, value: Any) -> None:
             fresh = _fresh_bytes(obj)
         except Exception:
             _count(f"unserializable.{fam}.tvid:{name}")
+            _bump_unprot("tvid_fail")
             continue
         if not _mirror_expect_ok(h, fresh):
             # No slot replacement on the TypeVarId itself, so neither the
             # root nor any parent needs the hidden-embed re-index.
             _update_and_cascade(h, fresh, "")
         else:
+            _kernel_mod.rust_mirror_stamp_sync(h, _UNPROT_EPOCH)
             _count(f"tvid_cascade_ok.{name}")
 
 
@@ -1124,6 +1167,11 @@ def _mirror_alias_setattr(self: Any, name: str, value: Any) -> None:
     old = getattr(self, name, None)
     _ORIG_SETATTR(self, name, value)
     if not hook:
+        # The shim only captures _is_recursive; other writes (a rebound
+        # `.target`, for example) restamp only when this alias node is
+        # already pinned by adoption (registered carriers embed it).
+        if _active and name != "_is_recursive" and id(self) in _ALIAS_REVERSE:
+            _bump_unprot("alias_window")
         return
     if old == value:
         _count(f"alias_setattr_equal.{name}")
@@ -1145,12 +1193,14 @@ def _mirror_alias_setattr(self: Any, name: str, value: Any) -> None:
             fresh = _fresh_bytes(obj)
         except Exception:
             _count(f"unserializable.{fam}.alias:{name}")
+            _bump_unprot("alias_fail")
             continue
         if not _mirror_expect_ok(h, fresh):
             # No slot replacement on the node itself, so neither the root
             # nor any parent needs the hidden-embed re-index.
             _update_and_cascade(h, fresh, "")
         else:
+            _kernel_mod.rust_mirror_stamp_sync(h, _UNPROT_EPOCH)
             _count(f"alias_cascade_ok.{name}")
 
 

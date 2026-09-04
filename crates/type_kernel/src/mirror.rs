@@ -25,6 +25,14 @@ use crate::wire::{read_type, read_type_list, write_type, ReadBuffer, Type, Write
 pub(crate) struct MirrorEntry {
     pub(crate) family: String,
     pub(crate) bytes: Vec<u8>,
+    /// Value of the Python-side unprotected-write epoch when these bytes
+    /// were last written from an authoritative sync. A funnel skip is
+    /// allowed only while the current epoch equals this stamp: every
+    /// write path the mirror does not capture-and-sync bumps that epoch
+    /// (construction-window and serialize-window setattrs, failed
+    /// capture/sync attempts), so one post-bump funnel verifies once and
+    /// re-stamps.
+    pub(crate) stamp: u64,
 }
 
 struct Mirror {
@@ -113,6 +121,7 @@ pub(crate) fn register(
             MirrorEntry {
                 family: family.to_string(),
                 bytes,
+                stamp: 0,
             },
         );
         if !child_handles.is_empty() {
@@ -167,6 +176,32 @@ pub(crate) fn entry_family(handle: u64) -> Option<String> {
 /// Parent handles whose wire code contains the given child.
 pub(crate) fn parents(handle: u64) -> Vec<u64> {
     with_mirror(|m| m.parents_of.get(&handle).cloned().unwrap_or_default())
+}
+
+/// Funnel skip decision (F3 slice 6, #1397): true when `handle` is
+/// registered and its bytes were last written at the unprotected epoch
+/// `stamp_epoch`. On true the stamp is refreshed to `stamp_epoch`
+/// (idempotent; lets a post-bump verify re-arm future skips), so Python
+/// needs one call per funnel assert instead of tick + check + sync.
+pub(crate) fn write_skip(handle: u64, stamp_epoch: u64) -> bool {
+    with_mirror(|m| match m.by_handle.get_mut(&handle) {
+        Some(entry) if entry.stamp == stamp_epoch => {
+            true
+        }
+        Some(_) => false,
+        None => false,
+    })
+}
+
+/// Record that the stored bytes are authoritative as of `stamp_epoch`.
+pub(crate) fn stamp_sync(handle: u64, stamp_epoch: u64) -> bool {
+    with_mirror(|m| match m.by_handle.get_mut(&handle) {
+        Some(entry) => {
+            entry.stamp = stamp_epoch;
+            true
+        }
+        None => false,
+    })
 }
 
 /// Clear all mirror state and reset the identity registry.
@@ -224,10 +259,24 @@ pub(crate) fn rust_mirror_family(handle: u64) -> Option<String> {
     entry_family(handle)
 }
 
-/// Parents whose wire code contains this child (cascade loop input).
+/// Lookup the mirror parents index (cascade loop input).
 #[pyfunction]
 pub(crate) fn rust_mirror_parents(handle: u64) -> Vec<u64> {
     parents(handle)
+}
+
+/// Funnel skip op: see `write_skip`. Returns whether the funnel can skip
+/// the fresh serialization because nothing unprotected has drifted the
+/// object's subtree since its blobs last synced at `stamp_epoch`.
+#[pyfunction]
+pub(crate) fn rust_mirror_write_skip(handle: u64, stamp_epoch: u64) -> bool {
+    write_skip(handle, stamp_epoch)
+}
+
+/// Record an authoritative sync of the stored blob at `stamp_epoch`.
+#[pyfunction]
+pub(crate) fn rust_mirror_stamp_sync(handle: u64, stamp_epoch: u64) -> bool {
+    stamp_sync(handle, stamp_epoch)
 }
 
 /// Drop all mirror state; returns the new identity generation.
@@ -742,6 +791,44 @@ mod mirror_tests {
             let obj4 = fresh(py);
             let h4 = register(obj4, "instance", lkv_instance_blob(None), vec![]).unwrap();
             assert_eq!(patch_instance_lkv(h4, Some(b"garbage")), None);
+        });
+    }
+
+    #[test]
+    fn test_write_skip_and_stamp_semantics() {
+        with_py(|py| {
+            reset();
+            let obj = fresh(py);
+            let h = register(obj, "instance", b"z".to_vec(), vec![]).unwrap();
+            // A fresh entry is stamped 0: skip only at epoch 0.
+            assert!(write_skip(h, 0));
+            assert!(!write_skip(h, 7));
+            // Stamp sync moves the epoch cursor forward.
+            assert!(stamp_sync(h, 7));
+            assert!(write_skip(h, 7));
+            assert!(!write_skip(h, 8));
+            // Unknown handles never skip and never stamp.
+            assert!(!write_skip(h + 1, 0));
+            assert!(!stamp_sync(h + 1, 0));
+            // Reset clears stamps with the storage.
+            assert!(stamp_sync(h, 3));
+            reset();
+            assert!(!write_skip(h, 3));
+        });
+    }
+
+    #[test]
+    fn test_register_reentry_resets_stamp() {
+        with_py(|py| {
+            reset();
+            let obj = fresh(py);
+            let h = register(obj, "instance", b"z".to_vec(), vec![]).unwrap();
+            assert!(stamp_sync(h, 9));
+            // Re-registration installs fresh unknown-provenance bytes.
+            let h2 = register(obj, "instance", b"z2".to_vec(), vec![]).unwrap();
+            assert_eq!(h2, h);
+            assert!(!write_skip(h, 9));
+            assert!(write_skip(h, 0));
         });
     }
 }
