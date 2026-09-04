@@ -3388,6 +3388,48 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
     // Slice 7: Rust walk for types_mirror._walk_indices (reverse-index
     // collection); Python keeps the apply steps.
     module.add_function(wrap_pyfunction!(mirror::rust_mirror_walk_indices, module)?)?;
+    // Slice 8: CallableType field-granular splice ops (same protocol as
+    // the Instance ops: stored blob on noop, new blob on change, None defers).
+    module.add_function(wrap_pyfunction!(
+        mirror::rust_mirror_patch_callable_ret_type,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        mirror::rust_mirror_patch_callable_arg_types,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        mirror::rust_mirror_patch_callable_arg_kinds,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        mirror::rust_mirror_patch_callable_arg_names,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        mirror::rust_mirror_patch_callable_name,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        mirror::rust_mirror_patch_callable_variables,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        mirror::rust_mirror_patch_callable_opt_field,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        mirror::rust_mirror_patch_callable_fallback,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        mirror::rust_mirror_patch_callable_instance_type,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        mirror::rust_mirror_patch_callable_flags,
+        module
+    )?)?;
 
     Ok(())
 }

@@ -444,6 +444,412 @@ pub(crate) fn rust_mirror_patch_instance_lkv(
     patch_instance_lkv(handle, lkv_blob)
 }
 
+// ---- CallableType splice ops (F3 slice 8, #1397) ----
+
+/// The wire fields of a decoded `Type::CallableType`, grouped so the
+/// per-field splice ops can read/patch/re-encode without repeating the
+/// variant's 12-field pattern.
+struct CallableFields {
+    fallback: Box<Type>,
+    instance_type: Option<Box<Type>>,
+    // Wire write order: is_ellipsis_args, implicit, is_bound,
+    // from_concatenate, imprecise_arg_kinds, unpack_kwargs, from_type_type.
+    is_ellipsis_args: bool,
+    implicit: bool,
+    is_bound: bool,
+    from_concatenate: bool,
+    imprecise_arg_kinds: bool,
+    unpack_kwargs: bool,
+    from_type_type: bool,
+    arg_types: Vec<Type>,
+    arg_kinds: Vec<i64>,
+    arg_names: Vec<Option<String>>,
+    ret_type: Box<Type>,
+    name: Option<String>,
+    variables: Vec<Type>,
+    type_guard: Option<Box<Type>>,
+    type_is: Option<Box<Type>>,
+}
+
+/// Decode the stored blob for `handle` into its wire fields. `None`
+/// defers (unregistered handle, undecodable blob, or a non-CallableType
+/// stored family — the mirror must never retype a stored blob).
+fn callable_fields(handle: u64) -> Option<CallableFields> {
+    let old = entry_bytes(handle)?;
+    let stored = {
+        let mut buf = ReadBuffer::new(&old);
+        read_type(&mut buf, None).ok()?
+    };
+    let Type::CallableType {
+        fallback,
+        instance_type,
+        is_ellipsis_args,
+        implicit,
+        is_bound,
+        from_concatenate,
+        imprecise_arg_kinds,
+        unpack_kwargs,
+        from_type_type,
+        arg_types,
+        arg_kinds,
+        arg_names,
+        ret_type,
+        name,
+        variables,
+        type_guard,
+        type_is,
+        special_sig: _,
+    } = stored
+    else {
+        return None;
+    };
+    Some(CallableFields {
+        fallback,
+        instance_type,
+        is_ellipsis_args,
+        implicit,
+        is_bound,
+        from_concatenate,
+        imprecise_arg_kinds,
+        unpack_kwargs,
+        from_type_type,
+        arg_types,
+        arg_kinds,
+        arg_names,
+        ret_type,
+        name,
+        variables,
+        type_guard,
+        type_is,
+    })
+}
+
+/// Re-encode `cf` and store it under `handle`; returns the new blob.
+/// `None` propagates encode/update failures to the full fresh path, the
+/// same protocol as the Instance splice ops.
+fn store_callable(handle: u64, cf: CallableFields) -> Option<Vec<u8>> {
+    let patched = Type::CallableType {
+        fallback: cf.fallback,
+        instance_type: cf.instance_type,
+        // `special_sig` is Rust-resident only; re-encode resets it to the
+        // decoded default (None), matching the pre-splice blob bytes.
+        special_sig: None,
+        is_ellipsis_args: cf.is_ellipsis_args,
+        implicit: cf.implicit,
+        is_bound: cf.is_bound,
+        from_concatenate: cf.from_concatenate,
+        imprecise_arg_kinds: cf.imprecise_arg_kinds,
+        unpack_kwargs: cf.unpack_kwargs,
+        from_type_type: cf.from_type_type,
+        arg_types: cf.arg_types,
+        arg_kinds: cf.arg_kinds,
+        arg_names: cf.arg_names,
+        ret_type: cf.ret_type,
+        name: cf.name,
+        variables: cf.variables,
+        type_guard: cf.type_guard,
+        type_is: cf.type_is,
+    };
+    let mut wbuf = WriteBuffer::new();
+    write_type(&mut wbuf, &patched).ok()?;
+    let blob = wbuf.into_bytes();
+    update(handle, blob.clone()).ok()?;
+    Some(blob)
+}
+
+/// Splice `CallableType.ret_type` into the stored blob. `ret_blob` is one
+/// serialized `Type`. Stored blob on noop, new blob on change, `None` to
+/// defer; an undecodable `ret_blob` defers too (garbage must never
+/// silently corrupt the blob).
+fn patch_callable_ret_type(handle: u64, ret_blob: &[u8]) -> Option<Vec<u8>> {
+    let mut cf = callable_fields(handle)?;
+    let new_ret = {
+        let mut buf = ReadBuffer::new(ret_blob);
+        match read_type(&mut buf, None) {
+            Ok(t) => Box::new(t),
+            Err(_) => return None,
+        }
+    };
+    if cf.ret_type == new_ret {
+        return entry_bytes(handle);
+    }
+    cf.ret_type = new_ret;
+    store_callable(handle, cf)
+}
+
+#[pyfunction]
+#[pyo3(signature = (handle, ret_blob))]
+pub(crate) fn rust_mirror_patch_callable_ret_type(
+    handle: u64,
+    ret_blob: &[u8],
+) -> Option<Vec<u8>> {
+    patch_callable_ret_type(handle, ret_blob)
+}
+
+/// Splice `CallableType.arg_types` from `write_type_list` bytes.
+fn patch_callable_arg_types(handle: u64, args_blob: &[u8]) -> Option<Vec<u8>> {
+    let mut cf = callable_fields(handle)?;
+    let new_args = {
+        let mut buf = ReadBuffer::new(args_blob);
+        match read_type_list(&mut buf) {
+            Ok(ts) => ts,
+            Err(_) => return None,
+        }
+    };
+    if cf.arg_types == new_args {
+        return entry_bytes(handle);
+    }
+    cf.arg_types = new_args;
+    store_callable(handle, cf)
+}
+
+#[pyfunction]
+#[pyo3(signature = (handle, args_blob))]
+pub(crate) fn rust_mirror_patch_callable_arg_types(
+    handle: u64,
+    args_blob: &[u8],
+) -> Option<Vec<u8>> {
+    patch_callable_arg_types(handle, args_blob)
+}
+
+/// Splice `CallableType.arg_kinds` as raw kind ints. Python passes
+/// `[int(k.value) for k in self.arg_kinds]`.
+fn patch_callable_arg_kinds(handle: u64, kinds: Vec<i64>) -> Option<Vec<u8>> {
+    let mut cf = callable_fields(handle)?;
+    if cf.arg_kinds == kinds {
+        return entry_bytes(handle);
+    }
+    cf.arg_kinds = kinds;
+    store_callable(handle, cf)
+}
+
+#[pyfunction]
+#[pyo3(signature = (handle, kinds))]
+pub(crate) fn rust_mirror_patch_callable_arg_kinds(
+    handle: u64,
+    kinds: Vec<i64>,
+) -> Option<Vec<u8>> {
+    patch_callable_arg_kinds(handle, kinds)
+}
+
+/// Splice `CallableType.arg_names` as `Option<&str>` entries (None is a
+/// positional/unnamed argument).
+fn patch_callable_arg_names(handle: u64, names: Vec<Option<String>>) -> Option<Vec<u8>> {
+    let mut cf = callable_fields(handle)?;
+    if cf.arg_names == names {
+        return entry_bytes(handle);
+    }
+    cf.arg_names = names;
+    store_callable(handle, cf)
+}
+
+#[pyfunction]
+#[pyo3(signature = (handle, names))]
+pub(crate) fn rust_mirror_patch_callable_arg_names(
+    handle: u64,
+    names: Vec<Option<String>>,
+) -> Option<Vec<u8>> {
+    patch_callable_arg_names(handle, names)
+}
+
+/// Splice `CallableType.name` (the function-ish name; `None` unnames).
+fn patch_callable_name_field(handle: u64, name: Option<&str>) -> Option<Vec<u8>> {
+    let mut cf = callable_fields(handle)?;
+    let new_name = name.map(|s| s.to_string());
+    if cf.name == new_name {
+        return entry_bytes(handle);
+    }
+    cf.name = new_name;
+    store_callable(handle, cf)
+}
+
+#[pyfunction]
+#[pyo3(signature = (handle, name))]
+pub(crate) fn rust_mirror_patch_callable_name(
+    handle: u64,
+    name: Option<&str>,
+) -> Option<Vec<u8>> {
+    patch_callable_name_field(handle, name)
+}
+
+/// Splice `CallableType.variables` from `write_type_list` bytes (the
+/// TypeVarLikeType entries; the wire reads them through the
+/// `read_type_var_likes` list framing, so the bytes must contain the
+/// type-var-like list — produced by Python's `write_type_list`-shaped
+/// list serializer).
+fn patch_callable_variables(handle: u64, vars_blob: &[u8]) -> Option<Vec<u8>> {
+    let mut cf = callable_fields(handle)?;
+    let new_vars = {
+        let mut buf = ReadBuffer::new(vars_blob);
+        match read_type_list(&mut buf) {
+            Ok(ts) => ts,
+            Err(_) => return None,
+        }
+    };
+    if cf.variables == new_vars {
+        return entry_bytes(handle);
+    }
+    cf.variables = new_vars;
+    store_callable(handle, cf)
+}
+
+#[pyfunction]
+#[pyo3(signature = (handle, vars_blob))]
+pub(crate) fn rust_mirror_patch_callable_variables(
+    handle: u64,
+    vars_blob: &[u8],
+) -> Option<Vec<u8>> {
+    patch_callable_variables(handle, vars_blob)
+}
+
+/// Splice `CallableType.type_guard` / `type_is` (single optional Type):
+/// `None` is the write_type_opt LITERAL_NONE clear, `Some(blob)` is one
+/// serialized Type. Both branches route through `which` to keep the two
+/// call sites on one pyfunction each.
+const OPT_FIELD_TYPE_GUARD: u32 = 0;
+const OPT_FIELD_TYPE_IS: u32 = 1;
+fn patch_callable_opt_field(
+    handle: u64,
+    which: u32,
+    blob: Option<&[u8]>,
+) -> Option<Vec<u8>> {
+    let slot_is_guard = match which {
+        OPT_FIELD_TYPE_GUARD => true,
+        OPT_FIELD_TYPE_IS => false,
+        _ => return None,
+    };
+    let mut cf = callable_fields(handle)?;
+    let new_val = match blob {
+        None => None,
+        Some(b) => {
+            let mut buf = ReadBuffer::new(b);
+            match read_type(&mut buf, None) {
+                Ok(t) => Some(Box::new(t)),
+                Err(_) => return None,
+            }
+        }
+    };
+    let current_matches = if slot_is_guard {
+        cf.type_guard.as_deref() == new_val.as_deref()
+    } else {
+        cf.type_is.as_deref() == new_val.as_deref()
+    };
+    if current_matches {
+        return entry_bytes(handle);
+    }
+    if slot_is_guard {
+        cf.type_guard = new_val;
+    } else {
+        cf.type_is = new_val;
+    }
+    store_callable(handle, cf)
+}
+
+#[pyfunction]
+#[pyo3(signature = (handle, which, blob))]
+pub(crate) fn rust_mirror_patch_callable_opt_field(
+    handle: u64,
+    which: u32,
+    blob: Option<&[u8]>,
+) -> Option<Vec<u8>> {
+    patch_callable_opt_field(handle, which, blob)
+}
+
+/// Splice `CallableType.fallback` (a full serialized Instance type).
+fn patch_callable_fallback(handle: u64, fb_blob: &[u8]) -> Option<Vec<u8>> {
+    let mut cf = callable_fields(handle)?;
+    let new_fb = {
+        let mut buf = ReadBuffer::new(fb_blob);
+        match read_type(&mut buf, None) {
+            Ok(t) => Box::new(t),
+            Err(_) => return None,
+        }
+    };
+    if cf.fallback == new_fb {
+        return entry_bytes(handle);
+    }
+    cf.fallback = new_fb;
+    store_callable(handle, cf)
+}
+
+#[pyfunction]
+#[pyo3(signature = (handle, fb_blob))]
+pub(crate) fn rust_mirror_patch_callable_fallback(
+    handle: u64,
+    fb_blob: &[u8],
+) -> Option<Vec<u8>> {
+    patch_callable_fallback(handle, fb_blob)
+}
+
+/// Splice `CallableType.instance_type` (the write_type_opt LITERAL_NONE
+/// clear vs one serialized Type, same protocol as `patch_instance_lkv`).
+fn patch_callable_instance_type(handle: u64, blob: Option<&[u8]>) -> Option<Vec<u8>> {
+    let mut cf = callable_fields(handle)?;
+    let new_val = match blob {
+        None => None,
+        Some(b) => {
+            let mut buf = ReadBuffer::new(b);
+            match read_type(&mut buf, None) {
+                Ok(t) => Some(Box::new(t)),
+                Err(_) => return None,
+            }
+        }
+    };
+    if cf.instance_type == new_val {
+        return entry_bytes(handle);
+    }
+    cf.instance_type = new_val;
+    store_callable(handle, cf)
+}
+
+#[pyfunction]
+#[pyo3(signature = (handle, blob))]
+pub(crate) fn rust_mirror_patch_callable_instance_type(
+    handle: u64,
+    blob: Option<&[u8]>,
+) -> Option<Vec<u8>> {
+    patch_callable_instance_type(handle, blob)
+}
+
+/// Splice the seven wire bools. `flags` must be seven long, wire write
+/// order: is_ellipsis_args, implicit, is_bound, from_concatenate,
+/// imprecise_arg_kinds, unpack_kwargs, from_type_type.
+fn patch_callable_flags(handle: u64, flags: Vec<bool>) -> Option<Vec<u8>> {
+    let mut cf = callable_fields(handle)?;
+    if flags.len() != 7 {
+        return None;
+    }
+    let cur = [
+        cf.is_ellipsis_args,
+        cf.implicit,
+        cf.is_bound,
+        cf.from_concatenate,
+        cf.imprecise_arg_kinds,
+        cf.unpack_kwargs,
+        cf.from_type_type,
+    ];
+    if cur == flags.as_slice() {
+        return entry_bytes(handle);
+    }
+    cf.is_ellipsis_args = flags[0];
+    cf.implicit = flags[1];
+    cf.is_bound = flags[2];
+    cf.from_concatenate = flags[3];
+    cf.imprecise_arg_kinds = flags[4];
+    cf.unpack_kwargs = flags[5];
+    cf.from_type_type = flags[6];
+    store_callable(handle, cf)
+}
+
+#[pyfunction]
+#[pyo3(signature = (handle, flags))]
+pub(crate) fn rust_mirror_patch_callable_flags(
+    handle: u64,
+    flags: Vec<bool>,
+) -> Option<Vec<u8>> {
+    patch_callable_flags(handle, flags)
+}
+
 // ---- reverse-index collection walk (Slice 7) ----
 // Port of the fused `_walk_indices` traversal from mypy/types_mirror.py: one
 // descent over the live graph collecting tvids, TypeAlias nodes, family Types.
@@ -1186,5 +1592,348 @@ mod mirror_tests {
             .getattr("_WalkRoot")
             .unwrap();
         cls.call0().unwrap()
+    }
+
+    // ---- CallableType splice ops (F3 slice 8, #1397) ----
+
+    /// Wire-legal non-callable carrier for deferral checks: a TVar.
+    fn tvt(name: &str) -> Type {
+        Type::TypeVarType {
+            name: name.to_string(),
+            fullname: format!("mod.{name}"),
+            raw_id: 1,
+            namespace: "".to_string(),
+            values: vec![],
+            upper_bound: Box::new(Type::NoneType),
+            default: Box::new(Type::NoneType),
+            variance: 0,
+            meta_level: 0,
+        }
+    }
+
+    /// A callable blob `f(T) -> T` on the `builtins.function` fallback.
+    fn callable_blob() -> Vec<u8> {
+        let t = Type::CallableType {
+            fallback: Box::new(Type::Instance {
+                type_ref: "builtins.function".to_string(),
+                args: vec![],
+                last_known_value: None,
+                extra_attrs: None,
+            }),
+            instance_type: None,
+            special_sig: None,
+            is_ellipsis_args: false,
+            implicit: false,
+            is_bound: false,
+            from_concatenate: false,
+            imprecise_arg_kinds: false,
+            unpack_kwargs: false,
+            from_type_type: false,
+            arg_types: vec![tvt("T")],
+            arg_kinds: vec![0],
+            arg_names: vec![None],
+            ret_type: Box::new(Type::NoneType),
+            name: Some("f".to_string()),
+            variables: vec![tvt("T")],
+            type_guard: None,
+            type_is: None,
+        };
+        let mut w = WriteBuffer::new();
+        write_type(&mut w, &t).unwrap();
+        w.into_bytes()
+    }
+
+    fn registered_callable(py: Python<'_>) -> u64 {
+        register(fresh(py), "callable", callable_blob(), vec![]).unwrap()
+    }
+
+    fn decode(h: u64) -> Type {
+        let blob = entry_bytes(h).unwrap();
+        let mut rbuf = ReadBuffer::new(&blob);
+        read_type(&mut rbuf, None).unwrap()
+    }
+
+    fn anyt() -> Type {
+        Type::AnyType {
+            type_of_any: 2,
+            source_any: None,
+            missing_import_name: None,
+        }
+    }
+
+    fn single_blob(t: &Type) -> Vec<u8> {
+        let mut w = WriteBuffer::new();
+        write_type(&mut w, t).unwrap();
+        w.into_bytes()
+    }
+
+    fn type_list_blob(items: &[Type]) -> Vec<u8> {
+        let mut b = WriteBuffer::new();
+        write_type_list(&mut b, items).unwrap();
+        b.into_bytes()
+    }
+
+    #[test]
+    fn test_patch_callable_ret_type_roundtrip() {
+        with_py(|py| {
+            reset();
+            let h = registered_callable(py);
+            // Garbage payload defers without touching storage.
+            let before = entry_bytes(h).unwrap();
+            assert_eq!(patch_callable_ret_type(h, &[9]), None);
+            assert_eq!(
+                patch_callable_ret_type(h, &single_blob(&Type::NoneType)).unwrap(),
+                before
+            );
+            // Changed ret: stored blob now carries the Any.
+            let new = patch_callable_ret_type(h, &single_blob(&anyt())).unwrap();
+            assert!(new != before);
+            match decode(h) {
+                Type::CallableType { ret_type, .. } => {
+                    assert!(matches!(*ret_type, Type::AnyType { .. }))
+                }
+                _ => panic!("not a CallableType after patch"),
+            }
+            assert_eq!(patch_callable_ret_type(h, &single_blob(&anyt())).unwrap(), new);
+        });
+    }
+
+    #[test]
+    fn test_patch_callable_arg_types_and_variables() {
+        with_py(|py| {
+            reset();
+            let h = registered_callable(py);
+            let new = patch_callable_arg_types(h, &type_list_blob(&[anyt(), tvt("Q")]))
+                .unwrap();
+            match decode(h) {
+                Type::CallableType { arg_types, .. } => {
+                    assert_eq!(arg_types.len(), 2);
+                    assert!(matches!(arg_types[1], Type::TypeVarType { .. }));
+                }
+                _ => panic!("not a CallableType after arg_types patch"),
+            }
+            // Noop: identical list round-trips the same bytes.
+            assert_eq!(
+                patch_callable_arg_types(h, &type_list_blob(&[anyt(), tvt("Q")])).unwrap(),
+                new
+            );
+            // variables: same list framing; swap T for Q.
+            let vars = patch_callable_variables(h, &type_list_blob(&[tvt("Q")])).unwrap();
+            match decode(h) {
+                Type::CallableType { variables, .. } => {
+                    assert_eq!(variables.len(), 1);
+                    if let Type::TypeVarType { name, .. } = &variables[0] {
+                        assert_eq!(name, "Q");
+                    } else {
+                        panic!("variable is not a tvar");
+                    }
+                }
+                _ => panic!("not a CallableType after variables patch"),
+            }
+            assert_eq!(entry_bytes(h), Some(vars));
+        });
+    }
+
+    #[test]
+    fn test_patch_callable_arg_kinds_names() {
+        with_py(|py| {
+            reset();
+            let h = registered_callable(py);
+            let kinds = patch_callable_arg_kinds(h, vec![0, 2]).unwrap();
+            match decode(h) {
+                Type::CallableType { arg_kinds, .. } => assert_eq!(arg_kinds, vec![0, 2]),
+                _ => panic!("not a CallableType after kinds patch"),
+            }
+            // Weird kind values pass through: the wire stores bare ints.
+            assert_eq!(
+                patch_callable_arg_kinds(h, vec![0, 2]).unwrap(),
+                kinds
+            );
+            let names = patch_callable_arg_names(h, vec![Some("x".to_string()), None]).unwrap();
+            match decode(h) {
+                Type::CallableType { arg_names, .. } => {
+                    assert_eq!(arg_names, vec![Some("x".to_string()), None])
+                }
+                _ => panic!("not a CallableType after names patch"),
+            }
+            // Noop names: same list returns the pre-call stored bytes.
+            assert_eq!(
+                patch_callable_arg_names(h, vec![Some("x".to_string()), None]).unwrap(),
+                names
+            );
+            assert_eq!(entry_bytes(h), Some(names));
+        });
+    }
+
+    #[test]
+    fn test_patch_callable_name_and_flags() {
+        with_py(|py| {
+            reset();
+            let h = registered_callable(py);
+            match decode(h) {
+                Type::CallableType { name, .. } => assert_eq!(name.as_deref(), Some("f")),
+                _ => panic!("setup blob wrong"),
+            }
+            // Noop on the same name.
+            assert_eq!(
+                patch_callable_name_field(h, Some("f")).unwrap(),
+                entry_bytes(h).unwrap()
+            );
+            patch_callable_name_field(h, Some("g")).unwrap();
+            // Second write of the same name is a noop: stored bytes unchanged.
+            assert_eq!(
+                patch_callable_name_field(h, Some("g")).unwrap(),
+                entry_bytes(h).unwrap()
+            );
+            // Flags: full wire-order reorder, and a wrong-length list defers.
+            assert_eq!(patch_callable_flags(h, vec![true]), None);
+            let flags_blob = patch_callable_flags(h, vec![false, true, true, false, false, false, false])
+                .unwrap();
+            match decode(h) {
+                Type::CallableType {
+                    implicit,
+                    is_bound,
+                    ..
+                } => {
+                    assert!(implicit);
+                    assert!(is_bound);
+                }
+                _ => panic!("not a CallableType after flags patch"),
+            }
+            // Noop flags pass-through.
+            assert_eq!(
+                patch_callable_flags(h, vec![false, true, true, false, false, false, false])
+                    .unwrap(),
+                flags_blob
+            );
+        });
+    }
+
+    #[test]
+    fn test_patch_callable_opt_fallback_instance_type() {
+        with_py(|py| {
+            reset();
+            let h = registered_callable(py);
+            // type_guard: set to an Any via which=0, then clear with None.
+            let guard = patch_callable_opt_field(h, 0, Some(&single_blob(&anyt()))).unwrap();
+            match decode(h) {
+                Type::CallableType { type_guard, .. } => {
+                    assert!(matches!(type_guard, Some(ref t) if matches!(&**t, Type::AnyType { .. })))
+                }
+                _ => panic!("not a CallableType after type_guard set"),
+            }
+            assert_eq!(entry_bytes(h), Some(guard));
+            let cleared = patch_callable_opt_field(h, 0, None).unwrap();
+            match decode(h) {
+                Type::CallableType { type_guard, .. } => assert!(type_guard.is_none()),
+                _ => panic!("not a CallableType after type_guard clear"),
+            }
+            assert_eq!(entry_bytes(h), Some(cleared));
+            // type_is via which=1.
+            patch_callable_opt_field(h, 1, Some(&single_blob(&Type::NoneType))).unwrap();
+            match decode(h) {
+                Type::CallableType { type_is, .. } => {
+                    assert!(matches!(type_is, Some(ref t) if matches!(&**t, Type::NoneType)))
+                }
+                _ => panic!("not a CallableType after type_is set"),
+            }
+            // Unknown which defers without touching storage.
+            let before = entry_bytes(h).unwrap();
+            assert_eq!(patch_callable_opt_field(h, 2, Some(&single_blob(&anyt()))), None);
+            assert_eq!(entry_bytes(h), Some(before));
+            // fallback: swap to an int Instance.
+            let fb = patch_callable_fallback(h, &single_blob(&int_fallback())).unwrap();
+            match decode(h) {
+                Type::CallableType { fallback, .. } => {
+                    assert!(matches!(*fallback, Type::Instance { .. }))
+                }
+                _ => panic!("not a CallableType after fallback patch"),
+            }
+            assert_eq!(entry_bytes(h), Some(fb));
+            // instance_type: absent -> None noop, then set.
+            assert_eq!(
+                patch_callable_instance_type(h, None).unwrap(),
+                entry_bytes(h).unwrap()
+            );
+            patch_callable_instance_type(h, Some(&single_blob(&anyt()))).unwrap();
+            match decode(h) {
+                Type::CallableType { instance_type, .. } => {
+                    assert!(matches!(instance_type, Some(ref t) if matches!(&**t, Type::AnyType { .. })))
+                }
+                _ => panic!("not a CallableType after instance_type set"),
+            }
+        });
+    }
+
+    #[test]
+    fn test_patch_callable_defers_on_bad_shapes() {
+        with_py(|py| {
+            reset();
+            // Garbage stored blob: every op defers.
+            let h = register(fresh(py), "callable", b"garbage".to_vec(), vec![]).unwrap();
+            assert_eq!(patch_callable_ret_type(h, &single_blob(&anyt())), None);
+            assert_eq!(patch_callable_arg_types(h, &type_list_blob(&[])), None);
+            assert_eq!(patch_callable_arg_kinds(h, vec![0]), None);
+            assert_eq!(patch_callable_arg_names(h, vec![None]), None);
+            assert_eq!(patch_callable_name_field(h, Some("g")), None);
+            assert_eq!(patch_callable_variables(h, &type_list_blob(&[])), None);
+            assert_eq!(patch_callable_opt_field(h, 0, None), None);
+            assert_eq!(patch_callable_fallback(h, &single_blob(&anyt())), None);
+            assert_eq!(patch_callable_instance_type(h, None), None);
+            assert_eq!(patch_callable_flags(h, vec![false, false, false, false, false, false, false]), None);
+            // Non-callable stored family: defers instead of retyping.
+            let mut w = WriteBuffer::new();
+            write_type(&mut w, &tvt("T")).unwrap();
+            let h2 = register(fresh(py), "tvar", w.into_bytes(), vec![]).unwrap();
+            assert_eq!(patch_callable_ret_type(h2, &single_blob(&anyt())), None);
+            assert_eq!(patch_callable_arg_kinds(h2, vec![0]), None);
+            assert_eq!(patch_callable_flags(h2, vec![false, false, false, false, false, false, false]), None);
+            // Unregistered handles defer.
+            assert_eq!(patch_callable_ret_type(h + 1, &single_blob(&anyt())), None);
+            // Registered callable, garbage list payloads defer too.
+            let h3 = registered_callable(py);
+            assert_eq!(patch_callable_arg_types(h3, b"garbage"), None);
+            assert_eq!(patch_callable_variables(h3, b"garbage"), None);
+            assert_eq!(patch_callable_fallback(h3, b"garbage"), None);
+            assert_eq!(patch_callable_ret_type(h3, b"garbage"), None);
+            assert_eq!(patch_callable_opt_field(h3, 0, Some(b"garbage")), None);
+            assert_eq!(patch_callable_instance_type(h3, Some(b"garbage")), None);
+        });
+    }
+
+    #[test]
+    fn test_patch_callable_preserves_unpatched_fields() {
+        with_py(|py| {
+            reset();
+            let h = registered_callable(py);
+            // Patching one field must keep every other wire field intact,
+            // including a wire-invisible round-trip (special_sig decodes to
+            // the None default because the wire never carries it).
+            patch_callable_arg_kinds(h, vec![0, 3]).unwrap();
+            patch_callable_name_field(h, Some("g")).unwrap();
+            match decode(h) {
+                Type::CallableType {
+                    name,
+                    arg_kinds,
+                    arg_types,
+                    ret_type,
+                    variables,
+                    ..
+                } => {
+                    assert_eq!(name.as_deref(), Some("g"));
+                    assert_eq!(arg_kinds, vec![0, 3]);
+                    // arg_types was NOT patched: still the single tvar.
+                    assert_eq!(arg_types.len(), 1);
+                    if let Type::TypeVarType { name: n, .. } = &arg_types[0] {
+                        assert_eq!(n, "T");
+                    } else {
+                        panic!("arg_types drifted");
+                    }
+                    assert!(matches!(*ret_type, Type::NoneType));
+                    assert_eq!(variables.len(), 1);
+                }
+                _ => panic!("not a CallableType"),
+            }
+        });
     }
 }
