@@ -475,21 +475,22 @@ const WALK_SKIP_SLOTS: [&str; 4] = ["line", "column", "end_line", "end_column"];
 const WALK_DEPTH_CAP: usize = 2500;
 
 enum WalkErr {
-    /// Any failure the pure-Python body will reproduce identically.
-    Defer(PyErr),
+    /// Any failure the pure-Python body will reproduce identically. The
+    /// payload is never inspected (both defers become `None`).
+    Defer,
     /// Depth cap reached: defer so Python's recursion limit governs.
     Depth,
 }
 
 impl From<PyErr> for WalkErr {
-    fn from(e: PyErr) -> Self {
-        WalkErr::Defer(e)
+    fn from(_: PyErr) -> Self {
+        WalkErr::Defer
     }
 }
 
 impl From<PyDowncastError<'_>> for WalkErr {
-    fn from(e: PyDowncastError<'_>) -> Self {
-        WalkErr::Defer(e.into())
+    fn from(_: PyDowncastError<'_>) -> Self {
+        WalkErr::Defer
     }
 }
 
@@ -510,7 +511,7 @@ fn read_slot(obj: &PyAny, name: &str, py: Python) -> Result<Option<PyObject>, Wa
     match obj.getattr(name) {
         Ok(v) => Ok(Some(v.to_object(py))),
         Err(e) if e.is_instance_of::<PyAttributeError>(py) => Ok(None),
-        Err(e) => Err(WalkErr::Defer(e)),
+        Err(_) => Err(WalkErr::Defer),
     }
 }
 
@@ -524,7 +525,7 @@ fn collect_slot_names(ty: &PyType, py: Python) -> Result<Vec<String>, WalkErr> {
         let slots = match klass.getattr("__slots__") {
             Ok(s) => s,
             Err(e) if e.is_instance_of::<PyAttributeError>(py) => continue,
-            Err(e) => return Err(WalkErr::Defer(e)),
+            Err(_) => return Err(WalkErr::Defer),
         };
         if !slots.is_true().map_err(WalkErr::from)? {
             continue;
@@ -564,9 +565,17 @@ fn slot_names_for(ctx: &mut WalkCtx, py: Python, t: &PyAny) -> Result<Rc<Vec<Str
     if let Some(v) = ctx.slot_cache.get(&key) {
         return Ok(v.clone());
     }
-    let names = Rc::new(collect_slot_names(&ty, py)?);
+    let names = Rc::new(collect_slot_names(ty, py)?);
     ctx.slot_cache.insert(key, names.clone());
     Ok(names)
+}
+
+/// The three walk output lists, grouped so walk_slots/walk_value stay
+/// under the clippy argument limit.
+struct WalkOut {
+    tvids: Vec<Py<PyAny>>,
+    aliases: Vec<Py<PyAny>>,
+    embeds: Vec<Py<PyAny>>,
 }
 
 fn walk_slots(
@@ -575,9 +584,7 @@ fn walk_slots(
     t: &PyAny,
     seen: &mut HashSet<usize>,
     depth: usize,
-    tvids: &mut Vec<Py<PyAny>>,
-    aliases: &mut Vec<Py<PyAny>>,
-    embeds: &mut Vec<Py<PyAny>>,
+    out: &mut WalkOut,
 ) -> Result<(), WalkErr> {
     let names = slot_names_for(ctx, py, t)?;
     for name in names.iter() {
@@ -586,16 +593,7 @@ fn walk_slots(
             return Err(WalkErr::Depth);
         }
         if let Some(value) = read_slot(t, name, py)? {
-            walk_value(
-                ctx,
-                py,
-                value.as_ref(py),
-                seen,
-                depth,
-                tvids,
-                aliases,
-                embeds,
-            )?;
+            walk_value(ctx, py, value.as_ref(py), seen, depth, out)?;
         }
     }
     Ok(())
@@ -632,9 +630,7 @@ fn walk_value(
     value: &PyAny,
     seen: &mut HashSet<usize>,
     depth: usize,
-    tvids: &mut Vec<Py<PyAny>>,
-    aliases: &mut Vec<Py<PyAny>>,
-    embeds: &mut Vec<Py<PyAny>>,
+    out: &mut WalkOut,
 ) -> Result<(), WalkErr> {
     if depth > WALK_DEPTH_CAP {
         return Err(WalkErr::Depth);
@@ -648,7 +644,7 @@ fn walk_value(
         .map_err(WalkErr::from)?
     {
         // TypeVarId items are collected per occurrence, like Python.
-        tvids.push(value.to_object(py));
+        out.tvids.push(value.to_object(py));
         return Ok(());
     }
     if value
@@ -663,27 +659,18 @@ fn walk_value(
                 .iter()
                 .any(|f| f.as_ref(py).as_ptr() == ty_obj.as_ptr())
             {
-                embeds.push(value.to_object(py));
+                out.embeds.push(value.to_object(py));
             }
-            walk_slots(ctx, py, value, seen, depth, tvids, aliases, embeds)?;
+            walk_slots(ctx, py, value, seen, depth, out)?;
         }
         return Ok(());
     }
     if py_type_name(value)? == "TypeAlias" {
         if !seen.contains(&vptr) {
             seen.insert(vptr);
-            aliases.push(value.to_object(py));
+            out.aliases.push(value.to_object(py));
             if let Some(target) = read_slot(value, "target", py)? {
-                walk_value(
-                    ctx,
-                    py,
-                    target.as_ref(py),
-                    seen,
-                    depth + 1,
-                    tvids,
-                    aliases,
-                    embeds,
-                )?;
+                walk_value(ctx, py, target.as_ref(py), seen, depth + 1, out)?;
             }
         }
         return Ok(());
@@ -692,7 +679,7 @@ fn walk_value(
         seen.insert(vptr);
         for item in value.iter().map_err(WalkErr::from)? {
             let item = item.map_err(WalkErr::from)?;
-            walk_value(ctx, py, item, seen, depth + 1, tvids, aliases, embeds)?;
+            walk_value(ctx, py, item, seen, depth + 1, out)?;
         }
         return Ok(());
     }
@@ -701,22 +688,13 @@ fn walk_value(
         let values = value.call_method0("values").map_err(WalkErr::from)?;
         for item in values.iter().map_err(WalkErr::from)? {
             let item = item.map_err(WalkErr::from)?;
-            walk_value(ctx, py, item, seen, depth + 1, tvids, aliases, embeds)?;
+            walk_value(ctx, py, item, seen, depth + 1, out)?;
         }
         return Ok(());
     }
     if py_type_name(value)? == "ExtraAttrs" {
         if let Some(attrs) = read_slot(value, "attrs", py)? {
-            walk_value(
-                ctx,
-                py,
-                attrs.as_ref(py),
-                seen,
-                depth + 1,
-                tvids,
-                aliases,
-                embeds,
-            )?;
+            walk_value(ctx, py, attrs.as_ref(py), seen, depth + 1, out)?;
         }
     }
     Ok(())
@@ -725,11 +703,12 @@ fn walk_value(
 /// Family classes in registration order (FAMILY_NAME in types_mirror.py).
 const FAMILY_ORDER: [&str; 4] = ["Instance", "CallableType", "TypeVarType", "UnionType"];
 
+/// The three index lists; alias keeps the pyfunction signature out of the
+/// clippy type-complexity limit.
+type WalkLists = (Vec<Py<PyAny>>, Vec<Py<PyAny>>, Vec<Py<PyAny>>);
+
 #[pyfunction]
-pub(crate) fn rust_mirror_walk_indices(
-    py: Python,
-    root: &PyAny,
-) -> Option<(Vec<Py<PyAny>>, Vec<Py<PyAny>>, Vec<Py<PyAny>>)> {
+pub(crate) fn rust_mirror_walk_indices(py: Python, root: &PyAny) -> Option<WalkLists> {
     let types_mod = py.import("mypy.types").ok()?;
     let cls = |name: &str| types_mod.getattr(name).ok().map(|o| o.to_object(py));
     let mut ctx = WalkCtx {
@@ -741,22 +720,19 @@ pub(crate) fn rust_mirror_walk_indices(
             .collect::<Option<Vec<_>>>()?,
         slot_cache: HashMap::new(),
     };
-    let mut tvids = Vec::new();
-    let mut aliases = Vec::new();
-    let mut embeds = Vec::new();
     let mut seen = HashSet::new();
     seen.insert(root.as_ptr() as usize);
-    walk_slots(
-        &mut ctx,
-        py,
-        root,
-        &mut seen,
-        0,
-        &mut tvids,
-        &mut aliases,
-        &mut embeds,
-    )
-    .ok()?;
+    let mut out = WalkOut {
+        tvids: Vec::new(),
+        aliases: Vec::new(),
+        embeds: Vec::new(),
+    };
+    walk_slots(&mut ctx, py, root, &mut seen, 0, &mut out).ok()?;
+    let WalkOut {
+        tvids,
+        aliases,
+        embeds,
+    } = out;
     Some((tvids, aliases, embeds))
 }
 
