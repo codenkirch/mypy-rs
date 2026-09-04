@@ -522,7 +522,21 @@ def _walk_indices(root: Type) -> tuple[list[TypeVarId], list[Any], list[Type]]:
 
     Returns (tvids, alias_nodes, family_embeds_excluding_root), ordered
     like the separate walks each produced.
+
+    The Rust kernel mirrors this exact traversal (`rust_mirror_walk_indices`);
+    a None result (unreadable shape, undecodable slots, depth cap, missing
+    mypy.types module) defers to the pure-Python body below.
     """
+    if _kernel_mod is not None:
+        res = _kernel_mod.rust_mirror_walk_indices(root)
+        if res is not None:
+            return cast("tuple[list[TypeVarId], list[Any], list[Type]]", res)
+    return _walk_indices_py(root)
+
+
+def _walk_indices_py(root: Type) -> tuple[list[TypeVarId], list[Any], list[Type]]:
+    """Pure-Python `_walk_indices` body (kept for deferral and the
+    gate-off differential)."""
     tvids: list[TypeVarId] = []
     aliases: list[Any] = []
     embeds: list[Type] = []

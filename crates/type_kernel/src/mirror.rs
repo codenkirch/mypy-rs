@@ -444,10 +444,315 @@ pub(crate) fn rust_mirror_patch_instance_lkv(
     patch_instance_lkv(handle, lkv_blob)
 }
 
+// ---- reverse-index collection walk (Slice 7) ----
+// Port of the fused `_walk_indices` traversal from mypy/types_mirror.py: one
+// descent over the live graph collecting tvids, TypeAlias nodes, family Types.
+
+// Python keeps the apply steps (`_apply_tvid_carriers` / `_apply_alias_carriers`
+// / `_apply_hidden_embeds`), which own the real bookkeeping; only the slot-scan
+// tree walk moves here. The dispatch order mirrors Python exactly:
+
+// scalar -> TypeVarId -> Type -> "TypeAlias" by type name -> list/tuple ->
+// dict -> ExtraAttrs, with a per-class memoized slot-name list (the analogue
+// of `_type_names`). None defers: unreadable shape, undecodable slots,
+
+// unknown module, or walk depth past the recursion cap (Python's recursion
+// limit then governs, raising or succeeding exactly as before).
+
+use std::collections::HashSet;
+use std::rc::Rc;
+
+use pyo3::exceptions::PyAttributeError;
+use pyo3::types::{PyBytes, PyDict, PyFloat, PyInt, PyList, PyString, PyTuple, PyType};
+use pyo3::PyDowncastError;
+
+/// Slots that never hold a Type child (positions; _-prefixed slot names
+/// are skipped by prefix in `collect_slot_names`).
+const WALK_SKIP_SLOTS: [&str; 4] = ["line", "column", "end_line", "end_column"];
+
+/// Depth cap for the recursive walk. Each walked edge costs the pure-Python
+/// fallback roughly one `_walk_value` frame (two through a Type-node hop),
+/// so a default 1000-frame limit raises `RecursionError` by ~500 edges. The
+/// cap sits below that horizon: past the cap we defer and the fallback
+/// raises or succeeds exactly as the pre-port Python did.
+const WALK_DEPTH_CAP: usize = 400;
+
+enum WalkErr {
+    /// Any failure the pure-Python body will reproduce identically. The
+    /// payload is never inspected (both defers become `None`).
+    Defer,
+    /// Depth cap reached: defer so Python's recursion limit governs.
+    Depth,
+}
+
+impl From<PyErr> for WalkErr {
+    fn from(_: PyErr) -> Self {
+        WalkErr::Defer
+    }
+}
+
+impl From<PyDowncastError<'_>> for WalkErr {
+    fn from(_: PyDowncastError<'_>) -> Self {
+        WalkErr::Defer
+    }
+}
+
+struct WalkCtx {
+    /// `mypy.types.Type` base class (`isinstance(value, Type)` check).
+    type_cls: Py<PyAny>,
+    /// `mypy.types.TypeVarId` class (checked before Type, like Python).
+    tvid_cls: Py<PyAny>,
+    /// The four family class objects (`type(value) in FAMILY_NAME`).
+    family: Vec<Py<PyAny>>,
+    /// Per-class usable slot names (`_SLOT_NAMES` minus skipped names).
+    slot_cache: HashMap<usize, Rc<Vec<String>>>,
+}
+
+/// Read one slot; `Ok(None)` is an unset slot descriptor (the AttributeError
+/// pass), any other error propagates as a defer.
+/// Slot reads use the full builtin attribute lookup, while Python's
+/// `_walk_slots` uses `object.__getattribute__` (no `__getattr__`
+/// fallback). Parity holds because the mypy family/alias/ExtraAttrs
+/// classes define no attribute hooks; revisit if one ever does.
+fn read_slot(obj: &PyAny, name: &str, py: Python) -> Result<Option<PyObject>, WalkErr> {
+    match obj.getattr(name) {
+        Ok(v) => Ok(Some(v.to_object(py))),
+        Err(e) if e.is_instance_of::<PyAttributeError>(py) => Ok(None),
+        Err(_) => Err(WalkErr::Defer),
+    }
+}
+
+/// Collect a class's MRO __slots__ names (the `_type_names` fold),
+/// deduplicated in order, filtered to the names the walk reads.
+fn collect_slot_names(ty: &PyType, py: Python) -> Result<Vec<String>, WalkErr> {
+    let mro = ty.getattr("__mro__").map_err(WalkErr::from)?;
+    let mut collected: Vec<String> = Vec::new();
+    for klass in mro.iter().map_err(WalkErr::from)? {
+        let klass = klass.map_err(WalkErr::from)?;
+        let slots = match klass.getattr("__slots__") {
+            Ok(s) => s,
+            Err(e) if e.is_instance_of::<PyAttributeError>(py) => continue,
+            Err(_) => return Err(WalkErr::Defer),
+        };
+        if !slots.is_true().map_err(WalkErr::from)? {
+            continue;
+        }
+        if slots.is_instance_of::<PyString>() {
+            // A string __slots__ contributes its characters, like the
+            // Python list.extend over the string would.
+            let s: &PyString = slots.downcast().map_err(WalkErr::from)?;
+            for ch in s.to_str().map_err(WalkErr::from)?.chars() {
+                collected.push(ch.to_string());
+            }
+        } else {
+            for item in slots.iter().map_err(WalkErr::from)? {
+                let item = item.map_err(WalkErr::from)?;
+                let s: &PyString = item.downcast().map_err(WalkErr::from)?;
+                collected.push(s.to_str().map_err(WalkErr::from)?.to_string());
+            }
+        }
+    }
+    // dict.fromkeys dedup (first occurrence wins), then name filters.
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut out: Vec<String> = Vec::new();
+    for name in collected {
+        if seen.insert(name.clone()) {
+            if name.starts_with('_') || WALK_SKIP_SLOTS.contains(&name.as_str()) {
+                continue;
+            }
+            out.push(name);
+        }
+    }
+    Ok(out)
+}
+
+fn slot_names_for(ctx: &mut WalkCtx, py: Python, t: &PyAny) -> Result<Rc<Vec<String>>, WalkErr> {
+    let ty = t.get_type();
+    let key = ty.as_ptr() as usize;
+    if let Some(v) = ctx.slot_cache.get(&key) {
+        return Ok(v.clone());
+    }
+    let names = Rc::new(collect_slot_names(ty, py)?);
+    ctx.slot_cache.insert(key, names.clone());
+    Ok(names)
+}
+
+/// The three walk output lists, grouped so walk_slots/walk_value stay
+/// under the clippy argument limit.
+struct WalkOut {
+    tvids: Vec<Py<PyAny>>,
+    aliases: Vec<Py<PyAny>>,
+    embeds: Vec<Py<PyAny>>,
+}
+
+fn walk_slots(
+    ctx: &mut WalkCtx,
+    py: Python,
+    t: &PyAny,
+    seen: &mut HashSet<usize>,
+    depth: usize,
+    out: &mut WalkOut,
+) -> Result<(), WalkErr> {
+    let names = slot_names_for(ctx, py, t)?;
+    for name in names.iter() {
+        let depth = depth + 1;
+        if depth > WALK_DEPTH_CAP {
+            return Err(WalkErr::Depth);
+        }
+        if let Some(value) = read_slot(t, name, py)? {
+            walk_value(ctx, py, value.as_ref(py), seen, depth, out)?;
+        }
+    }
+    Ok(())
+}
+
+fn is_scalar(value: &PyAny) -> bool {
+    value.is_none()
+        || value.is_instance_of::<PyString>()
+        || value.is_instance_of::<PyBytes>()
+        || value.is_instance_of::<PyInt>()
+        || value.is_instance_of::<PyFloat>()
+}
+
+/// `type(value).__name__` — pyo3's `PyType::name()` returns `__qualname__`,
+/// which diverges for classes defined in a local scope (duck-typed stubs
+/// like the ExtraAttrs test double).
+fn py_type_name(value: &PyAny) -> Result<String, WalkErr> {
+    let name = value
+        .get_type()
+        .getattr("__name__")
+        .map_err(WalkErr::from)?;
+    let s = name.downcast::<PyString>().map_err(WalkErr::from)?;
+    Ok(s.to_str().map_err(WalkErr::from)?.to_string())
+}
+
+/// Dispatch order mirrors `_walk_value` exactly. The cap gate here plus the
+/// `depth + 1` passed into every direct recursion bounds all descent edges,
+/// so a pure-container cycle defers at the cap instead of overflowing the
+/// native stack (Python's fallback then hits its own RecursionError, as
+/// before the port).
+fn walk_value(
+    ctx: &mut WalkCtx,
+    py: Python,
+    value: &PyAny,
+    seen: &mut HashSet<usize>,
+    depth: usize,
+    out: &mut WalkOut,
+) -> Result<(), WalkErr> {
+    if depth > WALK_DEPTH_CAP {
+        return Err(WalkErr::Depth);
+    }
+    if is_scalar(value) {
+        return Ok(());
+    }
+    let vptr = value.as_ptr() as usize;
+    if value
+        .is_instance(ctx.tvid_cls.as_ref(py))
+        .map_err(WalkErr::from)?
+    {
+        // TypeVarId items are collected per occurrence, like Python.
+        out.tvids.push(value.to_object(py));
+        return Ok(());
+    }
+    if value
+        .is_instance(ctx.type_cls.as_ref(py))
+        .map_err(WalkErr::from)?
+    {
+        if !seen.contains(&vptr) {
+            seen.insert(vptr);
+            let ty_obj = value.get_type();
+            if ctx
+                .family
+                .iter()
+                .any(|f| f.as_ref(py).as_ptr() == ty_obj.as_ptr())
+            {
+                out.embeds.push(value.to_object(py));
+            }
+            walk_slots(ctx, py, value, seen, depth, out)?;
+        }
+        return Ok(());
+    }
+    let type_name = py_type_name(value)?;
+    if type_name == "TypeAlias" {
+        if !seen.contains(&vptr) {
+            seen.insert(vptr);
+            out.aliases.push(value.to_object(py));
+            if let Some(target) = read_slot(value, "target", py)? {
+                walk_value(ctx, py, target.as_ref(py), seen, depth + 1, out)?;
+            }
+        }
+        return Ok(());
+    }
+    if value.is_instance_of::<PyList>() || value.is_instance_of::<PyTuple>() {
+        seen.insert(vptr);
+        for item in value.iter().map_err(WalkErr::from)? {
+            let item = item.map_err(WalkErr::from)?;
+            walk_value(ctx, py, item, seen, depth + 1, out)?;
+        }
+        return Ok(());
+    }
+    if value.is_instance_of::<PyDict>() {
+        seen.insert(vptr);
+        let values = value.call_method0("values").map_err(WalkErr::from)?;
+        for item in values.iter().map_err(WalkErr::from)? {
+            let item = item.map_err(WalkErr::from)?;
+            walk_value(ctx, py, item, seen, depth + 1, out)?;
+        }
+        return Ok(());
+    }
+    if type_name == "ExtraAttrs" {
+        // Python reads `value.attrs` with NO AttributeError suppression
+        // here (unlike the slot scan and the alias target); an unreadable
+        // read defers, so the fallback re-raises identically.
+        match value.getattr("attrs") {
+            Ok(attrs) => walk_value(ctx, py, attrs, seen, depth + 1, out)?,
+            Err(_) => return Err(WalkErr::Defer),
+        }
+    }
+    Ok(())
+}
+
+/// Family classes in registration order (FAMILY_NAME in types_mirror.py).
+const FAMILY_ORDER: [&str; 4] = ["Instance", "CallableType", "TypeVarType", "UnionType"];
+
+/// The three index lists; alias keeps the pyfunction signature out of the
+/// clippy type-complexity limit.
+type WalkLists = (Vec<Py<PyAny>>, Vec<Py<PyAny>>, Vec<Py<PyAny>>);
+
+#[pyfunction]
+pub(crate) fn rust_mirror_walk_indices(py: Python, root: &PyAny) -> Option<WalkLists> {
+    let types_mod = py.import("mypy.types").ok()?;
+    let cls = |name: &str| types_mod.getattr(name).ok().map(|o| o.to_object(py));
+    let mut ctx = WalkCtx {
+        type_cls: cls("Type")?,
+        tvid_cls: cls("TypeVarId")?,
+        family: FAMILY_ORDER
+            .iter()
+            .map(|name| cls(name))
+            .collect::<Option<Vec<_>>>()?,
+        slot_cache: HashMap::new(),
+    };
+    let mut seen = HashSet::new();
+    seen.insert(root.as_ptr() as usize);
+    let mut out = WalkOut {
+        tvids: Vec::new(),
+        aliases: Vec::new(),
+        embeds: Vec::new(),
+    };
+    walk_slots(&mut ctx, py, root, &mut seen, 0, &mut out).ok()?;
+    let WalkOut {
+        tvids,
+        aliases,
+        embeds,
+    } = out;
+    Some((tvids, aliases, embeds))
+}
+
 #[cfg(test)]
 mod mirror_tests {
     use super::*;
     use crate::wire::{write_type_list, LiteralValue};
+    use pyo3::types::PyModule;
     fn with_py<T>(f: impl FnOnce(Python<'_>) -> T) -> T {
         pyo3::prepare_freethreaded_python();
         Python::with_gil(f)
@@ -828,5 +1133,58 @@ mod mirror_tests {
             assert!(!write_skip(h, 9));
             assert!(write_skip(h, 0));
         });
+    }
+
+    /// A self-referencing container held in a slots-bearing root must defer
+    /// at the depth cap, not overflow the native stack (Python's fallback
+    /// then hits its own RecursionError as before the port).
+    #[test]
+    fn test_walk_indices_defers_on_container_cycle() {
+        with_py(|py| {
+            let root = slots_root(py);
+            let cycle = PyList::empty(py);
+            cycle.append(cycle).unwrap(); // self cycle
+            root.setattr("args", cycle).unwrap();
+            assert!(rust_mirror_walk_indices(py, root).is_none());
+        });
+    }
+
+    /// Acyclic but deeper than the cap defers the same way.
+    #[test]
+    fn test_walk_indices_defers_on_deep_container_nesting() {
+        with_py(|py| {
+            let root = slots_root(py);
+            let mut cur: Py<PyAny> = PyList::empty(py).into();
+            for _ in 0..(WALK_DEPTH_CAP + 10) {
+                let l = PyList::empty(py);
+                l.append(cur.as_ref(py)).unwrap();
+                cur = l.into();
+            }
+            root.setattr("args", cur).unwrap();
+            assert!(rust_mirror_walk_indices(py, root).is_none());
+        });
+    }
+
+    /// Duck-typed "ExtraAttrs" without a readable `attrs` defers: Python
+    /// reads `value.attrs` unguarded and would raise AttributeError.
+    #[test]
+    fn test_walk_indices_defers_on_unreadable_extra_attrs() {
+        with_py(|py| {
+            let root = slots_root(py);
+            let fake = py.eval("type('ExtraAttrs', (), {})", None, None).unwrap();
+            root.setattr("args", fake.call0().unwrap()).unwrap();
+            assert!(rust_mirror_walk_indices(py, root).is_none());
+        });
+    }
+
+    /// Duck-typed walk root with a single `args` slot, so the entry's
+    /// slot scan reaches the container descent regardless of whether
+    /// `mypy.types` is importable.
+    fn slots_root(py: Python<'_>) -> &PyAny {
+        let cls = PyModule::from_code(py, "class _WalkRoot:\n    __slots__ = ('args',)\n", "", "")
+            .unwrap()
+            .getattr("_WalkRoot")
+            .unwrap();
+        cls.call0().unwrap()
     }
 }

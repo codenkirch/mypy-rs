@@ -50774,6 +50774,147 @@ class NativeMirrorWalkIndicesSuite(Suite):
         )
 
 
+@skipUnless(_splice_kernel is not None, "requires the type_kernel extension")
+class NativeMirrorWalkIndicesRustSuite(Suite):
+    """Unit tests for the Rust port of `_walk_indices` (Slice 7).
+
+    `_walk_indices` routes to `rust_mirror_walk_indices` (one PyO3 walk
+    over the live graph, mirroring the Python dispatch and seen-set
+    semantics exactly) and falls back to `_walk_indices_py` when the
+    kernel defers. These tests pin the Rust-only behaviors the big
+    differential suite above does not capture explicitly: shim routing
+    (Rust engaged, output identical), gate-off fall-through, no tvid
+    deduplication, the string-`__slots__` character spill, and the
+    undecodable-slot defer.
+    """
+
+    def setUp(self) -> None:
+        from mypy import types_mirror
+
+        types_mirror.activate(audit=True)
+        types_mirror.reset(clear_counts=True)
+        self._m = types_mirror
+        self.fx = TypeFixture()
+
+    def tearDown(self) -> None:
+        self._m._strict = False
+        self._m.reset(clear_counts=True)
+
+    def _graphs(self) -> dict[str, Any]:
+        from mypy.types import ExtraAttrs
+
+        fx = self.fx
+        graphs: dict[str, Any] = {}
+        graphs["instance"] = Instance(fx.gi, [fx.a, fx.t])
+        graphs["callable"] = CallableType(
+            [fx.o, fx.str_type],
+            [ARG_POS, ARG_POS],
+            [None, None],
+            fx.o,
+            fx.function,
+            name="f",
+            variables=[fx.t],
+        )
+        graphs["alias"] = fx.def_alias_1(fx.a)[0]
+        graphs["union"] = UnionType([fx.gb, Instance(fx.std_tuplei, [graphs["alias"]])])
+        inst = Instance(fx.gi, [fx.d])
+        # The walk only duck-types this dict; two keys are intentionally not
+        # Types (scalar flag + mixed list) to pin container recursion.
+        attrs = cast("dict[str, Type]", {"x": fx.str_type, "n": 5, "lst": [fx.a, "zz"]})
+        inst.extra_attrs = ExtraAttrs(attrs, immutable=set())
+        graphs["extra_attrs"] = inst
+        graphs["tuple"] = TupleType([fx.o, fx.t], fx.std_tuple)
+        graphs["tvar"] = fx.t
+        return graphs
+
+    def _assert_equal(self, key: str, t: Any, rust: Any, py: Any) -> None:
+        assert rust is not None, key
+        for tag, r, p in zip(("tvids", "aliases", "embeds"), rust, py, strict=True):
+            assert [id(x) for x in r] == [id(x) for x in p], (key, type(t).__name__, tag)
+
+    def test_differential_over_graphs(self) -> None:
+        for key, t in self._graphs().items():
+            rust = self._m._kernel_mod.rust_mirror_walk_indices(t)
+            py = self._m._walk_indices_py(t)
+            self._assert_equal(key, t, rust, py)
+
+    def test_shim_routes_to_rust_and_matches(self) -> None:
+        for key, t in self._graphs().items():
+            got = self._m._walk_indices(t)
+            py = self._m._walk_indices_py(t)
+            self._assert_equal(key, t, got, py)
+
+    def test_gate_off_matches_python(self) -> None:
+        """A deferring kernel seam routes `_walk_indices` to the
+        pure-Python body with identical results. A stub stands in for the
+        kernel: Nones-out `_kernel_mod` while the mirror lives on would
+        crash unrelated funnels in `_handle_of`."""
+        import types as _types_mod
+
+        stub = _types_mod.SimpleNamespace(
+            rust_mirror_handle_of=lambda obj: None, rust_mirror_walk_indices=lambda root: None
+        )
+        graphs = self._graphs()
+        saved = self._m._kernel_mod
+        try:
+            self._m._kernel_mod = stub
+            for key, t in graphs.items():
+                got = self._m._walk_indices(t)
+                py = self._m._walk_indices_py(t)
+                self._assert_equal(key, t, got, py)
+        finally:
+            self._m._kernel_mod = saved
+
+    def test_tvids_not_deduplicated(self) -> None:
+        """Two distinct TypeVarType nodes carrying the SAME TypeVarId
+        object each contribute an occurrence: the walk dedupes Type
+        nodes, never TypeVarIds."""
+        fx = self.fx
+        twin = fx.t.copy_modified(id=fx.t.id)
+        assert twin is not fx.t and twin.id is fx.t.id
+        c = CallableType(
+            [fx.o, fx.o],
+            [ARG_POS, ARG_POS],
+            [None, None],
+            fx.o,
+            fx.function,
+            name="f",
+            variables=[fx.t, twin],
+        )
+        res = self._m._kernel_mod.rust_mirror_walk_indices(c)
+        assert res is not None
+        assert len(res[0]) == 2
+        self._assert_equal("dup-tvid", c, res, self._m._walk_indices_py(c))
+
+    def test_string_slots_chars_parity(self) -> None:
+        """A string __slots__ contributes its characters, like Python's
+        list.extend over the string; both walks land the same empty
+        result since the chars are unreadable slot names."""
+
+        class StrSlots:
+            __slots__ = "ab"  # names 'a', 'b' per _type_names
+
+        s: Any = StrSlots()
+        res = self._m._kernel_mod.rust_mirror_walk_indices(s)
+        assert res is not None
+        assert res == ([], [], []), res
+        assert self._m._walk_indices_py(s) == ([], [], [])
+
+    def test_defers_on_unreadable_slot_item(self) -> None:
+        """A non-string item in __slots__ cannot be a name: Rust defers,
+        the shim re-runs the pure-Python body which raises the same
+        AttributeError as before."""
+
+        class WeirdSlots:
+            __slots__ = ("x",)
+
+        WeirdSlots.__slots__ = (object(),)  # type: ignore[assignment]  # post-hoc; walkers only
+        w = WeirdSlots()
+        res = self._m._kernel_mod.rust_mirror_walk_indices(w)
+        assert res is None
+        self.assertRaises(AttributeError, self._m._walk_indices_py, w)
+
+
 class NativeMirrorReadSuite(Suite):
     """Unit tests for the Phase F2 (#1393) mirror-read flip at checkexpr.
 
