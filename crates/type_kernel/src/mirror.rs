@@ -470,9 +470,12 @@ use pyo3::PyDowncastError;
 /// are skipped by prefix in `collect_slot_names`).
 const WALK_SKIP_SLOTS: [&str; 4] = ["line", "column", "end_line", "end_column"];
 
-/// Depth cap for the recursive walk; deeper graphs defer so the
-/// (recursion-limited) pure-Python walk governs.
-const WALK_DEPTH_CAP: usize = 2500;
+/// Depth cap for the recursive walk. Each walked edge costs the pure-Python
+/// fallback roughly one `_walk_value` frame (two through a Type-node hop),
+/// so a default 1000-frame limit raises `RecursionError` by ~500 edges. The
+/// cap sits below that horizon: past the cap we defer and the fallback
+/// raises or succeeds exactly as the pre-port Python did.
+const WALK_DEPTH_CAP: usize = 400;
 
 enum WalkErr {
     /// Any failure the pure-Python body will reproduce identically. The
@@ -740,6 +743,7 @@ pub(crate) fn rust_mirror_walk_indices(py: Python, root: &PyAny) -> Option<WalkL
 mod mirror_tests {
     use super::*;
     use crate::wire::{write_type_list, LiteralValue};
+    use pyo3::types::PyModule;
     fn with_py<T>(f: impl FnOnce(Python<'_>) -> T) -> T {
         pyo3::prepare_freethreaded_python();
         Python::with_gil(f)
@@ -1122,15 +1126,17 @@ mod mirror_tests {
         });
     }
 
-    /// A self-referencing list must defer at the depth cap, not overflow the
-    /// native stack (Python's fallback then hits its own RecursionError).
+    /// A self-referencing container held in a slots-bearing root must defer
+    /// at the depth cap, not overflow the native stack (Python's fallback
+    /// then hits its own RecursionError as before the port).
     #[test]
     fn test_walk_indices_defers_on_container_cycle() {
         with_py(|py| {
-            let l = PyList::empty(py);
-            l.append(py.None()).unwrap();
-            l.append(l).unwrap(); // self cycle
-            assert!(rust_mirror_walk_indices(py, l).is_none());
+            let root = slots_root(py);
+            let cycle = PyList::empty(py);
+            cycle.append(cycle).unwrap(); // self cycle
+            root.setattr("args", cycle).unwrap();
+            assert!(rust_mirror_walk_indices(py, root).is_none());
         });
     }
 
@@ -1138,13 +1144,26 @@ mod mirror_tests {
     #[test]
     fn test_walk_indices_defers_on_deep_container_nesting() {
         with_py(|py| {
+            let root = slots_root(py);
             let mut cur: Py<PyAny> = PyList::empty(py).into();
             for _ in 0..(WALK_DEPTH_CAP + 10) {
                 let l = PyList::empty(py);
                 l.append(cur.as_ref(py)).unwrap();
                 cur = l.into();
             }
-            assert!(rust_mirror_walk_indices(py, cur.as_ref(py)).is_none());
+            root.setattr("args", cur).unwrap();
+            assert!(rust_mirror_walk_indices(py, root).is_none());
         });
+    }
+
+    /// Duck-typed walk root with a single `args` slot, so the entry's
+    /// slot scan reaches the container descent regardless of whether
+    /// `mypy.types` is importable.
+    fn slots_root(py: Python<'_>) -> &PyAny {
+        let cls = PyModule::from_code(py, "class _WalkRoot:\n    __slots__ = ('args',)\n", "", "")
+            .unwrap()
+            .getattr("_WalkRoot")
+            .unwrap();
+        cls.call0().unwrap()
     }
 }
