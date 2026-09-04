@@ -51178,6 +51178,28 @@ class NativeMirrorReadSuite(Suite):
         # Never written: no handle. The funnel serializes exactly as before.
         assert _serialize_type_erasetype(ct) == self._m._fresh_bytes(ct)
 
+    def test_join_seam_reads_mirror_bytes(self) -> None:
+        from librt.internal import WriteBuffer
+
+        from mypy.join import _serialize_type as _serialize_type_join
+
+        ct = self._generic_callable()
+        ct.write(WriteBuffer())  # adoption funnel registers the tree
+        calls = self._set_read_spy()
+        self._m._read_mode = True
+        assert _serialize_type_join(ct) == self._m._fresh_bytes(ct)
+        assert calls == [ct]  # the funnel consulted the mirror, not the fallback walk
+
+    def test_join_seam_gate_off_serializes(self) -> None:
+        from mypy.join import _serialize_type as _serialize_type_join
+        from mypy.types import _set_native_mirror_read
+
+        ct = self._generic_callable()
+        _set_native_mirror_read(None)
+        self._m._read_mode = True
+        # Never written: no handle. The funnel serializes exactly as before.
+        assert _serialize_type_join(ct) == self._m._fresh_bytes(ct)
+
 
 class NativeInstanceWriteSuite(Suite):
     """Unit tests for the Phase F3 (#1397) instance-write splice of the mirror.
