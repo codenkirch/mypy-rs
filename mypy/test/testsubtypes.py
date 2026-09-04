@@ -2,7 +2,15 @@ from __future__ import annotations
 
 from unittest import skipUnless
 
-from mypy.nodes import CONTRAVARIANT, COVARIANT, INVARIANT, TypeInfo
+from mypy.nodes import (
+    CONTRAVARIANT,
+    COVARIANT,
+    INVARIANT,
+    MDEF,
+    SymbolTableNode,
+    TypeInfo,
+    Var,
+)
 from mypy.subtypes import is_subtype
 from mypy.test.helpers import Suite, _env_gate
 from mypy.test.typefixture import InterfaceTypeFixture, TypeFixture
@@ -932,3 +940,36 @@ class NativeNarrowDeclaredSuite(Suite):
             variance=INVARIANT,
         )
         self._assert_parity(tvar, self.fx.b)
+
+
+class KernelAbsentProtocolImplSuite(Suite):
+    """Regression #1408: protocol pair-registration must respect kernel absence.
+
+    build.py flips `_native_subtype_active` from the `native_type_kernel`
+    option default without checking the kernel import, so a build worker
+    without `type_kernel` on PYTHONPATH reached `_serialize_type` and
+    crashed on the None-bound `_WriteBuffer`.
+    """
+
+    def test_is_protocol_impl_skips_pair_key_without_kernel(self) -> None:
+        import mypy.subtypes as st
+
+        st._set_native_subtype_active(True)
+        # getattr/setattr: the private names are not re-exported to the
+        # self-check; the patch simulates the ImportError fallback state.
+        saved = (st.__dict__["_HAS_TYPE_KERNEL"], st.__dict__["_WriteBuffer"])
+        st.__dict__["_HAS_TYPE_KERNEL"] = False
+        st.__dict__["_WriteBuffer"] = None
+        try:
+            fx = TypeFixture(INVARIANT)
+            proto_i = fx.make_type_info("P")
+            proto_i.is_protocol = True
+            # A real Protocol member comes from names: add a Var 'f' to P.
+            proto_i.names["f"] = SymbolTableNode(MDEF, Var("f", None))
+            # Left (A) has no member 'f': the check must answer False,
+            # routing through the pair-key registration on the way in.
+            result = st.is_protocol_implementation(Instance(fx.ai, []), Instance(proto_i, []))
+            assert result is False
+        finally:
+            st.__dict__["_HAS_TYPE_KERNEL"], st.__dict__["_WriteBuffer"] = saved
+            st._set_native_subtype_active(False)
