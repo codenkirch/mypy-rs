@@ -300,7 +300,11 @@ def _serialize_type(t: Type) -> bytes:
             return _BUILTIN_INSTANCE_BYTES[fn]
     buf = _WriteBuffer()
     result, saw_tvar = _serialize_with_taint_check(t, buf)
-    if not saw_tvar and _wire_cache_enabled() and (not isinstance(t, Instance) or t.type_ref is None):  # type: ignore[misc]
+    if (
+        not saw_tvar
+        and _wire_cache_enabled()
+        and (not isinstance(t, Instance) or t.type_ref is None)
+    ):  # type: ignore[misc]
         _type_wire_cache[key] = (t, result)
     return result
 
@@ -623,9 +627,9 @@ def is_proper_subtype(
             keep_erased_types=keep_erased_types,
         )
     else:
-        assert (
-            not ignore_promotions and not erase_instances and not keep_erased_types
-        ), "Don't pass both context and individual flags"
+        assert not ignore_promotions and not erase_instances and not keep_erased_types, (
+            "Don't pass both context and individual flags"
+        )
     if type_state.is_assumed_proper_subtype(left, right):
         return True
     if mypy.typeops.is_recursive_pair(left, right):
@@ -1950,7 +1954,7 @@ def is_protocol_implementation(
     # post-fallback left (the Instance natively re-derived). A
     # serialization failure just skips registration.
     pair_key: tuple[bytes, bytes, bool] | None = None
-    if _native_subtype_active:
+    if _HAS_TYPE_KERNEL and _native_subtype_active:
         try:
             pair_key = (_serialize_type(left), _serialize_type(right), proper_subtype)
             count = _PROTOCOL_PAIRS_IN_FLIGHT.get(pair_key, 0)
@@ -2056,9 +2060,7 @@ def get_protocol_member(
     ):
         # The kernel defers gpm on extra_attrs-bearing instances (module
         # types); resolve the miss/hit through the #1074 prelude classifier
-        # so the decision still comes from Rust and the Python fallback
-        # body below does not re-run. `__call__` is excluded because the
-        # metaclass special-case at the bottom must still fire.
+        # (`__call__` is excluded: the metaclass case at the bottom fires).
         try:
             tag = _rust_classify_find_member(member, left, False, False)
         except (AssertionError, NotImplementedError, ValueError, AttributeError):
@@ -2185,13 +2187,9 @@ def find_member(
         context=Context(),  # all errors are filtered, but this is a required argument
         chk=type_checker,
         suppress_errors=True,
-        # This is needed to avoid infinite recursion in situations involving protocols like
-        #     class P(Protocol[T]):
-        #         def combine(self, other: P[S]) -> P[Tuple[T, S]]: ...
-        # Normally we call freshen_all_functions_type_vars() during attribute access,
-        # to avoid type variable id collisions, but for protocols this means we can't
-        # use the assumption stack, that will grow indefinitely.
-        # TODO: find a cleaner solution that doesn't involve massive perf impact.
+        # Avoid infinite recursion with protocols like
+        # class P(Protocol[T]): def combine(self, other: P[S]) -> P[Tuple[T, S]]: ...
+        # Protocols can't use the assumption stack here (it would grow indefinitely).
         preserve_type_var_ids=True,
     )
     with type_checker.msg.filter_errors(filter_deprecated=True):
