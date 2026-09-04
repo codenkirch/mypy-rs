@@ -51458,6 +51458,7 @@ class NativeMirrorCallableWriteSuite(Suite):
         cb.arg_kinds = [ARG_OPT]
         delta = self._delta(before)
         assert delta.get("setattr_noop.callable.arg_kinds") == 1, delta
+        self._assert_clean(delta)
         self._blob_matches_fresh(cb)
         # Names: change then noop.
         before = dict(self._m.report())
@@ -51470,6 +51471,7 @@ class NativeMirrorCallableWriteSuite(Suite):
         cb.arg_names = ["x"]
         delta = self._delta(before)
         assert delta.get("setattr_noop.callable.arg_names") == 1, delta
+        self._assert_clean(delta)
         self._blob_matches_fresh(cb)
 
     def test_spliced_name_write(self) -> None:
@@ -51533,6 +51535,7 @@ class NativeMirrorCallableWriteSuite(Suite):
         cb.type_guard = None
         delta = self._delta(before)
         assert delta.get("setattr_spliced.callable.type_guard") == 1, delta
+        self._assert_clean(delta)
         self._blob_matches_fresh(cb)
 
     def test_fallback_write_matches_fresh_bytes(self) -> None:
@@ -51558,6 +51561,7 @@ class NativeMirrorCallableWriteSuite(Suite):
         cb.instance_type = None
         delta = self._delta(before)
         assert delta.get("setattr_noop.callable.instance_type") == 1, delta
+        self._assert_clean(delta)
         self._blob_matches_fresh(cb)
         # Set: a real clear-to-set splice.
         before = dict(self._m.report())

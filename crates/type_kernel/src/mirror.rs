@@ -711,6 +711,11 @@ fn patch_callable_opt_field(
     which: u32,
     blob: Option<&[u8]>,
 ) -> Option<Vec<u8>> {
+    let slot_is_guard = match which {
+        0 => true,
+        1 => false,
+        _ => return None,
+    };
     let mut cf = callable_fields(handle)?;
     let new_val = match blob {
         None => None,
@@ -722,10 +727,10 @@ fn patch_callable_opt_field(
             }
         }
     };
-    let (slot_is_guard, current) = match which {
-        0 => (true, cf.type_guard.as_ref()),
-        1 => (false, cf.type_is.as_ref()),
-        _ => return None,
+    let current = if slot_is_guard {
+        cf.type_guard.as_ref()
+    } else {
+        cf.type_is.as_ref()
     };
     let current_cloned = current.cloned();
     let current_matches = current_cloned == new_val;
@@ -1932,6 +1937,3 @@ mod mirror_tests {
         });
     }
 }
-
-
-
