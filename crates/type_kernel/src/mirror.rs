@@ -444,6 +444,310 @@ pub(crate) fn rust_mirror_patch_instance_lkv(
     patch_instance_lkv(handle, lkv_blob)
 }
 
+// ---- reverse-index collection walk (Slice 7) ----
+// Port of the fused `_walk_indices` traversal from mypy/types_mirror.py: one
+// descent over the live graph collecting tvids, TypeAlias nodes, family Types.
+
+// Python keeps the apply steps (`_apply_tvid_carriers` / `_apply_alias_carriers`
+// / `_apply_hidden_embeds`), which own the real bookkeeping; only the slot-scan
+// tree walk moves here. The dispatch order mirrors Python exactly:
+
+// scalar -> TypeVarId -> Type -> "TypeAlias" by type name -> list/tuple ->
+// dict -> ExtraAttrs, with a per-class memoized slot-name list (the analogue
+// of `_type_names`). None defers: unreadable shape, undecodable slots,
+
+// unknown module, or walk depth past the recursion cap (Python's recursion
+// limit then governs, raising or succeeding exactly as before).
+
+use std::collections::HashSet;
+use std::rc::Rc;
+
+use pyo3::exceptions::PyAttributeError;
+use pyo3::PyDowncastError;
+use pyo3::types::{PyBytes, PyDict, PyFloat, PyInt, PyList, PyString, PyTuple, PyType};
+
+/// Slots that never hold a Type child (positions; _-prefixed slot names
+/// are skipped by prefix in `collect_slot_names`).
+const WALK_SKIP_SLOTS: [&str; 4] = ["line", "column", "end_line", "end_column"];
+
+/// Depth cap for the recursive walk; deeper graphs defer so the
+/// (recursion-limited) pure-Python walk governs.
+const WALK_DEPTH_CAP: usize = 2500;
+
+enum WalkErr {
+    /// Any failure the pure-Python body will reproduce identically.
+    Defer(PyErr),
+    /// Depth cap reached: defer so Python's recursion limit governs.
+    Depth,
+}
+
+impl From<PyErr> for WalkErr {
+    fn from(e: PyErr) -> Self {
+        WalkErr::Defer(e)
+    }
+}
+
+impl From<PyDowncastError<'_>> for WalkErr {
+    fn from(e: PyDowncastError<'_>) -> Self {
+        WalkErr::Defer(e.into())
+    }
+}
+
+struct WalkCtx {
+    /// `mypy.types.Type` base class (`isinstance(value, Type)` check).
+    type_cls: Py<PyAny>,
+    /// `mypy.types.TypeVarId` class (checked before Type, like Python).
+    tvid_cls: Py<PyAny>,
+    /// The four family class objects (`type(value) in FAMILY_NAME`).
+    family: Vec<Py<PyAny>>,
+    /// Per-class usable slot names (`_SLOT_NAMES` minus skipped names).
+    slot_cache: HashMap<usize, Rc<Vec<String>>>,
+}
+
+/// Read one slot; `Ok(None)` is an unset slot descriptor (the AttributeError
+/// pass), any other error propagates as a defer.
+fn read_slot(obj: &PyAny, name: &str, py: Python) -> Result<Option<PyObject>, WalkErr> {
+    match obj.getattr(name) {
+        Ok(v) => Ok(Some(v.to_object(py))),
+        Err(e) if e.is_instance_of::<PyAttributeError>(py) => Ok(None),
+        Err(e) => Err(WalkErr::Defer(e)),
+    }
+}
+
+/// Collect a class's MRO __slots__ names (the `_type_names` fold),
+/// deduplicated in order, filtered to the names the walk reads.
+fn collect_slot_names(ty: &PyType, py: Python) -> Result<Vec<String>, WalkErr> {
+    let mro = ty.getattr("__mro__").map_err(WalkErr::from)?;
+    let mut collected: Vec<String> = Vec::new();
+    for klass in mro.iter().map_err(WalkErr::from)? {
+        let klass = klass.map_err(WalkErr::from)?;
+        let slots = match klass.getattr("__slots__") {
+            Ok(s) => s,
+            Err(e) if e.is_instance_of::<PyAttributeError>(py) => continue,
+            Err(e) => return Err(WalkErr::Defer(e)),
+        };
+        if !slots.is_true().map_err(WalkErr::from)? {
+            continue;
+        }
+        if slots.is_instance_of::<PyString>() {
+            // A string __slots__ contributes its characters, like the
+            // Python list.extend over the string would.
+            let s: &PyString = slots.downcast().map_err(WalkErr::from)?;
+            for ch in s.to_str().map_err(WalkErr::from)?.chars() {
+                collected.push(ch.to_string());
+            }
+        } else {
+            for item in slots.iter().map_err(WalkErr::from)? {
+                let item = item.map_err(WalkErr::from)?;
+                let s: &PyString = item.downcast().map_err(WalkErr::from)?;
+                collected.push(s.to_str().map_err(WalkErr::from)?.to_string());
+            }
+        }
+    }
+    // dict.fromkeys dedup (first occurrence wins), then name filters.
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut out: Vec<String> = Vec::new();
+    for name in collected {
+        if seen.insert(name.clone()) {
+            if name.starts_with('_') || WALK_SKIP_SLOTS.contains(&name.as_str()) {
+                continue;
+            }
+            out.push(name);
+        }
+    }
+    Ok(out)
+}
+
+fn slot_names_for(
+    ctx: &mut WalkCtx,
+    py: Python,
+    t: &PyAny,
+) -> Result<Rc<Vec<String>>, WalkErr> {
+    let ty = t.get_type();
+    let key = ty.as_ptr() as usize;
+    if let Some(v) = ctx.slot_cache.get(&key) {
+        return Ok(v.clone());
+    }
+    let names = Rc::new(collect_slot_names(&ty, py)?);
+    ctx.slot_cache.insert(key, names.clone());
+    Ok(names)
+}
+
+fn walk_slots(
+    ctx: &mut WalkCtx,
+    py: Python,
+    t: &PyAny,
+    seen: &mut HashSet<usize>,
+    depth: usize,
+    tvids: &mut Vec<Py<PyAny>>,
+    aliases: &mut Vec<Py<PyAny>>,
+    embeds: &mut Vec<Py<PyAny>>,
+) -> Result<(), WalkErr> {
+    let names = slot_names_for(ctx, py, t)?;
+    for name in names.iter() {
+        let depth = depth + 1;
+        if depth > WALK_DEPTH_CAP {
+            return Err(WalkErr::Depth);
+        }
+        if let Some(value) = read_slot(t, name, py)? {
+            walk_value(
+                ctx,
+                py,
+                value.as_ref(py),
+                seen,
+                depth,
+                tvids,
+                aliases,
+                embeds,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn is_scalar(value: &PyAny) -> bool {
+    value.is_none()
+        || value.is_instance_of::<PyString>()
+        || value.is_instance_of::<PyBytes>()
+        || value.is_instance_of::<PyInt>()
+        || value.is_instance_of::<PyFloat>()
+}
+
+/// `type(value).__name__` — pyo3's `PyType::name()` returns `__qualname__`,
+/// which diverges for classes defined in a local scope (duck-typed stubs
+/// like the ExtraAttrs test double).
+fn py_type_name(value: &PyAny) -> Result<String, WalkErr> {
+    let name = value.get_type().getattr("__name__").map_err(WalkErr::from)?;
+    let s = name.downcast::<PyString>().map_err(WalkErr::from)?;
+    Ok(s.to_str().map_err(WalkErr::from)?.to_string())
+}/// Dispatch order mirrors `_walk_value` exactly. Depth cap checked here:
+/// every descent step and slot read lands in walk_value, so this one
+/// gate bounds the whole recursion.
+fn walk_value(
+    ctx: &mut WalkCtx,
+    py: Python,
+    value: &PyAny,
+    seen: &mut HashSet<usize>,
+    depth: usize,
+    tvids: &mut Vec<Py<PyAny>>,
+    aliases: &mut Vec<Py<PyAny>>,
+    embeds: &mut Vec<Py<PyAny>>,
+) -> Result<(), WalkErr> {
+    if depth > WALK_DEPTH_CAP {
+        return Err(WalkErr::Depth);
+    }
+    if is_scalar(value) {
+        return Ok(());
+    }
+    let vptr = value.as_ptr() as usize;
+    if value
+        .is_instance(ctx.tvid_cls.as_ref(py))
+        .map_err(WalkErr::from)?
+    {
+        // TypeVarId items are collected per occurrence, like Python.
+        tvids.push(value.to_object(py));
+        return Ok(());
+    }
+    if value
+        .is_instance(ctx.type_cls.as_ref(py))
+        .map_err(WalkErr::from)?
+    {
+        if !seen.contains(&vptr) {
+            seen.insert(vptr);
+            let ty_obj = value.get_type();
+            if ctx
+                .family
+                .iter()
+                .any(|f| f.as_ref(py).as_ptr() == ty_obj.as_ptr())
+            {
+                embeds.push(value.to_object(py));
+            }
+            walk_slots(ctx, py, value, seen, depth, tvids, aliases, embeds)?;
+        }
+        return Ok(());
+    }
+    if py_type_name(value)? == "TypeAlias" {
+        if !seen.contains(&vptr) {
+            seen.insert(vptr);
+            aliases.push(value.to_object(py));
+            if let Some(target) = read_slot(value, "target", py)? {
+                walk_value(
+                    ctx,
+                    py,
+                    target.as_ref(py),
+                    seen,
+                    depth,
+                    tvids,
+                    aliases,
+                    embeds,
+                )?;
+            }
+        }
+        return Ok(());
+    }
+    if value.is_instance_of::<PyList>() || value.is_instance_of::<PyTuple>() {
+        seen.insert(vptr);
+        for item in value.iter().map_err(WalkErr::from)? {
+            let item = item.map_err(WalkErr::from)?;
+            walk_value(ctx, py, item, seen, depth, tvids, aliases, embeds)?;
+        }
+        return Ok(());
+    }
+    if value.is_instance_of::<PyDict>() {
+        seen.insert(vptr);
+        let values = value.call_method0("values").map_err(WalkErr::from)?;
+        for item in values.iter().map_err(WalkErr::from)? {
+            let item = item.map_err(WalkErr::from)?;
+            walk_value(ctx, py, item, seen, depth, tvids, aliases, embeds)?;
+        }
+        return Ok(());
+    }
+    if py_type_name(value)? == "ExtraAttrs" {
+        if let Some(attrs) = read_slot(value, "attrs", py)? {
+            walk_value(
+                ctx,
+                py,
+                attrs.as_ref(py),
+                seen,
+                depth,
+                tvids,
+                aliases,
+                embeds,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// Family classes in registration order (FAMILY_NAME in types_mirror.py).
+const FAMILY_ORDER: [&str; 4] = ["Instance", "CallableType", "TypeVarType", "UnionType"];
+
+#[pyfunction]
+pub(crate) fn rust_mirror_walk_indices(
+    py: Python,
+    root: &PyAny,
+) -> Option<(Vec<Py<PyAny>>, Vec<Py<PyAny>>, Vec<Py<PyAny>>)> {
+    let types_mod = py.import("mypy.types").ok()?;
+    let cls = |name: &str| types_mod.getattr(name).ok().map(|o| o.to_object(py));
+    let mut ctx = WalkCtx {
+        type_cls: cls("Type")?,
+        tvid_cls: cls("TypeVarId")?,
+        family: FAMILY_ORDER
+            .iter()
+            .map(|name| cls(name))
+            .collect::<Option<Vec<_>>>()?,
+        slot_cache: HashMap::new(),
+    };
+    let mut tvids = Vec::new();
+    let mut aliases = Vec::new();
+    let mut embeds = Vec::new();
+    let mut seen = HashSet::new();
+    seen.insert(root.as_ptr() as usize);
+    walk_slots(&mut ctx, py, root, &mut seen, 0, &mut tvids, &mut aliases, &mut embeds)
+        .ok()?;
+    Some((tvids, aliases, embeds))
+}
+
 #[cfg(test)]
 mod mirror_tests {
     use super::*;

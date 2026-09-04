@@ -3385,6 +3385,9 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
     // write-funnel assert skip.
     module.add_function(wrap_pyfunction!(mirror::rust_mirror_write_skip, module)?)?;
     module.add_function(wrap_pyfunction!(mirror::rust_mirror_stamp_sync, module)?)?;
+    // Slice 7: Rust walk for types_mirror._walk_indices (reverse-index
+    // collection); Python keeps the apply steps.
+    module.add_function(wrap_pyfunction!(mirror::rust_mirror_walk_indices, module)?)?;
 
     Ok(())
 }
