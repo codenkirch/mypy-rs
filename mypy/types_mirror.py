@@ -90,6 +90,12 @@ SKIP_ATTRS: Final = frozenset(
         # recorded write can only be a noop (profile: 418 capturable writes
         # per self-check).
         "special_sig",
+        # UnionType plain data (Phase F0, #1349, slice 9 #1397): wire-invisible,
+        # Rust-resident. nativeparse.py:967-969 writes all three per deserialized
+        # union (~29k per self-check); a capture only proved straight equality.
+        "is_evaluated",
+        "original_str_expr",
+        "original_str_fallback",
     }
 )
 

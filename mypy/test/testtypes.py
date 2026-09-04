@@ -51596,3 +51596,86 @@ class NativeMirrorCallableWriteSuite(Suite):
         delta = self._delta(before)
         assert delta == {}, delta
         self._blob_matches_fresh(cb)
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeMirrorUnionPlainDataSuite(Suite):
+    """UnionType plain-data writes (is_evaluated, original_str_*) skip capture.
+
+    Phase F0 (#1349): the union wire never carries is_evaluated /
+    original_str_expr / original_str_fallback, so a captured write can only
+    prove a full _fresh_bytes re-serialize to identical bytes (slice 9 of the
+    F3 write flip, #1397: ~29k such writes per nativeparse self-check). They
+    join SKIP_ATTRS like CallableType.special_sig in slice 8.
+    """
+
+    def setUp(self) -> None:
+        from mypy import types_mirror
+
+        types_mirror.activate(audit=True)
+        types_mirror.reset(clear_counts=True)
+        self._m = types_mirror
+        self.fx = TypeFixture()
+
+    def tearDown(self) -> None:
+        self._m._strict = False
+        self._m.reset(clear_counts=True)
+
+    def _registered_union(self) -> UnionType:
+        # A carrier embedding the union runs the first-serialization funnel,
+        # which adopts the whole subtree (the carrier and the union).
+        from librt.internal import WriteBuffer
+
+        u = UnionType([self.fx.a, self.fx.b])
+        ct = Instance(self.fx.std_tuplei, [u])
+        ct.write(WriteBuffer())
+        h = self._m._handle_of(u)
+        assert h is not None, "union never adopted by the funnel"
+        return u
+
+    def _delta(self, before: dict[str, int]) -> dict[str, int]:
+        after = self._m.report()
+        return {
+            k: v - before.get(k, 0)
+            for k, v in after.items()
+            if v != before.get(k, 0) and "init." not in k
+        }
+
+    def test_skip_attrs_cover_union_plain_data(self) -> None:
+        from mypy import types_mirror
+
+        for name in ("is_evaluated", "original_str_expr", "original_str_fallback"):
+            assert name in types_mirror.SKIP_ATTRS
+
+    def test_plain_data_writes_skip_bookkeeping(self) -> None:
+        u = self._registered_union()
+        before = dict(self._m.report())
+        for field, value in (
+            ("is_evaluated", False),
+            ("original_str_expr", "A | B"),
+            ("original_str_fallback", "builtins.int"),
+            ("is_evaluated", True),
+            ("original_str_expr", None),
+        ):
+            setattr(u, field, value)
+        delta = self._delta(before)
+        assert delta == {}, delta
+
+    def test_plain_data_writes_leave_wire_bytes_unchanged(self) -> None:
+        u = self._registered_union()
+        h = self._m._handle_of(u)
+        before_blob = bytes(self._m._kernel_mod.rust_mirror_bytes(h))
+        u.is_evaluated = False
+        u.original_str_expr = "A | B"
+        u.original_str_fallback = "builtins.int"
+        after_blob = bytes(self._m._kernel_mod.rust_mirror_bytes(h))
+        assert before_blob == after_blob
+
+    def test_plain_data_writes_reach_the_live_object(self) -> None:
+        u = self._registered_union()
+        u.is_evaluated = False
+        u.original_str_expr = "A | B"
+        u.original_str_fallback = "builtins.int"
+        assert u.is_evaluated is False
+        assert u.original_str_expr == "A | B"
+        assert u.original_str_fallback == "builtins.int"
