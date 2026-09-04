@@ -510,6 +510,10 @@ struct WalkCtx {
 
 /// Read one slot; `Ok(None)` is an unset slot descriptor (the AttributeError
 /// pass), any other error propagates as a defer.
+/// Slot reads use the full builtin attribute lookup, while Python's
+/// `_walk_slots` uses `object.__getattribute__` (no `__getattr__`
+/// fallback). Parity holds because the mypy family/alias/ExtraAttrs
+/// classes define no attribute hooks; revisit if one ever does.
 fn read_slot(obj: &PyAny, name: &str, py: Python) -> Result<Option<PyObject>, WalkErr> {
     match obj.getattr(name) {
         Ok(v) => Ok(Some(v.to_object(py))),
@@ -668,7 +672,8 @@ fn walk_value(
         }
         return Ok(());
     }
-    if py_type_name(value)? == "TypeAlias" {
+    let type_name = py_type_name(value)?;
+    if type_name == "TypeAlias" {
         if !seen.contains(&vptr) {
             seen.insert(vptr);
             out.aliases.push(value.to_object(py));
@@ -695,9 +700,13 @@ fn walk_value(
         }
         return Ok(());
     }
-    if py_type_name(value)? == "ExtraAttrs" {
-        if let Some(attrs) = read_slot(value, "attrs", py)? {
-            walk_value(ctx, py, attrs.as_ref(py), seen, depth + 1, out)?;
+    if type_name == "ExtraAttrs" {
+        // Python reads `value.attrs` with NO AttributeError suppression
+        // here (unlike the slot scan and the alias target); an unreadable
+        // read defers, so the fallback re-raises identically.
+        match value.getattr("attrs") {
+            Ok(attrs) => walk_value(ctx, py, attrs, seen, depth + 1, out)?,
+            Err(_) => return Err(WalkErr::Defer),
         }
     }
     Ok(())
@@ -1152,6 +1161,18 @@ mod mirror_tests {
                 cur = l.into();
             }
             root.setattr("args", cur).unwrap();
+            assert!(rust_mirror_walk_indices(py, root).is_none());
+        });
+    }
+
+    /// Duck-typed "ExtraAttrs" without a readable `attrs` defers: Python
+    /// reads `value.attrs` unguarded and would raise AttributeError.
+    #[test]
+    fn test_walk_indices_defers_on_unreadable_extra_attrs() {
+        with_py(|py| {
+            let root = slots_root(py);
+            let fake = py.eval("type('ExtraAttrs', (), {})", None, None).unwrap();
+            root.setattr("args", fake.call0().unwrap()).unwrap();
             assert!(rust_mirror_walk_indices(py, root).is_none());
         });
     }
