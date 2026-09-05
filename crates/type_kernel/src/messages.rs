@@ -1638,7 +1638,7 @@ fn append_union_note_inner(
     let Type::UnionType { items, .. } = arg else {
         return None;
     };
-    let items = flatten_nested_unions_inner(items, true, true, None, &mut Vec::new())?;
+    let items = flatten_nested_unions_inner(items, true, true, None, &mut Vec::new(), None)?;
     if items.len() < MAX_UNION_ITEMS {
         return Some(Vec::new());
     }

@@ -1901,7 +1901,9 @@ def is_literal_type_like(t: Type | None) -> bool:
         # top of every recursive call, and the wire form cannot carry an
         # unexpanded TypeAliasType (Rust would defer on it).
         try:
-            result = _type_kernel.rust_is_literal_type_like(_serialize_type(get_proper_type(t)))
+            result = _type_kernel.rust_is_literal_type_like(
+                _serialize_type(get_proper_type(t)), _native_typeops_resolver
+            )
             if result is not None:
                 return result
         except (AssertionError, NotImplementedError):

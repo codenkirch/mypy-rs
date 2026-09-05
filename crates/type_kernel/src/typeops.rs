@@ -640,20 +640,29 @@ pub(crate) fn rust_is_simple_literal(
 }
 
 /// `#[pyfunction]` entry for `is_simple_literal`'s sibling
-/// `is_literal_type_like` (typeops.py:1241-1257). Accepts a serialized type
-/// and returns `Some(bool)` when the wire form can be fully decoded and no
-/// TypeAliasType is encountered; `None` (defer to Python) otherwise.
+/// `is_literal_type_like` (typeops.py:1895-1915). Accepts a serialized type
+/// and returns `Some(bool)` when the walk decides; `None` (defer to Python)
+/// on an undecodable blob or an alias the snapshot cannot resolve. With a
+/// resolver, `TypeAliasType` nodes expand through the alias snapshot at
+/// every recursion step (Python's `get_proper_type` at the top of each
+/// recursive call), so nested aliases no longer defer.
 #[pyfunction]
-pub(crate) fn rust_is_literal_type_like(t_bytes: &[u8]) -> Option<bool> {
+#[pyo3(signature = (t_bytes, resolver = None))]
+pub(crate) fn rust_is_literal_type_like(
+    t_bytes: &[u8],
+    resolver: Option<&mut NativeTypeResolver>,
+) -> Option<bool> {
     let t = decode_type(t_bytes)?;
-    is_literal_type_like(&t)
+    let aliases: Option<&dyn crate::aliases::AliasLookup> =
+        resolver.map(|r| r.alias_resolver() as &dyn crate::aliases::AliasLookup);
+    is_literal_type_like(&t, aliases)
 }
 
 /// `mypy.typeops.is_literal_type_like` — whether a (proper) type is
 /// potentially a LiteralType, a Union whose items all qualify, or a TypeVar
 /// whose upper bound / values qualify.
 ///
-/// Mirrors typeops.py:1241-1257:
+/// Mirrors typeops.py:1895-1915:
 /// ```text
 /// t = get_proper_type(t)
 /// if t is None: return False
@@ -666,15 +675,27 @@ pub(crate) fn rust_is_literal_type_like(t_bytes: &[u8]) -> Option<bool> {
 /// else: return False
 /// ```
 ///
-/// TypeAliasType can't be resolved to a proper type here (no target in the
-/// wire form), so it returns `None` and the Python shim defers.
-fn is_literal_type_like(t: &Type) -> Option<bool> {
-    match t {
-        Type::TypeAliasType { .. } => None,
+/// A `TypeAliasType` node expands through the alias snapshot (one chain
+/// step with argument substitution, `_expand_once` semantics); a missing
+/// snapshot, an alias cycle, or an unbuildable substitution env defers
+/// (`None`) and the Python shim re-runs its body.
+fn is_literal_type_like(
+    t: &Type,
+    aliases: Option<&dyn crate::aliases::AliasLookup>,
+) -> Option<bool> {
+    let proper: Type = match t {
+        Type::TypeAliasType { .. } => {
+            let aliases = aliases?;
+            let (target, _, _) = expanded_alias_target(t, aliases)?;
+            target
+        }
+        _ => t.clone(),
+    };
+    match &proper {
         Type::LiteralType { .. } => Some(true),
         Type::UnionType { items, .. } => {
             for item in items {
-                match is_literal_type_like(item) {
+                match is_literal_type_like(item, aliases) {
                     Some(true) => return Some(true),
                     None => return None,
                     Some(false) => {}
@@ -687,13 +708,13 @@ fn is_literal_type_like(t: &Type) -> Option<bool> {
             values,
             ..
         } => {
-            match is_literal_type_like(upper_bound) {
+            match is_literal_type_like(upper_bound, aliases) {
                 Some(true) => return Some(true),
                 None => return None,
                 Some(false) => {}
             }
             for v in values {
-                match is_literal_type_like(v) {
+                match is_literal_type_like(v, aliases) {
                     Some(true) => return Some(true),
                     None => return None,
                     Some(false) => {}
@@ -823,17 +844,16 @@ fn make_union(items: Vec<Type>) -> Type {
         0 => Type::UninhabitedType { ambiguous: false },
         1 => items.into_iter().next().unwrap(),
         _ => {
-            // UnionType.__init__ flattens nested unions (types.py:3465) with
-            // handle_type_alias_type=False, so type aliases pass through and
-            // the helper never returns None here. Truthiness iterates the
-
-            // flattened items, matching Python's lazy any(item.can_be_true).
+            // UnionType.__init__ flattens nested unions (types.py:3465)
+            // with handle_type_alias_type=False, so aliases pass through
+            // and truthiness iterates the flattened items lazily.
             let flat = crate::visitor::flatten_nested_unions_inner(
                 &items,
                 false,
                 true,
                 None,
                 &mut Vec::new(),
+                None,
             )
             .unwrap_or_else(|| items.clone());
             let can_be_true = flat.iter().any(crate::setops::union_item_can_be_true);
@@ -903,17 +923,16 @@ pub(crate) fn try_expanding_sum_type_to_union_inner(
                     .cloned()
                     .collect()
             };
-            // flatten_nested_unions(relevant, type_alias_type=True, recursive=True).
-            // A recursive TypeAliasType inside yields None (defer); by then the
-            // relevant items may include NoneTypes, which must not be dropped
-
-            // twice, so `relevant` is the pre-None-filtered input.
+            // flatten_nested_unions(relevant, type_alias_type=True,
+            // recursive=True): a recursive alias inside yields None;
+            // `relevant` is pre-None-filtered so NoneTypes drop once.
             let flat = crate::visitor::flatten_nested_unions_inner(
                 &relevant,
                 true,
                 true,
                 None,
                 &mut Vec::new(),
+                None,
             )?;
             let deduped = crate::visitor::remove_dups_inner(&flat);
             let mut out = Vec::with_capacity(deduped.len());
@@ -3863,13 +3882,13 @@ mod tests {
 
     #[test]
     fn literal_type_like_is_true() {
-        assert_eq!(is_literal_type_like(&lit_str("x")), Some(true));
+        assert_eq!(is_literal_type_like(&lit_str("x"), None), Some(true));
     }
 
     #[test]
     fn literal_type_like_instance_is_false() {
         assert_eq!(
-            is_literal_type_like(&plain_instance("builtins.str")),
+            is_literal_type_like(&plain_instance("builtins.str"), None),
             Some(false)
         );
     }
@@ -3885,7 +3904,7 @@ mod tests {
             original_str_expr: None,
             original_str_fallback: None,
         };
-        assert_eq!(is_literal_type_like(&t), Some(true));
+        assert_eq!(is_literal_type_like(&t, None), Some(true));
     }
 
     #[test]
@@ -3901,7 +3920,7 @@ mod tests {
             original_str_expr: None,
             original_str_fallback: None,
         };
-        assert_eq!(is_literal_type_like(&t), Some(true));
+        assert_eq!(is_literal_type_like(&t, None), Some(true));
     }
 
     #[test]
@@ -3921,7 +3940,7 @@ mod tests {
             variance: 1,
             meta_level: 0,
         };
-        assert_eq!(is_literal_type_like(&t), Some(true));
+        assert_eq!(is_literal_type_like(&t, None), Some(true));
     }
 
     #[test]
@@ -3941,7 +3960,7 @@ mod tests {
             variance: 1,
             meta_level: 0,
         };
-        assert_eq!(is_literal_type_like(&t), Some(true));
+        assert_eq!(is_literal_type_like(&t, None), Some(true));
     }
 
     #[test]
@@ -3951,7 +3970,24 @@ mod tests {
             type_ref: "mod.Alias".to_string(),
             is_recursive: false,
         };
-        assert_eq!(is_literal_type_like(&t), None);
+        assert_eq!(is_literal_type_like(&t, None), None);
+    }
+
+    #[test]
+    fn literal_type_like_alias_expands_via_snapshot() {
+        // An alias snapshot target replaces the raw alias node at each
+        // recursion step, so an alias to a literal decides natively.
+        let mut aliases = crate::aliases::TypeAliasResolver::new();
+        aliases.insert(
+            "mod.Alias".to_string(),
+            alias_snap("mod.Alias", &lit_str("x")),
+        );
+        let alias = Type::TypeAliasType {
+            type_ref: "mod.Alias".to_string(),
+            args: vec![],
+            is_recursive: false,
+        };
+        assert_eq!(is_literal_type_like(&alias, Some(&aliases)), Some(true));
     }
 
     #[test]
@@ -3976,7 +4012,7 @@ mod tests {
             type_is: None,
             special_sig: None,
         };
-        assert_eq!(is_literal_type_like(&t), Some(false));
+        assert_eq!(is_literal_type_like(&t, None), Some(false));
     }
 
     // ------------------------------------------------------------------
