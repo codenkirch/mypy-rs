@@ -1,31 +1,35 @@
 # Handoff: strangler-fig Rust migration loop (seam-deferral reduction)
 
-*Written 2026-08-28, refreshed 2026-09-05 (post-wave37, #1423 closed by
-#1425, #1426 closed by #1428; wave-38 issue #1427 filed). Goal: "migrate
+*Written 2026-08-28, refreshed 2026-09-06 (post-wave38, #1427 closed by
+#1430; wave-38 declined the headline sgc target but shipped the
+extra_tvars channel + constraint-builder residue below wrapper
+granularity). Goal: "migrate
 all python code to rust, really all", pursued as the established measure
 -> file -> dispatch-agents -> process-PRs -> gate loop. This file is the
 resume point.*
 
-## Where main stands (2026-09-05, post-wave37)
+## Where main stands (2026-09-06, post-wave38)
 
-- `main` = `f815e8144` (`fix(type_kernel): wave37 port
-  unify_generic_callable non-generic-right arm (#1426) (#1428)`),
+- `main` = `815df5c4d` (`perf(type_kernel): kernel extra_tvars channel
+  for unify_generic_callable (#1427) (#1430)`),
   local ff'd to origin.
 - Phase state: F0 audit + F1 dual-write mirror + F2 read flip (slices
   1-10, #1393) all landed. F3 (#1397) write flip has Instance +
   CallableType splice ops; the planned tvar/union splice slice was
   profiled with `misc/f3s9_tvar_union.py` and came back EMPTY (zero
   per-field writes on a self-check) - dropped, do not build it.
-- Gates on the wave-37 squash content: `cargo fmt` + scoped clippy
-  + 2,669 kernel unit tests; testtypes differential 3,176 passed /
-  6 skipped; testcheck 8,144 passed / 69 skipped / 7 xfailed (exact
-  parity baseline); cold self-check "Success: no issues found in 347
-  source files".
-- Shared `.so` rebuilt + codesigned at `f815e8144` content
+- Gates on the wave-38 squash content: `cargo fmt` + scoped clippy
+  + 2,673 kernel unit tests (0 fail / 11 ignored); testtypes differential
+  3,176 passed / 6 skipped (stable, incl. the new ambient-flake pin
+  for `type_state.infer_polymorphic`); testcheck 8,144 passed / 69
+  skipped / 7 xfailed (exact parity baseline); cold self-check clean.
+- Shared `.so` rebuilt + codesigned at `815df5c4d` content
   (`/private/tmp/mypy-rs-local-typekernel|resolver|ast`).
-- Survey (post-wave37): 7,744,093 seam calls;
-  `rust_is_subtype` 26,369 @ 97%; `rust_solve_generic_call` 8,502
-  @ 98%; `rust_check_overload_call` 13,736 @ 96%;
+- Survey (post-wave38): 7,743,423 seam calls;
+  `rust_is_subtype` 26,333 @ 98%; `rust_infer_constraints_full`
+  21,673 @ 99% (21,734 pre-wave38); `rust_skip_reverse_union_constraints`
+  49 @ 100% (82 pre-wave38); `rust_solve_generic_call` 8,502 @ 98%
+  (139 fallbacks, unchanged); `rust_check_overload_call` 13,736 @ 96%;
   `rust_remove_redundant_union_items` 10,123 @ 92%.
 - Survey caveats (do not chase): `rust_is_subtype_batch` reports 221%
   and the total fallback line went NEGATIVE - per-decision counting
@@ -36,7 +40,7 @@ resume point.*
   `ocr review --from origin/main --to <branch> --audience agent`,
   then `gh pr merge --squash --admin` after pr-gate + parity green.
 
-## Waves 33-37 (since the 2026-08-31 refresh)
+## Waves 33-38 (since the 2026-08-31 refresh)
 
 | PR | Issue | What | Numbers |
 |----|-------|------|---------|
@@ -47,22 +51,23 @@ resume point.*
 | #1424 | - | docs: HANDOFF refresh for post-wave35 loop state | - |
 | #1425 | #1423 | wave36: alias prepass closes the `is_subtype` engine walls - `expand_top_aliases` resolves top-level alias chains through the resolver snapshot at the entry of `is_subtype`/`is_same_type`/`is_equivalent`/`is_more_precise`/batch seam, `alias_assuming_contains` RAII recursion guard, alias fold in the `remove_redundant_union_items` + `check_argument_types_plan` paths; OCR composed fixes (scope-gated assuming walk, per-level args contract, Cow alias shapes) | #1423 closed; st engine walls shut (2,176+ defers eliminated), post-wave37 residual st ~3%/rru ~8% only |
 | #1428 | #1426 | wave37: port `unify_generic_callable` non-generic-right arm (`unify.rs::unify_generic_callable_core`) + thread ambient `infer_unions` through the subtype seams. Generic-right (cc_vars, extra_tvars) shapes + 6 residual `p42619` 1|0 defers stay by design | sgc 8,502 @ 98% post-wave37 |
+| #1430 | #1427 | wave38: kernel `extra_tvars` channel (Rust-internal `Vec<Type>` on `Constraint`, wire stays 3-field, `Eq` keeps Python's 3-field semantics) + ambient `infer_polymorphic` mode plumbing through constraints/visitor/solve `unify` shims; testtypes ambient-flake pin commit `a09283a5d`. Honest outcome: the headline sgc share did NOT move (below wrapper granularity); real corpus wins are at constraint-builder level | icf 21,734 -> 21,673 calls; skip_reverse_union_constraints 82 -> 49 (100%); sgc 8,502 / 139 fallbacks unchanged |
 
 Closed alongside: #1412, #1393 (F2 complete), #1397 (F3 partial,
 Instance/CallableType only), #1300, #1418 (closed 2026-09-05 with the
 #1419/#1422 pointers), #1420 (auto-closed by #1422), #1423 (#1425
-auto-closed it), #1426 (#1428 auto-closed it), #1424, #1425, #1426,
-#1428.
+auto-closed it), #1426 (#1428 auto-closed it), #1427 (#1430 + manual
+close, PR body lacked the `Closes` line), #1424, #1425, #1426,
+#1428, #1429, #1430.
 
 ## Open backlog (next waves; dispatch max ~2 port agents)
 
-1. **#1427 (wave 38)**: kernel `extra_tvars` channel - wire-format
-   extension + solver support so `ConstraintBuilderVisitor`'s
-   extra_tvars shapes (constraints.py:1712/1768,
-   `type_state.infer_polymorphic=True`) decide natively instead of
-   `no_extra_tvar_shape` gating them out (unify.rs:140). Retires the
-   ~217 generic-right (cc_vars 1|1) + 6 `p42619` 1|0 single-defers on
-   the cold self-check; sgc 8,502 @ 98% -> target ~100%.
+1. **Wave 39 (issue to file, dup-check first)**: the
+   `remove_redundant_union_items` wall - 10,123 calls @ 92%, the
+   largest absolute fallback bucket left (~810 defers on the cold
+   self-check; counting artifact caveat applies). Audit-first: rank its
+   exact defer buckets, retire the decided ones, keep defers for
+   undecidable shapes. Same audit-first method as waves 35-37.
 2. **#624**: meta Phase E1 - the `visit_*` decision-head program that
    unlocks the 50%-Rust milestone. The kernel branch/defer surface is
    exhausted (top rows 100%); this is the next structural front.
