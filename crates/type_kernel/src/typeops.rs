@@ -828,8 +828,14 @@ fn make_union(items: Vec<Type>) -> Type {
             // the helper never returns None here. Truthiness iterates the
 
             // flattened items, matching Python's lazy any(item.can_be_true).
-            let flat = crate::visitor::flatten_nested_unions_inner(&items, false, true)
-                .unwrap_or_else(|| items.clone());
+            let flat = crate::visitor::flatten_nested_unions_inner(
+                &items,
+                false,
+                true,
+                None,
+                &mut Vec::new(),
+            )
+            .unwrap_or_else(|| items.clone());
             let can_be_true = flat.iter().any(crate::setops::union_item_can_be_true);
             let can_be_false = flat.iter().any(crate::setops::union_item_can_be_false);
             Type::UnionType {
@@ -902,7 +908,13 @@ pub(crate) fn try_expanding_sum_type_to_union_inner(
             // relevant items may include NoneTypes, which must not be dropped
 
             // twice, so `relevant` is the pre-None-filtered input.
-            let flat = crate::visitor::flatten_nested_unions_inner(&relevant, true, true)?;
+            let flat = crate::visitor::flatten_nested_unions_inner(
+                &relevant,
+                true,
+                true,
+                None,
+                &mut Vec::new(),
+            )?;
             let deduped = crate::visitor::remove_dups_inner(&flat);
             let mut out = Vec::with_capacity(deduped.len());
             for item in &deduped {
