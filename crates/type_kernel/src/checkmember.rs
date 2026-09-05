@@ -5702,6 +5702,7 @@ mod tests {
                 source_any: None,
                 missing_import_name: None,
             }),
+            meta_level: 0,
         }
     }
 

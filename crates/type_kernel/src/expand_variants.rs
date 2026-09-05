@@ -222,6 +222,7 @@ mod tests {
             flavor: 0,
             upper_bound: Box::new(any()),
             default: Box::new(any()),
+            meta_level: 0,
         }
     }
 

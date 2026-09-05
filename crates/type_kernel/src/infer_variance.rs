@@ -66,7 +66,7 @@ use pyo3::prelude::*;
 use crate::expandtype::{expand_type_with_env, result_has_typevar};
 use crate::subtypes::{self, SubtypeContext};
 use crate::typeinfo::{NativeTypeResolver, TypeResolver};
-use crate::wire::{read_type, ReadBuffer, Type};
+use crate::wire::{py_type_eq, read_type, ReadBuffer, Type};
 
 /// Bitmask of the caller's `co` / `contra` flips for one member:
 /// 0 = none, 1 = co only, 2 = contra only, 3 = both.
@@ -110,13 +110,13 @@ fn erase_return_self_types_wire(typ: &Type, self_type: &Type) -> Option<Type> {
     let s = get_proper_type_or_none(self_type)?;
     // Bare `Instance == self_type` is NOT a function-like self return; the
     // Python path returns it unchanged, so it must not become Any here.
-    if matches!(t, Type::Instance { .. }) && t == s {
+    if matches!(t, Type::Instance { .. }) && py_type_eq(&t, &s) {
         return None;
     }
     match &t {
         Type::CallableType { ret_type, .. } => {
             let ret = get_proper_type_or_none(ret_type)?;
-            if matches!(ret, Type::Instance { .. }) && ret == s {
+            if matches!(ret, Type::Instance { .. }) && py_type_eq(&ret, &s) {
                 let Type::CallableType {
                     fallback,
                     instance_type,

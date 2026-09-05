@@ -2388,6 +2388,7 @@ mod tests {
             flavor: 0,
             upper_bound: Box::new(instance("builtins.object", vec![])),
             default: Box::new(Type::UninhabitedType { ambiguous: false }),
+            meta_level: 0,
         };
         let (lin, id) = {
             let c = crate::constraints::Constraint {
@@ -2417,6 +2418,7 @@ mod tests {
             flavor: 0,
             upper_bound: Box::new(instance("builtins.object", vec![])),
             default: Box::new(Type::UninhabitedType { ambiguous: false }),
+            meta_level: 0,
         };
         let prefixed_c = crate::constraints::Constraint {
             origin_type_var: p.clone(),
@@ -2440,6 +2442,7 @@ mod tests {
             upper_bound: Box::new(instance("builtins.object", vec![])),
             default: Box::new(Type::UninhabitedType { ambiguous: false }),
             min_len: 0,
+            meta_level: 0,
         };
         let target = Type::TupleType {
             partial_fallback: Box::new(instance("builtins.tuple", vec![])),
@@ -3218,6 +3221,7 @@ mod tests {
             }),
             default: Box::new(any_from_error()),
             min_len: 0,
+            meta_level: 0,
         };
         let mut tuple_index = 0;
         let mut kwargs_used = None;

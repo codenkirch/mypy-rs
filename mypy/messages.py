@@ -739,8 +739,9 @@ class MessageBuilder:
             typ_fmt, bound_fmt = format_type_distinctly(typ, bound, options=self.options)
             original_type_fmt = format_type(original_type, self.options)
             self.fail(
-                "Item {} of the upper bound {} of type variable {} has no "
-                'attribute "{}"{}'.format(typ_fmt, bound_fmt, original_type_fmt, member, extra),
+                'Item {} of the upper bound {} of type variable {} has no attribute "{}"{}'.format(
+                    typ_fmt, bound_fmt, original_type_fmt, member, extra
+                ),
                 context,
                 code=codes.UNION_ATTR,
             )

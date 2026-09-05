@@ -150,7 +150,7 @@ that decode Python-side keep the gate default-off.
 | `unpack_kwargs`        | yes  | yes  | flag bit 6                                 |
 | `from_type_type`       | yes  | yes  | flag bit 7                                 |
 | `is_bound`             | yes  | yes  | flag bit 3                                 |
-| `special_sig`          | no   | yes  | defaults `None` (Phase F0 addition)        |
+| `special_sig`          | yes  | yes  | `write_str_opt` after `name` (#1412)       |
 | `instance_type`        | yes  | yes  | `write_type_opt`                           |
 
 Note: the 7 flag bits serialize as a single `write_flags` run; the table

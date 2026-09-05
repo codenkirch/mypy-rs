@@ -91,7 +91,7 @@ import mypy.types_mirror
 
 rep = mypy.types_mirror.report()
 rows = sorted(
-    ((k, v) for k, v in rep.items() if k.startswith(("setattr_", "unser", "capture"))),
+    ((k, v) for k, v in rep.items() if k.startswith(("setattr_", "unserializable", "capture"))),
     key=lambda kv: -kv[1],
 )
 for k, v in rows[:50]:

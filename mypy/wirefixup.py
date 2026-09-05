@@ -265,6 +265,19 @@ class _FreshVarCanonicalizer(TypeTranslator):
             return t
         if existing == t:
             return existing
+        # Same id but different content: an expansion result, not a wire
+        # split copy. ParamSpec occurrences of the same fresh variable may
+        # differ only in `flavor`, mirroring Python's ExpandTypeVisitor.
+
+        # Unify those onto the canonical identity so freeze-in-place and
+        # id-keyed substitution see one variable; a genuine Concatenate
+        # prefix growth stays split, unequal past the flavor rewrite.
+        if (
+            isinstance(t, ParamSpecType)
+            and isinstance(existing, ParamSpecType)
+            and existing.copy_modified(flavor=t.flavor) == t
+        ):
+            return existing.copy_modified(flavor=t.flavor)
         # Same id but different content (env-expanded occurrence, e.g. a
         # ParamSpec whose prefix grew via Concatenate): an expansion result,
         # not a wire-split copy. Leave it alone for downstream inference.
@@ -311,7 +324,9 @@ class _FreshVarCanonicalizer(TypeTranslator):
         type_guard = t.type_guard.accept(self) if t.type_guard is not None else None
         type_is = t.type_is.accept(self) if t.type_is is not None else None
         return result.copy_modified(
-            variables=variables, type_guard=type_guard, type_is=type_is  # type: ignore[arg-type]
+            variables=cast("Sequence[TypeVarLikeType]", variables),
+            type_guard=type_guard,
+            type_is=type_is,
         )
 
 
@@ -479,7 +494,9 @@ class _VarIdentityCanonicalizer(TypeTranslator):
         type_guard = t.type_guard.accept(self) if t.type_guard is not None else None
         type_is = t.type_is.accept(self) if t.type_is is not None else None
         return result.copy_modified(
-            variables=variables, type_guard=type_guard, type_is=type_is  # type: ignore[arg-type]
+            variables=cast("Sequence[TypeVarLikeType]", variables),
+            type_guard=type_guard,
+            type_is=type_is,
         )
 
 
@@ -655,7 +672,9 @@ class _ReceiverTvarResyncer(TypeTranslator):
         type_guard = t.type_guard.accept(self) if t.type_guard is not None else None
         type_is = t.type_is.accept(self) if t.type_is is not None else None
         return result.copy_modified(
-            variables=new_variables, type_guard=type_guard, type_is=type_is  # type: ignore[arg-type]
+            variables=cast("Sequence[TypeVarLikeType]", new_variables),
+            type_guard=type_guard,
+            type_is=type_is,
         )
 
 

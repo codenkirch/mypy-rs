@@ -581,6 +581,7 @@ mod tests {
             flavor: 0,
             upper_bound: Box::new(any_type()),
             default: Box::new(any_type()),
+            meta_level: 0,
         }
     }
 

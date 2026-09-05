@@ -2,15 +2,7 @@ from __future__ import annotations
 
 from unittest import skipUnless
 
-from mypy.nodes import (
-    CONTRAVARIANT,
-    COVARIANT,
-    INVARIANT,
-    MDEF,
-    SymbolTableNode,
-    TypeInfo,
-    Var,
-)
+from mypy.nodes import CONTRAVARIANT, COVARIANT, INVARIANT, MDEF, SymbolTableNode, TypeInfo, Var
 from mypy.subtypes import is_subtype
 from mypy.test.helpers import Suite, _env_gate
 from mypy.test.typefixture import InterfaceTypeFixture, TypeFixture

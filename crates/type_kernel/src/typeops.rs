@@ -4879,6 +4879,7 @@ mod tests {
                 source_any: None,
                 missing_import_name: None,
             }),
+            meta_level: 0,
         })
         .expect("ParamSpecType must be wire-encodable");
         match super::decode_type(&encoded).expect("round-trip decode") {

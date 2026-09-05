@@ -2056,12 +2056,7 @@ class FreshVarCanonicalizerSuite(Suite):
         self.fresh1 = TypeVarType("T", "T", TypeVarId(1, meta_level=1), [], self.fx.o, any_type)
         self.fresh2 = TypeVarType("S", "S", TypeVarId(2, meta_level=1), [], self.fx.o, any_type)
         self.declared = TypeVarType(
-            "D",
-            "D",
-            TypeVarId(3),
-            [],
-            self.fx.o,
-            any_type,  # meta_level=0
+            "D", "D", TypeVarId(3), [], self.fx.o, any_type  # meta_level=0
         )
 
     def test_same_occurrences_share_one_object(self) -> None:
@@ -2745,9 +2740,9 @@ class NativeMethodFullnameSuite(Suite):
         self._set_active(False)
         py = ExpressionChecker.method_fullname(None, t, method_name)  # type: ignore[arg-type]
         rusted = _type_kernel.rust_method_fullname(self.resolver, self._bytes_of(t), method_name)
-        assert (rusted if rusted is not None else py) == py, (
-            f"method_fullname({t!r}, {method_name!r}) rust={{}} py={{}}".format(rusted, py)
-        )
+        assert (
+            rusted if rusted is not None else py
+        ) == py, f"method_fullname({t!r}, {method_name!r}) rust={{}} py={{}}".format(rusted, py)
 
     def test_instance(self) -> None:
         self.assert_fullname_par(self.fx.a, "foo")
@@ -5237,9 +5232,9 @@ class NativeExpandTypeDefinitionGateSuite(Suite):
         from mypy.expandtype import _needs_python
 
         assert _needs_python(self._callee), "gate=True must defer on definition"
-        assert not _needs_python(self._callee, definition_gate=False), (
-            "gate=False must not defer on a re-stamped callable"
-        )
+        assert not _needs_python(
+            self._callee, definition_gate=False
+        ), "gate=False must not defer on a re-stamped callable"
         # A nested definition-carrying callable must also pass relaxed.
         nested = UnionType([self._callee, self.fx.b])
         assert not _needs_python(nested, definition_gate=False)
@@ -5363,9 +5358,9 @@ class NativeExpandTypeEmptyEnvSuite(Suite):
         result = _type_kernel.rust_expand_type(
             self._resolver, _serialize_type(self.fx.gt), _serialize_env({}), state.strict_optional
         )
-        assert result is not None, (
-            "empty-env typevar-bearing expand_type must return the leftover-tvar result"
-        )
+        assert (
+            result is not None
+        ), "empty-env typevar-bearing expand_type must return the leftover-tvar result"
         off = self._with_gate(False, lambda: self._expand(self.fx.gt))
         on = self._with_gate(True, lambda: self._expand(self.fx.gt))
         assert_equal(str(on), str(off), "expand_type(empty env) parity")
@@ -6261,9 +6256,9 @@ class NativeMapTypeFromSupertypeSuite(Suite):
         result = _type_kernel.rust_map_type_from_supertype(
             self._resolver, self.fx.bi, self.fx.ai, _serialize_type(typ), True
         )
-        assert result is not None, (
-            "leftover-tvar map_type_from_supertype must return the expansion"
-        )
+        assert (
+            result is not None
+        ), "leftover-tvar map_type_from_supertype must return the expansion"
         off = self._with_gate(False, lambda: self._map(typ, self.fx.bi, self.fx.ai))
         on = self._with_gate(True, lambda: self._map(typ, self.fx.bi, self.fx.ai))
         assert_equal(str(on), str(off), "map_type_from_supertype parity (leftover tvar)")
@@ -6604,9 +6599,9 @@ class NativeMapFreshVarRepairSuite(Suite):
         # The seam must not cache fresh-bearing decoded trees.
         from mypy.maptype import _map_supertype_decode_cache
 
-        assert set(_map_supertype_decode_cache) == before_keys, (
-            "fresh-bearing call inserted into the shared decode cache"
-        )
+        assert (
+            set(_map_supertype_decode_cache) == before_keys
+        ), "fresh-bearing call inserted into the shared decode cache"
         # Engagement: the Rust seam actually maps the fresh-bearing
         # instance instead of silently deferring to Python.
         buf = _WriteBuffer()
@@ -6627,9 +6622,9 @@ class NativeMapFreshVarRepairSuite(Suite):
         before = set(_map_supertype_decode_cache)
         on = self._with_gate(True, lambda: map_instance_to_supertype(inst, fx.gi))
         assert_equal(str(on), str(off), "fresh singlet map str parity")
-        assert set(_map_supertype_decode_cache) == before, (
-            "fresh-bearing call inserted into the shared decode cache"
-        )
+        assert (
+            set(_map_supertype_decode_cache) == before
+        ), "fresh-bearing call inserted into the shared decode cache"
         self._assert_same_id(on.args[0], 500, 1)
 
     def test_clean_call_caches_and_hits(self) -> None:
@@ -8237,9 +8232,9 @@ class NativeRevealImportedSuite(Suite):
         self, kind: int, is_imported: bool, enabled: bool, expected: str | None
     ) -> None:
         result = _type_kernel.rust_classify_reveal_imported(kind, is_imported, enabled)
-        assert result == expected, (
-            f"seam({kind}, {is_imported}, {enabled}) = {result!r}, want {expected!r}"
-        )
+        assert (
+            result == expected
+        ), f"seam({kind}, {is_imported}, {enabled}) = {result!r}, want {expected!r}"
 
     def test_seam_disabled(self) -> None:
         from mypy.nodes import REVEAL_LOCALS, REVEAL_TYPE
@@ -9137,21 +9132,21 @@ class NativeProtocolImplementationSuite(Suite):
             subtypes_mod._subtype_batch.append((left_b, right_b, ctx_key))
             subtypes_mod._subtype_batch.append(sibling)
             answers = subtypes_mod._flush_subtype_batch()
-            assert answers.get(flushed_key) is True, (
-                f"cut answer must reach the caller: {answers!r}"
-            )
+            assert (
+                answers.get(flushed_key) is True
+            ), f"cut answer must reach the caller: {answers!r}"
             # (_clear_subtype_batch wipes _subtype_answers too, so every
             # cache assertion must run before the cleanup.)
-            assert flushed_key not in subtypes_mod._subtype_answers, (
-                "cut answer must not persist into _subtype_answers"
-            )
+            assert (
+                flushed_key not in subtypes_mod._subtype_answers
+            ), "cut answer must not persist into _subtype_answers"
             assert (
                 sibling in subtypes_mod._subtype_answers
                 and subtypes_mod._subtype_answers[sibling] is True
             ), "plain decided pair must still cache"
-            assert _PROTOCOL_PAIRS_IN_FLIGHT.get(pair_key) == 1, (
-                "flush must not touch the registry"
-            )
+            assert (
+                _PROTOCOL_PAIRS_IN_FLIGHT.get(pair_key) == 1
+            ), "flush must not touch the registry"
         finally:
             _PROTOCOL_PAIRS_IN_FLIGHT.pop(pair_key, None)
             _clear_subtype_batch()
@@ -9202,9 +9197,9 @@ class NativeProtocolImplementationSuite(Suite):
             # re-derive and answer False instead.
             subtypes_mod._subtype_batch.append((left_b, right_b, ctx_key))
             second = _flush_subtype_batch()
-            assert second.get((left_b, right_b, ctx_key)) is False, (
-                f"poisoned cache re-answered cut True without re-derivation: {second!r}"
-            )
+            assert (
+                second.get((left_b, right_b, ctx_key)) is False
+            ), f"poisoned cache re-answered cut True without re-derivation: {second!r}"
         finally:
             _clear_subtype_batch()
             _set_native_subtype_active(False)
@@ -10375,9 +10370,9 @@ class NativeTruthinessSuite(Suite):
             on = self._with_gate(True, lambda: fn(t))
         assert_equal(str(on), str(off), f"{op}(t) str parity strict_optional={strict_optional}")
         if expect_uninhabited:
-            assert isinstance(on, UninhabitedType), (
-                f"{op}(t) should be UninhabitedType, got {on!r}"
-            )
+            assert isinstance(
+                on, UninhabitedType
+            ), f"{op}(t) should be UninhabitedType, got {on!r}"
 
     def _add_dunder(self, info: TypeInfo, name: str, ret: Type) -> None:
         """Add a `def __bool__/__len__(self) -> ret` method to a live TypeInfo.
@@ -10637,7 +10632,12 @@ class NativeTypeImplTruthinessSuite(Suite):
         _types_mod._ReadBuffer = ReadBuffer  # type: ignore[attr-defined]
         for n in self._VISITOR_SEAM_NAMES:
             _types_mod.__dict__["_rust_" + n] = getattr(_type_kernel, "rust_" + n)
+        self._orig_kernel_flag = _types_mod._VISITOR_HAS_TYPE_KERNEL
         _types_mod._VISITOR_HAS_TYPE_KERNEL = True
+        # `_native_visitor_active` is a process-global other suites (the
+        # conftest parity installer) may have enabled; save it and restore
+        # the prior value in tearDown rather than forcing False.
+        self._orig_visitor_gate = _types_mod._native_visitor_active
 
         from mypy.types import _set_native_truthiness_resolver
 
@@ -10651,10 +10651,12 @@ class NativeTypeImplTruthinessSuite(Suite):
     def tearDown(self) -> None:
         from mypy.types import _set_native_truthiness_resolver
 
-        # Restore the pre-suite state: visitor gate off and no resolver.
-        self._set_gate(False)
+        # Restore the pre-suite state: the visitor gate as when the
+        # suite started, no resolver, and the kernel flag as when the
+        # suite started. The old hardcoded False leaked into other tests.
+        self._set_gate(self._orig_visitor_gate)
         _set_native_truthiness_resolver(None)
-        self._types_mod._VISITOR_HAS_TYPE_KERNEL = False
+        self._types_mod._VISITOR_HAS_TYPE_KERNEL = self._orig_kernel_flag
 
     def _set_gate(self, active: bool) -> None:
         from mypy.types import _set_native_visitor_active
@@ -16672,9 +16674,9 @@ class NativePluginHookSuite(Suite):
     def test_known_absent_false_for_default_hook_fullnames(self) -> None:
         # Fullnames in the DefaultPlugin set are never "known absent".
         for fullname in self._fullnames:
-            assert not self._plugin_call_hook_known_absent(fullname), (
-                f"{fullname!r} should not be known-absent (it has a hook)"
-            )
+            assert not self._plugin_call_hook_known_absent(
+                fullname
+            ), f"{fullname!r} should not be known-absent (it has a hook)"
 
     def test_known_absent_true_for_unrelated_fullname(self) -> None:
         assert self._plugin_call_hook_known_absent("builtins.print")
@@ -16704,9 +16706,9 @@ class NativePluginHookSuite(Suite):
                 or self._default_plugin.get_method_signature_hook(fullname) is not None
                 or self._default_plugin.get_method_hook(fullname) is not None
             )
-            assert has_hook, (
-                f"{fullname!r} in DEFAULT_CALL_HOOK_FULLNAMES but no DefaultPlugin hook matches"
-            )
+            assert (
+                has_hook
+            ), f"{fullname!r} in DEFAULT_CALL_HOOK_FULLNAMES but no DefaultPlugin hook matches"
 
     def test_call_union_does_not_leak_non_call_kinds(self) -> None:
         # C3 regression guard: a name owned by a non-call kind must not
@@ -16720,12 +16722,12 @@ class NativePluginHookSuite(Suite):
             ):
                 continue
             for fullname in names:
-                assert not self._registry.has_call_hook(fullname), (
-                    f"{fullname!r} (kind {kind}) widened the call union"
-                )
-                assert self._plugin_call_hook_known_absent(fullname), (
-                    f"{fullname!r} (kind {kind}) wrongly blocks the call gate"
-                )
+                assert not self._registry.has_call_hook(
+                    fullname
+                ), f"{fullname!r} (kind {kind}) widened the call union"
+                assert self._plugin_call_hook_known_absent(
+                    fullname
+                ), f"{fullname!r} (kind {kind}) wrongly blocks the call gate"
 
     def test_per_kind_known_absent(self) -> None:
         # For each non-call kind, a name in its set is never known-absent
@@ -16739,12 +16741,12 @@ class NativePluginHookSuite(Suite):
             ):
                 continue
             for fullname in names:
-                assert not self._plugin_hook_known_absent(kind, fullname), (
-                    f"{fullname!r} should not be known-absent for {kind}"
-                )
-            assert self._plugin_hook_known_absent(kind, "builtins.print"), (
-                f"builtins.print should be known-absent for {kind}"
-            )
+                assert not self._plugin_hook_known_absent(
+                    kind, fullname
+                ), f"{fullname!r} should not be known-absent for {kind}"
+            assert self._plugin_hook_known_absent(
+                kind, "builtins.print"
+            ), f"builtins.print should be known-absent for {kind}"
             assert not self._plugin_hook_known_absent(kind, None)
 
     def test_per_kind_matches_default_plugin_surface(self) -> None:
@@ -16756,12 +16758,12 @@ class NativePluginHookSuite(Suite):
             "get_class_decorator_hook_2",
         ):
             for fullname in self._by_kind[kind]:
-                assert getattr(self._default_plugin, kind)(fullname) is not None, (
-                    f"{fullname!r} in per-kind set for {kind} but hook resolves None"
-                )
-            assert not self._registry.has_call_hook(next(iter(self._by_kind[kind]))), (
-                f"{kind} names must not widen the call union"
-            )
+                assert (
+                    getattr(self._default_plugin, kind)(fullname) is not None
+                ), f"{fullname!r} in per-kind set for {kind} but hook resolves None"
+            assert not self._registry.has_call_hook(
+                next(iter(self._by_kind[kind]))
+            ), f"{kind} names must not widen the call union"
 
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
@@ -18861,9 +18863,9 @@ class NativeFindTypeOverlapsSuite(Suite):
         alias = TypeAlias(self.fx.a, "mod.TA", "mod", -1, -1)
         alias_type = TypeAliasType(alias, [])
         # The seam must decline (None) on the alias wire form.
-        assert _type_kernel.rust_find_type_overlaps([self._bytes_of(alias_type)]) is None, (
-            "rust should defer on TypeAliasType"
-        )
+        assert (
+            _type_kernel.rust_find_type_overlaps([self._bytes_of(alias_type)]) is None
+        ), "rust should defer on TypeAliasType"
         off = self._with_gate(False, lambda: find_type_overlaps(alias_type))
         on = self._with_gate(True, lambda: find_type_overlaps(alias_type))
         assert_equal(on, off, "alias find_type_overlaps parity")
@@ -22339,9 +22341,9 @@ class NativeRestrictSubtypeAwaySuite(Suite):
         finally:
             self._set_active(True)
         actual = restrict_subtype_away(t, s, consider_runtime_isinstance=consider)
-        assert str(actual) == str(expected), (
-            f"restrict parity {t!r} minus {s!r}: py={expected!r} rust={actual!r}"
-        )
+        assert str(actual) == str(
+            expected
+        ), f"restrict parity {t!r} minus {s!r}: py={expected!r} rust={actual!r}"
 
     def assert_engages(self, t: Type, s: Type) -> bytes:
         """Call the seam directly; returns the encoded result (or raises)."""
@@ -23349,8 +23351,7 @@ class NativeCanPossiblyBeTypeFormSuite(Suite):
             from types import SimpleNamespace
 
             sym = SymbolTableNode(
-                MDEF,
-                SimpleNamespace(fullname=typealias_fullname),  # type: ignore[arg-type]
+                MDEF, SimpleNamespace(fullname=typealias_fullname)  # type: ignore[arg-type]
             )
         else:
             sym = None
@@ -24235,9 +24236,9 @@ class NativeTupleConstraintsSuite(Suite):
             strict_optional_flag(),
             True,
         )
-        assert raw is not None, (
-            f"Rust seam must engage for template={template!r} actual={actual!r}"
-        )
+        assert (
+            raw is not None
+        ), f"Rust seam must engage for template={template!r} actual={actual!r}"
 
     # --- Template has an Unpack, actual is a varlength tuple ---
 
@@ -24485,9 +24486,9 @@ class NativeConstraintsDeferralSuite(Suite):
         self, template: Type, actual: Type, direction: int = SUBTYPE_OF, erase_types: bool = False
     ) -> None:
         raw = self._rust(template, actual, direction, erase_types)
-        assert raw is not None, (
-            f"Rust seam must engage for template={template!r} actual={actual!r}"
-        )
+        assert (
+            raw is not None
+        ), f"Rust seam must engage for template={template!r} actual={actual!r}"
 
     def _assert_defers(
         self, template: Type, actual: Type, direction: int = SUBTYPE_OF, erase_types: bool = False
@@ -25396,12 +25397,12 @@ class NativeClassmethodStaticSuite(Suite):
         assert_equal(on_st, off_st, f"is_node_static parity {node!r}")
 
     def _assert_engages(self, node: Any) -> None:
-        assert _type_kernel.rust_is_classmethod_node(node) is not None, (
-            f"Rust is_classmethod_node did not engage for {node!r}"
-        )
-        assert _type_kernel.rust_is_node_static(node) is not None, (
-            f"Rust is_node_static did not engage for {node!r}"
-        )
+        assert (
+            _type_kernel.rust_is_classmethod_node(node) is not None
+        ), f"Rust is_classmethod_node did not engage for {node!r}"
+        assert (
+            _type_kernel.rust_is_node_static(node) is not None
+        ), f"Rust is_node_static did not engage for {node!r}"
 
     def _func_def(self, name: str) -> FuncDef:
         return FuncDef(name)
@@ -26941,9 +26942,9 @@ class NativeConditionalTypesSuite(Suite):
         )
         # Structural protocol checks decide natively now: the seam returns
         # the narrowed pair, and the Python answer below must be unchanged.
-        assert result is not None, (
-            f"Rust conditional_types did not engage for {current} vs protocol"
-        )
+        assert (
+            result is not None
+        ), f"Rust conditional_types did not engage for {current} vs protocol"
         yes, no = self._with_gate(True, lambda: conditional_types(current, ranges, None))
         assert_equal((str(yes), str(no)), ("None", "Never"))
 
@@ -32704,10 +32705,7 @@ class NativeFindMatchingOverloadSuite(Suite):
         kernel for the matched item indices (None = deferred)."""
         items_wire = [self._bytes_of(item) for item in items]
         return _type_kernel.rust_find_matching_overload_items(
-            self.resolver,
-            items_wire,
-            self._bytes_of(template),
-            True,  # strict_optional
+            self.resolver, items_wire, self._bytes_of(template), True  # strict_optional
         )
 
     def test_engages_and_returns_indices(self) -> None:
@@ -33482,9 +33480,9 @@ class NativeTypeRequiresUsageSuite(Suite):
         from mypy.checker import _serialize_type_for_checker
 
         result = _type_kernel.rust_type_requires_usage(_serialize_type_for_checker(typ), resolver)
-        assert result == expected_code, (
-            f"rust_type_requires_usage({typ}) = {result!r}, expected {expected_code!r}"
-        )
+        assert (
+            result == expected_code
+        ), f"rust_type_requires_usage({typ}) = {result!r}, expected {expected_code!r}"
 
     def test_awaitable_class_returns_awaitable_note(self) -> None:
         # Instance with __await__ in names -> UNUSED_AWAITABLE.
@@ -33670,9 +33668,9 @@ class NativeCheckexprJoinAndTupleSuite(Suite):
         python = self._join_python(if_t, else_t)
         if engage:
             assert native is not None, f"join({if_t}, {else_t}) did not engage"
-        assert native is None or native == python, (
-            f"join({if_t}, {else_t}): native {native!r} != python {python!r}"
-        )
+        assert (
+            native is None or native == python
+        ), f"join({if_t}, {else_t}): native {native!r} != python {python!r}"
 
     def _assert_tuple_parity(self, items: list[Type], seen_unpack: bool, engage: bool) -> None:
         native = self._tuple_native(items, seen_unpack)
@@ -34039,9 +34037,9 @@ class NativeGeneratorReturnTypeSuite(Suite):
         else:
             args = (_serialize_type_for_checker(typ), is_coroutine)
         result = getattr(_type_kernel, seam)(*args, state.strict_optional, self.resolver)
-        assert result == expected, (
-            f"{seam}({typ}, coroutine={is_coroutine}) = {result!r}, expected {expected!r}"
-        )
+        assert (
+            result == expected
+        ), f"{seam}({typ}, coroutine={is_coroutine}) = {result!r}, expected {expected!r}"
 
     def _assert_engages_type(
         self, seam: str, typ: Type, is_coroutine: bool, expected: str
@@ -35212,9 +35210,7 @@ class NativeDecoratedFunctionIsMethodSuite(Suite):
         def check_one() -> list[str]:
             ns = self._analyzer(has_type=has_type, func_scope=func_scope)
             SemanticAnalyzer.check_decorated_function_is_method(
-                ns,
-                "abstractmethod",
-                None,  # type: ignore[arg-type]
+                ns, "abstractmethod", None  # type: ignore[arg-type]
             )
             fails: list[str] = ns._fail
             return fails
@@ -43476,11 +43472,7 @@ class NativePrepareMethodSignatureSuite(Suite):
             )
             sa._native_prepare_method_signature = lambda func, i, hst, ft: (
                 SemanticAnalyzer._native_prepare_method_signature(
-                    sa,  # type: ignore[arg-type]
-                    func,
-                    i,
-                    hst,
-                    ft,
+                    sa, func, i, hst, ft  # type: ignore[arg-type]
                 )
             )
             fdef = self._fdef(name, [arg0], unanalyzed_arg0, is_static)
@@ -43635,11 +43627,7 @@ class NativePrepareMethodSignatureSuite(Suite):
             )
             sa._native_prepare_method_signature = lambda func, i, hst, ft: (
                 SemanticAnalyzer._native_prepare_method_signature(
-                    sa,  # type: ignore[arg-type]
-                    func,
-                    i,
-                    hst,
-                    ft,
+                    sa, func, i, hst, ft  # type: ignore[arg-type]
                 )
             )
             fdef = self._fdef("m", [fx.str_type], unanalyzed_arg0=fx.str_type)
@@ -47849,9 +47837,9 @@ class NativeProtocolMemberMissSuite(Suite):
         self._build_resolver()
         off, on = self._parity(Instance(i, []), "f")
         assert off is not None and on is not None
-        assert str(off) == str(on) == str(AnyType(TypeOfAny.special_form)), (
-            f"fallback mismatch: off={off!r} on={on!r}"
-        )
+        assert (
+            str(off) == str(on) == str(AnyType(TypeOfAny.special_form))
+        ), f"fallback mismatch: off={off!r} on={on!r}"
         raw = self._raw(Instance(i, []), "f")
         assert raw is not None and len(raw) > 0, f"expected found bytes, got {raw!r}"
         self._restore()
@@ -47876,9 +47864,9 @@ class NativeProtocolMemberMissSuite(Suite):
         i = self._class("mod.GetattrDerived", [b], None)
         self._build_resolver()
         off, on = self._parity(Instance(i, []), "f")
-        assert str(off) == str(on) == "builtins.str", (
-            f"base accessor mismatch: off={off!r} on={on!r}"
-        )
+        assert (
+            str(off) == str(on) == "builtins.str"
+        ), f"base accessor mismatch: off={off!r} on={on!r}"
         raw = self._raw(Instance(i, []), "f")
         assert raw is not None and len(raw) > 0, f"expected found bytes, got {raw!r}"
         self._restore()
@@ -48876,9 +48864,9 @@ class NativeSolveGenericCallSuite(Suite):
         g = CallableType(
             [self.fx.str_type], [ARG_POS], ["y"], self.fx.str_type, self.fx.function, name="g"
         )
-        assert self._seam(callee, [f, g], [[0], [1]]) is None, (
-            "multi-lower callable join must defer (definition loss)"
-        )
+        assert (
+            self._seam(callee, [f, g], [[0], [1]]) is None
+        ), "multi-lower callable join must defer (definition loss)"
 
     def test_unsolvable_var_defers(self) -> None:
         # def [T] (a: G[T], b: G[T]) -> T with G-invariant args A and D
@@ -48889,9 +48877,9 @@ class NativeSolveGenericCallSuite(Suite):
         callee = self._callee_of([g, g], t, t)
         ga = Instance(self.fx.gi, [self.fx.a])
         gd = Instance(self.fx.gi, [self.fx.d])
-        assert self._seam(callee, [ga, gd], [[0], [1]]) is None, (
-            "unsolvable invariant conflict must defer"
-        )
+        assert (
+            self._seam(callee, [ga, gd], [[0], [1]]) is None
+        ), "unsolvable invariant conflict must defer"
 
     def test_alias_actual_parity(self) -> None:
         # identity(mod.A) with mod.A = A: the alias actual expands before
@@ -48930,9 +48918,9 @@ class NativeSolveGenericCallSuite(Suite):
         raw = self._seam_raw(callee, [self.fx.b], [[0]])
         assert raw is not None, "Rust deferred on def (A) -> Any [B]"
         py = self._python_reference(callee, [self.fx.b], [ARG_POS], None, [[0]])
-        assert raw == _serialize_type_for_checkexpr(py), (
-            f"solve parity: native={raw!r} python={py!r}"
-        )
+        assert raw == _serialize_type_for_checkexpr(
+            py
+        ), f"solve parity: native={raw!r} python={py!r}"
 
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
@@ -49174,9 +49162,9 @@ class NativeStarExpansionSuite(Suite):
         t = self._generic_t()
         callee = self._callee_of([t], t)
         actual = Instance(self.fx.gi, [self.fx.a])
-        assert self._seam(callee, [actual], [ARG_STAR], [[0]]) is None, (
-            "missing Iterable context must defer"
-        )
+        assert (
+            self._seam(callee, [actual], [ARG_STAR], [[0]]) is None
+        ), "missing Iterable context must defer"
 
     def test_star_kwargs_key_miss_defers(self) -> None:
         # A TypedDict ** actual whose named formal has no matching item
@@ -49294,9 +49282,9 @@ class NativeConstraintUnionSuite(Suite):
         )
 
     def _assert_engages(self, template: Type, actual: Type, direction: int) -> None:
-        assert self._rust(template, actual, direction) is not None, (
-            f"Rust seam must engage for template={template!r} actual={actual!r}"
-        )
+        assert (
+            self._rust(template, actual, direction) is not None
+        ), f"Rust seam must engage for template={template!r} actual={actual!r}"
 
     # --- branch a: SUBTYPE_OF with a union template ---
 
@@ -50486,9 +50474,9 @@ class NativeWriteFunnelSkipSuite(Suite):
         before = dict(self._m.report())
         inst.line = 123  # in SKIP_ATTRS: uncaptured by design, harmless
         delta = self._delta(before)
-        assert not any(k.startswith(("assert_ok.", "assert_skip.", "mismatch.")) for k in delta), (
-            delta
-        )
+        assert not any(
+            k.startswith(("assert_ok.", "assert_skip.", "mismatch.")) for k in delta
+        ), delta
         before = dict(self._m.report())
         inst.write(WriteBuffer())  # stamp unaffected: still skips
         delta = self._delta(before)
@@ -51939,3 +51927,70 @@ class NativeMirrorAdoptionFastPathSuite(Suite):
         assert delta.get("adopt.instance.write") == 1, delta
         assert delta.get("strike_cleared_on_adopt") == 1, delta
         assert self._m._handle_of(inst) is not None
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeVisitorBindSuite(Suite):
+    """Regression for #1412: the visitor-kernel gate actually engages.
+
+    The Stage 7 try-block used `from mypy.types import read_type` during
+    mypy.types' own import, before read_type is defined; the ImportError
+    nulled every visitor binding and pinned `_VISITOR_HAS_TYPE_KERNEL`
+    to False forever. The fix drops the self-import and binds
+    `_visitor_read_type = read_type` after read_type's definition, so the
+    visitor seams reach their Rust path for the first time. These tests
+    pin the flag, the binding, and one live seam engagement.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.fx = TypeFixture()
+
+    def test_flag_and_reader_bound(self) -> None:
+        # The precise regression: the try-block never failed with a missing
+        # kernel here, it failed on the self-import. Flag True and a bound
+        # reader means both halves work.
+        import mypy.types as t
+
+        assert t._VISITOR_HAS_TYPE_KERNEL
+        assert t._visitor_read_type is t.read_type
+
+    def test_has_type_vars_takes_rust_path_when_active(self) -> None:
+        import mypy.types as t
+
+        saved = t._native_visitor_active
+        try:
+            t._set_native_visitor_active(True)
+            seen: list[int] = []
+            # Bound via getattr/setattr on a variable name: the underscore
+            # name is an imported alias in mypy.types, not an implicit
+            # re-export, and bugbear B009/B010 would fix a constant name.
+            attr = "_rust_has_type_vars"
+            orig: Callable[[bytes], bool] = getattr(t, attr)
+
+            def spy(b: bytes) -> bool:
+                seen.append(1)
+                return orig(b)
+
+            setattr(t, attr, spy)
+            assert t.has_type_vars(self.fx.t)
+            assert t.has_type_vars(self.fx.o) is False
+            assert seen == [1, 1]
+        finally:
+            setattr(t, attr, orig)
+            t._set_native_visitor_active(saved)
+
+    def test_gate_off_keeps_pure_python_visitor(self) -> None:
+        import mypy.types as t
+
+        saved = t._native_visitor_active
+        try:
+            # Control its own input rather than inheriting the
+            # process-global gate value (which may be True under
+            # MYPY_NATIVE_PARITY_INSTALL_VISITOR) as a precondition.
+            t._set_native_visitor_active(False)
+            assert not t._native_visitor_active
+            assert t.has_type_vars(self.fx.t)
+            assert t.has_type_vars(self.fx.o) is False
+        finally:
+            t._set_native_visitor_active(saved)

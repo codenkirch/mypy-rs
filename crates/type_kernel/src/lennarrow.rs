@@ -194,6 +194,7 @@ fn refine_tuple_type_with_len(
         upper_bound,
         default,
         min_len: tv_min_len,
+        meta_level,
     } = unpacked
     {
         // TypeVarTuple unpack: reachability + min_len restrictions.
@@ -219,6 +220,7 @@ fn refine_tuple_type_with_len(
                     upper_bound,
                     default,
                     min_len: new_min_len,
+                    meta_level,
                 };
                 let new_unpack = Type::UnpackType {
                     typ: Box::new(new_tvt),
