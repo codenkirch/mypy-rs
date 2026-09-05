@@ -675,23 +675,23 @@ pub(crate) fn rust_is_literal_type_like(
 /// else: return False
 /// ```
 ///
-/// A `TypeAliasType` node expands through the alias snapshot (one chain
-/// step with argument substitution, `_expand_once` semantics); a missing
-/// snapshot, an alias cycle, or an unbuildable substitution env defers
-/// (`None`) and the Python shim re-runs its body.
+/// A `TypeAliasType` node expands through the alias snapshots to the end
+/// of the chain (`get_proper_type` semantics, including `no_args` levels
+/// whose target is itself an alias); a missing snapshot, an alias cycle,
+/// or an unbuildable substitution env defers (`None`) and the Python shim
+/// re-runs its body.
 fn is_literal_type_like(
     t: &Type,
     aliases: Option<&dyn crate::aliases::AliasLookup>,
 ) -> Option<bool> {
-    let proper: Type = match t {
+    let proper: std::borrow::Cow<'_, Type> = match t {
         Type::TypeAliasType { .. } => {
             let aliases = aliases?;
-            let (target, _, _) = expanded_alias_target(t, aliases)?;
-            target
+            std::borrow::Cow::Owned(crate::types_impl::chain_resolve_alias_target(t, aliases)?)
         }
-        _ => t.clone(),
+        _ => std::borrow::Cow::Borrowed(t),
     };
-    match &proper {
+    match &*proper {
         Type::LiteralType { .. } => Some(true),
         Type::UnionType { items, .. } => {
             for item in items {
@@ -3988,6 +3988,88 @@ mod tests {
             is_recursive: false,
         };
         assert_eq!(is_literal_type_like(&alias, Some(&aliases)), Some(true));
+    }
+
+    #[test]
+    fn literal_type_like_no_args_chain_to_literal_is_true() {
+        // X = Y (no_args) and Y = Literal["x"]: expanded_alias_target
+        // stops at the leftover Y alias node, so only the outer chain
+        // walk reaches the literal, as Python's get_proper_type does.
+        let mut aliases = crate::aliases::TypeAliasResolver::new();
+        let y_target = alias_snap("mod.Y", &lit_str("x"));
+        aliases.insert("mod.Y".to_string(), y_target);
+        let y_alias = Type::TypeAliasType {
+            type_ref: "mod.Y".to_string(),
+            args: vec![],
+            is_recursive: false,
+        };
+        // no_args snapshots need a manual build: alias_snap defaults
+        // no_args to false, and the bug shows only when the frozen
+        // target is returned without a substitution pass.
+        let mut buf = WriteBuffer::new();
+        wire::write_type(&mut buf, &y_alias).expect("x target encodes");
+        aliases.insert(
+            "mod.X".to_string(),
+            crate::aliases::TypeAliasSnapshot {
+                fullname: "mod.X".to_string(),
+                target: buf.into_bytes(),
+                no_args: true,
+                ..Default::default()
+            },
+        );
+        let x_alias = Type::TypeAliasType {
+            type_ref: "mod.X".to_string(),
+            args: vec![],
+            is_recursive: false,
+        };
+        assert_eq!(is_literal_type_like(&x_alias, Some(&aliases)), Some(true));
+    }
+
+    #[test]
+    fn literal_type_like_no_args_chain_cycle_defers() {
+        // Mutual recursion across no_args aliases (A -> B, B -> A): the
+        // chain walk must defer rather than loop forever.
+        let mut aliases = crate::aliases::TypeAliasResolver::new();
+        let a_alias = Type::TypeAliasType {
+            type_ref: "mod.A".to_string(),
+            args: vec![],
+            is_recursive: true,
+        };
+        let mut buf = WriteBuffer::new();
+        wire::write_type(
+            &mut buf,
+            &Type::TypeAliasType {
+                type_ref: "mod.B".to_string(),
+                args: vec![],
+                is_recursive: true,
+            },
+        )
+        .expect("b target encodes");
+        aliases.insert(
+            "mod.A".to_string(),
+            crate::aliases::TypeAliasSnapshot {
+                fullname: "mod.A".to_string(),
+                target: buf.into_bytes(),
+                no_args: true,
+                ..Default::default()
+            },
+        );
+        let mut buf2 = WriteBuffer::new();
+        wire::write_type(&mut buf2, &a_alias).expect("a target encodes");
+        aliases.insert(
+            "mod.B".to_string(),
+            crate::aliases::TypeAliasSnapshot {
+                fullname: "mod.B".to_string(),
+                target: buf2.into_bytes(),
+                no_args: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            is_literal_type_like(&a_alias, Some(&aliases)),
+            None,
+            "cycle must defer"
+        );
     }
 
     #[test]
