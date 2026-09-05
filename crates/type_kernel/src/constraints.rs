@@ -2720,10 +2720,12 @@ fn infer_against_any_native(
     aliases: &crate::aliases::TypeAliasResolver,
     strict_optional: bool,
 ) -> Option<Vec<Constraint>> {
+    let mut active = Vec::new();
     let flat = flatten_nested_tuples_inner(
         items,
         true,
         Some(aliases as &dyn crate::aliases::AliasLookup),
+        &mut active,
     )?;
     let mut res = Vec::new();
     for t in flat {
