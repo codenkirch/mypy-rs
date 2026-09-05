@@ -31,17 +31,39 @@ thread_local! {
     static INFER_UNIONS: Cell<bool> = const { Cell::new(false) };
 }
 
-/// Install the ambient `type_state.infer_unions` for one FFI call.
-pub(crate) fn set_infer_unions(value: bool) {
-    INFER_UNIONS.with(|s| s.set(value));
+/// RAII guard restoring the ambient `type_state.infer_unions` (the
+/// pre-call value) on `Drop`, so a thread-local set by one FFI entry
+/// never leaks into a later FFI call on the same thread that was not
+/// handed the flag. `prev` is captured at install time, so nested or
+/// interleaved installs restore correctly in reverse order.
+#[must_use]
+pub(crate) struct InferUnionsGuard {
+    prev: bool,
+    active: bool,
 }
 
-fn infer_unions() -> bool {
+impl InferUnionsGuard {
+    /// Stash the previous value and store `value` as the ambient flag.
+    pub(crate) fn install(value: bool) -> Self {
+        let prev = INFER_UNIONS.with(|s| s.replace(value));
+        Self { prev, active: true }
+    }
+}
+
+impl Drop for InferUnionsGuard {
+    fn drop(&mut self) {
+        if self.active {
+            INFER_UNIONS.with(|s| s.set(self.prev));
+        }
+    }
+}
+
+pub(crate) fn infer_unions() -> bool {
     INFER_UNIONS.with(|s| s.get())
 }
 
 /// `unify_generic_callable` outcome (see module docs).
-#[derive(Clone, PartialEq)]
+#[derive(Clone, PartialEq, Debug)]
 pub(crate) enum UnifyOutcome {
     Unified(Type),
     NoUnify,
@@ -283,6 +305,127 @@ mod tests {
     #[test]
     fn test_strip_ret_non_callable_defers() {
         assert!(strip_ret(&instance("builtins.int", vec![])).is_none());
+    }
+
+    // -- unify_generic_callable_core outcomes --
+
+    fn callable_with(variables: Vec<Type>, args: Vec<Type>, ret: Type) -> Type {
+        let mut c = callable(variables);
+        if let Type::CallableType {
+            arg_types,
+            arg_kinds,
+            arg_names,
+            ret_type,
+            ..
+        } = &mut c
+        {
+            *arg_types = args;
+            *arg_kinds = vec![0; arg_types.len()];
+            *arg_names = vec![None; arg_types.len()];
+            *ret_type = Box::new(ret);
+        }
+        c
+    }
+
+    fn resolver_with(fullnames: &[&str]) -> crate::typeinfo::TypeResolver {
+        let mut r = crate::typeinfo::TypeResolver::new();
+        for f in fullnames {
+            let mut s = crate::typeinfo::TypeInfoSnapshot {
+                fullname: f.to_string(),
+                name: f.to_string(),
+                ..Default::default()
+            };
+            s.mro.push(f.to_string());
+            s.has_base.insert(f.to_string());
+            if *f != "builtins.object" {
+                s.mro.push("builtins.object".to_string());
+                s.has_base.insert("builtins.object".to_string());
+            }
+            r.insert(f.to_string(), s);
+        }
+        r
+    }
+
+    fn empty_aliases() -> TypeAliasResolver {
+        TypeAliasResolver::new()
+    }
+
+    #[test]
+    fn test_unify_defers_on_tvar_clash() {
+        // Right's tree carries a TypeVar with the same raw id as one of
+        // left's variables: freshening territory -> Defer.
+        let left = callable(vec![tvar(1)]);
+        let right = callable_with(vec![], vec![tvar(1)], instance("builtins.int", vec![]));
+        let r = resolver_with(&["builtins.int", "builtins.object"]);
+        let outcome = unify_generic_callable_core(&left, &right, false, true, &r, &empty_aliases());
+        assert_eq!(outcome, UnifyOutcome::Defer);
+    }
+
+    #[test]
+    fn test_unify_no_unify_on_unsolvable_var() {
+        // Mixing a contravariant position with a plain position gives T a
+        // lower (a.B <: T) and an unrelated upper (T <: a.A): strict solve
+        // returns None (skip_unsatisfied=False) -> NoUnify.
+        let left = callable_with(
+            vec![tvar(1)],
+            vec![
+                callable_with(vec![], vec![tvar(1)], instance("builtins.int", vec![])),
+                tvar(1),
+            ],
+            instance("builtins.int", vec![]),
+        );
+        let right = callable_with(
+            vec![],
+            vec![
+                callable_with(
+                    vec![],
+                    vec![instance("a.B", vec![])],
+                    instance("builtins.int", vec![]),
+                ),
+                instance("a.A", vec![]),
+            ],
+            instance("builtins.int", vec![]),
+        );
+        let r = resolver_with(&[
+            "a.A",
+            "a.B",
+            "builtins.function",
+            "builtins.object",
+            // The nested callables' `-> int` ret pairs cross
+            // visit_instance_native, which snapshots both classes.
+            "builtins.int",
+        ]);
+        // ignore_return=true: the unsolvability lives in the arg
+        // constraints; the ret pair is unrelated to the None verdict.
+        let outcome = unify_generic_callable_core(&left, &right, true, true, &r, &empty_aliases());
+        assert_eq!(outcome, UnifyOutcome::NoUnify);
+    }
+
+    #[test]
+    fn test_unify_unified_substitutes_right_actuals() {
+        // T's single constraint points at builtins.int: unified left gets
+        // its arg substituted with int.
+        let left = callable_with(
+            vec![tvar(1)],
+            vec![tvar(1)],
+            instance("builtins.int", vec![]),
+        );
+        let right = callable_with(
+            vec![],
+            vec![instance("builtins.int", vec![])],
+            instance("builtins.int", vec![]),
+        );
+        let r = resolver_with(&["builtins.int", "builtins.object"]);
+        let outcome = unify_generic_callable_core(&left, &right, false, true, &r, &empty_aliases());
+        match outcome {
+            UnifyOutcome::Unified(t) => match t {
+                Type::CallableType { arg_types, .. } => {
+                    assert_eq!(arg_types, vec![instance("builtins.int", vec![])],);
+                }
+                other => panic!("expected CallableType, got {:?}", other),
+            },
+            other => panic!("expected Unified, got {:?}", other),
+        }
     }
 }
 

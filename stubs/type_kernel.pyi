@@ -817,6 +817,7 @@ def rust_find_matching_overload_items(
     items_bytes: list[bytes],
     template_bytes: bytes,
     strict_optional: bool,
+    infer_unions: bool = False,
 ) -> list[int] | None: ...
 def rust_is_typed_callable(type_bytes: bytes) -> bool | None: ...
 def rust_is_private(node_name: str) -> bool: ...
@@ -934,7 +935,10 @@ def rust_is_typeddict_type_context(
 ) -> bool | None: ...
 def rust_is_typevar_default_recursive(tv_fname: str, start: object) -> bool | None: ...
 def rust_conditional_expr_join(
-    if_bytes: bytes, else_bytes: bytes, resolver: NativeTypeResolver
+    if_bytes: bytes,
+    else_bytes: bytes,
+    resolver: NativeTypeResolver,
+    infer_unions: bool = False,
 ) -> bytes | None: ...
 def rust_conditional_types(
     current: bytes,
@@ -1324,7 +1328,12 @@ def rust_is_settable_property(defn: Any) -> bool: ...
 def rust_is_custom_settable_property(defn: Any) -> bool: ...
 def rust_can_have_shared_disjoint_base(instances: list[Any]) -> bool: ...
 def rust_check_operator(
-    resolver: NativeTypeResolver, op_name: str, left: bytes, right: bytes, strict_optional: bool
+    resolver: NativeTypeResolver,
+    op_name: str,
+    left: bytes,
+    right: bytes,
+    strict_optional: bool,
+    infer_unions: bool = False,
 ) -> int | None: ...
 def rust_is_trivial_bound(type_bytes: bytes, allow_tuple: bool) -> bool | None: ...
 def rust_find_linear(
@@ -1413,6 +1422,7 @@ def rust_is_equivalent(
     ignore_type_params: bool,
     strict_optional: bool,
     resolver: NativeTypeResolver,
+    infer_unions: bool = False,
 ) -> bool | None: ...
 def rust_is_same_type(
     a_bytes: bytes,
@@ -1420,12 +1430,14 @@ def rust_is_same_type(
     ignore_promotions: bool,
     strict_optional: bool,
     resolver: NativeTypeResolver,
+    infer_unions: bool = False,
 ) -> bool | None: ...
 def rust_all_same_types(
     items_bytes: list[bytes],
     ignore_promotions: bool,
     strict_optional: bool,
     resolver: NativeTypeResolver,
+    infer_unions: bool = False,
 ) -> bool | None: ...
 def rust_is_more_precise(
     left_bytes: bytes,
@@ -1433,6 +1445,7 @@ def rust_is_more_precise(
     ignore_promotions: bool,
     strict_optional: bool,
     resolver: NativeTypeResolver,
+    infer_unions: bool = False,
 ) -> bool | None: ...
 def rust_is_erased_instance(t_bytes: bytes) -> bool | None: ...
 def rust_has_underscore_prefix(name: str) -> bool: ...
@@ -1445,6 +1458,7 @@ def rust_restrict_subtype_away(
     consider_runtime_isinstance: bool,
     strict_optional: bool,
     resolver: NativeTypeResolver,
+    infer_unions: bool = False,
 ) -> bytes | None: ...
 def rust_custom_special_method(
     type_bytes: bytes, name: str, check_all: bool, resolver: NativeTypeResolver
@@ -1851,6 +1865,7 @@ def rust_check_self_arg(
     is_classmethod: bool,
     name: str,
     strict_optional: bool,
+    infer_unions: bool = False,
 ) -> tuple[int, bool, bytes] | None: ...
 def rust_expand_without_binding(
     typ_bytes: bytes,
@@ -1905,7 +1920,11 @@ def rust_combine_function_signatures(
     strict_optional: bool,
 ) -> tuple[int, bytes] | None: ...
 def rust_arg_approximate_similarity(
-    actual_bytes: bytes, formal_bytes: bytes, strict_optional: bool, resolver: NativeTypeResolver
+    actual_bytes: bytes,
+    formal_bytes: bytes,
+    strict_optional: bool,
+    resolver: NativeTypeResolver,
+    infer_unions: bool = False,
 ) -> bool | None: ...
 def rust_visit_tuple_index_helper(
     items_bytes: list[bytes],
@@ -2250,6 +2269,7 @@ def rust_any_causes_overload_ambiguity(
     arg_types_bytes: list[bytes],
     arg_kinds: Any,
     arg_names: Any,
+    infer_unions: bool,
     strict_optional: bool,
 ) -> bool | None: ...
 def rust_are_related_types(
@@ -2517,7 +2537,11 @@ def rust_classify_literal_param(
 ) -> int: ...
 def rust_classify_metaclass_compat(info: Any) -> int | None: ...
 def rust_covers_at_runtime(
-    item_bytes: bytes, supertype_bytes: bytes, strict_optional: bool, resolver: NativeTypeResolver
+    item_bytes: bytes,
+    supertype_bytes: bytes,
+    strict_optional: bool,
+    resolver: NativeTypeResolver,
+    infer_unions: bool = False,
 ) -> bool | None: ...
 def rust_erase_return_self_types(typ_bytes: bytes, self_type_bytes: bytes) -> bytes | None: ...
 def rust_fill_typevars_with_any(typ: Any) -> bytes | None: ...
@@ -2537,6 +2561,7 @@ def rust_infer_variance_member(
     object_type_bytes: bytes,
     raw_id: int,
     resolver: NativeTypeResolver,
+    infer_unions: bool = False,
 ) -> int | None: ...
 def rust_is_better(
     t_bytes: bytes, s_bytes: bytes, resolver: NativeTypeResolver

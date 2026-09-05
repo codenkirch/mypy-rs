@@ -952,7 +952,9 @@ def _try_native_conditional_expr_join(if_bytes: bytes, else_bytes: bytes) -> byt
     ):
         return None
     try:
-        return _rust_conditional_expr_join(if_bytes, else_bytes, _native_checkexpr_resolver)
+        return _rust_conditional_expr_join(
+            if_bytes, else_bytes, _native_checkexpr_resolver, type_state.infer_unions
+        )
     except (AssertionError, NotImplementedError, ValueError):
         return None
 
@@ -1121,6 +1123,7 @@ def _try_native_operator_plan(
                 _serialize_type_for_checkexpr(left_type),
                 _serialize_type_for_checkexpr(right_type),
                 strict_optional,
+                type_state.infer_unions,
             )
         except (AssertionError, NotImplementedError, ValueError):
             return None
@@ -9235,6 +9238,7 @@ def arg_approximate_similarity(actual: Type, formal: Type) -> bool:
                 _serialize_type_for_checkexpr(formal),
                 state.strict_optional,
                 _native_checkexpr_resolver,
+                type_state.infer_unions,
             )
             if result is not None:
                 return result
@@ -9327,6 +9331,7 @@ def any_causes_overload_ambiguity(
                 arg_types_bytes,
                 [int(k.value) for k in arg_kinds],
                 list(arg_names) if arg_names is not None else None,
+                type_state.infer_unions,
                 state.strict_optional,
             )
             if result is not None:
@@ -9382,7 +9387,11 @@ def all_same_types(types: list[Type]) -> bool:
         try:
             type_bytes = [_serialize_type_for_checkexpr(t) for t in types]
             result = _rust_all_same_types(
-                type_bytes, True, state.strict_optional, _native_checkexpr_resolver
+                type_bytes,
+                True,
+                state.strict_optional,
+                _native_checkexpr_resolver,
+                type_state.infer_unions,
             )
             if result is not None:
                 return result

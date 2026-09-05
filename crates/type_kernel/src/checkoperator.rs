@@ -237,13 +237,16 @@ pub(crate) fn operator_plan_inner(
 /// Returns an `int | None` order code: 0 = shortcut-single, 1 = reverse-first,
 /// 2 = normal. `None` defers to the pure-Python chain.
 #[pyfunction]
+#[pyo3(signature = (resolver, op_name, left_bytes, right_bytes, strict_optional, infer_unions = false))]
 pub(crate) fn rust_check_operator(
     resolver: &NativeTypeResolver,
     op_name: &str,
     left_bytes: &[u8],
     right_bytes: &[u8],
     strict_optional: bool,
+    infer_unions: bool,
 ) -> PyResult<Option<u8>> {
+    let _infer_unions_guard = crate::unify::InferUnionsGuard::install(infer_unions);
     let left = match decode_type(left_bytes) {
         Some(t) => t,
         None => {

@@ -496,7 +496,9 @@ pub(crate) fn rust_are_parameters_compatible(
     infer_unions: bool,
 ) -> Option<bool> {
     // Ambient `type_state.infer_unions` for kernel-expect unify (#1426).
-    crate::unify::set_infer_unions(infer_unions);
+    // RAII: restored on drop, so the thread-local cannot leak into a
+    // later FFI call that was not handed the flag.
+    let _infer_unions_guard = crate::unify::InferUnionsGuard::install(infer_unions);
     let left = decode_type(left_bytes)?;
     let right = decode_type(right_bytes)?;
     let lf = arg_list_from_type(&left)?;
@@ -789,7 +791,9 @@ pub(crate) fn rust_callables_compatible(
     infer_unions: bool,
 ) -> Option<bool> {
     // Ambient `type_state.infer_unions` for kernel-expect unify (#1426).
-    crate::unify::set_infer_unions(infer_unions);
+    // RAII: restored on drop, so the thread-local cannot leak into a
+    // later FFI call that was not handed the flag.
+    let _infer_unions_guard = crate::unify::InferUnionsGuard::install(infer_unions);
     let left = decode_type(left_bytes)?;
     let right = decode_type(right_bytes)?;
 
@@ -923,14 +927,13 @@ pub(crate) fn callables_compatible_with_ignore_return(
                 Ok(t) => t,
                 Err(_) => return None,
             };
-            unified_right = Some(right_norm);
             let aliases = match resolver.aliases() {
                 Some(shared) => crate::aliases::TypeAliasResolver::from_shared_view(shared),
                 None => crate::aliases::TypeAliasResolver::new(),
             };
             unified = match crate::unify::unify_generic_callable_core(
                 &left_norm,
-                unified_right.as_ref().unwrap(),
+                &right_norm,
                 ignore_return,
                 ctx.strict_optional,
                 resolver,
@@ -940,11 +943,12 @@ pub(crate) fn callables_compatible_with_ignore_return(
                 UnifyOutcome::NoUnify => return Some(false),
                 UnifyOutcome::Defer => return None,
             };
+            unified_right = Some(right_norm);
             &unified
         }
         _ => left,
     };
-    let right: &Type = unified_right.as_ref().map_or(right, |t| t as &Type);
+    let right: &Type = unified_right.as_ref().map_or(right, |t| t);
 
     let is_compat: &dyn Fn(&Type, &Type) -> Option<bool> =
         &|l, r| crate::subtypes::is_subtype(l, r, ctx, resolver);

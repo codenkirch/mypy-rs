@@ -270,7 +270,12 @@ def _native_infer_variance_member(
         return None
     try:
         return _rust_infer_variance_member(
-            typ_bytes, self_bytes, object_bytes, tvar.id.raw_id, _native_subtype_resolver
+            typ_bytes,
+            self_bytes,
+            object_bytes,
+            tvar.id.raw_id,
+            _native_subtype_resolver,
+            type_state.infer_unions,
         )
     except Exception:
         return None
@@ -673,6 +678,7 @@ def is_equivalent(
                 ignore_type_params,
                 state.strict_optional,
                 _native_subtype_resolver,
+                type_state.infer_unions,
             )
         except (AssertionError, NotImplementedError):
             result = None
@@ -733,6 +739,7 @@ def is_same_type(
                 ignore_promotions,
                 state.strict_optional,
                 _native_subtype_resolver,
+                type_state.infer_unions,
             )
         except (AssertionError, NotImplementedError):
             result = None
@@ -3077,6 +3084,7 @@ def restrict_subtype_away(t: Type, s: Type, *, consider_runtime_isinstance: bool
                 consider_runtime_isinstance,
                 state.strict_optional,
                 _native_subtype_resolver,
+                type_state.infer_unions,
             )
             if result is not None:
                 decoded = _deserialize_type(bytes(result))
@@ -3124,6 +3132,7 @@ def covers_at_runtime(item: Type, supertype: Type) -> bool:
                 _serialize_type(supertype),
                 state.strict_optional,
                 _native_subtype_resolver,
+                type_state.infer_unions,
             )
             if result is not None:
                 return result
@@ -3178,6 +3187,7 @@ def is_more_precise(left: Type, right: Type, *, ignore_promotions: bool = False)
                 ignore_promotions,
                 state.strict_optional,
                 _native_subtype_resolver,
+                type_state.infer_unions,
             )
         except (AssertionError, NotImplementedError):
             result = None

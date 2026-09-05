@@ -402,13 +402,17 @@ pub(crate) fn callable_with_vars_reachable(typ: &Type) -> Option<bool> {
         }
         _ => {}
     }
+    // None must win over an earlier Some(true): Python keeps scanning the
+    // remaining children for a blocking alias before committing to true.
+    let mut any_true = false;
     for k in kids {
         match callable_with_vars_reachable(k) {
             Some(false) => {}
-            other => return other,
+            None => return None,
+            Some(true) => any_true = true,
         }
     }
-    Some(false)
+    Some(any_true)
 }
 
 /// Yield the direct child types of `typ` (for ANY_STRATEGY / ALL_STRATEGY
@@ -2037,6 +2041,15 @@ mod tests {
         let u = make_union(vec![
             make_alias("m.A", vec![], false),
             make_generic_callable(),
+        ]);
+        assert_eq!(callable_with_vars_reachable(&u), None);
+    }
+
+    #[test]
+    fn test_gate_alias_beats_generic_reversed_order() {
+        let u = make_union(vec![
+            make_generic_callable(),
+            make_alias("m.A", vec![], false),
         ]);
         assert_eq!(callable_with_vars_reachable(&u), None);
     }

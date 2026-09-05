@@ -2938,7 +2938,9 @@ pub(crate) fn infer_callable_arguments_constraints_core(
                 // The by-name/by-pos merge case needs `meet_types`, which the
                 // kernel cannot reconstruct: defer the whole call so constraints
                 // are neither dropped nor changed.
-                Err(_) => return None,
+                Err(_) => {
+                    return None;
+                }
             };
         res.extend(infer_directed_arg_constraints_native(
             left_arg.typ.clone(),

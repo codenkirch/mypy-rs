@@ -192,13 +192,19 @@ fn erase_return_self_types_wire(typ: &Type, self_type: &Type) -> Option<Type> {
 /// The result is a bitmask of the caller's `co` / `contra` flips.
 #[pyfunction]
 #[allow(clippy::too_many_arguments)]
+#[pyo3(signature = (member_type_bytes, self_type_bytes, object_type_bytes, raw_id, resolver, infer_unions = false))]
 pub(crate) fn rust_infer_variance_member(
     member_type_bytes: &[u8],
     self_type_bytes: &[u8],
     object_type_bytes: &[u8],
     raw_id: i64,
     resolver: &mut NativeTypeResolver,
+    infer_unions: bool,
 ) -> Option<i32> {
+    // Ambient `type_state.infer_unions`: variance inference runs in the
+    // controller-free phase where Python's ambient is False; the guard
+    // makes the entry insensitive to cross-engine state.
+    let _infer_unions_guard = crate::unify::InferUnionsGuard::install(infer_unions);
     let member_type = decode_type(member_type_bytes)?;
     let self_type = decode_type(self_type_bytes)?;
     let object_type = decode_type(object_type_bytes)?;

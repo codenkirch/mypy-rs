@@ -152,13 +152,15 @@ fn is_function_like_type_obj(typ: &Type, resolver: &TypeResolver) -> bool {
 /// mirroring `_is_subtype`'s `get_proper_type` on both sides
 /// (subtypes.py:531); nested alias items still defer in the inner.
 #[pyfunction]
-#[pyo3(signature = (item_bytes, supertype_bytes, strict_optional, resolver))]
+#[pyo3(signature = (item_bytes, supertype_bytes, strict_optional, resolver, infer_unions = false))]
 pub(crate) fn rust_covers_at_runtime(
     item_bytes: &[u8],
     supertype_bytes: &[u8],
     strict_optional: bool,
     resolver: &mut NativeTypeResolver,
+    infer_unions: bool,
 ) -> Option<bool> {
+    let _infer_unions_guard = crate::unify::InferUnionsGuard::install(infer_unions);
     let item = decode_type(item_bytes)?;
     let supertype = decode_type(supertype_bytes)?;
     let item = crate::checkexpr_functions::get_proper_or_expand(&item, resolver.alias_resolver())?;
@@ -222,7 +224,13 @@ mod tests {
         let item = alias_type("mod.Alias");
         let supertype = alias_type("mod.Alias");
         assert_eq!(
-            rust_covers_at_runtime(&encode(&item), &encode(&supertype), true, &mut native),
+            rust_covers_at_runtime(
+                &encode(&item),
+                &encode(&supertype),
+                true,
+                &mut native,
+                false
+            ),
             Some(true)
         );
     }
@@ -236,7 +244,13 @@ mod tests {
         // The alias resolver has no snapshot for mod.Alias: the expansion
         // defers, preserving the pre-change defer behavior.
         assert_eq!(
-            rust_covers_at_runtime(&encode(&item), &encode(&supertype), true, &mut native),
+            rust_covers_at_runtime(
+                &encode(&item),
+                &encode(&supertype),
+                true,
+                &mut native,
+                false
+            ),
             None
         );
     }

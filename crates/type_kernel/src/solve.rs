@@ -343,6 +343,9 @@ pub(crate) fn rust_solve_one(
     strict_optional: bool,
     resolver: &NativeTypeResolver,
 ) -> Option<(i64, Option<Vec<u8>>)> {
+    // Ambient `type_state.infer_unions` for the engine's unify reads;
+    // RAII so a thread-local set here cannot outlive this call.
+    let _infer_unions_guard = crate::unify::InferUnionsGuard::install(infer_unions);
     let mut lowers_types: Vec<Type> = Vec::with_capacity(lowers.len());
     for b in &lowers {
         lowers_types.push(decode_type(b)?);
@@ -1356,6 +1359,9 @@ pub(crate) fn rust_solve_dependent(
     strict_optional: bool,
     resolver: &NativeTypeResolver,
 ) -> SolveDependentOut {
+    // Ambient `type_state.infer_unions` for the engine's unify reads;
+    // RAII so a thread-local set here cannot outlive this call.
+    let _infer_unions_guard = crate::unify::InferUnionsGuard::install(infer_unions);
     let mut var_types: Vec<Type> = Vec::with_capacity(vars.len());
     for b in &vars {
         var_types.push(decode_type(b)?);
@@ -1650,20 +1656,9 @@ pub(crate) fn solve_constraints_poly_native(
     // pre-validation (solve.py:242-244, 288).
     let filtered = crate::constraints_filter::skip_reverse_union_kernel(constraints).ok_or(())?;
 
-    // cmap (solve.py:249-251) restricted to the solving vars.
-    let mut cmap: HashMap<TvId, Vec<Constraint>> = HashMap::new();
-    for t in original_vars {
-        cmap.insert(tv_id(t).ok_or(())?, Vec::new());
-    }
-    for con in &filtered {
-        if let Some(k) = tv_id(&con.origin_type_var) {
-            if let Some(cs) = cmap.get_mut(&k) {
-                cs.push(con.clone());
-            }
-        }
-    }
-
-    // Dependent solve over the filtered constraints (solve.py:255-261).
+    // Dependent solve over the filtered constraints (solve.py:255-261); it
+    // consumes `filtered` directly (Python's cmap is shared with the
+    // non-polymorphic branch, which this poly-only port does not implement).
     let (solutions, free_vars): (Vec<(TvId, Option<Type>)>, Vec<TvId>) = if !filtered.is_empty() {
         match solve_with_dependent_core(original_vars, &filtered, infer_unions, strict_optional, r)?
         {
@@ -1791,6 +1786,9 @@ pub(crate) fn rust_solve_constraints(
     skip_unsatisfied: bool,
     resolver: &NativeTypeResolver,
 ) -> SolveDependentOut {
+    // Ambient `type_state.infer_unions` for the engine's unify reads;
+    // RAII so a thread-local set here cannot outlive this call.
+    let _infer_unions_guard = crate::unify::InferUnionsGuard::install(infer_unions);
     let mut var_types: Vec<Type> = Vec::with_capacity(vars.len());
     for b in &vars {
         var_types.push(decode_type(b)?);
@@ -1843,6 +1841,9 @@ pub(crate) fn rust_infer_function_type_arguments(
     iterable_type: Option<Vec<u8>>,
     mapping_type: Option<Vec<u8>>,
 ) -> Option<Vec<u8>> {
+    // Ambient `type_state.infer_unions` for the engine's unify reads;
+    // RAII so a thread-local set here cannot outlive this call.
+    let _infer_unions_guard = crate::unify::InferUnionsGuard::install(infer_unions);
     let mut buf = ReadBuffer::new(callee_bytes);
     let callee = match wire::read_type(&mut buf, None) {
         Ok(t) => t,
