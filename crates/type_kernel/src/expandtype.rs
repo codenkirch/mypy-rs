@@ -1116,16 +1116,19 @@ pub(crate) fn expand_type_inner(
         Type::TypeAliasType {
             args,
             type_ref,
-            is_recursive: _,
+            is_recursive,
         } => {
             if args.is_empty() {
                 return Some(typ.clone());
             }
             let new_args = expand_type_list_with_unpack(args, env, strict_optional)?;
+            // Propagate the wire-carried recursion flag (wave36): a rebuild
+            // with hardcoded false silenced the engine's recursive-pair
+            // guard and let aliased re-entries loop to a stack overflow.
             Some(Type::TypeAliasType {
                 args: new_args,
                 type_ref: type_ref.clone(),
-                is_recursive: false,
+                is_recursive: *is_recursive,
             })
         }
 

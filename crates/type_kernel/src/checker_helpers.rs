@@ -1122,17 +1122,34 @@ pub(crate) fn get_protocol_member_inner(
     else {
         return None;
     };
-    if extra_attrs.is_some() {
-        // `find_member` consults `itype.extra_attrs` for module attrs; a
-        // present extra_attrs cannot be decided here.
-        return Some(GetProtocolMemberResult::Defer);
-    }
     let snap = match resolver.get(type_ref) {
         Some(s) => s,
         None => {
             return None;
         }
     };
+
+    if let Some(ea) = extra_attrs {
+        // module-typed instances. Python's get_protocol_member prelude
+        // + find_member miss tail (subtypes.py:2120-2137, 2228) decide
+        // a plain miss as None: the accessor scan is skipped on extra_attrs.
+
+        // Keep the deferral for every other shape: an attrs hit needs
+        // the live Type, a MRO hit rides the member-access tail.
+        if !class_obj
+            && !is_lvalue
+            && member != "__call__"
+            && member != "__init__"
+            && !ea.attrs.contains_key(member)
+            && !snap.fallback_to_any
+        {
+            // Fall through to the normal walk below;
+            // member_miss_decision skips the accessor scan for this
+            // instance shape, so the plain-miss verdict matches Python.
+        } else {
+            return Some(GetProtocolMemberResult::Defer);
+        }
+    }
 
     if member == "__call__" && class_obj {
         // type_object_type(left.type): the constructor type. This needs
@@ -1476,10 +1493,20 @@ fn member_miss_decision(
     self_type: &Type,
     strict_optional: bool,
 ) -> Option<GetProtocolMemberResult> {
-    if !matches!(member, "__getattr__" | "__setattr__" | "__getattribute__") {
+    // Python skips the accessor scan for extra_attrs-bearing instances
+    // (subtypes.py:2198 `itype.extra_attrs is None` gate, the ModuleType
+    // case), and the attrs hit was already excluded upstream.
+    let skip_accessors = matches!(
+        left,
+        Type::Instance {
+            extra_attrs: Some(_),
+            ..
+        }
+    );
+    if !skip_accessors && !matches!(member, "__getattr__" | "__setattr__" | "__getattribute__") {
         for method_name in ["__getattribute__", "__getattr__"] {
-            let Some((definer_fullname, method_node)) = get_method_definer(py, info, method_name)?
-            else {
+            let def = get_method_definer(py, info, method_name);
+            let Some((definer_fullname, method_node)) = def? else {
                 continue;
             };
             if definer_fullname == "builtins.object" {

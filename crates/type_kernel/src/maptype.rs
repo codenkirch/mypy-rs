@@ -187,22 +187,7 @@ pub(crate) fn rust_map_instance_to_supertype(
         };
         Ok(encode_type(&inst))
     } else {
-        // subtypes_map deferred (usually an alias-carrying base arg in
-        // the derivation path): retry with the alias-aware local walker
-        // before handing back to Python.
-        let mapped = map_path_alias(&instance_ref, &args, &supertype_ref, resolver.resolver());
-        match mapped {
-            Some(mapped_args) => {
-                let inst = Type::Instance {
-                    type_ref: supertype_ref,
-                    args: mapped_args,
-                    last_known_value: None,
-                    extra_attrs: None,
-                };
-                Ok(encode_type(&inst))
-            }
-            None => Ok(None),
-        }
+        Ok(None)
     }
 }
 
@@ -356,323 +341,6 @@ pub(crate) fn rust_map_instance_to_direct_supertypes(
     } else {
         Ok(Some(result))
     }
-}
-
-// 4. Alias-aware fallback walker — closes the subtypes_map defer when the
-// derivation-path base args carry a TypeAliasType (visitor-ABC mappings,
-// e.g. `_Hasher(ExpressionVisitor[Key])`).
-
-/// `ArgKind.ARG_STAR` (nodes.py:2563).
-const MAP_ARG_STAR: i64 = 2;
-
-/// Alias-aware copy of `subtypes.rs::expand_type_by_instance`, used ONLY
-/// when `subtypes_map` returned `None` for the mapping. Differences from
-/// the shared walker:
-///
-/// - `TypeAliasType` arm (expandtype.py:1321): alias args expand
-///   recursively and the alias node is kept (wire tag 100 carries it;
-///   the shim re-links via `fixup_wire_type(resolve_aliases=True)`).
-///   Empty args pass through unchanged. Unpack splicing on alias args
-///   (`expand_type_list_with_unpack`) still defers to Python.
-/// - `TypeVarType` arm: identical frame matching to
-///   `subtypes.rs::expand_type_by_instance` (`namespace == left_ref`,
-///   1-based `raw_id`); an unmatched var defers. Python's maptype
-///   substitutes by tvar object identity, so a var the frame key cannot
-///   describe (e.g. a tvar carried over from another class frame) is a
-///   defer, not a passthrough — the gs4 fresh-var fixture pins this.
-///   An Instance replacement clears `last_known_value`
-///   (expandtype.py:957-960).
-///
-/// Everything else mirrors `subtypes.rs::expand_type_by_instance` exactly,
-/// including its defers (ParamSpec variables, star-unpack interpolation,
-/// tuple normalization, named-tuple fallback branches).
-fn expand_frame(typ: &Type, left_ref: &str, left_args: &[Type]) -> Option<Type> {
-    match typ {
-        Type::Instance {
-            type_ref,
-            args,
-            last_known_value,
-            extra_attrs,
-        } => {
-            if args.is_empty() {
-                return Some(typ.clone());
-            }
-            let mut new_args = Vec::with_capacity(args.len());
-            for arg in args {
-                new_args.push(expand_frame(arg, left_ref, left_args)?);
-            }
-            Some(Type::Instance {
-                type_ref: type_ref.clone(),
-                args: new_args,
-                last_known_value: last_known_value.clone(),
-                extra_attrs: extra_attrs.clone(),
-            })
-        }
-        Type::TypeAliasType {
-            type_ref,
-            args,
-            is_recursive: _,
-        } => {
-            // Target of a type alias cannot contain typevars bound by the
-            // frame; only the args expand (expandtype.py:1321-1328).
-            if args.is_empty() {
-                return Some(typ.clone());
-            }
-            let mut new_args = Vec::with_capacity(args.len());
-            for arg in args {
-                if matches!(arg, Type::UnpackType { .. }) {
-                    // expand_type_list_with_unpack splice: defer.
-                    return None;
-                }
-                new_args.push(expand_frame(arg, left_ref, left_args)?);
-            }
-            Some(Type::TypeAliasType {
-                type_ref: type_ref.clone(),
-                args: new_args,
-                is_recursive: false,
-            })
-        }
-        Type::TypeVarType {
-            raw_id, namespace, ..
-        } => {
-            // Mirror subtypes.rs's frame matching exactly: substitutable
-            // class vars are (namespace == class being mapped, 1-based raw_id).
-            // Python substitutes by tvar identity: outside-frame var defers.
-            if namespace == left_ref && *raw_id >= 1 {
-                let idx = (*raw_id - 1) as usize;
-                if idx < left_args.len() {
-                    let repl = &left_args[idx];
-                    // Instance replacements drop the stale literal value
-                    // (expandtype.py:957-960).
-                    return match repl {
-                        Type::Instance {
-                            type_ref,
-                            args,
-                            extra_attrs,
-                            ..
-                        } => Some(Type::Instance {
-                            type_ref: type_ref.clone(),
-                            args: args.clone(),
-                            last_known_value: None,
-                            extra_attrs: extra_attrs.clone(),
-                        }),
-                        _ => Some(repl.clone()),
-                    };
-                }
-            }
-            None
-        }
-        Type::UnionType {
-            items,
-            uses_pep604_syntax,
-            ..
-        } => {
-            let mut new_items = Vec::with_capacity(items.len());
-            for item in items {
-                new_items.push(expand_frame(item, left_ref, left_args)?);
-            }
-            let can_be_true = new_items.iter().any(crate::setops::union_item_can_be_true);
-            let can_be_false = new_items.iter().any(crate::setops::union_item_can_be_false);
-            Some(Type::UnionType {
-                items: new_items,
-                uses_pep604_syntax: *uses_pep604_syntax,
-                can_be_true,
-                can_be_false,
-                is_evaluated: true,
-                original_str_expr: None,
-                original_str_fallback: None,
-            })
-        }
-        Type::NoneType | Type::UninhabitedType { .. } => Some(typ.clone()),
-        Type::AnyType { .. } | Type::DeletedType { .. } | Type::LiteralType { .. } => {
-            Some(typ.clone())
-        }
-        Type::CallableType {
-            fallback,
-            instance_type,
-            is_ellipsis_args,
-            implicit,
-            is_bound,
-            from_concatenate,
-            imprecise_arg_kinds,
-            unpack_kwargs,
-            from_type_type,
-            arg_types,
-            arg_kinds,
-            arg_names,
-            ret_type,
-            name,
-            variables,
-            type_guard,
-            type_is,
-            ..
-        } => {
-            // visit_callable_type (expandtype.py:870-918). Defer when a
-            // declared ParamSpec means Python's param_spec() takes the
-            // *args: P.args + **kwargs: P.kwargs branch (Parameters join).
-            for v in variables {
-                if matches!(v, Type::ParamSpecType { .. }) {
-                    return None;
-                }
-            }
-            // Defer a var-arg typed UnpackType: interpolation
-            // (expandtype.py:482-491) needs tuple splicing we do not port.
-            for (flag, at) in arg_kinds.iter().zip(arg_types.iter()) {
-                if *flag == MAP_ARG_STAR && matches!(at, Type::UnpackType { .. }) {
-                    return None;
-                }
-            }
-            let mut new_arg_types = Vec::with_capacity(arg_types.len());
-            for at in arg_types {
-                new_arg_types.push(expand_frame(at, left_ref, left_args)?);
-            }
-            let new_ret = expand_frame(ret_type, left_ref, left_args)?;
-            let new_guard = match type_guard {
-                Some(tg) => Some(Box::new(expand_frame(tg, left_ref, left_args)?)),
-                None => None,
-            };
-            let new_type_is = match type_is {
-                Some(ti) => Some(Box::new(expand_frame(ti, left_ref, left_args)?)),
-                None => None,
-            };
-            let new_instance_type = match instance_type {
-                Some(it) => Some(Box::new(expand_frame(it, left_ref, left_args)?)),
-                None => None,
-            };
-            Some(Type::CallableType {
-                fallback: fallback.clone(),
-                instance_type: new_instance_type,
-                is_ellipsis_args: *is_ellipsis_args,
-                implicit: *implicit,
-                is_bound: *is_bound,
-                from_concatenate: *from_concatenate,
-                imprecise_arg_kinds: *imprecise_arg_kinds,
-                unpack_kwargs: *unpack_kwargs,
-                from_type_type: *from_type_type,
-                arg_types: new_arg_types,
-                arg_kinds: arg_kinds.clone(),
-                arg_names: arg_names.clone(),
-                ret_type: Box::new(new_ret),
-                name: name.clone(),
-                variables: variables.clone(),
-                type_guard: new_guard,
-                type_is: new_type_is,
-                special_sig: None,
-            })
-        }
-        Type::Overloaded { items } => {
-            let mut new_items = Vec::with_capacity(items.len());
-            for item in items {
-                new_items.push(expand_frame(item, left_ref, left_args)?);
-            }
-            Some(Type::Overloaded { items: new_items })
-        }
-        Type::TupleType {
-            partial_fallback,
-            items,
-            implicit,
-        } => {
-            if items.len() == 1 {
-                if let Type::UnpackType { .. } = &items[0] {
-                    return None;
-                }
-            }
-            let mut new_items = Vec::with_capacity(items.len());
-            for item in items {
-                new_items.push(expand_frame(item, left_ref, left_args)?);
-            }
-            let new_fallback = expand_frame(partial_fallback, left_ref, left_args)?;
-            if let Type::Instance { ref type_ref, .. } = new_fallback {
-                if type_ref == "builtins.tuple" && new_items.len() == 1 {
-                    if let Type::UnpackType { .. } = &new_items[0] {
-                        // Single Tuple[*tuple[X, ...]] with a builtins.tuple
-                        // fallback normalizes to the inner Instance; defer.
-                        return None;
-                    }
-                }
-                Some(Type::TupleType {
-                    partial_fallback: Box::new(new_fallback),
-                    items: new_items,
-                    implicit: *implicit,
-                })
-            } else {
-                None
-            }
-        }
-        Type::TypeType { item, is_type_form } => {
-            let new_item = expand_frame(item, left_ref, left_args)?;
-            if matches!(new_item, Type::UnionType { .. }) {
-                return None;
-            }
-            Some(Type::TypeType {
-                item: Box::new(new_item),
-                is_type_form: *is_type_form,
-            })
-        }
-        Type::UnpackType { typ, .. } => {
-            let new_typ = expand_frame(typ, left_ref, left_args)?;
-            Some(Type::UnpackType {
-                typ: Box::new(new_typ),
-                from_star_syntax: false,
-            })
-        }
-        _ => None,
-    }
-}
-
-/// Alias-aware copy of `subtypes.rs::map_derivation_path` (same recursion,
-/// same tvt guard); only the frame expansion is alias-aware.
-fn map_path_alias(
-    left_ref: &str,
-    left_args: &[Type],
-    right_ref: &str,
-    resolver: &TypeResolver,
-) -> Option<Vec<Type>> {
-    let left_snap = match resolver.get(left_ref) {
-        Some(s) => s,
-        None => {
-            return None;
-        }
-    };
-    if left_snap.has_type_var_tuple_type {
-        return None;
-    }
-    for base_blob in &left_snap.bases {
-        let base = match decode_type(base_blob) {
-            Some(b) => b,
-            None => {
-                return None;
-            }
-        };
-        if let Type::Instance {
-            type_ref: base_ref,
-            args: _base_args,
-            ..
-        } = &base
-        {
-            if base_ref == right_ref {
-                // Direct base: expand base's args by left's frame.
-                let expanded = expand_frame(&base, left_ref, left_args)?;
-                if let Type::Instance { args, .. } = expanded {
-                    return Some(args);
-                }
-                return None;
-            }
-            // Multi-level: map left to this base's frame, then recurse.
-            let mapped = expand_frame(&base, left_ref, left_args)?;
-            if let Type::Instance {
-                type_ref: mid_ref,
-                args: mid_args,
-                ..
-            } = mapped
-            {
-                if let Some(result) = map_path_alias(&mid_ref, &mid_args, right_ref, resolver) {
-                    return Some(result);
-                }
-            }
-        }
-    }
-    None
 }
 
 #[cfg(test)]
@@ -833,11 +501,11 @@ mod tests {
         }
     }
 
-    // (a) The failure shape of the audit bucket: derivation-path base args
-    // carry a TypeAliasType node. `expand_frame` substitutes the frame arg
-    // into the alias args and keeps the node; `subtypes_map` defers there.
+    // Former audit-bucket shape: derivation-path base args carry a
+    // TypeAliasType node; the walker keeps it and substitutes the frame
+    // arg into the alias args, matching the shared subtypes.rs walker.
     #[test]
-    fn map_path_alias_maps_alias_carrying_base_arg() {
+    fn map_instance_to_supertype_maps_alias_carrying_base_arg() {
         let b = snapshot(
             "m.B",
             vec![inst("m.A", vec![alias("m.AliasKey", vec![tvar("m.B", 1)])])],
@@ -846,11 +514,7 @@ mod tests {
         resolver.insert("m.B".to_string(), b);
         resolver.insert("m.A".to_string(), snapshot("m.A", vec![]));
         let left_args = vec![inst("m.X", vec![])];
-        assert!(
-            subtypes_map("m.B", &left_args, "m.A", &resolver).is_none(),
-            "subtypes_map should defer on the alias arg"
-        );
-        let mapped = map_path_alias("m.B", &left_args, "m.A", &resolver).unwrap();
+        let mapped = subtypes_map("m.B", &left_args, "m.A", &resolver).unwrap();
         assert_eq!(mapped, vec![alias("m.AliasKey", vec![inst("m.X", vec![])])]);
     }
 
@@ -858,7 +522,7 @@ mod tests {
     // Python substitutes by tvar object identity, so a wire-frame key gap has
     // no safe answer (gs4 fresh-var fixture in NativeMapFreshVarRepairSuite).
     #[test]
-    fn map_path_alias_defers_unmatched_frame_tvar() {
+    fn map_instance_to_supertype_defers_unmatched_frame_tvar() {
         let b = snapshot(
             "m.B",
             vec![inst("m.A", vec![tvar("m.B", 1), tvar("m.B", 2)])],
@@ -869,18 +533,14 @@ mod tests {
         let left_args = vec![inst("m.T", vec![])];
         assert!(
             subtypes_map("m.B", &left_args, "m.A", &resolver).is_none(),
-            "subtypes_map should defer on the unmatched tvar"
-        );
-        assert!(
-            map_path_alias("m.B", &left_args, "m.A", &resolver).is_none(),
-            "the alias walker must defer on an unmatched frame tvar, not invent a result"
+            "the walker must defer on an unmatched frame tvar, not invent a result"
         );
     }
 
     // (c) An Unpack node inside alias args is a splice shape the walker
     // does not model; it defers to Python.
     #[test]
-    fn map_path_alias_defers_unpack_alias_arg() {
+    fn map_instance_to_supertype_defers_unpack_alias_arg() {
         let b = snapshot(
             "m.B",
             vec![inst(
@@ -898,6 +558,6 @@ mod tests {
         resolver.insert("m.B".to_string(), b);
         resolver.insert("m.A".to_string(), snapshot("m.A", vec![]));
         let left_args = vec![inst("m.X", vec![])];
-        assert!(map_path_alias("m.B", &left_args, "m.A", &resolver).is_none());
+        assert!(subtypes_map("m.B", &left_args, "m.A", &resolver).is_none());
     }
 }

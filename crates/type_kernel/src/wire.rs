@@ -22,6 +22,7 @@
 //! string because the Python `write` insists on a live alias node but the
 //! kernel only ever sees the wire form (alias=None, type_ref set).
 
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 
@@ -2694,23 +2695,28 @@ pub(crate) fn encode_instance_simple_for_test(fullname: &str) -> Vec<u8> {
     blob
 }
 
-/// Python `==` semantics for wire-decoded types, for the seams that compare a
-/// serialized type against another serialized type instead of against live
-/// objects (the `erase_return_self_types` ret-vs-self comparison).
-///
-/// Plain `PartialEq` on `Type` is byte-exact and over-strict: Python's
-/// `TypeVarType.__eq__` (types.py:837) compares `id` (raw_id, meta_level,
-/// namespace), `upper_bound`, `values` and `default`, but deliberately ignores
-/// `variance` and name/fullname. The critical divergence: during PEP 695
-/// variance inference the self-side arg tvar carries the trial variance while
-/// the member-side carries VARIANCE_NOT_READY, so the wire bytes always differ
-/// but Python still says `ret == self_type` and erases the self return. A
-/// byte check then freezes reported variance at INVARIANT (test
-/// `testPEP695InferVarianceRecursive`).
-///
-/// Only the variants whose Python `__eq__` is variance-insensitive (or tvar
-/// carrying) are compared structurally; every other pair falls back to the
-/// derived byte equality, which matches Python for tvar-free types.
+// Python `==` semantics for wire-decoded types: mirrors each Variant's
+// `__eq__` override (TypeVarType ignores variance and name); ALIAS_EQ_ACTIVE
+// is Python's PyObject_RichCompareBool identity fast path on recursive aliases.
+thread_local! {
+    static ALIAS_EQ_ACTIVE: RefCell<HashSet<(String, String)>> = RefCell::new(HashSet::new());
+}
+
+// RAII: a frame inserted into ALIAS_EQ_ACTIVE must pop on unwind. A leaked
+// entry silently poisons every later comparison of that pair on the thread.
+struct AliasEqFrame {
+    key: (String, String),
+    fresh: bool,
+}
+
+impl Drop for AliasEqFrame {
+    fn drop(&mut self) {
+        if self.fresh {
+            ALIAS_EQ_ACTIVE.with(|c| c.borrow_mut().remove(&self.key));
+        }
+    }
+}
+
 pub(crate) fn py_type_eq(a: &Type, b: &Type) -> bool {
     match (a, b) {
         // Instance.__eq__ (types.py:1939): type identity + args +
@@ -2992,9 +2998,36 @@ pub(crate) fn py_type_eq(a: &Type, b: &Type) -> bool {
                 ..
             },
         ) => {
-            r1 == r2
-                && a1.len() == a2.len()
-                && a1.iter().zip(a2.iter()).all(|(x, y)| py_type_eq(x, y))
+            if r1 != r2 {
+                false
+            } else {
+                let fresh =
+                    ALIAS_EQ_ACTIVE.with(|c| c.borrow_mut().insert((r1.clone(), r2.clone())));
+                match fresh {
+                    true => {
+                        // Fresh pair: mirror the structural
+                        // `self.args == other.args` half of TypeAliasType
+                        // __eq__ (types.py:545); Drop pops the frame.
+                        let _guard = AliasEqFrame {
+                            key: (r1.clone(), r2.clone()),
+                            fresh: true,
+                        };
+                        a1.len() == a2.len()
+                            && a1.iter().zip(a2.iter()).all(|(x, y)| py_type_eq(x, y))
+                    }
+                    false => {
+                        // Re-entered pair (identity fast path): cut only
+                        // when both sides' args agree byte-for-byte; a
+                        // diverging nested arg is decided structurally.
+                        if a1.is_empty() && a2.is_empty() || (a1 == a2) {
+                            true
+                        } else {
+                            a1.len() == a2.len()
+                                && a1.iter().zip(a2.iter()).all(|(x, y)| py_type_eq(x, y))
+                        }
+                    }
+                }
+            }
         }
         // UnboundType.__eq__ (types.py:1300): name/optional/original_str*;
         // args compare py-eq.
@@ -3038,8 +3071,7 @@ pub(crate) fn py_type_eq(a: &Type, b: &Type) -> bool {
         }
         // Remaining variants are scalar-only shapes (NoneType, ErasedType,
         // UninhabitedType, DeletedType): the derived PartialEq matches
-        // their Python __eq__ bodies field for field. Cross-variant pairs
-        // are never equal.
+        // Python field for field; cross-variant pairs are never equal.
         _ => a == b,
     }
 }
@@ -3920,6 +3952,71 @@ mod tests {
         ));
         // Truly identical → true.
         assert!(py_type_eq(&instance_with_tvar(2), &instance_with_tvar(2)));
+    }
+
+    #[test]
+    fn py_type_eq_recursive_alias_back_ref_closes() {
+        // A self-recursive alias vs an equally-shaped tree: the nested
+        // back-ref pair hits the active-set cut (identity-fast-path
+        // analogue) instead of recursing forever.
+        let mk = |name: &str| Type::TypeAliasType {
+            type_ref: name.to_string(),
+            is_recursive: true,
+            args: vec![Type::TypeAliasType {
+                type_ref: name.to_string(),
+                is_recursive: true,
+                args: Vec::new(),
+            }],
+        };
+        assert!(py_type_eq(&mk("__main__.A"), &mk("__main__.A")));
+        assert!(!py_type_eq(&mk("__main__.A"), &mk("__main__.B")));
+
+        // Args divergence settles before any back-ref cut.
+        let inst = |inner: &str| Type::Instance {
+            type_ref: inner.to_string(),
+            args: Vec::new(),
+            last_known_value: None,
+            extra_attrs: None,
+        };
+        let mk_f = |inner: &str| Type::TypeAliasType {
+            type_ref: "__main__.F".to_string(),
+            is_recursive: true,
+            args: vec![inst(inner)],
+        };
+        assert!(!py_type_eq(&mk_f("builtins.int"), &mk_f("builtins.str")));
+        assert!(py_type_eq(&mk_f("builtins.int"), &mk_f("builtins.int")));
+    }
+
+    #[test]
+    fn py_type_eq_reentered_alias_pair_divergent_args_is_false() {
+        // Wave36 review: the old identity cut keyed the pair on
+        // type_ref alone, so re-entered applications with diverging
+        // nested args compared equal once the pair was active.
+        let inst = |inner: &str| Type::Instance {
+            type_ref: inner.to_string(),
+            args: Vec::new(),
+            last_known_value: None,
+            extra_attrs: None,
+        };
+        // Outer A[int] nesting A[int] re-mentioned vs A[int,others],
+        // nested divergence past the shared ref: outer == must be false.
+        let mk = |name: &str, deep: &str| Type::TypeAliasType {
+            type_ref: name.to_string(),
+            is_recursive: true,
+            args: vec![Type::TypeAliasType {
+                type_ref: name.to_string(),
+                is_recursive: true,
+                args: vec![inst(deep)],
+            }],
+        };
+        assert!(!py_type_eq(
+            &mk("A", "builtins.int"),
+            &mk("A", "builtins.str")
+        ));
+        assert!(py_type_eq(
+            &mk("A", "builtins.int"),
+            &mk("A", "builtins.int")
+        ));
     }
 
     // ----- Phase F0 (#1349): Rust-resident plain-data fields -----
