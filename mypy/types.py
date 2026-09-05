@@ -189,8 +189,10 @@ def _clear_serialize_stats() -> None:
 
 
 # Phase F2 (#1393): types_mirror.read_fresh_bytes when the F2 mirror-read
-# flip is enabled, else None. Shared by all kernel wire-seam funnels
-# (slice 1: checkexpr; slice 2: checkmember); wired from build.py.
+# flip is enabled, else None. Shared by every kernel wire-seam funnel
+
+# (slice 1: checkexpr; slice 2: checkmember); wired from build.py next to
+# the other _set_native_* gates.
 _mirror_read_fn: Callable[[Type], bytes | None] | None = None
 
 
@@ -1054,22 +1056,38 @@ class ParamSpecType(TypeVarLikeType):
         write_int(data, self.flavor)
         _write_type_cached(self.upper_bound, data)
         _write_type_cached(self.default, data)
+        # TypeVarId.meta_level, same tagged conditional int as
+        # TypeVarType: dropped when 0 so old readers still see END_TAG.
+        if self.id.meta_level:
+            write_int(data, self.id.meta_level)
         write_tag(data, END_TAG)
 
     @classmethod
     def read(cls, data: ReadBuffer) -> ParamSpecType:
         assert read_tag(data) == PARAMETERS
         prefix = Parameters.read(data)
+        name = read_str(data)
+        fullname = read_str(data)
+        raw_id = read_int(data)
+        namespace = read_str(data)
+        flavor = read_int(data)
+        upper_bound = read_type(data)
+        default = read_type(data)
+        tag = read_tag(data)
+        meta_level = 0
+        if tag == LITERAL_INT:
+            meta_level = read_int_bare(data)
+            tag = read_tag(data)
+        assert tag == END_TAG
         ret = ParamSpecType(
-            read_str(data),
-            read_str(data),
-            TypeVarId(read_int(data), namespace=read_str(data)),
-            read_int(data),
-            read_type(data),
-            read_type(data),
+            name,
+            fullname,
+            TypeVarId(raw_id, meta_level, namespace=namespace),
+            flavor,
+            upper_bound,
+            default,
             prefix=prefix,
         )
-        assert read_tag(data) == END_TAG
         return ret
 
 
@@ -1137,22 +1155,38 @@ class TypeVarTupleType(TypeVarLikeType):
         _write_type_cached(self.upper_bound, data)
         _write_type_cached(self.default, data)
         write_int(data, self.min_len)
+        # TypeVarId.meta_level, same tagged conditional int as
+        # TypeVarType: dropped when 0 so old readers still see END_TAG.
+        if self.id.meta_level:
+            write_int(data, self.id.meta_level)
         write_tag(data, END_TAG)
 
     @classmethod
     def read(cls, data: ReadBuffer) -> TypeVarTupleType:
         assert read_tag(data) == INSTANCE
         fallback = Instance.read(data)
+        name = read_str(data)
+        fullname = read_str(data)
+        raw_id = read_int(data)
+        namespace = read_str(data)
+        upper_bound = read_type(data)
+        default = read_type(data)
+        min_len = read_int(data)
+        tag = read_tag(data)
+        meta_level = 0
+        if tag == LITERAL_INT:
+            meta_level = read_int_bare(data)
+            tag = read_tag(data)
+        assert tag == END_TAG
         ret = TypeVarTupleType(
-            read_str(data),
-            read_str(data),
-            TypeVarId(read_int(data), namespace=read_str(data)),
-            read_type(data),
+            name,
+            fullname,
+            TypeVarId(raw_id, meta_level, namespace=namespace),
+            upper_bound,
             fallback,
-            read_type(data),
-            min_len=read_int(data),
+            default,
+            min_len=min_len,
         )
-        assert read_tag(data) == END_TAG
         return ret
 
     def accept(self, visitor: TypeVisitor[T]) -> T:
@@ -1774,7 +1808,8 @@ class ExtraAttrs:
 
     @classmethod
     def read(cls, data: ReadBuffer) -> ExtraAttrs:
-        ret = ExtraAttrs(read_type_map(data), set(read_str_list(data)), read_str_opt(data))
+        attrs = read_type_map(data)
+        ret = ExtraAttrs(attrs, set(read_str_list(data)), read_str_opt(data))
         assert read_tag(data) == END_TAG
         return ret
 
@@ -2498,6 +2533,40 @@ class CallableType(FunctionLike):
             changes["type_guard"] = type_guard
         if type_is is not _dummy:
             changes["type_is"] = type_is
+        # Every changed field must land in `changes`, even fields the native
+        # #475 seam does not serialize (`variables`, `name`, scalars, ...).
+
+        # The seam engages only on one supported change; recording the rest
+        # makes multi-field copies defer to the Python body instead of
+        # silently dropping the extra writes (Unpack-kwargs bug).
+        if name is not _dummy:
+            changes["name"] = name
+        if definition is not _dummy:
+            changes["definition"] = definition
+        if variables is not _dummy:
+            changes["variables"] = variables
+        if line != _dummy_int:
+            changes["line"] = line
+        if column != _dummy_int:
+            changes["column"] = column
+        if is_ellipsis_args is not _dummy:
+            changes["is_ellipsis_args"] = is_ellipsis_args
+        if implicit is not _dummy:
+            changes["implicit"] = implicit
+        if special_sig is not _dummy:
+            changes["special_sig"] = special_sig
+        if from_type_type is not _dummy:
+            changes["from_type_type"] = from_type_type
+        if is_bound is not _dummy:
+            changes["is_bound"] = is_bound
+        if from_concatenate is not _dummy:
+            changes["from_concatenate"] = from_concatenate
+        if imprecise_arg_kinds is not _dummy:
+            changes["imprecise_arg_kinds"] = imprecise_arg_kinds
+        if unpack_kwargs is not _dummy:
+            changes["unpack_kwargs"] = unpack_kwargs
+        if instance_type is not _dummy:
+            changes["instance_type"] = instance_type
         native = _native_copy_modified(self, changes)
         if native is not None:
             return cast(CT, native)
@@ -2969,6 +3038,7 @@ class CallableType(FunctionLike):
         write_str_opt_list(data, self.arg_names)
         _write_type_cached(self.ret_type, data)
         write_str_opt(data, self.name)
+        write_str_opt(data, self.special_sig)
         write_type_list(data, self.variables)
         write_type_opt(data, self.type_guard)
         write_type_opt(data, self.type_is)
@@ -2996,6 +3066,7 @@ class CallableType(FunctionLike):
             read_type(data),
             fallback,
             name=read_str_opt(data),
+            special_sig=read_str_opt(data),
             variables=read_type_var_likes(data),
             is_ellipsis_args=is_ellipsis_args,
             implicit=implicit,
@@ -4565,6 +4636,11 @@ class HasTypeVars(BoolTypeQuery):
 # Rust returns None for TypeAliasType (no alias target on the wire);
 
 # Python falls back to the pure-Python visitor.
+
+# Declared ahead of the import so the ImportError fallback (None) and the
+# late binding at read_type below both typecheck against one Callable type.
+_visitor_read_type: Callable[[Any], Type]
+
 try:
     from librt.internal import ReadBuffer as _ReadBuffer, WriteBuffer as _VisitorWriteBuffer
     from type_kernel import (
@@ -4597,8 +4673,9 @@ try:
         rust_union_length as _rust_union_length,
     )
 
-    from mypy.types import read_type as _visitor_read_type
-
+    # Phase gate #1412: read_type is defined later, so it cannot be bound
+    # here; the kernel flag is still True and _visitor_read_type is bound
+    # after read_type's definition (the except branch nulls it).
     _VISITOR_HAS_TYPE_KERNEL = True
 except ImportError:
     _rust_has_type_vars = None  # type: ignore[assignment]
@@ -4828,6 +4905,14 @@ def _native_callable_is_generic(t: Type) -> bool | None:
 def _native_tuple_length(t: Type) -> int | None:
     if not (_VISITOR_HAS_TYPE_KERNEL and _native_visitor_active):
         return None
+    # Re-entry guard: a length() evaluated from can_be_true during an
+    # in-flight serialization (write) would re-serialize a partially
+    # written cyclic alias graph and blow the stack (recursive-alias tests).
+
+    # Defer to the pure len(items) path, which never re-serializes and
+    # answers identically.
+    if _type_wire_cache_session_depth > 0:
+        return None
     try:
         return _rust_tuple_length(_serialize_type_for_visitor(t))
     except (AssertionError, NotImplementedError):
@@ -4837,15 +4922,54 @@ def _native_tuple_length(t: Type) -> int | None:
 def _native_union_length(t: Type) -> int | None:
     if not (_VISITOR_HAS_TYPE_KERNEL and _native_visitor_active):
         return None
+    # Same serialization re-entry guard as _native_tuple_length.
+    if _type_wire_cache_session_depth > 0:
+        return None
     try:
         return _rust_union_length(_serialize_type_for_visitor(t))
     except (AssertionError, NotImplementedError):
         return None
 
 
-def _deserialize_type_from_visitor(b: bytes) -> Type:
+def _deserialize_type_from_visitor(b: bytes) -> Type | None:
+    """Decode a visitor-seam blob into a live Type, fixed up (#1412).
+
+    Runs `fixup_wire_type` so decoded Instances/TypeAliasTypes are
+    re-linked to their live TypeInfo / TypeAlias nodes. Returns None
+    (defer to the pure-Python caller) when the fixup cannot be performed
+    (no typeinfo map, unresolved type_ref) — an unfixed decode
+    (alias=None / FakeInfo instance) must never reach live state.
+    """
     buf = _ReadBuffer(b)
-    return _visitor_read_type(buf)
+    decoded = _visitor_read_type(buf)
+    from mypy.wirefixup import fixup_wire_type
+
+    fixed = fixup_wire_type(decoded)
+    # Mirrors the expandtype seam hygiene: read_type lazily fills
+    # process-global instance_cache with Instance(NOT_READY, []) singletons
+    # for str/int/bool/etc.; those must not leak into later builds.
+    from mypy.types import instance_cache
+
+    instance_cache.int_type = None
+    instance_cache.str_type = None
+    instance_cache.bool_type = None
+    instance_cache.object_type = None
+    instance_cache.function_type = None
+    return fixed
+
+
+def _deserialize_type_list_from_visitor(bs: list[bytes]) -> list[Type] | None:
+    """All-or-nothing list variant of `_deserialize_type_from_visitor`."""
+    # Rust Vec<Vec<u8>> arrives as list[list[int]] over PyO3, so each row is
+    # widened to bytes here (mirrors the single-blob bytes(result) call in
+    # the copy_modified seam); a plain bytes row passes through unchanged.
+    out: list[Type] = []
+    for b in bs:
+        t = _deserialize_type_from_visitor(bytes(b))
+        if t is None:
+            return None
+        out.append(t)
+    return out
 
 
 def _native_callable_formal_arguments(t: Type) -> list[tuple[str | None, int | None, bool]] | None:
@@ -4890,6 +5014,380 @@ def _native_callable_argument_by_position(
         return None
 
 
+class _WireMetaCollector(TypeQuery[None]):
+    """Live-side snapshot: (raw_id, namespace) -> meta_level (applytype pattern).
+
+    Marks a conflict with -1 when the same id appears at two meta levels.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        # The decoded tree is wire-shaped: TypeAliasType has no target, so
+        # any tvar it references arrives via alias args, never via the
+        # expanded target.
+
+        # Walking live alias targets here would fork fresh alias objects
+        # per level (InstantiateAliasVisitor -> ExpandTypeVisitor ->
+
+        # copy_modified -> _restore_wire_meta) and recurse forever on
+        # recursive aliases; args-only is exact for the wire-shaped decode.
+        self.skip_alias_target = True
+        self.meta: dict[tuple[int, str], int] = {}
+
+    def strategy(self, items: list[None]) -> None:
+        return None
+
+    def _record(self, t: TypeVarLikeType) -> None:
+        k = (t.id.raw_id, t.id.namespace)
+        old = self.meta.get(k)
+        if old is not None and old != t.id.meta_level:
+            self.meta[k] = -1
+        else:
+            self.meta[k] = t.id.meta_level
+
+    def visit_type_var(self, t: TypeVarType, /) -> None:
+        self._record(t)
+        super().visit_type_var(t)
+
+    def visit_param_spec(self, t: ParamSpecType, /) -> None:
+        self._record(t)
+        super().visit_param_spec(t)
+
+    def visit_type_var_tuple(self, t: TypeVarTupleType, /) -> None:
+        self._record(t)
+        super().visit_type_var_tuple(t)
+
+    def visit_callable_type(self, t: CallableType, /) -> None:
+        # Base TypeQuery skips variables, type_guard, type_is and
+        # instance_type, so walk them explicitly.
+        super().visit_callable_type(t)
+        for v in t.variables:
+            v.accept(self)
+        for extra in (t.type_guard, t.type_is, t.instance_type):
+            if extra is not None:
+                extra.accept(self)
+
+
+class _WireMetaFixer(TypeQuery[None]):
+    """Decoded-side: restore meta_level; flag unknown ids or conflicts."""
+
+    def __init__(self, meta: dict[tuple[int, str], int]) -> None:
+        super().__init__()
+        self.meta = meta
+        self.missing = False
+
+    def strategy(self, items: list[None]) -> None:
+        return None
+
+    def _fix(self, t: TypeVarLikeType) -> None:
+        m = self.meta.get((t.id.raw_id, t.id.namespace))
+        if m is None or m == -1:
+            self.missing = True
+            return
+        t.id.meta_level = m
+
+    def visit_type_var(self, t: TypeVarType, /) -> None:
+        self._fix(t)
+        super().visit_type_var(t)
+
+    def visit_param_spec(self, t: ParamSpecType, /) -> None:
+        self._fix(t)
+        super().visit_param_spec(t)
+
+    def visit_type_var_tuple(self, t: TypeVarTupleType, /) -> None:
+        self._fix(t)
+        super().visit_type_var_tuple(t)
+
+    def visit_callable_type(self, t: CallableType, /) -> None:
+        super().visit_callable_type(t)
+        for v in t.variables:
+            v.accept(self)
+        for extra in (t.type_guard, t.type_is, t.instance_type):
+            if extra is not None:
+                extra.accept(self)
+
+
+def _collect_wire_meta_types(t: Type, changes: dict[str, Any]) -> list[Type]:
+    """Gather every live Type reachable from the copy_modified inputs."""
+    types = [t]
+    for v in changes.values():
+        if isinstance(v, Type):
+            types.append(v)
+        elif isinstance(v, list):
+            types.extend(x for x in v if isinstance(x, Type))
+        elif isinstance(v, dict):
+            types.extend(x for x in v.values() if isinstance(x, Type))
+    return types
+
+
+def _restore_wire_meta(fixed: Type, live_types: list[Type]) -> bool:
+    """Patch TypeVarId.meta_level dropped by the wire codec.
+
+    Snapshots meta_level from the live inputs (applytype seam pattern) and
+    rewrites it onto the freshly decoded tree. Returns False when an
+    invariant cannot hold (conflicting meta levels for one id, or an id
+    unknown to the live map); the caller defers to the pure-Python copy.
+    """
+    meta: dict[tuple[int, str], int] = {}
+    for lt in live_types:
+        collector = _WireMetaCollector()
+        lt.accept(collector)
+        for k, v in collector.meta.items():
+            if k in meta and meta[k] != v:
+                return False
+            meta[k] = v
+    fixer = _WireMetaFixer(meta)
+    fixed.accept(fixer)
+    return not fixer.missing
+
+
+class _WireVarCanonCollector(TypeQuery[None]):
+    """Live-side snapshot: key -> the canonical TypeVarLikeType object.
+
+    Key is (raw_id, namespace, meta_level): one canonical object per
+    variable identity/level pair, picked from the live inputs of a native
+    copy_modified. Sets conflict=True when two value-different objects
+    share a key (then identity is not restorable; caller defers).
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        # See _WireMetaCollector: live alias targets must not be expanded
+        # here: the wire-shaped decode references tvars only through alias
+        # args, and expanding targets recurses through native copy_modified
+
+        # on recursive-alias graphs.
+        self.skip_alias_target = True
+        self.canon: dict[tuple[int, str, int], TypeVarLikeType] = {}
+        self.conflict = False
+
+    def strategy(self, items: list[None]) -> None:
+        return None
+
+    def _record(self, t: TypeVarLikeType) -> None:
+        k = (t.id.raw_id, t.id.namespace, t.id.meta_level)
+        old = self.canon.get(k)
+        if old is None:
+            self.canon[k] = t
+        elif old != t:
+            self.conflict = True
+
+    def visit_type_var(self, t: TypeVarType, /) -> None:
+        self._record(t)
+        super().visit_type_var(t)
+
+    def visit_param_spec(self, t: ParamSpecType, /) -> None:
+        self._record(t)
+        super().visit_param_spec(t)
+
+    def visit_type_var_tuple(self, t: TypeVarTupleType, /) -> None:
+        self._record(t)
+        super().visit_type_var_tuple(t)
+
+    def visit_callable_type(self, t: CallableType, /) -> None:
+        super().visit_callable_type(t)
+        for v in t.variables:
+            v.accept(self)
+
+
+class _WireVarCanonizer(TypeTranslator):
+    """Decoded-side rewrite: point every occurrence at the canon object.
+
+    Rebuilds the decoded tree with each TypeVarLikeType occurrence replaced
+    by the live canon object for its (raw_id, namespace, meta_level) key.
+    visit_parameters is overridden with a bare construction because
+    Parameters.copy_modified(arg_types=...) would itself route through the
+    native path and re-decode the leaves we just canonized.
+    """
+
+    def __init__(self, canon: dict[tuple[int, str, int], TypeVarLikeType]) -> None:
+        super().__init__()
+        self.canon = canon
+
+    def _canon(self, t: TypeVarLikeType) -> TypeVarLikeType:
+        r = self.canon.get((t.id.raw_id, t.id.namespace, t.id.meta_level))
+        if r is None or r is t:
+            return t
+        return r
+
+    def visit_type_var(self, t: TypeVarType, /) -> Type:
+        return self._canon(t)
+
+    def visit_param_spec(self, t: ParamSpecType, /) -> Type:
+        return self._canon(t)
+
+    def visit_type_var_tuple(self, t: TypeVarTupleType, /) -> Type:
+        return self._canon(t)
+
+    def visit_type_alias_type(self, t: TypeAliasType, /) -> Type:
+        # The decoded tree is wire-shaped: an alias's target lives in the
+        # TypeAlias node (not a Type), so only the alias ARGS can embed var
+        # leaves; translate them and keep the alias object otherwise.
+        return t.copy_modified(args=self.translate_type_list(t.args))
+
+    def translate_variables(
+        self, variables: Sequence[TypeVarLikeType]
+    ) -> Sequence[TypeVarLikeType]:
+        return [self._canon(t) for t in variables]
+
+    def visit_parameters(self, t: Parameters, /) -> Type:
+        # visit_parameters keeps its arg_kinds/arg_names object identity;
+        # only the arg_types (which may embed var leaves from the wire) are
+        # translated, mirroring the bare-native-avoiding Python copy path.
+        return Parameters(
+            arg_types=self.translate_type_list(t.arg_types),
+            arg_kinds=t.arg_kinds,
+            arg_names=t.arg_names,
+            is_ellipsis_args=t.is_ellipsis_args,
+            variables=list(self.translate_variables(t.variables)),
+            imprecise_arg_kinds=t.imprecise_arg_kinds,
+            line=t.line,
+            column=t.column,
+        )
+
+
+def _restore_wire_var_identity(fixed: Type, live_types: list[Type]) -> Type | None:
+    """Restore occurrence identity lost by the wire round-trip (#475).
+
+    The native copy_modified decodes one fresh object per var occurrence,
+    but Python copies share one object per (identity, meta_level) across a
+    whole tree; seams like apply_poly + freeze_all_type_vars mutate through
+    the `variables` list and rely on that sharing. This rebuilds the
+    decoded tree so each decoded leaf points at the value-equal live
+    object. Returns None on canon conflicts so the caller defers to the
+    (identity-complete) pure-Python copy.
+    """
+    collector = _WireVarCanonCollector()
+    for lt in live_types:
+        lt.accept(collector)
+    if collector.conflict:
+        return None
+    if not collector.canon:
+        return fixed
+    return fixed.accept(_WireVarCanonizer(collector.canon))
+
+
+def _restore_wire_lines(fixed: Any, live: Any, changed: tuple[str, Any] | None = None) -> None:
+    """Sync line/column of a wire-decoded copy_modified result back to live positions.
+
+    The wire codec has no line/column fields, so every decoded node lands
+    at -1. A single-field copy_modified is a structural mirror of the live
+    inputs (the changed field's subtree mirrors the replacement value
+    instead), so pairing the two trees positionally recovers every lost
+    position. A kind mismatch stops the walk: that shape keeps its decoded
+    -1 positions and the failure mode is identical to pre-fix behavior.
+
+    Args are Any because callers feed mixed containers (lists/dicts from
+    copy_modified mirrors) as well as Types; the container handling lives
+    here and the typed core is dispatched from `_restore_wire_type_lines`.
+    """
+    if isinstance(fixed, (list, tuple)) and isinstance(live, (list, tuple)):
+        for f, l in zip(fixed, live):
+            _restore_wire_lines(f, l, changed)
+        return
+    if isinstance(fixed, dict) and isinstance(live, dict):
+        for k, f_val in fixed.items():
+            if k in live:
+                _restore_wire_lines(f_val, live[k], changed)
+        return
+    if not isinstance(fixed, Type) or not isinstance(live, Type):
+        return
+    _restore_wire_type_lines(fixed, live, changed)
+
+
+# (field, mode) spec table for `_restore_wire_type_lines` below. It replaces
+# the earlier per-class branch chain: the self-check config's proper-plugin
+# defeats `type(x) is C` refinement on this file's shape (the chain lost
+
+# narrowing no matter the surrounding body), while every value from
+# `getattr` reads as Any and needs no refinement at all. mode "opt" mirrors
+# the both-not-None guards (skip when either side is None); values inside
+
+# tuple-typed fields still walk via `_restore_wire_lines`' container layer.
+# Field order per class matches the dispatch order of the chain it
+# replaces; scalar mirrors live in the walker epilogues, keyed the same way.
+_WIRE_LINE_FIELDS: Final[dict[type[Any], list[tuple[str, str]]]] = {
+    Instance: [("args", "req"), ("last_known_value", "opt")],
+    CallableType: [
+        ("arg_types", "req"),
+        ("ret_type", "req"),
+        ("fallback", "req"),
+        ("variables", "req"),
+        ("type_guard", "opt"),
+        ("type_is", "opt"),
+        ("instance_type", "opt"),
+    ],
+    UnionType: [("items", "req")],
+    TupleType: [("items", "req"), ("partial_fallback", "req")],
+    TypedDictType: [("items", "req"), ("fallback", "req")],
+    TypeType: [("item", "req")],
+    TypeAliasType: [("args", "req")],
+    UnboundType: [("args", "req")],
+    UnpackType: [("type", "req")],
+    LiteralType: [("fallback", "req")],
+    Overloaded: [("items", "req")],
+    TypeVarType: [("upper_bound", "req"), ("default", "req"), ("values", "req")],
+    TypeVarTupleType: [("upper_bound", "req"), ("default", "req"), ("tuple_fallback", "req")],
+    ParamSpecType: [("upper_bound", "req"), ("default", "req"), ("prefix", "req")],
+    Parameters: [("arg_types", "req"), ("variables", "req")],
+}
+
+
+def _restore_wire_type_lines(
+    fixed: Type, live: Type, changed: tuple[str, Any] | None = None
+) -> None:
+    """Typed core of `_restore_wire_lines`.
+
+    Identity dispatch `type(x) is` is used where it remains only because
+    none of these classes have runtime subclasses (and the proper-plugin
+    flags isinstance against Type-derived classes); its result is never
+    relied upon for attribute narrowing.
+
+    The changed-field subtree mirrors the replacement value instead of
+    the live field, matching the positional mirror property of a
+    single-field copy_modified.
+    """
+    cls = type(fixed)
+    if cls is not type(live):
+        return
+    fixed.line = live.line
+    fixed.column = live.column
+    if cls is CallableType:
+        # Python copy_modified preserves `name`/`definition` from `self`
+        # unless that exact field is the change input; the codec drops
+        # both, so mirror them the same way as line/column.
+        if changed is None or changed[0] != "name":
+            fixed.name = live.name
+        if changed is None or changed[0] != "definition":
+            fixed.definition = live.definition
+    spec = _WIRE_LINE_FIELDS.get(cls)
+    if spec is None:
+        return
+    for field, mode in spec:
+        fval = getattr(fixed, field)
+        lval = getattr(live, field)
+        if mode == "opt" and (fval is None or lval is None):
+            continue
+        _restore_wire_lines(
+            fval, changed[1] if changed is not None and changed[0] == field else lval, None
+        )
+    if cls is Instance:
+        # Plugin- or module-synthesized attr types (e.g. the
+        # functools.partial `__mypy_partial` callable) are nested in the
+        # wire blob of any outer copy; mirror them by attr key so their
+
+        # name/definition/line parity survives the decode like the rest
+        # of the tree. Attr keys are not copy_modified field names, so no
+        # changed-field redirection applies.
+        f_attrs = fixed.extra_attrs
+        l_attrs = live.extra_attrs
+        if f_attrs is not None and l_attrs is not None:
+            for k, fattr in f_attrs.attrs.items():
+                lattr = l_attrs.attrs.get(k)
+                if lattr is not None and fattr is not None:
+                    _restore_wire_lines(fattr, lattr, None)
+
+
 def _native_copy_modified(t: Type, changes: dict[str, Any]) -> Type | None:
     """Native fast path for `Type.copy_modified(**changes)` (#475).
 
@@ -4907,6 +5405,34 @@ def _native_copy_modified(t: Type, changes: dict[str, Any]) -> Type | None:
         ((field, value),) = changes.items()
     except ValueError:
         return None
+    # Recursive-alias deferral: the fresh decode forks a new object per
+    # occurrence, so TypeQuery walks over the live inputs cannot keep the
+    # seen_aliases identity the alias-expansion guard relies on;
+
+    # the walk then expands a recursive alias-default chain forever. Defer
+    # any copy that touches a recursive alias to the pure-Python body.
+    #
+
+    # The may-be-recursive walk reads TypeAliasType.is_recursive, whose
+    # lazy evaluation caches `_is_recursive` on the underlying TypeAlias
+    # node. Holding that cache while a forward-referenced alias's target
+
+    # is not self-containing yet (e.g. mutually recursive NamedTuples
+    # during semanal) would freeze a bogus False; pure-Python
+    # copy_modified never evaluates the flag at all.
+
+    # Suppress the cache here so each later real evaluation sees the
+    # settled truth.
+    global _REC_CACHE_SUPPRESSED
+    prev_suppressed = _REC_CACHE_SUPPRESSED
+    _REC_CACHE_SUPPRESSED = True
+    try:
+        if has_recursive_types(t) or (isinstance(value, Type) and has_recursive_types(value)):
+            return None
+    except (AssertionError, NotImplementedError):
+        pass
+    finally:
+        _REC_CACHE_SUPPRESSED = prev_suppressed
     # The in-flight guard stops recursion: `_serialize_type_for_visitor`
     # calls Type.write, and UnionType.write reads can_be_true / can_be_false
     # which route through the native default → re-serialize → infinite loop.
@@ -4923,12 +5449,45 @@ def _native_copy_modified(t: Type, changes: dict[str, Any]) -> Type | None:
         _native_truthiness_in_flight = False
     if result is None:
         return None
-    decoded = _deserialize_type_from_visitor(bytes(result))
-    from mypy.wirefixup import fixup_wire_type
-
-    fixed = fixup_wire_type(decoded)
+    try:
+        fixed = _deserialize_type_from_visitor(bytes(result))
+    except (AssertionError, NotImplementedError, ValueError, TypeError):
+        # Tag-122 (ErasedType) cannot round-trip through Python's read_type
+        # by design (#1412 invariant; see has_erased_component): defer.
+        return None
     if fixed is None:
         return None
+    # The wire codec drops TypeVarId.meta_level (freshened metavariables);
+    # restore it from the live inputs or defer. Then restore occurrence
+    # identity (the decode forks one object per occurrence; Python copies
+
+    # share one), or defer when canon conflicts make that impossible.
+    live_types = _collect_wire_meta_types(t, changes)
+    if not _restore_wire_meta(fixed, live_types):
+        return None
+    fixed = _restore_wire_var_identity(fixed, live_types)
+    if fixed is None:
+        return None
+    # The codec also drops line/column on every decoded node; the result is
+    # a positional mirror of the live inputs (the changed field mirrors the
+    # replacement value), so recover the lost positions in one walk.
+    _restore_wire_lines(fixed, t, (field, value))
+    # CallableType copies that were never a change input (they fail
+    # _serialize_copy_modified_value above) live only on the live type:
+
+    # special_sig (the check_argument_count paramspec arm reads "partial") and
+    # the error-context trio that the codec does not serialize. Restore them.
+
+    # Identity checks, not isinstance: parity with Python copy_modified
+    # requires the fixup NOT to fire through a type alias unwrapping to a
+    # callable, and CallableType/Instance have no runtime subclasses.
+    if type(t) is CallableType and type(fixed) is CallableType:
+        ct = t
+        cf = fixed
+        cf.special_sig = ct.special_sig
+        cf.definition = ct.definition
+        cf.line = ct.line
+        cf.column = ct.column
     return fixed
 
 
@@ -4999,10 +5558,6 @@ def _serialize_type_list_for_visitor(types: Iterable[Type]) -> list[bytes]:
     return [_serialize_type_for_visitor(t) for t in types]
 
 
-def _deserialize_type_list_from_visitor(bs: list[bytes]) -> list[Type]:
-    return [_deserialize_type_from_visitor(b) for b in bs]
-
-
 def _encode_literal_value(value: LiteralValue) -> tuple[str, str]:
     """Encode a Python literal value for rust_is_literal_type."""
     if isinstance(value, bool):
@@ -5061,20 +5616,194 @@ def has_recursive_types(typ: Type) -> bool:
     return typ.accept(_has_recursive_type)
 
 
+def _wire_split_source_rows(
+    types: tuple[Type, ...], prefix: int, suffix: int
+) -> tuple[list[int], Type | None]:
+    """Map each output row of `split_with_prefix_and_suffix` back to its source.
+
+    Row value is an index into `types`, or -1 for an unpack-item repeat row
+    (Python repeats the one live `item` object, sharing identity). Mirrors
+    `extend_args_for_prefix_and_suffix` + the slicing tail.
+    """
+    idx: int | None = None
+    item: Type | None = None
+    if len(types) <= prefix + suffix:
+        for i, t in enumerate(types):
+            if isinstance(t, UnpackType):
+                p_type = get_proper_type(t.type)
+                if isinstance(p_type, Instance) and p_type.type.fullname == "builtins.tuple":
+                    item = p_type.args[0]
+                    idx = i
+                    break
+    if idx is None:
+        return list(range(len(types))), None
+    rows: list[int] = list(range(idx))
+    if idx < prefix:
+        rows.extend([-1] * (prefix - idx))
+    rows.append(idx)
+    if len(types) - idx - 1 < suffix:
+        rows.extend([-1] * (suffix - len(types) + idx + 1))
+    rows.extend(range(idx + 1, len(types)))
+    return rows, item
+
+
+def _restore_wire_split_identity(
+    types: tuple[Type, ...], prefix: int, suffix: int, rows: list[Type]
+) -> tuple[tuple[Type, ...], tuple[Type, ...], tuple[Type, ...]] | None:
+    """Rebuild the split result from live input objects.
+
+    The wire decode forks one fresh object per row with line/column
+    dropped to -1; Python's split shares identity and positions with the
+    input (an unpack item repeats the same object). The native result is
+    therefore re-pointed at the live row sources; None defers to Python.
+    """
+    if not rows:
+        return ((), (), ())
+    src_rows, item = _wire_split_source_rows(types, prefix, suffix)
+    if len(src_rows) != len(rows):
+        return None
+    final: list[Type] = []
+    for src, t in zip(src_rows, rows):
+        if src >= 0:
+            final.append(types[src])
+        else:
+            assert item is not None
+            final.append(item)
+    if suffix:
+        return (
+            tuple(final[:prefix]),
+            tuple(final[prefix : len(final) - suffix]),
+            tuple(final[-suffix:]),
+        )
+    return (tuple(final[:prefix]), tuple(final[prefix:]), ())
+
+
+def _restore_list_identity(
+    types: Sequence[Type], type_bytes_list: list[bytes], decoded: list[Type]
+) -> list[Type] | None:
+    """Re-point a decoded list seam result at the live input rows.
+
+    The wire decode forks one fresh object per row with line/column
+    dropped to -1; Python's list seams (flatten, dedup, ...) share identity
+    and positions with the input when the operation is a no-op for that
+    row. Map each decoded row back to its live source by re-serializing it
+    and matching the canonical input bytes (first occurrence, order
+    preserved); None defers to the decoded fork (rows that genuinely
+    changed, e.g. an actual flattening, keep wire values but lose
+    positions only where the live row was not structurally the same).
+    """
+    src: list[Type | None] = []
+    for row in decoded:
+        row_bytes = _serialize_type_list_for_visitor([row])
+        src.append(None)
+        if row_bytes:
+            key = row_bytes[0]
+            for i, b in enumerate(type_bytes_list):
+                if b == key:
+                    src[-1] = types[i]
+                    type_bytes_list[i] = b""  # consume first occurrence
+                    break
+    if any(s is None for s in src):
+        return None
+    return cast("list[Type]", src)
+
+
+def _restore_flat_row_flags(
+    types: Sequence[Type], input_bytes: list[bytes], decoded: list[Type]
+) -> None:
+    """Copy identity-bearing scalars from live input rows onto decoded rows.
+
+    List seams keep pass-through rows structurally identical to the input,
+    but the wire decode forks them with line/column and the truthiness
+    flags reset. For each decoded row whose canonical bytes match a live
+    input row, mirror line/column and can_be_true/can_be_false; genuinely
+    new rows (flattening products) keep the decoded defaults. Unlike
+    _restore_list_identity this is per-row, so it also applies when the
+    operation added rows that exist in no live source.
+    """
+    for row in decoded:
+        row_bytes = _serialize_type_list_for_visitor([row])
+        if not row_bytes:
+            continue
+        key = row_bytes[0]
+        for i, b in enumerate(input_bytes):
+            if b == key:
+                src = types[i]
+                row.line = src.line
+                row.column = src.column
+                row.can_be_true = src.can_be_true
+                row.can_be_false = src.can_be_false
+                break
+
+
+def _restore_dedup_identity(
+    types: Sequence[Type], type_bytes_list: list[bytes], decoded: list[Type]
+) -> list[Type] | None:
+    """Map a remove_dups result back to live first-occurrence rows."""
+    src: list[Type] = []
+    available = list(type_bytes_list)
+    for row in decoded:
+        row_bytes = _serialize_type_list_for_visitor([row])
+        if not row_bytes:
+            return None
+        key = row_bytes[0]
+        live = None
+        for i, b in enumerate(available):
+            if b == key:
+                live = types[i]
+                available[i] = b""
+                break
+        if live is None:
+            return None
+        src.append(live)
+    return src
+
+
+def _restore_tvars_as_args_identity(
+    type_vars: Sequence[TypeVarLikeType], type_bytes_list: list[bytes], args: list[Type]
+) -> tuple[Type, ...] | None:
+    """Rebuild type_vars_as_args result from the live type variables.
+
+    Python wraps each TypeVarTupleType in a fresh UnpackType (line -1 by
+    construction, so the wire fork matches there) and passes every other
+    tv through with shared identity; re-point each decoded row at the live
+    tv when the inner object's canonical bytes agree with the input bytes.
+    """
+    if len(args) != len(type_vars):
+        return None
+    final: list[Type] = []
+    for i, (tv, row) in enumerate(zip(type_vars, args)):
+        body = row
+        if isinstance(tv, TypeVarTupleType):
+            if not (isinstance(row, UnpackType) and isinstance(row.type, TypeVarTupleType)):
+                return None
+            body = row.type
+        if not isinstance(body, TypeVarLikeType):
+            return None
+        inner_bytes = _serialize_type_list_for_visitor([body])
+        if not inner_bytes or inner_bytes[0] != type_bytes_list[i]:
+            return None
+        final.append(UnpackType(tv) if isinstance(tv, TypeVarTupleType) else tv)
+    return tuple(final)
+
+
 def split_with_prefix_and_suffix(
     types: tuple[Type, ...], prefix: int, suffix: int
 ) -> tuple[tuple[Type, ...], tuple[Type, ...], tuple[Type, ...]]:
     if _VISITOR_HAS_TYPE_KERNEL and _native_visitor_types_active:
         try:
             type_bytes_list = _serialize_type_list_for_visitor(types)
-            head_b, mid_b, tail_b = _rust_split_with_prefix_and_suffix(
-                type_bytes_list, prefix, suffix
-            )
-            return (
-                tuple(_deserialize_type_list_from_visitor(head_b)),
-                tuple(_deserialize_type_list_from_visitor(mid_b)),
-                tuple(_deserialize_type_list_from_visitor(tail_b)),
-            )
+            raw = _rust_split_with_prefix_and_suffix(type_bytes_list, prefix, suffix)
+            if raw is not None:
+                head = _deserialize_type_list_from_visitor(raw[0])
+                mid = _deserialize_type_list_from_visitor(raw[1])
+                tail = _deserialize_type_list_from_visitor(raw[2])
+                if head is not None and mid is not None and tail is not None:
+                    restored = _restore_wire_split_identity(
+                        types, prefix, suffix, head + mid + tail
+                    )
+                    if restored is not None:
+                        return restored
         except (AssertionError, NotImplementedError):
             pass
     if len(types) <= prefix + suffix:
@@ -5124,7 +5853,20 @@ def flatten_nested_unions(
                 type_bytes_list, handle_type_alias_type, handle_recursive
             )
             if result is not None:
-                return _deserialize_type_list_from_visitor(result)
+                flat = _deserialize_type_list_from_visitor(result)
+                if flat is not None:
+                    # Copy before _restore_list_identity consumes entries.
+                    input_bytes = list(type_bytes_list)
+                    restored = _restore_list_identity(types, type_bytes_list, flat)
+                    if restored is not None:
+                        return restored
+                    # Flattening may add rows with no live source, in which
+                    # case identity restore is all-or-nothing; fall back to
+
+                    # a per-row flag mirror so pass-through rows keep their
+                    # truthiness and positions.
+                    _restore_flat_row_flags(types, input_bytes, flat)
+                    return flat
         except (AssertionError, NotImplementedError):
             pass
     if not isinstance(types, list):
@@ -5164,7 +5906,8 @@ def find_unpack_in_list(items: Sequence[Type]) -> int | None:
         try:
             type_bytes_list = _serialize_type_list_for_visitor(items)
             idx = _rust_find_unpack_in_list(type_bytes_list)
-            return idx if idx >= 0 else None
+            if idx is not None:
+                return idx if idx >= 0 else None
         except (AssertionError, NotImplementedError):
             pass
     unpack_index: int | None = None
@@ -5194,7 +5937,12 @@ def flatten_nested_tuples(types: Iterable[Type], handle_recursive: bool = True) 
             type_bytes_list = _serialize_type_list_for_visitor(types)
             result = _rust_flatten_nested_tuples(type_bytes_list, handle_recursive)
             if result is not None:
-                return _deserialize_type_list_from_visitor(result)
+                flat = _deserialize_type_list_from_visitor(result)
+                if flat is not None:
+                    restored = _restore_list_identity(list(types), type_bytes_list, flat)
+                    if restored is not None:
+                        return restored
+                    return flat
         except (AssertionError, NotImplementedError):
             pass
     for typ in types:
@@ -5280,7 +6028,9 @@ def callable_with_ellipsis(any_type: AnyType, ret_type: Type, fallback: Instance
             fb_bytes = _serialize_type_for_visitor(fallback)
             result = _rust_callable_with_ellipsis(any_bytes, ret_bytes, fb_bytes)
             if result is not None:
-                return _deserialize_type_from_visitor(bytes(result))  # type: ignore[return-value]
+                fixed = _deserialize_type_from_visitor(bytes(result))
+                if fixed is not None:
+                    return fixed  # type: ignore[return-value]
         except (AssertionError, NotImplementedError):
             pass
     return CallableType(
@@ -5294,11 +6044,25 @@ def callable_with_ellipsis(any_type: AnyType, ret_type: Type, fallback: Instance
 
 
 def remove_dups(types: list[T]) -> list[T]:
-    if _VISITOR_HAS_TYPE_KERNEL and _native_visitor_types_active and len(types) > 1:
+    # The native path serializes each element as a Type, but remove_dups is
+    # generic (e.g. semanal passes (TypeVarLikeType, ...) tuples); only take
+    # it when every element is a real Type instance (#1412 sweep).
+    if (
+        _VISITOR_HAS_TYPE_KERNEL
+        and _native_visitor_types_active
+        and len(types) > 1
+        and all(isinstance(t, Type) for t in types)
+    ):
         try:
             type_bytes_list = _serialize_type_list_for_visitor(types)  # type: ignore[arg-type]
             result = _rust_remove_dups(type_bytes_list)
-            return _deserialize_type_list_from_visitor(result)  # type: ignore[return-value]
+            if result is not None:
+                deduped = _deserialize_type_list_from_visitor(result)
+                if deduped is not None:
+                    live = _restore_dedup_identity(types, type_bytes_list, deduped)  # type: ignore[arg-type]
+                    if live is not None:
+                        return live  # type: ignore[return-value]
+                    return deduped  # type: ignore[return-value]
         except (AssertionError, NotImplementedError):
             pass
     if len(types) <= 1:
@@ -5319,7 +6083,15 @@ def type_vars_as_args(type_vars: Sequence[TypeVarLikeType]) -> tuple[Type, ...]:
         try:
             type_bytes_list = _serialize_type_list_for_visitor(type_vars)
             result = _rust_type_vars_as_args(type_bytes_list)
-            return tuple(_deserialize_type_list_from_visitor(result))
+            if result is not None:
+                wire_args = _deserialize_type_list_from_visitor(result)
+                if wire_args is not None:
+                    live_args = _restore_tvars_as_args_identity(
+                        type_vars, type_bytes_list, wire_args
+                    )
+                    if live_args is not None:
+                        return live_args
+                    return tuple(wire_args)
         except (AssertionError, NotImplementedError):
             pass
     args: list[Type] = []
@@ -5422,6 +6194,16 @@ def read_type(data: ReadBuffer, tag: Tag | None = None) -> Type:
     if tag == DELETED_TYPE:
         return DeletedType.read(data)
     assert False, f"Unknown type tag {tag}"
+
+
+# The visitor-kernel try-block above cannot import read_type from this
+# partially-initialized module (#1412): bind the decoder now that read_type
+# exists, so the visitor seams get a working wire reader when the kernel is
+
+# present. On a missing kernel the except branch left it as None and the
+# flag off, so this stays inert.
+if _VISITOR_HAS_TYPE_KERNEL:
+    _visitor_read_type = read_type
 
 
 def read_function_like(data: ReadBuffer, tag: Tag) -> FunctionLike:
