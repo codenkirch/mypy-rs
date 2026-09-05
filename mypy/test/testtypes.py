@@ -24843,14 +24843,9 @@ class NativeConstraintsPolyGateSuite(Suite):
     """Parity suite for the skip_neg_op / infer_polymorphic gate (issue #1226).
 
     The cb-actual-generic defer fired whenever the actual callable was
-    generic, but the sole skip_neg_op=True callers live inside the
-    polymorphic extra-tvars block itself (constraints.py:1780/1821), where
-    Python skips that block too (`not self.skip_neg_op`). So a generic
-    actual with skip_neg_op=True now proceeds natively: the emitted
-    param-spec target mirrors the infer_polymorphic ternary at
-    constraints.py:1845. Direct seam calls assert engagement/deferral;
-    gate-off vs gate-on differentials through `infer_constraints` assert
-    parity.
+    generic; since #1427 the generic helpers are pinned by body and the
+    deferral set is ambient-mode dependent (Known(false) engages
+    extras-free, Known(true) defers at the FFI boundary).
     """
 
     def setUp(self) -> None:
@@ -24886,6 +24881,16 @@ class NativeConstraintsPolyGateSuite(Suite):
 
         old = type_state.infer_polymorphic
         type_state.infer_polymorphic = True
+        self.addCleanup(setattr, type_state, "infer_polymorphic", old)
+
+    def _polymorphic_off(self) -> None:
+        # Mirror of _polymorphic_on: pin ambient False (test / old-inference
+        # mode) so a test cannot observe leaked ambient state from a worker
+        # because infer_polymorphic is never restored by its producers.
+        from mypy.typestate import type_state
+
+        old = type_state.infer_polymorphic
+        type_state.infer_polymorphic = False
         self.addCleanup(setattr, type_state, "infer_polymorphic", old)
 
     def _generic_callable(self, name: str, var: TypeVarType) -> CallableType:
@@ -24955,15 +24960,32 @@ class NativeConstraintsPolyGateSuite(Suite):
         raw = self._rust(template, actual, SUBTYPE_OF, skip_neg_op=True)
         assert raw is not None, "skip_neg_op=True must run the generic actual natively"
 
-    def test_skip_false_generic_actual_defers(self) -> None:
+    def test_skip_false_generic_actual_mode_dependent(self) -> None:
         t1 = self.fx.t
         u1 = self.fx.s
         template = self._generic_callable("f", t1)
         actual = self._generic_callable("g", u1)
-        # Gate-on run defers and falls back to Python, so parity holds.
+        # Gate-on run matches the Python body in both ambient modes,
+        # since the extras channel (#1427) carries the reverse frame.
         self._assert_par(template, actual, SUBTYPE_OF, skip_neg_op=False)
-        raw = self._rust(template, actual, SUBTYPE_OF, skip_neg_op=False)
-        assert raw is None, "skip_neg_op=False with a generic actual must defer"
+        # Ambient is flipped mid-test, so save and restore the entry value.
+        from mypy.typestate import type_state
+
+        old = type_state.infer_polymorphic
+        try:
+            # Ambient off: the kernel installs Known(false), the reverse
+            # frame stays off, and the pair decides extras-free.
+            type_state.infer_polymorphic = False
+            raw_off = self._rust(template, actual, SUBTYPE_OF, skip_neg_op=False)
+            # Ambient on: the reverse frame attaches the actual's own
+            # variables as extras; the 3-field wire cannot express them, so
+            # defer.
+            type_state.infer_polymorphic = True
+            raw_on = self._rust(template, actual, SUBTYPE_OF, skip_neg_op=False)
+        finally:
+            type_state.infer_polymorphic = old
+        assert raw_off is not None, "Known(false) ambient keeps the call engaged"
+        assert raw_on is None, "Known(true) extras-carrying output must defer"
 
     # --- param-spec target mirrors the infer_polymorphic ternary ---
 
@@ -24985,7 +25007,10 @@ class NativeConstraintsPolyGateSuite(Suite):
 
     def test_param_spec_target_keeps_variables_without_polymorphic(self) -> None:
         # With infer_polymorphic=False (old inference or tests), the target
-        # keeps cactual.variables: parity must hold in that mode too.
+        # keeps cactual.variables: parity must hold in that mode too. Pin
+        # ambient False so the differential runs the intended mode even on
+        # a worker whose ambient state was leaked True by an earlier suite.
+        self._polymorphic_off()
         p = ParamSpecType(
             "P",
             "P",

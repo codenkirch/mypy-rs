@@ -615,7 +615,6 @@ fn add_secondary_constraints(
         &no_aliases,
         strict_optional,
         false,
-        false,
         // Python `infer_constraints` wrapper default (constraints.py:802).
         true,
     )
@@ -632,7 +631,6 @@ fn add_secondary_constraints(
         resolver,
         &no_aliases,
         strict_optional,
-        false,
         false,
         // Python `infer_constraints` wrapper default (constraints.py:802).
         true,
@@ -1194,9 +1192,16 @@ pub(crate) enum DependentSolve {
 
 /// `solve_with_dependent` (solve.py:234-292), Rust subset.
 ///
+/// `originals` mirrors Python's `originals` dict (solve.py:248-251): the
+/// free-variable pass looks up each free var's original type there, which
+/// lets the polymorphic caller solve over `vars + extra_vars` while
+/// returning the untouched live originals (solve.py:262-265). Callers
+/// without extras pass the same slice for both.
+///
 /// `Err(())` = defer to Python.
 fn solve_with_dependent_core(
     vars: &[Type],
+    originals: &[Type],
     constraints: &[Constraint],
     infer_unions: bool,
     strict_optional: bool,
@@ -1235,7 +1240,7 @@ fn solve_with_dependent_core(
             if all_empty {
                 match choose_free_single(scc) {
                     Some(id) => {
-                        let orig = vars
+                        let orig = originals
                             .iter()
                             .find(|t| tv_id(t) == Some(id.clone()))
                             .cloned()
@@ -1298,7 +1303,14 @@ fn solve_with_dependent_native(
     strict_optional: bool,
     resolver: &crate::typeinfo::TypeResolver,
 ) -> Result<NativeDependentOut, ()> {
-    match solve_with_dependent_core(vars, constraints, infer_unions, strict_optional, resolver)? {
+    match solve_with_dependent_core(
+        vars,
+        vars,
+        constraints,
+        infer_unions,
+        strict_optional,
+        resolver,
+    )? {
         DependentSolve::EmptySolutions => Ok(Some((None, None))),
         DependentSolve::Solved {
             solutions,
@@ -1631,14 +1643,15 @@ pub(crate) fn pre_validate_solutions_inner(
 
 /// `solve_constraints` polymorphic branch (solve.py:241-262 + 277-289)
 /// with `allow_polymorphic=True`, used by the `unify_generic_callable`
-/// port. Python's extra-tvar collection is not ported: the kernel
-/// `Constraint` carries no `extra_tvars`, so `unify_generic_callable_core`
-/// gates on the attach shapes instead (constraints.py:1712, 1768 via
-/// `no_extra_tvar_shape`) and defers them to Python before reaching
-/// this entry, keeping parity rather than making extras impossible.
-/// `strict=True` / `skip_unsatisfied=False` match the unify call site
-/// (subtypes.py). Returns `Err(())` = defer to Python; the returned
-/// list may contain `None` (unsolved var, unify must fail).
+/// port. Extras are collected over the INPUT constraints before the
+/// `skip_reverse_union_constraints` filter reassigns them (solve.py:245-
+/// 251): first-wins by tv id, encounter order kept for the solve targets,
+/// and the untouched originals ride `originals` through the dependent
+/// solve (solve.py:253-261). Unify passes strict=True /
+/// skip_unsatisfied=False; `res` and pre-validation stay over
+/// `original_vars` (solve.py:323, 340). Returns `Err(())` = defer to
+/// Python; the returned list may contain `None` (unsolved var, unify
+/// must fail).
 pub(crate) fn solve_constraints_poly_native(
     original_vars: &[Type],
     constraints: &[Constraint],
@@ -1650,6 +1663,22 @@ pub(crate) fn solve_constraints_poly_native(
     if original_vars.is_empty() {
         return Ok(Vec::new());
     }
+    // Extra-tvar collection over the INPUT constraints (solve.py:245-251),
+    // ahead of the reverse-union filter.
+    let left_ids: HashSet<TvId> = original_vars.iter().filter_map(tv_id).collect();
+    let mut extra_types: Vec<Type> = Vec::new();
+    let mut extra_ids: HashSet<TvId> = HashSet::new();
+    for c in constraints {
+        for v in &c.extra_tvars {
+            if let Some(id) = tv_id(v) {
+                if !left_ids.contains(&id) && extra_ids.insert(id.clone()) {
+                    extra_types.push(v.clone());
+                }
+            }
+        }
+    }
+    let mut all_vars: Vec<Type> = original_vars.to_vec();
+    all_vars.extend(extra_types);
     // Python reassigns `constraints` before both the solve and the
     // pre-validation (solve.py:242-244, 288).
     let filtered = crate::constraints_filter::skip_reverse_union_kernel(constraints).ok_or(())?;
@@ -1658,8 +1687,14 @@ pub(crate) fn solve_constraints_poly_native(
     // consumes `filtered` directly (Python's cmap is shared with the
     // non-polymorphic branch, which this poly-only port does not implement).
     let (solutions, free_vars): (Vec<(TvId, Option<Type>)>, Vec<TvId>) = if !filtered.is_empty() {
-        match solve_with_dependent_core(original_vars, &filtered, infer_unions, strict_optional, r)?
-        {
+        match solve_with_dependent_core(
+            &all_vars,
+            &all_vars,
+            &filtered,
+            infer_unions,
+            strict_optional,
+            r,
+        )? {
             DependentSolve::EmptySolutions => (Vec::new(), Vec::new()),
             DependentSolve::Solved {
                 solutions,
@@ -1731,7 +1766,6 @@ pub(crate) fn infer_type_arguments_inner(
         resolver.resolver(),
         resolver.alias_resolver(),
         strict_optional,
-        false,
         false,
         erase_types,
     )?;
@@ -1949,7 +1983,6 @@ pub(crate) fn rust_infer_function_type_arguments(
                 resolver.resolver(),
                 resolver.alias_resolver(),
                 strict_optional,
-                false,
                 false,
                 // Python `infer_constraints` wrapper default (constraints.py:802).
                 true,
@@ -2455,6 +2488,7 @@ mod tests {
             origin_type_var: origin,
             op,
             target,
+            extra_tvars: Vec::new(),
         };
         let mut cb = crate::wire::WriteBuffer::new();
         c.write(&mut cb).unwrap();
@@ -2537,6 +2571,7 @@ mod tests {
                 origin_type_var: p.clone(),
                 op: 0,
                 target: p.clone(),
+                extra_tvars: Vec::new(),
             };
             find_linear(&c)
         };
@@ -2566,6 +2601,7 @@ mod tests {
             origin_type_var: p.clone(),
             op: 0,
             target: prefixed,
+            extra_tvars: Vec::new(),
         };
         let (lin, id) = find_linear(&prefixed_c);
         assert!(!lin);
@@ -2598,6 +2634,7 @@ mod tests {
             origin_type_var: tvv.clone(),
             op: 0,
             target: target.clone(),
+            extra_tvars: Vec::new(),
         };
         let (lin, id) = find_linear(&c);
         assert!(lin);
@@ -2619,6 +2656,7 @@ mod tests {
             origin_type_var: tvv,
             op: 0,
             target: two_items,
+            extra_tvars: Vec::new(),
         };
         let (lin, id) = find_linear(&c);
         assert!(!lin);
@@ -3052,6 +3090,7 @@ mod tests {
             origin_type_var: tv_type(7, "T"),
             op: crate::constraints::SUPERTYPE_OF,
             target: instance("builtins.int", vec![]),
+            extra_tvars: Vec::new(),
         };
         let (sol_blob, _) = solve_constraints_native(
             std::slice::from_ref(&tv),
@@ -3079,6 +3118,7 @@ mod tests {
             origin_type_var: tv_type(7, "T"),
             op: crate::constraints::SUBTYPE_OF,
             target: instance("builtins.str", vec![]),
+            extra_tvars: Vec::new(),
         };
         let (sol_blob, _) = solve_constraints_native(
             std::slice::from_ref(&tv),
@@ -3107,6 +3147,7 @@ mod tests {
             origin_type_var: tv_type(7, "T"),
             op: crate::constraints::SUPERTYPE_OF,
             target: sol_alias.clone(),
+            extra_tvars: Vec::new(),
         };
         let (sol_blob, _) = solve_constraints_native(
             std::slice::from_ref(&tv),
@@ -3134,6 +3175,7 @@ mod tests {
             origin_type_var: tv_type(7, "T"),
             op: crate::constraints::SUPERTYPE_OF,
             target: instance("builtins.int", vec![]),
+            extra_tvars: Vec::new(),
         };
         assert!(solve_constraints_native(
             std::slice::from_ref(&tv),

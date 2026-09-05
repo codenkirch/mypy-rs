@@ -114,6 +114,7 @@ impl ConstraintTriple for crate::constraints::Constraint {
             origin_type_var: origin,
             op,
             target,
+            extra_tvars: Vec::new(),
         }
     }
 }
@@ -377,10 +378,14 @@ pub(crate) fn rust_infer_directed_arg_constraints(
         resolver.alias_resolver(),
         strict_optional,
         false,
-        false,
         // Python `infer_constraints` wrapper default (constraints.py:802).
         true,
     )?;
+    // The write loop is 3-field: extras would be lost in serialization.
+    // Defensive: no mode is installed on this FFI, so extras cannot arise.
+    if constraints.iter().any(|c| !c.extra_tvars.is_empty()) {
+        return None;
+    }
 
     let mut output = WriteBuffer::new();
     write_size(&mut output, constraints.len() as i64).ok()?;

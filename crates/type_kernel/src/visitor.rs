@@ -333,6 +333,10 @@ pub(crate) fn type_contains_erased(typ: &Type) -> bool {
 /// `None` when a nested `TypeAliasType` blocks visibility (the
 /// proper-typed shape a deferred Python call would see is not provable
 /// here); `Some(true)` / `Some(false)` on decided verdicts.
+///
+/// Kept for #1427's nested-actual UX and the unit tests below; its lib
+/// consumer went away with the wave-37 `no_extra_tvar_shape` gate.
+#[allow(dead_code)]
 pub(crate) fn callable_with_vars_reachable(typ: &Type) -> Option<bool> {
     match typ {
         Type::TypeAliasType { .. } => return None,

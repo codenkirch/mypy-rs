@@ -869,6 +869,7 @@ pub fn rust_solve_generic_call(
                         origin_type_var: unpack_inner.as_ref().clone(),
                         op: crate::constraints::SUPERTYPE_OF,
                         target: tuple_target,
+                        extra_tvars: Vec::new(),
                     });
                 }
             } else if let Type::TupleType { .. } = unpack_inner.as_ref() {
@@ -939,7 +940,6 @@ pub fn rust_solve_generic_call(
                 resolver.resolver(),
                 resolver.alias_resolver(),
                 strict_optional,
-                false,
                 false,
                 // Python `infer_constraints` wrapper default (constraints.py:802).
                 true,
