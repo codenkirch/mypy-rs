@@ -1561,11 +1561,9 @@ fn solve_constraints_native(
 
     let ordered_pairs: Vec<(TvId, Option<Type>)> = original_vars
         .iter()
-        .map(|t| tv_id(t).ok_or(()))
-        .collect::<Result<Vec<_>, _>>()?
-        .into_iter()
         .zip(ordered)
-        .collect();
+        .map(|(t, sol)| Ok((tv_id(t).ok_or(())?, sol)))
+        .collect::<Result<_, ()>>()?;
 
     let sol_blob = encode_solutions_blob(&ordered_pairs)?;
     let free_blob = encode_free_vars_blob(&[])?;

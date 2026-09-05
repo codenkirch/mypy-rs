@@ -81,57 +81,40 @@ impl TypeAliasSnapshot {
 /// pyclass, so the `RefCell` is safe.
 #[allow(dead_code)]
 pub(crate) struct TypeAliasResolver {
-    snapshots: HashMap<String, TypeAliasSnapshot>,
-    /// Cheap shareable full-map view for the expand kernel's TLS install
-    /// (expandtype.rs): a clone-at-most-once cache, dropped by `insert`
-    /// so a later install sees the grown map.
-    shared: std::cell::RefCell<Option<std::sync::Arc<HashMap<String, TypeAliasSnapshot>>>>,
+    snapshots: std::sync::Arc<HashMap<String, TypeAliasSnapshot>>,
 }
 
 #[allow(dead_code)]
 impl TypeAliasResolver {
     pub fn new() -> Self {
         Self {
-            snapshots: HashMap::new(),
-            shared: std::cell::RefCell::new(None),
+            snapshots: std::sync::Arc::new(HashMap::new()),
         }
     }
 
     pub fn insert(&mut self, fullname: String, snap: TypeAliasSnapshot) {
-        self.snapshots.insert(fullname, snap);
-        // Any snapshot change must invalidate the frozen view.
-        *self.shared.borrow_mut() = None;
+        // Inserts are rare (build-manager snapshot passes); clones the
+        // backing map only when the Arc is shared.
+        std::sync::Arc::make_mut(&mut self.snapshots).insert(fullname, snap);
     }
 
     pub fn get(&self, fullname: &str) -> Option<&TypeAliasSnapshot> {
         self.snapshots.get(fullname)
     }
 
-    /// Full map as a cheap-to-clone `Arc` (built at most once between
-    /// inserts). The map is frozen between build-manager snapshot passes,
-    /// so per-call installs in the expand kernel pay one refcount bump.
+    /// Full map as a cheap-to-clone `Arc` (refcount bump).
     pub(crate) fn shared(&self) -> std::sync::Arc<HashMap<String, TypeAliasSnapshot>> {
-        let mut slot = self.shared.borrow_mut();
-        slot.get_or_insert_with(|| std::sync::Arc::new(self.snapshots.clone()))
-            .clone()
+        self.snapshots.clone()
     }
 
-    /// Rebuild a resolver from the shared `Arc` view, for engine-depth
-    /// callers that only hold the `TypeResolver`'s alias snapshot (/kernel
-    /// unify port, issue #1426: `unify_generic_callable`'s constraint and
-    /// apply paths take a `&TypeAliasResolver`, and the `is_subtype`
-    /// engine does not carry the `NativeTypeResolver` down). The map is
-    /// frozen between build-manager snapshot passes, so one clone per
-    /// unify call is correct; the `shared` slot is prefilled so any
-    /// `shared()` re-request inside the call does not clone again.
+    /// Build a resolver from the shared `Arc` view, for engine-depth
+    /// callers that only hold the `TypeResolver`'s alias snapshot (kernel
+    /// unify port, issue #1426). Zero-copy: the view owns the same map up
+    /// to the next `insert`, which `Arc::make_mut` makes a full clone once.
     pub(crate) fn from_shared_view(
         shared: std::sync::Arc<HashMap<String, TypeAliasSnapshot>>,
     ) -> Self {
-        let snapshots = (*shared).clone();
-        Self {
-            snapshots,
-            shared: std::cell::RefCell::new(Some(shared)),
-        }
+        Self { snapshots: shared }
     }
 
     pub fn len(&self) -> usize {
