@@ -244,9 +244,15 @@ pub(crate) fn has_recursive_types_inner(typ: &Type) -> bool {
         } => has_recursive_types_inner(upper_bound) || has_recursive_types_inner(default),
         // visit_parameters: arg_types only (variables not queried).
         Type::Parameters(p) => p.arg_types.iter().any(has_recursive_types_inner),
-        // Leaves (AnyType, UninhabitedType, NoneType, ErasedType,
-        // DeletedType, LiteralType, RawExpression-ish): self.default.
-        _ => false,
+        // Leaves: Python's BoolTypeQuery returns self.default (False) for
+        // these; note it also does NOT visit AnyType.source_any or
+        // LiteralType.fallback, so they are intentionally unqueried here.
+        Type::AnyType { .. }
+        | Type::UninhabitedType { .. }
+        | Type::NoneType
+        | Type::ErasedType
+        | Type::DeletedType { .. }
+        | Type::LiteralType { .. } => false,
     }
 }
 
