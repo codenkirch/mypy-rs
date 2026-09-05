@@ -22,6 +22,7 @@ use std::cell::RefCell;
 use std::collections::HashSet;
 
 use crate::typeinfo::{NativeTypeResolver, TypeInfoSnapshot, TypeResolver};
+use crate::typeops::recursive_pair_core;
 use crate::wire::{self, ReadBuffer, Type, WriteBuffer};
 
 /// Variance constants mirroring `mypy.nodes` (nodes.py:3146).
@@ -249,13 +250,23 @@ fn ctor_blob_decision(
     resolver: &TypeResolver,
 ) -> Option<bool> {
     let mut buf = ReadBuffer::new(ctor_bytes);
-    let ctor = wire::read_type(&mut buf, None).ok()?;
-    let expanded = crate::expandtype::expand_type_by_instance_core(
+    let ctor = match wire::read_type(&mut buf, None) {
+        Ok(c) => c,
+        Err(_) => {
+            return None;
+        }
+    };
+    let expanded = match crate::expandtype::expand_type_by_instance_core(
         &ctor,
         item,
         resolver,
         ctx.strict_optional,
-    )?;
+    ) {
+        Some(e) => e,
+        None => {
+            return None;
+        }
+    };
     match &expanded {
         Type::CallableType { ret_type, .. } => is_subtype(ret_type, right_ret, ctx, resolver),
         Type::Overloaded { items } => {
@@ -363,6 +374,45 @@ impl SubtypeContext {
     }
 }
 
+// Python's recursive-alias assumption stack (typestate.py:105), pushed at the
+// public entries (subtypes.py:612/651); kept separate from the protocol-right
+// ASSUMING stack since is_assumed_(proper_)subtype consults only this one.
+thread_local! {
+    static ALIAS_ASSUME: std::cell::RefCell<Vec<(Type, Type, bool)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+pub(crate) fn alias_assuming_contains(left: &Type, right: &Type, proper: bool) -> bool {
+    // py_type_eq, not derived PartialEq: recursive-alias wire trees nest
+    // without identity, so a byte-structural == never reaches a base case;
+    // py_type_eq's active-pair cut self-terminates (the Python alias shape).
+    ALIAS_ASSUME.with(|s| {
+        s.borrow().iter().any(|(l, r, p)| {
+            *p == proper && wire::py_type_eq(l, left) && wire::py_type_eq(r, right)
+        })
+    })
+}
+
+/// RAII twin of Python's `pop_on_exit(type_state.get_assumptions(..))`
+/// (subtypes.py:1905): pushes the pair, pops on every exit path including
+/// deferrals.
+pub(crate) struct AliasAssumingPush;
+
+impl AliasAssumingPush {
+    pub(crate) fn new(left: Type, right: Type, proper: bool) -> Self {
+        ALIAS_ASSUME.with(|s| s.borrow_mut().push((left, right, proper)));
+        AliasAssumingPush
+    }
+}
+
+impl Drop for AliasAssumingPush {
+    fn drop(&mut self) {
+        ALIAS_ASSUME.with(|s| {
+            s.borrow_mut().pop();
+        });
+    }
+}
+
 /// Entry point mirroring `mypy.subtypes._is_subtype` for the nominal path.
 ///
 /// Returns `Some(bool)` when Rust decided the check; `None` when the
@@ -370,9 +420,15 @@ impl SubtypeContext {
 /// responsible for `get_proper_type` expansion, the `AnyType`/`UnboundType`/
 /// `ErasedType` right short-circuit (subtypes.py:754-761; mirrored below
 /// for the shim-bypassing recursive paths), the `UnionType`
-/// right dispatch (subtypes.py:317-364), the `TypeVarType`-with-values
-/// right (subtypes.py:366-374), and the `assuming` recursion guard
-/// (subtypes.py:167-189) BEFORE calling this.
+/// right dispatch (subtypes.py:317-364), and the `TypeVarType`-with-values
+/// right (subtypes.py:366-374) BEFORE calling this. Since wave36 the
+/// three public-entry guards of `is_subtype`/`is_proper_subtype` are
+/// mirrored here UNCONDITIONALLY at the top of the body (Python runs
+/// them before the `rust_is_subtype` seam, and check_type_parameter
+/// re-enters through the public entries from inside the visitor,
+/// subtypes.py:982-988, so the engine's own recursion must settle
+/// recursive pairs the same way; only an alias-shaped operand
+/// additionally expands before the walk, see the gate below).
 #[allow(dead_code)]
 pub(crate) fn is_subtype(
     left: &Type,
@@ -380,11 +436,55 @@ pub(crate) fn is_subtype(
     ctx: &SubtypeContext,
     resolver: &TypeResolver,
 ) -> Option<bool> {
+    // wave36: the three public-entry guards (subtypes.py:562/582/584 for
+    // is_subtype, 635/647/649 for is_proper_subtype) run UNCONDITIONALLY,
+    // mirroring Python; they also terminate the engine's own recursion.
+
+    // check_type_parameter re-enters through the public entries
+    // (subtypes.py:982-988), so py_type_eq = Python's `left == right` must
+    // settle a self-recursive entry pair or the parity suite segfaults.
+
+    // 1. `if left == right: return True`. py_type_eq mirrors Python's
+    //    documented __eq__ overrides, which every wire variant reachable
+    //    at this entry carries (identity-only scalars are byte singletons).
+    if wire::py_type_eq(left, right) {
+        return Some(true);
+    }
+    // 2. `type_state.is_assumed_(proper_)subtype(left, right)`: Python
+    //    compares get_proper_type(l) == get_proper_type(left)
+    //    (typestate.py:134); iso-recursive re-entries share wire shape.
+    if alias_assuming_contains(left, right, ctx.proper_subtype) {
+        return Some(true);
+    }
+    // 3. `is_recursive_pair(left, right)` -> push the pair onto the
+    // assumption stack and recurse under it (Python's pop_on_exit).
+    // Alias-heavy; a missing snapshot yields false and the branch defers.
+    let alias_lookup = resolver.aliases();
+    let _assume_guard = if recursive_pair_core(
+        left,
+        right,
+        alias_lookup
+            .as_ref()
+            .map(|m| m as &dyn crate::aliases::AliasLookup),
+    ) == Some(true)
+    {
+        Some(AliasAssumingPush::new(
+            left.clone(),
+            right.clone(),
+            ctx.proper_subtype,
+        ))
+    } else {
+        None
+    };
     if matches!(left, Type::TypeAliasType { .. }) || matches!(right, Type::TypeAliasType { .. }) {
-        // Python expands both operands with get_proper_type before every
-        // comparison (subtypes.py:346-347); recursive check_type_parameter
-        // and callable-compat paths bypass that, so defer unexpanded aliases.
-        return None;
+        // Python expands both operands with get_proper_type pre-comparison
+        // (subtypes.py:346-347); recursive paths bypass that, so expand
+        // alias operands via expand_top_aliases (#1356 proper_top pattern).
+        let alias_map = resolver.aliases()?;
+        let alias_lookup: &dyn crate::aliases::AliasLookup = &alias_map;
+        let left_ex = expand_top_aliases(left, alias_lookup, ctx.strict_optional)?;
+        let right_ex = expand_top_aliases(right, alias_lookup, ctx.strict_optional)?;
+        return is_subtype(&left_ex, &right_ex, ctx, resolver);
     }
     // subtypes.py:754-761: a non-proper subtype of an Any/Unbound/Erased
     // right is always True, unless left is UnpackType (defer mirroring
@@ -779,11 +879,26 @@ pub(crate) fn is_subtype(
                     return Some(true);
                 }
             }
-            // subtypes.py:983-994: protocol branch. is_protocol_implementation
-            // is Python-only (member-wise protocol checks); defer those to
-            // Python. For non-protocol Instance right we return False here.
+            // subtypes.py:983-994 protocol branch: is_protocol_implementation
+            // (subtypes.py:1942) accepts a TupleType candidate, rebuilding it
+            // as the tuple fallback Instance (subtypes.py:1947-1953).
+
+            // It binds self to the original tuple and runs the member-wise
+            // loop; reuse the instance arm with self_type = original tuple.
+            // Deferrals (unreadable members etc.) still fall to Python.
             if resolver.get(right_ref).is_some_and(|s| s.is_protocol) {
-                return None;
+                let tf = crate::typeops::tuple_fallback(left, resolver)?;
+                return pyo3::Python::with_gil(|py| {
+                    crate::protocols::is_protocol_implementation_inner(
+                        py,
+                        &tf,
+                        left,
+                        right,
+                        &[],
+                        ctx,
+                        resolver,
+                    )
+                });
             }
             return Some(false);
         }
@@ -1587,7 +1702,12 @@ fn visit_instance_noninstance_right(
     // nominal path also treats as missing-snapshot. Defer rather than
 
     // risk a wrong result for FakeInfo / fallback_to_any left types.
-    let left_snap = resolver.get(left_ref)?;
+    let left_snap = match resolver.get(left_ref) {
+        Some(s) => s,
+        None => {
+            return None;
+        }
+    };
     // fallback_to_any short-circuit (subtypes.py:638-643): a class with
     // dynamic bases is a subtype of everything except NoneType. Matches
     // the nominal-path guard (subtypes.py:493-498 equivalent).
@@ -1760,8 +1880,13 @@ fn visit_instance_noninstance_right(
                         py, left, left, "__call__", false, false, resolver,
                     )
                 });
-                if let Some(crate::checker_helpers::GetProtocolMemberResult::Found(call)) = fetch {
-                    return is_subtype(&call, right, ctx, resolver);
+                match fetch {
+                    Some(crate::checker_helpers::GetProtocolMemberResult::Found(call)) => {
+                        return is_subtype(&call, right, ctx, resolver);
+                    }
+                    Some(crate::checker_helpers::GetProtocolMemberResult::Defer) => {}
+                    Some(crate::checker_helpers::GetProtocolMemberResult::NoneVal) => {}
+                    None => {}
                 }
             }
         }
@@ -2210,6 +2335,34 @@ fn expand_type_by_instance(typ: &Type, left_ref: &str, left_args: &[Type]) -> Op
                 is_type_form: *is_type_form,
             })
         }
+        Type::TypeAliasType {
+            type_ref,
+            args,
+            is_recursive: _,
+        } => {
+            // visit_type_alias_type (expandtype.py:1321-1328): the alias
+            // target's own frame cannot contain vars bound by this class
+            // frame, so only the args expand and the node is kept
+
+            // (Python's InstantiateAliasVisitor leaves the alias in place
+            // post-substitution).
+            if args.is_empty() {
+                return Some(typ.clone());
+            }
+            let mut new_args = Vec::with_capacity(args.len());
+            for arg in args {
+                if matches!(arg, Type::UnpackType { .. }) {
+                    // expand_type_list_with_unpack splice: defer.
+                    return None;
+                }
+                new_args.push(expand_type_by_instance(arg, left_ref, left_args)?);
+            }
+            Some(Type::TypeAliasType {
+                type_ref: type_ref.clone(),
+                args: new_args,
+                is_recursive: false,
+            })
+        }
         Type::UnpackType { typ, .. } => {
             // visit_unpack_type (expandtype.py:370-380): expand the inner
             // type and rewrap (the variadic splice happens in the caller).
@@ -2394,8 +2547,18 @@ fn protocol_right_decision(
     // Recursion guard + stack push live in `is_protocol_implementation_inner`
     // (mirroring Python's `pop_on_exit` inside `is_protocol_implementation`).
     pyo3::Python::with_gil(|py| {
-        let left_info = resolver.live_typeinfo(py, left_ref)?;
-        let right_info = resolver.live_typeinfo(py, right_ref)?;
+        let left_info = match resolver.live_typeinfo(py, left_ref) {
+            Some(i) if !i.is_none() => i,
+            _ => {
+                return None;
+            }
+        };
+        let right_info = match resolver.live_typeinfo(py, right_ref) {
+            Some(i) if !i.is_none() => i,
+            _ => {
+                return None;
+            }
+        };
         // Fine-grained dependency record (subtypes.py:1962); idempotent
         // set-add on the Python side. Defer on any failure so Python
         // performs the record itself.
@@ -2404,10 +2567,21 @@ fn protocol_right_decision(
             .ok()?
             .getattr("type_state")
             .ok()?;
-        type_state
+        if type_state
             .call_method1("record_protocol_subtype_check", (left_info, right_info))
-            .ok()?;
-        crate::protocols::is_protocol_implementation_inner(py, left, right, &[], ctx, resolver)
+            .is_err()
+        {
+            return None;
+        }
+        crate::protocols::is_protocol_implementation_inner(
+            py,
+            left,
+            left,
+            right,
+            &[],
+            ctx,
+            resolver,
+        )
     })
 }
 
@@ -2496,6 +2670,7 @@ fn callable_protocol_call_check(
         };
         crate::protocols::is_protocol_implementation_inner(
             py,
+            left_fallback,
             left_fallback,
             right,
             &["__call__".to_string()],
@@ -2640,7 +2815,12 @@ fn visit_instance_nominal(
         return Some(false);
     }
 
-    let right_snap = right_snap?;
+    let right_snap = match right_snap {
+        Some(s) => s,
+        None => {
+            return None;
+        }
+    };
 
     // Variadic right (subtypes.py:644-670): Python takes a special path
     // using split_with_prefix_and_suffix to splice the TypeVarTuple
@@ -2679,7 +2859,12 @@ fn visit_instance_nominal(
         // Generic path: map_instance_to_supertype walks class_derivation_paths over
         // the bases blobs, substituting TypeVars via expand_type_by_instance; None on
         // an unsupported Type variant (UnpackType, ParamSpec), Python falls through.
-        map_instance_to_supertype(left_ref, left_args, right_ref, resolver)?
+        match map_instance_to_supertype(left_ref, left_args, right_ref, resolver) {
+            Some(args) => args,
+            None => {
+                return None;
+            }
+        }
     };
 
     if ctx.ignore_type_params {
@@ -2725,7 +2910,9 @@ fn visit_instance_nominal(
             }
             // Recursive is_subtype hit an unsupported variant. Don't
             // assume not-subtype (would give wrong answers); defer.
-            None => return None,
+            None => {
+                return None;
+            }
         }
     }
     Some(nominal)
@@ -2795,11 +2982,91 @@ fn check_type_parameter(
 /// (`tvar_tuple_index` set), or any child expansion defers.
 pub(crate) fn expand_aliases(
     typ: &Type,
-    alias_resolver: &crate::aliases::TypeAliasResolver,
+    alias_resolver: &dyn crate::aliases::AliasLookup,
     strict_optional: bool,
 ) -> Option<Type> {
     let mut active: Vec<ActiveAlias> = Vec::new();
     expand_aliases_depth(typ, alias_resolver, strict_optional, 0, &mut active)
+}
+
+/// Python `get_proper_type` semantics (types.py:4181-4197): unroll the
+/// top-level `TypeAliasType` chain exactly one step per link
+/// (`_expand_once`, types.py:472-500) and stop at the first non-alias
+/// root. Nested alias occurrences inside the result stay untouched:
+/// `InstantiateAliasVisitor` inherits
+/// `ExpandTypeVisitor.visit_type_alias_type` (expandtype.py:1321-1329),
+/// which keeps alias nodes and substitutes their args only, and the
+/// mapping is built from the raw `self.args` with no arg expansion.
+///
+/// The fixpoint `expand_aliases` above re-walks nested alias refs until
+/// the active-cut fires, which deforms a recursive-alias TypedDict left
+/// operand by one nesting level per engine recursion and never
+/// converges under `is_subtype` re-entry (wave36 segfault). Returns
+/// `None` on snapshot miss, variadic target, substitution wall, cyclic
+/// chain, or depth cap: call sites defer the whole comparison.
+pub(crate) fn expand_top_aliases(
+    typ: &Type,
+    alias_resolver: &dyn crate::aliases::AliasLookup,
+    strict_optional: bool,
+) -> Option<Type> {
+    let mut current = typ.clone();
+    let mut depth: u32 = 0;
+    while let Type::TypeAliasType { args, type_ref, .. } = current {
+        depth += 1;
+        if depth > 50 {
+            return None;
+        }
+        let snap = match alias_resolver.get(&type_ref) {
+            Some(s) => s,
+            None => {
+                return None;
+            }
+        };
+        if snap.tvar_tuple_index.is_some() {
+            return None;
+        }
+        current = if snap.no_args {
+            // Python _expand_once asserts an Instance target (types.py:479)
+            // and swaps in the RAW alias args (copy_modified); defer rather
+            // than assert across FFI when the decoded target is not one.
+            match decode_type(&snap.target)? {
+                Type::Instance { type_ref, .. } => Type::Instance {
+                    type_ref,
+                    last_known_value: None,
+                    args: args.into_iter().collect(),
+                    extra_attrs: None,
+                },
+                _ => {
+                    return None;
+                }
+            }
+        } else {
+            let target = match decode_type(&snap.target) {
+                Some(t) => t,
+                None => {
+                    return None;
+                }
+            };
+            if snap.alias_tvars.len() != args.len() {
+                return None;
+            }
+            let mut env: std::collections::HashMap<crate::expandtype::EnvKey, Type> =
+                std::collections::HashMap::new();
+            for (tvar, arg) in snap.alias_tvars.iter().zip(args.iter()) {
+                env.insert(
+                    (tvar.raw_id, tvar.meta_level, tvar.namespace.clone()),
+                    arg.clone(),
+                );
+            }
+            match crate::expandtype::expand_type_inner(&target, &env, strict_optional) {
+                Some(t) => t,
+                None => {
+                    return None;
+                }
+            }
+        };
+    }
+    Some(current)
 }
 
 /// Identity key of an alias occurrence on the current expansion path: the
@@ -2812,7 +3079,7 @@ type ActiveAlias = (String, Vec<Type>);
 
 fn expand_aliases_depth(
     typ: &Type,
-    alias_resolver: &crate::aliases::TypeAliasResolver,
+    alias_resolver: &dyn crate::aliases::AliasLookup,
     strict_optional: bool,
     depth: u32,
     active: &mut Vec<ActiveAlias>,
@@ -2827,10 +3094,20 @@ fn expand_aliases_depth(
             type_ref,
             is_recursive: _,
         } => {
-            // Issue #1149: cut an alias already active on this descent (the
-            // `_expand_once` fixpoint). Keyed on args identity, so a sibling
-            // same-alias-different-args occurrence still expands in place.
-            if active.iter().any(|(r, a)| r == type_ref && *a == *args) {
+            // Issue #1149: cut an alias already active on this descent
+            // (the `_expand_once` fixpoint), keyed on args identity so a
+            // sibling same-alias-different-args occurrence still expands.
+
+            // py_type_eq over derived PartialEq: recursive alias args nest
+            // without identity, so a byte == never reaches a base case
+            // (wave36 segfault); ALIAS_EQ_ACTIVE cuts back-refs like Python.
+            if active.iter().any(|(r, a)| {
+                r == type_ref
+                    && a.len() == args.len()
+                    && a.iter()
+                        .zip(args.iter())
+                        .all(|(x, y)| wire::py_type_eq(x, y))
+            }) {
                 return Some(typ.clone());
             }
             let snap = match alias_resolver.get(type_ref) {
@@ -3310,7 +3587,7 @@ fn expand_aliases_depth(
 /// `expand_aliases_depth`; the rest are scalars.
 fn expand_parameters_depth(
     p: &wire::Parameters,
-    alias_resolver: &crate::aliases::TypeAliasResolver,
+    alias_resolver: &dyn crate::aliases::AliasLookup,
     strict_optional: bool,
     depth: u32,
     active: &mut Vec<ActiveAlias>,
@@ -3653,8 +3930,8 @@ pub(crate) fn rust_is_more_precise(
 ) -> Option<bool> {
     let left = decode_type(left_bytes)?;
     let right = decode_type(right_bytes)?;
-    let left = expand_aliases(&left, resolver.alias_resolver(), strict_optional)?;
-    let right = expand_aliases(&right, resolver.alias_resolver(), strict_optional)?;
+    let left = expand_top_aliases(&left, resolver.alias_resolver(), strict_optional)?;
+    let right = expand_top_aliases(&right, resolver.alias_resolver(), strict_optional)?;
     is_more_precise(
         &left,
         &right,
@@ -3707,8 +3984,8 @@ pub(crate) fn rust_is_equivalent(
 ) -> Option<bool> {
     let a = decode_type(a_bytes)?;
     let b = decode_type(b_bytes)?;
-    let a = expand_aliases(&a, resolver.alias_resolver(), strict_optional)?;
-    let b = expand_aliases(&b, resolver.alias_resolver(), strict_optional)?;
+    let a = expand_top_aliases(&a, resolver.alias_resolver(), strict_optional)?;
+    let b = expand_top_aliases(&b, resolver.alias_resolver(), strict_optional)?;
     is_equivalent(
         &a,
         &b,
@@ -3813,10 +4090,10 @@ pub(crate) fn rust_all_same_types(
         return Some(true);
     }
     let first = decode_type(items_bytes[0])?;
-    let first = expand_aliases(&first, resolver.alias_resolver(), strict_optional)?;
+    let first = expand_top_aliases(&first, resolver.alias_resolver(), strict_optional)?;
     for b_bytes in items_bytes.iter().skip(1) {
         let b = decode_type(b_bytes)?;
-        let b = expand_aliases(&b, resolver.alias_resolver(), strict_optional)?;
+        let b = expand_top_aliases(&b, resolver.alias_resolver(), strict_optional)?;
         match is_same_type(
             &first,
             &b,
@@ -3848,8 +4125,8 @@ pub(crate) fn rust_is_same_type(
 ) -> Option<bool> {
     let a = decode_type(a_bytes)?;
     let b = decode_type(b_bytes)?;
-    let a = expand_aliases(&a, resolver.alias_resolver(), strict_optional)?;
-    let b = expand_aliases(&b, resolver.alias_resolver(), strict_optional)?;
+    let a = expand_top_aliases(&a, resolver.alias_resolver(), strict_optional)?;
+    let b = expand_top_aliases(&b, resolver.alias_resolver(), strict_optional)?;
     let answer = is_same_type(
         &a,
         &b,
@@ -3884,10 +4161,30 @@ pub(crate) fn rust_is_subtype(
     strict_concatenate: bool,
     resolver: &mut NativeTypeResolver,
 ) -> Option<bool> {
-    let left = decode_type(left_bytes)?;
-    let right = decode_type(right_bytes)?;
-    let left = expand_aliases(&left, resolver.alias_resolver(), strict_optional)?;
-    let right = expand_aliases(&right, resolver.alias_resolver(), strict_optional)?;
+    let left = match decode_type(left_bytes) {
+        Some(t) => t,
+        None => {
+            return None;
+        }
+    };
+    let right = match decode_type(right_bytes) {
+        Some(t) => t,
+        None => {
+            return None;
+        }
+    };
+    let left = match expand_top_aliases(&left, resolver.alias_resolver(), strict_optional) {
+        Some(t) => t,
+        None => {
+            return None;
+        }
+    };
+    let right = match expand_top_aliases(&right, resolver.alias_resolver(), strict_optional) {
+        Some(t) => t,
+        None => {
+            return None;
+        }
+    };
     let ctx = SubtypeContext::with_callable_flags(
         ignore_type_params,
         ignore_declared_variance,
@@ -3943,14 +4240,14 @@ pub(crate) fn rust_is_subtype_batch(
     for [a, b] in chunks {
         let answer = match (decode_type(a), decode_type(b)) {
             (Some(left), Some(right)) => {
-                let left = match expand_aliases(&left, alias_resolver, strict_optional) {
+                let left = match expand_top_aliases(&left, alias_resolver, strict_optional) {
                     Some(t) => t,
                     None => {
                         out.push(-1);
                         continue;
                     }
                 };
-                let right = match expand_aliases(&right, alias_resolver, strict_optional) {
+                let right = match expand_top_aliases(&right, alias_resolver, strict_optional) {
                     Some(t) => t,
                     None => {
                         out.push(-1);
@@ -4436,13 +4733,12 @@ mod tests {
 
     #[test]
     fn same_ref_alias_arg_defers_without_snapshot() {
-        // Alias-carrying args keep the hoisted fast path out of the way:
-        // a deferred same-ref pair lets Python run its full visitor whose
-        // type_state bookkeeping later protocol checks consult, so defer.
+        // Unequal same-ref alias-arg pair: public-entry guards do not fire
+        // (left != right) and without a snapshot neither operand expands,
+        // so defer; Python's visitor keeps the type_state bookkeeping.
         let r = make_resolver(vec![]);
-        let alias = alias_type(vec![], "mod.Iter");
-        let left = instance("typing.Iterator", vec![alias.clone()]);
-        let right = instance("typing.Iterator", vec![alias]);
+        let left = instance("typing.Iterator", vec![alias_type(vec![], "mod.Iter")]);
+        let right = instance("typing.Iterator", vec![alias_type(vec![], "other.Iter")]);
         assert_eq!(is_subtype(&left, &right, &ctx_nominal(), &r), None);
     }
 
@@ -4511,12 +4807,19 @@ mod tests {
 
     #[test]
     fn same_ref_nested_alias_arg_defers_without_snapshot() {
-        // The alias check is recursive: an alias three levels deep
-        // (arg -> Instance args -> TypeAliasType) also defers.
+        // Unequal pair with an alias three levels deep (arg -> Instance
+        // args -> TypeAliasType): no snapshot means the alias-shaped
+        // branch cannot expand, so defer.
         let r = make_resolver(vec![]);
         let arg = instance("builtins.list", vec![alias_type(vec![], "mod.Iter")]);
         let left = instance("typing.Iterator", vec![arg.clone()]);
-        let right = instance("typing.Iterator", vec![arg]);
+        let right = instance(
+            "typing.Iterator",
+            vec![instance(
+                "builtins.list",
+                vec![alias_type(vec![], "other.Iter")],
+            )],
+        );
         assert_eq!(is_subtype(&left, &right, &ctx_nominal(), &r), None);
     }
 
@@ -4532,26 +4835,60 @@ mod tests {
 
     #[test]
     fn same_ref_fast_path_skipped_under_ignore_declared_variance() {
-        // Python skips the nominal branch under ignore_declared_variance
-        // and can then answer False, so the fast path must not fire.
+        // Under ignore_declared_variance Python skips the nominal branch
+        // and can answer False, so an EQUAL-shape pair must not be
+        // shortcut to True by guard 1.
+
+        // But byte-equal pairs do answer True: Python's public
+        // left == right check is not gated on ignore_declared_variance
+        // either. Skip semantics show only on UNEQUAL pairs; no snapshot defers.
         let r = make_resolver(vec![]);
-        let arg = instance("builtins.int", vec![]);
-        let left = instance("typing.Iterator", vec![arg.clone()]);
-        let right = instance("typing.Iterator", vec![arg]);
+        let left = instance("typing.Iterator", vec![instance("builtins.int", vec![])]);
+        let right = instance("typing.Iterator", vec![instance("builtins.str", vec![])]);
         let ctx = SubtypeContext::new(false, true, false, false, false, true);
         assert_eq!(is_subtype(&left, &right, &ctx, &r), None);
     }
 
     #[test]
     fn same_ref_fast_path_skipped_in_proper_mode() {
-        // proper-subtype checks keep the full walk (protocol/cache
-        // semantics), matching the old post-snapshot fast path guard.
+        // Proper-subtype checks keep the full walk for unequal pairs
+        // (protocol/cache semantics), matching the old post-snapshot guard;
+        // byte-equal pairs decide True via the ctx-independent guard 1.
+        let r = make_resolver(vec![]);
+        let left = instance("typing.Iterator", vec![instance("builtins.int", vec![])]);
+        let right = instance("typing.Iterator", vec![instance("builtins.str", vec![])]);
+        let ctx = SubtypeContext::new(false, false, false, false, true, true);
+        assert_eq!(is_subtype(&left, &right, &ctx, &r), None);
+    }
+
+    #[test]
+    fn equal_shape_pairs_decide_true_via_public_eq_ctx_independent() {
+        // Python runs `left == right` (subtypes.py:562, guard 1)
+        // unconditionally at the public entries, before any snapshot or
+        // context-specific branch, in every context mode.
         let r = make_resolver(vec![]);
         let arg = instance("builtins.int", vec![]);
         let left = instance("typing.Iterator", vec![arg.clone()]);
         let right = instance("typing.Iterator", vec![arg]);
-        let ctx = SubtypeContext::new(false, false, false, false, true, true);
-        assert_eq!(is_subtype(&left, &right, &ctx, &r), None);
+        assert_eq!(is_subtype(&left, &right, &ctx_nominal(), &r), Some(true));
+        assert_eq!(
+            is_subtype(
+                &left,
+                &right,
+                &SubtypeContext::new(false, false, false, false, true, true),
+                &r
+            ),
+            Some(true)
+        );
+        assert_eq!(
+            is_subtype(
+                &left,
+                &right,
+                &SubtypeContext::new(false, true, false, false, false, true),
+                &r
+            ),
+            Some(true)
+        );
     }
 
     #[test]
@@ -6762,6 +7099,198 @@ mod tests {
         assert_eq!(result, Some(input.clone()));
     }
 
+    // --- expand_top_aliases unit tests (wave36) ---
+
+    fn no_args_list_snap() -> TypeAliasSnapshot {
+        // A = List  (no_args=True; target is an Instance per semanal.py
+        // 5464-5469, args list[Any] -- the raw alias args REPLACE them).
+        TypeAliasSnapshot {
+            fullname: "mod.A".to_string(),
+            target: encode_for_alias(&instance("builtins.list", vec![any_type()])),
+            no_args: true,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn test_expand_top_aliases_no_args_swaps_raw_args() {
+        // `_expand_once` no_args arm (types.py:479-484):
+        // copy_modified(args=self.args) -> the decoded target's own args
+        // are ignored, the alias occurrence's raw args replace them.
+        let ar = make_alias_resolver(vec![no_args_list_snap()]);
+        let input = alias_type(vec![instance("builtins.int", vec![])], "mod.A");
+        assert_eq!(
+            expand_top_aliases(&input, &ar, true),
+            Some(instance(
+                "builtins.list",
+                vec![instance("builtins.int", vec![])]
+            ))
+        );
+    }
+
+    #[test]
+    fn test_expand_top_aliases_chains_alias_nodes() {
+        // B's target is an alias occurrence of A: the top-level chain
+        // unrolls to its non-alias root in one call.
+        let b_snap = TypeAliasSnapshot {
+            fullname: "mod.B".to_string(),
+            target: encode_for_alias(&alias_type(vec![instance("builtins.int", vec![])], "mod.A")),
+            no_args: false,
+            ..Default::default()
+        };
+        let ar = make_alias_resolver(vec![no_args_list_snap(), b_snap]);
+        let input = alias_type(vec![], "mod.B");
+        assert_eq!(
+            expand_top_aliases(&input, &ar, true),
+            Some(instance(
+                "builtins.list",
+                vec![instance("builtins.int", vec![])]
+            ))
+        );
+    }
+
+    #[test]
+    fn test_expand_top_aliases_keeps_nested_alias() {
+        // V = List[A] where A = List: the nested `A` occurrence has empty
+        // args and stays an alias node, mirroring InstantiateAliasVisitor
+        // (expandtype.py:1321-1329). Only the top-level chain expands.
+        let nested = instance("builtins.list", vec![alias_type(vec![], "mod.A")]);
+        let v_snap = TypeAliasSnapshot {
+            fullname: "mod.V".to_string(),
+            target: encode_for_alias(&nested),
+            no_args: false,
+            ..Default::default()
+        };
+        let ar = make_alias_resolver(vec![no_args_list_snap(), v_snap]);
+        let input = alias_type(vec![], "mod.V");
+        assert_eq!(
+            expand_top_aliases(&input, &ar, true),
+            Some(instance("builtins.list", vec![alias_type(vec![], "mod.A")]))
+        );
+    }
+
+    #[test]
+    fn test_expand_top_aliases_chains_generic_alias_nodes() {
+        // V[X] = B[T]; B[X] = List[T]: the chain unrolls top-level links
+        // until the root stops being an alias (get_proper_type's
+        // types.py:4196 while-loop); a middle link's args are pre-substituted.
+        let tvar = Type::TypeVarType {
+            name: "X".to_string(),
+            fullname: "mod.X".to_string(),
+            raw_id: 1,
+            namespace: "".to_string(),
+            values: vec![],
+            upper_bound: Box::new(instance("builtins.object", vec![])),
+            default: Box::new(any_type()),
+            variance: 1,
+            meta_level: 0,
+        };
+        let b_snap = TypeAliasSnapshot {
+            fullname: "mod.B".to_string(),
+            target: encode_for_alias(&instance(
+                "builtins.list",
+                vec![Type::TypeVarType {
+                    name: "T".to_string(),
+                    fullname: "mod.T".to_string(),
+                    raw_id: 2,
+                    namespace: "".to_string(),
+                    values: vec![],
+                    upper_bound: Box::new(instance("builtins.object", vec![])),
+                    default: Box::new(any_type()),
+                    variance: 1,
+                    meta_level: 0,
+                }],
+            )),
+            alias_tvars: vec![alias_tvar_fn("T", 2)],
+            no_args: false,
+            ..Default::default()
+        };
+        let v_snap = TypeAliasSnapshot {
+            fullname: "mod.V".to_string(),
+            target: encode_for_alias(&alias_type(vec![tvar], "mod.B")),
+            alias_tvars: vec![alias_tvar_fn("X", 1)],
+            no_args: false,
+            ..Default::default()
+        };
+        let ar = make_alias_resolver(vec![b_snap, v_snap]);
+        let input = alias_type(vec![instance("builtins.int", vec![])], "mod.V");
+        assert_eq!(
+            expand_top_aliases(&input, &ar, true),
+            Some(instance(
+                "builtins.list",
+                vec![instance("builtins.int", vec![])]
+            ))
+        );
+    }
+
+    #[test]
+    fn test_expand_top_aliases_defers_missing_snapshot() {
+        let ar = make_alias_resolver(vec![]);
+        let input = alias_type(vec![], "mod.Missing");
+        assert_eq!(expand_top_aliases(&input, &ar, true), None);
+    }
+
+    #[test]
+    fn test_expand_top_aliases_defers_no_args_noninstance() {
+        // semanal only sets no_args for Instance targets (semanal.py
+        // 5464-5469); no_args + non-Instance target is an unrepresentable
+        // Python state (assert in _expand_once, types.py:483). Rust defers.
+        let bad = TypeAliasSnapshot {
+            fullname: "mod.A".to_string(),
+            target: encode_for_alias(&any_type()),
+            no_args: true,
+            ..Default::default()
+        };
+        let ar = make_alias_resolver(vec![bad]);
+        let input = alias_type(vec![], "mod.A");
+        assert_eq!(expand_top_aliases(&input, &ar, true), None);
+    }
+
+    #[test]
+    fn test_expand_top_aliases_defers_variadic_target() {
+        // tvar_tuple_index aliases need the split_with_prefix_and_suffix
+        // middle-mapping (types.py:491-501): still deferred, as before.
+        let mut snap = no_args_list_snap();
+        snap.tvar_tuple_index = Some(0);
+        let ar = make_alias_resolver(vec![snap]);
+        let input = alias_type(vec![], "mod.A");
+        assert_eq!(expand_top_aliases(&input, &ar, true), None);
+    }
+
+    #[test]
+    fn test_expand_top_aliases_defers_arity_mismatch() {
+        // len(alias_tvars) != len(args): Python's zip would silently drop
+        // pairs; Rust defers instead of half-substituting.
+        let tvar = Type::TypeVarType {
+            name: "T".to_string(),
+            fullname: "mod.T".to_string(),
+            raw_id: 1,
+            namespace: "".to_string(),
+            values: vec![],
+            upper_bound: Box::new(instance("builtins.object", vec![])),
+            default: Box::new(any_type()),
+            variance: 1,
+            meta_level: 0,
+        };
+        let target = instance("builtins.list", vec![tvar]);
+        let snap = TypeAliasSnapshot {
+            fullname: "mod.A".to_string(),
+            target: encode_for_alias(&target),
+            alias_tvars: vec![alias_tvar_fn("T", 1)],
+            no_args: false,
+            ..Default::default()
+        };
+        let ar = make_alias_resolver(vec![snap]);
+        let input = alias_type(
+            vec![
+                instance("builtins.int", vec![]),
+                instance("builtins.str", vec![]),
+            ],
+            "mod.A",
+        );
+        assert_eq!(expand_top_aliases(&input, &ar, true), None);
+    }
+
     #[test]
     fn test_expand_aliases_variadic_keeps_node() {
         // tvar_tuple_index set: the variadic target needs the Python-side
@@ -7189,10 +7718,14 @@ mod tests {
     fn test_more_precise_alias_to_any() {
         // A = Any; is_more_precise(Any, A): right expands to Any -> True
         // even for a non-Instance left (previously defer via alias guard).
+
+        // no_args stays False: semanal only sets no_args for Instance
+        // targets (semanal.py:5464-5469); a non-Instance no_args target is
+        // an unrepresentable Python state (assert), so Rust defers it.
         let any_snap = TypeAliasSnapshot {
             fullname: "mod.A".to_string(),
             target: encode_for_alias(&any_type()),
-            no_args: true,
+            no_args: false,
             ..Default::default()
         };
         let mut native = make_native_with_alias(vec![any_snap]);

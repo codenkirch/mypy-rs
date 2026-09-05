@@ -9026,9 +9026,9 @@ mod tests {
 
     #[test]
     fn meet_types_both_union_resolves() {
-        // Both UnionType -> meet_union does pairwise meets then
-        // make_simplified_union.  For identical unions the result is
-        // the same union (encoded).
+        // Identical unions: Python's trivial_meet runs is_proper_subtype
+        // first, which fires at is_subtype's public-entry `left == right`
+        // guard (guard 1) before meet_union, so the answer is SameS.
         let r = make_resolver(vec![]);
         let s = Type::UnionType {
             items: vec![instance("a.A", vec![])],
@@ -9048,10 +9048,7 @@ mod tests {
             original_str_expr: None,
             original_str_fallback: None,
         };
-        assert!(matches!(
-            meet_types(&s, &t, &ctx(true), &r),
-            Some(SetOpResult::Encoded(_))
-        ));
+        assert_eq!(meet_types(&s, &t, &ctx(true), &r), Some(SetOpResult::SameS));
     }
 
     #[test]
@@ -9214,8 +9211,9 @@ mod tests {
 
     #[test]
     fn meet_types_both_callable_resolves() {
-        // Both callable-like (identical) -> meet_similar_callables
-        // produces a new CallableType encoded in the wire format.
+        // Python's is_proper_subtype short-circuits on CallableType.__eq__
+        // before meet_similar_callables, so the answer is SameS; the
+        // similar-callable machinery stays covered by the fixtures below.
         let r = make_resolver(vec![snap("builtins.function", "function")]);
         let s = callable(
             "builtins.function",
@@ -9227,10 +9225,7 @@ mod tests {
             vec![],
             instance("builtins.int", vec![]),
         );
-        assert!(matches!(
-            meet_types(&s, &t, &ctx(true), &r),
-            Some(SetOpResult::Encoded(_))
-        ));
+        assert_eq!(meet_types(&s, &t, &ctx(true), &r), Some(SetOpResult::SameS));
     }
 
     #[test]
@@ -9611,13 +9606,14 @@ mod tests {
     }
 
     #[test]
-    fn meet_type_var_tuple_same_id_equal_min_len_returns_t() {
-        // visit_type_var_tuple (meet.py:932): s.min_len == t.min_len ->
-        // `self.s if self.s.min_len > t.min_len else t` -> t (SameT).
+    fn meet_type_var_tuple_same_id_equal_min_len_returns_s() {
+        // Byte-equal operands: is_proper_subtype fires at the public-entry
+        // `left == right` guard (TypeVarTupleType py-eq covers id/min_len/
+        // default), so trivial_meet returns s. meet.py:932 tertiary unreachable.
         let r = make_resolver(vec![]);
         let s = type_var_tuple(1, "ns", 3);
         let t = type_var_tuple(1, "ns", 3);
-        assert_eq!(meet_types(&s, &t, &ctx(true), &r), Some(SetOpResult::SameT));
+        assert_eq!(meet_types(&s, &t, &ctx(true), &r), Some(SetOpResult::SameS));
     }
 
     #[test]
@@ -9993,13 +9989,27 @@ mod tests {
     }
 
     #[test]
-    fn meet_parameters_same_length_encodes_join() {
-        // Both-Parameters routed to meet_callable_like (both-callable
-        // pre-dispatch), then meet_parameters_pair: same length -> join
-        // int/int = int -> Encoded Parameters([int], [0]).
+    fn meet_parameters_byte_equal_returns_s() {
+        // Byte-equal Parameters: guard 1 fires before meet_parameters_pair,
+        // so trivial_meet returns s (SameS).
         let r = make_resolver(vec![snap("builtins.int", "int")]);
         let s = parameters(vec![instance("builtins.int", vec![])], vec![0]);
         let t = parameters(vec![instance("builtins.int", vec![])], vec![0]);
+        assert_eq!(meet_types(&s, &t, &ctx(true), &r), Some(SetOpResult::SameS));
+    }
+
+    #[test]
+    fn meet_parameters_same_length_encodes_join() {
+        // Unequal Parameters of equal length: both-callable pre-dispatch,
+        // then meet_parameters_pair joins per-arg; unrelated A vs B with
+        // no common base defer, but both deriving object gives join=object.
+        let r = make_resolver(vec![
+            snap_with_bases("a.A", "A", &["builtins.object"]),
+            snap_with_bases("a.B", "B", &["builtins.object"]),
+            snap("builtins.object", "object"),
+        ]);
+        let s = parameters(vec![instance("a.A", vec![])], vec![0]);
+        let t = parameters(vec![instance("a.B", vec![])], vec![0]);
         let result = meet_types(&s, &t, &ctx(true), &r);
         assert!(
             matches!(result, Some(SetOpResult::Encoded(_))),
@@ -10009,7 +10019,7 @@ mod tests {
         if let Some(SetOpResult::Encoded(bytes)) = result {
             let mut rbuf = ReadBuffer::new(&bytes);
             let decoded = wire::read_type(&mut rbuf, None).expect("decode failed");
-            let expected = parameters(vec![instance("builtins.int", vec![])], vec![0]);
+            let expected = parameters(vec![instance("builtins.object", vec![])], vec![0]);
             assert_eq!(decoded, expected);
         }
     }

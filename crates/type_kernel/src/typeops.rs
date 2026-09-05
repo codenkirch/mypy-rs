@@ -3565,8 +3565,19 @@ pub(crate) fn rust_is_recursive_pair(
 ) -> Option<bool> {
     let s = decode_type(s_bytes)?;
     let t = decode_type(t_bytes)?;
-    let aliases = resolver.alias_resolver();
+    recursive_pair_core(&s, &t, Some(resolver.alias_resolver()))
+}
 
+/// Core of `rust_is_recursive_pair` operating on decoded wire Types.
+/// Separated so the subtypes engine can mirror `mypy.typeops.
+/// is_recursive_pair` (typeops.py:344-362) at its public-entry guard
+/// wave36 without a wire round-trip. `aliases: None` (no alias map
+/// installed) defers where the branches would need a snapshot lookup.
+pub(crate) fn recursive_pair_core(
+    s: &Type,
+    t: &Type,
+    aliases: Option<&dyn crate::aliases::AliasLookup>,
+) -> Option<bool> {
     // The recursion flag rides the wire as a tagged conditional int on
     // each TypeAliasType; the decode already landed it in the variant's
     // `is_recursive` field, so no byte re-walk is needed.
@@ -3591,14 +3602,14 @@ pub(crate) fn rust_is_recursive_pair(
             return Some(true);
         }
         // Branch a: get_proper_type(t) is Instance or UnionType.
-        match crate::checkexpr_functions::expand_alias_shape(&t, aliases) {
+        match expand_shape(t, aliases) {
             Some(Type::Instance { .. } | Type::UnionType { .. }) => {
                 return Some(true);
             }
             Some(_) => {
                 // Branch a is False, branch b is False.
                 // Branch c: get_proper_type(s) is TupleType.
-                match crate::checkexpr_functions::expand_alias_shape(&s, aliases) {
+                match expand_shape(s, aliases) {
                     Some(Type::TupleType { .. }) => return Some(true),
                     Some(_) => return Some(false),
                     None => return None,
@@ -3607,7 +3618,7 @@ pub(crate) fn rust_is_recursive_pair(
             None => {
                 // Branch a undecidable. If branch c is True, the `or`
                 // is True regardless; otherwise defer (a could be True).
-                match crate::checkexpr_functions::expand_alias_shape(&s, aliases) {
+                match expand_shape(s, aliases) {
                     Some(Type::TupleType { .. }) => return Some(true),
                     _ => return None,
                 }
@@ -3618,19 +3629,19 @@ pub(crate) fn rust_is_recursive_pair(
     if t_rec {
         // s_rec is False here (block 1 would have handled it).
         // Branch a: get_proper_type(s) is Instance or UnionType.
-        match crate::checkexpr_functions::expand_alias_shape(&s, aliases) {
+        match expand_shape(s, aliases) {
             Some(Type::Instance { .. } | Type::UnionType { .. }) => {
                 return Some(true);
             }
             Some(_) => {
                 // Branch a is False. Branch c: get_proper_type(t) is TupleType.
-                match crate::checkexpr_functions::expand_alias_shape(&t, aliases) {
+                match expand_shape(t, aliases) {
                     Some(Type::TupleType { .. }) => return Some(true),
                     Some(_) => return Some(false),
                     None => return None,
                 }
             }
-            None => match crate::checkexpr_functions::expand_alias_shape(&t, aliases) {
+            None => match expand_shape(t, aliases) {
                 Some(Type::TupleType { .. }) => return Some(true),
                 _ => return None,
             },
@@ -3638,6 +3649,10 @@ pub(crate) fn rust_is_recursive_pair(
     }
 
     Some(false)
+}
+
+fn expand_shape(x: &Type, aliases: Option<&dyn crate::aliases::AliasLookup>) -> Option<Type> {
+    crate::checkexpr_functions::expand_alias_shape(x, aliases?)
 }
 
 // ---------------------------------------------------------------------------

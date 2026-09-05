@@ -67,6 +67,7 @@ fn member_is_skipped(member: &str, skip: &[String]) -> bool {
 pub(crate) fn is_protocol_implementation_inner(
     py: Python<'_>,
     left: &Type,
+    self_type: &Type,
     right: &Type,
     skip: &[String],
     ctx: &SubtypeContext,
@@ -111,28 +112,30 @@ pub(crate) fn is_protocol_implementation_inner(
         .collect();
     for member in members {
         // Python (subtypes.py:1906-1909): subtype = get_protocol_member(left,
-        // original_left, ...); supertype = find_member(member, right,
-        // original_left). self_type is original_left (== left) on both fetches.
-        let sub = match get_protocol_member_inner(py, left, left, member, false, false, resolver) {
-            Some(GetProtocolMemberResult::Found(t)) => Some(t),
-            Some(GetProtocolMemberResult::NoneVal) => None,
-            Some(GetProtocolMemberResult::Defer) => {
-                return None;
-            }
-            None => {
-                return None;
-            }
-        };
-        let sup = match get_protocol_member_inner(py, right, left, member, false, false, resolver) {
-            Some(GetProtocolMemberResult::Found(t)) => Some(t),
-            Some(GetProtocolMemberResult::NoneVal) => None,
-            Some(GetProtocolMemberResult::Defer) => {
-                return None;
-            }
-            None => {
-                return None;
-            }
-        };
+        // original_left, ...); supertype = find_member(member, right, original_left).
+        // self_type is original_left on both (left for instance; tuple fallback).
+        let sub =
+            match get_protocol_member_inner(py, left, self_type, member, false, false, resolver) {
+                Some(GetProtocolMemberResult::Found(t)) => Some(t),
+                Some(GetProtocolMemberResult::NoneVal) => None,
+                Some(GetProtocolMemberResult::Defer) => {
+                    return None;
+                }
+                None => {
+                    return None;
+                }
+            };
+        let sup =
+            match get_protocol_member_inner(py, right, self_type, member, false, false, resolver) {
+                Some(GetProtocolMemberResult::Found(t)) => Some(t),
+                Some(GetProtocolMemberResult::NoneVal) => None,
+                Some(GetProtocolMemberResult::Defer) => {
+                    return None;
+                }
+                None => {
+                    return None;
+                }
+            };
         // Missing member on either side: not an implementation.
         let (sub, sup) = match (sub, sup) {
             (Some(s), Some(p)) => (s, p),
@@ -171,8 +174,18 @@ pub(crate) fn is_protocol_implementation_inner(
         // defers to Python, which recomputes it exactly.
         let left_ref = left_ref(left)?;
         let right_ref = right_ref(right)?;
-        let left_info = resolver.live_typeinfo(py, left_ref)?;
-        let right_info = resolver.live_typeinfo(py, right_ref)?;
+        let left_info = match resolver.live_typeinfo(py, left_ref) {
+            Some(i) if !i.is_none() => i,
+            _ => {
+                return None;
+            }
+        };
+        let right_info = match resolver.live_typeinfo(py, right_ref) {
+            Some(i) if !i.is_none() => i,
+            _ => {
+                return None;
+            }
+        };
         let left_extra = extra_attrs(left);
         let right_extra = extra_attrs(right);
         let subflags = match get_member_flags_inner_pub(
@@ -205,9 +218,7 @@ pub(crate) fn is_protocol_implementation_inner(
         };
         // Member-flag loop (subtypes.py:2025-2055), decided whenever the
         // arbitration hangs only off the two flag sets and the already
-        // extracted member types. Explicit-setter members need lvalue
-        // re-resolution (find_member / get_protocol_member with
-        // is_lvalue=True) and defer.
+        // extracted member types; explicit-setter members defer.
         let settable_sub = subflags.contains(&IS_SETTABLE);
         let settable_super = superflags.contains(&IS_SETTABLE);
         if settable_super {
@@ -215,9 +226,8 @@ pub(crate) fn is_protocol_implementation_inner(
                 return None;
             }
             // Reversed subtype check (subtypes.py:2035-2037): plain
-            // is_subtype(supertype, subtype) — fresh visitor, so
-            // proper_subtype=False, ignore_pos_arg_names=False; the
-            // strict flags derive from the same options, hence ctx's.
+            // is_subtype(supertype, subtype) with a fresh visitor.
+            // Strict flags derive from the same options, hence ctx's.
             let rev_ctx = SubtypeContext::with_callable_flags(
                 false,
                 false,
@@ -231,7 +241,9 @@ pub(crate) fn is_protocol_implementation_inner(
             match is_subtype(&sup, &sub, &rev_ctx, resolver) {
                 Some(true) => {}
                 Some(false) => return Some(false),
-                None => return None,
+                None => {
+                    return None;
+                }
             }
         }
         if settable_super && !settable_sub {
@@ -344,5 +356,5 @@ pub(crate) fn rust_is_protocol_implementation(
         ignore_pos_arg_names,
         strict_concatenate,
     );
-    is_protocol_implementation_inner(py, &left, &right, &skip, &ctx, resolver.resolver())
+    is_protocol_implementation_inner(py, &left, &left, &right, &skip, &ctx, resolver.resolver())
 }

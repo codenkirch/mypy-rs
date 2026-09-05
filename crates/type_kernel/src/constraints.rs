@@ -1012,7 +1012,7 @@ fn visit_instance_protocol_supertype_native(
     let ctx = SubtypeContext::default();
     let verdict = pyo3::Python::with_gil(|py| {
         crate::protocols::is_protocol_implementation_inner(
-            py, actual, &erased, &skip, &ctx, resolver,
+            py, actual, actual, &erased, &skip, &ctx, resolver,
         )
     });
     match verdict {
