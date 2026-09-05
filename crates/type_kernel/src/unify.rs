@@ -148,24 +148,6 @@ fn strip_ret(t: &Type) -> Option<Type> {
     })
 }
 
-/// True when running the constraint inference with
-/// `infer_polymorphic=False` is faithful to the Python call. The Python
-/// fallback runs `visit_callable_type` under the ambient
-/// `type_state.infer_polymorphic` (true for ordinary checking,
-/// checkexpr.py:1325), which attaches `extra_tvars` at any proper-typed
-/// actual that declares variables (constraints.py:1712, 1768), including
-/// through the nested recursion where `skip_neg_op` is False again.
-/// `solve_constraints` then solves the extra vars beside the formal ones,
-/// and the kernel solve has no extra-var channel, so the port defers
-/// those calls instead. `false` also covers the undecided walker
-/// verdicts (a nested alias blocks visibility).
-fn no_extra_tvar_shape(actual: &Type) -> bool {
-    matches!(
-        crate::visitor::callable_with_vars_reachable(actual),
-        Some(false)
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -202,10 +184,6 @@ mod tests {
         }
     }
 
-    fn overloaded(items: Vec<Type>) -> Type {
-        Type::Overloaded { items }
-    }
-
     fn tvar(raw_id: i64) -> Type {
         Type::TypeVarType {
             name: "T".to_string(),
@@ -226,57 +204,6 @@ mod tests {
             variance: 0,
             meta_level: 0,
         }
-    }
-
-    #[test]
-    fn test_no_extra_shape_plain() {
-        assert!(no_extra_tvar_shape(&callable(vec![])));
-    }
-
-    #[test]
-    fn test_no_extra_shape_generic_root() {
-        assert!(!no_extra_tvar_shape(&callable(vec![tvar(1)])));
-    }
-
-    #[test]
-    fn test_no_extra_shape_overloaded_plain_items() {
-        let o = overloaded(vec![callable(vec![]), callable(vec![])]);
-        assert!(no_extra_tvar_shape(&o));
-    }
-
-    #[test]
-    fn test_no_extra_shape_overloaded_generic_item() {
-        let o = overloaded(vec![callable(vec![]), callable(vec![tvar(1)])]);
-        assert!(!no_extra_tvar_shape(&o));
-    }
-
-    #[test]
-    fn test_no_extra_shape_generic_nested_in_ret() {
-        let mut outer = callable(vec![]);
-        if let Type::CallableType { ret_type, .. } = &mut outer {
-            *ret_type = Box::new(callable(vec![]));
-            if let Type::CallableType {
-                ret_type: inner, ..
-            } = &mut outer
-            {
-                *inner = Box::new(callable(vec![tvar(1)]));
-            }
-        }
-        assert!(!no_extra_tvar_shape(&outer));
-    }
-
-    #[test]
-    fn test_no_extra_shape_alias_defers() {
-        let a = Type::TypeAliasType {
-            args: vec![],
-            type_ref: "m.A".to_string(),
-            is_recursive: false,
-        };
-        let mut c = callable(vec![]);
-        if let Type::CallableType { arg_types, .. } = &mut c {
-            arg_types.push(a);
-        }
-        assert!(!no_extra_tvar_shape(&c));
     }
 
     #[test]
@@ -427,6 +354,84 @@ mod tests {
             other => panic!("expected Unified, got {:?}", other),
         }
     }
+
+    #[test]
+    fn test_unify_generic_right_arg_frame_unifies() {
+        // The wave-37 no_extra_tvar_shape gate deferred every pair whose
+        // right callable declared its own type variables, even when the
+        // tree was clean. With the extras channel (#1427) the generic arg
+        // frame decides: T is constrained by str and substituted.
+        let left = callable_with(
+            vec![tvar(5)],
+            vec![tvar(5)],
+            instance("builtins.int", vec![]),
+        );
+        let right = callable_with(
+            vec![tvar(2)],
+            vec![instance("builtins.str", vec![])],
+            instance("builtins.int", vec![]),
+        );
+        let r = resolver_with(&[
+            "builtins.int",
+            "builtins.str",
+            "builtins.function",
+            "builtins.object",
+        ]);
+        let outcome = unify_generic_callable_core(&left, &right, true, true, &r, &empty_aliases());
+        match outcome {
+            UnifyOutcome::Unified(t) => match t {
+                Type::CallableType { arg_types, .. } => {
+                    assert_eq!(arg_types, vec![instance("builtins.str", vec![])],);
+                }
+                other => panic!("expected CallableType, got {:?}", other),
+            },
+            other => panic!("expected Unified, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_unify_ret_frame_extras_end_to_end() {
+        // ignore_return=false: the nested generic arg frame enters
+        // callable-vs-callable with the ambient reverse gate live, whose
+        // reverse inference attaches right's own variables as extras; the
+        // unified result still substitutes the inner arg.
+        let left = callable_with(
+            vec![tvar(5)],
+            vec![callable_with(vec![], vec![tvar(5)], tvar(5))],
+            instance("builtins.int", vec![]),
+        );
+        let right = callable_with(
+            vec![tvar(2)],
+            vec![callable_with(
+                vec![],
+                vec![instance("builtins.str", vec![])],
+                instance("builtins.str", vec![]),
+            )],
+            instance("builtins.int", vec![]),
+        );
+        let r = resolver_with(&[
+            "builtins.int",
+            "builtins.str",
+            "builtins.function",
+            "builtins.object",
+        ]);
+        let outcome = unify_generic_callable_core(&left, &right, false, true, &r, &empty_aliases());
+        match outcome {
+            UnifyOutcome::Unified(t) => match t {
+                Type::CallableType { arg_types, .. } => {
+                    let Type::CallableType {
+                        arg_types: inner, ..
+                    } = &arg_types[0]
+                    else {
+                        panic!("outer arg is a callable");
+                    };
+                    assert_eq!(inner, &vec![instance("builtins.str", vec![])],);
+                }
+                other => panic!("expected CallableType, got {:?}", other),
+            },
+            other => panic!("expected Unified, got {:?}", other),
+        }
+    }
 }
 
 /// Core of `unify_generic_callable` (subtypes.py:2954-3011).
@@ -454,6 +459,15 @@ pub(crate) fn unify_generic_callable_core(
         return UnifyOutcome::Defer;
     };
 
+    // The polymorphic reverse-inference gate (constraints.py:1712/1768)
+    // reads the ambient `type_state.infer_polymorphic`, True for ordinary
+    // checking (checkexpr.py:1325). Installing Known(true) is faithful for
+    // the production callers; under old_type_inference=True (ambient False)
+    // the kernel may infer where Python defers back to unify_generic_
+    // callable, which is argc-unify-only and cannot change a subtype
+    // verdict (accepted divergence, see PR notes).
+    let _poly = crate::constraints::PolyModeGuard::install(true);
+
     // subtypes.py:2966-2969: freshen when `type.type_var_ids()` clashes with
     // the type variables anywhere in `target`. Freshening needs the global
     // `TypeVarId.next_raw_id` counter (freshen.rs), so defer.
@@ -476,7 +490,7 @@ pub(crate) fn unify_generic_callable_core(
 
     // subtypes.py:2977-2983: arg constraints over the ret-stripped sides,
     // with `skip_neg_op=True`. The erased/infallible wrapper defaults ride
-    // `infer_constraints_full_inner` (see `no_extra_tvar_shape` for the gate).
+    // `infer_constraints_full_inner`.
     let lstrip = match strip_ret(left) {
         Some(t) => t,
         None => return UnifyOutcome::Defer,
@@ -485,9 +499,9 @@ pub(crate) fn unify_generic_callable_core(
         Some(t) => t,
         None => return UnifyOutcome::Defer,
     };
-    if !no_extra_tvar_shape(&rstrip) {
-        return UnifyOutcome::Defer;
-    }
+    // The tri-state install above makes the generic-right reverse frame
+    // decide natively; no `no_extra_tvar_shape` gate remains (removed in
+    // the #1427 extras-channel port).
     let mut constraints: Vec<Constraint> = Vec::new();
     match crate::constraints::infer_constraints_full_inner(
         &lstrip,
@@ -496,9 +510,8 @@ pub(crate) fn unify_generic_callable_core(
         resolver,
         aliases,
         strict_optional,
-        true,  // skip_neg_op
-        false, // infer_polymorphic
-        true,  // erase_types
+        true, // skip_neg_op
+        true, // erase_types
     ) {
         Some(cs) => constraints.extend(cs),
         None => return UnifyOutcome::Defer,
@@ -513,19 +526,10 @@ pub(crate) fn unify_generic_callable_core(
             }
             _ => return UnifyOutcome::Defer,
         };
-        // The ret call runs with `skip_neg_op=False`, so it is itself an
-        // extras-attach site: gate on the proper-typed right ret the
-        // dispatched call will see.
-
-        // The dispatched call proper-types its operand, so the gate must
-        // decide on the expanded shape; `expand_top_aliases` `None`
+        // The dispatched call proper-types its operand, so mirror the
+        // expansion side effects first; `expand_top_aliases` `None`
         // (snapshot miss, variadic alias, cycle) defers the call.
-        let right_ret_p =
-            match crate::subtypes::expand_top_aliases(right_ret, aliases, strict_optional) {
-                Some(t) => t,
-                None => return UnifyOutcome::Defer,
-            };
-        if !no_extra_tvar_shape(&right_ret_p) {
+        if crate::subtypes::expand_top_aliases(right_ret, aliases, strict_optional).is_none() {
             return UnifyOutcome::Defer;
         }
         match crate::constraints::infer_constraints_full_inner(
@@ -535,9 +539,9 @@ pub(crate) fn unify_generic_callable_core(
             resolver,
             aliases,
             strict_optional,
-            false, // skip_neg_op
-            false, // infer_polymorphic
-            true,  // erase_types
+            false,
+            // Python `infer_constraints` wrapper default (constraints.py:802).
+            true,
         ) {
             Some(cs) => constraints.extend(cs),
             None => return UnifyOutcome::Defer,

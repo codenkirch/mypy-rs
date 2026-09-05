@@ -9,7 +9,7 @@
 
 use pyo3::prelude::*;
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 
 use crate::argapprox::make_normalized_type_type;
 use crate::checkexpr_functions::get_proper_or_expand;
@@ -56,11 +56,30 @@ pub(crate) fn neg_op(op: i64) -> i64 {
 /// full `TypeVarType`), this carries the origin so the Python solver can
 /// use `values`/`upper_bound`/`variance`/`meta_level` when grouping and
 /// solving. The TypeVarType wire round-trip is complete (see #177).
-#[derive(Debug, Clone, PartialEq)]
+///
+/// `extra_tvars` is the @1427 kernel channel mirroring Python's
+/// `Constraint.extra_tvars` (constraints.py:597): vars of a generic
+/// actual callable attached by the polymorphic reverse-inference frame
+/// (constraints.py:1810-1812). Rust-internal only; `write`/`read` stay
+/// 3-field, so a decoded constraint carries an empty list.
+#[derive(Debug, Clone)]
 pub(crate) struct Constraint {
     pub origin_type_var: Type,
     pub op: i64, // SUBTYPE_OF or SUPERTYPE_OF
     pub target: Type,
+    pub extra_tvars: Vec<Type>,
+}
+
+// Python `Constraint.__eq__` compares exactly (type_var, op, target)
+// (constraints.py:608-611): `extra_tvars` must stay out of equality or the
+// remove-set filters in solve would diverge whenever a constraint happens
+// to carry extras.
+impl PartialEq for Constraint {
+    fn eq(&self, other: &Self) -> bool {
+        self.origin_type_var == other.origin_type_var
+            && self.op == other.op
+            && self.target == other.target
+    }
 }
 
 impl Constraint {
@@ -80,6 +99,7 @@ impl Constraint {
             origin_type_var,
             op,
             target,
+            extra_tvars: Vec::new(),
         })
     }
 }
@@ -128,6 +148,7 @@ fn infer_constraints_inner(template: &Type, actual: &Type, direction: i64) -> Op
                 origin_type_var: template.clone(),
                 op: direction,
                 target: actual.clone(),
+                extra_tvars: Vec::new(),
             })
         }
         _ => None,
@@ -160,6 +181,10 @@ pub(crate) fn rust_infer_constraints_full(
     let template = (read_type(&mut tb, None).ok())?;
     let mut ab = ReadBuffer::new(actual_bytes);
     let actual = (read_type(&mut ab, None).ok())?;
+    // constraints.py:954 passes the ambient `type_state.infer_polymorphic`
+    // faithfully; the tri-state mode hands it down through every nested
+    // frame so the callable-vs-callable reverse gate sees what Python sees.
+    let _poly = PolyModeGuard::install(infer_polymorphic);
     let constraints = infer_constraints_full_inner(
         &template,
         &actual,
@@ -168,9 +193,14 @@ pub(crate) fn rust_infer_constraints_full(
         resolver.alias_resolver(),
         strict_optional,
         skip_neg_op,
-        infer_polymorphic,
         erase_types,
     )?;
+    // The wire format stays 3-field: an extras-carrying constraint would
+    // lose its `extra_tvars` in serialization (#1171), so defer the whole
+    // call to Python instead (the Python body re-emits them as objects).
+    if constraints.iter().any(|c| !c.extra_tvars.is_empty()) {
+        return None;
+    }
     let mut out = Vec::with_capacity(constraints.len());
     for c in constraints {
         let mut b = WriteBuffer::new();
@@ -204,7 +234,6 @@ pub(crate) fn infer_constraints_full_inner(
     aliases: &crate::aliases::TypeAliasResolver,
     strict_optional: bool,
     skip_neg_op: bool,
-    infer_polymorphic: bool,
     // The `visit_type_type` callable/overloaded arms consult this
     // (constraints.py:2050,2057). Internal recursion passes `true` like the
     // Python wrapper default (constraints.py:802), entry carries caller flag.
@@ -235,7 +264,6 @@ pub(crate) fn infer_constraints_full_inner(
         aliases,
         strict_optional,
         skip_neg_op,
-        infer_polymorphic,
         erase_types,
     )
 }
@@ -244,6 +272,40 @@ thread_local! {
     /// Mirror of `constraints.py` `type_state.inferring`: in-progress
     /// (template, actual) pairs for alias-bearing templates.
     static INFERRING: RefCell<Vec<(Type, Type)>> = const { RefCell::new(Vec::new()) };
+    /// Tri-state mirror of `type_state.infer_polymorphic`
+    /// (constraints.py:1711-1724): `0` = Unknown (no entry installed the
+    /// Python flag, so the polymorphic reverse-inference frame defers the
+    /// whole callable-vs-callable call, pre-@1427 behavior), `1` =
+    /// Known(true) (the reverse frame fires and attaches `extra_tvars`),
+    /// `2` = Known(false) (the fold is skipped, no extras). Only the seams
+    /// that faithfully see the Python flag install Known
+    /// (`rust_infer_constraints_full` = Known(param),
+    /// `unify_generic_callable_core` = Known(true), accepted divergence
+    /// under `old_type_inference`); every other entry point inherits
+    /// Unknown so unverifiable mode defers to Python instead of guessing.
+    static INFER_POLY: Cell<u8> = const { Cell::new(0) };
+}
+
+/// RAII tri-state install for [`INFER_POLY`] (panic-safe; the mode is
+/// per-thread, so a guard must never outlive the frame that installed it).
+pub(crate) struct PolyModeGuard;
+
+impl PolyModeGuard {
+    pub(crate) fn install(value: bool) -> Self {
+        INFER_POLY.with(|c| c.set(if value { 1 } else { 2 }));
+        Self
+    }
+}
+
+impl Drop for PolyModeGuard {
+    fn drop(&mut self) {
+        INFER_POLY.with(|c| c.set(0));
+    }
+}
+
+/// The installed tri-state (0/1/2) visible to the current frame.
+fn infer_poly_mode() -> u8 {
+    INFER_POLY.with(Cell::get)
 }
 
 /// RAII pop for [`INFERRING`] (panic-safe, mirrors the wrapper's
@@ -267,7 +329,6 @@ fn infer_constraints_dispatch(
     aliases: &crate::aliases::TypeAliasResolver,
     strict_optional: bool,
     skip_neg_op: bool,
-    infer_polymorphic: bool,
     erase_types: bool,
 ) -> Option<Vec<Constraint>> {
     // `_infer_constraints` (constraints.py:815-943), top to bottom. `orig`
@@ -322,6 +383,7 @@ fn infer_constraints_dispatch(
             origin_type_var: t.clone(),
             op: direction,
             target: a.clone(),
+            extra_tvars: Vec::new(),
         }]);
     }
     // Actual TypeVar rebinding (constraints.py:866-879). Skipped when the
@@ -369,7 +431,6 @@ fn infer_constraints_dispatch(
                     aliases,
                     strict_optional,
                     false,
-                    false,
                     // Python branch a uses the wrapper (constraints.py:917).
                     true,
                 )?;
@@ -412,7 +473,6 @@ fn infer_constraints_dispatch(
                     resolver,
                     aliases,
                     strict_optional,
-                    false,
                     false,
                     // Python branch b uses the wrapper (constraints.py:927).
                     true,
@@ -484,7 +544,6 @@ fn infer_constraints_dispatch(
             aliases,
             strict_optional,
             skip_neg_op,
-            infer_polymorphic,
         ),
         Type::Overloaded { .. } => {
             visit_overloaded_native(&t, &a, direction, resolver, aliases, strict_optional)
@@ -642,7 +701,6 @@ fn infer_constraints_if_possible_inner(
         aliases,
         strict_optional,
         false,
-        false,
         // `infer_constraints_if_possible` tail (constraints.py:1032).
         true,
     )
@@ -664,6 +722,7 @@ fn rep_to_constraint(r: ConstraintRep) -> Constraint {
         origin_type_var: r.origin,
         op: r.op,
         target: r.target,
+        extra_tvars: Vec::new(),
     }
 }
 
@@ -676,6 +735,14 @@ fn run_any_constraints(
     strict_optional: bool,
     resolver: &TypeResolver,
 ) -> Option<Vec<Constraint>> {
+    // ConstraintRep is 3-field and drops `extra_tvars`; an option list
+    // carrying extras would silently lose them, so defer instead.
+    if options.iter().any(|opt| {
+        opt.as_ref()
+            .is_some_and(|cs| cs.iter().any(|c| !c.extra_tvars.is_empty()))
+    }) {
+        return None;
+    }
     let reps: Vec<Option<Vec<ConstraintRep>>> = options
         .into_iter()
         .map(|opt| opt.map(|cs| cs.into_iter().map(constraint_to_rep).collect()))
@@ -721,7 +788,6 @@ fn handle_recursive_union_inner(
         aliases,
         strict_optional,
         false,
-        false,
         // handle_recursive_union mirror (constraints.py:1090).
         true,
     )?;
@@ -735,7 +801,6 @@ fn handle_recursive_union_inner(
         resolver,
         aliases,
         strict_optional,
-        false,
         false,
         true,
     )?;
@@ -1311,7 +1376,6 @@ fn visit_instance_tail_native(
                 aliases,
                 strict_optional,
                 false,
-                false,
                 // Tail mirror of the wrapper call at constraints.py:1647.
                 true,
             )
@@ -1327,7 +1391,6 @@ fn visit_instance_tail_native(
             resolver,
             aliases,
             strict_optional,
-            false,
             false,
             // Tail mirror of the wrapper call at constraints.py:1650.
             true,
@@ -1422,6 +1485,7 @@ fn visit_tuple_native(
                         origin_type_var: unmapped_inner.clone(),
                         op: direction,
                         target: mapped_instance.clone(),
+                        extra_tvars: Vec::new(),
                     });
                 }
                 Type::Instance { type_ref, .. } if type_ref == "builtins.tuple" => {
@@ -1724,6 +1788,7 @@ fn simple_unpack_native(
                         items: Vec::new(),
                         implicit: false,
                     },
+                    extra_tvars: Vec::new(),
                 }]),
                 _ => Some(vec![]),
             };
@@ -1787,6 +1852,7 @@ fn simple_unpack_native(
                     origin_type_var: inner.clone(),
                     op: direction,
                     target,
+                    extra_tvars: Vec::new(),
                 });
             }
             _ => return None,
@@ -1859,6 +1925,7 @@ fn simple_unpack_native(
                     origin_type_var: inner.clone(),
                     op: direction,
                     target,
+                    extra_tvars: Vec::new(),
                 });
             }
             _ => {}
@@ -2163,7 +2230,6 @@ fn visit_callable_native(
     aliases: &crate::aliases::TypeAliasResolver,
     strict_optional: bool,
     skip_neg_op: bool,
-    infer_polymorphic: bool,
 ) -> Option<Vec<Constraint>> {
     // The CallableType actual takes the full template-vs-callable port
     // (constraints.py:1656-1780), which must see the raw template: the
@@ -2177,7 +2243,6 @@ fn visit_callable_native(
             aliases,
             strict_optional,
             skip_neg_op,
-            infer_polymorphic,
         );
     }
     let callee = match template {
@@ -2254,6 +2319,7 @@ fn visit_callable_native(
             origin_type_var: ps,
             op: SUBTYPE_OF,
             target,
+            extra_tvars: Vec::new(),
         });
     }
     res.extend(push_inner(
@@ -2395,25 +2461,26 @@ fn repack_callable_args_wire(
 }
 
 /// Port of the `isinstance(self.actual, CallableType)` branch of
-/// `visit_callable_type` (constraints.py:1656-1780): normalize both sides
+/// `visit_callable_type` (constraints.py:1656-1813): normalize both sides
 /// (`with_unpacked_kwargs().with_normalized_var_args()`), infer the
 /// ret-type constraint (with type_guard/type_is arms), then either the
-/// unpack-repack + simple-unpack path, `infer_callable_arguments_constraints`,
-/// or (template ParamSpec) the prefix + `param_spec_target` construction.
+/// reverse gate + args, or (template ParamSpec) the reverse gate +
+/// prefix + `param_spec_target` construction.
+///
+/// The ambient polymorphic state rides the thread-local tri-state
+/// (PolyModeGuard), mirroring the Python ambient `type_state.infer_
+/// polymorphic` read at constraints.py:1712/1768/1795: Unknown mode keeps
+/// the pre-#1427 defer front, Known(true) fires the opposite-direction
+/// reverse frame plus the extras tail (constraints.py:1710-1733,
+/// 1768-1775, 1810-1812), Known(false) keeps both gates off.
 ///
 /// Defers (`None`) when either side fails to normalize, any nested
-/// constraint step defers, or the actual carries type variables while the
-/// polymorphic opposite-direction inference is live
-/// (constraints.py:1720-1743, 1778-1785): that path attaches `extra_tvars`
-/// to every emitted constraint and the wire format has no representation
-/// for those (#1171). The gate only fires for skip_neg_op=False entries:
-/// the sole skip_neg_op=True callers (constraints.py:1740/1782) live
-/// inside the polymorphic block itself, so there the Opposite-work is
-/// skipped in Python too (`not self.skip_neg_op`) and the call proceeds
-/// natively with `extra_tvars` staying False; the param-spec-target
-/// `variables` write then mirrors the `infer_polymorphic` ternary at
-/// constraints.py:1805. Nested Rust recursions always pass
-/// (false, false), matching the Python recursion sites' defaults.
+/// constraint step defers, or the actual carries type variables in
+/// Unknown mode (the wire historically had no representation for the
+/// resulting `extra_tvars`; #1171). Nested Rust recursions have no mode
+/// install, so they read Unknown and keep the old
+/// skip_neg_op=False/erase_types=True defaults; the tri-state read sites
+/// mirror constraints.py:1712/1768/1795.
 #[allow(clippy::too_many_arguments)]
 fn callable_vs_callable_native(
     template: &Type,
@@ -2423,7 +2490,6 @@ fn callable_vs_callable_native(
     aliases: &crate::aliases::TypeAliasResolver,
     strict_optional: bool,
     skip_neg_op: bool,
-    infer_polymorphic: bool,
 ) -> Option<Vec<Constraint>> {
     let templ = match crate::checkcall::normalize_callable(template) {
         Ok(t) => t,
@@ -2461,11 +2527,14 @@ fn callable_vs_callable_native(
         return None;
     };
 
-    // Polymorphic / skip_neg_op gates (constraints.py:1674-1681,
-    // 1732-1736) fire only when cactual has variables.
-    if !a_vars.is_empty() && !skip_neg_op {
+    // Defer front parity (pre-#1427): the reverse gates need the ambient
+    // mode; the Unknown mode with a generic actual can't evaluate the
+    // infer_polymorphic conditionals at constraints.py:1711-1724/1768.
+    let mode = infer_poly_mode();
+    if !a_vars.is_empty() && !skip_neg_op && mode == 0 {
         return None;
     }
+    let mut extras_fired = false;
 
     // Ret constraint with the type_guard / type_is arms
     // (constraints.py:1662-1672).
@@ -2490,6 +2559,30 @@ fn callable_vs_callable_native(
 
     let param_spec = param_spec_of(t_args, t_kinds, t_names);
     if param_spec.is_none() {
+        // Opposite-direction inference marks extra type variables for
+        // the solver (constraints.py:1711-1733); a self-id var leaking
+        // through an ellipsis template is the only exception.
+        if mode == 1
+            && !a_vars.is_empty()
+            && !skip_neg_op
+            && !(a_vars
+                .iter()
+                .any(|v| matches!(v, Type::TypeVarType { raw_id: 0, .. }))
+                && *t_ellipsis)
+        {
+            let cs = infer_constraints_full_inner(
+                &cact,
+                &templ,
+                neg_op(direction),
+                resolver,
+                aliases,
+                strict_optional,
+                true,
+                true,
+            )?;
+            res.extend(cs);
+            extras_fired = true;
+        }
         // We can't infer constraints from arguments if the template is
         // Callable[..., T] (constraints.py:1694-1695).
         if !*t_ellipsis {
@@ -2520,6 +2613,11 @@ fn callable_vs_callable_native(
                 )?);
             }
         }
+        if extras_fired {
+            for c in &mut res {
+                c.extra_tvars.extend(a_vars.iter().cloned());
+            }
+        }
         return Some(res);
     }
     // ParamSpec prefix branch (constraints.py:1719-1779).
@@ -2531,6 +2629,23 @@ fn callable_vs_callable_native(
     };
     let prefix_len = prefix.arg_types.len();
     let cactual_ps = param_spec_of(a_args, a_kinds, a_names);
+
+    // No self/ellipsis exception here: the ps-branch gate is the plain
+    // conjunction (constraints.py:1768-1775).
+    if mode == 1 && !a_vars.is_empty() && !skip_neg_op {
+        let cs = infer_constraints_full_inner(
+            &cact,
+            &templ,
+            neg_op(direction),
+            resolver,
+            aliases,
+            strict_optional,
+            true,
+            true,
+        )?;
+        res.extend(cs);
+        extras_fired = true;
+    }
 
     // Compare prefixes as well (constraints.py:1743-1754).
     let mut cbase = match crate::checkcall::callable_base(&cact) {
@@ -2561,13 +2676,12 @@ fn callable_vs_callable_native(
                 arg_types: a_args[pl..].to_vec(),
                 arg_kinds: a_kinds[pl..].to_vec(),
                 arg_names: a_names[pl..].to_vec(),
-                // constraints.py:1805: under polymorphic inference the
-                // target carries no variables (they live in extra_tvars,
-                // which the wire cannot express; the gate deferred first).
-                variables: if infer_polymorphic {
-                    Vec::new()
-                } else {
-                    a_vars.clone()
+                // constraints.py:1795 reads the ambient flag directly,
+                // NOT the fired flag: a Known(true) skip_neg_op=True
+                // frame still yields an empty variables list here.
+                variables: match mode {
+                    1 => Vec::new(),
+                    _ => a_vars.clone(),
                 },
                 imprecise_arg_kinds: *a_imprecise,
                 is_ellipsis_args: false,
@@ -2617,7 +2731,13 @@ fn callable_vs_callable_native(
             origin_type_var: param_spec,
             op: direction,
             target,
+            extra_tvars: Vec::new(),
         });
+    }
+    if extras_fired {
+        for c in &mut res {
+            c.extra_tvars.extend(a_vars.iter().cloned());
+        }
     }
     Some(res)
 }
@@ -2736,6 +2856,7 @@ fn infer_against_any_native(
                         origin_type_var: typ.as_ref().clone(),
                         op: direction,
                         target: any_type.clone(),
+                        extra_tvars: Vec::new(),
                     });
                 }
                 _ => return None,
@@ -2772,7 +2893,6 @@ fn push_inner(
         resolver,
         aliases,
         strict_optional,
-        false,
         false,
         // Every visit_* nested recursion mirrors Python's top-level
         // `infer_constraints` call, whose wrapper default is True.
@@ -2862,6 +2982,11 @@ pub(crate) fn rust_infer_callable_arguments_constraints(
         resolver.alias_resolver(),
         strict_optional,
     )?;
+    // The write loop is 3-field: an extras-carrying constraint would lose
+    // its `extra_tvars` in serialization, so defer to Python instead.
+    if res.iter().any(|c| !c.extra_tvars.is_empty()) {
+        return None;
+    }
     let mut output = WriteBuffer::new();
     crate::wire::write_int_bare(&mut output, res.len() as i64).ok()?;
     for c in &res {
@@ -3035,7 +3160,6 @@ pub(crate) fn infer_directed_arg_constraints_native(
         strict_optional,
         false,
         // Python `infer_constraints` wrapper default (constraints.py:802).
-        false,
         true,
     )
 }
@@ -3073,6 +3197,7 @@ mod tests {
             origin_type_var: tv.clone(),
             op: SUPERTYPE_OF,
             target: any_type(),
+            extra_tvars: Vec::new(),
         };
         let mut buf = WriteBuffer::new();
         c.write(&mut buf).unwrap();
@@ -3214,7 +3339,6 @@ mod tests {
             &crate::aliases::TypeAliasResolver::new(),
             true,
             false,
-            false,
         );
         assert!(res.is_some());
         let constraints = res.unwrap();
@@ -3241,7 +3365,6 @@ mod tests {
             &resolver,
             &crate::aliases::TypeAliasResolver::new(),
             true,
-            false,
             false,
         )
         .is_none());
@@ -3281,7 +3404,6 @@ mod tests {
             &resolver,
             &crate::aliases::TypeAliasResolver::new(),
             true,
-            false,
             false,
         )
         .is_none());
@@ -3335,7 +3457,6 @@ mod tests {
             &resolver,
             &crate::aliases::TypeAliasResolver::new(),
             true,
-            false,
             false,
         )
         .is_none());
@@ -3509,7 +3630,6 @@ mod tests {
             &aliases,
             true,
             false,
-            false,
             true,
         );
         let constraints = res.expect("alias template must resolve natively");
@@ -3543,7 +3663,6 @@ mod tests {
             &aliases,
             true,
             false,
-            false,
             true,
         );
         let constraints = res.expect("alias actual must resolve natively");
@@ -3566,7 +3685,6 @@ mod tests {
             &resolver,
             &aliases,
             true,
-            false,
             false,
             true,
         )
@@ -3596,7 +3714,6 @@ mod tests {
             &resolver,
             &aliases,
             true,
-            false,
             false,
             true,
         );
@@ -3631,7 +3748,6 @@ mod tests {
             &crate::aliases::TypeAliasResolver::new(),
             true,
             false,
-            false,
             true,
         )
         .is_some_and(|c| c.is_empty()));
@@ -3653,7 +3769,6 @@ mod tests {
             &crate::aliases::TypeAliasResolver::new(),
             true,
             false,
-            false,
             true,
         )
         .is_none());
@@ -3668,7 +3783,7 @@ mod tests {
         let template = union_type(vec![generic_list(type_var(1, "T")), instance_str()]);
         let actual = generic_list(instance_int());
         let res = infer_constraints_full_inner(
-            &template, &actual, SUBTYPE_OF, &resolver, &aliases, true, false, false, true,
+            &template, &actual, SUBTYPE_OF, &resolver, &aliases, true, false, true,
         );
         let constraints = res.expect("branch a must compute natively");
         assert_eq!(constraints.len(), 1);
@@ -3696,7 +3811,6 @@ mod tests {
             &crate::aliases::TypeAliasResolver::new(),
             true,
             false,
-            false,
             true,
         );
         assert!(res.is_some_and(|c| c.is_empty()));
@@ -3719,7 +3833,6 @@ mod tests {
             &resolver,
             &crate::aliases::TypeAliasResolver::new(),
             true,
-            false,
             false,
             true,
         );
@@ -3756,7 +3869,6 @@ mod tests {
             &resolver,
             &crate::aliases::TypeAliasResolver::new(),
             true,
-            false,
             false,
             true,
         )
@@ -3854,7 +3966,6 @@ mod tests {
             &aliases,
             true,
             false,
-            false,
             true,
         );
         assert!(res.is_some_and(|c| c.is_empty()));
@@ -3881,7 +3992,6 @@ mod tests {
                 &resolver,
                 &aliases,
                 true,
-                false,
                 false,
                 true,
             );
@@ -4161,7 +4271,6 @@ mod tests {
             &aliases,
             true,
             false,
-            false,
         )
         .expect("plain callable-vs-callable must decide natively");
         assert_eq!(res.len(), 2);
@@ -4216,7 +4325,6 @@ mod tests {
             &aliases,
             true,
             false,
-            false,
         )
         .expect("ellipsis template must decide natively");
         assert_eq!(res.len(), 1);
@@ -4266,7 +4374,6 @@ mod tests {
             &aliases,
             true,
             false,
-            false,
         )
         .expect("unpack template must decide natively");
         // Ret constraint (T vs int, SUPERTYPE_OF) plus the unpack-middle
@@ -4314,7 +4421,6 @@ mod tests {
             &resolver,
             &aliases,
             true,
-            false,
             false,
         )
         .expect("ParamSpec template must decide natively");
@@ -4372,7 +4478,6 @@ mod tests {
             &aliases,
             true,
             false,
-            false,
         )
         .expect("both-ParamSpec pair must decide natively");
         assert_eq!(res.len(), 1);
@@ -4417,7 +4522,6 @@ mod tests {
             &aliases,
             true,
             false,
-            false,
         )
         .is_none());
     }
@@ -4452,7 +4556,6 @@ mod tests {
             SUPERTYPE_OF,
             &resolver,
             &aliases,
-            true,
             true,
             true,
         )
@@ -4504,7 +4607,6 @@ mod tests {
             &aliases,
             true,
             true,
-            false,
         )
         .expect("param-spec target with generic actual must engage (skip=true)");
         let ps_c = res
@@ -4523,6 +4625,7 @@ mod tests {
         // Same shape under infer_polymorphic=true: the target carries no
         // variables (they live in extra_tvars the wire cannot express;
         // #1171).
+        let _poly = PolyModeGuard::install(true);
         let resolver = builtin_resolver();
         let aliases = crate::aliases::TypeAliasResolver::new();
         let tv = type_var(7, "T");
@@ -4551,7 +4654,6 @@ mod tests {
             &aliases,
             true,
             true,
-            true,
         )
         .expect("param-spec target with generic actual must engage (skip=true)");
         let ps_c = res
@@ -4562,6 +4664,309 @@ mod tests {
             panic!("param-spec target not Parameters");
         };
         assert!(target.variables.is_empty());
+    }
+
+    // ---- extra_tvars reverse frames (#1427) ----
+
+    #[test]
+    fn test_cb_extras_reverse_frame_fires_when_polymorphic() {
+        let _poly = PolyModeGuard::install(true);
+        let resolver = builtin_resolver();
+        let aliases = crate::aliases::TypeAliasResolver::new();
+        let tv7 = type_var(7, "T");
+        let tv2 = type_var(2, "U");
+        let template = cb_callable(
+            vec![tv7.clone()],
+            vec![0],
+            vec![None],
+            tv7.clone(),
+            Vec::new(),
+            false,
+        );
+        let actual = cb_callable(
+            vec![instance_str()],
+            vec![0],
+            vec![None],
+            instance_int(),
+            vec![tv2.clone()],
+            false,
+        );
+        let res = callable_vs_callable_native(
+            &template,
+            &actual,
+            SUPERTYPE_OF,
+            &resolver,
+            &aliases,
+            true,
+            false,
+        )
+        .expect("polymorphic reverse frame must engage");
+        assert!(!res.is_empty());
+        // constraints.py:1710-1733: every emitted constraint marks the
+        // actual's own type variables for the solver.
+        for c in &res {
+            assert_eq!(c.extra_tvars, vec![tv2.clone()]);
+        }
+        assert!(res.iter().any(|c| c.op == SUBTYPE_OF));
+    }
+
+    #[test]
+    fn test_cb_extras_absent_when_not_polymorphic() {
+        let _poly = PolyModeGuard::install(false);
+        let resolver = builtin_resolver();
+        let aliases = crate::aliases::TypeAliasResolver::new();
+        let tv7 = type_var(7, "T");
+        let template = cb_callable(
+            vec![tv7.clone()],
+            vec![0],
+            vec![None],
+            tv7.clone(),
+            Vec::new(),
+            false,
+        );
+        let actual = cb_callable(
+            vec![instance_str()],
+            vec![0],
+            vec![None],
+            instance_int(),
+            vec![type_var(2, "U")],
+            false,
+        );
+        let res = callable_vs_callable_native(
+            &template,
+            &actual,
+            SUPERTYPE_OF,
+            &resolver,
+            &aliases,
+            true,
+            false,
+        )
+        .expect("Known(false) keeps pre-#1427 engagement (extras never attach)");
+        for c in &res {
+            assert!(c.extra_tvars.is_empty());
+        }
+    }
+
+    #[test]
+    fn test_cb_extras_frame_respects_skip_neg_op() {
+        let _poly = PolyModeGuard::install(true);
+        let resolver = builtin_resolver();
+        let aliases = crate::aliases::TypeAliasResolver::new();
+        let tv7 = type_var(7, "T");
+        let template = cb_callable(
+            vec![tv7.clone()],
+            vec![0],
+            vec![None],
+            tv7.clone(),
+            Vec::new(),
+            false,
+        );
+        let actual = cb_callable(
+            vec![instance_str()],
+            vec![0],
+            vec![None],
+            instance_int(),
+            vec![type_var(2, "U")],
+            false,
+        );
+        let res = callable_vs_callable_native(
+            &template,
+            &actual,
+            SUPERTYPE_OF,
+            &resolver,
+            &aliases,
+            true,
+            // skip_neg_op=True suppresses the reverse frame
+            // (constraints.py:1711) even under Known(true).
+            true,
+        )
+        .expect("skip_neg_op must not defer the call");
+        for c in &res {
+            assert!(c.extra_tvars.is_empty());
+        }
+    }
+
+    #[test]
+    fn test_cb_extras_self_id_ellipsis_exception() {
+        let _poly = PolyModeGuard::install(true);
+        let resolver = builtin_resolver();
+        let aliases = crate::aliases::TypeAliasResolver::new();
+        // constraints.py:1724-1731: a self-id variable carried by the
+        // raw_id==0 var leaking through an ellipsis template is the only
+        // exception to the reverse gate.
+        let template = cb_callable(vec![], vec![], vec![], type_var(1, "R"), Vec::new(), true);
+        let actual = cb_callable(
+            vec![instance_str()],
+            vec![0],
+            vec![None],
+            instance_int(),
+            vec![type_var(0, "S")],
+            false,
+        );
+        let res = callable_vs_callable_native(
+            &template,
+            &actual,
+            SUPERTYPE_OF,
+            &resolver,
+            &aliases,
+            true,
+            false,
+        )
+        .expect("the exception arm must keep the call engaged");
+        for c in &res {
+            assert!(c.extra_tvars.is_empty());
+        }
+    }
+
+    #[test]
+    fn test_cb_extras_ps_branch_reverse_gate() {
+        let _poly = PolyModeGuard::install(true);
+        let resolver = builtin_resolver();
+        let aliases = crate::aliases::TypeAliasResolver::new();
+        let ps = cb_param_spec("P", 5, vec![instance_int()]);
+        let template = cb_callable(
+            vec![instance_int(), ps, any_type()],
+            vec![0, 2, 4],
+            vec![None, None, None],
+            type_var(7, "T"),
+            Vec::new(),
+            false,
+        );
+        let actual = cb_callable(
+            vec![instance_int()],
+            vec![0],
+            vec![None],
+            instance_str(),
+            vec![type_var(2, "U")],
+            false,
+        );
+        let res = callable_vs_callable_native(
+            &template,
+            &actual,
+            SUPERTYPE_OF,
+            &resolver,
+            &aliases,
+            true,
+            false,
+        )
+        .expect("ps-branch reverse gate must engage under Known(true)");
+        // constraints.py:1768-1775 + the extras tail.
+        for c in &res {
+            assert_eq!(c.extra_tvars, vec![type_var(2, "U")]);
+        }
+        // constraints.py:1795 reads the ambient mode, not the fired flag.
+        let ps_c = res
+            .iter()
+            .find(|c| matches!(&c.target, Type::Parameters(_)))
+            .expect("param-spec constraint targets the captured Parameters");
+        let Type::Parameters(target) = &ps_c.target else {
+            panic!("param-spec target not Parameters");
+        };
+        assert!(target.variables.is_empty());
+    }
+
+    #[test]
+    fn test_run_any_constraints_defers_on_extras() {
+        let resolver = builtin_resolver();
+        let tv2 = type_var(2, "U");
+        let c = Constraint {
+            origin_type_var: type_var(7, "T"),
+            op: SUPERTYPE_OF,
+            target: instance_int(),
+            extra_tvars: vec![tv2],
+        };
+        assert!(
+            run_any_constraints(vec![Some(vec![c])], true, true, &resolver).is_none(),
+            "extras-carrying constraint blobs cannot survive the 3-field wire"
+        );
+        // The clean sibling still engages.
+        let c_clean = Constraint {
+            origin_type_var: type_var(7, "T"),
+            op: SUPERTYPE_OF,
+            target: instance_int(),
+            extra_tvars: Vec::new(),
+        };
+        let res = run_any_constraints(vec![Some(vec![c_clean])], true, true, &resolver)
+            .expect("clean single option engages");
+        assert_eq!(res.len(), 1);
+        assert!(res[0].extra_tvars.is_empty());
+    }
+
+    #[test]
+    fn test_poly_mode_guard_sequential_unwind() {
+        // The RAII guard resets to Unknown (0), not to a saved previous
+        // value: nesting is unsupported, sequential installs unwind fully.
+        assert_eq!(infer_poly_mode(), 0);
+        let g = PolyModeGuard::install(true);
+        assert_eq!(infer_poly_mode(), 1);
+        drop(g);
+        assert_eq!(infer_poly_mode(), 0);
+        let g2 = PolyModeGuard::install(false);
+        assert_eq!(infer_poly_mode(), 2);
+        drop(g2);
+        assert_eq!(infer_poly_mode(), 0);
+    }
+
+    #[test]
+    fn test_ffi_infer_polymorphic_serialization_guard() {
+        let nat = NativeTypeResolver::new(
+            builtin_resolver(),
+            crate::aliases::TypeAliasResolver::default(),
+        );
+        let tv7 = type_var(7, "T");
+        let template = cb_callable(
+            vec![tv7.clone()],
+            vec![0],
+            vec![None],
+            tv7.clone(),
+            Vec::new(),
+            false,
+        );
+        let actual = cb_callable(
+            vec![instance_str()],
+            vec![0],
+            vec![None],
+            instance_int(),
+            vec![type_var(2, "U")],
+            false,
+        );
+        let mut tb = WriteBuffer::new();
+        write_type(&mut tb, &template).unwrap();
+        let template_bytes = tb.into_bytes();
+        let mut ab = WriteBuffer::new();
+        write_type(&mut ab, &actual).unwrap();
+        let actual_bytes = ab.into_bytes();
+
+        // infer_polymorphic=false: decisions come out clean on the wire.
+        let clean = rust_infer_constraints_full(
+            &nat,
+            &template_bytes,
+            &actual_bytes,
+            SUPERTYPE_OF,
+            false,
+            true,
+            true,
+            false,
+        )
+        .expect("non-polymorphic pair serializes");
+        assert!(!clean.is_empty());
+
+        // infer_polymorphic=true: the emissions carry extra_tvars, which
+        // the 3-field wire cannot express, so defer (None).
+        assert!(
+            rust_infer_constraints_full(
+                &nat,
+                &template_bytes,
+                &actual_bytes,
+                SUPERTYPE_OF,
+                false,
+                true,
+                true,
+                true,
+            )
+            .is_none(),
+            "extras-carrying output must defer at the FFI boundary"
+        );
     }
 
     // ---- visit_type_type_native: type[T] vs a type-object callable ----
