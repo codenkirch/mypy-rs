@@ -171,9 +171,9 @@ pub(crate) fn rust_has_recursive_types(type_bytes: &[u8]) -> PyResult<Option<boo
 pub(crate) fn has_recursive_types_inner(typ: &Type) -> bool {
     match typ {
         // visit_type_alias_type override: is_recursive or args.
-        Type::TypeAliasType { is_recursive, args, .. } => {
-            *is_recursive || args.iter().any(has_recursive_types_inner)
-        }
+        Type::TypeAliasType {
+            is_recursive, args, ..
+        } => *is_recursive || args.iter().any(has_recursive_types_inner),
         // visit_unbound_type: args.
         Type::UnboundType { args, .. } => args.iter().any(has_recursive_types_inner),
         // visit_unpack_type: [type].
@@ -241,9 +241,7 @@ pub(crate) fn has_recursive_types_inner(typ: &Type) -> bool {
             upper_bound,
             default,
             ..
-        } => {
-            has_recursive_types_inner(upper_bound) || has_recursive_types_inner(default)
-        }
+        } => has_recursive_types_inner(upper_bound) || has_recursive_types_inner(default),
         // visit_parameters: arg_types only (variables not queried).
         Type::Parameters(p) => p.arg_types.iter().any(has_recursive_types_inner),
         // Leaves (AnyType, UninhabitedType, NoneType, ErasedType,
@@ -524,9 +522,7 @@ fn decode_types_for_list_return(blobs: &[Vec<u8>]) -> Option<Vec<Type>> {
 /// Returns the deduped list as wire-format type bytes. The shim decodes
 /// back to Python list.
 #[pyfunction]
-pub(crate) fn rust_remove_dups(
-    type_bytes_list: Vec<Vec<u8>>,
-) -> PyResult<Option<Vec<Vec<u8>>>> {
+pub(crate) fn rust_remove_dups(type_bytes_list: Vec<Vec<u8>>) -> PyResult<Option<Vec<Vec<u8>>>> {
     let types = match decode_types_for_list_return(&type_bytes_list) {
         Some(t) => t,
         None => return Ok(None),
@@ -664,9 +660,7 @@ pub(crate) fn callable_with_ellipsis_inner(
 /// silently return the first and rely on the earlier semanal pass to flag
 /// duplicates.
 #[pyfunction]
-pub(crate) fn rust_find_unpack_in_list(
-    type_bytes_list: Vec<Vec<u8>>,
-) -> PyResult<Option<i64>> {
+pub(crate) fn rust_find_unpack_in_list(type_bytes_list: Vec<Vec<u8>>) -> PyResult<Option<i64>> {
     let types = match decode_types_for_list_return(&type_bytes_list) {
         Some(t) => t,
         None => return Ok(None),
@@ -1172,7 +1166,11 @@ mod tests {
 
     #[test]
     fn test_has_recursive_types_alias_flag_false_plain_args() {
-        let alias = make_alias("mod.Alias", vec![make_instance("builtins.int", vec![])], false);
+        let alias = make_alias(
+            "mod.Alias",
+            vec![make_instance("builtins.int", vec![])],
+            false,
+        );
         assert!(!has_recursive_types_inner(&alias));
     }
 
@@ -1473,10 +1471,7 @@ mod tests {
         use crate::aliases::TypeAliasResolver;
         let target = make_union(vec![make_instance("A", vec![]), make_instance("B", vec![])]);
         let mut resolver = TypeAliasResolver::new();
-        resolver.insert(
-            "mod.U".to_string(),
-            bare_alias_snapshot("mod.U", &target),
-        );
+        resolver.insert("mod.U".to_string(), bare_alias_snapshot("mod.U", &target));
         let alias = make_alias("mod.U", vec![], false);
         let result = flatten_inner(&[alias], true, true, Some(&resolver));
         let flat = result.unwrap();
@@ -1490,10 +1485,7 @@ mod tests {
         use crate::aliases::TypeAliasResolver;
         let target = make_instance("builtins.list", vec![]);
         let mut resolver = TypeAliasResolver::new();
-        resolver.insert(
-            "mod.L".to_string(),
-            bare_alias_snapshot("mod.L", &target),
-        );
+        resolver.insert("mod.L".to_string(), bare_alias_snapshot("mod.L", &target));
         let alias = make_alias("mod.L", vec![], false);
         // Python appends the ORIGINAL alias for a non-union expansion.
         let result = flatten_inner(&[alias.clone()], true, true, Some(&resolver));
@@ -1505,10 +1497,7 @@ mod tests {
         use crate::aliases::TypeAliasResolver;
         let target = make_union(vec![make_instance("C", vec![])]);
         let mut resolver = TypeAliasResolver::new();
-        resolver.insert(
-            "mod.N".to_string(),
-            bare_alias_snapshot("mod.N", &target),
-        );
+        resolver.insert("mod.N".to_string(), bare_alias_snapshot("mod.N", &target));
         // Union[int, mod.N] where mod.N expands to Union[C].
         let alias = make_alias("mod.N", vec![], false);
         let row = make_union(vec![make_instance("builtins.int", vec![]), alias]);
@@ -1522,10 +1511,7 @@ mod tests {
         use crate::aliases::TypeAliasResolver;
         let target = make_union(vec![make_instance("A", vec![])]);
         let mut resolver = TypeAliasResolver::new();
-        resolver.insert(
-            "mod.G".to_string(),
-            bare_alias_snapshot("mod.G", &target),
-        );
+        resolver.insert("mod.G".to_string(), bare_alias_snapshot("mod.G", &target));
         // A generic alias application (non-empty args) needs
         // _expand_once substitution, which this seam defers.
         let alias = make_alias("mod.G", vec![make_instance("builtins.int", vec![])], false);
@@ -1536,7 +1522,12 @@ mod tests {
     #[test]
     fn test_flatten_nested_unions_missing_snapshot_defers() {
         let alias = make_alias("mod.Missing", vec![], false);
-        let result = flatten_inner(&[alias], true, true, Some(&crate::aliases::TypeAliasResolver::new()));
+        let result = flatten_inner(
+            &[alias],
+            true,
+            true,
+            Some(&crate::aliases::TypeAliasResolver::new()),
+        );
         assert!(result.is_none());
     }
 
@@ -1548,10 +1539,7 @@ mod tests {
         let self_ref = make_alias("mod.S", vec![], false);
         let target = make_union(vec![make_instance("builtins.int", vec![]), self_ref]);
         let mut resolver = TypeAliasResolver::new();
-        resolver.insert(
-            "mod.S".to_string(),
-            bare_alias_snapshot("mod.S", &target),
-        );
+        resolver.insert("mod.S".to_string(), bare_alias_snapshot("mod.S", &target));
         let alias = make_alias("mod.S", vec![], true);
         let result = flatten_inner(&[alias], true, true, Some(&resolver));
         assert!(result.is_none());
@@ -1573,10 +1561,7 @@ mod tests {
         // handle_recursive=False still expands NON-recursive aliases.
         let target = make_union(vec![make_instance("A", vec![])]);
         let mut resolver = TypeAliasResolver::new();
-        resolver.insert(
-            "mod.NR".to_string(),
-            bare_alias_snapshot("mod.NR", &target),
-        );
+        resolver.insert("mod.NR".to_string(), bare_alias_snapshot("mod.NR", &target));
         let alias = make_alias("mod.NR", vec![], false);
         let result = flatten_inner(&[alias], true, false, Some(&resolver));
         let flat = result.unwrap();

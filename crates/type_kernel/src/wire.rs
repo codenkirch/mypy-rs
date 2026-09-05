@@ -2904,8 +2904,7 @@ pub(crate) fn py_type_eq(a: &Type, b: &Type) -> bool {
         // Overloaded.__eq__ (types.py:3147): `self.items == other.items`,
         // i.e. elementwise py-eq.
         (Type::Overloaded { items: i1 }, Type::Overloaded { items: i2 }) => {
-            i1.len() == i2.len()
-                && i1.iter().zip(i2.iter()).all(|(x, y)| py_type_eq(x, y))
+            i1.len() == i2.len() && i1.iter().zip(i2.iter()).all(|(x, y)| py_type_eq(x, y))
         }
         // TupleType.__eq__ (types.py:3252): items + partial_fallback;
         // `implicit` is not compared.
@@ -2945,9 +2944,9 @@ pub(crate) fn py_type_eq(a: &Type, b: &Type) -> bool {
             },
         ) => {
             i1.len() == i2.len()
-                && i1.iter().all(|(k, v)| {
-                    i2.iter().any(|(k2, v2)| k == k2 && py_type_eq(v, v2))
-                })
+                && i1
+                    .iter()
+                    .all(|(k, v)| i2.iter().any(|(k2, v2)| k == k2 && py_type_eq(v, v2)))
                 && rk1 == rk2
                 && ro1 == ro2
                 && c1 == c2
@@ -2977,10 +2976,7 @@ pub(crate) fn py_type_eq(a: &Type, b: &Type) -> bool {
         ) => f1 == f2 && py_type_eq(it1, it2),
         // UnpackType.__eq__ (types.py:1463): `self.type == other.type`;
         // from_star_syntax is not compared.
-        (
-            Type::UnpackType { typ: t1, .. },
-            Type::UnpackType { typ: t2, .. },
-        ) => py_type_eq(t1, t2),
+        (Type::UnpackType { typ: t1, .. }, Type::UnpackType { typ: t2, .. }) => py_type_eq(t1, t2),
         // TypeAliasType.__eq__ (types.py:545): `self.alias == other.alias`
         // (node identity; the wire carries the fullname `type_ref`) +
         // `self.args == other.args`. `is_recursive` is not compared.
@@ -3077,8 +3073,7 @@ fn type_list_py_eq_bag(a: &[Type], b: &[Type]) -> bool {
 /// == contract.
 fn extra_attrs_py_eq(a: &ExtraAttrs, b: &ExtraAttrs) -> bool {
     a.attrs.len() == b.attrs.len()
-        && a
-            .attrs
+        && a.attrs
             .iter()
             .all(|(k, v)| b.attrs.get(k).is_some_and(|w| py_type_eq(v, w)))
         && a.immutable.len() == b.immutable.len()
@@ -4049,7 +4044,9 @@ mod tests {
             _ => panic!("expected CallableType"),
         }
         match round_trip(&mk(Some("partial".to_string()))) {
-            Type::CallableType { special_sig, .. } => assert_eq!(special_sig.as_deref(), Some("partial")),
+            Type::CallableType { special_sig, .. } => {
+                assert_eq!(special_sig.as_deref(), Some("partial"))
+            }
             _ => panic!("expected CallableType"),
         }
     }

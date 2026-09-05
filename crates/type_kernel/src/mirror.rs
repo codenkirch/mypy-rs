@@ -579,10 +579,7 @@ fn patch_callable_ret_type(handle: u64, ret_blob: &[u8]) -> Option<Vec<u8>> {
 
 #[pyfunction]
 #[pyo3(signature = (handle, ret_blob))]
-pub(crate) fn rust_mirror_patch_callable_ret_type(
-    handle: u64,
-    ret_blob: &[u8],
-) -> Option<Vec<u8>> {
+pub(crate) fn rust_mirror_patch_callable_ret_type(handle: u64, ret_blob: &[u8]) -> Option<Vec<u8>> {
     patch_callable_ret_type(handle, ret_blob)
 }
 
@@ -665,10 +662,7 @@ fn patch_callable_name_field(handle: u64, name: Option<&str>) -> Option<Vec<u8>>
 
 #[pyfunction]
 #[pyo3(signature = (handle, name))]
-pub(crate) fn rust_mirror_patch_callable_name(
-    handle: u64,
-    name: Option<&str>,
-) -> Option<Vec<u8>> {
+pub(crate) fn rust_mirror_patch_callable_name(handle: u64, name: Option<&str>) -> Option<Vec<u8>> {
     patch_callable_name_field(handle, name)
 }
 
@@ -708,11 +702,7 @@ pub(crate) fn rust_mirror_patch_callable_variables(
 /// call sites on one pyfunction each.
 const OPT_FIELD_TYPE_GUARD: u32 = 0;
 const OPT_FIELD_TYPE_IS: u32 = 1;
-fn patch_callable_opt_field(
-    handle: u64,
-    which: u32,
-    blob: Option<&[u8]>,
-) -> Option<Vec<u8>> {
+fn patch_callable_opt_field(handle: u64, which: u32, blob: Option<&[u8]>) -> Option<Vec<u8>> {
     let slot_is_guard = match which {
         OPT_FIELD_TYPE_GUARD => true,
         OPT_FIELD_TYPE_IS => false,
@@ -774,10 +764,7 @@ fn patch_callable_fallback(handle: u64, fb_blob: &[u8]) -> Option<Vec<u8>> {
 
 #[pyfunction]
 #[pyo3(signature = (handle, fb_blob))]
-pub(crate) fn rust_mirror_patch_callable_fallback(
-    handle: u64,
-    fb_blob: &[u8],
-) -> Option<Vec<u8>> {
+pub(crate) fn rust_mirror_patch_callable_fallback(handle: u64, fb_blob: &[u8]) -> Option<Vec<u8>> {
     patch_callable_fallback(handle, fb_blob)
 }
 
@@ -843,10 +830,7 @@ fn patch_callable_flags(handle: u64, flags: Vec<bool>) -> Option<Vec<u8>> {
 
 #[pyfunction]
 #[pyo3(signature = (handle, flags))]
-pub(crate) fn rust_mirror_patch_callable_flags(
-    handle: u64,
-    flags: Vec<bool>,
-) -> Option<Vec<u8>> {
+pub(crate) fn rust_mirror_patch_callable_flags(handle: u64, flags: Vec<bool>) -> Option<Vec<u8>> {
     patch_callable_flags(handle, flags)
 }
 
@@ -1694,7 +1678,10 @@ mod mirror_tests {
                 }
                 _ => panic!("not a CallableType after patch"),
             }
-            assert_eq!(patch_callable_ret_type(h, &single_blob(&anyt())).unwrap(), new);
+            assert_eq!(
+                patch_callable_ret_type(h, &single_blob(&anyt())).unwrap(),
+                new
+            );
         });
     }
 
@@ -1703,8 +1690,7 @@ mod mirror_tests {
         with_py(|py| {
             reset();
             let h = registered_callable(py);
-            let new = patch_callable_arg_types(h, &type_list_blob(&[anyt(), tvt("Q")]))
-                .unwrap();
+            let new = patch_callable_arg_types(h, &type_list_blob(&[anyt(), tvt("Q")])).unwrap();
             match decode(h) {
                 Type::CallableType { arg_types, .. } => {
                     assert_eq!(arg_types.len(), 2);
@@ -1745,10 +1731,7 @@ mod mirror_tests {
                 _ => panic!("not a CallableType after kinds patch"),
             }
             // Weird kind values pass through: the wire stores bare ints.
-            assert_eq!(
-                patch_callable_arg_kinds(h, vec![0, 2]).unwrap(),
-                kinds
-            );
+            assert_eq!(patch_callable_arg_kinds(h, vec![0, 2]).unwrap(), kinds);
             let names = patch_callable_arg_names(h, vec![Some("x".to_string()), None]).unwrap();
             match decode(h) {
                 Type::CallableType { arg_names, .. } => {
@@ -1787,13 +1770,12 @@ mod mirror_tests {
             );
             // Flags: full wire-order reorder, and a wrong-length list defers.
             assert_eq!(patch_callable_flags(h, vec![true]), None);
-            let flags_blob = patch_callable_flags(h, vec![false, true, true, false, false, false, false])
-                .unwrap();
+            let flags_blob =
+                patch_callable_flags(h, vec![false, true, true, false, false, false, false])
+                    .unwrap();
             match decode(h) {
                 Type::CallableType {
-                    implicit,
-                    is_bound,
-                    ..
+                    implicit, is_bound, ..
                 } => {
                     assert!(implicit);
                     assert!(is_bound);
@@ -1818,7 +1800,9 @@ mod mirror_tests {
             let guard = patch_callable_opt_field(h, 0, Some(&single_blob(&anyt()))).unwrap();
             match decode(h) {
                 Type::CallableType { type_guard, .. } => {
-                    assert!(matches!(type_guard, Some(ref t) if matches!(&**t, Type::AnyType { .. })))
+                    assert!(
+                        matches!(type_guard, Some(ref t) if matches!(&**t, Type::AnyType { .. }))
+                    )
                 }
                 _ => panic!("not a CallableType after type_guard set"),
             }
@@ -1839,7 +1823,10 @@ mod mirror_tests {
             }
             // Unknown which defers without touching storage.
             let before = entry_bytes(h).unwrap();
-            assert_eq!(patch_callable_opt_field(h, 2, Some(&single_blob(&anyt()))), None);
+            assert_eq!(
+                patch_callable_opt_field(h, 2, Some(&single_blob(&anyt()))),
+                None
+            );
             assert_eq!(entry_bytes(h), Some(before));
             // fallback: swap to an int Instance.
             let fb = patch_callable_fallback(h, &single_blob(&int_fallback())).unwrap();
@@ -1858,7 +1845,9 @@ mod mirror_tests {
             patch_callable_instance_type(h, Some(&single_blob(&anyt()))).unwrap();
             match decode(h) {
                 Type::CallableType { instance_type, .. } => {
-                    assert!(matches!(instance_type, Some(ref t) if matches!(&**t, Type::AnyType { .. })))
+                    assert!(
+                        matches!(instance_type, Some(ref t) if matches!(&**t, Type::AnyType { .. }))
+                    )
                 }
                 _ => panic!("not a CallableType after instance_type set"),
             }
@@ -1880,14 +1869,20 @@ mod mirror_tests {
             assert_eq!(patch_callable_opt_field(h, 0, None), None);
             assert_eq!(patch_callable_fallback(h, &single_blob(&anyt())), None);
             assert_eq!(patch_callable_instance_type(h, None), None);
-            assert_eq!(patch_callable_flags(h, vec![false, false, false, false, false, false, false]), None);
+            assert_eq!(
+                patch_callable_flags(h, vec![false, false, false, false, false, false, false]),
+                None
+            );
             // Non-callable stored family: defers instead of retyping.
             let mut w = WriteBuffer::new();
             write_type(&mut w, &tvt("T")).unwrap();
             let h2 = register(fresh(py), "tvar", w.into_bytes(), vec![]).unwrap();
             assert_eq!(patch_callable_ret_type(h2, &single_blob(&anyt())), None);
             assert_eq!(patch_callable_arg_kinds(h2, vec![0]), None);
-            assert_eq!(patch_callable_flags(h2, vec![false, false, false, false, false, false, false]), None);
+            assert_eq!(
+                patch_callable_flags(h2, vec![false, false, false, false, false, false, false]),
+                None
+            );
             // Unregistered handles defer.
             assert_eq!(patch_callable_ret_type(h + 1, &single_blob(&anyt())), None);
             // Registered callable, garbage list payloads defer too.

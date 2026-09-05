@@ -74,14 +74,8 @@ fn make_union(items: &[Type]) -> Type {
         0 => Type::UninhabitedType { ambiguous: false },
         1 => items[0].clone(),
         _ => {
-            let flat = flatten_nested_unions_inner(
-                items,
-                false,
-                true,
-                None,
-                &mut Vec::new(),
-            )
-            .unwrap_or_else(|| items.to_vec());
+            let flat = flatten_nested_unions_inner(items, false, true, None, &mut Vec::new())
+                .unwrap_or_else(|| items.to_vec());
             union_make_union(flat)
         }
     }
@@ -124,8 +118,7 @@ pub(crate) fn expand_for_target<'py>(
             };
             // flatten_nested_unions(relevant, type_alias_type=True,
             // recursive=True): a recursive alias inside yields None (defer).
-            let flat =
-                flatten_nested_unions_inner(&relevant, true, true, None, &mut Vec::new())?;
+            let flat = flatten_nested_unions_inner(&relevant, true, true, None, &mut Vec::new())?;
             let deduped = remove_dups_inner(&flat);
             let mut out = Vec::with_capacity(deduped.len());
             for item in &deduped {
