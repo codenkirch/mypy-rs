@@ -740,11 +740,9 @@ pub(crate) fn split_with_prefix_and_suffix_inner(
 fn encode_type_list(types: &[Type]) -> Option<Vec<Vec<u8>>> {
     let mut out = Vec::with_capacity(types.len());
     for t in types {
-        match encode_type(t) {
-            Some(b) => out.push(b),
-            // Strict all-or-nothing (#1412): silently dropping a row would
-            // hand the shim a truncated list of Types.
-            None => return None,
+        {
+            let b = encode_type(t)?;
+            out.push(b)
         }
     }
     Some(out)
@@ -877,9 +875,7 @@ pub(crate) fn flatten_nested_unions_inner(
                 // Python: `tp = get_proper_type(t)`; only the UnionType
                 // check consumes the expansion. The wire `is_recursive`
                 // flag is the same fact Python reads on the live node.
-                let Some(aliases) = aliases else {
-                    return None;
-                };
+                let aliases = aliases?;
                 let type_ref = match t {
                     Type::TypeAliasType { type_ref, .. } => type_ref.clone(),
                     _ => unreachable!(),
@@ -890,10 +886,7 @@ pub(crate) fn flatten_nested_unions_inner(
                 if active.contains(&type_ref) {
                     return None;
                 }
-                let target = match expand_alias_target_raw(t, aliases) {
-                    Some(x) => x,
-                    None => return None,
-                };
+                let target = expand_alias_target_raw(t, aliases)?;
                 let union_items = match &target {
                     Type::UnionType { items, .. } => Some(items),
                     // Non-union proper type: Python appends the original
