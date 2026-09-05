@@ -514,6 +514,7 @@ def rust_is_subtype(
     ignore_pos_arg_names: bool,
     strict_concatenate: bool,
     resolver: NativeTypeResolver,
+    infer_unions: bool = False,
 ) -> bool | None: ...
 def rust_is_protocol_implementation(
     left: bytes,
@@ -540,6 +541,7 @@ def rust_is_subtype_batch(
     ignore_pos_arg_names: bool,
     strict_concatenate: bool,
     resolver: NativeTypeResolver,
+    infer_unions: bool = False,
 ) -> list[int]: ...
 def rust_subtype_tvar_tuple_right(
     left: bytes, right: bytes, proper_subtype: bool, resolver: NativeTypeResolver
@@ -1375,6 +1377,7 @@ def rust_callables_compatible(
     strict_concatenate: bool,
     strict_optional: bool,
     resolver: NativeTypeResolver,
+    infer_unions: bool = False,
 ) -> bool | None: ...
 def rust_are_parameters_compatible(
     left_bytes: bytes,
@@ -1386,6 +1389,7 @@ def rust_are_parameters_compatible(
     strict_optional: bool,
     nested_proper_subtype: bool,
     resolver: NativeTypeResolver,
+    infer_unions: bool = False,
 ) -> bool | None: ...
 def rust_are_args_compatible(
     left: Any,

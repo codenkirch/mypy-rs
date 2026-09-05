@@ -70,37 +70,84 @@ pub(crate) fn rust_skip_reverse_union_constraints(constraints_bytes: &[u8]) -> O
     Some(output.into_bytes())
 }
 
-fn skip_reverse_union_inner(constraints: &[WireConstraint]) -> Option<Vec<WireConstraint>> {
+/// Access to the (origin, op, target) triple shared by the wire-form
+/// [`WireConstraint`] and the kernel [`crate::constraints::Constraint`].
+/// Lets `skip_reverse_union_inner` filter either list shape.
+trait ConstraintTriple
+where
+    Self: Clone + Sized,
+{
+    fn triple_origin(&self) -> &Type;
+    fn triple_op(&self) -> i64;
+    fn triple_target(&self) -> &Type;
+    /// Rebuild a new constraint from the filtered parts.
+    fn from_parts(origin: Type, op: i64, target: Type) -> Self;
+}
+
+impl ConstraintTriple for WireConstraint {
+    fn triple_origin(&self) -> &Type {
+        &self.origin
+    }
+    fn triple_op(&self) -> i64 {
+        self.op
+    }
+    fn triple_target(&self) -> &Type {
+        &self.target
+    }
+    fn from_parts(origin: Type, op: i64, target: Type) -> Self {
+        WireConstraint { origin, op, target }
+    }
+}
+
+impl ConstraintTriple for crate::constraints::Constraint {
+    fn triple_origin(&self) -> &Type {
+        &self.origin_type_var
+    }
+    fn triple_op(&self) -> i64 {
+        self.op
+    }
+    fn triple_target(&self) -> &Type {
+        &self.target
+    }
+    fn from_parts(origin: Type, op: i64, target: Type) -> Self {
+        crate::constraints::Constraint {
+            origin_type_var: origin,
+            op,
+            target,
+        }
+    }
+}
+
+fn skip_reverse_union_inner<T: ConstraintTriple + Clone + PartialEq>(
+    constraints: &[T],
+) -> Option<Vec<T>> {
     // Build the set of constraints to remove, mirroring solve.py:871-883.
     // Constraint equality is (origin_type_var, op, target) by value.
-    let mut remove_set: Vec<WireConstraint> = Vec::new();
+    let mut remove_set: Vec<T> = Vec::new();
 
     for c in constraints {
         // get_proper_type(c.target) — wire types are already proper, but
         // TypeAliasType needs expansion; defer.
-        match &c.target {
+        match c.triple_target() {
             Type::TypeAliasType { .. } => return None,
             Type::UnionType { items, .. } => {
                 for item in items {
                     if let Type::TypeVarType { .. } = item {
                         // Check if item == c.origin_type_var and op == SUBTYPE_OF.
-                        if item == &c.origin && c.op == SUBTYPE_OF {
+                        if item == c.triple_origin() && c.triple_op() == SUBTYPE_OF {
                             // reverse_union_cs.add(c) — remove the original.
                             remove_set_push(&mut remove_set, c.clone());
                         }
                         // reverse_union_cs.add(Constraint(item, neg_op(op), origin))
-                        let rev = WireConstraint {
-                            origin: item.clone(),
-                            op: neg_op(c.op),
-                            target: c.origin.clone(),
-                        };
+                        let rev = T::from_parts(
+                            item.clone(),
+                            neg_op(c.triple_op()),
+                            c.triple_origin().clone(),
+                        );
                         remove_set_push(&mut remove_set, rev);
                         // reverse_union_cs.add(Constraint(origin, op, item))
-                        let fwd = WireConstraint {
-                            origin: c.origin.clone(),
-                            op: c.op,
-                            target: item.clone(),
-                        };
+                        let fwd =
+                            T::from_parts(c.triple_origin().clone(), c.triple_op(), item.clone());
                         remove_set_push(&mut remove_set, fwd);
                     }
                 }
@@ -110,7 +157,7 @@ fn skip_reverse_union_inner(constraints: &[WireConstraint]) -> Option<Vec<WireCo
     }
 
     // Filter: keep constraints not in remove_set.
-    let result: Vec<WireConstraint> = constraints
+    let result: Vec<T> = constraints
         .iter()
         .filter(|c| !remove_set.iter().any(|r| r == *c))
         .cloned()
@@ -424,10 +471,19 @@ fn decode_type(bytes: &[u8]) -> Option<Type> {
 }
 
 /// Push a constraint into the remove_set if not already present.
-fn remove_set_push(set: &mut Vec<WireConstraint>, c: WireConstraint) {
+fn remove_set_push<T: PartialEq>(set: &mut Vec<T>, c: T) {
     if !set.contains(&c) {
         set.push(c);
     }
+}
+
+/// In-crate entry: filter a kernel `Constraint` list the way the Python
+/// `skip_reverse_union_constraints` (solve.py:889) FFI seam does. The
+/// unify port calls this before the polymorphic solve.
+pub(crate) fn skip_reverse_union_kernel(
+    constraints: &[crate::constraints::Constraint],
+) -> Option<Vec<crate::constraints::Constraint>> {
+    skip_reverse_union_inner(constraints)
 }
 
 #[cfg(test)]

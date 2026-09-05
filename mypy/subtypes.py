@@ -453,6 +453,7 @@ def _flush_subtype_batch() -> dict[tuple[bytes, bytes, tuple[bool, ...]], bool]:
         strict_optional,
         ignore_pos_arg_names,
         strict_concatenate,
+        infer_unions,
     ) = ctx_key
     try:
         answers = _type_kernel.rust_is_subtype_batch(
@@ -466,6 +467,7 @@ def _flush_subtype_batch() -> dict[tuple[bytes, bytes, tuple[bool, ...]], bool]:
             ignore_pos_arg_names,
             strict_concatenate,
             _native_subtype_resolver,
+            infer_unions,
         )
     except (AssertionError, NotImplementedError):
         # Unserializable variant reached the Rust edge; nothing was
@@ -889,6 +891,10 @@ def _is_subtype(
                 state.strict_optional,
                 subtype_context.ignore_pos_arg_names,
                 _strict_concatenate_flag(subtype_context),
+                # Ambient flag consumed by the kernel's wave-37 unify port
+                # (#1426): two pairs differing only here must not share a
+                # batched answer.
+                type_state.infer_unions,
             )
             if _subtype_batch:
                 prev_flags = _subtype_batch[0][2]
@@ -941,6 +947,7 @@ def _is_subtype(
                     else False
                 ),
                 _native_subtype_resolver,
+                type_state.infer_unions,
             )
         except (AssertionError, NotImplementedError):
             # Type tree contains an unserializable variant (e.g.
@@ -1325,6 +1332,7 @@ class SubtypeVisitor(TypeVisitor[bool]):
                         state.strict_optional,
                         self.proper_subtype,  # nested comparisons
                         _native_subtype_resolver,
+                        type_state.infer_unions,
                     )
                 except (AssertionError, NotImplementedError):
                     result = None
@@ -1402,6 +1410,7 @@ class SubtypeVisitor(TypeVisitor[bool]):
                         ),
                         state.strict_optional,
                         _native_subtype_resolver,
+                        type_state.infer_unions,
                     )
                 except (AssertionError, NotImplementedError):
                     result = None
@@ -2670,6 +2679,7 @@ def are_parameters_compatible(
                 state.strict_optional,
                 nested_proper,
                 _native_subtype_resolver,
+                type_state.infer_unions,
             )
         except (AssertionError, NotImplementedError):
             result = None

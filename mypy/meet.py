@@ -56,6 +56,7 @@ from mypy.types import (
     read_type,
     split_with_prefix_and_suffix,
 )
+from mypy.typestate import type_state
 
 # Stage 3c (M8d) type-kernel seam: trivial_meet reuses the join
 # path's resolver + WriteBuffer (only needs is_subtype). The active
@@ -738,6 +739,7 @@ def is_overlapping_types(
                     state.strict_optional,
                     False,  # nested overlap is non-proper
                     join._native_join_resolver,
+                    type_state.infer_unions,
                 )
             except (AssertionError, NotImplementedError):
                 result = None

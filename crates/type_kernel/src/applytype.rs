@@ -80,18 +80,25 @@ pub(crate) fn rust_apply_generic_arguments(
         &orig_types,
         skip_unsatisfied,
         strict_optional,
-        resolver,
+        resolver.resolver(),
+        resolver.alias_resolver(),
     )?;
     encode_type(&result)
 }
 
 /// Core logic for `apply_generic_arguments`. Mirrors applytype.py:88-193.
-fn apply_generic_arguments_inner(
+///
+/// `r` drives the subtype checks; `aliases` expands alias upper bounds
+/// (an empty resolver defers on alias bounds, mirroring a missing
+/// snapshot).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn apply_generic_arguments_inner(
     callable: &Type,
     orig_types: &[Option<Type>],
     skip_unsatisfied: bool,
     strict_optional: bool,
-    resolver: &NativeTypeResolver,
+    r: &crate::typeinfo::TypeResolver,
+    aliases: &crate::aliases::TypeAliasResolver,
 ) -> Option<Type> {
     let callable = if let Type::CallableType { .. } = callable {
         callable
@@ -159,7 +166,8 @@ fn apply_generic_arguments_inner(
             tvar,
             target,
             skip_unsatisfied,
-            resolver,
+            r,
+            aliases,
             &id_to_type,
             strict_optional,
         )?;
@@ -280,7 +288,8 @@ fn get_target_type(
     tvar: &Type,
     type_arg: &Type,
     skip_unsatisfied: bool,
-    resolver: &NativeTypeResolver,
+    r: &crate::typeinfo::TypeResolver,
+    aliases: &crate::aliases::TypeAliasResolver,
     id_to_type: &HashMap<EnvKey, Type>,
     strict_optional: bool,
 ) -> Option<Option<Type>> {
@@ -319,9 +328,8 @@ fn get_target_type(
                 // The bound can be a TypeAliasType (issue #1260); expand it
                 // through the alias snapshot. `type_arg` needs no expansion:
                 // the prelude's `get_proper_type` deferred on alias args.
-                let aliases = resolver.alias_resolver();
                 let s_bound = crate::checkexpr_functions::get_proper_or_expand(&bound, aliases)?;
-                match is_subtype(type_arg, &s_bound, &subtype_ctx(), resolver.resolver()) {
+                match is_subtype(type_arg, &s_bound, &subtype_ctx(), r) {
                     Some(true) => Some(Some(type_arg.clone())),
                     Some(false) => {
                         if skip_unsatisfied {
@@ -335,7 +343,7 @@ fn get_target_type(
                 }
             } else {
                 // applytype.py:52-73: value constraint check.
-                get_target_type_with_values(type_arg, &p_type, values, skip_unsatisfied, resolver)
+                get_target_type_with_values(type_arg, &p_type, values, skip_unsatisfied, r)
             }
         }
         Type::ParamSpecType { .. } => {
@@ -356,7 +364,7 @@ fn get_target_type_with_values(
     p_type: &Type,
     values: &[Type],
     skip_unsatisfied: bool,
-    resolver: &NativeTypeResolver,
+    r: &crate::typeinfo::TypeResolver,
 ) -> Option<Option<Type>> {
     // applytype.py:53-54: AnyType passes through.
     if matches!(p_type, Type::AnyType { .. }) {
@@ -369,11 +377,9 @@ fn get_target_type_with_values(
     } = p_type
     {
         if !p_values.is_empty() {
-            let all_legal = p_values.iter().all(|v1| {
-                values
-                    .iter()
-                    .any(|v| is_same_type(v, v1, resolver.resolver()))
-            });
+            let all_legal = p_values
+                .iter()
+                .all(|v1| values.iter().any(|v| is_same_type(v, v1, r)));
             if all_legal {
                 return Some(Some(type_arg.clone()));
             }
@@ -382,7 +388,7 @@ fn get_target_type_with_values(
     // applytype.py:60-70: find matching values (narrowest).
     let mut matching: Vec<Type> = Vec::new();
     for value in values {
-        match is_subtype(type_arg, value, &subtype_ctx(), resolver.resolver()) {
+        match is_subtype(type_arg, value, &subtype_ctx(), r) {
             Some(true) => matching.push(value.clone()),
             Some(false) => {}
             None => {
@@ -394,7 +400,7 @@ fn get_target_type_with_values(
         // applytype.py:65-70: select narrowest match.
         let mut best = matching[0].clone();
         for m in &matching[1..] {
-            match is_subtype(m, &best, &subtype_ctx(), resolver.resolver()) {
+            match is_subtype(m, &best, &subtype_ctx(), r) {
                 Some(true) => best = m.clone(),
                 Some(false) => {}
                 None => return None,
@@ -1384,7 +1390,15 @@ mod tests {
             (1, 0, "ns".to_string()),
             make_instance("builtins.int", vec![]),
         );
-        let result = get_target_type(&t2, &make_amb_uninhabited(), true, &resolver, &env, true);
+        let result = get_target_type(
+            &t2,
+            &make_amb_uninhabited(),
+            true,
+            resolver.resolver(),
+            &crate::aliases::TypeAliasResolver::new(),
+            &env,
+            true,
+        );
         let got = result.expect("should decide").expect("should not skip");
         assert_eq!(got, make_instance("builtins.int", vec![]));
     }
@@ -1397,7 +1411,15 @@ mod tests {
         let resolver = make_resolver();
         let tvar = make_typevar_with_default(1, "ns", make_omitted_any());
         let env: HashMap<EnvKey, Type> = HashMap::new();
-        let result = get_target_type(&tvar, &make_amb_uninhabited(), true, &resolver, &env, true);
+        let result = get_target_type(
+            &tvar,
+            &make_amb_uninhabited(),
+            true,
+            resolver.resolver(),
+            &crate::aliases::TypeAliasResolver::new(),
+            &env,
+            true,
+        );
         let got = result.expect("should decide").expect("should not skip");
         assert!(matches!(got, Type::UninhabitedType { ambiguous: true }));
     }
@@ -1414,7 +1436,8 @@ mod tests {
             &tvar,
             &make_plain_uninhabited(),
             true,
-            &resolver,
+            resolver.resolver(),
+            &crate::aliases::TypeAliasResolver::new(),
             &env,
             true,
         );

@@ -4163,6 +4163,7 @@ pub(crate) fn rust_is_same_type(
 /// `UnionType` right dispatch, the `TypeVarType`-with-values right,
 /// and the `assuming` recursion guard BEFORE calling this.
 #[pyfunction]
+#[pyo3(signature = (left_bytes, right_bytes, ignore_type_params, ignore_declared_variance, always_covariant, ignore_promotions, proper_subtype, strict_optional, ignore_pos_arg_names, strict_concatenate, resolver, infer_unions = false))]
 #[allow(clippy::too_many_arguments, dead_code)]
 pub(crate) fn rust_is_subtype(
     left_bytes: &[u8],
@@ -4176,7 +4177,10 @@ pub(crate) fn rust_is_subtype(
     ignore_pos_arg_names: bool,
     strict_concatenate: bool,
     resolver: &mut NativeTypeResolver,
+    infer_unions: bool,
 ) -> Option<bool> {
+    // Ambient `type_state.infer_unions` for kernel-expect unify (#1426).
+    crate::unify::set_infer_unions(infer_unions);
     let left = match decode_type(left_bytes) {
         Some(t) => t,
         None => {
@@ -4226,6 +4230,7 @@ pub(crate) fn rust_is_subtype(
 /// defer (decode error or the engine returned
 /// `None`). A deferring entry only marks its own slot: the remaining
 #[pyfunction]
+#[pyo3(signature = (pairs_bytes, ignore_type_params, ignore_declared_variance, always_covariant, ignore_promotions, proper_subtype, strict_optional, ignore_pos_arg_names, strict_concatenate, resolver, infer_unions = false))]
 #[allow(clippy::too_many_arguments, dead_code)]
 pub(crate) fn rust_is_subtype_batch(
     pairs_bytes: Vec<&[u8]>,
@@ -4238,7 +4243,10 @@ pub(crate) fn rust_is_subtype_batch(
     ignore_pos_arg_names: bool,
     strict_concatenate: bool,
     resolver: &mut NativeTypeResolver,
+    infer_unions: bool,
 ) -> Vec<i8> {
+    // Ambient `type_state.infer_unions` for kernel-expect unify (#1426).
+    crate::unify::set_infer_unions(infer_unions);
     let ctx = SubtypeContext::with_callable_flags(
         ignore_type_params,
         ignore_declared_variance,
@@ -6853,6 +6861,7 @@ mod tests {
             false, // ignore_pos_arg_names
             false, // strict_concatenate
             &mut NativeTypeResolver::from_resolver(r),
+            false, // infer_unions
         );
         assert_eq!(got, vec![expect; 4]);
     }
@@ -6897,6 +6906,7 @@ mod tests {
             false,
             false,
             &mut NativeTypeResolver::from_resolver(r),
+            false, // infer_unions
         );
         assert_eq!(got, vec![1, -1]);
     }
@@ -6924,6 +6934,7 @@ mod tests {
             false, // ignore_pos_arg_names
             false, // strict_concatenate
             &mut native,
+            false, // infer_unions
         );
         assert_eq!(got, None);
     }

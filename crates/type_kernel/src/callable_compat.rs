@@ -13,7 +13,9 @@
 //!
 //! * either side is a `Parameters` (wire format drops `Parameters.is_ellipsis_args`,
 //!   which `are_parameters_compatible` reads);
-//! * `left.variables` non-empty (needs `unify_generic_callable`);
+//! * `left.variables` non-empty and `unify_generic_callable` (wave 37
+//!   kernel port, issue #1426) defers — freshening needed, an exotic
+//!   constraint shape, or any unified result the kernel cannot rebuild;
 //! * either side `unpack_kwargs` (`with_unpacked_kwargs` expands a trailing
 //!   `TypedDictType` into named args);
 //! * any arg is an `UnpackType` (`with_normalized_var_args` would unfold);
@@ -29,6 +31,7 @@ use pyo3::prelude::*;
 
 use crate::subtypes::SubtypeContext;
 use crate::typeinfo::{NativeTypeResolver, TypeResolver};
+use crate::unify::UnifyOutcome;
 use crate::wire::{self, ReadBuffer, Type};
 
 /// ArgKind constants mirroring `mypy.nodes` (nodes.py:2480-2507).
@@ -478,6 +481,7 @@ pub(crate) fn arg_list_from_type(t: &Type) -> Option<AnyArgList<'_>> {
 /// `rust_callables_compatible` requires both sides to be `CallableType`.
 /// Returns `None` (defer to Python) for anything the engine cannot decide.
 #[pyfunction]
+#[pyo3(signature = (left_bytes, right_bytes, is_proper_subtype, ignore_pos_arg_names, allow_partial_overlap, strict_concatenate_check, strict_optional, nested_proper_subtype, resolver, infer_unions = false))]
 #[allow(clippy::too_many_arguments, dead_code)]
 pub(crate) fn rust_are_parameters_compatible(
     left_bytes: &[u8],
@@ -489,7 +493,10 @@ pub(crate) fn rust_are_parameters_compatible(
     strict_optional: bool,
     nested_proper_subtype: bool,
     resolver: &mut NativeTypeResolver,
+    infer_unions: bool,
 ) -> Option<bool> {
+    // Ambient `type_state.infer_unions` for kernel-expect unify (#1426).
+    crate::unify::set_infer_unions(infer_unions);
     let left = decode_type(left_bytes)?;
     let right = decode_type(right_bytes)?;
     let lf = arg_list_from_type(&left)?;
@@ -769,6 +776,7 @@ fn is_uninhabited_proper(t: &Type) -> bool {
 /// Returns `None` (Python `None`) when Rust doesn't handle the case; the shim
 /// then falls through to the pure-Python `is_callable_compatible`.
 #[pyfunction]
+#[pyo3(signature = (left_bytes, right_bytes, is_proper_subtype, ignore_pos_arg_names, strict_concatenate, strict_optional, resolver, infer_unions = false))]
 #[allow(clippy::too_many_arguments, dead_code)]
 pub(crate) fn rust_callables_compatible(
     left_bytes: &[u8],
@@ -778,7 +786,10 @@ pub(crate) fn rust_callables_compatible(
     strict_concatenate: bool,
     strict_optional: bool,
     resolver: &mut NativeTypeResolver,
+    infer_unions: bool,
 ) -> Option<bool> {
+    // Ambient `type_state.infer_unions` for kernel-expect unify (#1426).
+    crate::unify::set_infer_unions(infer_unions);
     let left = decode_type(left_bytes)?;
     let right = decode_type(right_bytes)?;
 
@@ -886,17 +897,54 @@ pub(crate) fn callables_compatible_with_ignore_return(
     }
 
     // Everything exotic defers to Python.
-    if let Some(vars) = left_variables(left) {
-        if !vars.is_empty() {
-            return None;
-        }
-    }
     if lf.unpack_kwargs || rf.unpack_kwargs {
         return None;
     }
     if any_unpack_anywhere(left) || any_unpack_anywhere(right) {
         return None;
     }
+
+    // subtypes.py:2590-2595: a generic `left` unifies via
+    // `unify_generic_callable` (issue #1426): `NoUnify` returns False,
+    // `Defer` keeps the blanket `None` so the Python shim re-runs.
+
+    // The unpack gates above keep their pre-unify order: when they defer,
+    // Python is_callable_compatible itself decides. Non-generic left keeps
+    // the original (unnormalized) operands, preserving pre-#1426 parity.
+    let mut unified_right: Option<Type> = None;
+    let unified;
+    let left: &Type = match left_variables(left) {
+        Some(vars) if !vars.is_empty() => {
+            let left_norm = match crate::checkcall::normalize_callable(left) {
+                Ok(t) => t,
+                Err(_) => return None,
+            };
+            let right_norm = match crate::checkcall::normalize_callable(right) {
+                Ok(t) => t,
+                Err(_) => return None,
+            };
+            unified_right = Some(right_norm);
+            let aliases = match resolver.aliases() {
+                Some(shared) => crate::aliases::TypeAliasResolver::from_shared_view(shared),
+                None => crate::aliases::TypeAliasResolver::new(),
+            };
+            unified = match crate::unify::unify_generic_callable_core(
+                &left_norm,
+                unified_right.as_ref().unwrap(),
+                ignore_return,
+                ctx.strict_optional,
+                resolver,
+                &aliases,
+            ) {
+                UnifyOutcome::Unified(t) => t,
+                UnifyOutcome::NoUnify => return Some(false),
+                UnifyOutcome::Defer => return None,
+            };
+            &unified
+        }
+        _ => left,
+    };
+    let right: &Type = unified_right.as_ref().map_or(right, |t| t as &Type);
 
     let is_compat: &dyn Fn(&Type, &Type) -> Option<bool> =
         &|l, r| crate::subtypes::is_subtype(l, r, ctx, resolver);

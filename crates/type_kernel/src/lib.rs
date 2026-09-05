@@ -156,6 +156,7 @@ mod typeanal_unbound2;
 mod typeinfo;
 mod typeops;
 mod types_impl;
+mod unify;
 mod util;
 mod visitor;
 mod wire;

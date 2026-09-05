@@ -2674,6 +2674,41 @@ including:
   new and not fixed here: the ast_serialize
   `serializes_trivial_call_like_existing_binary_contract` failure
   is a baseline item tracked in #1273.
+- `unify_generic_callable` non-generic-right kernel port (wave37,
+  issue #1426, `crates/type_kernel/src/unify.rs`): the solve
+  `rust_solve_generic_call` defer bucket for a target callable whose
+  right side carries no type variables (`unify_generic_callable`'s
+  non-generic-right path, `mypy/solve.py`) now decides natively. Rust
+  drives `constraints.py` `infer_constraints_full_inner` on wire
+  callables with the `no_extra_tvar_shape` gate (`unify.rs:140`):
+  it defers any actual tree with a `variables`-carrying reachable
+  callable (`callable_with_vars_reachable`, `visitor.rs:336`),
+  because the kernel has no `extra_tvars` channel and Python's
+  ambient `type_state.infer_polymorphic` (True in ordinary checking,
+  checkexpr.py:1325) attaches extras at any such node. Under
+  `old_type_inference=True` the port is parity by construction (the
+  ambient flag is exactly the hardcoded False); no fixture exercises
+  it. The `infer_unions = false` defaulted FFI param was added to
+  `rust_is_subtype` / `rust_is_subtype_batch` /
+  `rust_callables_compatible` / `rust_are_parameters_compatible`
+  (stub edits in `stubs/type_kernel.pyi`), threading ambient
+  `type_state.infer_unions` from the Python seams (`mypy/meet.py`
+  via `rust_are_parameters_compatible`, `mypy/subtypes.py` `_is_subtype`
+  batch/single and the visitor callable-compat seams) so pairs
+  differing only in that flag never share a batched answer. Kernel
+  dispatch defers `Parameters` templates entirely, so the
+  constraints.py:1339/1343 ambient-branch divergence is unreachable.
+  Audit (env-gated, stripped before landing): the biggest-worker
+  `cc|cc` bucket went from 236 (split `1|1`:217 / `1|0`:19) to 217
+  all-`1|1` with the `1|0` count at 0, so ~13 of the 19 non-generic
+  right pairs retired natively; the 217 generic-right pairs stay
+  deferred by design pending a kernel `extra_tvars` channel.
+  Covered by `NativeCallableUnifyPreludeSuite` in
+  `mypy/test/testtypes.py` (seam-engagement, now patching
+  `rust_is_subtype` and expecting one call in both the unify-success
+  and unify-failure blocks) plus 19 new Rust unit tests
+  (11 gate-walker descents in `visitor.rs`, 8 `no_extra_tvar_shape`
+  / `strip_ret` in `unify.rs`).
 
 ## Pull Requests
 
