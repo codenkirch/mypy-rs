@@ -445,11 +445,17 @@ fn typevar_id_key(tvar: &Type) -> Option<EnvKey> {
             ..
         } => Some((*raw_id, *meta_level, namespace.clone())),
         Type::ParamSpecType {
-            raw_id, namespace, ..
-        } => Some((*raw_id, 0, namespace.clone())),
+            raw_id,
+            namespace,
+            meta_level,
+            ..
+        } => Some((*raw_id, *meta_level, namespace.clone())),
         Type::TypeVarTupleType {
-            raw_id, namespace, ..
-        } => Some((*raw_id, 0, namespace.clone())),
+            raw_id,
+            namespace,
+            meta_level,
+            ..
+        } => Some((*raw_id, *meta_level, namespace.clone())),
         _ => None,
     }
 }
@@ -869,6 +875,7 @@ mod tests {
             flavor: PARAM_SPEC_FLAVOR_BARE,
             upper_bound: Box::new(make_instance("builtins.object", vec![])),
             default: Box::new(make_any()),
+            meta_level: 0,
         };
         assert!(find_param_spec(&[ps]).is_some());
     }
@@ -1070,6 +1077,7 @@ mod tests {
             flavor: PARAM_SPEC_FLAVOR_BARE,
             upper_bound: Box::new(make_instance("builtins.object", vec![])),
             default: Box::new(make_omitted_any()),
+            meta_level: 0,
         };
         assert_eq!(
             tags(
@@ -1096,6 +1104,7 @@ mod tests {
             upper_bound: Box::new(make_instance("builtins.object", vec![])),
             default: Box::new(make_omitted_any()),
             min_len: 0,
+            meta_level: 0,
         };
         assert_eq!(
             tags(

@@ -250,6 +250,7 @@ struct Serializer<'a> {
     forced_type_loc: Option<SourceLocation>,
     uses_template_strings: bool,
     callable_arg_list_depth: usize,
+    lambda_depth: usize,
 }
 
 impl<'a> Serializer<'a> {
@@ -277,6 +278,7 @@ impl<'a> Serializer<'a> {
             parse_errors: Vec::new(),
             forced_type_loc: None,
             callable_arg_list_depth: 0,
+            lambda_depth: 0,
             uses_template_strings: false,
         }
     }
@@ -2113,11 +2115,16 @@ fn serialize_lambda_expr(
 ) -> PyResult<()> {
     let loc = serializer.loc(expression);
     serializer.writer.tag(LAMBDA_EXPR);
+    // CPython (type_comments=True) never attaches `# type:` comments to
+    // lambda parameters; a per-line statement comment must not leak into
+    // the lambda's argument annotations.
+    serializer.lambda_depth += 1;
     if let Some(parameters) = &lambda.parameters {
         serialize_parameters(serializer, parameters, None)?;
     } else {
         serialize_empty_parameters(serializer);
     }
+    serializer.lambda_depth -= 1;
     serialize_lambda_body(serializer, &lambda.body)?;
     serializer.writer.loc(&loc);
     serializer.writer.tag(END_TAG);
@@ -2522,11 +2529,17 @@ fn serialize_parameter(
     let loc = serializer.loc(&parameter);
     let name = parameter.name().as_str();
     let pos_only = pos_only || argument_elide_name(name);
-    let inline_comment = serializer
-        .type_comments
-        .get(&loc.end_line)
-        .filter(|comment| parse_function_type_comment(comment).is_none())
-        .cloned();
+    // CPython never populates arg.type_comment for lambda parameters, so a
+    // line-matched statement comment must not become a lambda arg annotation.
+    let inline_comment = if serializer.lambda_depth > 0 {
+        None
+    } else {
+        serializer
+            .type_comments
+            .get(&loc.end_line)
+            .filter(|comment| parse_function_type_comment(comment).is_none())
+            .cloned()
+    };
     if parameter.annotation().is_some() && inline_comment.is_some() {
         serializer
             .parse_errors

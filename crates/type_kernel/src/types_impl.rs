@@ -1134,6 +1134,7 @@ mod tests {
                 missing_import_name: None,
             }),
             min_len: 0,
+            meta_level: 0,
         };
         let t = Type::TupleType {
             partial_fallback: Box::new(fallback),
@@ -1175,6 +1176,7 @@ mod tests {
                 missing_import_name: None,
             }),
             min_len: 1,
+            meta_level: 0,
         };
         let t = Type::TupleType {
             partial_fallback: Box::new(fallback),

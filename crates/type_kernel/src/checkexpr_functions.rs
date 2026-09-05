@@ -3904,6 +3904,7 @@ mod tests {
             upper_bound: Box::new(make_instance("object", vec![])),
             namespace: Default::default(),
             default: Box::new(make_any(TYPE_OF_ANY_FROM_OMITTED_GENERICS)),
+            meta_level: 0,
         };
         assert_eq!(
             has_any_type_inner(&ps, false, &empty_alias_resolver()),
@@ -3927,6 +3928,7 @@ mod tests {
             tuple_fallback: Box::new(make_any(TYPE_OF_ANY_UNANNOTATED)),
             min_len: 0,
             namespace: Default::default(),
+            meta_level: 0,
         };
         assert_eq!(
             has_any_type_inner(&tvt, false, &empty_alias_resolver()),
@@ -3946,6 +3948,7 @@ mod tests {
             tuple_fallback: Box::new(make_instance("tuple", vec![])),
             min_len: 0,
             namespace: Default::default(),
+            meta_level: 0,
         };
         assert_eq!(
             has_any_type_inner(&tvt, false, &empty_alias_resolver()),
@@ -5789,6 +5792,7 @@ mod tests {
             )),
             default: Box::new(make_any(TYPE_OF_ANY_FROM_OMITTED_GENERICS)),
             min_len: 0,
+            meta_level: 0,
         };
         let star = Type::UnpackType {
             typ: Box::new(ts),
@@ -6660,6 +6664,7 @@ mod is_valid_var_arg_tests {
             flavor: 0,
             upper_bound: Box::new(instance("builtins.object")),
             default: Box::new(any_type()),
+            meta_level: 0,
         }
     }
 

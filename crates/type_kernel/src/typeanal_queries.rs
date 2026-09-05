@@ -3202,6 +3202,7 @@ fn analyze_type_inner(
             flavor,
             upper_bound,
             default,
+            meta_level,
         } => {
             let prefix = Box::new(Parameters {
                 arg_types: analyze_type_list(
@@ -3242,6 +3243,7 @@ fn analyze_type_inner(
                 flavor: *flavor,
                 upper_bound,
                 default,
+                meta_level: *meta_level,
             })
         }
 
@@ -3254,6 +3256,7 @@ fn analyze_type_inner(
             upper_bound,
             default,
             min_len,
+            meta_level,
         } => {
             let tuple_fallback = Box::new(analyze_type_inner(
                 tuple_fallback,
@@ -3282,6 +3285,7 @@ fn analyze_type_inner(
                 upper_bound,
                 default,
                 min_len: *min_len,
+                meta_level: *meta_level,
             })
         }
 

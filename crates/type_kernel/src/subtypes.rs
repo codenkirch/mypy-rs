@@ -3158,6 +3158,7 @@ fn expand_aliases_depth(
             flavor,
             upper_bound,
             default,
+            meta_level,
         } => {
             let new_prefix =
                 expand_parameters_depth(prefix, alias_resolver, strict_optional, depth, active)?;
@@ -3184,6 +3185,7 @@ fn expand_aliases_depth(
                 flavor: *flavor,
                 upper_bound: ub,
                 default: def,
+                meta_level: *meta_level,
             })
         }
         Type::TypeVarTupleType {
@@ -3195,6 +3197,7 @@ fn expand_aliases_depth(
             upper_bound,
             default,
             min_len,
+            meta_level,
         } => {
             let fb = Box::new(expand_aliases_depth(
                 tuple_fallback,
@@ -3226,6 +3229,7 @@ fn expand_aliases_depth(
                 upper_bound: ub,
                 default: def,
                 min_len: *min_len,
+                meta_level: *meta_level,
             })
         }
         Type::UnpackType { typ, .. } => {
@@ -3481,7 +3485,7 @@ fn erase_return_self_types_wire(typ: &Type, self_type: &Type) -> Option<Type> {
             ..
         } => {
             if !match ret_type.as_ref() {
-                Type::Instance { .. } => ret_type.as_ref() == self_type,
+                Type::Instance { .. } => wire::py_type_eq(ret_type.as_ref(), self_type),
                 Type::TypeAliasType { .. } => return None,
                 _ => false,
             } {
@@ -4647,6 +4651,7 @@ mod tests {
             upper_bound: Box::new(instance("builtins.object", vec![])),
             default: Box::new(Type::UninhabitedType { ambiguous: false }),
             min_len: 0,
+            meta_level: 0,
         };
         assert_eq!(is_subtype(&left, &right, &ctx_nominal(), &r), Some(false));
     }
@@ -4714,6 +4719,7 @@ mod tests {
             tuple_fallback: Box::new(instance("builtins.tuple", vec![])),
             default: Box::new(Type::UninhabitedType { ambiguous: false }),
             min_len: 0,
+            meta_level: 0,
         };
         let mut base = snap("a.Gen", "Gen");
         base.type_vars_with_variance = vec![("T".to_string(), COVARIANT, 0)];
@@ -4936,6 +4942,7 @@ mod tests {
             flavor: 0,
             upper_bound: Box::new(instance("builtins.object", vec![])),
             default: Box::new(any_type()),
+            meta_level: 0,
         };
         let t = callable_type(vec![], any_type(), None);
         let with_paramspec = match t {

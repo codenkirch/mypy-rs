@@ -2292,6 +2292,27 @@ including:
   same-alias-different-args expansion, pop-then-expand) plus
   `test_recursive_alias_gate_parity_no_wrong_verdict` in
   `NativeSubtypesDeferralSuite` (mypy/test/testtypes.py).
+- `py_type_eq` (issue #1412, `crate::wire`) — mirrors Python `==` on two
+  wire `Type`s for the kernel's self-return comparisons
+  (`subtypes.rs:3488`) and the infer-variance identical-class fast paths
+  (`infer_variance.rs:113`). Per-class structural equality following
+  Python's `__eq__` overrides where they exist (`Instance`: type + args +
+  last_known_value + extra_attrs; `TypeAliasType`: alias + args).
+  `TypeVarType.__eq__` (types.py:837) compares id/upper_bound/values/
+  default and deliberately ignores variance and name/fullname; the wire
+  seam stands in for the `TypeVarId` comparison with
+  `raw_id`+`namespace`+`meta_level`, which makes the comparison
+  variance-insensitive. `ParamSpecType` compares id + flavor + prefix +
+  default (the bound is determined by flavor), `TypeVarTupleType`
+  compares id + min_len + default; every other pair falls back to derived
+  byte equality (matching Python for tvar-free types). Cross-build facts
+  (type_ref fullname for live TypeInfo identity) follow the usual
+  wire-seam assumption. The fix un-breaks
+  `testPEP695InferVarianceRecursive`: the recomputed self-return
+  previously compared with wire-structural eq (variance-sensitive), so a
+  recursive generic class whose self-return carries a different variance
+  read as "self.type is not s.type" and produced a bogus INFERS/wrong
+  variance verdict.
 - `rust_expand_type` alias-entry defer removal (issue #1195) — the
   `expand_type` seam no longer defers alias-bearing inputs: the
   `alias_entry` guard (any `TypeAliasType` input) and the

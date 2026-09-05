@@ -3049,6 +3049,7 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
                                     definition=callee.definition,
                                     line=callee.line,
                                     column=callee.column,
+                                    special_sig=callee.special_sig,
                                 )
                                 # Native solve succeeded; skip Python's infer pass.
                                 native_solved = True

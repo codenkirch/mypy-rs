@@ -535,6 +535,7 @@ mod tests {
             upper_bound: Box::new(instance("builtins.object", vec![])),
             default: Box::new(any_type()),
             min_len: 0,
+            meta_level: 0,
         };
         let callee = callable(
             vec![unpack(tuple_type(vec![unpack(ts.clone()), any_type()]))],

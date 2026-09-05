@@ -661,6 +661,7 @@ pub(crate) enum Type {
         flavor: i64,
         upper_bound: Box<Type>,
         default: Box<Type>,
+        meta_level: i64,
     },
     TypeVarTupleType {
         tuple_fallback: Box<Type>,
@@ -671,6 +672,7 @@ pub(crate) enum Type {
         upper_bound: Box<Type>,
         default: Box<Type>,
         min_len: i64,
+        meta_level: i64,
     },
     UnboundType {
         name: String,
@@ -722,9 +724,8 @@ pub(crate) enum Type {
         variables: Vec<Type>,
         type_guard: Option<Box<Type>>,
         type_is: Option<Box<Type>>,
-        /// `CallableType.special_sig` ("tuple" or None) — plain data the
-        /// Python class carries but the wire format never serializes; see
-        /// the plain-data note on `UnboundType`.
+        /// `CallableType.special_sig` ("partial" or None) — round-trips on
+        /// the wire, serialized after `name`.
         special_sig: Option<String>,
     },
     Overloaded {
@@ -979,7 +980,28 @@ fn read_param_spec_type(buf: &mut ReadBuffer<'_>) -> Result<Type, WireError> {
     let flavor = read_int(buf)?;
     let upper_bound = read_type(buf, None)?;
     let default = read_type(buf, None)?;
-    expect_end_tag(buf)?;
+    // Backward-compatible meta_level append (same as read_type_var_type):
+    // written only when non-zero, so the next tag is either LITERAL_INT
+    // (meta_level present, itself followed by END_TAG) or END_TAG (absent).
+    let peek = read_tag(buf)?;
+    let meta_level = match peek {
+        LITERAL_INT => {
+            let ml = read_int_bare(buf)?;
+            let end = read_tag(buf)?;
+            if end != END_TAG {
+                return Err(WireError::invalid(format!(
+                    "expected END_TAG (255) after ParamSpec meta_level, got tag {end}"
+                )));
+            }
+            ml
+        }
+        END_TAG => 0,
+        other => {
+            return Err(WireError::invalid(format!(
+                "expected END_TAG (255) or LITERAL_INT (ParamSpec meta_level), got tag {other}"
+            )));
+        }
+    };
     Ok(Type::ParamSpecType {
         prefix: Box::new(prefix),
         name,
@@ -989,6 +1011,7 @@ fn read_param_spec_type(buf: &mut ReadBuffer<'_>) -> Result<Type, WireError> {
         flavor,
         upper_bound: Box::new(upper_bound),
         default: Box::new(default),
+        meta_level,
     })
 }
 
@@ -1009,7 +1032,28 @@ fn read_type_var_tuple_type(buf: &mut ReadBuffer<'_>) -> Result<Type, WireError>
     let upper_bound = read_type(buf, None)?;
     let default = read_type(buf, None)?;
     let min_len = read_int(buf)?;
-    expect_end_tag(buf)?;
+    // Backward-compatible meta_level append (same as read_type_var_type):
+    // written only when non-zero, so the next tag is either LITERAL_INT
+    // (meta_level present, itself followed by END_TAG) or END_TAG (absent).
+    let peek = read_tag(buf)?;
+    let meta_level = match peek {
+        LITERAL_INT => {
+            let ml = read_int_bare(buf)?;
+            let end = read_tag(buf)?;
+            if end != END_TAG {
+                return Err(WireError::invalid(format!(
+                    "expected END_TAG (255) after TypeVarTuple meta_level, got tag {end}"
+                )));
+            }
+            ml
+        }
+        END_TAG => 0,
+        other => {
+            return Err(WireError::invalid(format!(
+                "expected END_TAG (255) or LITERAL_INT (TypeVarTuple meta_level), got tag {other}"
+            )));
+        }
+    };
     Ok(Type::TypeVarTupleType {
         tuple_fallback: Box::new(tuple_fallback),
         name,
@@ -1019,6 +1063,7 @@ fn read_type_var_tuple_type(buf: &mut ReadBuffer<'_>) -> Result<Type, WireError>
         upper_bound: Box::new(upper_bound),
         default: Box::new(default),
         min_len,
+        meta_level,
     })
 }
 
@@ -1151,6 +1196,7 @@ fn read_callable_type(buf: &mut ReadBuffer<'_>) -> Result<Type, WireError> {
     let arg_names = read_str_opt_list(buf)?;
     let ret_type = read_type(buf, None)?;
     let name = read_str_opt(buf)?;
+    let special_sig = read_str_opt(buf)?;
     let variables = read_type_var_likes(buf)?;
     let type_guard = read_type_opt(buf)?;
     let type_is = read_type_opt(buf)?;
@@ -1173,8 +1219,7 @@ fn read_callable_type(buf: &mut ReadBuffer<'_>) -> Result<Type, WireError> {
         variables,
         type_guard: type_guard.map(Box::new),
         type_is: type_is.map(Box::new),
-        // Wire format does not carry `special_sig` (Phase F0, #1349).
-        special_sig: None,
+        special_sig,
     })
 }
 
@@ -2380,6 +2425,7 @@ pub(crate) fn write_type(buf: &mut WriteBuffer, t: &Type) -> Result<(), WireErro
             arg_names,
             ret_type,
             name,
+            special_sig,
             variables,
             type_guard,
             type_is,
@@ -2387,8 +2433,6 @@ pub(crate) fn write_type(buf: &mut WriteBuffer, t: &Type) -> Result<(), WireErro
         } => {
             write_tag(buf, CALLABLE_TYPE);
             // fallback is always an Instance (Python asserts the tag).
-            // `special_sig` is Rust-resident only (Phase F0, #1349); the
-            // wire format matches `CallableType.write` in types.py.
             write_type(buf, fallback)?;
             write_type_opt(buf, instance_type.as_deref())?;
             write_flags(
@@ -2408,6 +2452,7 @@ pub(crate) fn write_type(buf: &mut WriteBuffer, t: &Type) -> Result<(), WireErro
             write_str_opt_list(buf, arg_names)?;
             write_type(buf, ret_type)?;
             write_str_opt(buf, name.as_deref())?;
+            write_str_opt(buf, special_sig.as_deref())?;
             write_type_var_likes(buf, variables)?;
             write_type_opt(buf, type_guard.as_deref())?;
             write_type_opt(buf, type_is.as_deref())?;
@@ -2490,6 +2535,7 @@ pub(crate) fn write_type(buf: &mut WriteBuffer, t: &Type) -> Result<(), WireErro
             flavor,
             upper_bound,
             default,
+            meta_level,
         } => {
             // Field order mirrors `read_param_spec_type` (wire.rs:790) and
             // `ParamSpecType.write` in mypy/types.py:911. The prefix is an
@@ -2503,6 +2549,11 @@ pub(crate) fn write_type(buf: &mut WriteBuffer, t: &Type) -> Result<(), WireErro
             write_int(buf, *flavor)?;
             write_type(buf, upper_bound)?;
             write_type(buf, default)?;
+            // meta_level is written only when non-zero
+            // (backward-compatible append, mirroring types.py).
+            if *meta_level != 0 {
+                write_int(buf, *meta_level)?;
+            }
             write_tag(buf, END_TAG);
             Ok(())
         }
@@ -2515,6 +2566,7 @@ pub(crate) fn write_type(buf: &mut WriteBuffer, t: &Type) -> Result<(), WireErro
             upper_bound,
             default,
             min_len,
+            meta_level,
         } => {
             // Field order mirrors `read_type_var_tuple_type` (wire.rs:820) and
             // `TypeVarTupleType.write` in mypy/types.py:993. tuple_fallback is
@@ -2528,6 +2580,11 @@ pub(crate) fn write_type(buf: &mut WriteBuffer, t: &Type) -> Result<(), WireErro
             write_type(buf, upper_bound)?;
             write_type(buf, default)?;
             write_int(buf, *min_len)?;
+            // meta_level is written only when non-zero
+            // (backward-compatible append, mirroring types.py).
+            if *meta_level != 0 {
+                write_int(buf, *meta_level)?;
+            }
             write_tag(buf, END_TAG);
             Ok(())
         }
@@ -2665,6 +2722,182 @@ pub(crate) fn encode_instance_simple_for_test(fullname: &str) -> Vec<u8> {
     blob.extend(encode_short_int_for_test(bytes.len() as i64));
     blob.extend_from_slice(bytes);
     blob
+}
+
+/// Python `==` semantics for wire-decoded types, for the seams that compare a
+/// serialized type against another serialized type instead of against live
+/// objects (the `erase_return_self_types` ret-vs-self comparison).
+///
+/// Plain `PartialEq` on `Type` is byte-exact and over-strict: Python's
+/// `TypeVarType.__eq__` (types.py:837) compares `id` (raw_id, meta_level,
+/// namespace), `upper_bound`, `values` and `default`, but deliberately ignores
+/// `variance` and name/fullname. The critical divergence: during PEP 695
+/// variance inference the self-side arg tvar carries the trial variance while
+/// the member-side carries VARIANCE_NOT_READY, so the wire bytes always differ
+/// but Python still says `ret == self_type` and erases the self return. A
+/// byte check then freezes reported variance at INVARIANT (test
+/// `testPEP695InferVarianceRecursive`).
+///
+/// Only the variants whose Python `__eq__` is variance-insensitive (or tvar
+/// carrying) are compared structurally; every other pair falls back to the
+/// derived byte equality, which matches Python for tvar-free types.
+pub(crate) fn py_type_eq(a: &Type, b: &Type) -> bool {
+    match (a, b) {
+        // Instance.__eq__ (types.py:1939): type identity + args +
+        // last_known_value + extra_attrs. The wire carries `type_ref`
+        // (fullname) in place of the live TypeInfo identity.
+        (
+            Type::Instance {
+                type_ref: t1,
+                args: a1,
+                last_known_value: l1,
+                extra_attrs: e1,
+            },
+            Type::Instance {
+                type_ref: t2,
+                args: a2,
+                last_known_value: l2,
+                extra_attrs: e2,
+            },
+        ) => {
+            t1 == t2
+                && a1.len() == a2.len()
+                && a1.iter().zip(a2.iter()).all(|(x, y)| py_type_eq(x, y))
+                && match (l1, l2) {
+                    (None, None) => true,
+                    (Some(x), Some(y)) => py_type_eq(x, y),
+                    _ => false,
+                }
+                && match (e1, e2) {
+                    (None, None) => true,
+                    (Some(x), Some(y)) => extra_attrs_py_eq(x, y),
+                    _ => false,
+                }
+        }
+        // TypeVarType.__eq__ (types.py:837): id + upper_bound + values +
+        // default; `variance` and name/fullname are NOT part of the ==
+        // contract, letting the trial-variance tvar match the NOT_READY.
+        (
+            Type::TypeVarType {
+                raw_id: r1,
+                namespace: n1,
+                meta_level: m1,
+                values: v1,
+                upper_bound: u1,
+                default: d1,
+                ..
+            },
+            Type::TypeVarType {
+                raw_id: r2,
+                namespace: n2,
+                meta_level: m2,
+                values: v2,
+                upper_bound: u2,
+                default: d2,
+                ..
+            },
+        ) => {
+            r1 == r2
+                && n1 == n2
+                && m1 == m2
+                && v1.len() == v2.len()
+                && v1.iter().zip(v2.iter()).all(|(x, y)| py_type_eq(x, y))
+                && py_type_eq(u1, u2)
+                && py_type_eq(d1, d2)
+        }
+        // ParamSpecType.__eq__ (types.py:1035): id + flavor + prefix +
+        // default (upper_bound is implied by flavor).
+        (
+            Type::ParamSpecType {
+                raw_id: r1,
+                namespace: n1,
+                meta_level: m1,
+                flavor: f1,
+                prefix: p1,
+                default: d1,
+                ..
+            },
+            Type::ParamSpecType {
+                raw_id: r2,
+                namespace: n2,
+                meta_level: m2,
+                flavor: f2,
+                prefix: p2,
+                default: d2,
+                ..
+            },
+        ) => {
+            r1 == r2
+                && n1 == n2
+                && m1 == m2
+                && f1 == f2
+                && py_type_eq(d1, d2)
+                && p1.arg_types.len() == p2.arg_types.len()
+                && p1
+                    .arg_types
+                    .iter()
+                    .zip(p2.arg_types.iter())
+                    .all(|(x, y)| py_type_eq(x, y))
+                && p1.arg_kinds == p2.arg_kinds
+                && p1.arg_names == p2.arg_names
+                && p1
+                    .variables
+                    .iter()
+                    .zip(p2.variables.iter())
+                    .all(|(x, y)| py_type_eq(x, y))
+                && p1.imprecise_arg_kinds == p2.imprecise_arg_kinds
+                && p1.is_ellipsis_args == p2.is_ellipsis_args
+        }
+        // TypeVarTupleType.__eq__ (types.py:1221): id + min_len + default.
+        (
+            Type::TypeVarTupleType {
+                raw_id: r1,
+                namespace: n1,
+                meta_level: m1,
+                min_len: l1,
+                default: d1,
+                ..
+            },
+            Type::TypeVarTupleType {
+                raw_id: r2,
+                namespace: n2,
+                meta_level: m2,
+                min_len: l2,
+                default: d2,
+                ..
+            },
+        ) => r1 == r2 && n1 == n2 && m1 == m2 && l1 == l2 && py_type_eq(d1, d2),
+        // UnionType.__eq__: order-sensitive items + uses_pep604.
+        (
+            Type::UnionType {
+                items: i1,
+                uses_pep604_syntax: p1,
+                ..
+            },
+            Type::UnionType {
+                items: i2,
+                uses_pep604_syntax: p2,
+                ..
+            },
+        ) => {
+            p1 == p2
+                && i1.len() == i2.len()
+                && i1.iter().zip(i2.iter()).all(|(x, y)| py_type_eq(x, y))
+        }
+        _ => a == b,
+    }
+}
+
+/// `ExtraAttrs.__eq__` (types.py:1793): attrs map + immutable set only —
+/// `mod_name` is not part of the == contract.
+fn extra_attrs_py_eq(a: &ExtraAttrs, b: &ExtraAttrs) -> bool {
+    a.attrs.len() == b.attrs.len()
+        && a
+            .attrs
+            .iter()
+            .all(|(k, v)| b.attrs.get(k).iter().all(|w| py_type_eq(v, w)))
+        && a.immutable.len() == b.immutable.len()
+        && a.immutable.iter().all(|k| b.immutable.contains(k))
 }
 
 #[cfg(test)]
@@ -3423,6 +3656,7 @@ mod tests {
                 source_any: None,
                 missing_import_name: None,
             }),
+            meta_level: 0,
         };
         let mut buf = WriteBuffer::new();
         write_type(&mut buf, &t).expect("ParamSpecType must be writable");
@@ -3430,6 +3664,82 @@ mod tests {
         let mut rbuf = ReadBuffer::new(&bytes);
         let back = read_type(&mut rbuf, None).expect("ParamSpecType must round-trip");
         assert!(matches!(back, Type::ParamSpecType { .. }));
+    }
+
+    // ----- py_type_eq (Python == semantics for wire types) -----
+
+    /// Self-referencing generic class instance: `C[T]` arg tvar with variance
+    /// NOT_READY vs the same tvar with a trial variance — Python says the two
+    /// `TypeVarType`s compare == (variance is not part of its __eq__).
+    fn instance_with_tvar(variance: i64) -> Type {
+        Type::Instance {
+            type_ref: "__main__.Invariant".to_string(),
+            args: vec![Type::TypeVarType {
+                name: "T".to_string(),
+                fullname: "__main__.T".to_string(),
+                raw_id: 1,
+                namespace: String::new(),
+                values: Vec::new(),
+                upper_bound: Box::new(Type::Instance {
+                    type_ref: "builtins.object".to_string(),
+                    args: Vec::new(),
+                    last_known_value: None,
+                    extra_attrs: None,
+                }),
+                default: Box::new(Type::AnyType {
+                    type_of_any: 0,
+                    source_any: None,
+                    missing_import_name: None,
+                }),
+                variance,
+                meta_level: 0,
+            }],
+            last_known_value: None,
+            extra_attrs: None,
+        }
+    }
+
+    #[test]
+    fn py_type_eq_ignores_tvar_variance() {
+        // The testPEP695InferVarianceRecursive regression: member-side tvar
+        // frozen NOT_READY (3) vs self-side trial tvar — Python compares
+        // equal, so a self-returning method erases to Any.
+        assert!(py_type_eq(&instance_with_tvar(3), &instance_with_tvar(0)));
+        assert!(py_type_eq(&instance_with_tvar(3), &instance_with_tvar(2)));
+        // ...but id, bound, values and default still matter.
+        let mut wrong_raw_id = instance_with_tvar(3);
+        if let Type::Instance { args, .. } = &mut wrong_raw_id {
+            if let Type::TypeVarType { raw_id, .. } = &mut args[0] {
+                *raw_id = 77;
+            }
+        }
+        assert!(!py_type_eq(&instance_with_tvar(3), &wrong_raw_id));
+    }
+
+    #[test]
+    fn py_type_eq_instance_shape() {
+        // Different class fullname → Python Instance.__eq__ false.
+        assert!(!py_type_eq(
+            &instance_with_tvar(0),
+            &Type::Instance {
+                type_ref: "__main__.Other".to_string(),
+                args: Vec::new(),
+                last_known_value: None,
+                extra_attrs: None
+            }
+        ));
+        // Arg-count mismatch → false.
+        assert!(!py_type_eq(
+            &instance_with_tvar(1),
+            &Type::Instance {
+                type_ref: "__main__.Invariant".to_string(),
+                args: Vec::new(),
+                last_known_value: None,
+                extra_attrs: None
+            }
+        ));
+        // Truly identical → true.
+        assert!(py_type_eq(&instance_with_tvar(2), &instance_with_tvar(2)));
     }
 
     // ----- Phase F0 (#1349): Rust-resident plain-data fields -----
@@ -3523,8 +3833,8 @@ mod tests {
     }
 
     #[test]
-    fn f0_callable_type_reader_fills_special_sig_default() {
-        let t = Type::CallableType {
+    fn f0_callable_type_reader_round_trips_special_sig() {
+        let mk = |special_sig: Option<String>| Type::CallableType {
             fallback: Box::new(Type::Instance {
                 type_ref: "builtins.function".to_string(),
                 args: Vec::new(),
@@ -3547,10 +3857,14 @@ mod tests {
             variables: Vec::new(),
             type_guard: None,
             type_is: None,
-            special_sig: None,
+            special_sig,
         };
-        match round_trip(&t) {
+        match round_trip(&mk(None)) {
             Type::CallableType { special_sig, .. } => assert_eq!(special_sig, None),
+            _ => panic!("expected CallableType"),
+        }
+        match round_trip(&mk(Some("partial".to_string()))) {
+            Type::CallableType { special_sig, .. } => assert_eq!(special_sig.as_deref(), Some("partial")),
             _ => panic!("expected CallableType"),
         }
     }

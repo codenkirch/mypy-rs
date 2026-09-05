@@ -157,8 +157,7 @@ class TypeArgumentAnalyzer(MixedTraverserVisitor):
             return True
         if isinstance(arg, Parameters):
             self.fail(
-                f"Cannot use {format_type(arg, self.options)} for {tv_kind},"
-                " only for ParamSpec",
+                f"Cannot use {format_type(arg, self.options)} for {tv_kind}, only for ParamSpec",
                 context,
                 code=codes.VALID_TYPE,
             )

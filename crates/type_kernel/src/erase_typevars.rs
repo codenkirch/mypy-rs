@@ -210,6 +210,7 @@ pub(crate) fn erase_typevars_inner(
             flavor,
             upper_bound,
             default,
+            meta_level,
         } => {
             if should_erase(*raw_id, namespace, ids) {
                 Some(replacement.clone())
@@ -225,6 +226,7 @@ pub(crate) fn erase_typevars_inner(
                     flavor: *flavor,
                     upper_bound: upper_bound.clone(),
                     default: default.clone(),
+                    meta_level: *meta_level,
                 })
             }
         }
@@ -238,6 +240,7 @@ pub(crate) fn erase_typevars_inner(
             upper_bound,
             default,
             min_len,
+            meta_level,
         } => {
             if should_erase(*raw_id, namespace, ids) {
                 // visit_type_var_tuple (erasetype.py:391-394): the wire
@@ -253,6 +256,7 @@ pub(crate) fn erase_typevars_inner(
                     upper_bound: upper_bound.clone(),
                     default: default.clone(),
                     min_len: *min_len,
+                    meta_level: *meta_level,
                 })
             }
         }
@@ -1036,6 +1040,7 @@ mod tests {
                 missing_import_name: None,
             }),
             min_len: 0,
+            meta_level: 0,
         }
     }
 

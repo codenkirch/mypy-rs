@@ -452,6 +452,7 @@ fn transform_children<F: Fn(Type) -> Type>(t: Type, f: F) -> Type {
             flavor,
             upper_bound,
             default,
+            meta_level,
         } => Type::ParamSpecType {
             prefix,
             name,
@@ -461,6 +462,7 @@ fn transform_children<F: Fn(Type) -> Type>(t: Type, f: F) -> Type {
             flavor,
             upper_bound: Box::new(f(*upper_bound)),
             default: Box::new(f(*default)),
+            meta_level,
         },
         Type::TypeVarTupleType {
             tuple_fallback,
@@ -471,6 +473,7 @@ fn transform_children<F: Fn(Type) -> Type>(t: Type, f: F) -> Type {
             upper_bound,
             default,
             min_len,
+            meta_level,
         } => Type::TypeVarTupleType {
             tuple_fallback: Box::new(f(*tuple_fallback)),
             name,
@@ -480,6 +483,7 @@ fn transform_children<F: Fn(Type) -> Type>(t: Type, f: F) -> Type {
             upper_bound: Box::new(f(*upper_bound)),
             default: Box::new(f(*default)),
             min_len,
+            meta_level,
         },
         Type::DeletedType { source } => Type::DeletedType { source },
         Type::UninhabitedType { .. } => Type::UninhabitedType { ambiguous: false },

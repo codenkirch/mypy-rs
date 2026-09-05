@@ -374,6 +374,32 @@ pub(crate) fn is_unannotated_any_inner(typ: &Type) -> bool {
     }
 }
 
+// Strict list-return decode helpers (#1412).
+
+// The visitor seams above return wire blobs that the Python shim decodes
+// back into live `Type` graphs; a blob carrying a `TypeAliasType` decodes
+// to an alias with `alias=None`, poisoning `get_proper_type` downstream.
+
+// Guard 1, `decode_type_scoped`: single blob, defers (`None`) on
+// undecodable bytes or any alias in the tree. Guard 2,
+// `decode_types_for_list_return`: all-or-nothing list of blobs.
+
+fn decode_type_scoped(bytes: &[u8]) -> Option<Type> {
+    let typ = decode_type(bytes)?;
+    if type_contains_alias(&typ) {
+        return None;
+    }
+    Some(typ)
+}
+
+fn decode_types_for_list_return(blobs: &[Vec<u8>]) -> Option<Vec<Type>> {
+    let mut types = Vec::with_capacity(blobs.len());
+    for b in blobs {
+        types.push(decode_type_scoped(b)?);
+    }
+    Some(types)
+}
+
 // ---------------------------------------------------------------------------
 // remove_dups: generic dedup preserving order
 // ---------------------------------------------------------------------------
@@ -385,15 +411,15 @@ pub(crate) fn is_unannotated_any_inner(typ: &Type) -> bool {
 /// Returns the deduped list as wire-format type bytes. The shim decodes
 /// back to Python list.
 #[pyfunction]
-pub(crate) fn rust_remove_dups(type_bytes_list: Vec<Vec<u8>>) -> PyResult<Vec<Vec<u8>>> {
-    let mut types: Vec<Type> = Vec::with_capacity(type_bytes_list.len());
-    for b in &type_bytes_list {
-        if let Some(t) = decode_type(b) {
-            types.push(t);
-        }
-    }
+pub(crate) fn rust_remove_dups(
+    type_bytes_list: Vec<Vec<u8>>,
+) -> PyResult<Option<Vec<Vec<u8>>>> {
+    let types = match decode_types_for_list_return(&type_bytes_list) {
+        Some(t) => t,
+        None => return Ok(None),
+    };
     let deduped = remove_dups_inner(&types);
-    Ok(deduped.iter().filter_map(encode_type).collect())
+    Ok(encode_type_list(&deduped))
 }
 
 pub(crate) fn remove_dups_inner(types: &[Type]) -> Vec<Type> {
@@ -418,15 +444,15 @@ pub(crate) fn remove_dups_inner(types: &[Type]) -> Vec<Type> {
 /// list of serialized type variables; the output is a list of
 /// serialized types.
 #[pyfunction]
-pub(crate) fn rust_type_vars_as_args(type_bytes_list: Vec<Vec<u8>>) -> PyResult<Vec<Vec<u8>>> {
-    let mut types: Vec<Type> = Vec::with_capacity(type_bytes_list.len());
-    for b in &type_bytes_list {
-        if let Some(t) = decode_type(b) {
-            types.push(t);
-        }
-    }
+pub(crate) fn rust_type_vars_as_args(
+    type_bytes_list: Vec<Vec<u8>>,
+) -> PyResult<Option<Vec<Vec<u8>>>> {
+    let types = match decode_types_for_list_return(&type_bytes_list) {
+        Some(t) => t,
+        None => return Ok(None),
+    };
     let result = type_vars_as_args_inner(&types);
-    Ok(result.iter().filter_map(encode_type).collect())
+    Ok(encode_type_list(&result))
 }
 
 pub(crate) fn type_vars_as_args_inner(type_vars: &[Type]) -> Vec<Type> {
@@ -462,15 +488,15 @@ pub(crate) fn rust_callable_with_ellipsis(
     ret_bytes: &[u8],
     fallback_bytes: &[u8],
 ) -> PyResult<Option<Vec<u8>>> {
-    let any_type = match decode_type(any_bytes) {
+    let any_type = match decode_type_scoped(any_bytes) {
         Some(t) => t,
         None => return Ok(None),
     };
-    let ret_type = match decode_type(ret_bytes) {
+    let ret_type = match decode_type_scoped(ret_bytes) {
         Some(t) => t,
         None => return Ok(None),
     };
-    let fallback = match decode_type(fallback_bytes) {
+    let fallback = match decode_type_scoped(fallback_bytes) {
         Some(t) => t,
         None => return Ok(None),
     };
@@ -518,15 +544,21 @@ pub(crate) fn callable_with_ellipsis_inner(
 /// return the first and rely on the earlier semanal pass to flag
 /// duplicates.
 ///
-/// Returns `-1` encoded as a None-via-Option: the shim decodes `-1` as
-/// "not found", any other value as the index.
+/// Returns the 0-based index, or `-1` (in the Some arm) if no UnpackType
+/// is present; `None` defers (an input blob failed the strict decode, see
+/// `decode_types_for_list_return`), mirroring the shim's fall-through.
+/// The Python version asserts uniqueness (raises if two are found); we
+/// silently return the first and rely on the earlier semanal pass to flag
+/// duplicates.
 #[pyfunction]
-pub(crate) fn rust_find_unpack_in_list(type_bytes_list: Vec<Vec<u8>>) -> PyResult<i64> {
-    let types: Vec<Type> = type_bytes_list
-        .iter()
-        .filter_map(|b| decode_type(b))
-        .collect();
-    Ok(find_unpack_in_list_inner(&types))
+pub(crate) fn rust_find_unpack_in_list(
+    type_bytes_list: Vec<Vec<u8>>,
+) -> PyResult<Option<i64>> {
+    let types = match decode_types_for_list_return(&type_bytes_list) {
+        Some(t) => t,
+        None => return Ok(None),
+    };
+    Ok(Some(find_unpack_in_list_inner(&types)))
 }
 
 pub(crate) fn find_unpack_in_list_inner(types: &[Type]) -> i64 {
@@ -557,19 +589,22 @@ pub(crate) fn rust_split_with_prefix_and_suffix(
     type_bytes_list: Vec<Vec<u8>>,
     prefix: usize,
     suffix: usize,
-) -> PyResult<(Vec<Vec<u8>>, Vec<Vec<u8>>, Vec<Vec<u8>>)> {
-    let mut types = Vec::with_capacity(type_bytes_list.len());
-    for b in &type_bytes_list {
-        if let Some(t) = decode_type(b) {
-            types.push(t);
-        }
-    }
+) -> PyResult<Option<(Vec<Vec<u8>>, Vec<Vec<u8>>, Vec<Vec<u8>>)>> {
+    let types = match decode_types_for_list_return(&type_bytes_list) {
+        Some(t) => t,
+        None => return Ok(None),
+    };
     let (head, mid, tail) = split_with_prefix_and_suffix_inner(&types, prefix, suffix);
-    Ok((
+    let (Some(head), Some(mid), Some(tail)) = (
         encode_type_list(&head),
         encode_type_list(&mid),
         encode_type_list(&tail),
-    ))
+    ) else {
+        // Strict all-or-nothing (#1412): an unencodable row defers instead
+        // of silently truncating the list.
+        return Ok(None);
+    };
+    Ok(Some((head, mid, tail)))
 }
 
 pub(crate) fn split_with_prefix_and_suffix_inner(
@@ -595,8 +630,17 @@ pub(crate) fn split_with_prefix_and_suffix_inner(
     }
 }
 
-fn encode_type_list(types: &[Type]) -> Vec<Vec<u8>> {
-    types.iter().filter_map(encode_type).collect()
+fn encode_type_list(types: &[Type]) -> Option<Vec<Vec<u8>>> {
+    let mut out = Vec::with_capacity(types.len());
+    for t in types {
+        match encode_type(t) {
+            Some(b) => out.push(b),
+            // Strict all-or-nothing (#1412): silently dropping a row would
+            // hand the shim a truncated list of Types.
+            None => return None,
+        }
+    }
+    Some(out)
 }
 
 /// `mypy.types.extend_args_for_prefix_and_suffix` — extend a list of
@@ -660,24 +704,22 @@ pub(crate) fn rust_flatten_nested_unions(
     handle_type_alias_type: bool,
     handle_recursive: bool,
 ) -> PyResult<Option<Vec<Vec<u8>>>> {
-    let mut types: Vec<Type> = Vec::with_capacity(type_bytes_list.len());
-    for b in &type_bytes_list {
-        if let Some(t) = decode_type(b) {
-            types.push(t);
-        }
-    }
+    let types = match decode_types_for_list_return(&type_bytes_list) {
+        Some(t) => t,
+        None => return Ok(None),
+    };
     // Fast path: nothing to flatten if no TypeAliasType or UnionType.
     if !types
         .iter()
         .any(|t| matches!(t, Type::TypeAliasType { .. } | Type::UnionType { .. }))
     {
-        return Ok(Some(encode_type_list(&types)));
+        return Ok(encode_type_list(&types));
     }
     let flat = match flatten_nested_unions_inner(&types, handle_type_alias_type, handle_recursive) {
         Some(f) => f,
         None => return Ok(None),
     };
-    Ok(Some(encode_type_list(&flat)))
+    Ok(encode_type_list(&flat))
 }
 
 pub(crate) fn flatten_nested_unions_inner(
@@ -730,17 +772,15 @@ pub(crate) fn rust_flatten_nested_tuples(
     type_bytes_list: Vec<Vec<u8>>,
     handle_recursive: bool,
 ) -> PyResult<Option<Vec<Vec<u8>>>> {
-    let mut types: Vec<Type> = Vec::with_capacity(type_bytes_list.len());
-    for b in &type_bytes_list {
-        if let Some(t) = decode_type(b) {
-            types.push(t);
-        }
-    }
+    let types = match decode_types_for_list_return(&type_bytes_list) {
+        Some(t) => t,
+        None => return Ok(None),
+    };
     let flat = match flatten_nested_tuples_inner(&types, handle_recursive) {
         Some(f) => f,
         None => return Ok(None),
     };
-    Ok(Some(encode_type_list(&flat)))
+    Ok(encode_type_list(&flat))
 }
 
 pub(crate) fn flatten_nested_tuples_inner(
@@ -971,6 +1011,7 @@ mod tests {
                 missing_import_name: None,
             }),
             min_len: 0,
+            meta_level: 0,
         };
         let result = type_vars_as_args_inner(&[tvt]);
         assert!(matches!(result[0], Type::UnpackType { .. }));

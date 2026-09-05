@@ -7486,6 +7486,7 @@ mod tests {
             flavor: 0,
             upper_bound: Box::new(upper_bound),
             default: Box::new(any_type()),
+            meta_level: 0,
         }
     }
 
@@ -7566,6 +7567,7 @@ mod tests {
                 missing_import_name: None,
             }),
             min_len,
+            meta_level: 0,
         }
     }
 

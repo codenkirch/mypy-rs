@@ -1169,6 +1169,7 @@ pub(crate) fn expand_type_inner(
             upper_bound,
             default,
             min_len,
+            meta_level,
         } => {
             let key = (*raw_id, 0, namespace.clone());
             match env.get(&key) {
@@ -1202,6 +1203,7 @@ pub(crate) fn expand_type_inner(
                     upper_bound: upper_bound.clone(),
                     default: default.clone(),
                     min_len: *min_len,
+                    meta_level: *meta_level,
                 }),
             }
         }
@@ -1667,6 +1669,7 @@ mod tests {
             upper_bound: Box::new(any()),
             default: Box::new(any()),
             min_len: 0,
+            meta_level: 0,
         }
     }
 
@@ -2413,6 +2416,7 @@ mod tests {
             flavor,
             upper_bound: Box::new(any()),
             default: Box::new(any()),
+            meta_level: 0,
         }
     }
 

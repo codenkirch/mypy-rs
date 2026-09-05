@@ -2293,6 +2293,7 @@ pub(crate) fn param_spec_of(
             flavor: _,
             upper_bound,
             default,
+            meta_level,
         } => {
             let m = arg_types.len();
             let names_len = arg_names.len();
@@ -2312,6 +2313,7 @@ pub(crate) fn param_spec_of(
                 flavor: 0, // ParamSpecFlavor.BARE
                 upper_bound: upper_bound.clone(),
                 default: default.clone(),
+                meta_level: *meta_level,
             })
         }
         _ => None,
@@ -2581,6 +2583,7 @@ fn callable_vs_callable_native(
                 flavor,
                 upper_bound,
                 default,
+                meta_level,
             } = cp
             else {
                 unreachable!("cactual_ps is a ParamSpecType");
@@ -2602,6 +2605,7 @@ fn callable_vs_callable_native(
                     flavor: *flavor,
                     upper_bound: upper_bound.clone(),
                     default: default.clone(),
+                    meta_level: *meta_level,
                 })
             } else {
                 None
@@ -2641,6 +2645,7 @@ fn detect_param_spec(arg_types: &[Type], arg_kinds: &[i64]) -> Option<Type> {
             flavor: _,
             upper_bound,
             default,
+            meta_level,
         } => {
             // ParamSpecFlavor.BARE = 0 (types.py:2447).
             let _ = prefix;
@@ -2660,6 +2665,7 @@ fn detect_param_spec(arg_types: &[Type], arg_kinds: &[i64]) -> Option<Type> {
                 flavor: 0,
                 upper_bound: upper_bound.clone(),
                 default: default.clone(),
+                meta_level: *meta_level,
             })
         }
         _ => None,
@@ -3167,6 +3173,7 @@ mod tests {
             flavor: 1,
             upper_bound: Box::new(any_type()),
             default: Box::new(any_type()),
+            meta_level: 0,
         };
         let types = vec![ps, any_type()];
         let kinds = vec![2, 4];
@@ -3307,6 +3314,7 @@ mod tests {
                 flavor: 0,
                 upper_bound: Box::new(any_type()),
                 default: Box::new(any_type()),
+                meta_level: 0,
             }],
             type_guard: None,
             type_is: None,
@@ -4111,6 +4119,7 @@ mod tests {
             flavor: 0, // BARE
             upper_bound: Box::new(any_type()),
             default: Box::new(any_type()),
+            meta_level: 0,
         }
     }
 
