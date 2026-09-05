@@ -442,8 +442,8 @@ fn infer_constraints_dispatch(
             if !result.is_empty() {
                 return Some(result);
             }
-            let t_rec = has_recursive_types_inner(&t)?;
-            let a_rec = has_recursive_types_inner(&a)?;
+            let t_rec = has_recursive_types_inner(&t);
+            let a_rec = has_recursive_types_inner(&a);
             if t_rec && !a_rec {
                 return handle_recursive_union_inner(
                     &t,

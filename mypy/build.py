@@ -1723,6 +1723,11 @@ class BuildManager:
         from mypy.typeanal import _set_native_typeanal_resolver
 
         _set_native_typeanal_resolver(resolver)
+        # Issue #1418: the alias-aware flatten_nested_unions seam expands
+        # zero-argument aliases via the same snapshot.
+        from mypy.types import _set_native_visitor_resolver
+
+        _set_native_visitor_resolver(resolver)
 
     def _clear_native_resolvers(self) -> None:
         """Clear all native resolver globals so the kernel defers to Python.
@@ -1786,6 +1791,11 @@ class BuildManager:
         from mypy.typeanal import _set_native_typeanal_resolver
 
         _set_native_typeanal_resolver(None)
+        # Issue #1418: the alias-aware flatten seam defers to Python
+        # (resolver None) on alias input once cleared.
+        from mypy.types import _set_native_visitor_resolver
+
+        _set_native_visitor_resolver(None)
         # Stage 6 (issue #425): maptype resolver shares the same snapshot
         # as the subtype/expand paths.
         from mypy.maptype import _set_native_map_resolver
@@ -5846,6 +5856,9 @@ def _clear_native_kernel_resolvers(manager: BuildManager) -> None:
         from mypy.typeanal import _set_native_typeanal_resolver
 
         _set_native_typeanal_resolver(None)
+        from mypy.types import _set_native_visitor_resolver
+
+        _set_native_visitor_resolver(None)
 
 
 def process_stale_scc(graph: Graph, ascc: SCC, manager: BuildManager) -> None:

@@ -10801,6 +10801,189 @@ class NativeTypeImplTruthinessSuite(Suite):
 
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeHasRecursiveTypesFlattenSuite(Suite):
+    """Parity for the issue #1418 ports in `mypy.types`.
+
+    `has_recursive_types` is now total: the wire carries the alias
+    `is_recursive` flag and the Rust port mirrors
+    `HasRecursiveType`/`BoolTypeQuery` at the exact visitor positions,
+    so every well-formed blob decides natively (gate-on == gate-off).
+    `flatten_nested_unions` expands zero-argument alias rows through the
+    alias snapshot installed on the resolver (mirroring Python's
+    `get_proper_type` union-shape decision, cycle cut per issue #1149);
+    applied aliases and missing snapshots defer to the Python body.
+    Direct seam calls prove engagement.
+    """
+
+    def setUp(self) -> None:
+        from librt.internal import ReadBuffer, WriteBuffer
+
+        import mypy.types as _types_mod
+
+        self._types_mod = _types_mod
+        # Bind the seam names the module-level try would have bound.
+        _types_mod._VisitorWriteBuffer = WriteBuffer  # type: ignore[attr-defined]
+        _types_mod._ReadBuffer = ReadBuffer  # type: ignore[attr-defined]
+        for n in ("flatten_nested_unions", "has_recursive_types"):
+            _types_mod.__dict__["_rust_" + n] = getattr(_type_kernel, "rust_" + n)
+        self._orig_kernel_flag = _types_mod._VISITOR_HAS_TYPE_KERNEL
+        _types_mod._VISITOR_HAS_TYPE_KERNEL = True
+        # Save the process-global gates other suites (the conftest parity
+        # installer) may have enabled; restore prior values in tearDown.
+        self._orig_visitor_gate = _types_mod._native_visitor_active
+        self._orig_types_gate = _types_mod._native_visitor_types_active
+
+        from mypy.types import _set_native_visitor_resolver
+
+        self.fx = TypeFixture()
+        self.type_infos = _base_infos(self.fx)
+        self.resolver = _type_kernel.build_native_resolver(self.type_infos, [])
+        self.resolver.set_live_typeinfo_map({info.fullname: info for info in self.type_infos})
+        _set_native_visitor_resolver(self.resolver)
+        self._set_gates(True, True)
+
+    def tearDown(self) -> None:
+        from mypy.types import _set_native_visitor_resolver
+
+        self._set_gates(self._orig_visitor_gate, self._orig_types_gate)
+        _set_native_visitor_resolver(None)
+        self._types_mod._VISITOR_HAS_TYPE_KERNEL = self._orig_kernel_flag
+
+    def _set_gates(self, visitor: bool, types: bool) -> None:
+        from mypy.types import _set_native_visitor_active, _set_native_visitor_types_active
+
+        _set_native_visitor_active(visitor)
+        _set_native_visitor_types_active(types)
+
+    def _hrt_par(self, t: Type, expected: bool) -> None:
+        from mypy.types import has_recursive_types
+
+        self._set_gates(False, self._orig_types_gate)
+        off = has_recursive_types(t)
+        self._set_gates(True, self._orig_types_gate)
+        on = has_recursive_types(t)
+        assert on == off == expected, f"hrt parity {t!r}: off={off} on={on} expected={expected}"
+
+    def _def_union_alias(
+        self, name: str, target: Type
+    ) -> tuple[TypeAlias, TypeAliasType]:
+        node = TypeAlias(target, f"__main__.{name}", "__main__", -1, -1)
+        return node, TypeAliasType(node, [])
+
+    def _install_resolver(self, aliases: list[TypeAlias]) -> None:
+        from mypy.types import _set_native_visitor_resolver
+
+        res = _type_kernel.build_native_resolver(self.type_infos, aliases)
+        res.set_live_typeinfo_map({info.fullname: info for info in self.type_infos})
+        _set_native_visitor_resolver(res)
+        self.resolver = res
+
+    def test_hrt_parities(self) -> None:
+        A, _ = self.fx.def_alias_1(self.fx.a)
+        T = TypeVarType(
+            "T", "T", TypeVarId(-1), [], self.fx.o, AnyType(TypeOfAny.from_omitted_generics)
+        )
+        NA = self.fx.non_rec_alias(Instance(self.fx.gi, [T]), [T], [A])
+        U = UnionType([self.fx.a, A])
+        # Recursive alias in the upper bound position.
+        UB = TypeVarType("U", "U", TypeVarId(-2), [], A, self.fx.o)
+        self._hrt_par(A, True)
+        self._hrt_par(NA, True)
+        self._hrt_par(U, True)
+        self._hrt_par(UB, True)
+        self._hrt_par(self.fx.a, False)
+
+    def test_hrt_direct_seam_engages(self) -> None:
+        from mypy.types import _serialize_type_for_visitor
+
+        A, _ = self.fx.def_alias_1(self.fx.a)
+        assert _type_kernel.rust_has_recursive_types(_serialize_type_for_visitor(A)) is True
+        assert _type_kernel.rust_has_recursive_types(_serialize_type_for_visitor(self.fx.a)) is False
+
+    def test_flatten_bare_alias_union_target(self) -> None:
+        from mypy.types import flatten_nested_unions
+
+        node, alias = self._def_union_alias("F", UnionType([self.fx.a, self.fx.str_type]))
+        self._install_resolver([node])
+        self._set_gates(True, False)
+        off = flatten_nested_unions([alias])
+        self._set_gates(True, True)
+        on = flatten_nested_unions([alias])
+        assert [str(x) for x in on] == [str(x) for x in off]
+        assert len(on) == 2
+        assert all(not isinstance(x, TypeAliasType) for x in on)
+
+    def test_flatten_alias_preserved_for_non_union_target(self) -> None:
+        from mypy.types import flatten_nested_unions
+
+        node, alias = self._def_union_alias("L", Instance(self.fx.gi, [self.fx.a]))
+        self._install_resolver([node])
+        self._set_gates(True, False)
+        off = flatten_nested_unions([alias])
+        self._set_gates(True, True)
+        on = flatten_nested_unions([alias])
+        assert [str(x) for x in on] == [str(x) for x in off]
+        # Python appends the ORIGINAL alias for a non-union expansion.
+        assert on[0] is alias
+
+    def test_flatten_nested_bare_alias_in_union_items(self) -> None:
+        from mypy.types import flatten_nested_unions
+
+        node, inner = self._def_union_alias("N", UnionType([self.fx.b]))
+        outer = UnionType([self.fx.a, inner])
+        self._install_resolver([node])
+        self._set_gates(True, False)
+        off = flatten_nested_unions([outer])
+        self._set_gates(True, True)
+        on = flatten_nested_unions([outer])
+        assert [str(x) for x in on] == [str(x) for x in off]
+        assert len(on) == 2
+
+    def test_flatten_recursive_alias_handle_off_kept(self) -> None:
+        from mypy.types import flatten_nested_unions
+
+        A, _ = self.fx.def_alias_1(self.fx.a)
+        self._set_gates(True, False)
+        off = flatten_nested_unions([A], handle_recursive=False)
+        self._set_gates(True, True)
+        on = flatten_nested_unions([A], handle_recursive=False)
+        assert on[0] is off[0] is A
+
+    def test_flatten_alias_missing_snapshot_defers(self) -> None:
+        from mypy.types import _serialize_type_list_for_visitor, flatten_nested_unions
+
+        node, alias = self._def_union_alias("M", UnionType([self.fx.a]))
+        # Resolver without the alias snapshot: direct seam defers.
+        assert (
+            _type_kernel.rust_flatten_nested_unions(
+                _serialize_type_list_for_visitor([alias]), True, True, self.resolver
+            )
+            is None
+        )
+        # Module function falls back to the Python body, which expands
+        # the union target (no snapshot needed).
+        self._set_gates(True, False)
+        off = flatten_nested_unions([alias])
+        self._set_gates(True, True)
+        on = flatten_nested_unions([alias])
+        assert [str(x) for x in on] == [str(x) for x in off]
+        assert len(on) == 1
+        assert not isinstance(on[0], TypeAliasType)
+
+    def test_flatten_direct_seam_engages(self) -> None:
+        from mypy.types import _serialize_type_list_for_visitor
+
+        node, alias = self._def_union_alias("E", UnionType([self.fx.a, self.fx.b]))
+        self._install_resolver([node])
+        assert (
+            _type_kernel.rust_flatten_nested_unions(
+                _serialize_type_list_for_visitor([alias]), True, True, self.resolver
+            )
+            is not None
+        )
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeInstantiateTypeAliasSuite(Suite):
     """Parity for the Rust `instantiate_type_alias` port (mypy.typeanal).
 

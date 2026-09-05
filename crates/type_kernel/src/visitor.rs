@@ -12,14 +12,15 @@
 //!     expand the alias, which needs the live alias target. The wire
 //!     `TypeAliasType` carries only `type_ref: String` (the alias
 //!     fullname), not the resolved target, so we cannot expand.
-//!   * `is_recursive` — `has_recursive_types` needs `t.is_recursive`
-//!     from the live `TypeAlias` node. The wire format has no such
-//!     field, so we defer (return false) for TypeAliasType.
+//!     `has_recursive_types` is exempt: the `is_recursive` flag rides
+//!     the wire on every alias node (types.py writer, #1361).
 //!   * `is_named_instance` — needs `get_proper_type` to expand alias.
 //!     NOT portable without alias resolution.
 
 use pyo3::prelude::*;
 
+use crate::checkexpr_functions::expand_alias_target_raw;
+use crate::typeinfo::NativeTypeResolver;
 use crate::wire::{read_type, write_type, LiteralValue, ReadBuffer, Type, WriteBuffer};
 
 // ---------------------------------------------------------------------------
@@ -141,52 +142,126 @@ pub(crate) fn has_type_vars_inner(typ: &Type) -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// has_recursive_types: defers (returns None) because wire format lacks
-// `is_recursive` on TypeAliasType
+// has_recursive_types: total since issue #1418 (wave 34)
 
 // ---------------------------------------------------------------------------
 
 /// `mypy.types.has_recursive_types` — check if a type contains any
 /// recursive type aliases.
 ///
-/// Returns `None` for `TypeAliasType` because the wire format doesn't
-/// carry the `is_recursive` field (types.py:388-403 derives it from
-/// the live `TypeAlias` node). For all other variants, delegates to
-/// `has_type_vars`-style recursion with `ANY_STRATEGY` over args.
+/// Mirrors `HasRecursiveType` (types.py:5597): a `BoolTypeQuery` with
+/// ANY_STRATEGY whose only custom arm is `visit_type_alias_type`
+/// (`t.is_recursive or self.query_types(t.args)`). The recursion flag
+/// rides the wire on every alias node (types.py writer, #1361), so the
+/// port is total over the wire tree: only an undecodable blob defers.
+/// The query positions follow the `BoolTypeQuery.visit_*` defaults
+/// (type_visitor.py:518-571): `Instance` skips `last_known_value`,
+/// `CallableType` skips `variables`, `TypeVarTupleType` skips
+/// `tuple_fallback`, `TypedDictType` skips `fallback`, `LiteralType`
+/// is a leaf, and `TypeAliasType` never expands the target.
 #[pyfunction]
 pub(crate) fn rust_has_recursive_types(type_bytes: &[u8]) -> PyResult<Option<bool>> {
     let typ = match decode_type(type_bytes) {
         Some(t) => t,
         None => return Ok(None),
     };
-    Ok(has_recursive_types_inner(&typ))
+    Ok(Some(has_recursive_types_inner(&typ)))
 }
 
-pub(crate) fn has_recursive_types_inner(typ: &Type) -> Option<bool> {
-    // Defer: no is_recursive field on the wire TypeAliasType.
-    if matches!(typ, Type::TypeAliasType { .. }) {
-        return None;
-    }
-    // ANY_STRATEGY over children: if any child returns Some(true), result
-    // is Some(true). If any child returns None, result is None. Otherwise
-    // Some(false).
-    let mut result = false;
-    for child in children(typ) {
-        match has_recursive_types_inner(child) {
-            Some(true) => return Some(true),
-            None => return None,
-            Some(false) => {}
+pub(crate) fn has_recursive_types_inner(typ: &Type) -> bool {
+    match typ {
+        // visit_type_alias_type override: is_recursive or args.
+        Type::TypeAliasType {
+            is_recursive, args, ..
+        } => *is_recursive || args.iter().any(has_recursive_types_inner),
+        // visit_unbound_type: args.
+        Type::UnboundType { args, .. } => args.iter().any(has_recursive_types_inner),
+        // visit_unpack_type: [type].
+        Type::UnpackType { typ, .. } => has_recursive_types_inner(typ),
+        // visit_instance: args only.
+        Type::Instance { args, .. } => args.iter().any(has_recursive_types_inner),
+        // visit_callable_type: arg_types or ret_type or instance_type
+        // (the "FIX generics" arm never queries `variables`).
+        Type::CallableType {
+            arg_types,
+            ret_type,
+            instance_type,
+            ..
+        } => {
+            arg_types.iter().any(has_recursive_types_inner)
+                || has_recursive_types_inner(ret_type)
+                || instance_type
+                    .as_ref()
+                    .is_some_and(|it| has_recursive_types_inner(it))
         }
+        // visit_overloaded: items.
+        Type::Overloaded { items } => items.iter().any(has_recursive_types_inner),
+        // visit_tuple_type: [partial_fallback] + items.
+        Type::TupleType {
+            items,
+            partial_fallback,
+            ..
+        } => {
+            has_recursive_types_inner(partial_fallback)
+                || items.iter().any(has_recursive_types_inner)
+        }
+        // visit_typeddict_type: items.values() only (fallback skipped).
+        Type::TypedDictType { items, .. } => {
+            items.iter().any(|(_, t)| has_recursive_types_inner(t))
+        }
+        // visit_union_type: items.
+        Type::UnionType { items, .. } => items.iter().any(has_recursive_types_inner),
+        // visit_type_type: t.item.
+        Type::TypeType { item, .. } => has_recursive_types_inner(item),
+        // visit_type_var: [upper_bound, default] + values.
+        Type::TypeVarType {
+            values,
+            upper_bound,
+            default,
+            ..
+        } => {
+            has_recursive_types_inner(upper_bound)
+                || has_recursive_types_inner(default)
+                || values.iter().any(has_recursive_types_inner)
+        }
+        // visit_param_spec: [upper_bound, default, prefix].
+        Type::ParamSpecType {
+            prefix,
+            upper_bound,
+            default,
+            ..
+        } => {
+            has_recursive_types_inner(upper_bound)
+                || has_recursive_types_inner(default)
+                || prefix.arg_types.iter().any(has_recursive_types_inner)
+        }
+        // visit_type_var_tuple: [upper_bound, default] (tuple_fallback
+        // not queried).
+        Type::TypeVarTupleType {
+            upper_bound,
+            default,
+            ..
+        } => has_recursive_types_inner(upper_bound) || has_recursive_types_inner(default),
+        // visit_parameters: arg_types only (variables not queried).
+        Type::Parameters(p) => p.arg_types.iter().any(has_recursive_types_inner),
+        // Leaves: Python's BoolTypeQuery returns self.default (False) for
+        // these; note it also does NOT visit AnyType.source_any or
+        // LiteralType.fallback, so they are intentionally unqueried here.
+        Type::AnyType { .. }
+        | Type::UninhabitedType { .. }
+        | Type::NoneType
+        | Type::ErasedType
+        | Type::DeletedType { .. }
+        | Type::LiteralType { .. } => false,
     }
-    let _ = &mut result;
-    Some(false)
 }
 
 /// True if `typ` contains any `TypeAliasType` node. On the wire a
 /// self-recursive alias is only expressible as a lazy `TypeAliasType` ref,
 /// so "contains an alias" is the conservative recursive-shape test used by
-/// the constraints cycle guard (issue #1133), where
-/// `has_recursive_types_inner`'s defer is too coarse to branch on.
+/// the constraints cycle guard (issue #1133), where a structural alias
+/// check is needed rather than the recursive-flag predicate of
+/// `has_recursive_types_inner`.
 pub(crate) fn type_contains_alias(typ: &Type) -> bool {
     if matches!(typ, Type::TypeAliasType { .. }) {
         return true;
@@ -453,9 +528,7 @@ fn decode_types_for_list_return(blobs: &[Vec<u8>]) -> Option<Vec<Type>> {
 /// Returns the deduped list as wire-format type bytes. The shim decodes
 /// back to Python list.
 #[pyfunction]
-pub(crate) fn rust_remove_dups(
-    type_bytes_list: Vec<Vec<u8>>,
-) -> PyResult<Option<Vec<Vec<u8>>>> {
+pub(crate) fn rust_remove_dups(type_bytes_list: Vec<Vec<u8>>) -> PyResult<Option<Vec<Vec<u8>>>> {
     let types = match decode_types_for_list_return(&type_bytes_list) {
         Some(t) => t,
         None => return Ok(None),
@@ -593,9 +666,7 @@ pub(crate) fn callable_with_ellipsis_inner(
 /// silently return the first and rely on the earlier semanal pass to flag
 /// duplicates.
 #[pyfunction]
-pub(crate) fn rust_find_unpack_in_list(
-    type_bytes_list: Vec<Vec<u8>>,
-) -> PyResult<Option<i64>> {
+pub(crate) fn rust_find_unpack_in_list(type_bytes_list: Vec<Vec<u8>>) -> PyResult<Option<i64>> {
     let types = match decode_types_for_list_return(&type_bytes_list) {
         Some(t) => t,
         None => return Ok(None),
@@ -675,11 +746,9 @@ pub(crate) fn split_with_prefix_and_suffix_inner(
 fn encode_type_list(types: &[Type]) -> Option<Vec<Vec<u8>>> {
     let mut out = Vec::with_capacity(types.len());
     for t in types {
-        match encode_type(t) {
-            Some(b) => out.push(b),
-            // Strict all-or-nothing (#1412): silently dropping a row would
-            // hand the shim a truncated list of Types.
-            None => return None,
+        {
+            let b = encode_type(t)?;
+            out.push(b)
         }
     }
     Some(out)
@@ -734,19 +803,25 @@ pub(crate) fn extend_args_for_prefix_and_suffix_inner(
 // ---------------------------------------------------------------------------
 
 /// `mypy.types.flatten_nested_unions` — flatten nested unions in a type
-/// list. Defers (returns None) on `TypeAliasType` since `get_proper_type`
-/// needs the live alias target.
+/// list.
 ///
-/// Mirrors `flatten_nested_unions` (types.py:4267-4293). The wire format
-/// has no alias target, so we can only flatten when no TypeAliasType is
-/// present in the list (or its transitive closure).
+/// Mirrors `flatten_nested_unions` (types.py:5849-5905). With
+/// `handle_type_alias_type`, a `TypeAliasType` row is expanded through
+/// the alias snapshot exactly like Python's `get_proper_type(t)`
+/// decision: only the *union shape* of the expansion matters, and the
+/// flattened items come from the snapshot target. Zero-argument aliases
+/// expand raw (no type-argument substitution,
+/// `expand_alias_target_raw`); applied aliases, a missing snapshot, or
+/// an alias cycle on the active expansion path defer the whole call
+/// (`None`) so the Python body re-runs.
 #[pyfunction]
 pub(crate) fn rust_flatten_nested_unions(
     type_bytes_list: Vec<Vec<u8>>,
     handle_type_alias_type: bool,
     handle_recursive: bool,
+    resolver: Option<&mut NativeTypeResolver>,
 ) -> PyResult<Option<Vec<Vec<u8>>>> {
-    let types = match decode_types_for_list_return(&type_bytes_list) {
+    let types = match decode_types_for_flatten(&type_bytes_list) {
         Some(t) => t,
         None => return Ok(None),
     };
@@ -757,43 +832,101 @@ pub(crate) fn rust_flatten_nested_unions(
     {
         return Ok(encode_type_list(&types));
     }
-    let flat = match flatten_nested_unions_inner(&types, handle_type_alias_type, handle_recursive) {
+    let aliases: Option<&dyn crate::aliases::AliasLookup> =
+        resolver.map(|r| r.alias_resolver() as &dyn crate::aliases::AliasLookup);
+    let mut active = Vec::new();
+    let flat = flatten_nested_unions_inner(
+        &types,
+        handle_type_alias_type,
+        handle_recursive,
+        aliases,
+        &mut active,
+    );
+    let flat = match flat {
         Some(f) => f,
         None => return Ok(None),
     };
     Ok(encode_type_list(&flat))
 }
 
+/// Decode a list seam's input blobs. Unlike `decode_types_for_list_return`
+/// this keeps `TypeAliasType` nodes (the flatten seam expands bare ones
+/// through the alias snapshot); an undecodable blob still defers.
+fn decode_types_for_flatten(blobs: &[Vec<u8>]) -> Option<Vec<Type>> {
+    let mut types = Vec::with_capacity(blobs.len());
+    for b in blobs {
+        types.push(decode_type(b)?);
+    }
+    Some(types)
+}
+
 pub(crate) fn flatten_nested_unions_inner(
     types: &[Type],
     handle_type_alias_type: bool,
     handle_recursive: bool,
+    aliases: Option<&dyn crate::aliases::AliasLookup>,
+    active: &mut Vec<String>,
 ) -> Option<Vec<Type>> {
     let mut flat_items: Vec<Type> = Vec::with_capacity(types.len());
     for t in types {
-        let tp: Type = if handle_type_alias_type {
-            if let Type::TypeAliasType { .. } = t {
-                if !handle_recursive {
-                    t.clone()
-                } else {
-                    // Defer: wire format has no expanded alias target.
+        if handle_type_alias_type {
+            if let Type::TypeAliasType { is_recursive, .. } = t {
+                if !handle_recursive && *is_recursive {
+                    // Python: `not handle_recursive and t.is_recursive`
+                    // keeps the recursive alias unexpanded (and an alias
+                    // is never a UnionType, so the row passes through).
+                    flat_items.push(t.clone());
+                    continue;
+                }
+                // Python: `tp = get_proper_type(t)`; only the UnionType
+                // check consumes the expansion. The wire `is_recursive`
+                // flag is the same fact Python reads on the live node.
+                let aliases = aliases?;
+                let type_ref = match t {
+                    Type::TypeAliasType { type_ref, .. } => type_ref.clone(),
+                    _ => unreachable!(),
+                };
+                // Recursive re-entry would expand the same snapshot
+                // target forever; Python's get_proper_type is lazy and
+                // the make_union guard keeps it off this seam (#1149).
+                if active.contains(&type_ref) {
                     return None;
                 }
-            } else {
-                t.clone()
+                let target = expand_alias_target_raw(t, aliases)?;
+                let union_items = match &target {
+                    Type::UnionType { items, .. } => Some(items),
+                    // Non-union proper type: Python appends the original
+                    // alias, not the expansion ("Must preserve original
+                    // aliases when possible").
+                    _ => None,
+                };
+                if let Some(items) = union_items {
+                    active.push(type_ref);
+                    let inner = flatten_nested_unions_inner(
+                        items,
+                        handle_type_alias_type,
+                        handle_recursive,
+                        Some(aliases),
+                        active,
+                    );
+                    active.pop();
+                    flat_items.extend(inner?);
+                } else {
+                    flat_items.push(t.clone());
+                }
+                continue;
             }
-        } else {
-            t.clone()
-        };
-        if matches!(tp, Type::UnionType { .. }) {
+        }
+        if let Type::UnionType { items, .. } = t {
             // Recurse into UnionType items.
-            if let Type::UnionType { items, .. } = &tp {
-                let inner =
-                    flatten_nested_unions_inner(items, handle_type_alias_type, handle_recursive)?;
-                flat_items.extend(inner);
-            } else {
-                unreachable!();
-            }
+            let inner = flatten_nested_unions_inner(
+                items,
+                handle_type_alias_type,
+                handle_recursive,
+                aliases,
+                active,
+            )?;
+            flat_items.extend(inner);
         } else {
             flat_items.push(t.clone());
         }
@@ -976,20 +1109,207 @@ mod tests {
         assert!(has_type_vars_inner(&u));
     }
 
+    fn make_alias(type_ref: &str, args: Vec<Type>, is_recursive: bool) -> Type {
+        Type::TypeAliasType {
+            args,
+            type_ref: type_ref.to_string(),
+            is_recursive,
+        }
+    }
+
+    fn make_callable() -> Type {
+        Type::CallableType {
+            fallback: Box::new(make_instance("builtins.function", vec![])),
+            instance_type: None,
+            is_ellipsis_args: false,
+            implicit: false,
+            is_bound: false,
+            from_concatenate: false,
+            imprecise_arg_kinds: false,
+            unpack_kwargs: false,
+            from_type_type: false,
+            arg_types: vec![],
+            arg_kinds: vec![],
+            arg_names: vec![],
+            ret_type: Box::new(make_instance("builtins.int", vec![])),
+            name: None,
+            variables: vec![],
+            type_guard: None,
+            type_is: None,
+            special_sig: None,
+        }
+    }
+
+    fn make_typeddict(fallback: Type, items: Vec<(String, Type)>) -> Type {
+        Type::TypedDictType {
+            fallback: Box::new(fallback),
+            items,
+            required_keys: std::collections::HashSet::new(),
+            readonly_keys: std::collections::HashSet::new(),
+            is_closed: false,
+        }
+    }
+
     #[test]
-    fn test_has_recursive_types_alias_defers() {
-        let alias = Type::TypeAliasType {
-            args: vec![],
-            type_ref: "mod.Alias".to_string(),
-            is_recursive: false,
-        };
-        assert_eq!(has_recursive_types_inner(&alias), None);
+    fn test_has_recursive_types_alias_flag_true() {
+        let alias = make_alias("mod.Alias", vec![], true);
+        assert!(has_recursive_types_inner(&alias));
+    }
+
+    #[test]
+    fn test_has_recursive_types_alias_flag_false_args_recursive() {
+        let inner = make_alias("mod.Inner", vec![], true);
+        let alias = make_alias("mod.Alias", vec![inner], false);
+        assert!(has_recursive_types_inner(&alias));
+    }
+
+    #[test]
+    fn test_has_recursive_types_alias_flag_false_plain_args() {
+        let alias = make_alias(
+            "mod.Alias",
+            vec![make_instance("builtins.int", vec![])],
+            false,
+        );
+        assert!(!has_recursive_types_inner(&alias));
     }
 
     #[test]
     fn test_has_recursive_types_false_simple() {
         let inst = make_instance("builtins.int", vec![]);
-        assert_eq!(has_recursive_types_inner(&inst), Some(false));
+        assert!(!has_recursive_types_inner(&inst));
+    }
+
+    // Position parity with BoolTypeQuery (type_visitor.py): the
+    // visited slots differ per variant; an alias in a non-visited slot
+    // must NOT answer true.
+
+    #[test]
+    fn test_has_recursive_types_true_typevar_upper_bound() {
+        let mut tv = make_typevar(1);
+        if let Type::TypeVarType { upper_bound, .. } = &mut tv {
+            *upper_bound = Box::new(make_alias("mod.A", vec![], true));
+        }
+        assert!(has_recursive_types_inner(&tv));
+    }
+
+    #[test]
+    fn test_has_recursive_types_true_typevar_default() {
+        let mut tv = make_typevar(1);
+        if let Type::TypeVarType { default, .. } = &mut tv {
+            *default = Box::new(make_alias("mod.A", vec![], true));
+        }
+        assert!(has_recursive_types_inner(&tv));
+    }
+
+    #[test]
+    fn test_has_recursive_types_true_typevar_values() {
+        let mut tv = make_typevar(1);
+        if let Type::TypeVarType { values, .. } = &mut tv {
+            *values = vec![make_alias("mod.A", vec![], true)];
+        }
+        assert!(has_recursive_types_inner(&tv));
+    }
+
+    #[test]
+    fn test_has_recursive_types_false_callable_variables_only() {
+        // visit_callable_type never queries `variables`.
+        let mut c = make_callable();
+        if let Type::CallableType { variables, .. } = &mut c {
+            *variables = vec![make_alias("mod.A", vec![], true)];
+        }
+        assert!(!has_recursive_types_inner(&c));
+    }
+
+    #[test]
+    fn test_has_recursive_types_false_instance_lkv_only() {
+        // visit_instance queries args only.
+        let inst = Type::Instance {
+            type_ref: "builtins.int".to_string(),
+            args: vec![],
+            last_known_value: Some(Box::new(make_alias("mod.A", vec![], true))),
+            extra_attrs: None,
+        };
+        assert!(!has_recursive_types_inner(&inst));
+    }
+
+    #[test]
+    fn test_has_recursive_types_false_typeddict_fallback_only() {
+        // visit_typeddict_type queries item values only.
+        let td = make_typeddict(make_alias("mod.A", vec![], true), vec![]);
+        assert!(!has_recursive_types_inner(&td));
+    }
+
+    #[test]
+    fn test_has_recursive_types_true_typeddict_item() {
+        let td = make_typeddict(
+            make_instance("builtins.dict", vec![]),
+            vec![("k".to_string(), make_alias("mod.A", vec![], true))],
+        );
+        assert!(has_recursive_types_inner(&td));
+    }
+
+    #[test]
+    fn test_has_recursive_types_false_tvt_tuple_fallback_only() {
+        // visit_type_var_tuple queries upper_bound/default, not
+        // tuple_fallback.
+        let tvt = Type::TypeVarTupleType {
+            tuple_fallback: Box::new(make_alias("mod.A", vec![], true)),
+            name: "Ts".to_string(),
+            fullname: "Ts".to_string(),
+            raw_id: 1,
+            namespace: "".to_string(),
+            upper_bound: Box::new(make_unannotated_any()),
+            default: Box::new(make_unannotated_any()),
+            min_len: 0,
+            meta_level: 0,
+        };
+        assert!(!has_recursive_types_inner(&tvt));
+    }
+
+    #[test]
+    fn test_has_recursive_types_true_paramspec_prefix() {
+        // visit_param_spec queries [upper_bound, default, prefix].
+        let params = crate::wire::Parameters {
+            arg_types: vec![make_alias("mod.A", vec![], true)],
+            arg_kinds: vec![0],
+            arg_names: vec![None],
+            variables: vec![],
+            imprecise_arg_kinds: false,
+            is_ellipsis_args: false,
+        };
+        let ps = Type::ParamSpecType {
+            prefix: Box::new(params),
+            name: "P".to_string(),
+            fullname: "P".to_string(),
+            raw_id: 1,
+            namespace: "".to_string(),
+            flavor: 0,
+            upper_bound: Box::new(make_unannotated_any()),
+            default: Box::new(make_unannotated_any()),
+            meta_level: 0,
+        };
+        assert!(has_recursive_types_inner(&ps));
+    }
+
+    #[test]
+    fn test_has_recursive_types_false_parameters_variables_only() {
+        // visit_parameters queries arg_types only.
+        let params = crate::wire::Parameters {
+            arg_types: vec![],
+            arg_kinds: vec![],
+            arg_names: vec![],
+            variables: vec![make_alias("mod.A", vec![], true)],
+            imprecise_arg_kinds: false,
+            is_ellipsis_args: false,
+        };
+        assert!(!has_recursive_types_inner(&Type::Parameters(params)));
+    }
+
+    #[test]
+    fn test_has_recursive_types_nested_union_instance_args() {
+        let alias = make_alias("mod.A", vec![], true);
+        let inst = make_instance("builtins.list", vec![alias]);
+        assert!(has_recursive_types_inner(&inst));
     }
 
     #[test]
@@ -1086,13 +1406,36 @@ mod tests {
         assert_eq!(result, -1);
     }
 
+    fn flatten_inner(
+        types: &[Type],
+        htaa: bool,
+        hr: bool,
+        aliases: Option<&dyn crate::aliases::AliasLookup>,
+    ) -> Option<Vec<Type>> {
+        let mut active = Vec::new();
+        flatten_nested_unions_inner(types, htaa, hr, aliases, &mut active)
+    }
+
+    /// Build a zero-argument alias snapshot whose target is the wire
+    /// encoding of `target`.
+    fn bare_alias_snapshot(fullname: &str, target: &Type) -> crate::aliases::TypeAliasSnapshot {
+        use crate::wire::write_type;
+        let mut wbuf = WriteBuffer::new();
+        write_type(&mut wbuf, target).unwrap();
+        crate::aliases::TypeAliasSnapshot {
+            fullname: fullname.to_string(),
+            target: wbuf.into_bytes(),
+            ..Default::default()
+        }
+    }
+
     #[test]
     fn test_flatten_nested_unions_simple() {
         let a = make_instance("A", vec![]);
         let b = make_instance("B", vec![]);
         let inner = make_union(vec![a.clone(), b.clone()]);
         let outer = make_union(vec![inner, a.clone()]);
-        let result = flatten_nested_unions_inner(&[outer], true, true);
+        let result = flatten_inner(&[outer], true, true, None);
         assert!(result.is_some());
         let flat = result.unwrap();
         assert_eq!(flat.len(), 3);
@@ -1102,31 +1445,127 @@ mod tests {
     fn test_flatten_nested_unions_no_union() {
         let a = make_instance("A", vec![]);
         let b = make_instance("B", vec![]);
-        let result = flatten_nested_unions_inner(&[a.clone(), b.clone()], true, true);
+        let result = flatten_inner(&[a.clone(), b.clone()], true, true, None);
         assert!(result.is_some());
         assert_eq!(result.unwrap().len(), 2);
     }
 
     #[test]
-    fn test_flatten_nested_unions_alias_defers() {
-        let alias = Type::TypeAliasType {
-            args: vec![],
-            type_ref: "mod.A".to_string(),
-            is_recursive: false,
-        };
-        let result = flatten_nested_unions_inner(&[alias], true, true);
+    fn test_flatten_nested_unions_alias_defers_without_resolver() {
+        let alias = make_alias("mod.A", vec![], false);
+        let result = flatten_inner(&[alias], true, true, None);
         assert!(result.is_none());
     }
 
     #[test]
     fn test_flatten_nested_unions_alias_no_handle() {
-        let alias = Type::TypeAliasType {
-            args: vec![],
-            type_ref: "mod.A".to_string(),
-            is_recursive: false,
-        };
-        let result = flatten_nested_unions_inner(&[alias], false, true);
+        let alias = make_alias("mod.A", vec![], false);
+        let result = flatten_inner(&[alias.clone()], false, true, None);
         assert!(result.is_some());
+        assert_eq!(result.unwrap(), vec![alias]);
+    }
+
+    #[test]
+    fn test_flatten_nested_unions_bare_alias_union_target_expands() {
+        use crate::aliases::TypeAliasResolver;
+        let target = make_union(vec![make_instance("A", vec![]), make_instance("B", vec![])]);
+        let mut resolver = TypeAliasResolver::new();
+        resolver.insert("mod.U".to_string(), bare_alias_snapshot("mod.U", &target));
+        let alias = make_alias("mod.U", vec![], false);
+        let result = flatten_inner(&[alias], true, true, Some(&resolver));
+        let flat = result.unwrap();
+        assert_eq!(flat.len(), 2);
+        assert!(matches!(flat[0], Type::Instance { .. }));
+        assert!(matches!(flat[1], Type::Instance { .. }));
+    }
+
+    #[test]
+    fn test_flatten_nested_unions_bare_alias_instance_target_kept() {
+        use crate::aliases::TypeAliasResolver;
+        let target = make_instance("builtins.list", vec![]);
+        let mut resolver = TypeAliasResolver::new();
+        resolver.insert("mod.L".to_string(), bare_alias_snapshot("mod.L", &target));
+        let alias = make_alias("mod.L", vec![], false);
+        // Python appends the ORIGINAL alias for a non-union expansion.
+        let result = flatten_inner(&[alias.clone()], true, true, Some(&resolver));
+        assert_eq!(result.unwrap(), vec![alias]);
+    }
+
+    #[test]
+    fn test_flatten_nested_unions_nested_bare_alias_in_union_items() {
+        use crate::aliases::TypeAliasResolver;
+        let target = make_union(vec![make_instance("C", vec![])]);
+        let mut resolver = TypeAliasResolver::new();
+        resolver.insert("mod.N".to_string(), bare_alias_snapshot("mod.N", &target));
+        // Union[int, mod.N] where mod.N expands to Union[C].
+        let alias = make_alias("mod.N", vec![], false);
+        let row = make_union(vec![make_instance("builtins.int", vec![]), alias]);
+        let result = flatten_inner(&[row], true, true, Some(&resolver));
+        let flat = result.unwrap();
+        assert_eq!(flat.len(), 2);
+    }
+
+    #[test]
+    fn test_flatten_nested_unions_applied_alias_defers() {
+        use crate::aliases::TypeAliasResolver;
+        let target = make_union(vec![make_instance("A", vec![])]);
+        let mut resolver = TypeAliasResolver::new();
+        resolver.insert("mod.G".to_string(), bare_alias_snapshot("mod.G", &target));
+        // A generic alias application (non-empty args) needs
+        // _expand_once substitution, which this seam defers.
+        let alias = make_alias("mod.G", vec![make_instance("builtins.int", vec![])], false);
+        let result = flatten_inner(&[alias], true, true, Some(&resolver));
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_flatten_nested_unions_missing_snapshot_defers() {
+        let alias = make_alias("mod.Missing", vec![], false);
+        let result = flatten_inner(
+            &[alias],
+            true,
+            true,
+            Some(&crate::aliases::TypeAliasResolver::new()),
+        );
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_flatten_nested_unions_recursive_alias_cycle_cuts() {
+        use crate::aliases::TypeAliasResolver;
+        // mod.S = Union[int, mod.S] (self-referential bare alias): the
+        // active-path cut defers instead of looping.
+        let self_ref = make_alias("mod.S", vec![], false);
+        let target = make_union(vec![make_instance("builtins.int", vec![]), self_ref]);
+        let mut resolver = TypeAliasResolver::new();
+        resolver.insert("mod.S".to_string(), bare_alias_snapshot("mod.S", &target));
+        let alias = make_alias("mod.S", vec![], true);
+        let result = flatten_inner(&[alias], true, true, Some(&resolver));
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_flatten_nested_unions_recursive_alias_no_handle_kept() {
+        // handle_recursive=False keeps recursive aliases unexpanded
+        // (the wire is_recursive flag drives the decision, no resolver
+        // needed).
+        let alias = make_alias("mod.S", vec![], true);
+        let result = flatten_inner(&[alias.clone()], true, false, None);
+        assert_eq!(result.unwrap(), vec![alias]);
+    }
+
+    #[test]
+    fn test_flatten_nested_unions_recursive_alias_no_handle_nonrecursive_expands() {
+        use crate::aliases::TypeAliasResolver;
+        // handle_recursive=False still expands NON-recursive aliases.
+        let target = make_union(vec![make_instance("A", vec![])]);
+        let mut resolver = TypeAliasResolver::new();
+        resolver.insert("mod.NR".to_string(), bare_alias_snapshot("mod.NR", &target));
+        let alias = make_alias("mod.NR", vec![], false);
+        let result = flatten_inner(&[alias], true, false, Some(&resolver));
+        let flat = result.unwrap();
+        assert_eq!(flat.len(), 1);
+        assert!(matches!(flat[0], Type::Instance { .. }));
     }
 
     #[test]

@@ -4714,12 +4714,25 @@ _native_visitor_active: bool = False
 _native_visitor_types_active: bool = False
 _native_truthiness_in_flight: bool = False
 _native_truthiness_resolver: Any = None
+_native_visitor_resolver: Any = None
 
 
 def _set_native_visitor_active(active: bool) -> None:
     """Enable/disable the Rust visitor path (parity-only)."""
     global _native_visitor_active
     _native_visitor_active = active
+
+
+def _set_native_visitor_resolver(resolver: Any) -> None:
+    """Install the `NativeTypeResolver` for the alias-aware flatten seam.
+
+    `flatten_nested_unions` (issue #1418) expands zero-argument alias
+    rows through this resolver's alias snapshot, mirroring Python's
+    `get_proper_type` union-shape decision. With no resolver installed
+    the seam defers on any alias input, as before.
+    """
+    global _native_visitor_resolver
+    _native_visitor_resolver = resolver
 
 
 def _set_native_truthiness_resolver(resolver: Any) -> None:
@@ -5854,7 +5867,7 @@ def flatten_nested_unions(
         try:
             type_bytes_list = _serialize_type_list_for_visitor(types)
             result = _rust_flatten_nested_unions(
-                type_bytes_list, handle_type_alias_type, handle_recursive
+                type_bytes_list, handle_type_alias_type, handle_recursive, _native_visitor_resolver
             )
             if result is not None:
                 flat = _deserialize_type_list_from_visitor(result)
