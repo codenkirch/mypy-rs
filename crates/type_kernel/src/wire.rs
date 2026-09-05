@@ -912,6 +912,36 @@ fn read_instance(buf: &mut ReadBuffer<'_>) -> Result<Type, WireError> {
     })
 }
 
+/// The optional trailing `meta_level` append shared by the TypeVar /
+/// ParamSpec / TypeVarTuple readers: written only when non-zero, so the
+/// next tag is either `LITERAL_INT` (value present, itself followed by
+/// END_TAG) or END_TAG (absent, defaults to 0). `what` labels error
+/// messages so parity failures stay diagnosable per reader.
+fn read_optional_trailing_meta_level(
+    buf: &mut ReadBuffer<'_>,
+    what: &str,
+) -> Result<i64, WireError> {
+    match read_tag(buf)? {
+        LITERAL_INT => {
+            let ml = read_int_bare(buf)?;
+            // The writer always appends END_TAG after an optional
+            // meta_level: with LITERAL_INT the END_TAG is still in the
+            // stream; consume it so back-to-back records stay aligned.
+            let end = read_tag(buf)?;
+            if end != END_TAG {
+                return Err(WireError::invalid(format!(
+                    "expected END_TAG (255) after {what}, got tag {end}"
+                )));
+            }
+            Ok(ml)
+        }
+        END_TAG => Ok(0),
+        other => Err(WireError::invalid(format!(
+            "expected END_TAG (255) or LITERAL_INT ({what}), got tag {other}"
+        ))),
+    }
+}
+
 /// Read a `TypeVarType` (tag already consumed).
 fn read_type_var_type(buf: &mut ReadBuffer<'_>) -> Result<Type, WireError> {
     let name = read_str(buf)?;
@@ -925,31 +955,7 @@ fn read_type_var_type(buf: &mut ReadBuffer<'_>) -> Result<Type, WireError> {
     // Backward-compatible meta_level append: written only when non-zero,
     // so the next tag is either LITERAL_INT (meta_level present) or
     // END_TAG (absent, defaults to 0).
-    let peek = read_tag(buf)?;
-    let meta_level = match peek {
-        LITERAL_INT => {
-            let ml = read_int_bare(buf)?;
-            // The writer always appends END_TAG after an optional
-            // meta_level; when the tag was LITERAL_INT the END_TAG is
-            // still in the stream (unlike the absent case above, where
-
-            // the peek consumed it). Consume it so back-to-back records
-            // (e.g. `read_type_list`) stay aligned.
-            let end = read_tag(buf)?;
-            if end != END_TAG {
-                return Err(WireError::invalid(format!(
-                    "expected END_TAG (255) after meta_level, got tag {end}"
-                )));
-            }
-            ml
-        }
-        END_TAG => 0,
-        other => {
-            return Err(WireError::invalid(format!(
-                "expected END_TAG (255) or LITERAL_INT (meta_level), got tag {other}"
-            )));
-        }
-    };
+    let meta_level = read_optional_trailing_meta_level(buf, "meta_level")?;
     Ok(Type::TypeVarType {
         name,
         fullname,
@@ -983,25 +989,7 @@ fn read_param_spec_type(buf: &mut ReadBuffer<'_>) -> Result<Type, WireError> {
     // Backward-compatible meta_level append (same as read_type_var_type):
     // written only when non-zero, so the next tag is either LITERAL_INT
     // (meta_level present, itself followed by END_TAG) or END_TAG (absent).
-    let peek = read_tag(buf)?;
-    let meta_level = match peek {
-        LITERAL_INT => {
-            let ml = read_int_bare(buf)?;
-            let end = read_tag(buf)?;
-            if end != END_TAG {
-                return Err(WireError::invalid(format!(
-                    "expected END_TAG (255) after ParamSpec meta_level, got tag {end}"
-                )));
-            }
-            ml
-        }
-        END_TAG => 0,
-        other => {
-            return Err(WireError::invalid(format!(
-                "expected END_TAG (255) or LITERAL_INT (ParamSpec meta_level), got tag {other}"
-            )));
-        }
-    };
+    let meta_level = read_optional_trailing_meta_level(buf, "ParamSpec meta_level")?;
     Ok(Type::ParamSpecType {
         prefix: Box::new(prefix),
         name,
@@ -1035,25 +1023,7 @@ fn read_type_var_tuple_type(buf: &mut ReadBuffer<'_>) -> Result<Type, WireError>
     // Backward-compatible meta_level append (same as read_type_var_type):
     // written only when non-zero, so the next tag is either LITERAL_INT
     // (meta_level present, itself followed by END_TAG) or END_TAG (absent).
-    let peek = read_tag(buf)?;
-    let meta_level = match peek {
-        LITERAL_INT => {
-            let ml = read_int_bare(buf)?;
-            let end = read_tag(buf)?;
-            if end != END_TAG {
-                return Err(WireError::invalid(format!(
-                    "expected END_TAG (255) after TypeVarTuple meta_level, got tag {end}"
-                )));
-            }
-            ml
-        }
-        END_TAG => 0,
-        other => {
-            return Err(WireError::invalid(format!(
-                "expected END_TAG (255) or LITERAL_INT (TypeVarTuple meta_level), got tag {other}"
-            )));
-        }
-    };
+    let meta_level = read_optional_trailing_meta_level(buf, "TypeVarTuple meta_level")?;
     Ok(Type::TypeVarTupleType {
         tuple_fallback: Box::new(tuple_fallback),
         name,
@@ -2805,7 +2775,7 @@ pub(crate) fn py_type_eq(a: &Type, b: &Type) -> bool {
                 && py_type_eq(u1, u2)
                 && py_type_eq(d1, d2)
         }
-        // ParamSpecType.__eq__ (types.py:1035): id + flavor + prefix +
+        // ParamSpecType.__eq__ (types.py:1011): id + flavor + prefix +
         // default (upper_bound is implied by flavor).
         (
             Type::ParamSpecType {
@@ -2840,12 +2810,6 @@ pub(crate) fn py_type_eq(a: &Type, b: &Type) -> bool {
                     .all(|(x, y)| py_type_eq(x, y))
                 && p1.arg_kinds == p2.arg_kinds
                 && p1.arg_names == p2.arg_names
-                && p1
-                    .variables
-                    .iter()
-                    .zip(p2.variables.iter())
-                    .all(|(x, y)| py_type_eq(x, y))
-                && p1.imprecise_arg_kinds == p2.imprecise_arg_kinds
                 && p1.is_ellipsis_args == p2.is_ellipsis_args
         }
         // TypeVarTupleType.__eq__ (types.py:1221): id + min_len + default.
@@ -2867,35 +2831,256 @@ pub(crate) fn py_type_eq(a: &Type, b: &Type) -> bool {
                 ..
             },
         ) => r1 == r2 && n1 == n2 && m1 == m2 && l1 == l2 && py_type_eq(d1, d2),
-        // UnionType.__eq__: order-sensitive items + uses_pep604.
+        // UnionType.__eq__ (types.py:3876): frozenset(items) only --
+        // order-insensitive, uses_pep604_syntax excluded. Python unions
+        // are de-duplicated, so a matching loop reproduces the frozenset.
         (
             Type::UnionType {
                 items: i1,
-                uses_pep604_syntax: p1,
+                uses_pep604_syntax: _p1,
                 ..
             },
             Type::UnionType {
                 items: i2,
-                uses_pep604_syntax: p2,
+                uses_pep604_syntax: _p2,
+                ..
+            },
+        ) => type_list_py_eq_bag(i1, i2),
+        // AnyType.__eq__ (types.py:1534): isinstance check only — every
+        // Any equals every Any, whatever its type_of_any/source_any.
+        (Type::AnyType { .. }, Type::AnyType { .. }) => true,
+        // CallableType.__eq__ (types.py:2949): ret_type, arg_types,
+        // arg_names, arg_kinds, name, is_ellipsis_args, type_guard +
+        // type_is, and fallback; flags/instance_type/variables excluded.
+        (
+            Type::CallableType {
+                fallback: fb1,
+                instance_type: _,
+                is_ellipsis_args: e1,
+                arg_types: a1,
+                arg_kinds: k1,
+                arg_names: n1,
+                ret_type: rt1,
+                name: nm1,
+                variables: _,
+                type_guard: g1,
+                type_is: t1,
+                ..
+            },
+            Type::CallableType {
+                fallback: fb2,
+                instance_type: _,
+                is_ellipsis_args: e2,
+                arg_types: a2,
+                arg_kinds: k2,
+                arg_names: n2,
+                ret_type: rt2,
+                name: nm2,
+                variables: _,
+                type_guard: g2,
+                type_is: t2,
                 ..
             },
         ) => {
-            p1 == p2
-                && i1.len() == i2.len()
+            nm1 == nm2
+                && e1 == e2
+                && k1 == k2
+                && n1 == n2
+                && a1.len() == a2.len()
+                && a1.iter().zip(a2.iter()).all(|(x, y)| py_type_eq(x, y))
+                && py_type_eq(rt1, rt2)
+                && py_type_eq(fb1, fb2)
+                && match (g1, g2) {
+                    (None, None) => true,
+                    (Some(x), Some(y)) => py_type_eq(x, y),
+                    _ => false,
+                }
+                && match (t1, t2) {
+                    (None, None) => true,
+                    (Some(x), Some(y)) => py_type_eq(x, y),
+                    _ => false,
+                }
+        }
+        // Overloaded.__eq__ (types.py:3147): `self.items == other.items`,
+        // i.e. elementwise py-eq.
+        (Type::Overloaded { items: i1 }, Type::Overloaded { items: i2 }) => {
+            i1.len() == i2.len()
                 && i1.iter().zip(i2.iter()).all(|(x, y)| py_type_eq(x, y))
         }
+        // TupleType.__eq__ (types.py:3252): items + partial_fallback;
+        // `implicit` is not compared.
+        (
+            Type::TupleType {
+                partial_fallback: fb1,
+                items: i1,
+                implicit: _,
+            },
+            Type::TupleType {
+                partial_fallback: fb2,
+                items: i2,
+                implicit: _,
+            },
+        ) => {
+            i1.len() == i2.len()
+                && i1.iter().zip(i2.iter()).all(|(x, y)| py_type_eq(x, y))
+                && py_type_eq(fb1, fb2)
+        }
+        // TypedDictType.__eq__ (types.py:3461): same key set paired
+        // through `zip` (by key), py-eq on the paired values, plus
+        // fallback / key sets / is_closed.
+        (
+            Type::TypedDictType {
+                fallback: fb1,
+                items: i1,
+                required_keys: rk1,
+                readonly_keys: ro1,
+                is_closed: c1,
+            },
+            Type::TypedDictType {
+                fallback: fb2,
+                items: i2,
+                required_keys: rk2,
+                readonly_keys: ro2,
+                is_closed: c2,
+            },
+        ) => {
+            i1.len() == i2.len()
+                && i1.iter().all(|(k, v)| {
+                    i2.iter().any(|(k2, v2)| k == k2 && py_type_eq(v, v2))
+                })
+                && rk1 == rk2
+                && ro1 == ro2
+                && c1 == c2
+                && py_type_eq(fb1, fb2)
+        }
+        // LiteralType.__eq__ (types.py:3761): value + fallback.
+        (
+            Type::LiteralType {
+                fallback: fb1,
+                value: v1,
+            },
+            Type::LiteralType {
+                fallback: fb2,
+                value: v2,
+            },
+        ) => v1 == v2 && py_type_eq(fb1, fb2),
+        // TypeType.__eq__ (types.py:4089): item + is_type_form.
+        (
+            Type::TypeType {
+                item: it1,
+                is_type_form: f1,
+            },
+            Type::TypeType {
+                item: it2,
+                is_type_form: f2,
+            },
+        ) => f1 == f2 && py_type_eq(it1, it2),
+        // UnpackType.__eq__ (types.py:1463): `self.type == other.type`;
+        // from_star_syntax is not compared.
+        (
+            Type::UnpackType { typ: t1, .. },
+            Type::UnpackType { typ: t2, .. },
+        ) => py_type_eq(t1, t2),
+        // TypeAliasType.__eq__ (types.py:545): `self.alias == other.alias`
+        // (node identity; the wire carries the fullname `type_ref`) +
+        // `self.args == other.args`. `is_recursive` is not compared.
+        (
+            Type::TypeAliasType {
+                type_ref: r1,
+                args: a1,
+                ..
+            },
+            Type::TypeAliasType {
+                type_ref: r2,
+                args: a2,
+                ..
+            },
+        ) => {
+            r1 == r2
+                && a1.len() == a2.len()
+                && a1.iter().zip(a2.iter()).all(|(x, y)| py_type_eq(x, y))
+        }
+        // UnboundType.__eq__ (types.py:1300): name/optional/original_str*;
+        // args compare py-eq.
+        (
+            Type::UnboundType {
+                name: nm1,
+                args: a1,
+                original_str_expr: e1,
+                original_str_fallback: fb1,
+                optional: o1,
+                empty_tuple_index: _,
+            },
+            Type::UnboundType {
+                name: nm2,
+                args: a2,
+                original_str_expr: e2,
+                original_str_fallback: fb2,
+                optional: o2,
+                empty_tuple_index: _,
+            },
+        ) => {
+            nm1 == nm2
+                && o1 == o2
+                && e1 == e2
+                && fb1 == fb2
+                && a1.len() == a2.len()
+                && a1.iter().zip(a2.iter()).all(|(x, y)| py_type_eq(x, y))
+        }
+        // Parameters.__eq__ (types.py:2392): arg_types/arg_names/
+        // arg_kinds/is_ellipsis_args only.
+        (Type::Parameters(p1), Type::Parameters(p2)) => {
+            p1.arg_types.len() == p2.arg_types.len()
+                && p1
+                    .arg_types
+                    .iter()
+                    .zip(p2.arg_types.iter())
+                    .all(|(x, y)| py_type_eq(x, y))
+                && p1.arg_kinds == p2.arg_kinds
+                && p1.arg_names == p2.arg_names
+                && p1.is_ellipsis_args == p2.is_ellipsis_args
+        }
+        // Remaining variants are scalar-only shapes (NoneType, ErasedType,
+        // UninhabitedType, DeletedType): the derived PartialEq matches
+        // their Python __eq__ bodies field for field. Cross-variant pairs
+        // are never equal.
         _ => a == b,
     }
 }
 
-/// `ExtraAttrs.__eq__` (types.py:1793): attrs map + immutable set only —
-/// `mod_name` is not part of the == contract.
+/// Python `frozenset(items) ==` for `UnionType.__eq__`: each item of `a`
+/// must match a *distinct* py-equal item of `b`. Python unions are
+/// de-duplicated, so the distinct-pairing loop reproduces the frozenset
+/// semantics for bag-equal item lists.
+fn type_list_py_eq_bag(a: &[Type], b: &[Type]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    // Python unions carry no duplicate items (make_simplified_union and
+    // the union visitor dedupe), so a set-style one-shot pairing is exact.
+    let mut taken = vec![false; b.len()];
+    'outer: for x in a {
+        for (y, y_taken) in b.iter().zip(taken.iter_mut()) {
+            if !*y_taken && py_type_eq(x, y) {
+                *y_taken = true;
+                continue 'outer;
+            }
+        }
+        return false;
+    }
+    true
+}
+
+/// `ExtraAttrs.__eq__` (types.py:1793): identical key sets (Python compares
+/// the attrs dicts directly, so a key present only on one side is a miss),
+/// py-eq per key, and the immutable set — `mod_name` is not part of the
+/// == contract.
 fn extra_attrs_py_eq(a: &ExtraAttrs, b: &ExtraAttrs) -> bool {
     a.attrs.len() == b.attrs.len()
         && a
             .attrs
             .iter()
-            .all(|(k, v)| b.attrs.get(k).iter().all(|w| py_type_eq(v, w)))
+            .all(|(k, v)| b.attrs.get(k).is_some_and(|w| py_type_eq(v, w)))
         && a.immutable.len() == b.immutable.len()
         && a.immutable.iter().all(|k| b.immutable.contains(k))
 }

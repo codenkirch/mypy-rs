@@ -948,37 +948,15 @@ pub fn rust_solve_generic_call(
     // Empty constraints are still solvable: the solver fills every
     // unconstrained var with strict Never / lax Any (solve.py:277-289),
     // matching Python's empty-cmap fill (#382 path). No deferral needed.
-    let tv_key = |t: &Type| -> Option<(i64, i64, String)> {
-        match t {
-            Type::TypeVarType {
-                raw_id,
-                meta_level,
-                namespace,
-                ..
-            } => Some((*raw_id, *meta_level, namespace.clone())),
-            Type::ParamSpecType {
-                raw_id,
-                meta_level,
-                namespace,
-                ..
-            } => Some((*raw_id, *meta_level, namespace.clone())),
-            Type::TypeVarTupleType {
-                raw_id,
-                meta_level,
-                namespace,
-                ..
-            } => Some((*raw_id, *meta_level, namespace.clone())),
-            _ => None,
-        }
-    };
     // A var with multiple lowers is joined by the solver. When the joined
     // solution nests a FunctionLike, the nested FuncDef definitions do not
     // survive the wire (pretty_callable needs them): defer those joins.
+    // Identity keys go through the shared solve_typevar_key helper.
     let mut lowers_by_var: std::collections::HashMap<(i64, i64, String), usize> =
         std::collections::HashMap::new();
     for c in &all_constraints {
         if c.op == crate::constraints::SUPERTYPE_OF {
-            if let Some(key) = tv_key(&c.origin_type_var) {
+            if let Some(key) = solve_typevar_key(&c.origin_type_var) {
                 *lowers_by_var.entry(key).or_insert(0) += 1;
             }
         }

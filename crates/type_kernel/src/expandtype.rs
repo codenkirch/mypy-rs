@@ -1171,7 +1171,10 @@ pub(crate) fn expand_type_inner(
             min_len,
             meta_level,
         } => {
-            let key = (*raw_id, 0, namespace.clone());
+            // Python keys the env by the full TypeVarId (expandtype.py:1069):
+            // raw_id + meta_level + namespace. A decoded TVT with a non-zero
+            // meta_level must key the same 3-tuple or it reads the original.
+            let key = (*raw_id, *meta_level, namespace.clone());
             match env.get(&key) {
                 Some(repl @ (Type::AnyType { .. } | Type::UninhabitedType { .. })) => {
                     let fallback = tuple_fallback.as_ref();
@@ -1336,11 +1339,15 @@ pub(crate) fn rust_remove_trivial(
 /// raise RuntimeError).
 fn expand_unpack(tvt: &Type, env: &HashMap<EnvKey, Type>) -> Option<Vec<Type>> {
     let tvt = if let Type::TypeVarTupleType {
-        raw_id, namespace, ..
+        raw_id,
+        namespace,
+        meta_level,
+        ..
     } = tvt
     {
-        // TypeVarTupleType wire has no meta_level yet; env meta is 0.
-        let key = (*raw_id, 0, namespace.clone());
+        // Python keys the env by full TypeVarId (meta_level included); the
+        // wire round-trips meta_level on TypeVarTupleType.
+        let key = (*raw_id, *meta_level, namespace.clone());
         // Unmatched TypeVarTuple: defer to Python.
         match env.get(&key) {
             Some(r) => r,

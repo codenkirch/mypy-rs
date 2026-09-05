@@ -191,7 +191,49 @@ pub(crate) fn type_contains_alias(typ: &Type) -> bool {
     if matches!(typ, Type::TypeAliasType { .. }) {
         return true;
     }
-    children(typ).into_iter().any(type_contains_alias)
+    let mut kids = children(typ);
+    match typ {
+        // The wire decodes tvar-family sub-positions as full type blobs, so
+        // an alias nested in a bound / values / default / prefix must trip
+        // the guard; the generic Boolean-query children() walker skips them.
+        Type::TypeVarType {
+            values,
+            upper_bound,
+            default,
+            ..
+        } => {
+            kids.extend(values.iter());
+            kids.push(upper_bound);
+            kids.push(default);
+        }
+        Type::ParamSpecType {
+            prefix,
+            upper_bound,
+            default,
+            ..
+        } => {
+            kids.extend(prefix.arg_types.iter());
+            kids.extend(prefix.variables.iter());
+            kids.push(upper_bound);
+            kids.push(default);
+        }
+        Type::TypeVarTupleType {
+            tuple_fallback,
+            upper_bound,
+            default,
+            ..
+        } => {
+            kids.push(tuple_fallback);
+            kids.push(upper_bound);
+            kids.push(default);
+        }
+        Type::Parameters(p) => {
+            kids.extend(p.arg_types.iter());
+            kids.extend(p.variables.iter());
+        }
+        _ => {}
+    }
+    kids.into_iter().any(type_contains_alias)
 }
 
 /// True if `typ` contains any `ErasedType` node. ErasedType is not

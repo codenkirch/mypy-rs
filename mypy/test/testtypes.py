@@ -10634,6 +10634,10 @@ class NativeTypeImplTruthinessSuite(Suite):
             _types_mod.__dict__["_rust_" + n] = getattr(_type_kernel, "rust_" + n)
         self._orig_kernel_flag = _types_mod._VISITOR_HAS_TYPE_KERNEL
         _types_mod._VISITOR_HAS_TYPE_KERNEL = True
+        # `_native_visitor_active` is a process-global other suites (the
+        # conftest parity installer) may have enabled; save it and restore
+        # the prior value in tearDown rather than forcing False.
+        self._orig_visitor_gate = _types_mod._native_visitor_active
 
         from mypy.types import _set_native_truthiness_resolver
 
@@ -10647,10 +10651,10 @@ class NativeTypeImplTruthinessSuite(Suite):
     def tearDown(self) -> None:
         from mypy.types import _set_native_truthiness_resolver
 
-        # Restore the pre-suite state: visitor gate off, no resolver, and the
-        # kernel flag as when the suite started (True when the extension
-        # is present); the old hardcoded False leaked into other tests.
-        self._set_gate(False)
+        # Restore the pre-suite state: the visitor gate as when the
+        # suite started, no resolver, and the kernel flag as when the
+        # suite started. The old hardcoded False leaked into other tests.
+        self._set_gate(self._orig_visitor_gate)
         _set_native_truthiness_resolver(None)
         self._types_mod._VISITOR_HAS_TYPE_KERNEL = self._orig_kernel_flag
 
@@ -51954,28 +51958,39 @@ class NativeVisitorBindSuite(Suite):
     def test_has_type_vars_takes_rust_path_when_active(self) -> None:
         import mypy.types as t
 
-        t._set_native_visitor_active(True)
-        seen: list[int] = []
-        # Bound via getattr: the underscore name is an imported alias in
-        # mypy.types and is not an implicit re-export.
-        orig: Callable[[bytes], bool] = t._rust_has_type_vars
+        saved = t._native_visitor_active
         try:
+            t._set_native_visitor_active(True)
+            seen: list[int] = []
+            # Bound via getattr/setattr on a variable name: the underscore
+            # name is an imported alias in mypy.types, not an implicit
+            # re-export, and bugbear B009/B010 would fix a constant name.
+            attr = "_rust_has_type_vars"
+            orig: Callable[[bytes], bool] = getattr(t, attr)
 
             def spy(b: bytes) -> bool:
                 seen.append(1)
                 return orig(b)
 
-            t._rust_has_type_vars = spy
+            setattr(t, attr, spy)
             assert t.has_type_vars(self.fx.t)
             assert t.has_type_vars(self.fx.o) is False
             assert seen == [1, 1]
         finally:
-            t._rust_has_type_vars = orig
-            t._set_native_visitor_active(False)
+            setattr(t, attr, orig)
+            t._set_native_visitor_active(saved)
 
     def test_gate_off_keeps_pure_python_visitor(self) -> None:
         import mypy.types as t
 
-        assert not t._native_visitor_active
-        assert t.has_type_vars(self.fx.t)
-        assert t.has_type_vars(self.fx.o) is False
+        saved = t._native_visitor_active
+        try:
+            # Control its own input rather than inheriting the
+            # process-global gate value (which may be True under
+            # MYPY_NATIVE_PARITY_INSTALL_VISITOR) as a precondition.
+            t._set_native_visitor_active(False)
+            assert not t._native_visitor_active
+            assert t.has_type_vars(self.fx.t)
+            assert t.has_type_vars(self.fx.o) is False
+        finally:
+            t._set_native_visitor_active(saved)

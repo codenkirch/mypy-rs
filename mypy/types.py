@@ -5356,10 +5356,12 @@ def _restore_wire_type_lines(
         # Python copy_modified preserves `name`/`definition` from `self`
         # unless that exact field is the change input; the codec drops
         # both, so mirror them the same way as line/column.
+        ct_fixed = cast(CallableType, fixed)
+        ct_live = cast(CallableType, live)
         if changed is None or changed[0] != "name":
-            fixed.name = live.name
+            ct_fixed.name = ct_live.name
         if changed is None or changed[0] != "definition":
-            fixed.definition = live.definition
+            ct_fixed.definition = ct_live.definition
     spec = _WIRE_LINE_FIELDS.get(cls)
     if spec is None:
         return
@@ -5379,8 +5381,10 @@ def _restore_wire_type_lines(
         # name/definition/line parity survives the decode like the rest
         # of the tree. Attr keys are not copy_modified field names, so no
         # changed-field redirection applies.
-        f_attrs = fixed.extra_attrs
-        l_attrs = live.extra_attrs
+        ins_fixed = cast(Instance, fixed)
+        ins_live = cast(Instance, live)
+        f_attrs = ins_fixed.extra_attrs
+        l_attrs = ins_live.extra_attrs
         if f_attrs is not None and l_attrs is not None:
             for k, fattr in f_attrs.attrs.items():
                 lattr = l_attrs.attrs.get(k)
