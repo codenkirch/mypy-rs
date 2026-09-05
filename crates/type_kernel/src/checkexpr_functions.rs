@@ -207,7 +207,11 @@ pub(crate) fn expanded_alias_target(
     aliases: &dyn crate::aliases::AliasLookup,
 ) -> Option<(Type, Vec<Type>, bool)> {
     let mut current = typ.clone();
+    // Returned args are the level-0 application's (BoolTypeQuery
+    // callers mirror query_types(t.args) on the original node,
+    // type_visitor.py:615); per-level substitution uses cur_args.
     let mut args: Vec<Type> = Vec::new();
+    let mut top_installed = false;
     let mut python_3_12 = false;
     let mut seen: HashSet<String> = HashSet::new();
     loop {
@@ -227,7 +231,10 @@ pub(crate) fn expanded_alias_target(
         // Each chain level substitutes with its own applied args:
         // Python's _expand_once builds the mapping from self.args at
         // every get_proper_type loop step (chain levels carry args).
-        args = cur_args;
+        if !top_installed {
+            args = cur_args.clone();
+            top_installed = true;
+        }
         if !python_3_12 {
             python_3_12 = snap.python_3_12_type_alias;
         }
@@ -240,10 +247,10 @@ pub(crate) fn expanded_alias_target(
             current = target;
             continue;
         }
-        // Build the substitution env from zip(alias_tvars, args),
-        // mirroring _expand_once's mapping; an arg-count mismatch
-        // truncates (unbound tvars stay), so defer conservatively.
-        let env = build_alias_env(&snap.alias_tvars, &args)?;
+        // Build the substitution env from zip(alias_tvars, cur_args):
+        // the current level's own applied args, mirroring _expand_once's
+        // mapping; an arg-count mismatch truncates (unbound tvars stay).
+        let env = build_alias_env(&snap.alias_tvars, &cur_args)?;
         let substituted = crate::expandtype::expand_type_inner(&target, &env, true)?;
         current = substituted;
     }
@@ -3902,7 +3909,92 @@ mod tests {
         // outer-args bug would put str first and S second.
         assert_alias_list_arg(first, "builtins.int");
         assert_alias_list_arg(second, "builtins.str");
-        assert_eq!(args.len(), 2);
+        // Returned args stay the level-0 application's own ([str]):
+        // predicate callers mirror Python's query_types(t.args) on
+        // the original node; [int, str] drove the substitution only.
+        assert_eq!(args.len(), 1);
+        assert_eq!(args[0].clone(), make_instance("builtins.str", vec![]));
+    }
+
+    #[test]
+    fn test_expanded_alias_target_returns_level0_args_when_dropped() {
+        // Outer[T] = Inner[int] drops the outer arg (T unused): the
+        // target substitutes per level (Inner[int] -> list[int]), but
+        // the returned args must stay [str], not the inner [int].
+        let t = crate::aliases::AliasTvar {
+            name: "T".to_string(),
+            raw_id: 1,
+            meta_level: 0,
+            namespace: "NS".to_string(),
+            is_type_var_tuple: false,
+        };
+        let s = crate::aliases::AliasTvar {
+            name: "S".to_string(),
+            raw_id: 2,
+            meta_level: 0,
+            namespace: "NS".to_string(),
+            is_type_var_tuple: false,
+        };
+        let tvar_s = Type::TypeVarType {
+            name: "S".to_string(),
+            fullname: "mod.S".to_string(),
+            raw_id: 2,
+            namespace: "NS".to_string(),
+            values: vec![],
+            upper_bound: Box::new(make_instance("object", vec![])),
+            default: Box::new(Type::UninhabitedType { ambiguous: false }),
+            variance: 0,
+            meta_level: 0,
+        };
+        let mut resolver = empty_alias_resolver();
+        resolver.insert(
+            "mod.Inner".to_string(),
+            crate::aliases::TypeAliasSnapshot {
+                fullname: "mod.Inner".to_string(),
+                target: encode_type(&make_instance("builtins.list", vec![tvar_s.clone()]))
+                    .expect("inner target"),
+                alias_tvars: vec![s],
+                ..Default::default()
+            },
+        );
+        let inner_app = Type::TypeAliasType {
+            type_ref: "mod.Inner".to_string(),
+            args: vec![make_instance("builtins.int", vec![])],
+            is_recursive: false,
+        };
+        resolver.insert(
+            "mod.Outer".to_string(),
+            crate::aliases::TypeAliasSnapshot {
+                fullname: "mod.Outer".to_string(),
+                target: encode_type(&inner_app).expect("outer target"),
+                alias_tvars: vec![t],
+                ..Default::default()
+            },
+        );
+        let app = Type::TypeAliasType {
+            type_ref: "mod.Outer".to_string(),
+            args: vec![make_instance("builtins.str", vec![])],
+            is_recursive: false,
+        };
+        let (target, ret_args, _py312) = expanded_alias_target(&app, &resolver).expect("decides");
+        let Type::Instance {
+            type_ref,
+            args: inst_args,
+            ..
+        } = &target
+        else {
+            panic!("expected a list Instance target, got {:?}", target);
+        };
+        // Target substituted per level: list[int].
+        assert_eq!(type_ref, "builtins.list");
+        assert_eq!(inst_args.len(), 1);
+        assert!(matches!(
+            &inst_args[0],
+            Type::Instance { type_ref, .. } if type_ref == "builtins.int"
+        ));
+        // Returned args are the level-0 application's own [str].
+        assert_eq!(ret_args.len(), 1);
+        assert_eq!(ret_args[0].clone(), make_instance("builtins.str", vec![]));
     }
 
     fn assert_alias_list_arg(got: &Type, expected_inner: &str) {
