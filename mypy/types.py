@@ -5866,8 +5866,27 @@ def flatten_nested_unions(
     if _VISITOR_HAS_TYPE_KERNEL and _native_visitor_types_active:
         try:
             type_bytes_list = _serialize_type_list_for_visitor(types)
+            row_expansions: list[bytes | None] = []
+            if _native_visitor_resolver is None:
+                # No alias snapshot yet (startup): alias rows expand via
+                # the live get_proper_type (one chain step); recursive
+                # aliases keep the pass-through row (Rust skip arm).
+                for t in types:
+                    if handle_type_alias_type and isinstance(t, TypeAliasType):
+                        if not handle_recursive and t.is_recursive:
+                            row_expansions.append(None)
+                        else:
+                            row_expansions.append(
+                                _serialize_type_for_visitor(get_proper_type(t))
+                            )
+                    else:
+                        row_expansions.append(None)
             result = _rust_flatten_nested_unions(
-                type_bytes_list, handle_type_alias_type, handle_recursive, _native_visitor_resolver
+                type_bytes_list,
+                handle_type_alias_type,
+                handle_recursive,
+                _native_visitor_resolver,
+                row_expansions,
             )
             if result is not None:
                 flat = _deserialize_type_list_from_visitor(result)
@@ -5952,7 +5971,9 @@ def flatten_nested_tuples(types: Iterable[Type], handle_recursive: bool = True) 
     if _VISITOR_HAS_TYPE_KERNEL and _native_visitor_types_active:
         try:
             type_bytes_list = _serialize_type_list_for_visitor(types)
-            result = _rust_flatten_nested_tuples(type_bytes_list, handle_recursive)
+            result = _rust_flatten_nested_tuples(
+                type_bytes_list, handle_recursive, _native_visitor_resolver
+            )
             if result is not None:
                 flat = _deserialize_type_list_from_visitor(result)
                 if flat is not None:

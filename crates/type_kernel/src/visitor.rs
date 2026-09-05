@@ -19,7 +19,7 @@
 
 use pyo3::prelude::*;
 
-use crate::checkexpr_functions::expand_alias_target_raw;
+use crate::checkexpr_functions::expanded_alias_target;
 use crate::typeinfo::NativeTypeResolver;
 use crate::wire::{read_type, write_type, LiteralValue, ReadBuffer, Type, WriteBuffer};
 
@@ -660,14 +660,16 @@ pub(crate) fn callable_with_ellipsis_inner(
 /// duplicates.
 ///
 /// Returns the 0-based index, or `-1` (in the Some arm) if no UnpackType
-/// is present; `None` defers (an input blob failed the strict decode, see
-/// `decode_types_for_list_return`), mirroring the shim's fall-through.
+/// is present; `None` defers (an input blob failed the wire decode).
+/// The decision only reads the top-level item kind, so alias rows ride
+/// the non-strict decode (`decode_types_for_flatten`): Python's
+/// `isinstance(item, UnpackType)` is alias-blind.
 /// The Python version asserts uniqueness (raises if two are found); we
 /// silently return the first and rely on the earlier semanal pass to flag
 /// duplicates.
 #[pyfunction]
 pub(crate) fn rust_find_unpack_in_list(type_bytes_list: Vec<Vec<u8>>) -> PyResult<Option<i64>> {
-    let types = match decode_types_for_list_return(&type_bytes_list) {
+    let types = match decode_types_for_flatten(&type_bytes_list) {
         Some(t) => t,
         None => return Ok(None),
     };
@@ -806,20 +808,30 @@ pub(crate) fn extend_args_for_prefix_and_suffix_inner(
 /// list.
 ///
 /// Mirrors `flatten_nested_unions` (types.py:5849-5905). With
-/// `handle_type_alias_type`, a `TypeAliasType` row is expanded through
-/// the alias snapshot exactly like Python's `get_proper_type(t)`
-/// decision: only the *union shape* of the expansion matters, and the
-/// flattened items come from the snapshot target. Zero-argument aliases
-/// expand raw (no type-argument substitution,
-/// `expand_alias_target_raw`); applied aliases, a missing snapshot, or
-/// an alias cycle on the active expansion path defer the whole call
-/// (`None`) so the Python body re-runs.
+/// `handle_type_alias_type`, a `TypeAliasType` row is expanded exactly
+/// like Python's `get_proper_type(t)` decision: only the *union shape*
+/// of the expansion matters, and the flattened items come from it. With
+/// a resolver the expansion rides the alias snapshot (one chain step
+/// plus argument substitution, `_expand_once` semantics); without one
+/// (startup, before build wires the resolver) it rides
+/// `row_expansions`, shim-precomputed per-row proper-type blobs. A
+/// missing source, an alias cycle on the active expansion path, or an
+/// unbuildable substitution env defers the whole call (`None`) so the
+/// Python body re-runs.
 #[pyfunction]
+#[pyo3(signature = (
+    type_bytes_list,
+    handle_type_alias_type,
+    handle_recursive,
+    resolver,
+    row_expansions = Vec::new()
+))]
 pub(crate) fn rust_flatten_nested_unions(
     type_bytes_list: Vec<Vec<u8>>,
     handle_type_alias_type: bool,
     handle_recursive: bool,
     resolver: Option<&mut NativeTypeResolver>,
+    row_expansions: Vec<Option<Vec<u8>>>,
 ) -> PyResult<Option<Vec<Vec<u8>>>> {
     let types = match decode_types_for_flatten(&type_bytes_list) {
         Some(t) => t,
@@ -841,6 +853,7 @@ pub(crate) fn rust_flatten_nested_unions(
         handle_recursive,
         aliases,
         &mut active,
+        Some(&row_expansions),
     );
     let flat = match flat {
         Some(f) => f,
@@ -866,9 +879,13 @@ pub(crate) fn flatten_nested_unions_inner(
     handle_recursive: bool,
     aliases: Option<&dyn crate::aliases::AliasLookup>,
     active: &mut Vec<String>,
+    // Top-level per-row proper-type blobs for alias rows when no alias
+    // snapshot is installed (startup); `None` rows defer. Nested union
+    // items always need the snapshot, so recursion passes `None`.
+    expansions: Option<&[Option<Vec<u8>>]>,
 ) -> Option<Vec<Type>> {
     let mut flat_items: Vec<Type> = Vec::with_capacity(types.len());
-    for t in types {
+    for (idx, t) in types.iter().enumerate() {
         if handle_type_alias_type {
             if let Type::TypeAliasType { is_recursive, .. } = t {
                 if !handle_recursive && *is_recursive {
@@ -881,18 +898,30 @@ pub(crate) fn flatten_nested_unions_inner(
                 // Python: `tp = get_proper_type(t)`; only the UnionType
                 // check consumes the expansion. The wire `is_recursive`
                 // flag is the same fact Python reads on the live node.
-                let aliases = aliases?;
-                let type_ref = match t {
-                    Type::TypeAliasType { type_ref, .. } => type_ref.clone(),
-                    _ => unreachable!(),
+                let target: Option<Type> = match aliases {
+                    Some(a) => {
+                        let type_ref = match t {
+                            Type::TypeAliasType { type_ref, .. } => type_ref.clone(),
+                            _ => unreachable!(),
+                        };
+                        // Recursive re-entry would expand the same
+                        // snapshot target forever; Python's
+                        // get_proper_type stays lazy (guard #1149).
+                        if active.contains(&type_ref) {
+                            return None;
+                        }
+                        // Mirror Python's get_proper_type: one chain
+                        // step with applied-args substitution
+                        // (_expand_once); undecidable shape defers.
+                        expanded_alias_target(t, a).map(|(target, _, _)| target)
+                    }
+                    None => {
+                        let blob = expansions?.get(idx)?.as_ref()?;
+                        let mut buf = ReadBuffer::new(blob);
+                        read_type(&mut buf, None).ok()
+                    }
                 };
-                // Recursive re-entry would expand the same snapshot
-                // target forever; Python's get_proper_type is lazy and
-                // the make_union guard keeps it off this seam (#1149).
-                if active.contains(&type_ref) {
-                    return None;
-                }
-                let target = expand_alias_target_raw(t, aliases)?;
+                let target = target?;
                 let union_items = match &target {
                     Type::UnionType { items, .. } => Some(items),
                     // Non-union proper type: Python appends the original
@@ -901,15 +930,30 @@ pub(crate) fn flatten_nested_unions_inner(
                     _ => None,
                 };
                 if let Some(items) = union_items {
-                    active.push(type_ref);
+                    // The cycle guard only matters on the snapshot path
+                    // (re-expansion consults it); nested alias items on
+                    // the snapshot-free path defer via `expansions=None`.
+                    let guard = if aliases.is_some() {
+                        let type_ref = match t {
+                            Type::TypeAliasType { type_ref, .. } => type_ref.clone(),
+                            _ => unreachable!(),
+                        };
+                        active.push(type_ref);
+                        true
+                    } else {
+                        false
+                    };
                     let inner = flatten_nested_unions_inner(
                         items,
                         handle_type_alias_type,
                         handle_recursive,
-                        Some(aliases),
+                        aliases,
                         active,
+                        None,
                     );
-                    active.pop();
+                    if guard {
+                        active.pop();
+                    }
                     flat_items.extend(inner?);
                 } else {
                     flat_items.push(t.clone());
@@ -925,6 +969,7 @@ pub(crate) fn flatten_nested_unions_inner(
                 handle_recursive,
                 aliases,
                 active,
+                None,
             )?;
             flat_items.extend(inner);
         } else {
@@ -939,19 +984,32 @@ pub(crate) fn flatten_nested_unions_inner(
 // ---------------------------------------------------------------------------
 
 /// `mypy.types.flatten_nested_tuples` — recursively flatten TupleTypes
-/// nested with Unpack. Defers (returns None) on `TypeAliasType`.
+/// nested with Unpack.
 ///
-/// Mirrors `flatten_nested_tuples` (types.py:4326-4360).
+/// Mirrors `flatten_nested_tuples` (types.py:5943-5991). Rows with no
+/// Unpack pass through unchanged, so alias-free-of-unpack trees ride the
+/// non-strict decode. An UnpackType whose inner is a TypeAliasType
+/// expands through the alias snapshot exactly like Python's
+/// `get_proper_type(typ.type)` one-chain-step: a TupleType expansion
+/// flattens, anything else (and a recursive alias under
+/// `handle_recursive=False`) passes the row through unchanged. Defers
+/// (`None`) on an undecodable blob, an alias the snapshot cannot
+/// resolve (missing target, cycle, unbuildable substitution env), or a
+/// recursive re-entry of an already-active alias (guard #1149).
 #[pyfunction]
 pub(crate) fn rust_flatten_nested_tuples(
     type_bytes_list: Vec<Vec<u8>>,
     handle_recursive: bool,
+    resolver: Option<&mut NativeTypeResolver>,
 ) -> PyResult<Option<Vec<Vec<u8>>>> {
-    let types = match decode_types_for_list_return(&type_bytes_list) {
+    let types = match decode_types_for_flatten(&type_bytes_list) {
         Some(t) => t,
         None => return Ok(None),
     };
-    let flat = match flatten_nested_tuples_inner(&types, handle_recursive) {
+    let aliases: Option<&dyn crate::aliases::AliasLookup> =
+        resolver.map(|r| r.alias_resolver() as &dyn crate::aliases::AliasLookup);
+    let mut active = Vec::new();
+    let flat = match flatten_nested_tuples_inner(&types, handle_recursive, aliases, &mut active) {
         Some(f) => f,
         None => return Ok(None),
     };
@@ -961,22 +1019,61 @@ pub(crate) fn rust_flatten_nested_tuples(
 pub(crate) fn flatten_nested_tuples_inner(
     types: &[Type],
     handle_recursive: bool,
+    aliases: Option<&dyn crate::aliases::AliasLookup>,
+    active: &mut Vec<String>,
 ) -> Option<Vec<Type>> {
     let mut res: Vec<Type> = Vec::with_capacity(types.len());
     for typ in types {
         if let Type::UnpackType { typ: inner, .. } = typ {
-            // Defer if the unpacked type is a TypeAliasType (no target).
-            if let Type::TypeAliasType { .. } = inner.as_ref() {
-                if !handle_recursive {
-                    res.push(typ.clone());
-                    continue;
+            let is_alias = matches!(&**inner, Type::TypeAliasType { .. });
+            // Python computes p_type = get_proper_type(typ.type); for a
+            // non-alias the proper type is the node itself.
+            let alias_ref = match &**inner {
+                Type::TypeAliasType { type_ref, .. } => Some(type_ref.clone()),
+                _ => None,
+            };
+            let p_type = if is_alias {
+                let aliases = aliases?;
+                // Recursive re-entry would re-expand the same snapshot
+                // target forever; Python also loops here, so defer to
+                // the fallback (guard #1149, mirrors the union path).
+                if let Some(ref r) = alias_ref {
+                    if active.contains(r) {
+                        return None;
+                    }
                 }
-                return None;
-            }
-            if let Type::TupleType { items, .. } = inner.as_ref() {
-                res.extend(flatten_nested_tuples_inner(items, handle_recursive)?);
+                expanded_alias_target(inner, aliases).map(|(target, _, _)| target)?
+            } else {
+                *inner.clone()
+            };
+            let skip_recursive_alias = !handle_recursive
+                && matches!(
+                    &**inner,
+                    Type::TypeAliasType {
+                        is_recursive: true,
+                        ..
+                    }
+                );
+            if skip_recursive_alias || !matches!(p_type, Type::TupleType { .. }) {
+                res.push(typ.clone());
                 continue;
             }
+            let items = match p_type {
+                Type::TupleType { items, .. } => items,
+                _ => unreachable!(),
+            };
+            let guarded = if let Some(r) = alias_ref {
+                active.push(r);
+                true
+            } else {
+                false
+            };
+            let inner_flat = flatten_nested_tuples_inner(&items, handle_recursive, aliases, active);
+            if guarded {
+                active.pop();
+            }
+            res.extend(inner_flat?);
+            continue;
         }
         res.push(typ.clone());
     }
@@ -1413,7 +1510,7 @@ mod tests {
         aliases: Option<&dyn crate::aliases::AliasLookup>,
     ) -> Option<Vec<Type>> {
         let mut active = Vec::new();
-        flatten_nested_unions_inner(types, htaa, hr, aliases, &mut active)
+        flatten_nested_unions_inner(types, htaa, hr, aliases, &mut active, None)
     }
 
     /// Build a zero-argument alias snapshot whose target is the wire
@@ -1506,16 +1603,19 @@ mod tests {
     }
 
     #[test]
-    fn test_flatten_nested_unions_applied_alias_defers() {
+    fn test_flatten_nested_unions_applied_alias_expands() {
         use crate::aliases::TypeAliasResolver;
         let target = make_union(vec![make_instance("A", vec![])]);
         let mut resolver = TypeAliasResolver::new();
         resolver.insert("mod.G".to_string(), bare_alias_snapshot("mod.G", &target));
-        // A generic alias application (non-empty args) needs
-        // _expand_once substitution, which this seam defers.
+        // An applied alias (non-empty args) expands through the
+        // _expand_once substitution, matching Python's get_proper_type,
+        // so it no longer defers: the result is the flattened target.
         let alias = make_alias("mod.G", vec![make_instance("builtins.int", vec![])], false);
         let result = flatten_inner(&[alias], true, true, Some(&resolver));
-        assert!(result.is_none());
+        assert!(result.is_some());
+        let flat = result.unwrap();
+        assert_eq!(flat.len(), 1);
     }
 
     #[test]
@@ -1649,5 +1749,93 @@ mod tests {
         assert_eq!(head.len(), 1);
         assert_eq!(mid.len(), 2);
         assert!(tail.is_empty());
+    }
+
+    fn insert_alias_snapshot(resolver: &mut crate::aliases::TypeAliasResolver, target: &Type) {
+        let mut buf = WriteBuffer::new();
+        write_type(&mut buf, target).expect("target must encode");
+        let fullname = "m.Rec".to_string();
+        resolver.insert(
+            fullname.clone(),
+            crate::aliases::TypeAliasSnapshot {
+                fullname,
+                target: buf.into_bytes(),
+                ..Default::default()
+            },
+        );
+    }
+
+    #[test]
+    fn test_flatten_nested_tuples_recursive_alias_defers() {
+        // Rec = tuple[int, Unpack[Rec]]: the target contains the alias
+        // itself, so a handle_recursive=True re-entry must defer via
+        // the active guard, not re-expand forever.
+        let rec = make_alias("m.Rec", vec![], true);
+        let target = Type::TupleType {
+            partial_fallback: Box::new(make_instance("builtins.tuple", vec![])),
+            items: vec![
+                make_instance("builtins.int", vec![]),
+                Type::UnpackType {
+                    typ: Box::new(rec),
+                    from_star_syntax: false,
+                },
+            ],
+            implicit: false,
+        };
+        let mut resolver = crate::aliases::TypeAliasResolver::new();
+        insert_alias_snapshot(&mut resolver, &target);
+        let row = Type::UnpackType {
+            typ: Box::new(make_alias("m.Rec", vec![], true)),
+            from_star_syntax: false,
+        };
+        let mut active = Vec::new();
+        let out = flatten_nested_tuples_inner(
+            &[row],
+            true,
+            Some(&resolver as &dyn crate::aliases::AliasLookup),
+            &mut active,
+        );
+        assert!(out.is_none());
+    }
+
+    #[test]
+    fn test_flatten_nested_tuples_non_recursive_alias_expands() {
+        // Positive control: a non-recursive tuple alias expands and
+        // flattens natively (the pre-guard behavior stays intact).
+        let alias = make_alias("m.Plain", vec![], false);
+        let target = Type::TupleType {
+            partial_fallback: Box::new(make_instance("builtins.tuple", vec![])),
+            items: vec![
+                make_instance("builtins.int", vec![]),
+                make_instance("builtins.str", vec![]),
+            ],
+            implicit: false,
+        };
+        let mut buf = WriteBuffer::new();
+        write_type(&mut buf, &target).expect("target must encode");
+        let mut resolver = crate::aliases::TypeAliasResolver::new();
+        resolver.insert(
+            "m.Plain".to_string(),
+            crate::aliases::TypeAliasSnapshot {
+                fullname: "m.Plain".to_string(),
+                target: buf.into_bytes(),
+                ..Default::default()
+            },
+        );
+        let row = Type::UnpackType {
+            typ: Box::new(alias),
+            from_star_syntax: false,
+        };
+        let mut active = Vec::new();
+        let out = flatten_nested_tuples_inner(
+            &[row],
+            true,
+            Some(&resolver as &dyn crate::aliases::AliasLookup),
+            &mut active,
+        );
+        let flat = out.expect("non-recursive alias must expand");
+        assert!(matches!(&flat[0], Type::Instance { .. }));
+        assert!(matches!(&flat[1], Type::Instance { .. }));
+        assert!(active.is_empty());
     }
 }

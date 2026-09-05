@@ -387,15 +387,15 @@ pub(crate) fn rust_remove_redundant_union_items(
         Err(_) => return None,
     };
     let flags = parse_flags(flags_bytes, items.len())?;
-    // Alias-backed items dedup as their expanded target (typeops.py:1405):
-    // root-expand, scan deep-expanded copies, output deep-expanded survivors,
-    // the #774 contract extended to nested aliases (`str(aliastyp)` == target).
+    // Alias-backed items dedup as their expanded target (typeops.py:1425):
+    // root-expand with get_proper_type(ti) semantics, scan deep copies,
+    // output survivors (#774 contract extends to nested aliases).
     let mut current = Vec::with_capacity(items.len());
     let mut prov: Vec<usize> = Vec::with_capacity(items.len());
     for (i, ti) in items.into_iter().enumerate() {
         let root = match ti {
             Type::TypeAliasType { .. } => {
-                crate::checkexpr_functions::expand_alias_target_raw(&ti, resolver.alias_resolver())?
+                crate::checkexpr_functions::get_proper_or_expand(&ti, resolver.alias_resolver())?
             }
             _ => ti,
         };
