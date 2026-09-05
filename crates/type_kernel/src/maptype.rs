@@ -503,7 +503,7 @@ mod tests {
 
     // Former audit-bucket shape: derivation-path base args carry a
     // TypeAliasType node; the walker keeps it and substitutes the frame
-    // arg into the alias args, matching the unified maptype.rs copy.
+    // arg into the alias args, matching the shared subtypes.rs walker.
     #[test]
     fn map_instance_to_supertype_maps_alias_carrying_base_arg() {
         let b = snapshot(

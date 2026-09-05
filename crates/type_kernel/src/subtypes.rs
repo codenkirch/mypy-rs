@@ -2164,10 +2164,23 @@ fn expand_type_by_instance(typ: &Type, left_ref: &str, left_args: &[Type]) -> Op
             if namespace == left_ref && *raw_id >= 1 {
                 let idx = (*raw_id - 1) as usize;
                 if idx < left_args.len() {
-                    // Python clears last_known_value on Instance
-                    // replacements (expandtype.py:246-249); we clone as-is
-                    // since lkv handling is the LiteralType path (M8c+).
-                    return Some(left_args[idx].clone());
+                    // Python drops the stale literal value on Instance
+                    // replacements (expandtype.py:957-960); other
+                    // replacement kinds pass through unchanged.
+                    return match &left_args[idx] {
+                        Type::Instance {
+                            type_ref,
+                            args,
+                            extra_attrs,
+                            ..
+                        } => Some(Type::Instance {
+                            type_ref: type_ref.clone(),
+                            args: args.clone(),
+                            last_known_value: None,
+                            extra_attrs: extra_attrs.clone(),
+                        }),
+                        repl => Some(repl.clone()),
+                    };
                 }
             }
             // Unmatched TypeVar: namespace mismatch or raw_id out of
@@ -2338,7 +2351,7 @@ fn expand_type_by_instance(typ: &Type, left_ref: &str, left_args: &[Type]) -> Op
         Type::TypeAliasType {
             type_ref,
             args,
-            is_recursive: _,
+            is_recursive,
         } => {
             // visit_type_alias_type (expandtype.py:1321-1328): the alias
             // target's own frame cannot contain vars bound by this class
@@ -2357,10 +2370,13 @@ fn expand_type_by_instance(typ: &Type, left_ref: &str, left_args: &[Type]) -> Op
                 }
                 new_args.push(expand_type_by_instance(arg, left_ref, left_args)?);
             }
+            // Propagate the wire-carried recursion flag (wave36 review):
+            // a hardcoded false silences recursive_pair_core and the
+            // back-ref cut; aliased re-entries then loop instead of settling.
             Some(Type::TypeAliasType {
                 type_ref: type_ref.clone(),
                 args: new_args,
-                is_recursive: false,
+                is_recursive: *is_recursive,
             })
         }
         Type::UnpackType { typ, .. } => {

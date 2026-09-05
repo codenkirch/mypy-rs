@@ -2702,6 +2702,21 @@ thread_local! {
     static ALIAS_EQ_ACTIVE: RefCell<HashSet<(String, String)>> = RefCell::new(HashSet::new());
 }
 
+// RAII: a frame inserted into ALIAS_EQ_ACTIVE must pop on unwind. A leaked
+// entry silently poisons every later comparison of that pair on the thread.
+struct AliasEqFrame {
+    key: (String, String),
+    fresh: bool,
+}
+
+impl Drop for AliasEqFrame {
+    fn drop(&mut self) {
+        if self.fresh {
+            ALIAS_EQ_ACTIVE.with(|c| c.borrow_mut().remove(&self.key));
+        }
+    }
+}
+
 pub(crate) fn py_type_eq(a: &Type, b: &Type) -> bool {
     match (a, b) {
         // Instance.__eq__ (types.py:1939): type identity + args +
@@ -2985,15 +3000,33 @@ pub(crate) fn py_type_eq(a: &Type, b: &Type) -> bool {
         ) => {
             if r1 != r2 {
                 false
-            } else if !ALIAS_EQ_ACTIVE.with(|c| c.borrow_mut().insert((r1.clone(), r2.clone()))) {
-                // Identity-fast-path cut: the pair is being compared
-                // inside its own args, i.e. a same-node back-ref.
-                true
             } else {
-                let ok =
-                    a1.len() == a2.len() && a1.iter().zip(a2.iter()).all(|(x, y)| py_type_eq(x, y));
-                ALIAS_EQ_ACTIVE.with(|c| c.borrow_mut().remove(&(r1.clone(), r2.clone())));
-                ok
+                let fresh =
+                    ALIAS_EQ_ACTIVE.with(|c| c.borrow_mut().insert((r1.clone(), r2.clone())));
+                match fresh {
+                    true => {
+                        // Fresh pair: mirror the structural
+                        // `self.args == other.args` half of TypeAliasType
+                        // __eq__ (types.py:545); Drop pops the frame.
+                        let _guard = AliasEqFrame {
+                            key: (r1.clone(), r2.clone()),
+                            fresh: true,
+                        };
+                        a1.len() == a2.len()
+                            && a1.iter().zip(a2.iter()).all(|(x, y)| py_type_eq(x, y))
+                    }
+                    false => {
+                        // Re-entered pair (identity fast path): cut only
+                        // when both sides' args agree byte-for-byte; a
+                        // diverging nested arg is decided structurally.
+                        if a1.is_empty() && a2.is_empty() || (a1 == a2) {
+                            true
+                        } else {
+                            a1.len() == a2.len()
+                                && a1.iter().zip(a2.iter()).all(|(x, y)| py_type_eq(x, y))
+                        }
+                    }
+                }
             }
         }
         // UnboundType.__eq__ (types.py:1300): name/optional/original_str*;
@@ -3952,6 +3985,38 @@ mod tests {
         };
         assert!(!py_type_eq(&mk_f("builtins.int"), &mk_f("builtins.str")));
         assert!(py_type_eq(&mk_f("builtins.int"), &mk_f("builtins.int")));
+    }
+
+    #[test]
+    fn py_type_eq_reentered_alias_pair_divergent_args_is_false() {
+        // Wave36 review: the old identity cut keyed the pair on
+        // type_ref alone, so re-entered applications with diverging
+        // nested args compared equal once the pair was active.
+        let inst = |inner: &str| Type::Instance {
+            type_ref: inner.to_string(),
+            args: Vec::new(),
+            last_known_value: None,
+            extra_attrs: None,
+        };
+        // Outer A[int] nesting A[int] re-mentioned vs A[int,others],
+        // nested divergence past the shared ref: outer == must be false.
+        let mk = |name: &str, deep: &str| Type::TypeAliasType {
+            type_ref: name.to_string(),
+            is_recursive: true,
+            args: vec![Type::TypeAliasType {
+                type_ref: name.to_string(),
+                is_recursive: true,
+                args: vec![inst(deep)],
+            }],
+        };
+        assert!(!py_type_eq(
+            &mk("A", "builtins.int"),
+            &mk("A", "builtins.str")
+        ));
+        assert!(py_type_eq(
+            &mk("A", "builtins.int"),
+            &mk("A", "builtins.int")
+        ));
     }
 
     // ----- Phase F0 (#1349): Rust-resident plain-data fields -----
