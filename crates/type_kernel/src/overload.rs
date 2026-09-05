@@ -121,6 +121,11 @@ pub fn rust_check_overload_call(
         return None;
     }
 
+    // Ambient `type_state.infer_unions` for the engine's unify reads; the
+    // RAII guard restores the pre-call value on exit. The star-args early
+    // return below runs before any engine call, so install is harmless.
+    let _infer_unions_guard = crate::unify::InferUnionsGuard::install(infer_unions);
+
     let arg_names_inner = arg_names.as_deref();
 
     // Step 1: Any actual with star? -> defer (whole thing).
@@ -657,13 +662,19 @@ fn is_variadic_tvar(t: &Type) -> bool {
 /// when `strict_optional` is the active setting (`state.strict_optional`);
 /// otherwise the whole call defers so error messages cannot diverge.
 #[pyfunction]
+#[pyo3(signature = (resolver, items_wire, template_wire, strict_optional, infer_unions = false))]
 pub fn rust_find_matching_overload_items(
     _py: Python<'_>,
     resolver: &NativeTypeResolver,
     items_wire: Vec<&[u8]>,
     template_wire: &[u8],
     strict_optional: bool,
+    infer_unions: bool,
 ) -> Option<Vec<i64>> {
+    // Ambient for the per-item `callables_compatible_with_ignore_return`
+    // engine reads; generic overload items route through the wave37
+    // unify kernel, whose solve must see the Python ambient value.
+    let _infer_unions_guard = crate::unify::InferUnionsGuard::install(infer_unions);
     if items_wire.is_empty() {
         return None;
     }

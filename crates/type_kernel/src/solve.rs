@@ -343,6 +343,9 @@ pub(crate) fn rust_solve_one(
     strict_optional: bool,
     resolver: &NativeTypeResolver,
 ) -> Option<(i64, Option<Vec<u8>>)> {
+    // Ambient `type_state.infer_unions` for the engine's unify reads;
+    // RAII so a thread-local set here cannot outlive this call.
+    let _infer_unions_guard = crate::unify::InferUnionsGuard::install(infer_unions);
     let mut lowers_types: Vec<Type> = Vec::with_capacity(lowers.len());
     for b in &lowers {
         lowers_types.push(decode_type(b)?);
@@ -1178,18 +1181,27 @@ fn solve_iteratively_native(
     Ok(solutions)
 }
 
+/// Outcome of `solve_with_dependent_core`: Python's `(solutions,
+/// free_vars)` pair. `EmptySolutions` is the linear-fail literal
+/// `({}, [])` (solve.py:253-254).
+pub(crate) enum DependentSolve {
+    EmptySolutions,
+    Solved {
+        solutions: Vec<(TvId, Option<Type>)>,
+        free_vars: Vec<TvId>,
+    },
+}
+
 /// `solve_with_dependent` (solve.py:234-292), Rust subset.
 ///
-/// `Err(())` = defer to Python. `Ok(Some((None, None)))` = empty
-/// solutions `({}, [])`. `Ok(Some((Some(sol_blob), Some(free_blob))))`
-/// = native solution.
-fn solve_with_dependent_native(
+/// `Err(())` = defer to Python.
+fn solve_with_dependent_core(
     vars: &[Type],
     constraints: &[Constraint],
     infer_unions: bool,
     strict_optional: bool,
     resolver: &crate::typeinfo::TypeResolver,
-) -> Result<NativeDependentOut, ()> {
+) -> Result<DependentSolve, ()> {
     let tvars: Vec<TvId> = vars
         .iter()
         .map(|t| tv_id(t).ok_or(()))
@@ -1203,7 +1215,7 @@ fn solve_with_dependent_native(
     let sccs = strongly_connected_components(vertices, &dmap);
     if !sccs.iter().all(|s| check_linear(s, &lowers, &uppers)) {
         // Python returns the literal `({}, [])` (solve.py:253-254).
-        return Ok(Some((None, None)));
+        return Ok(DependentSolve::EmptySolutions);
     }
     let data = prepare_sccs(sccs, &dmap);
     let raw_batches = match topsort(&data) {
@@ -1271,9 +1283,31 @@ fn solve_with_dependent_native(
             Err(()) => return Err(()),
         }
     }
-    let sol_blob = encode_solutions_blob(&solutions)?;
-    let free_blob = encode_free_vars_blob(&free_vars)?;
-    Ok(Some((Some(sol_blob), Some(free_blob))))
+    Ok(DependentSolve::Solved {
+        solutions,
+        free_vars,
+    })
+}
+
+/// Blob-encoding wrapper around `solve_with_dependent_core`: keeps the
+/// FFI shape byte-identical for the `rust_solve_dependent` seam.
+fn solve_with_dependent_native(
+    vars: &[Type],
+    constraints: &[Constraint],
+    infer_unions: bool,
+    strict_optional: bool,
+    resolver: &crate::typeinfo::TypeResolver,
+) -> Result<NativeDependentOut, ()> {
+    match solve_with_dependent_core(vars, constraints, infer_unions, strict_optional, resolver)? {
+        DependentSolve::EmptySolutions => Ok(Some((None, None))),
+        DependentSolve::Solved {
+            solutions,
+            free_vars,
+        } => Ok(Some((
+            Some(encode_solutions_blob(&solutions)?),
+            Some(encode_free_vars_blob(&free_vars)?),
+        ))),
+    }
 }
 
 /// `encode_solutions_blob`: `(raw, meta, ns, has_sol, type?)...`. Uses
@@ -1325,6 +1359,9 @@ pub(crate) fn rust_solve_dependent(
     strict_optional: bool,
     resolver: &NativeTypeResolver,
 ) -> SolveDependentOut {
+    // Ambient `type_state.infer_unions` for the engine's unify reads;
+    // RAII so a thread-local set here cannot outlive this call.
+    let _infer_unions_guard = crate::unify::InferUnionsGuard::install(infer_unions);
     let mut var_types: Vec<Type> = Vec::with_capacity(vars.len());
     for b in &vars {
         var_types.push(decode_type(b)?);
@@ -1486,11 +1523,11 @@ fn solve_constraints_native(
     }
 
     // Ordered `res` assembly over `vars` only (solve.py:277-289).
-    let mut ordered: Vec<(TvId, Option<Type>)> = Vec::with_capacity(original_vars.len());
+    let mut ordered: Vec<Option<Type>> = Vec::with_capacity(original_vars.len());
     for t in original_vars {
         let tv = tv_id(t).ok_or(())?;
         match solutions.iter().find(|(k, _)| *k == tv) {
-            Some((_, sol)) => ordered.push((tv.clone(), sol.clone())),
+            Some((_, sol)) => ordered.push(sol.clone()),
             None => {
                 // Unconstrained or leak-skipped: strict Never / lax Any.
                 // `TypeOfAny.special_form` = 6.
@@ -1503,7 +1540,7 @@ fn solve_constraints_native(
                         missing_import_name: None,
                     }
                 };
-                ordered.push((tv.clone(), Some(cand)));
+                ordered.push(Some(cand));
             }
         }
     }
@@ -1512,57 +1549,158 @@ fn solve_constraints_native(
     // solution that violates its var's upper bound with the bound itself
     // when the bound satisfies every constraint.
     if !skip_unsatisfied {
-        let ctx = SubtypeContext::new(false, false, false, false, false, strict_optional);
-        let mut validated: Vec<(TvId, Option<Type>)> = Vec::with_capacity(ordered.len());
-        for (t, s) in original_vars.iter().zip(ordered.iter()) {
-            let tv = tv_id(t).ok_or(())?;
-            let ub = upper_bound_of(t).ok_or(())?;
-            if is_callable_protocol(&ub, r) {
-                validated.push((tv, s.1.clone()));
-                continue;
-            }
-            // Python's `is_subtype` applies `get_proper_type` at entry
-            // (subtypes.py:905); mirror it by expanding alias nodes here
-            // instead of deferring on every alias-bearing bound/solution.
-            if let Some(sol) = &s.1 {
-                let sol = subtypes::expand_aliases(sol, alr, strict_optional).ok_or(())?;
-                let ub_e = subtypes::expand_aliases(&ub, alr, strict_optional).ok_or(())?;
-                if !subtypes::is_subtype(&sol, &ub_e, &ctx, r).ok_or(())? {
-                    let mut bound_satisfies_all = true;
-                    for c in constraints {
-                        if c.op == crate::constraints::SUBTYPE_OF {
-                            let target = subtypes::expand_aliases(&c.target, alr, strict_optional)
-                                .ok_or(())?;
-                            if !subtypes::is_subtype(&ub_e, &target, &ctx, r).ok_or(())? {
-                                bound_satisfies_all = false;
-                                break;
-                            }
-                        }
-                        if c.op == crate::constraints::SUPERTYPE_OF {
-                            let target = subtypes::expand_aliases(&c.target, alr, strict_optional)
-                                .ok_or(())?;
-                            if !subtypes::is_subtype(&target, &ub_e, &ctx, r).ok_or(())? {
-                                bound_satisfies_all = false;
-                                break;
-                            }
-                        }
-                    }
-                    if bound_satisfies_all {
-                        // Python pushes the raw `t.upper_bound`, not the
-                        // proper-expanded copy used for the comparison.
-                        validated.push((tv, Some(ub.clone())));
-                        continue;
-                    }
-                }
-            }
-            validated.push((tv, s.1.clone()));
-        }
-        ordered = validated;
+        ordered = pre_validate_solutions_inner(
+            ordered,
+            original_vars,
+            constraints,
+            alr,
+            r,
+            strict_optional,
+        )?;
     }
 
-    let sol_blob = encode_solutions_blob(&ordered)?;
+    let ordered_pairs: Vec<(TvId, Option<Type>)> = original_vars
+        .iter()
+        .map(|t| tv_id(t).ok_or(()))
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .zip(ordered)
+        .collect();
+
+    let sol_blob = encode_solutions_blob(&ordered_pairs)?;
     let free_blob = encode_free_vars_blob(&[])?;
     Ok((sol_blob, free_blob))
+}
+
+/// `pre_validate_solutions` (solve.py:799-829) core, shared by the
+/// non-polymorphic and polymorphic solve paths. `res` must pair 1:1 with
+/// `original_vars`. Returns `Err(())` = defer to Python.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn pre_validate_solutions_inner(
+    res: Vec<Option<Type>>,
+    original_vars: &[Type],
+    constraints: &[Constraint],
+    lookup: &dyn crate::aliases::AliasLookup,
+    r: &crate::typeinfo::TypeResolver,
+    strict_optional: bool,
+) -> Result<Vec<Option<Type>>, ()> {
+    let ctx = SubtypeContext::new(false, false, false, false, false, strict_optional);
+    let mut validated: Vec<Option<Type>> = Vec::with_capacity(res.len());
+    for (t, s) in original_vars.iter().zip(res) {
+        let ub = upper_bound_of(t).ok_or(())?;
+        if is_callable_protocol(&ub, r) {
+            validated.push(s);
+            continue;
+        }
+        // Python's `is_subtype` applies `get_proper_type` at entry
+        // (subtypes.py:905); mirror it by expanding alias nodes here
+        // instead of deferring on every alias-bearing bound/solution.
+        if let Some(sol) = &s {
+            let sol = subtypes::expand_aliases(sol, lookup, strict_optional).ok_or(())?;
+            let ub_e = subtypes::expand_aliases(&ub, lookup, strict_optional).ok_or(())?;
+            if !subtypes::is_subtype(&sol, &ub_e, &ctx, r).ok_or(())? {
+                let mut bound_satisfies_all = true;
+                for c in constraints {
+                    if c.op == crate::constraints::SUBTYPE_OF {
+                        let target = subtypes::expand_aliases(&c.target, lookup, strict_optional)
+                            .ok_or(())?;
+                        if !subtypes::is_subtype(&ub_e, &target, &ctx, r).ok_or(())? {
+                            bound_satisfies_all = false;
+                            break;
+                        }
+                    }
+                    if c.op == crate::constraints::SUPERTYPE_OF {
+                        let target = subtypes::expand_aliases(&c.target, lookup, strict_optional)
+                            .ok_or(())?;
+                        if !subtypes::is_subtype(&target, &ub_e, &ctx, r).ok_or(())? {
+                            bound_satisfies_all = false;
+                            break;
+                        }
+                    }
+                }
+                if bound_satisfies_all {
+                    // Python pushes the raw `t.upper_bound`, not the
+                    // proper-expanded copy used for the comparison.
+                    validated.push(Some(ub));
+                    continue;
+                }
+            }
+        }
+        validated.push(s);
+    }
+    Ok(validated)
+}
+
+/// `solve_constraints` polymorphic branch (solve.py:241-262 + 277-289)
+/// with `allow_polymorphic=True`, used by the `unify_generic_callable`
+/// port. Python's extra-tvar collection is not ported: the kernel
+/// `Constraint` carries no `extra_tvars`, so `unify_generic_callable_core`
+/// gates on the attach shapes instead (constraints.py:1712, 1768 via
+/// `no_extra_tvar_shape`) and defers them to Python before reaching
+/// this entry, keeping parity rather than making extras impossible.
+/// `strict=True` / `skip_unsatisfied=False` match the unify call site
+/// (subtypes.py). Returns `Err(())` = defer to Python; the returned
+/// list may contain `None` (unsolved var, unify must fail).
+pub(crate) fn solve_constraints_poly_native(
+    original_vars: &[Type],
+    constraints: &[Constraint],
+    infer_unions: bool,
+    strict_optional: bool,
+    r: &crate::typeinfo::TypeResolver,
+    aliases: Option<&crate::aliases::TypeAliasResolver>,
+) -> Result<Vec<Option<Type>>, ()> {
+    if original_vars.is_empty() {
+        return Ok(Vec::new());
+    }
+    // Python reassigns `constraints` before both the solve and the
+    // pre-validation (solve.py:242-244, 288).
+    let filtered = crate::constraints_filter::skip_reverse_union_kernel(constraints).ok_or(())?;
+
+    // Dependent solve over the filtered constraints (solve.py:255-261); it
+    // consumes `filtered` directly (Python's cmap is shared with the
+    // non-polymorphic branch, which this poly-only port does not implement).
+    let (solutions, free_vars): (Vec<(TvId, Option<Type>)>, Vec<TvId>) = if !filtered.is_empty() {
+        match solve_with_dependent_core(original_vars, &filtered, infer_unions, strict_optional, r)?
+        {
+            DependentSolve::EmptySolutions => (Vec::new(), Vec::new()),
+            DependentSolve::Solved {
+                solutions,
+                free_vars,
+            } => (solutions, free_vars),
+        }
+    } else {
+        (Vec::new(), Vec::new())
+    };
+
+    // Ordered `res` over `vars` (solve.py:277-289). Unify always passes
+    // strict=True, so a var without solutions gets ambiguous Never.
+    let mut res: Vec<Option<Type>> = Vec::with_capacity(original_vars.len());
+    for t in original_vars {
+        let tv = tv_id(t).ok_or(())?;
+        match solutions.iter().find(|(k, _)| *k == tv) {
+            Some((_, sol)) => res.push(sol.clone()),
+            None => res.push(Some(Type::UninhabitedType { ambiguous: true })),
+        }
+    }
+
+    // pre_validate_solutions runs only when nothing is free
+    // (solve.py:287-289); unify passes skip_unsatisfied=False.
+    if free_vars.is_empty() {
+        let empty = crate::aliases::TypeAliasResolver::new();
+        let lookup: &dyn crate::aliases::AliasLookup = match aliases {
+            Some(a) => a,
+            None => &empty,
+        };
+        res = pre_validate_solutions_inner(
+            res,
+            original_vars,
+            &filtered,
+            lookup,
+            r,
+            strict_optional,
+        )?;
+    }
+    Ok(res)
 }
 
 /// `mypy.infer.infer_type_arguments` (infer.py:67-80): constraints from a
@@ -1648,6 +1786,9 @@ pub(crate) fn rust_solve_constraints(
     skip_unsatisfied: bool,
     resolver: &NativeTypeResolver,
 ) -> SolveDependentOut {
+    // Ambient `type_state.infer_unions` for the engine's unify reads;
+    // RAII so a thread-local set here cannot outlive this call.
+    let _infer_unions_guard = crate::unify::InferUnionsGuard::install(infer_unions);
     let mut var_types: Vec<Type> = Vec::with_capacity(vars.len());
     for b in &vars {
         var_types.push(decode_type(b)?);
@@ -1700,6 +1841,9 @@ pub(crate) fn rust_infer_function_type_arguments(
     iterable_type: Option<Vec<u8>>,
     mapping_type: Option<Vec<u8>>,
 ) -> Option<Vec<u8>> {
+    // Ambient `type_state.infer_unions` for the engine's unify reads;
+    // RAII so a thread-local set here cannot outlive this call.
+    let _infer_unions_guard = crate::unify::InferUnionsGuard::install(infer_unions);
     let mut buf = ReadBuffer::new(callee_bytes);
     let callee = match wire::read_type(&mut buf, None) {
         Ok(t) => t,

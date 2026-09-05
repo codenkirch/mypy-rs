@@ -321,6 +321,100 @@ pub(crate) fn type_contains_erased(typ: &Type) -> bool {
     children(typ).into_iter().any(type_contains_erased)
 }
 
+/// Over-approximation for the `extra_tvars` attach shapes of
+/// `ConstraintBuilderVisitor.visit_callable_type`: Python attaches
+/// `extra_tvars` at every `visit_callable_type` whose proper-typed actual
+/// declares its own type variables (constraints.py:1712, 1768) while
+/// `skip_neg_op` is false and the ambient `type_state.infer_polymorphic`
+/// is true (checkexpr.py:1325, true for ordinary checking, which is the
+/// common case at the engine's FFI depth). Nested `infer_constraints`
+/// recursion re-enters the visitor with `skip_neg_op=False`, so the shape
+/// can sit anywhere reachable in the actual tree, not just at its root.
+/// `None` when a nested `TypeAliasType` blocks visibility (the
+/// proper-typed shape a deferred Python call would see is not provable
+/// here); `Some(true)` / `Some(false)` on decided verdicts.
+pub(crate) fn callable_with_vars_reachable(typ: &Type) -> Option<bool> {
+    match typ {
+        Type::TypeAliasType { .. } => return None,
+        Type::CallableType { variables, .. } if !variables.is_empty() => return Some(true),
+        Type::Overloaded { items }
+            if items.iter().any(
+                |it| matches!(it, Type::CallableType { variables, .. } if !variables.is_empty()),
+            ) =>
+        {
+            return Some(true);
+        }
+        _ => {}
+    }
+    let mut kids = children(typ);
+    match typ {
+        Type::CallableType {
+            fallback,
+            type_guard,
+            type_is,
+            ..
+        } => {
+            // children() mirrors BoolTypeQuery and skips the fallback
+            // and guard slots; the constraint recursion consults all
+            // three for parity, so the walker must see through them.
+            kids.push(fallback);
+            if let Some(g) = type_guard {
+                kids.push(g);
+            }
+            if let Some(i) = type_is {
+                kids.push(i);
+            }
+        }
+        Type::TypeVarType {
+            values,
+            upper_bound,
+            default,
+            ..
+        } => {
+            kids.extend(values.iter());
+            kids.push(upper_bound);
+            kids.push(default);
+        }
+        Type::ParamSpecType {
+            prefix,
+            upper_bound,
+            default,
+            ..
+        } => {
+            kids.extend(prefix.arg_types.iter());
+            kids.extend(prefix.variables.iter());
+            kids.push(upper_bound);
+            kids.push(default);
+        }
+        Type::TypeVarTupleType {
+            tuple_fallback,
+            upper_bound,
+            default,
+            ..
+        } => {
+            kids.push(tuple_fallback);
+            kids.push(upper_bound);
+            kids.push(default);
+        }
+        Type::Parameters(p) => {
+            kids.extend(p.arg_types.iter());
+            kids.extend(p.variables.iter());
+        }
+        _ => {}
+    }
+    // None must win over an earlier Some(true): Python keeps scanning the
+    // remaining children for a blocking alias before committing to true.
+    let mut any_true = false;
+    for k in kids {
+        match callable_with_vars_reachable(k) {
+            Some(false) => {}
+            None => return None,
+            Some(true) => any_true = true,
+        }
+    }
+    Some(any_true)
+}
+
 /// Yield the direct child types of `typ` (for ANY_STRATEGY / ALL_STRATEGY
 /// traversal). Mirrors the `query_types` calls in `BoolTypeQuery.visit_*`.
 fn children(typ: &Type) -> Vec<&Type> {
@@ -1837,5 +1931,126 @@ mod tests {
         assert!(matches!(&flat[0], Type::Instance { .. }));
         assert!(matches!(&flat[1], Type::Instance { .. }));
         assert!(active.is_empty());
+    }
+
+    fn make_generic_callable() -> Type {
+        let mut c = make_callable();
+        if let Type::CallableType { variables, .. } = &mut c {
+            variables.push(make_typevar(1));
+        }
+        c
+    }
+
+    fn make_overloaded(items: Vec<Type>) -> Type {
+        Type::Overloaded { items }
+    }
+
+    #[test]
+    fn test_gate_plain_callable() {
+        assert_eq!(callable_with_vars_reachable(&make_callable()), Some(false));
+    }
+
+    #[test]
+    fn test_gate_generic_root() {
+        assert_eq!(
+            callable_with_vars_reachable(&make_generic_callable()),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn test_gate_generic_nested_in_arg() {
+        let mut c = make_callable();
+        if let Type::CallableType { arg_types, .. } = &mut c {
+            arg_types.push(make_generic_callable());
+        }
+        assert_eq!(callable_with_vars_reachable(&c), Some(true));
+    }
+
+    #[test]
+    fn test_gate_generic_via_type_guard() {
+        let mut c = make_callable();
+        if let Type::CallableType { type_guard, .. } = &mut c {
+            *type_guard = Some(Box::new(make_generic_callable()));
+        }
+        assert_eq!(callable_with_vars_reachable(&c), Some(true));
+    }
+
+    #[test]
+    fn test_gate_generic_via_fallback() {
+        let mut c = make_callable();
+        if let Type::CallableType { fallback, .. } = &mut c {
+            let mut f = make_callable();
+            if let Type::CallableType { ret_type, .. } = &mut f {
+                *ret_type = Box::new(make_generic_callable());
+            }
+            **fallback = f;
+        }
+        assert_eq!(callable_with_vars_reachable(&c), Some(true));
+    }
+
+    #[test]
+    fn test_gate_generic_inside_typevar_upper_bound() {
+        let mut tv = make_typevar(1);
+        if let Type::TypeVarType { upper_bound, .. } = &mut tv {
+            *upper_bound = Box::new(make_generic_callable());
+        }
+        assert_eq!(callable_with_vars_reachable(&tv), Some(true));
+    }
+
+    #[test]
+    fn test_gate_generic_inside_parameters_args() {
+        let p = Type::Parameters(crate::wire::Parameters {
+            arg_types: vec![make_generic_callable()],
+            arg_kinds: vec![0],
+            arg_names: vec![None],
+            variables: vec![],
+            imprecise_arg_kinds: false,
+            is_ellipsis_args: false,
+        });
+        assert_eq!(callable_with_vars_reachable(&p), Some(true));
+    }
+
+    #[test]
+    fn test_gate_overloaded_with_generic_item() {
+        let o = make_overloaded(vec![make_callable(), make_generic_callable()]);
+        assert_eq!(callable_with_vars_reachable(&o), Some(true));
+    }
+
+    #[test]
+    fn test_gate_overloaded_plain_items() {
+        let o = make_overloaded(vec![make_callable(), make_callable()]);
+        assert_eq!(callable_with_vars_reachable(&o), Some(false));
+    }
+
+    #[test]
+    fn test_gate_alias_blocks_verdict() {
+        let mut c = make_callable();
+        if let Type::CallableType { arg_types, .. } = &mut c {
+            arg_types.push(make_alias(
+                "m.A",
+                vec![make_instance("builtins.int", vec![])],
+                false,
+            ));
+        }
+        assert_eq!(callable_with_vars_reachable(&c), None);
+    }
+
+    #[test]
+    fn test_gate_alias_beats_generic() {
+        let u = make_union(vec![
+            make_alias("m.A", vec![], false),
+            make_generic_callable(),
+        ]);
+        assert_eq!(callable_with_vars_reachable(&u), None);
+    }
+
+    #[test]
+    fn test_gate_alias_beats_generic_reversed_order() {
+        let u = make_union(vec![
+            make_generic_callable(),
+            make_alias("m.A", vec![], false),
+        ]);
+        assert_eq!(callable_with_vars_reachable(&u), None);
     }
 }

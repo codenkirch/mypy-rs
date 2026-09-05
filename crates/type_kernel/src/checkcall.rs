@@ -764,6 +764,9 @@ pub fn rust_solve_generic_call(
     iterable_type: Option<Vec<u8>>,
     mapping_type: Option<Vec<u8>>,
 ) -> Option<Vec<u8>> {
+    // Ambient `type_state.infer_unions` for the solve engine's unify and
+    // join reads; the RAII guard restores the pre-call value on exit.
+    let _infer_unions_guard = crate::unify::InferUnionsGuard::install(infer_unions);
     // Reject producer bugs up front (issue #1360) instead of absorbing
     // them as a mid-loop deferral; see validate_solve_call_entry.
     if !validate_solve_call_entry(arg_kinds.len(), arg_types_bytes.len(), &formal_to_actual) {

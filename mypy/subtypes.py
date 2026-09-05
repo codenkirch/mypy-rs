@@ -270,7 +270,12 @@ def _native_infer_variance_member(
         return None
     try:
         return _rust_infer_variance_member(
-            typ_bytes, self_bytes, object_bytes, tvar.id.raw_id, _native_subtype_resolver
+            typ_bytes,
+            self_bytes,
+            object_bytes,
+            tvar.id.raw_id,
+            _native_subtype_resolver,
+            type_state.infer_unions,
         )
     except Exception:
         return None
@@ -453,6 +458,7 @@ def _flush_subtype_batch() -> dict[tuple[bytes, bytes, tuple[bool, ...]], bool]:
         strict_optional,
         ignore_pos_arg_names,
         strict_concatenate,
+        infer_unions,
     ) = ctx_key
     try:
         answers = _type_kernel.rust_is_subtype_batch(
@@ -466,6 +472,7 @@ def _flush_subtype_batch() -> dict[tuple[bytes, bytes, tuple[bool, ...]], bool]:
             ignore_pos_arg_names,
             strict_concatenate,
             _native_subtype_resolver,
+            infer_unions,
         )
     except (AssertionError, NotImplementedError):
         # Unserializable variant reached the Rust edge; nothing was
@@ -671,6 +678,7 @@ def is_equivalent(
                 ignore_type_params,
                 state.strict_optional,
                 _native_subtype_resolver,
+                type_state.infer_unions,
             )
         except (AssertionError, NotImplementedError):
             result = None
@@ -731,6 +739,7 @@ def is_same_type(
                 ignore_promotions,
                 state.strict_optional,
                 _native_subtype_resolver,
+                type_state.infer_unions,
             )
         except (AssertionError, NotImplementedError):
             result = None
@@ -889,6 +898,10 @@ def _is_subtype(
                 state.strict_optional,
                 subtype_context.ignore_pos_arg_names,
                 _strict_concatenate_flag(subtype_context),
+                # Ambient flag consumed by the kernel's wave-37 unify port
+                # (#1426): two pairs differing only here must not share a
+                # batched answer.
+                type_state.infer_unions,
             )
             if _subtype_batch:
                 prev_flags = _subtype_batch[0][2]
@@ -941,6 +954,7 @@ def _is_subtype(
                     else False
                 ),
                 _native_subtype_resolver,
+                type_state.infer_unions,
             )
         except (AssertionError, NotImplementedError):
             # Type tree contains an unserializable variant (e.g.
@@ -1325,6 +1339,7 @@ class SubtypeVisitor(TypeVisitor[bool]):
                         state.strict_optional,
                         self.proper_subtype,  # nested comparisons
                         _native_subtype_resolver,
+                        type_state.infer_unions,
                     )
                 except (AssertionError, NotImplementedError):
                     result = None
@@ -1402,6 +1417,7 @@ class SubtypeVisitor(TypeVisitor[bool]):
                         ),
                         state.strict_optional,
                         _native_subtype_resolver,
+                        type_state.infer_unions,
                     )
                 except (AssertionError, NotImplementedError):
                     result = None
@@ -2670,6 +2686,7 @@ def are_parameters_compatible(
                 state.strict_optional,
                 nested_proper,
                 _native_subtype_resolver,
+                type_state.infer_unions,
             )
         except (AssertionError, NotImplementedError):
             result = None
@@ -3067,6 +3084,7 @@ def restrict_subtype_away(t: Type, s: Type, *, consider_runtime_isinstance: bool
                 consider_runtime_isinstance,
                 state.strict_optional,
                 _native_subtype_resolver,
+                type_state.infer_unions,
             )
             if result is not None:
                 decoded = _deserialize_type(bytes(result))
@@ -3114,6 +3132,7 @@ def covers_at_runtime(item: Type, supertype: Type) -> bool:
                 _serialize_type(supertype),
                 state.strict_optional,
                 _native_subtype_resolver,
+                type_state.infer_unions,
             )
             if result is not None:
                 return result
@@ -3168,6 +3187,7 @@ def is_more_precise(left: Type, right: Type, *, ignore_promotions: bool = False)
                 ignore_promotions,
                 state.strict_optional,
                 _native_subtype_resolver,
+                type_state.infer_unions,
             )
         except (AssertionError, NotImplementedError):
             result = None

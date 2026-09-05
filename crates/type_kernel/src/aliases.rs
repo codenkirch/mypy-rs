@@ -116,6 +116,24 @@ impl TypeAliasResolver {
             .clone()
     }
 
+    /// Rebuild a resolver from the shared `Arc` view, for engine-depth
+    /// callers that only hold the `TypeResolver`'s alias snapshot (/kernel
+    /// unify port, issue #1426: `unify_generic_callable`'s constraint and
+    /// apply paths take a `&TypeAliasResolver`, and the `is_subtype`
+    /// engine does not carry the `NativeTypeResolver` down). The map is
+    /// frozen between build-manager snapshot passes, so one clone per
+    /// unify call is correct; the `shared` slot is prefilled so any
+    /// `shared()` re-request inside the call does not clone again.
+    pub(crate) fn from_shared_view(
+        shared: std::sync::Arc<HashMap<String, TypeAliasSnapshot>>,
+    ) -> Self {
+        let snapshots = (*shared).clone();
+        Self {
+            snapshots,
+            shared: std::cell::RefCell::new(Some(shared)),
+        }
+    }
+
     pub fn len(&self) -> usize {
         self.snapshots.len()
     }

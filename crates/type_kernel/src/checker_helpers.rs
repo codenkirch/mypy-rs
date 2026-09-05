@@ -641,13 +641,16 @@ fn try_restrict_literal_union(
 /// Returns `Some(Vec<u8>)` (encoded result type) or `None` (defer).
 #[pyfunction]
 #[allow(clippy::needless_pass_by_value)]
+#[pyo3(signature = (t_bytes, s_bytes, consider_runtime_isinstance, strict_optional, resolver, infer_unions = false))]
 pub(crate) fn rust_restrict_subtype_away(
     t_bytes: &[u8],
     s_bytes: &[u8],
     consider_runtime_isinstance: bool,
     strict_optional: bool,
     resolver: &mut NativeTypeResolver,
+    infer_unions: bool,
 ) -> Option<Vec<u8>> {
+    let _infer_unions_guard = crate::unify::InferUnionsGuard::install(infer_unions);
     let t = decode_type(t_bytes)?;
     let s = decode_type(s_bytes)?;
     // Mirror subtypes.py's `_is_subtype` (subtypes.py:531), which does
@@ -3389,8 +3392,8 @@ info.mro = [Cls()]
         // so restrict_subtype_away returns UninhabitedType.
         let t = encode_type(&alias_type("mod.Alias")).expect("t must encode");
         let s = encode_type(&make_instance("builtins.str", vec![])).expect("s must encode");
-        let result =
-            rust_restrict_subtype_away(&t, &s, true, true, &mut native).expect("seam must decide");
+        let result = rust_restrict_subtype_away(&t, &s, true, true, &mut native, false)
+            .expect("seam must decide");
         assert_eq!(
             decode_type(&result),
             Some(Type::UninhabitedType { ambiguous: false })
@@ -3406,7 +3409,7 @@ info.mro = [Cls()]
         let t = encode_type(&alias_type("mod.Alias")).expect("t must encode");
         let s = encode_type(&make_instance("builtins.str", vec![])).expect("s must encode");
         assert_eq!(
-            rust_restrict_subtype_away(&t, &s, true, true, &mut native),
+            rust_restrict_subtype_away(&t, &s, true, true, &mut native, false),
             None
         );
     }

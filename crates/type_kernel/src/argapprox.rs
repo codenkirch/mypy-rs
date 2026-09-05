@@ -466,12 +466,18 @@ fn approx(a: &Type, f: &Type, strict_optional: bool, res: &TypeResolver) -> Opti
 /// the cases Rust can decide. Returns `None` to defer to Python.
 #[pyfunction]
 #[allow(clippy::needless_pass_by_value)]
+#[pyo3(signature = (actual_bytes, formal_bytes, strict_optional, resolver, infer_unions = false))]
 pub(crate) fn rust_arg_approximate_similarity(
     actual_bytes: &[u8],
     formal_bytes: &[u8],
     strict_optional: bool,
     resolver: &mut NativeTypeResolver,
+    infer_unions: bool,
 ) -> Option<bool> {
+    // Ambient `type_state.infer_unions`: call arg-similarity runs during
+    // accept(), where the ambient True window for recursive contexts is
+    // live. The guard keeps the thread-local scoped to this call.
+    let _infer_unions_guard = crate::unify::InferUnionsGuard::install(infer_unions);
     let actual = decode(actual_bytes)?;
     let formal = decode(formal_bytes)?;
     approx(&actual, &formal, strict_optional, resolver.resolver())

@@ -666,6 +666,7 @@ fn all_same_wire(items: &[Type], strict_optional: bool, resolver: &TypeResolver)
     arg_types_bytes,
     arg_kinds,
     arg_names,
+    infer_unions,
     strict_optional
 ))]
 #[allow(clippy::too_many_arguments)]
@@ -676,8 +677,10 @@ pub(crate) fn rust_any_causes_overload_ambiguity(
     arg_types_bytes: Vec<Vec<u8>>,
     arg_kinds: Vec<i64>,
     arg_names: Option<Vec<Option<String>>>,
+    infer_unions: bool,
     strict_optional: bool,
 ) -> PyResult<Option<bool>> {
+    let _infer_unions_guard = crate::unify::InferUnionsGuard::install(infer_unions);
     let resolver_ref = resolver.resolver();
     let aliases = resolver.alias_resolver();
 

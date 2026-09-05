@@ -54,6 +54,7 @@ from mypy.typeops import (
     supported_self_type,
     tuple_fallback,
 )
+from mypy.typestate import type_state
 from mypy.types import (
     AnyType,
     CallableType,
@@ -2147,6 +2148,7 @@ def check_self_arg(
                 is_classmethod,
                 name,
                 state.state.strict_optional,
+                type_state.infer_unions,
             )
             if result is not None:
                 next_raw_id, changed, wire_bytes = result

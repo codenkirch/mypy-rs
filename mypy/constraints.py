@@ -2130,6 +2130,7 @@ def _try_native_find_matching_overload_items(
         items_buf,
         template_buf.getvalue(),
         mypy.state.state.strict_optional,
+        type_state.infer_unions,
     )
     if raw is None:
         raise NotImplementedError("kernel deferred find_matching_overload_items")

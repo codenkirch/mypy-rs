@@ -2270,6 +2270,7 @@ pub(crate) fn rust_type_object_type_from_function(
     infer_unions: bool,
     resolver: &mut NativeTypeResolver,
 ) -> Option<Vec<u8>> {
+    let _infer_unions_guard = crate::unify::InferUnionsGuard::install(infer_unions);
     let signature = decode_type(signature_bytes)?;
     let fallback = decode_type(fallback_bytes)?;
     // 1. orig_self_types
