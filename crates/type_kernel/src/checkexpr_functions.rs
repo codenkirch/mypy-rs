@@ -1971,11 +1971,17 @@ pub(crate) fn rust_star_expr(type_bytes: &[u8]) -> PyResult<Option<Vec<u8>>> {
 /// to Python, matching the Python gate pattern.
 #[pyfunction]
 #[allow(clippy::needless_pass_by_value)]
+#[pyo3(signature = (if_bytes, else_bytes, resolver, infer_unions = false))]
 pub(crate) fn rust_conditional_expr_join(
     if_bytes: &[u8],
     else_bytes: &[u8],
     resolver: &NativeTypeResolver,
+    infer_unions: bool,
 ) -> PyResult<Option<Vec<u8>>> {
+    // Ambient `type_state.infer_unions`: the conditional join runs during
+    // accept(); sync so its engine reads the same solve semantics Python
+    // would use at this exact call site.
+    let _infer_unions_guard = crate::unify::InferUnionsGuard::install(infer_unions);
     let if_type = match decode_type(if_bytes) {
         Some(t) => t,
         None => return Ok(None),

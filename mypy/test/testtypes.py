@@ -9119,7 +9119,7 @@ class NativeProtocolImplementationSuite(Suite):
         _set_native_subtype_resolver(self.resolver)
         left, right = Instance(p1, []), Instance(p2, [])
         left_b, right_b = self._serialize(left), self._serialize(right)
-        ctx_key = (False, False, False, False, False, True, False, False)
+        ctx_key = (False, False, False, False, False, True, False, False, False)
         pair_key = (left_b, right_b, False)
         assert pair_key not in _PROTOCOL_PAIRS_IN_FLIGHT
         _PROTOCOL_PAIRS_IN_FLIGHT[pair_key] = 1
@@ -9180,7 +9180,7 @@ class NativeProtocolImplementationSuite(Suite):
         _set_native_subtype_resolver(self.resolver)
         left, right = Instance(p1, []), Instance(p2, [])
         left_b, right_b = self._serialize(left), self._serialize(right)
-        ctx_key = (False, False, False, False, False, True, False, False)
+        ctx_key = (False, False, False, False, False, True, False, False, False)
         pair_key = (left_b, right_b, False)
         try:
             _clear_subtype_batch()
@@ -30903,9 +30903,13 @@ class NativeCallableUnifyPreludeSuite(Suite):
         assert (off, on) == (True, True)
 
     def test_seam_engagement(self) -> None:
-        # The unifiable generic pair must actually cross
-        # rust_callables_compatible under the gate, and the unify-failure
-        # pair must not (the shim answers before the seam).
+        # Wave 37 (#1426): the generic-left Callable|Callable pair is
+        # decided INSIDE rust_is_subtype (the kernel unifies the generic
+        # left natively), so the whole pair crosses the is_subtype seam:
+
+        # the unifiable pair once, and the unify-failure pair once more
+        # (kernel NoUnify -> False, no Python prelude involved).
+
         import contextlib
 
         import type_kernel as tk_mod
@@ -30915,18 +30919,18 @@ class NativeCallableUnifyPreludeSuite(Suite):
 
             @contextlib.contextmanager
             def ctx() -> Iterator[list[object]]:
-                orig = tk_mod.rust_callables_compatible
+                orig = tk_mod.rust_is_subtype
 
                 def counting(*args: object, **kwargs: object) -> object:
                     calls.append(args)
                     fn = cast(Callable[..., object], orig)
                     return fn(*args, **kwargs)
 
-                tk_mod.rust_callables_compatible = counting  # type: ignore[assignment]
+                tk_mod.rust_is_subtype = counting  # type: ignore[assignment]
                 try:
                     yield calls
                 finally:
-                    tk_mod.rust_callables_compatible = orig
+                    tk_mod.rust_is_subtype = orig
 
             return ctx()
 
@@ -30942,7 +30946,7 @@ class NativeCallableUnifyPreludeSuite(Suite):
         with counting_ctx() as calls:
             on = is_subtype(left, fail_right)
         assert on is False
-        assert calls == [], f"expected no seam calls, got {len(calls)}"
+        assert len(calls) == 1, f"expected 1 seam call, got {len(calls)}"
 
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
@@ -31077,7 +31081,7 @@ class NativeIsSubtypeBatchSuite(Suite):
         subtypes._clear_subtype_batch()
         left_b = subtypes._serialize_type(self.fx.a)
         right_b = subtypes._serialize_type(self.fx.o)
-        ctx_key = (False, False, False, False, False, False, False, False)
+        ctx_key = (False, False, False, False, False, False, False, False, False)
         subtypes._subtype_batch.append((left_b, right_b, ctx_key))
         proto_inst = Instance(self.proto_info, [])
         subtypes._subtype_batch.append(

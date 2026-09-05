@@ -3937,13 +3937,16 @@ pub(crate) fn is_more_precise(
 /// (mirroring `get_proper_type` in the `is_proper_subtype` fallback), so
 /// the alias-shaped operand answers natively.
 #[pyfunction]
+#[pyo3(signature = (left_bytes, right_bytes, ignore_promotions, strict_optional, resolver, infer_unions = false))]
 pub(crate) fn rust_is_more_precise(
     left_bytes: &[u8],
     right_bytes: &[u8],
     ignore_promotions: bool,
     strict_optional: bool,
     resolver: &mut NativeTypeResolver,
+    infer_unions: bool,
 ) -> Option<bool> {
+    let _infer_unions_guard = crate::unify::InferUnionsGuard::install(infer_unions);
     let left = decode_type(left_bytes)?;
     let right = decode_type(right_bytes)?;
     let left = expand_top_aliases(&left, resolver.alias_resolver(), strict_optional)?;
@@ -3991,13 +3994,16 @@ pub(crate) fn is_equivalent(
 /// recursive alias guard and deferring. Expand both operands here for
 /// parity with the `is_subtype(a, b)` fallback.
 #[pyfunction]
+#[pyo3(signature = (a_bytes, b_bytes, ignore_type_params, strict_optional, resolver, infer_unions = false))]
 pub(crate) fn rust_is_equivalent(
     a_bytes: &[u8],
     b_bytes: &[u8],
     ignore_type_params: bool,
     strict_optional: bool,
     resolver: &mut NativeTypeResolver,
+    infer_unions: bool,
 ) -> Option<bool> {
+    let _infer_unions_guard = crate::unify::InferUnionsGuard::install(infer_unions);
     let a = decode_type(a_bytes)?;
     let b = decode_type(b_bytes)?;
     let a = expand_top_aliases(&a, resolver.alias_resolver(), strict_optional)?;
@@ -4096,12 +4102,15 @@ pub(crate) fn is_same_type(
 /// (return `Option::None`) on any decoding or subtype-resolution defer,
 /// matching `rust_is_same_type` per-pair so the Python fallback can run.
 #[pyfunction]
+#[pyo3(signature = (items_bytes, ignore_promotions, strict_optional, resolver, infer_unions = false))]
 pub(crate) fn rust_all_same_types(
     items_bytes: Vec<&[u8]>,
     ignore_promotions: bool,
     strict_optional: bool,
     resolver: &mut NativeTypeResolver,
+    infer_unions: bool,
 ) -> Option<bool> {
+    let _infer_unions_guard = crate::unify::InferUnionsGuard::install(infer_unions);
     if items_bytes.is_empty() {
         return Some(true);
     }
@@ -4132,13 +4141,16 @@ pub(crate) fn rust_all_same_types(
 /// `_is_subtype`). Without this, a `TypeAliasType` operand hit the
 /// recursive alias guard in `is_subtype` and deferred the whole call.
 #[pyfunction]
+#[pyo3(signature = (a_bytes, b_bytes, ignore_promotions, strict_optional, resolver, infer_unions = false))]
 pub(crate) fn rust_is_same_type(
     a_bytes: &[u8],
     b_bytes: &[u8],
     ignore_promotions: bool,
     strict_optional: bool,
     resolver: &mut NativeTypeResolver,
+    infer_unions: bool,
 ) -> Option<bool> {
+    let _infer_unions_guard = crate::unify::InferUnionsGuard::install(infer_unions);
     let a = decode_type(a_bytes)?;
     let b = decode_type(b_bytes)?;
     let a = expand_top_aliases(&a, resolver.alias_resolver(), strict_optional)?;
@@ -4163,6 +4175,7 @@ pub(crate) fn rust_is_same_type(
 /// `UnionType` right dispatch, the `TypeVarType`-with-values right,
 /// and the `assuming` recursion guard BEFORE calling this.
 #[pyfunction]
+#[pyo3(signature = (left_bytes, right_bytes, ignore_type_params, ignore_declared_variance, always_covariant, ignore_promotions, proper_subtype, strict_optional, ignore_pos_arg_names, strict_concatenate, resolver, infer_unions = false))]
 #[allow(clippy::too_many_arguments, dead_code)]
 pub(crate) fn rust_is_subtype(
     left_bytes: &[u8],
@@ -4176,7 +4189,12 @@ pub(crate) fn rust_is_subtype(
     ignore_pos_arg_names: bool,
     strict_concatenate: bool,
     resolver: &mut NativeTypeResolver,
+    infer_unions: bool,
 ) -> Option<bool> {
+    // Ambient `type_state.infer_unions` for kernel-expect unify (#1426).
+    // RAII: restored on drop, so the thread-local cannot leak into a
+    // later FFI call that was not handed the flag.
+    let _infer_unions_guard = crate::unify::InferUnionsGuard::install(infer_unions);
     let left = match decode_type(left_bytes) {
         Some(t) => t,
         None => {
@@ -4226,6 +4244,7 @@ pub(crate) fn rust_is_subtype(
 /// defer (decode error or the engine returned
 /// `None`). A deferring entry only marks its own slot: the remaining
 #[pyfunction]
+#[pyo3(signature = (pairs_bytes, ignore_type_params, ignore_declared_variance, always_covariant, ignore_promotions, proper_subtype, strict_optional, ignore_pos_arg_names, strict_concatenate, resolver, infer_unions = false))]
 #[allow(clippy::too_many_arguments, dead_code)]
 pub(crate) fn rust_is_subtype_batch(
     pairs_bytes: Vec<&[u8]>,
@@ -4238,7 +4257,12 @@ pub(crate) fn rust_is_subtype_batch(
     ignore_pos_arg_names: bool,
     strict_concatenate: bool,
     resolver: &mut NativeTypeResolver,
+    infer_unions: bool,
 ) -> Vec<i8> {
+    // Ambient `type_state.infer_unions` for kernel-expect unify (#1426).
+    // RAII: restored on drop, so the thread-local cannot leak into a
+    // later FFI call that was not handed the flag.
+    let _infer_unions_guard = crate::unify::InferUnionsGuard::install(infer_unions);
     let ctx = SubtypeContext::with_callable_flags(
         ignore_type_params,
         ignore_declared_variance,
@@ -6853,6 +6877,7 @@ mod tests {
             false, // ignore_pos_arg_names
             false, // strict_concatenate
             &mut NativeTypeResolver::from_resolver(r),
+            false, // infer_unions
         );
         assert_eq!(got, vec![expect; 4]);
     }
@@ -6897,6 +6922,7 @@ mod tests {
             false,
             false,
             &mut NativeTypeResolver::from_resolver(r),
+            false, // infer_unions
         );
         assert_eq!(got, vec![1, -1]);
     }
@@ -6924,6 +6950,7 @@ mod tests {
             false, // ignore_pos_arg_names
             false, // strict_concatenate
             &mut native,
+            false, // infer_unions
         );
         assert_eq!(got, None);
     }
@@ -7679,11 +7706,11 @@ mod tests {
         let a = encode_for_alias(&alias_type(vec![], "mod.A"));
         let s = encode_for_alias(&instance("builtins.str", vec![]));
         assert_eq!(
-            rust_is_equivalent(&a, &s, false, true, &mut native),
+            rust_is_equivalent(&a, &s, false, true, &mut native, false),
             Some(true)
         );
         assert_eq!(
-            rust_is_equivalent(&s, &a, false, true, &mut native),
+            rust_is_equivalent(&s, &a, false, true, &mut native, false),
             Some(true)
         );
     }
@@ -7695,7 +7722,10 @@ mod tests {
         let mut native = make_native_with_alias(vec![]);
         let a = encode_for_alias(&alias_type(vec![], "mod.A"));
         let s = encode_for_alias(&instance("builtins.str", vec![]));
-        assert_eq!(rust_is_equivalent(&a, &s, false, true, &mut native), None);
+        assert_eq!(
+            rust_is_equivalent(&a, &s, false, true, &mut native, false),
+            None
+        );
     }
 
     #[test]
@@ -7704,7 +7734,7 @@ mod tests {
         let a = encode_for_alias(&alias_type(vec![], "mod.A"));
         let s = encode_for_alias(&instance("builtins.str", vec![]));
         assert_eq!(
-            rust_is_same_type(&a, &s, false, true, &mut native),
+            rust_is_same_type(&a, &s, false, true, &mut native, false),
             Some(true)
         );
     }
@@ -7714,7 +7744,10 @@ mod tests {
         let mut native = make_native_with_alias(vec![]);
         let a = encode_for_alias(&alias_type(vec![], "mod.A"));
         let s = encode_for_alias(&instance("builtins.str", vec![]));
-        assert_eq!(rust_is_same_type(&a, &s, false, true, &mut native), None);
+        assert_eq!(
+            rust_is_same_type(&a, &s, false, true, &mut native, false),
+            None
+        );
     }
 
     #[test]
@@ -7725,7 +7758,7 @@ mod tests {
         let a = encode_for_alias(&alias_type(vec![], "mod.A"));
         let s = encode_for_alias(&instance("builtins.str", vec![]));
         assert_eq!(
-            rust_is_more_precise(&a, &s, false, true, &mut native),
+            rust_is_more_precise(&a, &s, false, true, &mut native, false),
             Some(true)
         );
     }
@@ -7748,7 +7781,7 @@ mod tests {
         let a = encode_for_alias(&alias_type(vec![], "mod.A"));
         let l = encode_for_alias(&any_type());
         assert_eq!(
-            rust_is_more_precise(&l, &a, false, true, &mut native),
+            rust_is_more_precise(&l, &a, false, true, &mut native, false),
             Some(true)
         );
     }
@@ -7758,7 +7791,10 @@ mod tests {
         let mut native = make_native_with_alias(vec![]);
         let a = encode_for_alias(&alias_type(vec![], "mod.A"));
         let s = encode_for_alias(&instance("builtins.str", vec![]));
-        assert_eq!(rust_is_more_precise(&a, &s, false, true, &mut native), None);
+        assert_eq!(
+            rust_is_more_precise(&a, &s, false, true, &mut native, false),
+            None
+        );
     }
 
     #[test]
@@ -7769,7 +7805,7 @@ mod tests {
         let a = encode_for_alias(&alias_type(vec![], "mod.A"));
         let s = encode_for_alias(&instance("builtins.str", vec![]));
         assert_eq!(
-            rust_all_same_types(vec![&a, &s], false, true, &mut native),
+            rust_all_same_types(vec![&a, &s], false, true, &mut native, false),
             Some(true)
         );
     }
@@ -7780,7 +7816,7 @@ mod tests {
         let a = encode_for_alias(&alias_type(vec![], "mod.A"));
         let s = encode_for_alias(&instance("builtins.str", vec![]));
         assert_eq!(
-            rust_all_same_types(vec![&a, &s], false, true, &mut native),
+            rust_all_same_types(vec![&a, &s], false, true, &mut native, false),
             None
         );
     }

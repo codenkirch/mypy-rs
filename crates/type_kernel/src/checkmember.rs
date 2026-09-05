@@ -3515,6 +3515,7 @@ fn analyze_descriptor_access_inner(
 /// The `name` parameter is used only for the `__call__` special-case detection
 /// of a callable selfarg.
 #[pyfunction]
+#[pyo3(signature = (resolver, functype_bytes, dispatched_arg_type_bytes, is_classmethod, name, strict_optional, infer_unions = false))]
 pub(crate) fn rust_check_self_arg(
     resolver: &NativeTypeResolver,
     functype_bytes: &[u8],
@@ -3522,7 +3523,9 @@ pub(crate) fn rust_check_self_arg(
     is_classmethod: bool,
     name: &str,
     strict_optional: bool,
+    infer_unions: bool,
 ) -> PyResult<Option<(i64, bool, Vec<u8>)>> {
+    let _infer_unions_guard = crate::unify::InferUnionsGuard::install(infer_unions);
     let functype = match decode_type(functype_bytes) {
         Some(t) => t,
         None => return Ok(None),
