@@ -1,38 +1,38 @@
 # Handoff: strangler-fig Rust migration loop (seam-deferral reduction)
 
-*Written 2026-08-28, refreshed 2026-09-06 (post-wave40, #1436 closed by
-#1437: embedded defers 7,337 -> 4,580 across the sgc/st engine; st
-wrapper 98 -> 99%).
+*Written 2026-08-28, refreshed 2026-09-06 (post-wave41, #1439 closed by
+#1440: rust_check_overload_call wrapper 95.9 -> 99.1% native, wrapper
+defers 563 -> 101, the 386 type-object-target defers retired).
 Goal: "migrate
 all python code to rust, really all", pursued as the established measure
 -> file -> dispatch-agents -> process-PRs -> gate loop. This file is the
 resume point.*
 
-## Where main stands (2026-09-06, post-wave40)
+## Where main stands (2026-09-06, post-wave41)
 
-- `main` = `6764fb5ab` (`perf(type_kernel): wave-40 defer retirement
-  in u:def / sgc / st walls (#1437)`),
+- `main` = `007323a11` (`perf(type_kernel): roc typeobj targets decided
+  via shim gate facts (#1440)`),
   local ff'd to origin.
 - Phase state: F0 audit + F1 dual-write mirror + F2 read flip (slices
   1-10, #1393) all landed. F3 (#1397) write flip has Instance +
   CallableType splice ops; the planned tvar/union splice slice was
   profiled with `misc/f3s9_tvar_union.py` and came back EMPTY (zero
   per-field writes on a self-check) - dropped, do not build it.
-- Gates on the wave-40 squash content: `cargo fmt` + scoped clippy
-  (9 baseline warnings tolerated) + 2,675 kernel unit tests;
-  testtypes differential 3,177 passed / 6 skipped; testcheck 8,144
-  passed / 69 skipped / 7 xfailed (exact parity baseline); cold
-  self-check clean.
-- Shared `.so` rebuilt + codesigned at `6764fb5ab` content
+- Gates on the wave-41 squash content: `cargo fmt` + clippy -p
+  mypy-type-kernel clean on the merged head (re-verified 2026-09-06
+  with a forced re-emission run) + 2,675 kernel unit tests;
+  testtypes differential 3,182 passed / 6 skipped (+5 gate-fact tests);
+  testcheck 8,144 passed / 69 skipped / 7 xfailed (exact parity
+  baseline); cold self-check clean (202 files).
+- Shared `.so` rebuilt + codesigned at `007323a11` content
   (`/private/tmp/mypy-rs-local-typekernel|resolver|ast`).
-- Survey (post-wave40): 7,733,842 seam calls;
-  `rust_is_subtype` 25,666 @ 99%; `rust_infer_constraints_full`
-  21,349 @ 99%; `rust_solve_generic_call` 8,506 @ 98%;
-  `rust_check_overload_call` 13,750 @ 96% (wrapper unchanged: the
-  ~550 roc defers sit at the driver level, engine-level embedded
-  defers fell 7,337 -> 4,580); `rust_remove_redundant_union_items`
-  10,099 @ 99%.
-- Survey caveats (do not chase): `rust_is_subtype_batch` reports 221%
+- Survey (post-wave41): 7,735,729 seam calls;
+  `rust_check_overload_call` 13,750 @ 99% (~101 wrapper defers, was
+  563); `rust_is_subtype` 25,666 @ 99%;
+  `rust_infer_constraints_full` 21,375 @ 99%;
+  `rust_solve_generic_call` 8,506 @ 98%;
+  `rust_remove_redundant_union_items` 10,101 @ 99%.
+- Survey caveats (do not chase): `rust_is_subtype_batch` reports 228%
   and the total fallback line went NEGATIVE - per-decision counting
   artifacts; discount when ranking.
 - Runner note: the repo's ephemeral runner cannot re-register (403,
@@ -55,6 +55,7 @@ resume point.*
 | #1430 | #1427 | wave38: kernel `extra_tvars` channel (Rust-internal `Vec<Type>` on `Constraint`, wire stays 3-field, `Eq` keeps Python's 3-field semantics) + ambient `infer_polymorphic` mode plumbing through constraints/visitor/solve `unify` shims; testtypes ambient-flake pin commit `a09283a5d`. Honest outcome: the headline sgc share did NOT move (below wrapper granularity); real corpus wins are at constraint-builder level | icf 21,734 -> 21,673 calls; skip_reverse_union_constraints 82 -> 49 (100%); sgc 8,502 / 139 fallbacks unchanged |
 | #1434 | #1433 | wave39: audit-first rru wall - kernel now decides the mutated-survivor pairs natively in `remove_redundant.rs` (`scripts/rru_audit_driver.py` audit: 9,292 ok @91.8% -> 10,023 ok @99.0%, 728 widen_mutated defers -> 0); checkoffset plan/plan-server check stays; all 3 OCR files clean (0 comments) | rru 10,124 calls @ 99% native post-squash (from 92%); testtypes 3,177/6, testcheck exact |
 | #1437 | #1436 | wave40: u:def solve-chain + dependent-solve bounds + tvar-bearing return-solve decided natively (constraints/solve/subtypes/unify/callable_compat/checkcall); OCR rounds: 2 blocking fixed (`5139dabf0`: protocol-member live_typeinfo None guard + nested-owned-tvar doppelganger deferral), 10 advisory noted unpushed. Wrapper roc unchanged (driver-level defers are the roc residue); embedded engine defers fell 7,337 -> 4,580 (cc:unify 814 -> 110, st |Callable|Callable 348 -> 37, u:def 766 -> 50) | st wrapper 98 -> 99% (25,666 @ 99% post-squash); testtypes 3,177/6; testcheck exact |
+| #1440 | #1439 | wave41: roc type-object targets decided through shim gate facts (per-target `_typeobj_gate_flag_for_roc` pre-argument instantiation-gate scalar on the opt-in `typeobj_gate_fails` seam), OCR round-1 fix (missing/unknown gate fact defers, `6060cb253`), round-2 advisory constants (`7c36ccb1f`); gen_solve 112 -> 89, dupcheck 79 -> 27; no_match/star/plain buckets by design; advisory: 1 pushed | roc 95.9 -> 99.1% native (563 -> 101 defers); testtypes 3,182/6; testcheck exact; clippy clean on head |
 
 Closed alongside: #1412, #1393 (F2 complete), #1397 (F3 partial,
 Instance/CallableType only), #1300, #1418 (closed 2026-09-05 with the
@@ -62,15 +63,17 @@ Instance/CallableType only), #1300, #1418 (closed 2026-09-05 with the
 auto-closed it), #1426 (#1428 auto-closed it), #1427 (#1430 + manual
 close, PR body lacked the `Closes` line), #1424, #1425, #1426,
 #1428, #1429, #1430, #1431, #1433 (#1434 + manual close), #1434,
-#1435, #1436 (#1437 + manual close), #1437.
+#1435, #1436 (#1437 + manual close), #1437, #1439 (#1440
+auto-closed it).
 
 ## Open backlog (next waves; dispatch max ~2 port agents)
 
-1. **Wave 41 (issue to file, dup-check first)**: the last big wrapper
-   wall - `check_overload_call` 13,750 @ 96% (~550 driver-level
-   defers, engine residue now small after wave-40). Audit the driver
-   taxonomy first (list handling / per-pair dispatch); same honest
-   two-level reporting as #1436.
+1. **Wave 42 (issue to file, dup-check first)**: the three engine
+   residues all ~99% now - st 25,666 @ 99% (~257), icf 21,375 @ 99%
+   (~214), sgc 8,506 @ 98% (~170). Audit their remaining defer buckets
+   once more (post-wave40/41 rounds changed the upstream shape) and
+   retire what is decidable; expect diminishing returns, document an
+   honest taxonomy.
 2. **#624**: meta Phase E1 - the `visit_*` decision-head program that
    unlocks the 50%-Rust milestone. The kernel branch/defer surface is
    exhausted (top rows 100%); this is the next structural front.
