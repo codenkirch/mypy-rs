@@ -6,7 +6,8 @@
 //! verdict), and the `keep_erased` flag; Rust returns the deduped item
 //! list as wire bytes plus the provenance (input item index of every
 //! output position, which the shim needs to restore mutated-flag
-//! survivors), or `None` (defer to the pure-Python body).
+//! survivors and rebuild widened survivors), or `None` (defer to the
+//! pure-Python body).
 
 use pyo3::prelude::*;
 
@@ -158,7 +159,7 @@ pub(crate) fn remove_redundant_pass_indices(
     keep_erased: bool,
 ) -> Option<Vec<usize>> {
     let prov: Vec<usize> = (0..items.len()).collect();
-    let (surv, _) = remove_redundant_pass_indices_prov(
+    let (surv, _, _) = remove_redundant_pass_indices_prov(
         items,
         &default_flags(items),
         &prov,
@@ -221,10 +222,14 @@ fn parse_flags(bytes: &[u8], n: usize) -> Option<Vec<ItemFlags>> {
 /// for an unmutated survivor the write resets flags to their defaults,
 /// a content no-op the Rust expansion already reflects (the survivor
 /// rides its expanded tree); for a MUTATED survivor the write changes
-/// flags Rust cannot reproduce, so the whole call defers (`None`).
+/// flags Rust cannot reproduce, so the pass does not apply the write
+/// itself: it marks the survivor position as widened, and the shim
+/// rebuilds that output slot with `true_or_false(items[prov[i]])` on
+/// the live object (the same value Python produces; a marked survivor
+/// already carrying the reset flags stamp would re-widen to itself).
 ///
-/// Returns the survivor indices plus their traced input provenance, in
-/// output order.
+/// Returns the survivor indices plus their traced input provenance and
+/// per-survivor widen marks, in output order.
 pub(crate) fn remove_redundant_pass_indices_prov(
     items: &[Type],
     flags: &[ItemFlags],
@@ -232,12 +237,13 @@ pub(crate) fn remove_redundant_pass_indices_prov(
     ctx: &SubtypeContext,
     resolver: &TypeResolver,
     keep_erased: bool,
-) -> Option<(Vec<usize>, Vec<usize>)> {
+) -> Option<(Vec<usize>, Vec<usize>, Vec<bool>)> {
     // Survivors as indices into `items`, with the parallel traced
     // provenance. Wire `Type` is not `Hash`, so resolve exact
     // duplicates by a linear equality scan (Python's `seen` dict).
     let mut surv: Vec<usize> = Vec::new();
     let mut surv_prov: Vec<usize> = Vec::new();
+    let mut surv_widened: Vec<bool> = Vec::new();
     // unduplicated_literal_fallbacks: wire bytes of the fallback
     // Instances already added without a supertype found.
     let mut unduplicated_literal_fallbacks: Option<Vec<Vec<u8>>> = None;
@@ -255,6 +261,7 @@ pub(crate) fn remove_redundant_pass_indices_prov(
             }
             surv.push(i);
             surv_prov.push(prov[i]);
+            surv_widened.push(false);
             continue;
         }
         // Exact-duplicate fast path (typeops.py:1412-1414): Python keys
@@ -282,13 +289,14 @@ pub(crate) fn remove_redundant_pass_indices_prov(
             // provenance (position and input index no longer coincide).
             let tj_f = flags[prov[surv[j]]];
             let ti_f = flags[prov[i]];
-            if ((!tj_f.cbt && ti_f.cbt) || (!tj_f.cbf && ti_f.cbf)) && tj_f.mutated {
-                return None;
+            if (!tj_f.cbt && ti_f.cbt) || (!tj_f.cbf && ti_f.cbf) {
+                surv_widened[j] = true;
             }
             continue;
         }
         surv.push(i);
         surv_prov.push(prov[i]);
+        surv_widened.push(false);
         if let Type::LiteralType { .. } = ti {
             let key = encode_fallback_key(ti)?;
             if unduplicated_literal_fallbacks.is_none() {
@@ -297,7 +305,7 @@ pub(crate) fn remove_redundant_pass_indices_prov(
             unduplicated_literal_fallbacks.as_mut().unwrap().push(key);
         }
     }
-    Some((surv, surv_prov))
+    Some((surv, surv_prov, surv_widened))
 }
 
 /// Serialize a LiteralType's fallback Instance to a stable byte key.
@@ -355,9 +363,7 @@ fn find_subtype_index(
         match is_subtype(ti, tj, ctx, resolver) {
             Some(true) => return ScanOutcome::Found(j),
             Some(false) => {}
-            None => {
-                return ScanOutcome::Deferred;
-            }
+            None => return ScanOutcome::Deferred,
         }
     }
     ScanOutcome::NoneFound
@@ -368,8 +374,11 @@ fn find_subtype_index(
 /// truthiness facts (three bytes each: resolved `can_be_true`,
 /// resolved `can_be_false`, `_has_mutated_truthiness`) + `keep_erased`
 /// + `strict_optional` + the native resolver. Returns
-/// `(deduped items as wire bytes, provenance)` where provenance[i] is
-/// the input item index the output item traces to, or `None` (defer).
+/// `(deduped items as wire bytes, provenance, widen marks)` where
+/// provenance[i] is the input item index the output item traces to and
+/// widen[i] is 1 when a duplicate widened that survivor (the shim must
+/// rebuild the output slot with `true_or_false(items[prov[i]])` on the
+/// live object), or `None` (defer).
 ///
 /// Uses the exact `is_proper_subtype(ignore_promotions=True,
 /// keep_erased_types=...)` context the Python body passes.
@@ -380,7 +389,7 @@ pub(crate) fn rust_remove_redundant_union_items(
     keep_erased: bool,
     strict_optional: bool,
     resolver: &mut NativeTypeResolver,
-) -> Option<(Vec<u8>, Vec<u32>)> {
+) -> Option<(Vec<u8>, Vec<u32>, Vec<u8>)> {
     let mut buf = ReadBuffer::new(items_bytes);
     let items = match wire::read_type_list(&mut buf) {
         Ok(items) => items,
@@ -390,8 +399,9 @@ pub(crate) fn rust_remove_redundant_union_items(
     // Alias-backed items dedup as their expanded target (typeops.py:1425):
     // root-expand with get_proper_type(ti) semantics, scan deep copies,
     // output survivors (#774 contract extends to nested aliases).
-    let mut current = Vec::with_capacity(items.len());
-    let mut prov: Vec<usize> = Vec::with_capacity(items.len());
+    let n_items = items.len();
+    let mut current = Vec::with_capacity(n_items);
+    let mut prov: Vec<usize> = Vec::with_capacity(n_items);
     for (i, ti) in items.into_iter().enumerate() {
         let root = match ti {
             Type::TypeAliasType { .. } => {
@@ -409,8 +419,12 @@ pub(crate) fn rust_remove_redundant_union_items(
         prov.push(i);
     }
     let ctx = SubtypeContext::new(false, false, false, true, true, strict_optional);
+    // A pass marks widened survivors by output position; the entry remaps
+    // the marks through provenance so flags survive the second pass's
+    // reversal; the shim rebuilds marked slots with true_or_false(items[p]).
+    let mut widen_mark = vec![false; n_items];
     for _direction in 0..2 {
-        let (surv, prov_out) = remove_redundant_pass_indices_prov(
+        let (surv, prov_out, widened) = remove_redundant_pass_indices_prov(
             &current,
             &flags,
             &prov,
@@ -418,6 +432,11 @@ pub(crate) fn rust_remove_redundant_union_items(
             resolver.resolver(),
             keep_erased,
         )?;
+        for (pos, &w) in widened.iter().enumerate() {
+            if w {
+                widen_mark[prov_out[pos]] = true;
+            }
+        }
         current = surv.iter().map(|&i| current[i].clone()).collect();
         prov = prov_out;
         if current.len() <= 1 {
@@ -433,7 +452,8 @@ pub(crate) fn rust_remove_redundant_union_items(
         return None;
     }
     let out_prov: Vec<u32> = prov.iter().map(|&p| p as u32).collect();
-    encode_type_list(&current).map(|bytes| (bytes, out_prov))
+    let out_widen: Vec<u8> = prov.iter().map(|&p| widen_mark[p] as u8).collect();
+    encode_type_list(&current).map(|bytes| (bytes, out_prov, out_widen))
 }
 
 #[cfg(test)]
@@ -628,25 +648,29 @@ mod tests {
     }
 
     #[test]
-    fn widen_on_mutated_survivor_defers() {
+    fn widen_on_mutated_survivor_marks() {
         // Exact duplicate of a mutated survivor whose flags would widen:
-        // `true_or_false` resets content Rust cannot reproduce, so the
-        // whole call defers (typeops.py:1470-1478).
+        // the pass marks the survivor position instead of applying
+        // `true_or_false` (the shim rebuilds that slot on the live
+        // object, typeops.py:1470-1478).
         let a = instance("builtins.int", vec![]);
         let f = vec![item_flags(false, true, true), item_flags(true, true, false)];
         let prov = prov_identity(2);
         let ctx = SubtypeContext::new(false, false, false, true, true, true);
         let r = test_resolver(vec![snap("builtins.object", "object")]);
-        assert!(
+        let (surv, prov, widened) =
             remove_redundant_pass_indices_prov(&[a.clone(), a], &f, &prov, &ctx, &r, false)
-                .is_none()
-        );
+                .unwrap();
+        assert_eq!(surv, vec![0]);
+        assert_eq!(prov, vec![0]);
+        assert_eq!(widened, vec![true]);
     }
 
     #[test]
-    fn widen_on_unmutated_survivor_engages() {
-        // Same duplicate, survivor flags unmutated: the widening write is
-        // a content no-op and the dedup completes.
+    fn widen_on_unmutated_survivor_marks_with_flags_reset() {
+        // Same duplicate, survivor flags unmutated: the widening mark is
+        // recorded too (the shim's true_or_false rebuild is the exact
+        // Python outcome and the wire node carries kind-default flags).
         let a = instance("builtins.int", vec![]);
         let f = vec![
             item_flags(false, true, false),
@@ -655,11 +679,12 @@ mod tests {
         let prov = prov_identity(2);
         let ctx = SubtypeContext::new(false, false, false, true, true, true);
         let r = test_resolver(vec![snap("builtins.object", "object")]);
-        let (surv, prov) =
+        let (surv, prov, widened) =
             remove_redundant_pass_indices_prov(&[a.clone(), a], &f, &prov, &ctx, &r, false)
                 .unwrap();
         assert_eq!(surv, vec![0]);
         assert_eq!(prov, vec![0]);
+        assert_eq!(widened, vec![true]);
     }
 
     #[test]
@@ -686,7 +711,7 @@ mod tests {
         let mut current = items;
         let mut prov = prov_identity(2);
         for _ in 0..2 {
-            let (surv, prov_out) =
+            let (surv, prov_out, _) =
                 remove_redundant_pass_indices_prov(&current, &f, &prov, &ctx, &r, false).unwrap();
             current = surv.iter().map(|&i| current[i].clone()).collect();
             prov = prov_out;

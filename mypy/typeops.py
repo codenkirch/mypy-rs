@@ -1372,8 +1372,9 @@ def _remove_redundant_union_items(items: list[Type], keep_erased: bool) -> list[
     if _HAS_TYPE_KERNEL and _native_typeops_active and _native_typeops_resolver is not None:
         try:
             # The wire drops can_be_true/can_be_false: pass them as a
-            # per-item blob (flags + mutated bit). A widen on a mutated
-            # survivor defers the whole call to Python.
+            # per-item blob (flags + mutated bit). A widened survivor comes
+            # back marked in result[2]; the shim rebuilds that slot with
+            # true_or_false(items[src]) on the live object.
             flags_blob = bytearray()
             mutated_any = False
             for item in items:
@@ -1393,16 +1394,19 @@ def _remove_redundant_union_items(items: list[Type], keep_erased: bool) -> list[
                 _native_typeops_resolver,
             )
             if result is not None:
-                out, prov = bytes(result[0]), result[1]
+                out, prov, widen = bytes(result[0]), result[1], result[2]
                 decoded = _deserialize_type_list(out)
                 if decoded is not None:
-                    if mutated_any:
-                        # Mutated survivors keep their original live object
-                        # (true_or_false resets flags Rust cannot know);
+                    # Widened survivors: a duplicate's truthiness raised a
+                    # survivor, so Python replaces the slot with
+                    # true_or_false(orig_item), a flags-reset copy.
+                    if mutated_any or any(widen):
                         # decoded may be a shared cache entry, copy first.
                         decoded = list(decoded)
                         for i, src in enumerate(prov):
-                            if _has_mutated_truthiness(items[src]):
+                            if widen[i]:
+                                decoded[i] = true_or_false(items[src])
+                            elif _has_mutated_truthiness(items[src]):
                                 decoded[i] = items[src]
                     return decoded
         except (AssertionError, NotImplementedError, ValueError):

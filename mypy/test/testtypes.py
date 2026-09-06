@@ -8015,20 +8015,52 @@ class NativeRemoveRedundantUnionItemsSuite(Suite):
         assert r is not None, "Rust deferred on mutated-survivor dedup"
         assert r[1] == [0], f"provenance must trace input 0, got {r[1]!r}"
 
-    def test_widen_on_mutated_survivor_defers(self) -> None:
-        # The duplicate would widen the mutated survivor: true_or_false
-        # resets flags Rust cannot reproduce, so the seam defers and the
-        # Python body reruns (gate parity holds through the fallback).
-        from mypy.typeops import _serialize_type_list
+    def test_widen_on_mutated_survivor_rebuilds(self) -> None:
+        # The duplicate would widen the mutated survivor: the seam no longer
+        # defers; it marks the survivor and the shim rebuilds the slot with
+        # true_or_false(orig_item), a fresh flags-reset copy.
+        from mypy.typeops import _remove_redundant_union_items, _serialize_type_list
 
         mut = self._int()
         mut.can_be_false = False
         items = [mut, self._int()]
         self._assert_par(items, "widen on mutated survivor")
+        res = self._with_gate(True, lambda: _remove_redundant_union_items(list(items), False))
+        assert len(res) == 1, f"mutated survivor must dedup, got {res!r}"
+        assert res[0] is not mut, "widened survivor must be a fresh copy"
+        assert res[0].can_be_false is True, "widen must reset can_be_false"
+        assert res[0].can_be_true is True, "widen must reset can_be_true"
         r = _type_kernel.rust_remove_redundant_union_items(
             _serialize_type_list(items), _rru_flags_blob(items), False, True, self._resolver
         )
-        assert r is None, "seam must defer when a widen hits a mutated survivor"
+        assert r is not None, "seam must not defer on a widen-hits-mutated survivor"
+        assert r[1] == [0], f"provenance must trace input 0, got {r[1]!r}"
+        assert list(r[2]) == [1], f"widen mark must be set on the survivor, got {r[2]!r}"
+
+    def test_widen_marks_only_the_widened_survivor(self) -> None:
+        # Two mutated survivors, one widened by an exact duplicate, the
+        # other untouched: the mark applies per output position, so the
+        # untouched survivor keeps its live object; the widened one is fresh.
+        from mypy.typeops import _remove_redundant_union_items, _serialize_type_list
+
+        mut_a = self._int()
+        mut_a.can_be_false = False
+        mut_b = Instance(self.a_info, [])
+        mut_b.can_be_false = False
+        items = [mut_a, mut_b, self._int()]
+        self._assert_par(items, "one widened, one untouched")
+        res = self._with_gate(True, lambda: _remove_redundant_union_items(list(items), False))
+        assert len(res) == 2, f"two survivors expected, got {res!r}"
+        assert res[0] is not mut_a, "widened survivor must be a fresh copy"
+        assert res[0].can_be_false is True, "widen must reset can_be_false"
+        assert res[1] is mut_b, "untouched survivor must keep its original object"
+        assert res[1].can_be_false is False, "untouched survivor must keep its mutation"
+        r = _type_kernel.rust_remove_redundant_union_items(
+            _serialize_type_list(items), _rru_flags_blob(items), False, True, self._resolver
+        )
+        assert r is not None, "seam must handle one widened survivor among two"
+        assert r[1] == [0, 1], f"provenance must trace both survivors, got {r[1]!r}"
+        assert list(r[2]) == [1, 0], f"widen marks must be per position, got {r[2]!r}"
 
     def test_keep_erased_erased_type_decodes_natively(self) -> None:
         # keep_erased=True with a surviving ErasedType item: the output
@@ -10864,9 +10896,7 @@ class NativeHasRecursiveTypesFlattenSuite(Suite):
         on = has_recursive_types(t)
         assert on == off == expected, f"hrt parity {t!r}: off={off} on={on} expected={expected}"
 
-    def _def_union_alias(
-        self, name: str, target: Type
-    ) -> tuple[TypeAlias, TypeAliasType]:
+    def _def_union_alias(self, name: str, target: Type) -> tuple[TypeAlias, TypeAliasType]:
         node = TypeAlias(target, f"__main__.{name}", "__main__", -1, -1)
         return node, TypeAliasType(node, [])
 
@@ -10898,7 +10928,9 @@ class NativeHasRecursiveTypesFlattenSuite(Suite):
 
         A, _ = self.fx.def_alias_1(self.fx.a)
         assert _type_kernel.rust_has_recursive_types(_serialize_type_for_visitor(A)) is True
-        assert _type_kernel.rust_has_recursive_types(_serialize_type_for_visitor(self.fx.a)) is False
+        assert (
+            _type_kernel.rust_has_recursive_types(_serialize_type_for_visitor(self.fx.a)) is False
+        )
 
     def test_flatten_bare_alias_union_target(self) -> None:
         from mypy.types import flatten_nested_unions
