@@ -2269,10 +2269,10 @@ class Parameters(ProperType):
         if name is not None:
             native_result = _native_callable_argument_by_name(self, name)
             if native_result is not None:
-                n, p, r = native_result
-                typ = self.arg_types[p] if p is not None else None
-                if typ is not None:
-                    return FormalArgument(n, p, typ, r)
+                n, p, r, ai = native_result
+                if ai >= 0:
+                    return FormalArgument(n, p, self.arg_types[ai], r)
+                return None
         if name is None:
             return None
         seen_star = False
@@ -2294,10 +2294,10 @@ class Parameters(ProperType):
         if position is not None:
             native_result = _native_callable_argument_by_position(self, position)
             if native_result is not None:
-                n, p, r = native_result
-                typ = self.arg_types[p] if p is not None else None
-                if typ is not None:
-                    return FormalArgument(n, p, typ, r)
+                n, p, r, ai = native_result
+                if ai >= 0:
+                    return FormalArgument(n, p, self.arg_types[ai], r)
+                return None
         if position is None:
             return None
         if position >= len(self.arg_names):
@@ -2742,10 +2742,10 @@ class CallableType(FunctionLike):
         if name is not None:
             native_result = _native_callable_argument_by_name(self, name)
             if native_result is not None:
-                n, p, r = native_result
-                typ = self.arg_types[p] if p is not None else None
-                if typ is not None:
-                    return FormalArgument(n, p, typ, r)
+                n, p, r, ai = native_result
+                if ai >= 0:
+                    return FormalArgument(n, p, self.arg_types[ai], r)
+                return None
         if name is None:
             return None
         seen_star = False
@@ -2767,10 +2767,10 @@ class CallableType(FunctionLike):
         if position is not None:
             native_result = _native_callable_argument_by_position(self, position)
             if native_result is not None:
-                n, p, r = native_result
-                typ = self.arg_types[p] if p is not None else None
-                if typ is not None:
-                    return FormalArgument(n, p, typ, r)
+                n, p, r, ai = native_result
+                if ai >= 0:
+                    return FormalArgument(n, p, self.arg_types[ai], r)
+                return None
         if position is None:
             return None
         if position >= len(self.arg_names):
@@ -4999,30 +4999,30 @@ def _native_callable_formal_arguments(t: Type) -> list[tuple[str | None, int | N
 
 def _native_callable_argument_by_name(
     t: Type, name: str | None
-) -> tuple[str | None, int | None, bool] | None:
+) -> tuple[str | None, int | None, bool, int] | None:
     if not (_VISITOR_HAS_TYPE_KERNEL and _native_visitor_active):
         return None
     try:
         raw = _rust_callable_argument_by_name(_serialize_type_for_visitor(t), name)
         if raw is None:
             return None
-        n, p, r = raw
-        return (n, p, r)
+        n, p, r, ai = raw
+        return (n, p, r, ai)
     except (AssertionError, NotImplementedError):
         return None
 
 
 def _native_callable_argument_by_position(
     t: Type, position: int | None
-) -> tuple[str | None, int | None, bool] | None:
+) -> tuple[str | None, int | None, bool, int] | None:
     if not (_VISITOR_HAS_TYPE_KERNEL and _native_visitor_active):
         return None
     try:
         raw = _rust_callable_argument_by_position(_serialize_type_for_visitor(t), position)
         if raw is None:
             return None
-        n, p, r = raw
-        return (n, p, r)
+        n, p, r, ai = raw
+        return (n, p, r, ai)
     except (AssertionError, NotImplementedError):
         return None
 

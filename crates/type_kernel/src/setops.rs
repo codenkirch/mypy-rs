@@ -5239,7 +5239,8 @@ pub(crate) fn rust_join_types(
         }
     };
     let ctx = SubtypeContext::new(false, false, false, false, false, strict_optional);
-    join_types(&s, &t, &ctx, resolver.resolver()).map(discriminator)
+    let r = join_types(&s, &t, &ctx, resolver.resolver());
+    r.map(discriminator)
 }
 
 /// `#[pyfunction]` entry for `meet_types`. The Python-side shim

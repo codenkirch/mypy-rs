@@ -499,10 +499,30 @@ pub(crate) fn rust_are_parameters_compatible(
     // RAII: restored on drop, so the thread-local cannot leak into a
     // later FFI call that was not handed the flag.
     let _infer_unions_guard = crate::unify::InferUnionsGuard::install(infer_unions);
-    let left = decode_type(left_bytes)?;
-    let right = decode_type(right_bytes)?;
-    let lf = arg_list_from_type(&left)?;
-    let rf = arg_list_from_type(&right)?;
+    let left = match decode_type(left_bytes) {
+        Some(t) => t,
+        None => {
+            return None;
+        }
+    };
+    let right = match decode_type(right_bytes) {
+        Some(t) => t,
+        None => {
+            return None;
+        }
+    };
+    let lf = match arg_list_from_type(&left) {
+        Some(t) => t,
+        None => {
+            return None;
+        }
+    };
+    let rf = match arg_list_from_type(&right) {
+        Some(t) => t,
+        None => {
+            return None;
+        }
+    };
     // Generic `Parameters`/`CallableType` (variables non-empty) defer: the
     // Python visit would unify via type inference first.
     if !lf.variables_empty || !rf.variables_empty {
@@ -583,20 +603,30 @@ pub(crate) fn are_parameters_compatible(
         && left_kinds.iter().all(|k| kind_is_positional(*k, true));
 
     // Phase 1a (subtypes.py:1981-1986).
-    let star_incompat = is_compat_pair(
+    let star_incompat = match is_compat_pair(
         is_compat,
         &left_star,
         &right_star,
         allow_partial_overlap,
         trivial_suffix,
-    )?;
-    let star2_incompat = is_compat_pair(
+    ) {
+        Some(v) => v,
+        None => {
+            return None;
+        }
+    };
+    let star2_incompat = match is_compat_pair(
         is_compat,
         &left_star2,
         &right_star2,
         allow_partial_overlap,
         trivial_suffix,
-    )?;
+    ) {
+        Some(v) => v,
+        None => {
+            return None;
+        }
+    };
     if (star_incompat && !trivial_vararg_suffix) || star2_incompat {
         return Some(false);
     }
@@ -605,7 +635,9 @@ pub(crate) fn are_parameters_compatible(
     for right_arg in formal_arguments(right_types, right_kinds, right_names) {
         let left_arg =
             match callable_corresponding_argument(left_types, left_kinds, left_names, &right_arg) {
-                Err(Defer) => return None,
+                Err(Defer) => {
+                    return None;
+                }
                 Ok(x) => x,
             };
         let Some(left_arg) = left_arg else {
@@ -614,14 +646,19 @@ pub(crate) fn are_parameters_compatible(
             }
             return Some(false);
         };
-        let ok = are_args_compatible(
+        let ok = match are_args_compatible(
             &left_arg,
             &right_arg,
             is_compat,
             ignore_pos_arg_names,
             allow_partial_overlap,
             right_imprecise,
-        )?;
+        ) {
+            Some(v) => v,
+            None => {
+                return None;
+            }
+        };
         if !ok {
             return Some(false);
         }
@@ -636,21 +673,38 @@ pub(crate) fn are_parameters_compatible(
     // Phase 1c (subtypes.py:2016-2038).
     if right_star.is_some() && !trivial_vararg_suffix {
         let right_star_pos = right_star.as_ref().and_then(|a| a.pos).unwrap_or(0);
-        let right_by_position = try_synthesizing_arg_from_vararg(right_types, right_kinds, None)?;
+        let right_by_position =
+            match try_synthesizing_arg_from_vararg(right_types, right_kinds, None) {
+                Some(v) => v,
+                None => {
+                    return None;
+                }
+            };
         let mut i = right_star_pos;
         while i < left_kinds.len() && kind_is_positional(left_kinds[i], false) {
             if allow_partial_overlap && kind_is_optional(left_kinds[i]) {
                 break;
             }
-            let left_by_position = argument_by_position(left_types, left_kinds, left_names, i)?;
-            let ok = are_args_compatible(
+            let left_by_position = match argument_by_position(left_types, left_kinds, left_names, i)
+            {
+                Some(v) => v,
+                None => {
+                    return None;
+                }
+            };
+            let ok = match are_args_compatible(
                 &left_by_position,
                 &right_by_position,
                 is_compat,
                 ignore_pos_arg_names,
                 allow_partial_overlap,
                 false,
-            )?;
+            ) {
+                Some(v) => v,
+                None => {
+                    return None;
+                }
+            };
             if !ok {
                 return Some(false);
             }
@@ -673,20 +727,37 @@ pub(crate) fn are_parameters_compatible(
             }
         }
         if !left_only_names.is_empty() {
-            let right_by_name = try_synthesizing_arg_from_kwarg(right_types, right_kinds, None)?;
+            let right_by_name =
+                match try_synthesizing_arg_from_kwarg(right_types, right_kinds, None) {
+                    Some(v) => v,
+                    None => {
+                        return None;
+                    }
+                };
             for name in &left_only_names {
-                let left_by_name = argument_by_name(left_types, left_kinds, left_names, name)?;
+                let left_by_name = match argument_by_name(left_types, left_kinds, left_names, name)
+                {
+                    Some(v) => v,
+                    None => {
+                        return None;
+                    }
+                };
                 if allow_partial_overlap && !left_by_name.required {
                     continue;
                 }
-                let ok = are_args_compatible(
+                let ok = match are_args_compatible(
                     &left_by_name,
                     &right_by_name,
                     is_compat,
                     ignore_pos_arg_names,
                     allow_partial_overlap,
                     false,
-                )?;
+                ) {
+                    Some(v) => v,
+                    None => {
+                        return None;
+                    }
+                };
                 if !ok {
                     return Some(false);
                 }

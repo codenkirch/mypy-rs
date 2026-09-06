@@ -151,8 +151,13 @@ fn erase_typevar(t: &Type, strict_optional: bool, res: &TypeResolver) -> Option<
                     false,
                 )
             } else {
-                let ub = get_proper_or_defer(upper_bound.as_ref())?;
-                Some(ub.clone())
+                let ub = match get_proper_or_defer(upper_bound.as_ref()) {
+                    Some(u) => u.clone(),
+                    None => {
+                        return None;
+                    }
+                };
+                Some(ub)
             }
         }
         _ => Some(t.clone()),
@@ -378,8 +383,18 @@ fn approx_proper(a: &Type, f: &Type, strict_optional: bool, res: &TypeResolver) 
         return Some(true);
     }
     // is_typetype_like on both (checkexpr.py:7887-7888).
-    let a_like = is_typetype_like(a, res)?;
-    let f_like = is_typetype_like(f, res)?;
+    let a_like = match is_typetype_like(a, res) {
+        Some(v) => v,
+        None => {
+            return None;
+        }
+    };
+    let f_like = match is_typetype_like(f, res) {
+        Some(v) => v,
+        None => {
+            return None;
+        }
+    };
     if a_like && f_like {
         return Some(true);
     }
@@ -408,15 +423,26 @@ fn approx_proper(a: &Type, f: &Type, strict_optional: bool, res: &TypeResolver) 
         let transformed: Type = match a {
             Type::CallableType { fallback, .. } => (**fallback).clone(),
             Type::Overloaded { items } => {
-                let first = items.first()?;
+                let first = match items.first() {
+                    Some(f) => f,
+                    None => {
+                        return None;
+                    }
+                };
                 let Type::CallableType { fallback, .. } = first else {
                     // Python reads `items[0].fallback` (CallableType always);
                     // defer on an unexpected non-Callable item.
+
                     return None;
                 };
                 (**fallback).clone()
             }
-            Type::TupleType { .. } => tuple_fallback(a, strict_optional, res)?,
+            Type::TupleType { .. } => match tuple_fallback(a, strict_optional, res) {
+                Some(t) => t,
+                None => {
+                    return None;
+                }
+            },
             _ => a.clone(),
         };
         if let Type::Instance {
@@ -478,7 +504,18 @@ pub(crate) fn rust_arg_approximate_similarity(
     // accept(), where the ambient True window for recursive contexts is
     // live. The guard keeps the thread-local scoped to this call.
     let _infer_unions_guard = crate::unify::InferUnionsGuard::install(infer_unions);
-    let actual = decode(actual_bytes)?;
-    let formal = decode(formal_bytes)?;
-    approx(&actual, &formal, strict_optional, resolver.resolver())
+    let actual = match decode(actual_bytes) {
+        Some(t) => t,
+        None => {
+            return None;
+        }
+    };
+    let formal = match decode(formal_bytes) {
+        Some(t) => t,
+        None => {
+            return None;
+        }
+    };
+    let r = approx(&actual, &formal, strict_optional, resolver.resolver());
+    r
 }
