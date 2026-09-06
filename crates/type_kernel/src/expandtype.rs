@@ -42,7 +42,7 @@ use crate::wire::{
 // Alias-expanding union flatten (`flatten_nested_unions`, types.py:5057,
 // with handle_type_alias_type=True). Seams that reach `expand_type_inner`
 // without the expand entry keep the previous behavior (defer on aliases).
-type AliasMap = std::sync::Arc<HashMap<String, crate::aliases::TypeAliasSnapshot>>;
+pub(crate) type AliasMap = std::sync::Arc<HashMap<String, crate::aliases::TypeAliasSnapshot>>;
 
 thread_local! {
     /// Alias snapshots for `flatten_union_expanding_aliases`, installed
@@ -56,22 +56,30 @@ thread_local! {
     static INSTANTIATE: Cell<bool> = const { Cell::new(false) };
 }
 
-/// RAII: installs the alias map for one kernel call, clears it on drop
-/// (panic-safe). Also installed by the member-access / protocol-member
-/// FFI entries, whose expand tails reach the alias-expanding union arm.
-pub(crate) struct FlatAliasGuard;
+/// RAII: installs the alias map for one kernel call, restores the
+/// previous value on drop (panic-safe, nesting-aware). Installing from
+/// `AllowTopAliases` also covers engine-depth expand paths that reach
+/// `expand_type_inner` without an FFI entry, whose union arm must still
+/// see a live map (otherwise the alias-blind `setops::flatten_nested_unions`
+/// fallback defers on any `TypeAliasType` union item; types.py:5057 runs it
+/// with `handle_type_alias_type=True`).
+pub(crate) struct FlatAliasGuard(Option<AliasMap>);
 
 impl FlatAliasGuard {
     pub(crate) fn install(resolver: &NativeTypeResolver) -> Self {
-        let map = resolver.alias_resolver().shared();
+        Self::install_map(resolver.alias_resolver().shared())
+    }
+
+    pub(crate) fn install_map(map: AliasMap) -> Self {
+        let prev = FLAT_ALIASES.with(|c| c.borrow().clone());
         FLAT_ALIASES.with(|c| *c.borrow_mut() = Some(map));
-        FlatAliasGuard
+        FlatAliasGuard(prev)
     }
 }
 
 impl Drop for FlatAliasGuard {
     fn drop(&mut self) {
-        FLAT_ALIASES.with(|c| *c.borrow_mut() = None);
+        FLAT_ALIASES.with(|c| *c.borrow_mut() = self.0.clone());
     }
 }
 
@@ -131,36 +139,78 @@ fn alias_chain_needs_defer(type_ref: &str, map: &AliasMap) -> Option<bool> {
 /// types.py:4047-4064), recursing through union positions only; a
 /// non-union expansion appends the ORIGINAL alias node ("Must preserve
 /// original aliases when possible", types.py:5098-5099). Returns `None`
-/// to defer: no alias map installed, missing snapshot, alias cycle, or a
-/// `tvar_tuple_index` alias in the chain (see `alias_chain_needs_defer`).
+/// to defer: no alias map installed, missing snapshot, alias cycle, a
+/// `tvar_tuple_index` alias in the chain (see `alias_chain_needs_defer`),
+/// or a #1149 recursion cut.
+///
+/// `active` is the in-flight stack of chain-known alias identities: a
+/// re-encountered identity defers (#1149: `_expand_once` lazily bails on
+/// its own line of descent, Python's "pathological alias" shape can never
+/// re-enter its own unroll). A cut node cannot be emitted into the
+/// flattened union: the types.py:3855 seam contract pins that the
+/// comparison defers instead of answering a verdict over a cut tree, so
+/// `None` here unwinds the whole flatten rather than terminating it with
+/// the node kept in place.
+///
+/// Depth capped at 50 nested union/alias levels (mirroring
+/// `expand_aliases_depth` / `expand_top_aliases`); items arrive as
+/// caller-controlled wire blobs, so an unbounded walk over a hostile
+/// nested-union blob would overflow the stack instead of deferring.
 fn flatten_union_expanding_aliases(items: &[Type]) -> Option<Vec<Type>> {
     let map = FLAT_ALIASES.with(|c| c.borrow().clone())?;
-    let mut flat = Vec::with_capacity(items.len());
-    for t in items {
-        match t {
-            Type::TypeAliasType { type_ref, .. } => {
-                if alias_chain_needs_defer(type_ref, &map)? {
-                    return None;
-                }
-                let tp = {
-                    // InstantiateAliasVisitor, not the simplifying union
-                    // arm (types.py:5513-5525).
-                    let _guard = InstantiateGuard::new();
-                    crate::types_impl::chain_resolve_alias_target(t, &map)?
-                };
-                if let Type::UnionType { items: inner, .. } = tp {
-                    flat.extend(flatten_union_expanding_aliases(&inner)?);
-                } else {
-                    flat.push(t.clone());
-                }
-            }
-            Type::UnionType { items: inner, .. } => {
-                flat.extend(flatten_union_expanding_aliases(inner)?);
-            }
-            _ => flat.push(t.clone()),
+    let mut active: Vec<(String, Vec<Type>)> = Vec::new();
+    fn step(
+        items: &[Type],
+        map: &AliasMap,
+        active: &mut Vec<(String, Vec<Type>)>,
+        depth: u32,
+    ) -> Option<Vec<Type>> {
+        if depth > 50 {
+            return None;
         }
+        let mut flat = Vec::with_capacity(items.len());
+        for t in items {
+            match t {
+                Type::TypeAliasType { type_ref, args, .. } => {
+                    if active.iter().any(|(r, a)| {
+                        r == type_ref
+                            && a.len() == args.len()
+                            && a.iter()
+                                .zip(args.iter())
+                                .all(|(x, y)| crate::wire::py_type_eq(x, y))
+                    }) {
+                        return None;
+                    }
+                    if alias_chain_needs_defer(type_ref, map)? {
+                        return None;
+                    }
+                    let tp = {
+                        // InstantiateAliasVisitor, not the simplifying union
+                        // arm (types.py:5513-5525).
+                        let _guard = InstantiateGuard::new();
+                        crate::types_impl::chain_resolve_alias_target(t, map)?
+                    };
+                    if let Type::UnionType { items: inner, .. } = tp {
+                        active.push((type_ref.clone(), args.clone()));
+                        let inner = step(&inner, map, active, depth + 1)?;
+                        // On the `?` path above the pop is skipped: `None`
+                        // unwinds flatten() entirely (defer), so the
+                        // push/pop pair only balances on the Some path.
+                        active.pop();
+                        flat.extend(inner);
+                    } else {
+                        flat.push(t.clone());
+                    }
+                }
+                Type::UnionType { items: inner, .. } => {
+                    flat.extend(step(inner, map, active, depth + 1)?);
+                }
+                _ => flat.push(t.clone()),
+            }
+        }
+        Some(flat)
     }
-    Some(flat)
+    step(items, &map, &mut active, 0)
 }
 /// Key for the env: `(raw_id, meta_level, namespace)`. Mirrors
 /// `TypeVarId.__eq__` (types.py:574-576), which compares `raw_id`,
@@ -2133,6 +2183,23 @@ mod tests {
             assert!(
                 flatten_union_expanding_aliases(&[alias_type("testmod.Missing", vec![])]).is_none()
             );
+        });
+    }
+
+    #[test]
+    fn flatten_defers_on_deep_nested_union_blob() {
+        // Caller-controlled wire bytes can nest unions arbitrarily deep;
+        // depth caps at 50 levels and defers instead of overflowing
+        // (mirrors expand_aliases_depth / expand_top_aliases).
+        let deep = (0..60).fold(any(), |acc, _| union(vec![acc]));
+        with_alias_map(HashMap::new(), || {
+            assert!(flatten_union_expanding_aliases(&[deep]).is_none());
+        });
+        // Just under the cap still completes.
+        let shallow = (0..50).fold(instance("builtins.int", vec![]), |acc, _| union(vec![acc]));
+        with_alias_map(HashMap::new(), || {
+            let out = flatten_union_expanding_aliases(&[shallow]).unwrap();
+            assert!(matches!(out.as_slice(), [Type::Instance { .. }]));
         });
     }
 

@@ -481,9 +481,8 @@ pub(crate) fn is_subtype(
         // (subtypes.py:346-347); recursive paths bypass that, so expand
         // alias operands via expand_top_aliases (#1356 proper_top pattern).
         let alias_map = resolver.aliases()?;
-        let alias_lookup: &dyn crate::aliases::AliasLookup = &alias_map;
-        let left_ex = expand_top_aliases(left, alias_lookup, ctx.strict_optional)?;
-        let right_ex = expand_top_aliases(right, alias_lookup, ctx.strict_optional)?;
+        let left_ex = expand_top_aliases(left, &alias_map, ctx.strict_optional)?;
+        let right_ex = expand_top_aliases(right, &alias_map, ctx.strict_optional)?;
         return is_subtype(&left_ex, &right_ex, ctx, resolver);
     }
     // subtypes.py:754-761: a non-proper subtype of an Any/Unbound/Erased
@@ -3018,9 +3017,17 @@ pub(crate) fn expand_aliases(
 /// converges under `is_subtype` re-entry (wave36 segfault). Returns
 /// `None` on snapshot miss, variadic target, substitution wall, cyclic
 /// chain, or depth cap: call sites defer the whole comparison.
+///
+/// Deliberately NO FlatAliasGuard install here (wave42 slice): expanding
+/// a recursive-union-alias target with the live map flattens its inner
+/// union and deforms the operand tree; the join then re-derives a
+/// different shape (testRecursiveAliasesJoins). Alias-bearing targets
+/// keep deferring at the alias-blind flatten until a wave adds Python's
+/// is_recursive pass-through parity (handle_recursive=False arm,
+/// types.py:5920) to flatten_union_expanding_aliases.
 pub(crate) fn expand_top_aliases(
     typ: &Type,
-    alias_resolver: &dyn crate::aliases::AliasLookup,
+    alias_map: &crate::expandtype::AliasMap,
     strict_optional: bool,
 ) -> Option<Type> {
     let mut current = typ.clone();
@@ -3030,7 +3037,7 @@ pub(crate) fn expand_top_aliases(
         if depth > 50 {
             return None;
         }
-        let snap = match alias_resolver.get(&type_ref) {
+        let snap = match alias_map.get(&type_ref) {
             Some(s) => s,
             None => {
                 return None;
@@ -3947,8 +3954,8 @@ pub(crate) fn rust_is_more_precise(
     let _infer_unions_guard = crate::unify::InferUnionsGuard::install(infer_unions);
     let left = decode_type(left_bytes)?;
     let right = decode_type(right_bytes)?;
-    let left = expand_top_aliases(&left, resolver.alias_resolver(), strict_optional)?;
-    let right = expand_top_aliases(&right, resolver.alias_resolver(), strict_optional)?;
+    let left = expand_top_aliases(&left, &resolver.alias_resolver().shared(), strict_optional)?;
+    let right = expand_top_aliases(&right, &resolver.alias_resolver().shared(), strict_optional)?;
     is_more_precise(
         &left,
         &right,
@@ -4004,8 +4011,8 @@ pub(crate) fn rust_is_equivalent(
     let _infer_unions_guard = crate::unify::InferUnionsGuard::install(infer_unions);
     let a = decode_type(a_bytes)?;
     let b = decode_type(b_bytes)?;
-    let a = expand_top_aliases(&a, resolver.alias_resolver(), strict_optional)?;
-    let b = expand_top_aliases(&b, resolver.alias_resolver(), strict_optional)?;
+    let a = expand_top_aliases(&a, &resolver.alias_resolver().shared(), strict_optional)?;
+    let b = expand_top_aliases(&b, &resolver.alias_resolver().shared(), strict_optional)?;
     is_equivalent(
         &a,
         &b,
@@ -4113,10 +4120,11 @@ pub(crate) fn rust_all_same_types(
         return Some(true);
     }
     let first = decode_type(items_bytes[0])?;
-    let first = expand_top_aliases(&first, resolver.alias_resolver(), strict_optional)?;
+    let shared = resolver.alias_resolver().shared();
+    let first = expand_top_aliases(&first, &shared, strict_optional)?;
     for b_bytes in items_bytes.iter().skip(1) {
         let b = decode_type(b_bytes)?;
-        let b = expand_top_aliases(&b, resolver.alias_resolver(), strict_optional)?;
+        let b = expand_top_aliases(&b, &shared, strict_optional)?;
         match is_same_type(
             &first,
             &b,
@@ -4151,8 +4159,8 @@ pub(crate) fn rust_is_same_type(
     let _infer_unions_guard = crate::unify::InferUnionsGuard::install(infer_unions);
     let a = decode_type(a_bytes)?;
     let b = decode_type(b_bytes)?;
-    let a = expand_top_aliases(&a, resolver.alias_resolver(), strict_optional)?;
-    let b = expand_top_aliases(&b, resolver.alias_resolver(), strict_optional)?;
+    let a = expand_top_aliases(&a, &resolver.alias_resolver().shared(), strict_optional)?;
+    let b = expand_top_aliases(&b, &resolver.alias_resolver().shared(), strict_optional)?;
     let answer = is_same_type(
         &a,
         &b,
@@ -4205,18 +4213,20 @@ pub(crate) fn rust_is_subtype(
             return None;
         }
     };
-    let left = match expand_top_aliases(&left, resolver.alias_resolver(), strict_optional) {
+    let left = match expand_top_aliases(&left, &resolver.alias_resolver().shared(), strict_optional)
+    {
         Some(t) => t,
         None => {
             return None;
         }
     };
-    let right = match expand_top_aliases(&right, resolver.alias_resolver(), strict_optional) {
-        Some(t) => t,
-        None => {
-            return None;
-        }
-    };
+    let right =
+        match expand_top_aliases(&right, &resolver.alias_resolver().shared(), strict_optional) {
+            Some(t) => t,
+            None => {
+                return None;
+            }
+        };
     let ctx = SubtypeContext::with_callable_flags(
         ignore_type_params,
         ignore_declared_variance,
@@ -4270,21 +4280,21 @@ pub(crate) fn rust_is_subtype_batch(
         ignore_pos_arg_names,
         strict_concatenate,
     );
-    let alias_resolver = resolver.alias_resolver();
+    let alias_resolver = resolver.alias_resolver().shared();
     let type_resolver = resolver.resolver();
     let mut out = Vec::with_capacity(pairs_bytes.len() / 2);
     let (chunks, remainder) = pairs_bytes.as_chunks::<2>();
     for [a, b] in chunks {
         let answer = match (decode_type(a), decode_type(b)) {
             (Some(left), Some(right)) => {
-                let left = match expand_top_aliases(&left, alias_resolver, strict_optional) {
+                let left = match expand_top_aliases(&left, &alias_resolver, strict_optional) {
                     Some(t) => t,
                     None => {
                         out.push(-1);
                         continue;
                     }
                 };
-                let right = match expand_top_aliases(&right, alias_resolver, strict_optional) {
+                let right = match expand_top_aliases(&right, &alias_resolver, strict_optional) {
                     Some(t) => t,
                     None => {
                         out.push(-1);
@@ -7160,7 +7170,7 @@ mod tests {
         let ar = make_alias_resolver(vec![no_args_list_snap()]);
         let input = alias_type(vec![instance("builtins.int", vec![])], "mod.A");
         assert_eq!(
-            expand_top_aliases(&input, &ar, true),
+            expand_top_aliases(&input, &ar.shared(), true),
             Some(instance(
                 "builtins.list",
                 vec![instance("builtins.int", vec![])]
@@ -7181,7 +7191,7 @@ mod tests {
         let ar = make_alias_resolver(vec![no_args_list_snap(), b_snap]);
         let input = alias_type(vec![], "mod.B");
         assert_eq!(
-            expand_top_aliases(&input, &ar, true),
+            expand_top_aliases(&input, &ar.shared(), true),
             Some(instance(
                 "builtins.list",
                 vec![instance("builtins.int", vec![])]
@@ -7204,7 +7214,7 @@ mod tests {
         let ar = make_alias_resolver(vec![no_args_list_snap(), v_snap]);
         let input = alias_type(vec![], "mod.V");
         assert_eq!(
-            expand_top_aliases(&input, &ar, true),
+            expand_top_aliases(&input, &ar.shared(), true),
             Some(instance("builtins.list", vec![alias_type(vec![], "mod.A")]))
         );
     }
@@ -7255,7 +7265,7 @@ mod tests {
         let ar = make_alias_resolver(vec![b_snap, v_snap]);
         let input = alias_type(vec![instance("builtins.int", vec![])], "mod.V");
         assert_eq!(
-            expand_top_aliases(&input, &ar, true),
+            expand_top_aliases(&input, &ar.shared(), true),
             Some(instance(
                 "builtins.list",
                 vec![instance("builtins.int", vec![])]
@@ -7267,7 +7277,7 @@ mod tests {
     fn test_expand_top_aliases_defers_missing_snapshot() {
         let ar = make_alias_resolver(vec![]);
         let input = alias_type(vec![], "mod.Missing");
-        assert_eq!(expand_top_aliases(&input, &ar, true), None);
+        assert_eq!(expand_top_aliases(&input, &ar.shared(), true), None);
     }
 
     #[test]
@@ -7283,7 +7293,7 @@ mod tests {
         };
         let ar = make_alias_resolver(vec![bad]);
         let input = alias_type(vec![], "mod.A");
-        assert_eq!(expand_top_aliases(&input, &ar, true), None);
+        assert_eq!(expand_top_aliases(&input, &ar.shared(), true), None);
     }
 
     #[test]
@@ -7294,7 +7304,7 @@ mod tests {
         snap.tvar_tuple_index = Some(0);
         let ar = make_alias_resolver(vec![snap]);
         let input = alias_type(vec![], "mod.A");
-        assert_eq!(expand_top_aliases(&input, &ar, true), None);
+        assert_eq!(expand_top_aliases(&input, &ar.shared(), true), None);
     }
 
     #[test]
@@ -7328,7 +7338,7 @@ mod tests {
             ],
             "mod.A",
         );
-        assert_eq!(expand_top_aliases(&input, &ar, true), None);
+        assert_eq!(expand_top_aliases(&input, &ar.shared(), true), None);
     }
 
     #[test]
