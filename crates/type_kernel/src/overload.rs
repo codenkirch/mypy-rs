@@ -13,6 +13,12 @@
 
 use pyo3::prelude::*;
 
+/// Wire values of the per-target instantiation-gate fact, shared with
+/// the Python shim `_typeobj_gate_flag_for_roc` (checkexpr.py).
+const TYPEOBJ_GATE_FAIL: i8 = 1;
+const TYPEOBJ_GATE_PASS: i8 = 0;
+const TYPEOBJ_GATE_UNREADABLE: i8 = -1;
+
 use crate::argmap;
 use crate::checkcall;
 use crate::checkexpr_functions;
@@ -71,8 +77,10 @@ fn encode_type(typ: &Type) -> Option<Vec<u8>> {
 ///
 /// Algorithm contract:
 ///   1. Any actual with ARG_STAR / ARG_STAR2 -> defer.
-///   2. Each target: must be a CallableType that is not a type object.
-///      Non-conforming (incl. generic type-object callables) -> None.
+///   2. Each target: must be a CallableType. Type-object constructor
+///      items stay when the shim supplies per-target gate facts; without
+///      facts they keep the whole-call defer (Python's check_call
+///      applies calibration + specials the wire cannot mirror).
 ///   3. Generic targets (own `variables`) are decided through the native
 ///      constraint-solve kernel (`rust_solve_generic_call`): solve first,
 ///      then evaluate the fully-substituted form like a plain target. A
@@ -90,9 +98,34 @@ fn encode_type(typ: &Type) -> Option<Vec<u8>> {
 /// mirrors `type_state.infer_unions` at the solve call site
 /// (checkexpr.py), both threaded through `rust_solve_generic_call`.
 /// `strict_optional` mirrors `chk.options.strict_optional`.
+/// `typeobj_gate_fails` mirrors, per target (same order as
+/// `targets_bytes`), the pre-argument instantiation-gate chain of
+/// `check_callable_call` (checkexpr.py:2843-2871) precomputed by the
+/// shim:
+/// `TYPEOBJ_GATE_FAIL` = Python's protocol/abstract gate emits a fail
+/// regardless of the arguments, so the item can never match (the target
+/// is skipped like Python's own `check_call`-emits-errors step);
+/// `TYPEOBJ_GATE_UNREADABLE` = gate fact unreadable,
+/// position-identical to the old whole-call defer;
+/// `TYPEOBJ_GATE_PASS` = the gates are inapplicable or pass, so the
+/// item is evaluable by the same pair machinery as any other
+/// CallableType. A missing entry (a
+/// shorter vec than `targets_bytes`) or any unrecognized value also
+/// defers; unrecognized values never read as `0`. The presence of the
+/// parameter is the opt-in: callers that omit it (old-arity test
+/// callers and any shim that has not been upgraded) keep the pre-41
+/// type-object whole-call defer. The enum-base early return
+/// (checkexpr.py:2829-2841) is not mirrored: in the overload path
+/// `callable_node` is always `None` (checkexpr.py:4516, 4756), so that
+/// gate cannot fire during per-item matching in either flow.
 ///
 /// Returns `None` on decode failures, buffer OOB, or any "could not
 /// decide" signal. Rust NEVER decides "no match" or "ambiguous".
+///
+/// Wire values of the per-target instantiation-gate fact, shared with
+/// the Python shim `_typeobj_gate_flag_for_roc` (checkexpr.py):
+/// `TYPEOBJ_GATE_FAIL` = 1, `TYPEOBJ_GATE_PASS` = 0,
+/// `TYPEOBJ_GATE_UNREADABLE` = -1.
 #[pyfunction]
 #[pyo3(signature = (
     resolver,
@@ -103,6 +136,7 @@ fn encode_type(typ: &Type) -> Option<Vec<u8>> {
     arg_names = None,
     strict = true,
     infer_unions = false,
+    typeobj_gate_fails = None,
 ))]
 #[allow(clippy::too_many_arguments)]
 pub fn rust_check_overload_call(
@@ -115,6 +149,7 @@ pub fn rust_check_overload_call(
     arg_names: Option<Vec<Option<String>>>,
     strict: bool,
     infer_unions: bool,
+    typeobj_gate_fails: Option<Vec<i8>>,
 ) -> Option<usize> {
     // 0 targets -> defer.
     if targets_bytes.is_empty() {
@@ -148,8 +183,9 @@ pub fn rust_check_overload_call(
     };
 
     // Decode all targets once, validating shape. Callable targets (plain or
-    // generic) stay; type-object fallbacks and non-callables defer whole call
-    // (Python's check_call applies calibration + specials the wire cannot mirror).
+    // generic) stay. Without per-target instantiation-gate facts supplied
+    // by the shim, type-object constructor items keep the pre-wave-41
+    // whole-call defer; non-callables defer whole call either way.
     let mut decoded_targets: Vec<Type> = Vec::with_capacity(nformals_hint);
     for blob in &targets_bytes {
         let t = decode_type(blob);
@@ -158,11 +194,11 @@ pub fn rust_check_overload_call(
                 fallback,
                 from_concatenate,
                 ..
-            }) if !is_type_obj(fallback, *from_concatenate) => {
-                decoded_targets.push(t.unwrap());
+            }) if typeobj_gate_fails.is_none() && is_type_obj(fallback, *from_concatenate) => {
+                return None; // type-object target, no gate facts -> whole-call defer
             }
             Some(Type::CallableType { .. }) => {
-                return None; // type-object target -> defer whole call
+                decoded_targets.push(t.unwrap());
             }
             Some(_) => {
                 return None; // non-conforming target -> defer whole call
@@ -179,6 +215,25 @@ pub fn rust_check_overload_call(
         let Type::CallableType { .. } = target else {
             return None; // should not happen after validation
         };
+
+        // Per-target instantiation-gate fact. 1 skips the target exactly
+        // like Python's own arg-independent gate fail; -1 is
+        // position-identical to the old whole-call defer.
+        match typeobj_gate_fails.as_deref() {
+            None => {} // no fact list: caller opted out of gate arbitration
+            Some(facts) => match facts.get(idx) {
+                Some(&TYPEOBJ_GATE_FAIL) => {
+                    continue;
+                }
+                Some(&TYPEOBJ_GATE_UNREADABLE) | None => {
+                    return None; // gate fact unreadable -> whole-call defer
+                }
+                Some(&TYPEOBJ_GATE_PASS) => {}
+                Some(_) => {
+                    return None; // unknown fact value -> defer, never guess evaluable
+                }
+            },
+        }
 
         // Generic targets (own type variables) ride the constraint-solve
         // kernel; a solved form is then evaluated like a plain target.

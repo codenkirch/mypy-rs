@@ -19639,7 +19639,8 @@ class NativeOverloadCallSuite(Suite):
     Rust never decides no-match or ambiguity.
 
     Categories: first-match ordering, per-target rejects, deferral
-    shapes (star / typeobj / ParamSpec), direct generic solves.
+    shapes (star / typeobj / ParamSpec), direct generic solves,
+    per-target type-object instantiation-gate facts (#1439).
     """
 
     def setUp(self) -> None:
@@ -19670,6 +19671,7 @@ class NativeOverloadCallSuite(Suite):
         strict_optional: bool = True,
         strict: bool = False,
         infer_unions: bool = False,
+        typeobj_gate_fails: list[int] | None = None,
     ) -> int | None:
         kinds = (
             [k.value for k in arg_kinds]
@@ -19687,6 +19689,7 @@ class NativeOverloadCallSuite(Suite):
             arg_names,
             strict,
             infer_unions,
+            typeobj_gate_fails,
         )
 
     def _generic(self, tv: TypeVarType) -> CallableType:
@@ -19719,6 +19722,49 @@ class NativeOverloadCallSuite(Suite):
         # applies constructor calibration the wire cannot mirror.
         target = self.fx.callable_type(self.fx.a, self.fx.a)
         assert self._call([target], [self.fx.b]) is None
+
+    # --- per-target instantiation-gate facts for type-object items (#1439) ---
+
+    def test_typeobj_gate_fail_skips_to_next_target(self) -> None:
+        # A type-object item whose pre-argument instantiation gates fail
+        # (flag 1, shim-side) can never match; first-match steps past it
+        # to the plain target, mirroring Python's rejection step.
+        typeobj = self.fx.callable_type(self.fx.a, self.fx.a)
+        take_b = self.fx.callable(self.fx.b, self.fx.str_type)
+        assert self._call([typeobj, take_b], [self.fx.b], typeobj_gate_fails=[1, 0]) == 1
+
+    def test_typeobj_gate_pass_decides_natively(self) -> None:
+        # With gates passing (flag 0) the type-object item is evaluated
+        # by the same pair machinery as any other callable item.
+        typeobj = self.fx.callable_type(self.fx.a, self.fx.a)
+        assert self._call([typeobj], [self.fx.b], typeobj_gate_fails=[0]) == 0
+        # A rejected actual still never decides no-match.
+        assert self._call([typeobj], [self.fx.str_type], typeobj_gate_fails=[0]) is None
+
+    def test_typeobj_gate_unreadable_defers_whole_call(self) -> None:
+        # Flag -1 is position-identical to the pre-#1439 whole-call defer,
+        # even when a later target would have matched.
+        typeobj = self.fx.callable_type(self.fx.a, self.fx.a)
+        take_b = self.fx.callable(self.fx.b, self.fx.str_type)
+        assert self._call([typeobj, take_b], [self.fx.b], typeobj_gate_fails=[-1, 0]) is None
+
+    def test_typeobj_gate_missing_fact_defers(self) -> None:
+        # A fact list shorter than the target list, or an unrecognized
+        # fact value, must defer (never read as a passing fact).
+        typeobj = self.fx.callable_type(self.fx.a, self.fx.a)
+        assert self._call([typeobj], [self.fx.b], typeobj_gate_fails=[]) is None
+        take_b = self.fx.callable(self.fx.b, self.fx.str_type)
+        # First target rejected, second target has no fact: the search
+        # defers instead of reaching the fact-less item.
+        assert self._call([typeobj, take_b], [self.fx.str_type], typeobj_gate_fails=[0]) is None
+        assert self._call([typeobj], [self.fx.b], typeobj_gate_fails=[99]) is None
+
+    def test_typeobj_gate_all_fail_no_match_defers(self) -> None:
+        # All type-object items gate-failed and no other target matches:
+        # the exhausted search defers (Rust never decides no-match).
+        typeobj = self.fx.callable_type(self.fx.a, self.fx.a)
+        make_b = self.fx.callable(self.fx.b, self.fx.b)
+        assert self._call([make_b, typeobj], [self.fx.a], typeobj_gate_fails=[0, 1]) is None
 
     def test_undecodable_target_defers(self) -> None:
         import type_kernel as tk
