@@ -1028,8 +1028,58 @@ fn wire_unsafe_reason(typ: &Type, owned: &HashSet<TvId>) -> Option<&'static str>
                 None
             }
         }
+        // Carrier walk mirrors visitor.rs has_type_vars_inner, so an
+        // owned tvar nested in any decode-able carrier defers like the
+        // removed has_type_vars pre-guard did.
+        Type::UnboundType { args, .. } => args.iter().find_map(|t| wire_unsafe_reason(t, owned)),
+        Type::UnpackType { typ, .. } => wire_unsafe_reason(typ, owned),
+        Type::Instance {
+            args,
+            last_known_value,
+            ..
+        } => args
+            .iter()
+            .find_map(|t| wire_unsafe_reason(t, owned))
+            .or_else(|| {
+                last_known_value
+                    .as_ref()
+                    .and_then(|t| wire_unsafe_reason(t, owned))
+            }),
+        Type::CallableType {
+            arg_types,
+            ret_type,
+            variables,
+            instance_type,
+            ..
+        } => arg_types
+            .iter()
+            .find_map(|t| wire_unsafe_reason(t, owned))
+            .or_else(|| wire_unsafe_reason(ret_type, owned))
+            .or_else(|| variables.iter().find_map(|t| wire_unsafe_reason(t, owned)))
+            .or_else(|| {
+                instance_type
+                    .as_ref()
+                    .and_then(|t| wire_unsafe_reason(t, owned))
+            }),
+        Type::Overloaded { items } => items.iter().find_map(|t| wire_unsafe_reason(t, owned)),
+        Type::TupleType {
+            items,
+            partial_fallback,
+            ..
+        } => items
+            .iter()
+            .find_map(|t| wire_unsafe_reason(t, owned))
+            .or_else(|| wire_unsafe_reason(partial_fallback, owned)),
+        Type::TypedDictType {
+            items, fallback, ..
+        } => items
+            .iter()
+            .find_map(|(_, t)| wire_unsafe_reason(t, owned))
+            .or_else(|| wire_unsafe_reason(fallback, owned)),
+        Type::LiteralType { fallback, .. } => wire_unsafe_reason(fallback, owned),
         Type::UnionType { items, .. } => items.iter().find_map(|t| wire_unsafe_reason(t, owned)),
-        Type::Instance { args, .. } => args.iter().find_map(|t| wire_unsafe_reason(t, owned)),
+        Type::TypeType { item, .. } => wire_unsafe_reason(item, owned),
+        Type::TypeAliasType { args, .. } => args.iter().find_map(|t| wire_unsafe_reason(t, owned)),
         _ => None,
     }
 }
@@ -1678,9 +1728,6 @@ pub(crate) fn solve_constraints_poly_native(
     all_vars.extend(extra_types);
     // Python reassigns `constraints` before both the solve and the
     // pre-validation (solve.py:242-244, 288).
-    // Dependent solve over the filtered constraints (solve.py:255-261); it
-    // consumes `filtered` directly (Python's cmap is shared with the
-    // non-polymorphic branch, which this poly-only port does not implement).
     let filtered = match crate::constraints_filter::skip_reverse_union_kernel(constraints) {
         Some(f) => f,
         None => return Err(()),
@@ -2920,6 +2967,37 @@ mod tests {
         // doppelganger (wire_unsafe_reason "owned-tv").
         let r = make_resolver(vec![snap("a.A")]);
         let lo = tv_type(7, "T");
+        let owned: HashSet<TvId> = HashSet::from([(7, 1, "fn".to_string())]);
+        let out = solve_one_for_dependent(&[lo], &[], false, true, &r, &owned);
+        assert_eq!(out, Err(()));
+    }
+
+    #[test]
+    fn dependent_owned_tvar_nested_in_callable_defers() {
+        // An owned tvar nested inside a Callable lower bound must defer
+        // like a top-level one: the wire decode replaces it with a
+        // doppelganger inside the returned solution.
+        let r = make_resolver(vec![snap("a.A")]);
+        let lo = Type::CallableType {
+            fallback: Box::new(instance("builtins.function", vec![])),
+            instance_type: None,
+            is_ellipsis_args: false,
+            implicit: false,
+            is_bound: false,
+            from_concatenate: false,
+            imprecise_arg_kinds: false,
+            unpack_kwargs: false,
+            from_type_type: false,
+            arg_types: vec![tv_type(7, "T")],
+            arg_kinds: vec![0],
+            arg_names: vec![None],
+            ret_type: Box::new(instance("a.A", vec![])),
+            name: None,
+            variables: Vec::new(),
+            type_guard: None,
+            type_is: None,
+            special_sig: None,
+        };
         let owned: HashSet<TvId> = HashSet::from([(7, 1, "fn".to_string())]);
         let out = solve_one_for_dependent(&[lo], &[], false, true, &r, &owned);
         assert_eq!(out, Err(()));

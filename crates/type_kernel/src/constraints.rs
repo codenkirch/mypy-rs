@@ -877,7 +877,7 @@ fn visit_instance_native(
         return Some(vec![]);
     }
     if let Type::Instance { type_ref, args, .. } = actual {
-        let a_snap = resolver.get(type_ref).map_or_else(|| None, Some)?;
+        let a_snap = resolver.get(type_ref)?;
         // SUBTYPE_OF direction: template is a base of actual (fast path).
         if direction == SUBTYPE_OF && template_snap.has_base(type_ref) {
             if template_snap.has_type_var_tuple_type || a_snap.has_type_var_tuple_type {
@@ -916,7 +916,6 @@ fn visit_instance_native(
                             )?);
                         }
                     }
-                    // ParamSpecType (kind 1): defer (needs Parameters slicing).
                     // ParamSpecType (kind 1): defer (needs Parameters slicing).
                     1 => {
                         return None;
@@ -1257,8 +1256,10 @@ fn infer_constraints_from_protocol_members_native(
         )?);
         // Settable members are invariant: add opposite-direction
         // constraints (constraints.py:1679-1681).
-        let protocol_info = resolver.live_typeinfo(py, protocol_ref);
-        let protocol_info = protocol_info?;
+        let protocol_info = resolver.live_typeinfo(py, protocol_ref)?;
+        if protocol_info.is_none() {
+            return None;
+        }
         let flags = crate::member_flags::get_member_flags_inner_pub(
             py,
             protocol_info,
