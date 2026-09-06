@@ -3137,9 +3137,12 @@ class NativeJoinTypeListSuite(Suite):
     and folds it pairwise through `rust_join_type_list` (one setops pair
     join per accumulator step); arg-bearing Instance-Instance pairs the
     prejoin cannot decide route through the `join_instances_core`
-    engine. The whole call defers (`None`) for lists whose items carry
-    a last_known_value, `fallback_to_any` classes, or identity-unsafe
-    items; the Python shim then re-runs the identical pure fold.
+    engine. The whole call defers (`None`) for lists carrying a
+    last_known_value outside the relaxed shape (non-plain-class or
+    args-bearing LKV Instances), `fallback_to_any` classes, or
+    identity-unsafe items; the Python shim then re-runs the identical
+    pure fold. Plain-class args-less same-ref LKV pairs decide via the
+    prejoin (fresh Instance, LKV and extra_attrs dropped).
     Length <= 1 lists never cross the FFI boundary (Python early return
     before the gate). Every test asserts the gate-off vs gate-on
     results are identical, and a direct seam call proves Rust
@@ -3265,15 +3268,15 @@ class NativeJoinTypeListSuite(Suite):
         assert self._assert_parity([self.fx.anyt, self.fx.a]) == self.fx.anyt
         assert self._seam_result([self.fx.anyt, self.fx.a]) is not None
 
-    def test_lkv_list_defers(self) -> None:
-        # A literal-carrying Instance is a whole-list guard: the seam
-        # must return None and both gates fall back to the pure-Python
-        # fold (which drops the LKVs), so parity holds by re-running.
+    def test_lkv_list_decides_via_prejoin(self) -> None:
+        # Same-ref args-less LKV Instances of a plain class decide via the
+        # prejoin: Python's fold rebuilds the fresh instances and joins
+        # them to the LKV-less class (join.py:392), dropping both LKVs.
         from mypy.types import LiteralType
 
         lit_a = Instance(self.fx.ai, [], last_known_value=LiteralType(1, self.fx.a))
         lit_b = Instance(self.fx.ai, [], last_known_value=LiteralType(2, self.fx.a))
-        assert self._seam_result([lit_a, lit_b]) is None
+        assert self._seam_result([lit_a, lit_b]) is not None
         self._assert_parity([lit_a, lit_b])
 
     def test_fallback_to_any_list_defers(self) -> None:

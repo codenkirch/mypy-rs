@@ -283,10 +283,26 @@ pub(crate) fn rust_expand_type_by_instance(
     strict_optional: bool,
 ) -> Option<Vec<u8>> {
     let _flat_alias_guard = FlatAliasGuard::install(resolver);
-    let typ = decode_type(type_bytes)?;
-    let instance = decode_type(instance_bytes)?;
+    let typ = match decode_type(type_bytes) {
+        Some(t) => t,
+        None => {
+            return None;
+        }
+    };
+    let instance = match decode_type(instance_bytes) {
+        Some(t) => t,
+        None => {
+            return None;
+        }
+    };
     let expanded =
-        expand_type_by_instance_relink(&typ, &instance, resolver.resolver(), strict_optional)?;
+        match expand_type_by_instance_relink(&typ, &instance, resolver.resolver(), strict_optional)
+        {
+            Some(t) => t,
+            None => {
+                return None;
+            }
+        };
     encode_type(&expanded)
 }
 
@@ -1043,7 +1059,9 @@ pub(crate) fn expand_type_inner(
             // `param_spec_callable_arm` for the deferral contract.
             match param_spec_callable_arm(typ, env, strict_optional) {
                 Some(Some(res)) => return Some(res),
-                Some(None) => return None,
+                Some(None) => {
+                    return None;
+                }
                 None => {}
             }
             // `is_bound` needs no special handling here: it survives

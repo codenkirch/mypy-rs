@@ -714,10 +714,10 @@ fn join_type_list_inner(
     if items.len() == 1 {
         return None;
     }
-    // Whole-list cheap guards: Python's join erases last-known values
-    // and lets `fallback_to_any` classes absorb into Any; neither is
-    // reproducible through the wire kernel, so defer the whole call.
-    if items.iter().any(has_lkv) {
+    // Whole-list cheap guards: only LKVs outside the relaxed shape (or
+    // `fallback_to_any` classes, which absorb into Any) defer the whole
+    // call; a plain args-less LKV Instance is decided by the prejoin.
+    if items.iter().any(|t| !lkv_relax_ok(t, resolver)) {
         return None;
     }
     if items
@@ -766,13 +766,36 @@ fn join_one_pair(
     {
         if l_args.is_empty()
             && r_args.is_empty()
-            && l_lkv.is_none()
-            && r_lkv.is_none()
             && resolver.get(l_ref).is_some()
             && resolver.get(r_ref).is_some()
         {
             if l_ref == r_ref {
+                // Wave 43 LKV relaxation: same-ref args-less pairs with a
+                // plain class decide by rebuilding the fresh Instance
+                // Python produces (join.py:392): LKV and extra_attrs drop.
+                if l_lkv.is_some() || r_lkv.is_some() {
+                    // The plain-class guard keeps the protocol structural
+                    // arm (join.py:762-772) unreachable.
+                    let plain = resolver.get(l_ref).is_some_and(|snap| {
+                        !snap.is_protocol && !snap.fallback_to_any && !snap.meta_fallback_to_any
+                    });
+                    if !plain {
+                        return None;
+                    }
+                    return Some(Type::Instance {
+                        type_ref: l_ref.clone(),
+                        args: vec![],
+                        last_known_value: None,
+                        extra_attrs: None,
+                    });
+                }
                 return Some(left.clone());
+            }
+            // Cross-ref args-less pairs carrying an LKV defer to Python:
+            // the setops nominal walk is not LKV-aware, but Python
+            // answers these from last_known_value ground (join.py:139).
+            if l_lkv.is_some() || r_lkv.is_some() {
+                return None;
             }
             // Undecided prejoin results fall through to the core routing:
             // the args-less shapes its port declines (e.g. the
@@ -781,6 +804,21 @@ fn join_one_pair(
                 return instance_join_result_to_type(&result, left, right);
             }
         }
+    }
+    // A surviving top-level args-less LKV operand outside the same-ref
+    // arm rides the cross-ref routes (setops / core), whose subtype /
+    // ancestor walks do not reproduce Python's LKV semantics: defer.
+    if matches!(left, Type::Instance { args, last_known_value: Some(_), .. } if args.is_empty())
+        || matches!(
+            right,
+            Type::Instance {
+                args,
+                last_known_value: Some(_),
+                ..
+            } if args.is_empty()
+        )
+    {
+        return None;
     }
     let joined = crate::setops::join_types(left, right, ctx, resolver);
     match joined {
@@ -824,26 +862,27 @@ fn join_one_pair(
             if arg_discs.len() != l_args.len() || arg_discs.len() != r_args.len() {
                 return None;
             }
-            let final_args: Option<Vec<Type>> = arg_discs
-                .iter()
-                .enumerate()
-                .map(|(i, &d)| match d {
-                    0 => Some(l_args[i].clone()),
-                    1 => Some(r_args[i].clone()),
-                    // Disc 4: AnyType arg -> AnyType(7, Any side)
-                    // (join.py:335-338, shim join.py:283-295); t-preferred,
-                    // s verbatim when t is not Any. Other discs defer.
-                    4 => Some(reconstruct_any_from_another(
-                        if matches!(r_args[i], Type::AnyType { .. }) {
-                            &r_args[i]
-                        } else {
-                            &l_args[i]
-                        },
-                        None,
-                    )),
-                    _ => None,
-                })
-                .collect();
+            let final_args = if arg_discs.iter().all(|&d| matches!(d, 0 | 1 | 4)) {
+                arg_discs
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &d)| match d {
+                        0 => Some(l_args[i].clone()),
+                        1 => Some(r_args[i].clone()),
+                        4 => Some(reconstruct_any_from_another(
+                            if matches!(r_args[i], Type::AnyType { .. }) {
+                                &r_args[i]
+                            } else {
+                                &l_args[i]
+                            },
+                            None,
+                        )),
+                        _ => None,
+                    })
+                    .collect()
+            } else {
+                None
+            };
             let final_args = final_args?;
             Some(Type::Instance {
                 type_ref,
@@ -1025,6 +1064,36 @@ fn is_join_safe(t: &Type, resolver: &TypeResolver) -> bool {
     false
 }
 
+/// Can this list item ride the `last_known_value` relaxation? Python's
+/// fold is parity-decidable through the kernel only for an LKV that sits
+/// on a top-level args-less `Instance` of a plain class (not protocol,
+/// not fallback_to_any): the same-ref args-less prejoin can rebuild the
+/// fresh Instance Python produces (drops both the LKV and extra_attrs,
+/// join.py:392), and the protocol structural arm of `visit_instance`
+/// (join.py:762-772) is unreachable for such a pair. LKVs in any other
+/// position (inside args, unions, callables) or on an unresolvable /
+/// protocol / fallback class keep the whole-list defer.
+fn lkv_relax_ok(t: &Type, resolver: &TypeResolver) -> bool {
+    if !has_lkv(t) {
+        return true;
+    }
+    let Type::Instance {
+        type_ref,
+        args,
+        last_known_value: Some(_),
+        extra_attrs: None,
+    } = t
+    else {
+        return false;
+    };
+    if !args.is_empty() {
+        return false;
+    }
+    resolver.get(type_ref).is_some_and(|snap| {
+        !snap.is_protocol && !snap.fallback_to_any && !snap.meta_fallback_to_any
+    })
+}
+
 /// Does `t` (recursively) carry a `last_known_value` on any `Instance`?
 /// Python's join erases LKVs (`Literal[2]?` joins `int` to `int`); the
 /// wire kernel would keep the literal-typed form, so defer any list
@@ -1060,9 +1129,11 @@ pub(crate) fn rust_join_type_list(
 ) -> Option<Vec<u8>> {
     let mut items = Vec::with_capacity(type_blobs.len());
     for blob in &type_blobs {
-        items.push(decode_type(blob)?);
+        let decoded = decode_type(blob);
+        items.push(decoded?);
     }
-    let result = join_type_list_inner(&items, strict_optional, resolver.resolver())?;
+    let result = join_type_list_inner(&items, strict_optional, resolver.resolver());
+    let result = result?;
     encode_type(&result)
 }
 
@@ -2778,6 +2849,107 @@ info.mro = [Cls()]
         assert_eq!(joined, Some(inst));
     }
 
+    fn lkv_instance(type_ref: &str) -> Type {
+        Type::Instance {
+            type_ref: type_ref.to_string(),
+            args: vec![],
+            last_known_value: Some(Box::new(Type::NoneType)),
+            extra_attrs: None,
+        }
+    }
+
+    fn plain_snapshot(resolver: &mut TypeResolver, fullname: &str) {
+        resolver.insert(
+            fullname.to_string(),
+            TypeInfoSnapshot {
+                fullname: fullname.to_string(),
+                name: fullname.rsplit('.').next().unwrap().to_string(),
+                ..Default::default()
+            },
+        );
+    }
+
+    #[test]
+    fn test_join_type_list_lkv_same_ref_rebuilds_fresh() {
+        // Wave-43 relaxation: same-ref args-less pairs with a plain class
+        // rebuild the fresh Instance Python produces (join.py:392); the
+        // LKV (and extra_attrs) drop on both sides, whatever the values.
+        let mut r = TypeResolver::new();
+        plain_snapshot(&mut r, "builtins.int");
+        let joined = join_type_list_inner(
+            &[lkv_instance("builtins.int"), lkv_instance("builtins.int")],
+            true,
+            &r,
+        );
+        assert_eq!(
+            joined,
+            Some(Type::Instance {
+                type_ref: "builtins.int".to_string(),
+                args: vec![],
+                last_known_value: None,
+                extra_attrs: None,
+            })
+        );
+    }
+
+    #[test]
+    fn test_join_type_list_lkv_protocol_defers() {
+        let mut r = TypeResolver::new();
+        r.insert(
+            "myns.Proto".to_string(),
+            TypeInfoSnapshot {
+                fullname: "myns.Proto".to_string(),
+                name: "Proto".to_string(),
+                is_protocol: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            join_type_list_inner(
+                &[lkv_instance("myns.Proto"), lkv_instance("myns.Proto")],
+                true,
+                &r
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn test_join_type_list_lkv_cross_ref_defers() {
+        // Different refs leave the prejoin; the cross-ref routes' proper
+        // subtype walks are not LKV-aware on the wire, so defer.
+        let mut r = TypeResolver::new();
+        plain_snapshot(&mut r, "builtins.str");
+        plain_snapshot(&mut r, "builtins.bool");
+        assert_eq!(
+            join_type_list_inner(
+                &[lkv_instance("builtins.str"), lkv_instance("builtins.bool")],
+                true,
+                &r
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn test_join_type_list_lkv_nested_in_args_defers() {
+        // An LKV inside args is outside the relaxed shape: the per-arg
+        // join cannot reproduce Python's LKV-aware walk, defer the call.
+        let mut r = TypeResolver::new();
+        plain_snapshot(&mut r, "builtins.list");
+        plain_snapshot(&mut r, "builtins.int");
+        let outer = Type::Instance {
+            type_ref: "builtins.list".to_string(),
+            args: vec![lkv_instance("builtins.int")],
+            last_known_value: None,
+            extra_attrs: None,
+        };
+        assert_eq!(
+            join_type_list_inner(&[outer, make_instance("builtins.list", vec![])], true, &r),
+            None
+        );
+    }
+
     #[test]
     fn test_join_type_list_subtype_dominated_returns_dominant() {
         // int <: object (both snapshots with mro + has_base, and object
@@ -2798,6 +2970,33 @@ info.mro = [Cls()]
         let obj_t = make_instance("builtins.object", vec![]);
         let joined = join_type_list_inner(&[int_t, obj_t.clone()], true, &r);
         assert_eq!(joined, Some(obj_t));
+    }
+
+    #[test]
+    fn test_join_type_list_lkv_cross_ref_with_mro_defers() {
+        // Cross-ref args-less pair where the MRO walk alone would join
+        // (bool <: object). The setops walk is not LKV-aware, so the
+        // LKV operand defers to Python (join.py:139).
+        let mut r = TypeResolver::new();
+        for (fullname, name) in [("builtins.bool", "bool"), ("builtins.object", "object")] {
+            let mut s = TypeInfoSnapshot {
+                fullname: fullname.to_string(),
+                name: name.to_string(),
+                ..Default::default()
+            };
+            s.mro.push(fullname.to_string());
+            s.has_base.insert(fullname.to_string());
+            r.insert(fullname.to_string(), s);
+        }
+        let joined = join_type_list_inner(
+            &[
+                lkv_instance("builtins.bool"),
+                make_instance("builtins.object", vec![]),
+            ],
+            true,
+            &r,
+        );
+        assert_eq!(joined, None);
     }
 
     #[test]

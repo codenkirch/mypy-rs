@@ -251,8 +251,18 @@ fn overlap_impl(
     // `get_proper_types` would when expansion is impossible.
     let (left, right) = match aliases {
         Some(a) => {
-            let lo = crate::checkexpr_functions::get_proper_or_expand(left, a)?;
-            let ro = crate::checkexpr_functions::get_proper_or_expand(right, a)?;
+            let lo = match crate::checkexpr_functions::get_proper_or_expand(left, a) {
+                Some(x) => x,
+                None => {
+                    return None;
+                }
+            };
+            let ro = match crate::checkexpr_functions::get_proper_or_expand(right, a) {
+                Some(x) => x,
+                None => {
+                    return None;
+                }
+            };
             (lo, ro)
         }
         None => (left.clone(), right.clone()),
@@ -276,7 +286,12 @@ fn overlap_impl(
     // 2. no-strict-optional: drop None from Union items (meet.py:491-498).
     let left = if !strict_optional {
         match left {
-            Type::UnionType { items, .. } => make_union(relevant_items(items)?),
+            Type::UnionType { items, .. } => match relevant_items(items) {
+                Some(v) => make_union(v),
+                None => {
+                    return None;
+                }
+            },
             other => other.clone(),
         }
     } else {
@@ -284,7 +299,12 @@ fn overlap_impl(
     };
     let right = if !strict_optional {
         match right {
-            Type::UnionType { items, .. } => make_union(relevant_items(items)?),
+            Type::UnionType { items, .. } => match relevant_items(items) {
+                Some(v) => make_union(v),
+                None => {
+                    return None;
+                }
+            },
             other => other.clone(),
         }
     } else {
@@ -297,13 +317,6 @@ fn overlap_impl(
     }
 
     // 4. enums expanded to Literal-Unions, and literals inside Unions.
-    if is_enum_overlapping_union(&left, &right, res)?
-        || is_enum_overlapping_union(&right, &left, res)?
-        || is_literal_in_union(&left, &right)?
-        || is_literal_in_union(&right, &left)?
-    {
-        return Some(true);
-    }
 
     // 5. overload-strict: None overlaps only object (which erases to None).
     if overlap_for_overloads
@@ -321,19 +334,39 @@ fn overlap_impl(
         overlap_for_overloads,
         strict_optional,
     );
-    let a = is_subtype(&left, &right, &ctx, res)?;
-    let b = is_subtype(&right, &left, &ctx, res)?;
+    let a = match is_subtype(&left, &right, &ctx, res) {
+        Some(v) => v,
+        None => {
+            return None;
+        }
+    };
+    let b = match is_subtype(&right, &left, &ctx, res) {
+        Some(v) => v,
+        None => {
+            return None;
+        }
+    };
     if a || b {
         return Some(true);
     }
 
     // 7. get_possible_variants (meet.py:526-570).
-    let lv = get_possible_variants(&left, res, aliases)?;
-    let rv = get_possible_variants(&right, res, aliases)?;
+    let lv = match get_possible_variants(&left, res, aliases) {
+        Some(v) => v,
+        None => {
+            return None;
+        }
+    };
+    let rv = match get_possible_variants(&right, res, aliases) {
+        Some(v) => v,
+        None => {
+            return None;
+        }
+    };
     if lv.len() > 1 || rv.len() > 1 || is_type_var_like(&left) || is_type_var_like(&right) {
         for l in &lv {
             for r in &rv {
-                if overlap_impl(
+                let _ov_res = overlap_impl(
                     l,
                     r,
                     strict_optional,
@@ -342,8 +375,15 @@ fn overlap_impl(
                     res,
                     aliases,
                     depth + 1,
-                )? {
-                    return Some(true);
+                );
+                {
+                    match _ov_res {
+                        Some(true) => return Some(true),
+                        Some(false) => {}
+                        None => {
+                            return None;
+                        }
+                    }
                 }
             }
         }
@@ -370,8 +410,18 @@ fn overlap_impl(
             )
         });
     }
-    let tdp = typed_dict_mapping_pair(&left, &right, res)?;
-    let tdp2 = typed_dict_mapping_pair(&right, &left, res)?;
+    let tdp = match typed_dict_mapping_pair(&left, &right, res) {
+        Some(v) => v,
+        None => {
+            return None;
+        }
+    };
+    let tdp2 = match typed_dict_mapping_pair(&right, &left, res) {
+        Some(v) => v,
+        None => {
+            return None;
+        }
+    };
     if tdp || tdp2 {
         let overlapping_inner = &|a: &Type, b: &Type| -> Option<bool> {
             overlap_impl(
@@ -398,7 +448,7 @@ fn overlap_impl(
 
     // 10. Tuples (meet.py:600-610).
     if is_tuple(&left) && is_tuple(&right) {
-        return are_tuples_overlapping(&left, &right, &|a, b| {
+        let r = are_tuples_overlapping(&left, &right, &|a, b| {
             overlap_impl(
                 a,
                 b,
@@ -410,14 +460,25 @@ fn overlap_impl(
                 depth + 1,
             )
         });
+        return r;
     }
     let left = if matches!(left, Type::TupleType { .. }) {
-        tuple_fallback(&left, res)?
+        match tuple_fallback(&left, res) {
+            Some(t) => t,
+            None => {
+                return None;
+            }
+        }
     } else {
         left
     };
     let right = if matches!(right, Type::TupleType { .. }) {
-        tuple_fallback(&right, res)?
+        match tuple_fallback(&right, res) {
+            Some(t) => t,
+            None => {
+                return None;
+            }
+        }
     } else {
         right
     };
@@ -451,7 +512,9 @@ fn overlap_impl(
             ) {
                 Some(true) => return Some(true),
                 Some(false) => {}
-                None => return None,
+                None => {
+                    return None;
+                }
             }
             match _type_object_overlap(
                 &right,
@@ -465,7 +528,9 @@ fn overlap_impl(
             ) {
                 Some(true) => return Some(true),
                 Some(false) => {}
-                None => return None,
+                None => {
+                    return None;
+                }
             }
             return Some(false);
         }
@@ -477,10 +542,18 @@ fn overlap_impl(
         // are_parameters_compatible via the shared callable_compat engine,
         // `is_compat = overlap` (meet.py:708-716, allow_partial_overlap);
         // defers (None) on generic parameters / meet_types merge.
-        let (lf, rf) = (
-            crate::callable_compat::arg_list_from_type(&left)?,
-            crate::callable_compat::arg_list_from_type(&right)?,
-        );
+        let lf = match crate::callable_compat::arg_list_from_type(&left) {
+            Some(x) => x,
+            None => {
+                return None;
+            }
+        };
+        let rf = match crate::callable_compat::arg_list_from_type(&right) {
+            Some(x) => x,
+            None => {
+                return None;
+            }
+        };
         if !lf.variables_empty || !rf.variables_empty {
             return None;
         }
@@ -556,7 +629,9 @@ fn overlap_impl(
         ) {
             Some(true) => return Some(true),
             Some(false) => {}
-            None => return None,
+            None => {
+                return None;
+            }
         }
         return crate::callable_compat::is_callable_compatible(
             &right,
@@ -575,6 +650,7 @@ fn overlap_impl(
         || matches!(right, Type::CallableType { .. }) && matches!(left, Type::Instance { .. })
     {
         // find_member("__call__") not ported -> defer.
+
         return None;
     }
     let left = if let Type::CallableType { fallback, .. } = &left {
@@ -795,7 +871,12 @@ fn are_typed_dicts_overlapping(
         let Some(r_val) = r_map.get(key) else {
             return Some(false);
         };
-        if !is_overlapping(&l_map[key], r_val)? {
+        if !match is_overlapping(&l_map[key], r_val) {
+            Some(v) => v,
+            None => {
+                return None;
+            }
+        } {
             return Some(false);
         }
     }
@@ -803,7 +884,12 @@ fn are_typed_dicts_overlapping(
         let Some(l_val) = l_map.get(key) else {
             return Some(false);
         };
-        if !is_overlapping(l_val, &r_map[key])? {
+        if !match is_overlapping(l_val, &r_map[key]) {
+            Some(v) => v,
+            None => {
+                return None;
+            }
+        } {
             return Some(false);
         }
     }
@@ -1237,8 +1323,18 @@ pub(crate) fn rust_is_overlapping_types(
     strict_optional: bool,
     resolver: &mut NativeTypeResolver,
 ) -> Option<bool> {
-    let left = decode_type(left_bytes)?;
-    let right = decode_type(right_bytes)?;
+    let left = match decode_type(left_bytes) {
+        Some(t) => t,
+        None => {
+            return None;
+        }
+    };
+    let right = match decode_type(right_bytes) {
+        Some(t) => t,
+        None => {
+            return None;
+        }
+    };
     overlap_impl(
         &left,
         &right,

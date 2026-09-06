@@ -704,6 +704,14 @@ fn tuple_length_inner(typ: &Type) -> Option<i64> {
 /// only returns the flat metadata so the wire format stays out of it.
 type ArgRow = (Option<String>, Option<i64>, bool);
 
+/// Return shape for the by-name / by-position arg queries:
+/// `(name, pos, required, ai)` with `ai` the index of the origin
+/// `arg_types` element the Python shim builds the `FormalArgument` from
+/// and `ai == -1` (`DECIDED_NONE`) meaning "Python returns None".
+type ArgRowN = (Option<String>, Option<i64>, bool, i64);
+
+const DECIDED_NONE: i64 = -1;
+
 /// `mypy.types.CallableType.formal_arguments` — walk arg_types/kinds/names
 /// and collect FormalArgument records, mirroring types.py:2446-2467.
 ///
@@ -748,21 +756,25 @@ fn formal_arguments_inner(arg_names: &[Option<String>], arg_kinds: &[i64]) -> Ve
 /// `mypy.types.CallableType.argument_by_name` — scan by name, mirroring
 /// types.py:2469-2484.
 ///
-/// Returns `None` (Python `None`) for a non-CallableType. For
-/// CallableType, returns `(name, pos, required)` or `None` when no match
-/// is found (including deferral to `try_synthesizing_arg_from_kwarg`).
+/// Row is `(name, pos, required, ai)`: `ai >= 0` is the index of the
+/// typing element in the live `arg_types` the Python shim builds the
+/// `FormalArgument` from (no second wire crossing); `ai == -1` is a
+/// decided None (Python returns None without re-scanning).
+/// Only a decode / shape mismatch defers (Python `None`).
 #[pyfunction]
 pub(crate) fn rust_callable_argument_by_name(
     type_bytes: &[u8],
     name: Option<String>,
-) -> PyResult<Option<ArgRow>> {
-    let name = match name {
-        Some(n) => n,
-        None => return Ok(None),
+) -> PyResult<Option<ArgRowN>> {
+    let Some(name) = name else {
+        // Python `argument_by_name(None)` returns None unconditionally.
+        return Ok(Some((None, None, false, DECIDED_NONE)));
     };
     let typ = match decode_type(type_bytes) {
         Some(t) => t,
-        None => return Ok(None),
+        None => {
+            return Ok(None);
+        }
     };
     let Type::CallableType {
         arg_names,
@@ -772,14 +784,6 @@ pub(crate) fn rust_callable_argument_by_name(
     else {
         return Ok(None);
     };
-    Ok(argument_by_name_inner(arg_names, arg_kinds, &name))
-}
-
-fn argument_by_name_inner(
-    arg_names: &[Option<String>],
-    arg_kinds: &[i64],
-    name: &str,
-) -> Option<ArgRow> {
     let mut seen_star = false;
     for i in 0..arg_names.len() {
         let kind = arg_kinds[i];
@@ -789,31 +793,43 @@ fn argument_by_name_inner(
         if kind_is_star(kind) {
             continue;
         }
-        if arg_names[i] == Some(name.to_string()) {
+        if arg_names[i].as_deref() == Some(name.as_str()) {
             let pos = if seen_star { None } else { Some(i as i64) };
-            return Some((Some(name.to_string()), pos, kind_is_required(kind)));
+            return Ok(Some((
+                Some(name.clone()),
+                pos,
+                kind_is_required(kind),
+                i as i64,
+            )));
         }
     }
-    // Try synthesizing from kwarg — defers here; Python fills from kw_arg.
-    None
+    // No named match: Python falls through to
+    // `try_synthesizing_arg_from_kwarg(name)` -> `kw_arg()` (first
+    // ARG_STAR2). Decide it here.
+    if let Some(k) = arg_kinds.iter().position(|&k| k == ARG_STAR2) {
+        return Ok(Some((Some(name.clone()), None, false, k as i64)));
+    }
+    // Decided None: no named match and no **kwargs to synthesize from.
+    Ok(Some((None, None, false, DECIDED_NONE)))
 }
 
-/// `mypy.types.CallableType.argument_by_position` — scan by position, mirroring
-/// types.py:2486-2499.
-///
-/// Returns `None` for a non-CallableType or when position is None.
+/// `mypy.types.CallableType.argument_by_position` — scan by position,
+/// mirroring types.py:2486-2499. Same `(name, pos, required, ai)` row
+/// shape as `rust_callable_argument_by_name`.
 #[pyfunction]
 pub(crate) fn rust_callable_argument_by_position(
     type_bytes: &[u8],
     position: Option<i64>,
-) -> PyResult<Option<ArgRow>> {
-    let pos = match position {
-        Some(p) => p,
-        None => return Ok(None),
+) -> PyResult<Option<ArgRowN>> {
+    let Some(pos) = position else {
+        // Python `argument_by_position(None)` returns None unconditionally.
+        return Ok(Some((None, None, false, DECIDED_NONE)));
     };
     let typ = match decode_type(type_bytes) {
         Some(t) => t,
-        None => return Ok(None),
+        None => {
+            return Ok(None);
+        }
     };
     let Type::CallableType {
         arg_names,
@@ -823,18 +839,38 @@ pub(crate) fn rust_callable_argument_by_position(
     else {
         return Ok(None);
     };
-    let pos_usize = pos as usize;
-    if pos_usize >= arg_names.len() {
-        // Try synthesizing from vararg — defers here; Python fills from var_arg.
+    if pos < 0 {
+        // Python negative-indexes arg_names/arg_kinds here; defer so
+        // the slow path reproduces that exactly instead of a `as
+        // usize` wraparound routing into vararg synthesis.
         return Ok(None);
     }
-    let name = arg_names[pos_usize].clone();
+    let pos_usize = pos as usize;
+    if pos_usize >= arg_names.len() {
+        // Python falls through to `try_synthesizing_arg_from_vararg`:
+        // `var_arg()` is the first ARG_STAR.
+        return Ok(var_arg_row(arg_kinds, pos));
+    }
     let kind = arg_kinds[pos_usize];
     if kind_is_positional(kind) {
-        Ok(Some((name, Some(pos), kind == ARG_POS)))
-    } else {
-        // Not purely positional — defer to try_synthesizing from vararg.
-        Ok(None)
+        return Ok(Some((
+            arg_names[pos_usize].clone(),
+            Some(pos),
+            kind == ARG_POS,
+            pos_usize as i64,
+        )));
+    }
+    // Not purely positional: same vararg synthesis fallback.
+    Ok(var_arg_row(arg_kinds, pos))
+}
+
+/// Build the `try_synthesizing_arg_from_vararg` decision row, or the
+/// decided-None row when the callable has no `*args`.
+fn var_arg_row(arg_kinds: &[i64], pos: i64) -> Option<ArgRowN> {
+    match arg_kinds.iter().position(|&k| k == ARG_STAR) {
+        Some(k) => Some((None, Some(pos), false, k as i64)),
+        // Decided None: no *args to synthesize from.
+        None => Some((None, None, false, DECIDED_NONE)),
     }
 }
 
@@ -1263,6 +1299,48 @@ mod tests {
         assert_eq!(
             callable_min_args_inner(&decode_type(&bytes).unwrap()),
             Some(2)
+        );
+    }
+
+    #[test]
+    fn test_argument_by_position_negative_defers() {
+        let t = Type::CallableType {
+            fallback: Box::new(Type::Instance {
+                type_ref: "builtins.function".to_string(),
+                args: vec![],
+                last_known_value: None,
+                extra_attrs: None,
+            }),
+            instance_type: None,
+            is_ellipsis_args: false,
+            implicit: false,
+            is_bound: false,
+            from_concatenate: false,
+            imprecise_arg_kinds: false,
+            unpack_kwargs: false,
+            from_type_type: false,
+            arg_types: vec![Type::NoneType, Type::NoneType, Type::NoneType],
+            arg_kinds: vec![ARG_POS, ARG_POS, ARG_STAR],
+            arg_names: vec![Some("a".to_string()), None, None],
+            ret_type: Box::new(Type::NoneType),
+            name: None,
+            variables: vec![],
+            type_guard: None,
+            type_is: None,
+            special_sig: None,
+        };
+        let bytes = encode(&t);
+        // Negative position: Python slow-path negative-indexes
+        // arg_names/arg_kinds; defer instead of a `as usize`
+        // wraparound routing into vararg synthesis.
+        assert_eq!(
+            rust_callable_argument_by_position(&bytes, Some(-1)).unwrap(),
+            None
+        );
+        // In-range positional positions stay decided.
+        assert_eq!(
+            rust_callable_argument_by_position(&bytes, Some(0)).unwrap(),
+            Some((Some("a".to_string()), Some(0), true, 0))
         );
     }
 
