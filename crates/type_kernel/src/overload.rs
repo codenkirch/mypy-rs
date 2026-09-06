@@ -13,6 +13,12 @@
 
 use pyo3::prelude::*;
 
+/// Wire values of the per-target instantiation-gate fact, shared with
+/// the Python shim `_typeobj_gate_flag_for_roc` (checkexpr.py).
+const TYPEOBJ_GATE_FAIL: i8 = 1;
+const TYPEOBJ_GATE_PASS: i8 = 0;
+const TYPEOBJ_GATE_UNREADABLE: i8 = -1;
+
 use crate::argmap;
 use crate::checkcall;
 use crate::checkexpr_functions;
@@ -95,12 +101,15 @@ fn encode_type(typ: &Type) -> Option<Vec<u8>> {
 /// `typeobj_gate_fails` mirrors, per target (same order as
 /// `targets_bytes`), the pre-argument instantiation-gate chain of
 /// `check_callable_call` (checkexpr.py:2843-2871) precomputed by the
-/// shim: 1 = Python's protocol/abstract gate emits a fail regardless of
-/// the arguments, so the item can never match (the target is skipped
-/// like Python's own `check_call`-emits-errors step); -1 = gate fact
-/// unreadable, position-identical to the old whole-call defer; 0 = the
-/// gates are inapplicable or pass, so the item is evaluable by the
-/// same pair machinery as any other CallableType. A missing entry (a
+/// shim:
+/// `TYPEOBJ_GATE_FAIL` = Python's protocol/abstract gate emits a fail
+/// regardless of the arguments, so the item can never match (the target
+/// is skipped like Python's own `check_call`-emits-errors step);
+/// `TYPEOBJ_GATE_UNREADABLE` = gate fact unreadable,
+/// position-identical to the old whole-call defer;
+/// `TYPEOBJ_GATE_PASS` = the gates are inapplicable or pass, so the
+/// item is evaluable by the same pair machinery as any other
+/// CallableType. A missing entry (a
 /// shorter vec than `targets_bytes`) or any unrecognized value also
 /// defers; unrecognized values never read as `0`. The presence of the
 /// parameter is the opt-in: callers that omit it (old-arity test
@@ -112,6 +121,11 @@ fn encode_type(typ: &Type) -> Option<Vec<u8>> {
 ///
 /// Returns `None` on decode failures, buffer OOB, or any "could not
 /// decide" signal. Rust NEVER decides "no match" or "ambiguous".
+///
+/// Wire values of the per-target instantiation-gate fact, shared with
+/// the Python shim `_typeobj_gate_flag_for_roc` (checkexpr.py):
+/// `TYPEOBJ_GATE_FAIL` = 1, `TYPEOBJ_GATE_PASS` = 0,
+/// `TYPEOBJ_GATE_UNREADABLE` = -1.
 #[pyfunction]
 #[pyo3(signature = (
     resolver,
@@ -208,13 +222,13 @@ pub fn rust_check_overload_call(
         match typeobj_gate_fails.as_deref() {
             None => {} // no fact list: caller opted out of gate arbitration
             Some(facts) => match facts.get(idx) {
-                Some(&1) => {
+                Some(&TYPEOBJ_GATE_FAIL) => {
                     continue;
                 }
-                Some(&-1) | None => {
+                Some(&TYPEOBJ_GATE_UNREADABLE) | None => {
                     return None; // gate fact unreadable -> whole-call defer
                 }
-                Some(&0) => {}
+                Some(&TYPEOBJ_GATE_PASS) => {}
                 Some(_) => {
                     return None; // unknown fact value -> defer, never guess evaluable
                 }
