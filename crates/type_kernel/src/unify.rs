@@ -531,7 +531,9 @@ pub(crate) fn unify_generic_callable_core(
         // The dispatched call proper-types its operand, so mirror the
         // expansion side effects first; `expand_top_aliases` `None`
         // (snapshot miss, variadic alias, cycle) defers the call.
-        if crate::subtypes::expand_top_aliases(right_ret, aliases, strict_optional).is_none() {
+        if crate::subtypes::expand_top_aliases(right_ret, &aliases.shared(), strict_optional)
+            .is_none()
+        {
             return UnifyOutcome::Defer;
         }
         match crate::constraints::infer_constraints_full_inner(
