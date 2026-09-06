@@ -100,7 +100,9 @@ fn encode_type(typ: &Type) -> Option<Vec<u8>> {
 /// like Python's own `check_call`-emits-errors step); -1 = gate fact
 /// unreadable, position-identical to the old whole-call defer; 0 = the
 /// gates are inapplicable or pass, so the item is evaluable by the
-/// same pair machinery as any other CallableType. The presence of the
+/// same pair machinery as any other CallableType. A missing entry (a
+/// shorter vec than `targets_bytes`) or any unrecognized value also
+/// defers; unrecognized values never read as `0`. The presence of the
 /// parameter is the opt-in: callers that omit it (old-arity test
 /// callers and any shim that has not been upgraded) keep the pre-41
 /// type-object whole-call defer. The enum-base early return
@@ -203,14 +205,20 @@ pub fn rust_check_overload_call(
         // Per-target instantiation-gate fact. 1 skips the target exactly
         // like Python's own arg-independent gate fail; -1 is
         // position-identical to the old whole-call defer.
-        match typeobj_gate_fails.as_deref().and_then(|f| f.get(idx)) {
-            Some(&1) => {
-                continue;
-            }
-            Some(&-1) => {
-                return None;
-            }
-            _ => {}
+        match typeobj_gate_fails.as_deref() {
+            None => {} // no fact list: caller opted out of gate arbitration
+            Some(facts) => match facts.get(idx) {
+                Some(&1) => {
+                    continue;
+                }
+                Some(&-1) | None => {
+                    return None; // gate fact unreadable -> whole-call defer
+                }
+                Some(&0) => {}
+                Some(_) => {
+                    return None; // unknown fact value -> defer, never guess evaluable
+                }
+            },
         }
 
         // Generic targets (own type variables) ride the constraint-solve

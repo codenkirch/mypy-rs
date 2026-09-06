@@ -19748,6 +19748,17 @@ class NativeOverloadCallSuite(Suite):
         take_b = self.fx.callable(self.fx.b, self.fx.str_type)
         assert self._call([typeobj, take_b], [self.fx.b], typeobj_gate_fails=[-1, 0]) is None
 
+    def test_typeobj_gate_missing_fact_defers(self) -> None:
+        # A fact list shorter than the target list, or an unrecognized
+        # fact value, must defer (never read as a passing fact).
+        typeobj = self.fx.callable_type(self.fx.a, self.fx.a)
+        assert self._call([typeobj], [self.fx.b], typeobj_gate_fails=[]) is None
+        take_b = self.fx.callable(self.fx.b, self.fx.str_type)
+        # First target rejected, second target has no fact: the search
+        # defers instead of reaching the fact-less item.
+        assert self._call([typeobj, take_b], [self.fx.str_type], typeobj_gate_fails=[0]) is None
+        assert self._call([typeobj], [self.fx.b], typeobj_gate_fails=[99]) is None
+
     def test_typeobj_gate_all_fail_no_match_defers(self) -> None:
         # All type-object items gate-failed and no other target matches:
         # the exhausted search defers (Rust never decides no-match).
