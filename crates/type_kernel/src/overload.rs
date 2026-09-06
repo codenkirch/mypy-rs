@@ -136,10 +136,16 @@ pub fn rust_check_overload_call(
     let nformals_hint = targets_bytes.len();
 
     // Decode all arg types once.
-    let arg_types: Vec<Type> = arg_types_bytes
+    let arg_types: Vec<Type> = match arg_types_bytes
         .iter()
         .map(|b| decode_type(b))
-        .collect::<Option<Vec<_>>>()?;
+        .collect::<Option<Vec<_>>>()
+    {
+        Some(v) => v,
+        None => {
+            return None;
+        }
+    };
 
     // Decode all targets once, validating shape. Callable targets (plain or
     // generic) stay; type-object fallbacks and non-callables defer whole call
@@ -267,7 +273,9 @@ fn evaluate_plain_target(
         target_names.clone(),
     ) {
         Some(m) => m,
-        None => return MatchDecision::Undecided,
+        None => {
+            return MatchDecision::Undecided;
+        }
     };
 
     // Step 4a: required formal with no mapped actual -> not a match.
@@ -373,6 +381,9 @@ fn evaluate_plain_target(
                             checkexpr_functions::get_proper_or_expand(it, resolver.alias_resolver())
                         })
                         .collect();
+                    if expanded.is_none() {
+                        return MatchDecision::Undecided;
+                    }
                     expanded.map(|new_items| Type::UnionType {
                         items: new_items,
                         uses_pep604_syntax: *uses_pep604_syntax,
@@ -422,14 +433,12 @@ fn evaluate_plain_target(
                     // A subtype-`false` may be overturned by context
                     // re-analysis (literal refinement, TypedDict checks,
                     // typevar instantiation); defer if any flip applies.
-                    if pair_flip_reason(actual_use, formal_use).is_some() {
+                    if let Some(_reason) = pair_flip_reason(actual_use, formal_use) {
                         return MatchDecision::Undecided;
                     }
                     return MatchDecision::No;
                 }
-                None => {
-                    return MatchDecision::Undecided;
-                }
+                None => return MatchDecision::Undecided,
             }
         }
     }
@@ -486,7 +495,9 @@ fn evaluate_generic_target(
         target_names,
     ) {
         Some(m) => m,
-        None => return MatchDecision::Undecided,
+        None => {
+            return MatchDecision::Undecided;
+        }
     };
 
     let solved_bytes = match checkcall::rust_solve_generic_call(
@@ -505,12 +516,16 @@ fn evaluate_generic_target(
         None,
     ) {
         Some(b) => b,
-        None => return MatchDecision::Undecided,
+        None => {
+            return MatchDecision::Undecided;
+        }
     };
 
     let solved = match decode_type(&solved_bytes) {
         Some(t) => t,
-        None => return MatchDecision::Undecided,
+        None => {
+            return MatchDecision::Undecided;
+        }
     };
 
     let Type::CallableType {

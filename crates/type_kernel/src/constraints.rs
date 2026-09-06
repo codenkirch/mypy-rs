@@ -178,9 +178,19 @@ pub(crate) fn rust_infer_constraints_full(
     infer_polymorphic: bool,
 ) -> Option<Vec<Vec<u8>>> {
     let mut tb = ReadBuffer::new(template_bytes);
-    let template = (read_type(&mut tb, None).ok())?;
+    let template = match read_type(&mut tb, None).ok() {
+        Some(t) => t,
+        None => {
+            return None;
+        }
+    };
     let mut ab = ReadBuffer::new(actual_bytes);
-    let actual = (read_type(&mut ab, None).ok())?;
+    let actual = match read_type(&mut ab, None).ok() {
+        Some(t) => t,
+        None => {
+            return None;
+        }
+    };
     // constraints.py:954 passes the ambient `type_state.infer_polymorphic`
     // faithfully; the tri-state mode hands it down through every nested
     // frame so the callable-vs-callable reverse gate sees what Python sees.
@@ -204,7 +214,12 @@ pub(crate) fn rust_infer_constraints_full(
     let mut out = Vec::with_capacity(constraints.len());
     for c in constraints {
         let mut b = WriteBuffer::new();
-        (c.write(&mut b).ok())?;
+        match c.write(&mut b) {
+            Ok(()) => {}
+            Err(_) => {
+                return None;
+            }
+        }
         out.push(b.into_bytes());
     }
     Some(out)
@@ -873,7 +888,8 @@ fn visit_instance_native(
                 template_args,
                 type_ref,
                 resolver,
-            )?;
+            );
+            let mapped = mapped?;
             let mut res = Vec::new();
             for (tvar, mapped_arg, inst_arg) in zip3(tvars_of(a_snap), &mapped, args) {
                 match tvar.2 {
@@ -901,7 +917,9 @@ fn visit_instance_native(
                         }
                     }
                     // ParamSpecType (kind 1): defer (needs Parameters slicing).
-                    1 => return None,
+                    1 => {
+                        return None;
+                    }
                     // TypeVarTupleType (kind 2): covariant-ish single direction.
                     2 => {
                         res.extend(push_inner(
@@ -924,7 +942,8 @@ fn visit_instance_native(
                 return None;
             }
             let template_ref = get_type_ref(template)?;
-            let mapped = map_instance_to_supertype(type_ref, args, template_ref, resolver)?;
+            let mapped = map_instance_to_supertype(type_ref, args, template_ref, resolver);
+            let mapped = mapped?;
             let mut res = Vec::new();
             for (tvar, template_arg, mapped_arg) in
                 zip3(tvars_of(template_snap), template_args, &mapped)
@@ -952,7 +971,9 @@ fn visit_instance_native(
                             )?);
                         }
                     }
-                    1 => return None,
+                    1 => {
+                        return None;
+                    }
                     2 => {
                         res.extend(push_inner(
                             template_arg.clone(),
@@ -1072,7 +1093,8 @@ fn visit_instance_protocol_supertype_native(
         return Some(vec![]);
     }
     // erased = erase_typevars(template) (constraints.py:1422).
-    let erased = erase_typevars_inner(template, None, &crate::erase_typevars::make_any())?;
+    let erased = erase_typevars_inner(template, None, &crate::erase_typevars::make_any());
+    let erased = erased?;
     let skip = vec!["__call__".to_string()];
     let ctx = SubtypeContext::default();
     let verdict = pyo3::Python::with_gil(|py| {
@@ -1178,14 +1200,18 @@ fn infer_constraints_from_protocol_members_native(
             Some(GetProtocolMemberResult::Found(t)) => Some(t),
             Some(GetProtocolMemberResult::NoneVal) => None,
             // Defer / no-answer: fall back to the pure-Python loop.
-            _ => return None,
+            _ => {
+                return None;
+            }
         };
         let temp = match get_protocol_member_inner(
             py, template, subtype, member, false, false, resolver,
         ) {
             Some(GetProtocolMemberResult::Found(t)) => Some(t),
             Some(GetProtocolMemberResult::NoneVal) => None,
-            _ => return None,
+            _ => {
+                return None;
+            }
         };
         let (inst, temp) = match (inst, temp) {
             (Some(i), Some(t)) => (i, t),
@@ -2548,14 +2574,15 @@ fn callable_vs_callable_native(
         t_ret_ref = ti;
         a_ret_ref = ai;
     }
-    let mut res = push_inner(
+    let res = push_inner(
         t_ret_ref.clone(),
         a_ret_ref.clone(),
         direction,
         resolver,
         aliases,
         strict_optional,
-    )?;
+    );
+    let mut res = res?;
 
     let param_spec = param_spec_of(t_args, t_kinds, t_names);
     if param_spec.is_none() {
@@ -2591,26 +2618,34 @@ fn callable_vs_callable_native(
             if unpack_present >= 0 && cactual_ps.is_none() {
                 // Re-normalize args to the tuple form and use the same
                 // helper as for tuple types (constraints.py:1698-1726).
-                let tuple_ref = tuple_fallback_ref_from_unpack(&t_args[unpack_present as usize])?;
+                let tuple_ref =
+                    match tuple_fallback_ref_from_unpack(&t_args[unpack_present as usize]) {
+                        Some(r) => r,
+                        None => {
+                            return None;
+                        }
+                    };
                 let template_types = repack_callable_args_wire(t_args, t_kinds, &tuple_ref)?;
                 let actual_types = repack_callable_args_wire(a_args, a_kinds, &tuple_ref)?;
-                res.extend(simple_unpack_native(
+                let simple_attempt = simple_unpack_native(
                     &template_types,
                     &actual_types,
                     neg_op(direction),
                     resolver,
                     aliases,
                     strict_optional,
-                )?);
+                )?;
+                res.extend(simple_attempt);
             } else {
-                res.extend(infer_callable_arguments_constraints_core(
+                let new_args = infer_callable_arguments_constraints_core(
                     &templ,
                     &cact,
                     direction,
                     resolver,
                     aliases,
                     strict_optional,
-                )?);
+                )?;
+                res.extend(new_args);
             }
         }
         if extras_fired {

@@ -524,7 +524,9 @@ pub(crate) fn unify_generic_callable_core(
             (Type::CallableType { ret_type: lr, .. }, Type::CallableType { ret_type: rr, .. }) => {
                 (lr, rr)
             }
-            _ => return UnifyOutcome::Defer,
+            _ => {
+                return UnifyOutcome::Defer;
+            }
         };
         // The dispatched call proper-types its operand, so mirror the
         // expansion side effects first; `expand_top_aliases` `None`
