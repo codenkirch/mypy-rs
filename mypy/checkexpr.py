@@ -1198,6 +1198,39 @@ def _try_native_normalize_callable(callee: ProperType) -> bool | None:
         return None
 
 
+def _typeobj_gate_flag_for_roc(t: CallableType) -> int:
+    """Per-target instantiation-gate flag for the roc overload seam.
+
+    Mirrors the pre-argument gate chain of `check_callable_call`
+    (checkexpr.py:2843-2871) as a scalar fact: a protocol class or an
+    abstract class without `fallback_to_any` emits a fail for the item
+    regardless of the arguments (`Type[...]` riders via `from_type_type`
+    are exempt), so that overload item can never match. Rust arbitrates
+    from these facts alone: 1 = the gates emit a fail (item never
+    matches), 0 = the gates are inapplicable or pass, -1 = a fact is
+    unreadable (the whole call defers, position-identical to the old
+    type-object whole-call defer). The decision-free reads here are the
+    same ones Python's own gate chain performs; nothing is re-decided
+    Rust-side, so a stale or partial type snapshot cannot invert a
+    first-match selection.
+    """
+    try:
+        if not t.is_type_obj():
+            return 0
+        info = t.type_object()
+        from_type_type = t.from_type_type
+        # Protocol and abstract gates pair up as an if/elif chain; either
+        # branch failing means the item is rejected, so one flag is enough
+        # for matching semantics (the message emission stays in Python).
+        if info.is_protocol and not from_type_type:
+            return 1
+        if info.is_abstract and not from_type_type and not info.fallback_to_any:
+            return 1
+        return 0
+    except (AttributeError, AssertionError, TypeError, ValueError):
+        return -1
+
+
 # Type of callback user for checking individual function arguments. See
 # check_args() below for details.
 ArgChecker: _TypeAlias = Callable[
@@ -4506,6 +4539,7 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
                     list(arg_names) if arg_names is not None else None,
                     self.chk.in_checked_function(),
                     type_state.infer_unions,
+                    [_typeobj_gate_flag_for_roc(t) for t in plausible_targets],
                 )
             except (AssertionError, NotImplementedError, ValueError, TypeError, IndexError):
                 native_idx = None
