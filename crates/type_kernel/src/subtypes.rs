@@ -2926,9 +2926,7 @@ fn visit_instance_nominal(
             }
             // Recursive is_subtype hit an unsupported variant. Don't
             // assume not-subtype (would give wrong answers); defer.
-            None => {
-                return None;
-            }
+            None => return None,
         }
     }
     Some(nominal)
@@ -4229,8 +4227,7 @@ pub(crate) fn rust_is_subtype(
         ignore_pos_arg_names,
         strict_concatenate,
     );
-    let answer = is_subtype(&left, &right, &ctx, resolver.resolver());
-    answer
+    is_subtype(&left, &right, &ctx, resolver.resolver())
 }
 
 /// `#[pyfunction]` entry: batch variant of `rust_is_subtype`.

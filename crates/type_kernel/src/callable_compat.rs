@@ -863,7 +863,9 @@ pub(crate) fn callables_compatible_with_ignore_return(
     // `are_parameters_compatible` reads.
     let (lf, rf) = match (callable_fields(left), callable_fields(right)) {
         (Some(l), Some(r)) => (l, r),
-        _ => return None,
+        _ => {
+            return None;
+        }
     };
 
     // type_guard / type_is mismatch pre-checks
@@ -878,18 +880,24 @@ pub(crate) fn callables_compatible_with_ignore_return(
     if let (Some(lg), Some(rg)) = (lf.type_guard, rf.type_guard) {
         match ctx_compat_is_subtype(ctx, resolver, lg, rg) {
             Some(false) => return Some(false),
-            None => return None,
+            None => {
+                return None;
+            }
             Some(true) => {}
         }
     } else if let (Some(li), Some(ri)) = (lf.type_is, rf.type_is) {
         match ctx_compat_is_subtype(ctx, resolver, li, ri) {
             Some(false) => return Some(false),
-            None => return None,
+            None => {
+                return None;
+            }
             Some(true) => {}
         }
         match ctx_compat_is_subtype(ctx, resolver, ri, li) {
             Some(false) => return Some(false),
-            None => return None,
+            None => {
+                return None;
+            }
             Some(true) => {}
         }
     } else if (rf.type_guard.is_some() && lf.type_guard.is_none())
@@ -921,11 +929,15 @@ pub(crate) fn callables_compatible_with_ignore_return(
         Some(vars) if !vars.is_empty() => {
             let left_norm = match crate::checkcall::normalize_callable(left) {
                 Ok(t) => t,
-                Err(_) => return None,
+                Err(_) => {
+                    return None;
+                }
             };
             let right_norm = match crate::checkcall::normalize_callable(right) {
                 Ok(t) => t,
-                Err(_) => return None,
+                Err(_) => {
+                    return None;
+                }
             };
             let aliases = match resolver.aliases() {
                 Some(shared) => crate::aliases::TypeAliasResolver::from_shared_view(shared),
@@ -941,7 +953,9 @@ pub(crate) fn callables_compatible_with_ignore_return(
             ) {
                 UnifyOutcome::Unified(t) => t,
                 UnifyOutcome::NoUnify => return Some(false),
-                UnifyOutcome::Defer => return None,
+                UnifyOutcome::Defer => {
+                    return None;
+                }
             };
             unified_right = Some(right_norm);
             &unified

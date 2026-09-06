@@ -1061,15 +1061,9 @@ fn solve_one_for_dependent(
     // UnionType.make_union(lowers) / single-upper top (solve.py:587-610)
     // mirror solve_one_inner exactly, so no special-casing is needed.
 
-    // Identity-bearing bounds: solving while a bound still holds a live
-    // TypeVar would leak it into a candidate.
-    if lowers
-        .iter()
-        .chain(filtered_uppers.iter())
-        .any(crate::visitor::has_type_vars_inner)
-    {
-        return Err(());
-    }
+    // Tvars in bounds are fine: Python solves with tvar-bearing bounds
+    // natively (solve.py:456) and substitutes owned occurrences later.
+    // The old has_type_vars defer here was over-conservative.
 
     let out = match solve_one_inner(
         lowers,
@@ -1084,7 +1078,7 @@ fn solve_one_for_dependent(
     match out {
         (0, Some(bytes)) | (1, Some(bytes)) | (3, Some(bytes)) => {
             let typ = decode_type(&bytes).ok_or(())?;
-            if wire_unsafe_solution(&typ, owned) {
+            if wire_unsafe_reason(&typ, owned).is_some() {
                 return Err(());
             }
             Ok(Some(typ))
@@ -1213,7 +1207,10 @@ fn solve_with_dependent_core(
         .collect::<Result<_, _>>()?;
     let owned: HashSet<TvId> = tvars.iter().cloned().collect();
     let (mut graph, mut lowers, mut uppers) =
-        transitive_closure(&tvars, constraints, resolver, strict_optional)?;
+        match transitive_closure(&tvars, constraints, resolver, strict_optional) {
+            Ok(x) => x,
+            Err(()) => return Err(()),
+        };
     let dmap = compute_dependencies(&tvars, &graph, &lowers, &uppers);
 
     let vertices: HashSet<TvId> = tvars.iter().cloned().collect();
@@ -1681,7 +1678,13 @@ pub(crate) fn solve_constraints_poly_native(
     all_vars.extend(extra_types);
     // Python reassigns `constraints` before both the solve and the
     // pre-validation (solve.py:242-244, 288).
-    let filtered = crate::constraints_filter::skip_reverse_union_kernel(constraints).ok_or(())?;
+    // Dependent solve over the filtered constraints (solve.py:255-261); it
+    // consumes `filtered` directly (Python's cmap is shared with the
+    // non-polymorphic branch, which this poly-only port does not implement).
+    let filtered = match crate::constraints_filter::skip_reverse_union_kernel(constraints) {
+        Some(f) => f,
+        None => return Err(()),
+    };
 
     // Dependent solve over the filtered constraints (solve.py:255-261); it
     // consumes `filtered` directly (Python's cmap is shared with the
@@ -1694,12 +1697,13 @@ pub(crate) fn solve_constraints_poly_native(
             infer_unions,
             strict_optional,
             r,
-        )? {
-            DependentSolve::EmptySolutions => (Vec::new(), Vec::new()),
-            DependentSolve::Solved {
+        ) {
+            Ok(DependentSolve::EmptySolutions) => (Vec::new(), Vec::new()),
+            Ok(DependentSolve::Solved {
                 solutions,
                 free_vars,
-            } => (solutions, free_vars),
+            }) => (solutions, free_vars),
+            Err(()) => return Err(()),
         }
     } else {
         (Vec::new(), Vec::new())
@@ -1724,14 +1728,17 @@ pub(crate) fn solve_constraints_poly_native(
             Some(a) => a,
             None => &empty,
         };
-        res = pre_validate_solutions_inner(
+        res = match pre_validate_solutions_inner(
             res,
             original_vars,
             &filtered,
             lookup,
             r,
             strict_optional,
-        )?;
+        ) {
+            Ok(x) => x,
+            Err(()) => return Err(()),
+        };
     }
     Ok(res)
 }
@@ -2888,8 +2895,10 @@ mod tests {
     }
 
     #[test]
-    fn dependent_noop_typevar_bound_defers() {
-        // A bound carrying a live TypeVar must still defer (identity).
+    fn dependent_noop_typevar_bound_solves_with_lowers() {
+        // A bound carrying a live TypeVar now solves natively: Python
+        // solve_one (solve.py:456) never deferred on tvar-bearing bounds
+        // (owned occurrences substitute later; no-op returns the union).
         let r = make_resolver(vec![snap("a.A")]);
         let lo = Type::UnionType {
             items: vec![instance("a.A", vec![]), tv_type(7, "T")],
@@ -2900,7 +2909,19 @@ mod tests {
             original_str_expr: None,
             original_str_fallback: None,
         };
-        let out = solve_one_for_dependent(&[lo], &[], false, true, &r, &HashSet::new());
+        let out = solve_one_for_dependent(&[lo.clone()], &[], false, true, &r, &HashSet::new());
+        assert_eq!(out, Ok(Some(lo)));
+    }
+
+    #[test]
+    fn dependent_owned_tvar_solution_defers() {
+        // A solution mentioning a tvar of the current solve scope still
+        // defers: the wire decode would replace the live identity with a
+        // doppelganger (wire_unsafe_reason "owned-tv").
+        let r = make_resolver(vec![snap("a.A")]);
+        let lo = tv_type(7, "T");
+        let owned: HashSet<TvId> = HashSet::from([(7, 1, "fn".to_string())]);
+        let out = solve_one_for_dependent(&[lo], &[], false, true, &r, &owned);
         assert_eq!(out, Err(()));
     }
 

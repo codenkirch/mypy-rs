@@ -750,8 +750,49 @@ fn validate_solve_call_entry(
 /// runs and unsatisfied type-variable values still get the
 /// "cannot be ..." error instead of being silently skipped.
 #[pyfunction]
+#[pyo3(signature = (
+    resolver,
+    callee_bytes,
+    arg_types_bytes,
+    arg_kinds,
+    formal_to_actual,
+    strict,
+    infer_unions,
+    strict_optional,
+    iterable_type = None,
+    mapping_type = None,
+))]
 #[allow(clippy::too_many_arguments)]
 pub fn rust_solve_generic_call(
+    py: Python<'_>,
+    resolver: &crate::typeinfo::NativeTypeResolver,
+    callee_bytes: &[u8],
+    arg_types_bytes: Vec<Vec<u8>>,
+    arg_kinds: Vec<i64>,
+    formal_to_actual: Vec<Vec<i64>>,
+    strict: bool,
+    infer_unions: bool,
+    strict_optional: bool,
+    iterable_type: Option<Vec<u8>>,
+    mapping_type: Option<Vec<u8>>,
+) -> Option<Vec<u8>> {
+    solve_generic_call_core(
+        py,
+        resolver,
+        callee_bytes,
+        arg_types_bytes,
+        arg_kinds,
+        formal_to_actual,
+        strict,
+        infer_unions,
+        strict_optional,
+        iterable_type,
+        mapping_type,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn solve_generic_call_core(
     _py: Python<'_>,
     resolver: &crate::typeinfo::NativeTypeResolver,
     callee_bytes: &[u8],
@@ -780,14 +821,24 @@ pub fn rust_solve_generic_call(
 
     // Decode the callee.
     let mut buf = crate::wire::ReadBuffer::new(callee_bytes);
-    let callee = crate::wire::read_type(&mut buf, None).ok()?;
+    let callee = match crate::wire::read_type(&mut buf, None) {
+        Ok(t) => t,
+        Err(_) => {
+            return None;
+        }
+    };
 
     let Type::CallableType { .. } = &callee else {
         return None;
     };
 
     // Step 1: Normalize (with_unpacked_kwargs + with_normalized_var_args).
-    let normalized = normalize_callable(&callee).ok()?;
+    let normalized = match normalize_callable(&callee) {
+        Ok(t) => t,
+        Err(_) => {
+            return None;
+        }
+    };
     let (formal_arg_types, formal_arg_kinds, formal_arg_names, variables) = match &normalized {
         Type::CallableType {
             arg_types,
@@ -796,7 +847,9 @@ pub fn rust_solve_generic_call(
             variables,
             ..
         } => (arg_types, arg_kinds, arg_names, variables),
-        _ => return None,
+        _ => {
+            return None;
+        }
     };
 
     // Defer on ParamSpec/TypeVarTuple variables — expand_type defers.
@@ -818,7 +871,6 @@ pub fn rust_solve_generic_call(
             crate::wire::read_type(&mut b2, None).ok()
         })
         .collect::<Option<Vec<_>>>()?;
-
     // ArgTypeExpander per-call state shared across all (formal, actual)
     // pairs, mirroring the single `mapper` instance Python builds
     // (constraints.py:627) plus its Iterable/Mapping context (checkexpr.py:3725).
@@ -859,19 +911,20 @@ pub fn rust_solve_generic_call(
                         expanded.push(at.clone());
                     }
                 }
-                if !expanded.is_empty() {
-                    let tuple_target = Type::TupleType {
-                        partial_fallback: Box::new(tuple_fallback.as_ref().clone()),
-                        items: expanded,
-                        implicit: false,
-                    };
-                    all_constraints.push(crate::constraints::Constraint {
-                        origin_type_var: unpack_inner.as_ref().clone(),
-                        op: crate::constraints::SUPERTYPE_OF,
-                        target: tuple_target,
-                        extra_tvars: Vec::new(),
-                    });
+                if expanded.is_empty() {
+                    return None;
                 }
+                let tuple_target = Type::TupleType {
+                    partial_fallback: Box::new(tuple_fallback.as_ref().clone()),
+                    items: expanded,
+                    implicit: false,
+                };
+                all_constraints.push(crate::constraints::Constraint {
+                    origin_type_var: unpack_inner.as_ref().clone(),
+                    op: crate::constraints::SUPERTYPE_OF,
+                    target: tuple_target,
+                    extra_tvars: Vec::new(),
+                });
             } else if let Type::TupleType { .. } = unpack_inner.as_ref() {
                 // *args: *Tuple[...] — not a TypeVarTuple.
                 // Each actual gets a constraint against the tuple element type.
@@ -890,13 +943,28 @@ pub fn rust_solve_generic_call(
             let actual_expanded;
             let actual_proper = match actual_type {
                 Type::TypeAliasType { .. } => {
-                    actual_expanded = crate::checkexpr_functions::get_proper_or_expand(
+                    actual_expanded = match crate::checkexpr_functions::get_proper_or_expand(
                         actual_type,
                         resolver.alias_resolver(),
-                    )?;
-                    get_proper_or_none(&actual_expanded)?
+                    ) {
+                        Some(e) => e,
+                        None => {
+                            return None;
+                        }
+                    };
+                    match get_proper_or_none(&actual_expanded) {
+                        Some(t) => t,
+                        None => {
+                            return None;
+                        }
+                    }
                 }
-                t => get_proper_or_none(t)?,
+                t => match get_proper_or_none(t) {
+                    Some(t) => t,
+                    None => {
+                        return None;
+                    }
+                },
             };
             // Star actuals (TupleType against `*args`) now expand through
             // the ArgTypeExpander port (constraints.py:751-758) instead of
@@ -921,17 +989,38 @@ pub fn rust_solve_generic_call(
                 resolver.alias_resolver(),
                 resolver.resolver(),
                 strict_optional,
-            )?;
+            );
+            let expanded = match expanded {
+                Some(e) => e,
+                None => {
+                    return None;
+                }
+            };
             let formal_expanded;
             let formal_proper = match formal_type {
                 Type::TypeAliasType { .. } => {
-                    formal_expanded = crate::checkexpr_functions::get_proper_or_expand(
+                    formal_expanded = match crate::checkexpr_functions::get_proper_or_expand(
                         formal_type,
                         resolver.alias_resolver(),
-                    )?;
-                    get_proper_or_none(&formal_expanded)?
+                    ) {
+                        Some(e) => e,
+                        None => {
+                            return None;
+                        }
+                    };
+                    match get_proper_or_none(&formal_expanded) {
+                        Some(t) => t,
+                        None => {
+                            return None;
+                        }
+                    }
                 }
-                t => get_proper_or_none(t)?,
+                t => match get_proper_or_none(t) {
+                    Some(t) => t,
+                    None => {
+                        return None;
+                    }
+                },
             };
             let constraints = crate::constraints::infer_constraints_full_inner(
                 formal_proper,
@@ -943,7 +1032,8 @@ pub fn rust_solve_generic_call(
                 false,
                 // Python `infer_constraints` wrapper default (constraints.py:802).
                 true,
-            )?;
+            );
+            let constraints = constraints?;
             all_constraints.extend(constraints);
         }
     }
