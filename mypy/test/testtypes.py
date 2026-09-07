@@ -25089,8 +25089,7 @@ class NativeConstraintsPolyGateSuite(Suite):
     def test_param_spec_target_keeps_variables_without_polymorphic(self) -> None:
         # With infer_polymorphic=False (old inference or tests), the target
         # keeps cactual.variables: parity must hold in that mode too. Pin
-        # ambient False so the differential runs the intended mode even on
-        # a worker whose ambient state was leaked True by an earlier suite.
+        # ambient False so the intended mode runs even after a leakage.
         self._polymorphic_off()
         p = ParamSpecType(
             "P",
@@ -37511,11 +37510,18 @@ class NativeMemberVarDispatchSuite(Suite):
         assert str(decoded) == "def (self: mod.Base) -> mod.Base"
 
     def test_seam_nontrivial_bind_defers(self) -> None:
-        # A plain (non-Decorator) var in the call_type gate has
-        # is_trivial_self False; the non-trivial bind path defers.
-        self._register_var(
-            self.base, "x", Instance(self.base, []), is_initialized_in_class=True, is_inferred=True
+        # An unbound callable class var with is_trivial_self False hits
+        # the non-trivial bind path, which defers; a non-callable class
+        # var in the gate is a no-op re-expansion and answers natively.
+        sig = CallableType(
+            [Instance(self.base, [])],
+            [ArgKind.ARG_POS],
+            ["self"],
+            Instance(self.base, []),
+            Instance(self.base, []),
+            is_bound=False,
         )
+        self._register_var(self.base, "x", sig, is_initialized_in_class=True, is_inferred=True)
         assert self._seam(Instance(self.info, []), "x") is None
 
     def test_seam_init_defers(self) -> None:
@@ -52574,3 +52580,299 @@ class NativeFormatAliasTopSuite(Suite):
         alias, node = self._make_alias(Instance(self.fx.std_listi, [self.fx.a]))
         self._rebuild_resolver([node])
         self._assert_format_par(UnionType([self.fx.a, alias]))
+
+
+class NativeAmaResidualSuite(Suite):
+    """Wave 46a residual deferrals on the ama seam (#1449).
+
+    Retires the var-arm is_self blanket defer and the enum head gate.
+    is_self narrows to a pure self_type test: a typevar-like proper
+    self_type substitutes mx.self_type (supported_self_type with
+    instances/callables disallowed), any other annotation leaves the
+    type unchanged. Enum vars run the full arm plus the literal-wrap /
+    nonmember-unwrap tail with a resolver-snapshot membership test.
+
+    Direct seam calls assert the exact result per branch; the gate-off
+    vs gate-on differential drives the real `_analyze_member_access`
+    through a stub MemberContext, comparing str equality.
+    """
+
+    def setUp(self) -> None:
+        from mypy.checkexpr import _set_native_plugin_hook_registry
+        from mypy.checkmember import (
+            _set_native_checkmember_active,
+            _set_native_checkmember_resolver,
+        )
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        self._set_active = _set_native_checkmember_active
+        self._set_resolver = _set_native_checkmember_resolver
+        self._set_plugin_hook = _set_native_plugin_hook_registry
+        self._set_plugin_hook(SimpleNamespace(has_hook_for=lambda kind, fullname: False), False)
+        self._set_active(True)
+        self.info = self._typeinfo("mod.A")
+        self.base = self._typeinfo("mod.Base")
+        self.info.bases = [Instance(self.base, [])]
+        self.info.mro = [self.info, self.base]
+        self.enum_info = self._typeinfo("mod.E")
+        self.enum_info.is_enum = True
+        # enum_members is a computed property over names, and the resolver
+        # snapshot captures it at build time: seed the members first.
+        for member in ("RED", "GREEN", "BLUE"):
+            var = Var(member, Instance(self.enum_info, []))
+            var.info = self.enum_info
+            var.is_initialized_in_class = True
+            var.has_explicit_value = True
+            self.enum_info.names[member] = SymbolTableNode(MDEF, var)
+        self.nonmember_info = self._typeinfo("enum.nonmember")
+        self.str_info = self._typeinfo("builtins.str")
+        self.bool_info = self._typeinfo("builtins.bool")
+        self.function_info = self._typeinfo("builtins.function")
+        self.object_info = self._typeinfo("builtins.object")
+        # A self-reference TypeVar on mod.A (var.info.self_type) plus an
+        # unrelated typevar standing in for mx.self_type; both ride the
+        # wire with the same upper_bound so expansions stay decidable.
+        self.info_inst = Instance(self.info, [])
+        self.self_tvar = TypeVarType(
+            "Self", "Self", TypeVarId(100), [], self.info_inst, AnyType(TypeOfAny.special_form)
+        )
+        self.info.self_type = self.self_tvar
+        self.other_tvar = TypeVarType(
+            "S", "S", TypeVarId(200), [], self.info_inst, AnyType(TypeOfAny.special_form)
+        )
+        self._live_map = {
+            "mod.A": self.info,
+            "mod.Base": self.base,
+            "mod.E": self.enum_info,
+            "enum.nonmember": self.nonmember_info,
+            "builtins.str": self.str_info,
+            "builtins.bool": self.bool_info,
+            "builtins.function": self.function_info,
+            "builtins.object": self.object_info,
+        }
+        self.resolver = _type_kernel.build_native_resolver(list(self._live_map.values()), [])
+        self.resolver.set_live_typeinfo_map(dict(self._live_map))
+        set_wire_typeinfo_map(dict(self._live_map))
+        self._set_resolver(self.resolver)
+
+    def tearDown(self) -> None:
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        self._set_plugin_hook(None, False)
+        self._set_resolver(None)
+        set_wire_typeinfo_map(None)
+        self._set_active(False)
+
+    def _with_gate(self, active: bool, fn: Callable[[], T]) -> T:
+        self._set_active(active)
+        try:
+            return fn()
+        finally:
+            self._set_active(True)
+
+    def _typeinfo(self, fullname: str = "mod.A") -> TypeInfo:
+        from mypy.nodes import Block, ClassDef, SymbolTable
+
+        defn = ClassDef(fullname.rsplit(".", 1)[-1], Block([]), None, [])
+        defn.fullname = fullname
+        info = TypeInfo(SymbolTable(), defn, "mod")
+        defn.info = info
+        info.mro = [info]
+        return info
+
+    def _register_var(
+        self,
+        info: TypeInfo,
+        name: str,
+        typ: Type | None,
+        *,
+        is_initialized_in_class: bool = False,
+    ) -> None:
+        var = Var(name, typ)
+        var.info = info
+        var.is_initialized_in_class = is_initialized_in_class
+        info.names[name] = SymbolTableNode(MDEF, var)
+
+    def _seam(
+        self,
+        instance: Instance,
+        name: str,
+        *,
+        is_operator: bool = False,
+        is_self: bool = False,
+        self_type: Type | None = None,
+        start_raw_id: int = 100,
+    ) -> Type | None:
+        from mypy.checkmember import (
+            _deserialize_type_for_checkmember,
+            _serialize_type_for_checkmember,
+        )
+
+        result = _type_kernel.rust_analyze_member_access(
+            self.resolver,
+            name,
+            _serialize_type_for_checkmember(instance),
+            _serialize_type_for_checkmember(self_type or instance),
+            False,  # is_lvalue
+            False,  # is_super
+            is_operator,
+            is_self,
+            False,  # preserve_type_var_ids
+            start_raw_id,
+            True,  # strict_optional
+            None,  # plugin (registry stub proves absence)
+        )
+        if result is None:
+            return None
+        _, changed, wire_bytes = result
+        del changed
+        decoded = _deserialize_type_for_checkmember(bytes(wire_bytes), freeze=True)
+        assert decoded is not None
+        return decoded
+
+    # --- direct seam tests: is_self substitute-vs-skip gate ---
+
+    def test_seam_is_self_typevar_substitutes(self) -> None:
+        # A typevar-like self_type is supported: the Self reference in the
+        # var type is substituted with mx.self_type.
+        self._register_var(self.info, "x", self.self_tvar)
+        decoded = self._seam(Instance(self.info, []), "x", is_self=True, self_type=self.other_tvar)
+        assert decoded is not None, "is_self with a typevar self_type must be native"
+        assert str(decoded) == "S"
+
+    def test_seam_is_self_instance_skips_substitution(self) -> None:
+        # An Instance self_type is not supported (allow_instances=False):
+        # the Self reference stays even though var.info.self_type is set.
+        self._register_var(self.info, "x", self.self_tvar)
+        decoded = self._seam(
+            Instance(self.info, []), "x", is_self=True, self_type=Instance(self.info, [])
+        )
+        assert decoded is not None, "is_self with an instance self_type must be native"
+        assert str(decoded) == "Self"
+
+    def test_seam_is_self_plain_var(self) -> None:
+        # The dominant shape: self.attr on a NamedTuple / plain class where
+        # the var does not reference Self. No substitution, plain expand.
+        self._register_var(self.info, "x", Instance(self.base, []), is_initialized_in_class=True)
+        decoded = self._seam(
+            Instance(self.info, []), "x", is_self=True, self_type=Instance(self.info, [])
+        )
+        assert decoded is not None, "is_self plain var access must be native"
+        assert str(decoded) == "mod.Base"
+
+    def test_seam_is_self_alias_defers(self) -> None:
+        # An alias self_type has no wire target, so the substitute-vs-skip
+        # decision defers and Python re-runs with live state.
+        from mypy.nodes import TypeAlias as NodeAlias
+
+        alias_node = NodeAlias(AnyType(TypeOfAny.special_form), "mod.X", "mod", 0, 0)
+        alias_type = TypeAliasType(alias_node, [])
+        self._register_var(self.info, "x", Instance(self.base, []))
+        assert self._seam(Instance(self.info, []), "x", is_self=True, self_type=alias_type) is None
+
+    # --- direct seam tests: enum tail ---
+
+    def test_seam_enum_member_wraps_literal(self) -> None:
+        decoded = self._seam(Instance(self.enum_info, []), "RED")
+        assert decoded is not None, "enum member access must be native"
+        proper = get_proper_type(decoded)
+        assert isinstance(proper, Instance)
+        assert proper.last_known_value is not None
+        lkv = proper.last_known_value
+        assert isinstance(lkv, LiteralType)
+        assert lkv.value == "RED"
+        assert str(decoded) == "Literal[mod.E.RED]?"
+
+    def test_seam_enum_name_value_skip_wrap(self) -> None:
+        # name/value members do not wrap: the result stays the var type.
+        self._register_var(self.enum_info, "value", Instance(self.str_info, []))
+        decoded = self._seam(Instance(self.enum_info, []), "value")
+        assert decoded is not None, "enum name/value access must be native"
+        assert str(decoded) == "str"
+
+    def test_seam_enum_nonmember_unwraps(self) -> None:
+        # A member typed `enum.nonmember[X]` unwraps to X on access.
+        self._register_var(
+            self.enum_info,
+            "x",
+            Instance(self.nonmember_info, [Instance(self.base, [])]),
+            is_initialized_in_class=True,
+        )
+        decoded = self._seam(Instance(self.enum_info, []), "x")
+        assert decoded is not None, "enum nonmember access must be native"
+        assert str(decoded) == "mod.Base"
+
+    def test_seam_enum_live_miss_defers(self) -> None:
+        # The enum tail reads enum_members from the live info; a class
+        # absent from the live map defers to Python.
+        ghost = self._typeinfo("mod.Ghost")
+        self._register_var(ghost, "y", Instance(self.base, []))
+        assert self._seam(Instance(ghost, []), "y") is None
+
+    # --- gate-off vs gate-on differential through the real function ---
+
+    def _stub_mx(
+        self, itype: Instance, *, is_self: bool = False, self_type: Type | None = None
+    ) -> Any:
+        from contextlib import nullcontext
+
+        from mypy.checkmember import MemberContext
+
+        msg = SimpleNamespace(
+            has_no_attr=lambda *a, **kw: 0,
+            filter_errors=lambda *a, **kw: nullcontext(),
+            cant_assign_to_method=lambda *a, **kw: None,
+            read_only_property=lambda *a, **kw: None,
+            cant_assign_to_classvar=lambda *a, **kw: None,
+        )
+        chk = SimpleNamespace(
+            warn_deprecated=lambda *a, **kw: None,
+            plugin=SimpleNamespace(get_attribute_hook=lambda fullname: None),
+            module_refs=set(),
+            msg=msg,
+            handle_partial_var_type=lambda *a, **kw: AnyType(TypeOfAny.special_form),
+            expr_checker=SimpleNamespace(
+                analyze_static_reference=lambda *a, **kw: AnyType(TypeOfAny.special_form)
+            ),
+            scope=SimpleNamespace(active_self_type=lambda: itype),
+            checking_missing_await=False,
+            checking_await_set=nullcontext(),
+            get_precise_awaitable_type=lambda *a, **kw: None,
+        )
+        return MemberContext(
+            is_lvalue=False,
+            is_super=False,
+            is_operator=False,
+            original_type=itype,
+            context=NameExpr("x"),
+            chk=cast(Any, chk),
+            self_type=self_type,
+            is_self=is_self,
+        )
+
+    def test_differential_is_self_substitution(self) -> None:
+        from mypy.checkmember import _analyze_member_access
+
+        self._register_var(self.info, "x", self.self_tvar)
+        receiver = self.self_tvar
+
+        def run() -> str:
+            mx = self._stub_mx(self.info_inst, is_self=True, self_type=self.other_tvar)
+            return str(_analyze_member_access("x", receiver, mx))
+
+        assert self._with_gate(False, run) == "S"
+        assert self._with_gate(True, run) == "S"
+
+    def test_differential_enum_member(self) -> None:
+        from mypy.checkmember import _analyze_member_access
+
+        receiver = Instance(self.enum_info, [])
+
+        def run() -> str:
+            mx = self._stub_mx(receiver)
+            return str(_analyze_member_access("RED", receiver, mx))
+
+        off = self._with_gate(False, run)
+        on = self._with_gate(True, run)
+        assert off == on, f"enum member gate mismatch: off={off!r} on={on!r}"
+        assert "RED" in off

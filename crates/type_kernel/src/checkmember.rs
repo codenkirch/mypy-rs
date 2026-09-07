@@ -2332,6 +2332,19 @@ pub(crate) fn rust_analyze_instance_member_dispatch(
     Some((next_raw_id, changed, encode_type(&result)?))
 }
 
+/// `supported_self_type(self_type, allow_instances=False,
+/// allow_callable=False)` (checkmember.py:985): a TypeType recurses on
+/// the item; a TypeVarType passes; instances, callables, other shapes
+/// fail. `None` when the proper type cannot be decided (alias without
+/// a snapshot).
+fn self_substitution_allowed(typ: &Type) -> Option<bool> {
+    match get_proper_or_none(typ)? {
+        Type::TypeType { item, .. } => self_substitution_allowed(item),
+        Type::TypeVarType { .. } => Some(true),
+        _ => Some(false),
+    }
+}
+
 /// Wire-portable var arm of the Instance member dispatch:
 /// `analyze_member_var_access` + `analyze_var` (checkmember.py:1235,
 /// 1759), the path Python takes when `get_method` misses or finds a
@@ -2346,11 +2359,12 @@ pub(crate) fn rust_analyze_instance_member_dispatch(
 /// (`None`) to the pure-Python body: `__init__` (guard + fail),
 /// deprecated decorators (`warn_deprecated` side effect), non-Var /
 /// non-Decorator nodes (module refs, synthesized static-reference Vars),
-/// enum classes (literal wrap / `enum.nonmember` unwrap), union or
-/// Overloaded `call_type` item loops, the non-trivial bind-self path,
-/// property-bearing `call_type` (Python's property-extract tail in
-/// `expand_and_bind_callable`), self-type expansion, partial or not-ready
-/// vars, a possible plugin hook, and descriptor `__get__`-bearing accesses.
+/// union or Overloaded `call_type` item loops, the non-trivial bind-self
+/// path, property-bearing `call_type` (Python's property-extract tail in
+/// `expand_and_bind_callable`), partial or not-ready vars, a possible
+/// plugin hook, and descriptor `__get__`-bearing accesses. The is_self
+/// substitution gate and the enum literal-wrap / nonmember-unwrap tail
+/// are decided natively.
 #[allow(clippy::too_many_arguments)]
 fn dispatch_var_member_inner(
     py: Python<'_>,
@@ -2368,16 +2382,9 @@ fn dispatch_var_member_inner(
     strict_optional: bool,
     plugin: Option<&PyAny>,
 ) -> Option<Type> {
-    // `mx.is_self` routes through expand_self_type / bind_self with live
-    // Var state (checkmember.py:1898): defer to the Python body.
-
-    // `mx.is_super` is excluded by the caller's non-super gate; keep
-    // the guard symmetric.
-    if is_self {
-        return None;
-    }
-    // Python fails `__init__` access on a non-final class before the var
-    // path runs (checkmember.py:738); keep the whole name in Python.
+    // expand_self_type_if_needed is the only is_self consumer in the var
+    // arm; its rebind branch is unreachable (analyze_var pre-maps itype)
+    // and is_self narrows to a self_type test at the expand gate below.
     if name == "__init__" {
         return None;
     }
@@ -2424,9 +2431,6 @@ fn dispatch_var_member_inner(
     let var_info_fullname: String = var_info.getattr("fullname").ok()?.extract().ok()?;
     let var_info_is_enum = get_bool_flag(py, var_info, "is_enum")?;
     let var_info_is_protocol = get_bool_flag(py, var_info, "is_protocol")?;
-    if var_info_is_enum {
-        return None;
-    }
     // expand_without_binding native gate (checkmember.py:1902): a Var whose
     // `self_type` is set and which is not a property now replaces Self with
     // mx.self_type via the env (expandtype.py:1345); unreadable defers.
@@ -2445,7 +2449,19 @@ fn dispatch_var_member_inner(
     } else {
         None
     };
-    let self_expand_arg = self_tvar_key.as_ref().map(|k| (k, self_type));
+    // is_self substitute-vs-skip gate: supported_self_type(self_type,
+    // allow_instances=False, allow_callable=False) picks the substitute
+    // branch; other self annotations skip it; undecidable shapes defer.
+    let self_ok = if is_self {
+        self_substitution_allowed(self_type)?
+    } else {
+        true
+    };
+    let self_expand_arg = if self_ok {
+        self_tvar_key.as_ref().map(|k| (k, self_type))
+    } else {
+        None
+    };
 
     // checkmember.py:1802 `itype = map_instance_to_supertype(itype,
     // var.info)`; a snapshot miss defers.
@@ -2598,7 +2614,13 @@ fn dispatch_var_member_inner(
                     }
                     result = t;
                 }
-                _ => return None,
+                // Python (checkmember.py:1887-1901): Overloaded and Union
+                // call_types defer (FunctionLike / per-item binds); other
+                // shapes re-expand the same inputs, a no-op vs the top.
+                Type::Overloaded { .. } | Type::UnionType { .. } => {
+                    return None;
+                }
+                _ => {}
             }
         }
     }
@@ -2621,6 +2643,39 @@ fn dispatch_var_member_inner(
         match p.call_method1("get_attribute_hook", (&fullname,)) {
             Ok(hook) if hook.is_none() => {}
             _ => return None,
+        }
+    }
+
+    // checkmember.py:1949-1960 enum tail: non-lvalue member access wraps
+    // the result in a Literal last_known_value (name/value skip the wrap),
+    // an `enum.nonmember` result unwraps; a missing live info defers.
+    if var_info_is_enum && !is_lvalue {
+        // Live read, not snapshot: the SCC-sealed snapshot enum_members
+        // can list members that later resolved to enum.nonmember or
+        // FunctionLike; the live property (nodes.py:4124) excludes them.
+        let live = resolver.live_typeinfo(py, &var_info_fullname)?;
+        let members = crate::typeinfo::read_str_list_attr(live, "enum_members")?;
+        let enum_member_hit =
+            name != "name" && name != "value" && members.iter().any(|m| m == name);
+        if enum_member_hit {
+            let enum_literal = Type::LiteralType {
+                fallback: Box::new(itype.clone()),
+                value: crate::wire::LiteralValue::Str(name.to_string()),
+            };
+            let args = match &itype {
+                Type::Instance { args, .. } => args.clone(),
+                _ => Vec::new(),
+            };
+            result = Type::Instance {
+                type_ref: var_info_fullname.clone(),
+                args,
+                last_known_value: Some(Box::new(enum_literal)),
+                extra_attrs: None,
+            };
+        } else if let Type::Instance { type_ref, args, .. } = get_proper_or_none(&result)? {
+            if type_ref == "enum.nonmember" && !args.is_empty() {
+                result = args[0].clone();
+            }
         }
     }
 
@@ -7558,5 +7613,127 @@ mod check_final_member_tests {
         // the shim's fallback reproduces the same output either way.
         let entries = vec![Some(true), None];
         assert_eq!(check_final_member_fold(entries.into_iter()), Some(true));
+    }
+}
+
+/// Pure self_type-shape tests for `self_substitution_allowed` (issue
+/// #1449): the is_self substitute-vs-skip gate of the var arm is a pure
+/// function of the self_type proper shape (TypeType recursion, TypeVar
+/// pass, everything else fail), mirroring `supported_self_type` with
+/// allow_instances=False / allow_callable=False.
+#[cfg(test)]
+mod self_substitution_tests {
+    use super::self_substitution_allowed;
+    use crate::wire::Type;
+
+    fn typevar() -> Type {
+        Type::TypeVarType {
+            name: "T".to_string(),
+            fullname: "T".to_string(),
+            raw_id: 1,
+            namespace: "mod.A".to_string(),
+            values: vec![],
+            upper_bound: Box::new(Type::Instance {
+                type_ref: "builtins.object".to_string(),
+                args: vec![],
+                last_known_value: None,
+                extra_attrs: None,
+            }),
+            default: Box::new(Type::TypeVarType {
+                name: "T".to_string(),
+                fullname: "T".to_string(),
+                raw_id: 1,
+                namespace: "mod.A".to_string(),
+                values: vec![],
+                upper_bound: Box::new(Type::UninhabitedType { ambiguous: false }),
+                default: Box::new(Type::UninhabitedType { ambiguous: false }),
+                variance: 0,
+                meta_level: 0,
+            }),
+            variance: 0,
+            meta_level: 0,
+        }
+    }
+
+    fn instance(type_ref: &str) -> Type {
+        Type::Instance {
+            type_ref: type_ref.to_string(),
+            args: vec![],
+            last_known_value: None,
+            extra_attrs: None,
+        }
+    }
+
+    #[test]
+    fn test_typevar_passes() {
+        assert_eq!(self_substitution_allowed(&typevar()), Some(true));
+    }
+
+    #[test]
+    fn test_instance_fails() {
+        assert_eq!(self_substitution_allowed(&instance("mod.C")), Some(false));
+    }
+
+    #[test]
+    fn test_typetype_of_typevar_passes() {
+        assert_eq!(
+            self_substitution_allowed(&Type::TypeType {
+                item: Box::new(typevar()),
+                is_type_form: false,
+            }),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn test_typetype_of_instance_fails() {
+        assert_eq!(
+            self_substitution_allowed(&Type::TypeType {
+                item: Box::new(instance("mod.C")),
+                is_type_form: false,
+            }),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn test_nested_typetype_recurses() {
+        let nested = Type::TypeType {
+            item: Box::new(Type::TypeType {
+                item: Box::new(typevar()),
+                is_type_form: false,
+            }),
+            is_type_form: false,
+        };
+        assert_eq!(self_substitution_allowed(&nested), Some(true));
+    }
+
+    #[test]
+    fn test_other_shapes_fail() {
+        for shape in [
+            Type::NoneType,
+            Type::UnionType {
+                items: vec![instance("mod.C"), Type::NoneType],
+                uses_pep604_syntax: false,
+                can_be_true: true,
+                can_be_false: true,
+                is_evaluated: true,
+                original_str_expr: None,
+                original_str_fallback: None,
+            },
+            Type::DeletedType { source: None },
+        ] {
+            assert_eq!(self_substitution_allowed(&shape), Some(false));
+        }
+    }
+
+    #[test]
+    fn test_undecidable_alias_defers() {
+        let alias = Type::TypeAliasType {
+            args: vec![],
+            type_ref: "mod.X".to_string(),
+            is_recursive: false,
+        };
+        assert_eq!(self_substitution_allowed(&alias), None);
     }
 }
