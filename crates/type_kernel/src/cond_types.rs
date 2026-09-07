@@ -445,7 +445,12 @@ pub(crate) fn conditional_types_inner(
                     )?;
                     return Some((default.cloned(), Some(restricted)));
                 }
-                _ => return None,
+                // Python's `if is_subtype(...)` falls through on False (the
+                // else-branch is only a restatement of the current type, so
+                // the shared narrowing tail below handles it exactly).
+                Some(false) => {}
+                // Undecided: defer and let the pure-Python body decide.
+                None => return None,
             }
         }
     }

@@ -52287,3 +52287,127 @@ class NativeVisitorBindSuite(Suite):
             assert t.has_type_vars(self.fx.o) is False
         finally:
             t._set_native_visitor_active(saved)
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeConditionalStructuralFalseSuite(Suite):
+    """Wave 46 (#1450): the structural-subtype fall-through in the Rust
+    `conditional_types` port.
+
+    Python's conditional_types uses `is_subtype(current, proposed)` in the
+    structural branch only as an `if` gate: on False it falls through to the
+    shared narrowing tail (equality erasure, overlap, restrict_subtype_away,
+    avoid-widening). The seam used to defer the whole call on any answer
+    except Some(true); a decided Some(false) now falls through exactly like
+    Python, and only an undecided check defers. The protocol below carries a
+    member `f` that class A lacks, so is_subtype(A, ProtoF) is a decided
+    False. Toggling the checker gate off (pure Python) and on (Rust seam)
+    must produce identical results; a direct seam call proves the seam
+    engages instead of deferring.
+    """
+
+    def setUp(self) -> None:
+        from mypy.checker import _set_native_checker_active, _set_native_checker_resolver
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        self.fx = TypeFixture()
+        type_infos = []
+        for name in dir(self.fx):
+            if not name.endswith("i"):
+                continue
+            value = getattr(self.fx, name)
+            if _is_type_info(value):
+                type_infos.append(value)
+        # The builtins the fixture skips (name does not end in "i") and the
+        # function TypeInfo fallback for CallableType shapes.
+        type_infos.extend([self.fx.str_type_info, self.fx.bool_type_info])
+        # A protocol carrying a member f that mod.A (fx.ai) lacks: a
+        # non-conforming protocol target for the structural branch.
+        self.proto_info = self.fx.make_type_info("mod.ProtoF", mro=[self.fx.oi])
+        self.proto_info.is_protocol = True
+        pinst = Instance(self.proto_info, [])
+        node = FuncDef("f", [], None, None)
+        node.info = self.proto_info
+        node.type = CallableType([pinst], [ARG_POS], [None], self.fx.a, self.fx.function)
+        node.line = 1
+        node.column = 1
+        self.proto_info.names["f"] = SymbolTableNode(MDEF, node)
+        type_infos.append(self.proto_info)
+        set_wire_typeinfo_map({info.fullname: info for info in type_infos})
+        self.resolver = _type_kernel.build_native_resolver(type_infos, [])
+        self._live_map = {info.fullname: info for info in type_infos}
+        self.resolver.set_live_typeinfo_map(dict(self._live_map))
+        _set_native_checker_active(True)
+        _set_native_checker_resolver(self.resolver)
+
+    def tearDown(self) -> None:
+        from mypy.checker import _set_native_checker_active, _set_native_checker_resolver
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        _set_native_checker_active(False)
+        _set_native_checker_resolver(None)
+        set_wire_typeinfo_map(None)
+
+    def _with_gate(self, active: bool, fn: Callable[[], T]) -> T:
+        from mypy.checker import _set_native_checker_active
+
+        _set_native_checker_active(active)
+        try:
+            return fn()
+        finally:
+            _set_native_checker_active(True)
+
+    def test_structural_false_protocol_target_engages(self) -> None:
+        # A does not implement ProtoF (it has no member f): the structural
+        # is_subtype is a decided False, so the seam falls through to the
+        # shared narrowing tail and returns a decision instead of None.
+        from mypy.checker import (
+            _serialize_type_for_checker,
+            _serialize_type_ranges,
+            conditional_types,
+        )
+
+        current = self.fx.a
+        ranges = [TypeRange(Instance(self.proto_info, []), False)]
+        off = self._with_gate(False, lambda: conditional_types(current, ranges, None))
+        on = self._with_gate(True, lambda: conditional_types(current, ranges, None))
+        assert_equal(
+            (str(off[0]), str(off[1])),
+            (str(on[0]), str(on[1])),
+            f"structural-False parity {current} vs ProtoF",
+        )
+        result = _type_kernel.rust_conditional_types(
+            _serialize_type_for_checker(current),
+            _serialize_type_ranges(ranges),
+            None,
+            True,
+            False,
+            state.strict_optional,
+            self.resolver,
+        )
+        assert (
+            result is not None
+        ), "structural-False conditional_types must engage (pre-wave-46 deferral)"
+        assert (str(off[0]), str(off[1])) == (str(on[0]), str(on[1]))
+
+    def test_structural_false_callable_current_parity(self) -> None:
+        # proposed is a CallableType; current is a CallableType that is
+        # neither a proper nor a structural subtype of it. Parity must hold
+        # through the fall-through tail.
+        from mypy.checker import conditional_types
+        from mypy.types import CallableType
+
+        current = CallableType(
+            [self.fx.str_type], [ARG_POS], [None], self.fx.a, self.fx.function
+        )
+        proposed = CallableType(
+            [self.fx.str_type], [ARG_POS], [None], self.fx.b, self.fx.function
+        )
+        ranges = [TypeRange(proposed, False)]
+        off = self._with_gate(False, lambda: conditional_types(current, ranges, None))
+        on = self._with_gate(True, lambda: conditional_types(current, ranges, None))
+        assert_equal(
+            (str(off[0]), str(off[1])),
+            (str(on[0]), str(on[1])),
+            f"structural-False callable parity {current} vs {proposed}",
+        )
