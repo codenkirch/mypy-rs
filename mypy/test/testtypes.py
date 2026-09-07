@@ -52411,3 +52411,166 @@ class NativeConditionalStructuralFalseSuite(Suite):
             (str(on[0]), str(on[1])),
             f"structural-False callable parity {current} vs {proposed}",
         )
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeFormatAliasTopSuite(Suite):
+    """Gate-on/off differential for the fmt:alias_top retirement (#1447).
+
+    `rust_format_type_bare` mirrors `format_type_bare` (messages.py:3298).
+    The TypeAliasType arm of the formatter now expands non-recursive
+    aliases through the alias snapshots (`get_proper_type`, line 3015)
+    instead of deferring every alias; recursive aliases (Python renders
+    the live alias name), aliases missing from the snapshot, and
+    unexpandable shapes (variadic aliases / substitution walls) still
+    defer, so the formatting stays byte-identical in both gates.
+    """
+
+    def setUp(self) -> None:
+        from mypy.messages import _set_native_messages_active, _set_native_messages_resolver
+        from mypy.options import Options
+        from mypy.test.typefixture import TypeFixture as _TypeFixture
+
+        self.fx = _TypeFixture()
+        self.options = Options()
+        self._set_active = _set_native_messages_active
+        self._set_resolver = _set_native_messages_resolver
+        self._rebuild_resolver([])
+        self._set_active(True)
+
+    def tearDown(self) -> None:
+        self._set_active(False)
+        self._set_resolver(None)
+
+    def _rebuild_resolver(self, aliases: list[Any]) -> None:
+        type_infos = []
+        for name in dir(self.fx):
+            if not name.endswith("i"):
+                continue
+            value = getattr(self.fx, name)
+            if _is_type_info(value):
+                type_infos.append(value)
+        self.resolver = _type_kernel.build_native_resolver(type_infos, aliases)
+        self._set_resolver(self.resolver)
+
+    def _with_gate(self, active: bool, fn: Callable[[], Any]) -> Any:
+        self._set_active(active)
+        try:
+            return fn()
+        finally:
+            self._set_active(True)
+
+    def _seam_bare(self, typ: Type, verbosity: int = 0) -> str | None:
+        from mypy.messages import _serialize_type_for_messages
+
+        return _type_kernel.rust_format_type_bare(
+            _serialize_type_for_messages(typ),
+            self.resolver,
+            verbosity,
+            False,
+            self.options.use_star_unpack(),
+        )
+
+    def _assert_format_par(self, typ: Type, verbosity: int = 0) -> None:
+        from mypy.messages import format_type_bare
+
+        off = self._with_gate(False, lambda: format_type_bare(typ, self.options, verbosity))
+        on = format_type_bare(typ, self.options, verbosity)
+        assert_equal(on, off, f"format_type_bare(alias) parity {typ}")
+
+    def _make_alias(
+        self,
+        target: Type,
+        fullname: str = "__main__.A",
+        *,
+        alias_tvars: list[Any] | None = None,
+    ) -> tuple[TypeAliasType, TypeAlias]:
+        from mypy.nodes import TypeAlias as _TypeAlias
+
+        node = _TypeAlias(target, fullname, "__main__", -1, -1, alias_tvars=alias_tvars)
+        return TypeAliasType(node, []), node
+
+    def test_non_recursive_expansion_parity(self) -> None:
+        # A = list[A]; the formatter expands to the target Instance and
+        # both gates emit "list[A]" byte-identically.
+        from mypy.messages import format_type_bare
+
+        alias, node = self._make_alias(Instance(self.fx.std_listi, [self.fx.a]))
+        self._rebuild_resolver([node])
+        self._assert_format_par(alias)
+        expected = self._with_gate(False, lambda: format_type_bare(alias, self.options))
+        assert_equal(self._seam_bare(alias), expected, "direct seam mismatch")
+
+    def test_generic_alias_substitution_parity(self) -> None:
+        # A[T] = list[T]; A[A] -> list[A] with the wire arg substituted.
+        from mypy.messages import format_type_bare
+
+        alias, node = self._make_alias(
+            Instance(self.fx.std_listi, [self.fx.t]), alias_tvars=[self.fx.t]
+        )
+        self._rebuild_resolver([node])
+        applied = TypeAliasType(node, [self.fx.a])
+        self._assert_format_par(applied)
+        expected = self._with_gate(False, lambda: format_type_bare(applied, self.options))
+        assert_equal(self._seam_bare(applied), expected, "direct seam mismatch")
+
+    def test_chain_alias_parity(self) -> None:
+        # A = B; B = list[A]: the chain resolves through both snapshots
+        # before formatting ("list[A]").
+        from mypy.messages import format_type_bare
+
+        b_target = Instance(self.fx.std_listi, [self.fx.a])
+        _, b_node = self._make_alias(b_target, "__main__.B")
+        b_ref = TypeAliasType(b_node, [])
+        a, a_node = self._make_alias(b_ref)
+        self._rebuild_resolver([a_node, b_node])
+        self._assert_format_par(a)
+        expected = self._with_gate(False, lambda: format_type_bare(a, self.options))
+        assert_equal(self._seam_bare(a), expected, "direct seam mismatch")
+
+    def test_verbosity_fullname_parity(self) -> None:
+        # verbosity >= 2 prints the expanded type with fullnames; the
+        # alias arm must pass verbosity through to the recursive format.
+        alias, node = self._make_alias(Instance(self.fx.std_listi, [self.fx.a]))
+        self._rebuild_resolver([node])
+        self._assert_format_par(alias, verbosity=2)
+
+    def test_recursive_alias_defers(self) -> None:
+        # A = list[A]: is_recursive is flagged on the wire; the seam has
+        # no display-name channel and must defer (Python renders "A").
+        from mypy.messages import format_type_bare
+
+        inner = TypeAliasType(None, [])
+        alias = TypeAlias(
+            Instance(self.fx.std_listi, [inner]), "__main__.A", "__main__", -1, -1
+        )
+        inner.alias = alias
+        alias._is_recursive = True
+        self._rebuild_resolver([alias])
+        assert self._seam_bare(inner) is None, "recursive alias must defer"
+        assert_equal(
+            self._with_gate(False, lambda: format_type_bare(inner, self.options)),
+            format_type_bare(inner, self.options),
+            "recursive alias parity",
+        )
+
+    def test_missing_snapshot_defers(self) -> None:
+        # The alias node is not in the resolver snapshot; the seam cannot
+        # expand and must defer (Python renders from the live node).
+        from mypy.messages import format_type_bare
+
+        alias, _ = self._make_alias(Instance(self.fx.std_listi, [self.fx.a]))
+        self._rebuild_resolver([])
+        assert self._seam_bare(alias) is None, "missing-snapshot alias must defer"
+        assert_equal(
+            self._with_gate(False, lambda: format_type_bare(alias, self.options)),
+            format_type_bare(alias, self.options),
+            "missing-snapshot alias parity",
+        )
+
+    def test_alias_within_union_parity(self) -> None:
+        # A non-recursive alias nested inside a union argument formats
+        # through the same arm during the recursive format.
+        alias, node = self._make_alias(Instance(self.fx.std_listi, [self.fx.a]))
+        self._rebuild_resolver([node])
+        self._assert_format_par(UnionType([self.fx.a, alias]))
