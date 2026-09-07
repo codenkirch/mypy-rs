@@ -1,41 +1,45 @@
 # Handoff: strangler-fig Rust migration loop (seam-deferral reduction)
 
-*Written 2026-08-28, refreshed 2026-09-07 (post-wave43, #1446 + #1445 on
-main; wave 44 #1444 closed as a documented negative result, follow-up
-#1447 = wave 45). Goal: "migrate all python code to rust, really all",
+*Written 2026-08-28, refreshed 2026-09-07 (post-wave46: waves 45 (#1451)
+and 46a/b (#1452, #1453) on main; wave 44 #1444 closed as a documented
+negative result). Goal: "migrate all python code to rust, really all",
 pursued as the established measure -> file -> dispatch-agents ->
 process-PRs -> gate loop. This file is the resume point.*
 
-## Where main stands (2026-09-07, post-wave43)
+## Where main stands (2026-09-07, post-wave46)
 
-- `main` = `6f1f0d63a` (`perf(type_kernel): alias-map guard plus flatten
-  cut for wave 42 residue (#1442) (#1446)`), local ff'd to origin.
+- `main` = `4532c89b8` (`perf(type_kernel): wave 46 - retire ama
+  residual defers (#1449) (#1453)`), local ff'd to origin.
 - Phase state: F0 audit + F1 dual-write mirror + F2 read flip (slices
   1-10, #1393) all landed. F3 (#1397) write flip has Instance +
   CallableType splice ops; the planned tvar/union splice slice was
   profiled with `misc/f3s9_tvar_union.py` and came back EMPTY (zero
   per-field writes on a self-check) - dropped, do not build it.
-- Gates on the wave-42/43 merged head, per PR commit records: `cargo
-  fmt` + clippy -p mypy-type-kernel clean, 2,675 kernel unit tests /
-  11 ignored; testtypes differential 3,182 passed / 6 skipped; testcheck
-  8,144 passed / 69 skipped / 7 xfailed. Cold self-check clean.
-- Shared `.so` rebuilt + codesigned at `6f1f0d63a` content 2026-09-07
-  (`/private/tmp/mypy-rs-local-typekernel|resolver|ast`; the /tmp dirs
-  had been wiped, so all three extensions were rebuilt from scratch).
-- Survey (post-wave43, run 2026-09-07): 7,723,020 seam calls total
-  (was 7,735,729 post-wave41); top residual buckets by absolute
-  fallbacks: `rust_is_subtype` 25,576 @ 99% (~256),
-  `rust_infer_constraints_full` 21,374 @ 99% (~214),
-  `rust_solve_generic_call` 8,506 @ 98% (~170),
-  `rust_check_overload_call` 13,744 @ 99% (~137),
+- Gates on the wave-45/46 merged head, per PR commit records + CI:
+  `cargo fmt` + clippy -p mypy-type-kernel clean, 2,689 kernel unit
+  tests / 11 ignored (w46a; 7 new self_substitution_allowed tests);
+  testtypes 3,201 passed / 6 skipped; testcheck 8,144 / 69 / 7 exact;
+  cold self-check clean; pr-gate + parity + parity-typeops all pass.
+- Shared `.so` rebuilt + codesigned at `4532c89b8` content 2026-09-07
+  (`/private/tmp/mypy-rs-local-typekernel|resolver|ast`).
+- Survey (post-wave46, run 2026-09-07): 7,738,162 seam calls total
+  (was 7,723,020). Top residual buckets by absolute fallbacks:
+  `rust_is_subtype` 25,562 @ 99% (~256),
+  `rust_infer_constraints_full` 21,470 @ 99% (~215),
+  `rust_solve_generic_call` 8,521 @ 98% (~170),
+  `rust_check_overload_call` 13,779 @ 99% (~138),
   `rust_infer_function_type_arguments` 188 @ 30% (~132),
-  `rust_analyze_member_access` 12,303 @ 99% (~123),
-  `rust_remove_redundant_union_items` 10,099 @ 99% (~101),
-  `rust_conditional_types` 8,698 @ 99% (~87),
-  `rust_map_instance_to_supertype` 8,479 @ 99% (~85),
-  `rust_is_singleton_identity_type` 6,997 @ 99% (~70). st/icf/sgc
-  wrapper counts are FLAT vs wave 41 (wave-38 lesson: the wave-42/43
-  gains sit below wrapper granularity in the embedded engines).
+  `rust_analyze_member_access` 12,310 @ 99% (~123, contract floor per
+  the agent's embedded audit: 120 events; the taxonomy lives in project
+  memory `ama-residual-contract-floor.md`),
+  `rust_remove_redundant_union_items` 10,125 @ 99% (~101),
+  `rust_map_instance_to_supertype` 8,483 @ 99% (~85),
+  `rust_is_singleton_identity_type` 7,007 @ 99% (~70). COMPARED TO
+  post-wave43: every wrapper count is flat within noise EXCEPT
+  `rust_conditional_types` (8,698 @ ~87 -> off the top-22 list; the
+  wave-46b retirement IS wrapper-visible). Wave-45 (fmt) and wave-46a
+  (ama) gains are embedded-only - the wave-38 lesson again, so stop
+  ranking waves by wrapper movement; trust the embedded audit numbers.
 - Survey caveats (do not chase): `rust_is_subtype_batch` reports 228%
   and the total fallback line went NEGATIVE - per-decision counting
   artifacts; discount when ranking.
@@ -45,7 +49,7 @@ process-PRs -> gate loop. This file is the resume point.*
   `ocr review --from origin/main --to <branch> --audience agent`,
   then `gh pr merge --squash --admin` after pr-gate + parity green.
 
-## Waves 33-43 (since the 2026-08-31 refresh)
+## Waves 33-46 (since the 2026-08-31 refresh)
 
 | PR | Issue | What | Numbers |
 |----|-------|------|---------|
@@ -62,7 +66,10 @@ process-PRs -> gate loop. This file is the resume point.*
 | #1440 | #1439 | wave41: roc type-object targets decided through shim gate facts (per-target `_typeobj_gate_flag_for_roc` pre-argument instantiation-gate scalar on the opt-in `typeobj_gate_fails` seam), OCR round-1 fix (missing/unknown gate fact defers, `6060cb253`), round-2 advisory constants (`7c36ccb1f`); gen_solve 112 -> 89, dupcheck 79 -> 27; no_match/star/plain buckets by design; advisory: 1 pushed | roc 95.9 -> 99.1% native (563 -> 101 defers); testtypes 3,182/6; testcheck exact; clippy clean on head |
 | #1446 | #1442 | wave42: unify-engine residue - `FlatAliasGuard` restores the previous `FLAT_ALIASES` value on Drop (nesting-aware install per engine call); the union-flatten arm expands alias items through the live map; `flatten_union_expanding_aliases` walks with an active identity stack (re-entered (type_ref, args) defers the whole flatten, mirroring Python's lazy unroll, types.py:3855, pins testRecursiveAliasesJoins); `expand_top_aliases` takes the shared Arc alias snapshot directly, is_subtype entry checks `resolver.aliases()` explicitly; recursive-union alias targets keep the deliberate no-install behaviour | alias-expansion defer residue inside the st/icf/sgc engines retired; wrapper counts stayed flat (wave-38 lesson: below-wrapper granularity; post-wave43 survey confirms st ~256 / icf ~214 / sgc ~170 unchanged at wrapper level); gates exact (2675/11, 3182/6, 8144/69/7) |
 | #1445 | #1443 | wave43: retire decision-seam defers - by_name/by_position 4-tuple wire result now carries the formal's arg index (shim builds FormalArgument from the right slot instead of re-deriving; star-arg formals report index -1 and defer); rust_join_type_list three LKV retirements (same-ref args-less LKV of a plain class via the prejoin fresh Instance, LKV+extra_attrs dropped, join.py:392; LKV on distinct args-bearing instances + LKV nested in the signature stay deferred) | by_name 284 (was 82%), by_position 143 (was 68%) -> both 100% native; jtl 55 calls 45% -> 71% native; standing audited defers: ovl ~60, xbe ~50, jt 21, aa 20, fto 24, pc 8 |
-| - | #1444 | wave44: format/resolve-family seams (~260 defers) - DOCUMENTED NEGATIVE. fmt:needs_pretty retirement was implemented and measured (40 -> 0 bucket, bare pool 355 -> 115, distinctly 95% -> 99%) then REVERTED as provably unsound: the standalone pretty seam only fires when `get_func_def(tp) is None`, and the wire carries no FuncDef, so defined callables printed with an empty name; 25 testcheck callable-formatting tests failed. Post-revert tree byte-identical, gates green. Investigation record: /tmp/w44-investigation.md. Largest surviving fmt bucket (fmt:alias_top 42) moved to #1447 | negative result; follow-up #1447 (wave 45) |
+| - | #1444 | wave44: format/resolve-family seams (~260 defers) - DOCUMENTED NEGATIVE (see wave-45 row for the follow-up) | negative result; follow-up #1447 (wave 45) |
+| #1451 | #1447 | wave45: fmt:alias_top in format-type seams - non-recursive TypeAliasType expands through the alias snapshot (`expand_alias_for_format`: chain resolve + `no_args` instance-swap + tvar-arg substitution) and formats the expanded target byte-identically; recursive aliases / missing snapshot / cycle / variadic shapes defer (`<alias (unfixed)>` shape, wave-33 segfault guardrail: cycles via the `is_recursive` flag, never recursion). OCR: 1 blocking [bug] fixed by the orchestrator (zip truncation on snapshot arity mismatch -> arity guard defers; 2 pin unit tests) + advisory (redundant pre-lookup) applied in the same fix commit (#1440 precedent) | fmt alias defers 42 -> 0; testtypes 3,191/6; testcheck 8,144/69/7 exact |
+| #1452 | #1450 | wave46b: ct residual - `rust_conditional_types` structural-branch `Some(false)` now falls through like Python's `if is_subtype(...)`; only undecided engine shapes defer | 67 -> 29 defers (embedded); wrapper 8,650 calls @ 99.76%; cargo test 2,682/11; testtypes 3,184/6 (+2); testcheck exact |
+| #1453 | #1449 | wave46a: ama residual - is_self blanket defer retired (var-arm rebind branch unreachable; `analyze_var` pre-maps itype onto var.info, so is_self reduces to a pure self_type-shape test), enum head gate retired (full arm + literal-wrap/nonmember-unwrap tail with a LIVE `enum_members` read), latent non-callable `call_type` defer retired. OCR: 1 blocking [bug high] fixed by the agent (stale snapshot `enum_members` could list later-nonmember members -> live read), OCR runs 2-3 hit the tool file-read bug, run 4 clean (0 comments) | embedded 181 -> 120 events; wrapper 12,304 calls @ 99.0% (120 fallbacks) = contract floor (entry-miss 71, desc 22, plugin-hook 8, lvalue 8, bare-self-tvar 5, tuple-fb 3, overload-all 2, type-none 1; full taxonomy in project memory + PR body); cargo test 2,689/11; testtypes 3,201/6 (+10 NativeAmaResidualSuite); testcheck exact; CI parity/parity-typeops/pr-gate all pass |
 
 Closed alongside: #1412, #1393 (F2 complete), #1397 (F3 partial,
 Instance/CallableType only), #1300, #1418 (closed 2026-09-05 with the
@@ -73,28 +80,21 @@ close, PR body lacked the `Closes` line), #1424, #1425, #1426,
 #1435, #1436 (#1437 + manual close), #1437, #1439 (#1440
 auto-closed it), #1442 (#1446 auto-closed it), #1443 (#1445
 auto-closed it), #1444 (wave 44, closed by hand with the
-documented negative result), #1445, #1446.
+documented negative result), #1445, #1446, #1447 (#1451
+auto-closed it), #1449 (#1453 auto-closed it), #1450 (#1452
+auto-closed it), #1451, #1452, #1453.
 
 ## Open backlog (next waves; dispatch max ~2 port agents)
 
-1. **Wave 45 (#1447, open)**: `fmt:alias_top` 42 defers in the
-   format-type seams. Python messages.py:3003-3014 formats a
-   non-recursive TypeAliasType by expanding the target through
-   `get_proper_type` and formatting that; Rust needs the alias
-   snapshot (TypeResolver alias view from #1356) plus arg
-   substitution, with byte-identical output strings (format seams
-   must stay byte-identical, not just type-identical). Keep defers
-   for recursive aliases (`<alias (unfixed)>` shape) and missing
-   alias snapshot. Guardrail: wave 33 hit a recursive-alias segfault
-   here; cycles resolve via the `maybe_recursive` flag, not
-   recursion. Parked from wave 44: fmt:needs_pretty 40 (unsound
-   without shim-fact threading of FuncDef name/first_arg/
-   is_type_obj; priced high). Verified wave-44 instrumented buckets:
-   ct:join 19, fa:expand 21, fa:inner 28, icf:extras 27, icf:inner
-   239, ic 18, nwl 15, gpm 7, uma:item 1655 (per-item Python fill,
-   invisible to the wrapper share metric). Worktree
-   `perf/wave45-alias-top` exists (no commits yet); private scratch
-   dir per wave-44 (`/private/tmp/mypy-rs-local-tk-1444`).
+1. **Wave 47 (issue to file, dup-check first)**: audit the remaining
+   wrapper buckets from the post-wave46 survey (numbers in the survey
+   block above once refreshed): st ~250, icf ~215, sgc ~170, roc ~130,
+   ifta 188 @ ~30% (~130, un-audited rate outlier in checkcall), ct
+   residual ~29, rru ~100. Each has been audited at least once
+   (waves 39-46); expect the audit-first taxonomy to close more
+   not-planned than decidable; the ama seam is at its contract floor
+   (project memory `ama-residual-contract-floor.md` has the real
+   bucket table, do not re-audit blind).
 2. **#624**: meta Phase E1 - the `visit_*` decision-head program that
    unlocks the 50%-Rust milestone. The kernel branch/defer surface is
    exhausted (top rows 100%); this is the next structural front.
@@ -116,10 +116,14 @@ ports, overload-call fronts); the loop protocol below is unchanged.
    link-arg=dynamic_lookup`, cp to
    `/private/tmp/mypy-rs-local-typekernel/type_kernel.cpython-313-darwin.so`,
    `codesign -f -s - /private/tmp/mypy-rs-local-typekernel/*.so`.
-2. Survey: `PYTHONPATH=/private/tmp/mypy-rs-local-typekernel:/private/tmp/mypy-rs-local-resolver:/private/tmp/mypy-rs-local-ast
+2. Survey: `PYTHONPATH=$PWD:/private/tmp/mypy-rs-local-typekernel:/private/tmp/mypy-rs-local-resolver:/private/tmp/mypy-rs-local-ast
    uv run --no-sync python scripts/measure_native_share.py > /tmp/survey.txt
    2>&1`; the per-seam table lands on stderr, rank non-100% lines by
-   absolute fallbacks (`calls * (1 - native%)`).
+   absolute fallbacks (`calls * (1 - native%)`). The leading `$PWD`
+   is REQUIRED: `uv run --no-sync` does not install the project, and
+   script mode puts `scripts/` (not the repo root) on sys.path, so
+   `import mypy` fails with ModuleNotFoundError without it (hit
+   2026-09-07).
 3. Dup-check (`gh issue list --state open --search ...`), file a
    conventional issue with the numbers + audit-first method.
 4. Dispatch max ~2 coder agents per wave with the full workflow
@@ -180,3 +184,10 @@ ports, overload-call fronts); the loop protocol below is unchanged.
 - OCR: GH `ocr-review` is stuck `queued` forever (runner 403, #1249);
   the operative review gate is local `ocr review`, then pr-gate +
   parity green locally, then `--squash --admin`.
+- OCR tool bug: on large diffs the local ocr can fail with
+  `file_read failed: invalid line range: start_line N is greater than
+  end_line M` (hit 2026-09-07 on wave-45 first attempt and wave-46a
+  runs 2-3). It is resumable: rerun with `--resume <session-id>` (the
+  failure prints the session id), or just rerun fresh; the diff is
+  rerolled and the run usually succeeds. Do not treat the error as a
+  finding.
