@@ -442,6 +442,82 @@ fn format_key_list(keys: &[String], short: bool) -> String {
     }
 }
 
+/// Chain-expand a non-recursive `TypeAliasType` to its proper type,
+/// mirroring `get_proper_type`'s while loop (types.py:4171-4189) with
+/// `_expand_once` (types.py:472-500) per level: `no_args` aliases swap
+/// the raw applied args into the Instance target via `copy_modified`,
+/// generic aliases substitute through the declared-tvar env. Returns
+/// `None` (defer to Python, which re-runs on live nodes) on a snapshot
+/// miss, a non-Instance `no_args` target (Python asserts), a variadic
+/// alias, a substitution wall, or a cyclic chain (wave-33 guardrail:
+/// cycles must defer, never recurse, when the expander cannot close).
+fn expand_alias_for_format(typ: &Type, aliases: &dyn crate::aliases::AliasLookup) -> Option<Type> {
+    let mut current = typ.clone();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    loop {
+        let (type_ref, cur_args) = match &current {
+            Type::TypeAliasType {
+                type_ref,
+                args,
+                is_recursive: _,
+            } => (type_ref.clone(), args.clone()),
+            _ => return Some(current),
+        };
+        if !seen.insert(type_ref.clone()) {
+            return None;
+        }
+        let snap = aliases.get(&type_ref)?;
+        if snap.tvar_tuple_index.is_some() {
+            // Variadic args need split_with_prefix_and_suffix
+            // (types.py:490-498); defer rather than zip them wrong.
+            return None;
+        }
+        let mut buf = ReadBuffer::new(&snap.target);
+        let target = crate::wire::read_type(&mut buf, None).ok()?;
+        if snap.no_args {
+            // `_expand_once` (types.py:474-478): asserts an Instance
+            // target and swaps the raw applied args in.
+            let Type::Instance {
+                type_ref: iref,
+                last_known_value,
+                extra_attrs,
+                ..
+            } = &target
+            else {
+                return None;
+            };
+            current = Type::Instance {
+                type_ref: iref.clone(),
+                args: cur_args,
+                last_known_value: last_known_value.clone(),
+                extra_attrs: extra_attrs.clone(),
+            };
+            continue;
+        }
+        // Arity guard: a mismatched tvar/arg count on a stale snapshot
+        // would truncate in the zip and render an unmatched tvar; defer
+        // like every other invalid shape here.
+        if snap.alias_tvars.len() != cur_args.len() {
+            return None;
+        }
+        if snap.alias_tvars.is_empty() {
+            current = target;
+            continue;
+        }
+        // zip(alias_tvars, cur_args) env, mirroring the mapping in
+        // `_expand_once` (types.py:485-489).
+        let mut env: std::collections::HashMap<crate::expandtype::EnvKey, Type> =
+            std::collections::HashMap::new();
+        for (tv, arg) in snap.alias_tvars.iter().zip(cur_args.iter()) {
+            env.insert(
+                (tv.raw_id, tv.meta_level, tv.namespace.clone()),
+                arg.clone(),
+            );
+        }
+        current = crate::expandtype::expand_type_inner(&target, &env, true)?;
+    }
+}
+
 // ---------------------------------------------------------------------------
 // format_type_inner — the core type formatter (messages.py:2649)
 // ---------------------------------------------------------------------------
@@ -461,24 +537,35 @@ fn format_type_inner(
     use_pretty_callable: bool,
     use_star_unpack: bool,
 ) -> Option<String> {
-    // TypeAliasType recursive case (messages.py:2698-2708).
+    // TypeAliasType (messages.py:3003-3015): recursive aliases render
+    // from the live alias node (the wire has no display name, so they
+    // defer); the rest fall through to get_proper_type chain expansion.
     if let Type::TypeAliasType {
         type_ref,
         args,
-        is_recursive: _,
+        is_recursive,
     } = typ
     {
-        // The wire format carries type_ref but no resolved alias node.
-        // messages.py checks `typ.is_recursive` and `typ.alias`.
-        // Without the resolved alias, we can't determine is_recursive
-
-        // or alias.name. Return None to defer to Python.
-        let _ = (type_ref, args, py);
-        return None;
+        if *is_recursive {
+            let _ = (type_ref, args, py);
+            return None;
+        }
+        // Snapshot miss / cycle / unsubstitutable shape: the expander
+        // defers (None) and Python re-runs the live-node expansion,
+        // keeping the string byte-identical.
+        let aliases = resolver.alias_resolver();
+        let expanded = expand_alias_for_format(typ, aliases)?;
+        return format_type_inner(
+            py,
+            &expanded,
+            verbosity,
+            module_names,
+            fullnames,
+            resolver,
+            use_pretty_callable,
+            use_star_unpack,
+        );
     }
-
-    // get_proper_type: unwrap TypeAliasType (already handled above).
-    // The wire format stores ProperType directly, so typ is already proper.
 
     match typ {
         Type::Instance {
@@ -3375,6 +3462,213 @@ mod tests {
             last_known_value: None,
             extra_attrs: None,
         }
+    }
+
+    fn wire_alias(args: Vec<Type>, type_ref: &str, is_recursive: bool) -> Type {
+        Type::TypeAliasType {
+            args,
+            type_ref: type_ref.to_string(),
+            is_recursive,
+        }
+    }
+
+    fn wire_tvar() -> Type {
+        Type::TypeVarType {
+            name: "T".to_string(),
+            fullname: "mod.T".to_string(),
+            raw_id: 1,
+            namespace: "".to_string(),
+            values: vec![],
+            upper_bound: Box::new(wire_instance("builtins.object", vec![])),
+            default: Box::new(wire_any()),
+            variance: 1,
+            meta_level: 0,
+        }
+    }
+
+    fn alias_snap(
+        fullname: &str,
+        target: &Type,
+        alias_tvars: Vec<crate::aliases::AliasTvar>,
+    ) -> crate::aliases::TypeAliasSnapshot {
+        let mut wbuf = crate::wire::WriteBuffer::new();
+        crate::wire::write_type(&mut wbuf, target).expect("serialize alias target");
+        crate::aliases::TypeAliasSnapshot {
+            fullname: fullname.to_string(),
+            target: wbuf.into_bytes(),
+            alias_tvars,
+            ..Default::default()
+        }
+    }
+
+    fn build_native(
+        type_snaps: Vec<crate::typeinfo::TypeInfoSnapshot>,
+        alias_snaps: Vec<crate::aliases::TypeAliasSnapshot>,
+    ) -> NativeTypeResolver {
+        let mut tr = TypeResolver::new();
+        for s in type_snaps {
+            tr.insert(s.fullname.clone(), s);
+        }
+        let mut ar = crate::aliases::TypeAliasResolver::new();
+        for s in alias_snaps {
+            ar.insert(s.fullname.clone(), s);
+        }
+        NativeTypeResolver::new(tr, ar)
+    }
+
+    fn format_with(resolver: &NativeTypeResolver, typ: &Type) -> Option<String> {
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|py| {
+            let fullnames: HashSet<String> = HashSet::new();
+            format_type_inner(py, typ, 0, false, &fullnames, resolver, true, false)
+        })
+    }
+
+    #[test]
+    fn test_format_alias_non_recursive_expands() {
+        // A = list[int]: non-recursive, no tvars -> expands to the
+        // target Instance and formats "list[int]" (#1447).
+        let target = wire_instance("builtins.list", vec![wire_instance("builtins.int", vec![])]);
+        let resolver = build_native(
+            vec![snap("builtins.list", "list"), snap("builtins.int", "int")],
+            vec![alias_snap("mod.A", &target, vec![])],
+        );
+        let input = wire_alias(vec![], "mod.A", false);
+        assert_eq!(format_with(&resolver, &input).as_deref(), Some("list[int]"));
+    }
+
+    #[test]
+    fn test_format_alias_generic_substitution() {
+        // A = list[T]; A[int] -> list[int]: the wire args substitute for
+        // the declared typevar before formatting.
+        let target = wire_instance("builtins.list", vec![wire_tvar()]);
+        let tvar = crate::aliases::AliasTvar {
+            name: "T".to_string(),
+            raw_id: 1,
+            ..Default::default()
+        };
+        let resolver = build_native(
+            vec![snap("builtins.list", "list"), snap("builtins.int", "int")],
+            vec![alias_snap("mod.A", &target, vec![tvar])],
+        );
+        let input = wire_alias(vec![wire_instance("builtins.int", vec![])], "mod.A", false);
+        assert_eq!(format_with(&resolver, &input).as_deref(), Some("list[int]"));
+    }
+
+    #[test]
+    fn test_format_alias_arity_mismatch_defers() {
+        // A = list[T] met with TWO wire args: the zip would truncate and
+        // render an unmatched tvar; the arity guard defers instead.
+        let target = wire_instance("builtins.list", vec![wire_tvar()]);
+        let tvar = crate::aliases::AliasTvar {
+            name: "T".to_string(),
+            raw_id: 1,
+            ..Default::default()
+        };
+        let resolver = build_native(
+            vec![snap("builtins.list", "list")],
+            vec![alias_snap("mod.A", &target, vec![tvar])],
+        );
+        let input = wire_alias(
+            vec![
+                wire_instance("builtins.int", vec![]),
+                wire_instance("builtins.str", vec![]),
+            ],
+            "mod.A",
+            false,
+        );
+        assert_eq!(format_with(&resolver, &input), None);
+    }
+
+    #[test]
+    fn test_format_alias_zero_tvars_with_args_defers() {
+        // A = list[int] (no tvars) met with an applied arg: the guard
+        // defers instead of silently dropping the surplus arg.
+        let target = wire_instance("builtins.list", vec![wire_instance("builtins.int", vec![])]);
+        let resolver = build_native(
+            vec![snap("builtins.list", "list")],
+            vec![alias_snap("mod.A", &target, vec![])],
+        );
+        let input = wire_alias(vec![wire_instance("builtins.int", vec![])], "mod.A", false);
+        assert_eq!(format_with(&resolver, &input), None);
+    }
+
+    #[test]
+    fn test_format_alias_chain_resolves() {
+        // A = B; B = list[int]: the chain resolves through both snapshots
+        // (get_proper_type's while loop) before formatting.
+        let target_b = wire_instance("builtins.list", vec![wire_instance("builtins.int", vec![])]);
+        let b_node = wire_alias(vec![], "mod.B", false);
+        let resolver = build_native(
+            vec![snap("builtins.list", "list"), snap("builtins.int", "int")],
+            vec![
+                alias_snap("mod.A", &b_node, vec![]),
+                alias_snap("mod.B", &target_b, vec![]),
+            ],
+        );
+        let input = wire_alias(vec![], "mod.A", false);
+        assert_eq!(format_with(&resolver, &input).as_deref(), Some("list[int]"));
+    }
+
+    #[test]
+    fn test_format_alias_recursive_defers() {
+        // Recursive aliases render from the live alias node in Python;
+        // the wire has no display-name channel, so the seam defers.
+        let resolver = build_native(vec![], vec![]);
+        let input = wire_alias(vec![], "mod.A", true);
+        assert_eq!(format_with(&resolver, &input), None);
+    }
+
+    #[test]
+    fn test_format_alias_missing_snapshot_defers() {
+        // No snapshot entry: the expansion cannot run, defer to Python.
+        let resolver = build_native(vec![], vec![]);
+        let input = wire_alias(vec![], "mod.Missing", false);
+        assert_eq!(format_with(&resolver, &input), None);
+    }
+
+    #[test]
+    fn test_format_alias_cycle_defers() {
+        // A -> A snapshot cycle: chain resolution must not loop; the
+        // wave-33 guardrail keeps the defer rather than a stack overflow.
+        let a_node = wire_alias(vec![], "mod.A", false);
+        let resolver = build_native(vec![], vec![alias_snap("mod.A", &a_node, vec![])]);
+        let input = wire_alias(vec![], "mod.A", false);
+        assert_eq!(format_with(&resolver, &input), None);
+    }
+
+    #[test]
+    fn test_format_alias_no_args_swaps_raw_args() {
+        // L = List (no_args, target list[Any]); L[int] -> list[int]:
+        // _expand_once swaps the raw applied args via copy_modified.
+        let target = wire_instance("builtins.list", vec![wire_any()]);
+        let mut s = alias_snap("mod.L", &target, vec![]);
+        s.no_args = true;
+        let resolver = build_native(
+            vec![snap("builtins.list", "list"), snap("builtins.int", "int")],
+            vec![s],
+        );
+        let input = wire_alias(vec![wire_instance("builtins.int", vec![])], "mod.L", false);
+        assert_eq!(format_with(&resolver, &input).as_deref(), Some("list[int]"));
+    }
+
+    #[test]
+    fn test_format_alias_variadic_defers() {
+        // A[*Ts] = tuple[*Ts]: the zip env cannot splice the variadic
+        // middle correctly, so the format seam defers to Python.
+        let target = wire_instance("builtins.tuple", vec![]);
+        let mut s = alias_snap("mod.A", &target, vec![]);
+        s.tvar_tuple_index = Some(0);
+        let resolver = build_native(vec![snap("builtins.tuple", "tuple")], vec![s]);
+        let input = wire_alias(
+            vec![
+                wire_instance("builtins.int", vec![]),
+                wire_instance("builtins.str", vec![]),
+            ],
+            "mod.A",
+            false,
+        );
+        assert_eq!(format_with(&resolver, &input), None);
     }
 
     fn wire_any() -> Type {
