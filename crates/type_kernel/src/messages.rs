@@ -494,6 +494,12 @@ fn expand_alias_for_format(typ: &Type, aliases: &dyn crate::aliases::AliasLookup
             };
             continue;
         }
+        // Arity guard: a mismatched tvar/arg count on a stale snapshot
+        // would truncate in the zip and render an unmatched tvar; defer
+        // like every other invalid shape here.
+        if snap.alias_tvars.len() != cur_args.len() {
+            return None;
+        }
         if snap.alias_tvars.is_empty() {
             current = target;
             continue;
@@ -544,10 +550,10 @@ fn format_type_inner(
             let _ = (type_ref, args, py);
             return None;
         }
-        // Snapshot miss / cycle / unsubstitutable shape: Python re-runs
-        // the live-node expansion, keeping the string byte-identical.
+        // Snapshot miss / cycle / unsubstitutable shape: the expander
+        // defers (None) and Python re-runs the live-node expansion,
+        // keeping the string byte-identical.
         let aliases = resolver.alias_resolver();
-        aliases.get(type_ref)?;
         let expanded = expand_alias_for_format(typ, aliases)?;
         return format_type_inner(
             py,
@@ -3547,6 +3553,44 @@ mod tests {
         );
         let input = wire_alias(vec![wire_instance("builtins.int", vec![])], "mod.A", false);
         assert_eq!(format_with(&resolver, &input).as_deref(), Some("list[int]"));
+    }
+
+    #[test]
+    fn test_format_alias_arity_mismatch_defers() {
+        // A = list[T] met with TWO wire args: the zip would truncate and
+        // render an unmatched tvar; the arity guard defers instead.
+        let target = wire_instance("builtins.list", vec![wire_tvar()]);
+        let tvar = crate::aliases::AliasTvar {
+            name: "T".to_string(),
+            raw_id: 1,
+            ..Default::default()
+        };
+        let resolver = build_native(
+            vec![snap("builtins.list", "list")],
+            vec![alias_snap("mod.A", &target, vec![tvar])],
+        );
+        let input = wire_alias(
+            vec![
+                wire_instance("builtins.int", vec![]),
+                wire_instance("builtins.str", vec![]),
+            ],
+            "mod.A",
+            false,
+        );
+        assert_eq!(format_with(&resolver, &input), None);
+    }
+
+    #[test]
+    fn test_format_alias_zero_tvars_with_args_defers() {
+        // A = list[int] (no tvars) met with an applied arg: the guard
+        // defers instead of silently dropping the surplus arg.
+        let target = wire_instance("builtins.list", vec![wire_instance("builtins.int", vec![])]);
+        let resolver = build_native(
+            vec![snap("builtins.list", "list")],
+            vec![alias_snap("mod.A", &target, vec![])],
+        );
+        let input = wire_alias(vec![wire_instance("builtins.int", vec![])], "mod.A", false);
+        assert_eq!(format_with(&resolver, &input), None);
     }
 
     #[test]
