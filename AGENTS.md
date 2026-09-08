@@ -2780,6 +2780,54 @@ including:
     ~20, ParamSpec floors. The protocol-member constraints engine
     plus the ambient `infer_polymorphic`/`extra_tvars` channel is a
     multi-wave effort (same class as the #1426 unify port); floor.
+- sgc/ct embedded defer audits, floor decisions (wave 48b, issue
+  #1462) documentation-only close, zero code change. Env-gated
+  defer-bucket audits on `solve_generic_call_core` (sgc) and
+  `conditional_types_inner` (ct) (`MYPY_TK_SGC1462_AUDIT` /
+  `MYPY_TK_CT1462_AUDIT`, instrumented cold self-check at
+  `-n0 --no-incremental` with `MYPY_NUM_WORKERS=0`; the atexit
+  dump must use `os.write`, `hard_exit` flushes stdout then
+  `os._exit`s and drops buffered output), stripped before landing
+  (tree verified bit-identical to origin/main `135402e70`). Result:
+  sgc 253 / ct 29 embedded defers, every bucket a documented
+  engine/wire/emission floor; no decidable port in either seam.
+  - sgc 253 (wrapper 9,086 calls @ 92.4% native; the `#1460`
+    survey count 251 reproduces as 253): `infer_constraints_defer`
+    173 (the icf engine walls ride the wave-47 icf taxonomy
+    unchanged: defaultdict-init ~40, Generator/SupportsNext ~105,
+    Overloaded-actual ~20, ParamSpec floors; the SUPERTYPE_OF
+    formal/actual pairs are already proper-expanded at sgc entry);
+    `apply_generic` 69 (`rust_apply_generic_arguments` None:
+    sub-audit shows `gtt_bound_report` 90 + `gtt_nomatch_report`
+    12 across all `skip_unsatisfied=false` callers, is_subtype
+    decided false and Python must emit the "cannot infer type
+    parameter" error, an error-emission side effect, not portable,
+    plus `ap_expand_args` 7 expand-type-inner walls; the same
+    apply path is shared with the wave-37/40 `unify.rs:580`
+    caller); `solve_defer` 7 (gen_solve floor, #1430 precedent);
+    `multi_lower_fnlike` 4 (wire loses nested FuncDef definitions
+    on a multi-lower join, documented in-code). Wrapper-level
+    floors: `lam_typevar` 463 (lambda arg whose context type
+    carries a callee tvar needs Python's two-pass inference, a
+    full algorithm not a decision; the biggest single sgc gate),
+    `need_refresh` 90 (ParamSpec/TVT callee, by design), rust-None
+    140, has_rec / dict_kwargs / deserialize 0.
+  - ct 29 (re-pinned on the current head; the `#1460` "ct (50)"
+    number is stale, the wave-46b 29 stands):
+    `concrete_sub_undecided` 14 (is_subtype None in the
+    concrete-proper-subtype branch; st floor classes. The branch
+    must not fall through to the narrowing tail on an undecided
+    verdict: Python's pure `is_proper_subtype` could decide true
+    and the results diverge);
+    `overlap` 13 (meet overlap-kernel floors: alias snapshot /
+    cycle, TypeVar shapes, the #1346 wave audit's
+    db-final-overlap class); `restrict_away_2` 2 (st/restrict
+    multi-step floor). Wrapper 8,659 @ 99.76% native; rust-None
+    21, wire-decode AssertionErrors 33 (checker-state dependent).
+  Resolution per #1455 precedent: one docs-only PR closes the
+  issue with the bucket tables; the next wave must not re-derive
+  the sgc/ct strata; any sgc/ct work is icf engine, st engine,
+  meet overlap, or emission-channel porting, not seam-local.
 - `rust_classify_type_range` (issue #1464 C1, mypy.checker) — mirrors the
   leaf-decision dispatch of `TypeChecker.get_type_range_of_type`
   (checker.py:10408). The `TypeVarType` upper-bound unroll and the
