@@ -28317,6 +28317,30 @@ class NativeEnumProtocolClassifierSuite(Suite):
         assert self._tk.rust_classify_protocol_test_callee(c, 2) is None
 
 
+class _BrokenFinalVar(Var):
+    """Var stand-in whose `is_final` read raises `exc`.
+
+    Built for the issue #1470 deferral + error-class pins: an
+    AttributeError on the read must defer (Ok(None)) so the shim re-runs
+    the pure-Python body, while any other exception must re-propagate
+    identically on both gates. `Var.is_final` is a plain attribute (set by
+    assignment in `__init__`, never read), so the override only fires when
+    the seam or the pure body reads it.
+    """
+
+    def __init__(self, name: str, exc: type[Exception] = AttributeError) -> None:
+        self._broken_exc = exc
+        super().__init__(name)
+        self.is_final = False
+
+    def __getattribute__(self, name: str) -> Any:
+        if name == "_broken_exc":
+            return super().__getattribute__(name)
+        if name == "is_final":
+            raise super().__getattribute__("_broken_exc")(name)
+        return super().__getattribute__(name)
+
+
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeFinalSuperSuite(Suite):
     """Parity for the Rust `check_compatibility_final_super` decision-head port.
@@ -28473,6 +28497,75 @@ class NativeFinalSuperSuite(Suite):
         self._assert_par(node_final, base, self._var("base_attr", False))
         # Non-final override of non-final base var: trailing pass, no message.
         self._assert_par(node_plain, base, self._var("base_attr", False))
+
+    def _run_once(
+        self, node: Any, base: Any, base_node: Any, *, active: bool
+    ) -> BaseException | None:
+        """Run the real method under exactly one gate; return the raise.
+
+        `_run` toggles both gates internally, which cannot observe a
+        raising base_node (the gate-off raise short-circuits it), so the
+        broken-var pins need a single-gate variant (issue #1470).
+        """
+        from types import SimpleNamespace
+
+        from mypy.checker import TypeChecker
+
+        def check_one() -> None:
+            chk = TypeChecker.__new__(TypeChecker)
+            msgs: list[tuple[str, str]] = []
+            chk.msg = SimpleNamespace(  # type: ignore[assignment]
+                cant_override_final=lambda n, bn, ctx: msgs.append(("cant_override", n)),
+                final_cant_override_writable=lambda n, ctx: msgs.append(("writable", n)),
+            )
+            chk.is_writable_attribute = lambda base_n: True  # type: ignore[assignment]
+            chk.check_compatibility_final_super(node, base, base_node)
+
+        try:
+            self._with_gate(active, check_one)
+            return None
+        except Exception as err:
+            return err
+
+    def test_seam_defers_on_unreadable_final(self) -> None:
+        # An `is_final` read raising AttributeError must defer (None) so the
+        # shim re-runs the pure-Python body (issue #1470 pin).
+        base_node = _BrokenFinalVar("base_attr")
+        assert self._tag(base_node, True, "attr", "mod.Base") is None
+
+    def test_seam_repropagates_non_attribute_error(self) -> None:
+        # A read raising RuntimeError must NOT be swallowed: the seam
+        # re-propagates it so genuine kernel bugs stay visible (issue #1470
+        # error-class boundary pin).
+        import pytest
+
+        base_node = _BrokenFinalVar("base_attr", RuntimeError)
+        with pytest.raises(RuntimeError):
+            self._tag(base_node, True, "attr", "mod.Base")
+
+    def test_par_unreadable_final(self) -> None:
+        # Both gates raise the identical AttributeError: gate-off is the pure
+        # body, gate-on defers the unreadable attribute to it (issue #1470).
+        node = self._var("node_attr", True)
+        base = self._base("mod.Base")
+        base_node = _BrokenFinalVar("base_attr")
+        off = self._run_once(node, base, base_node, active=False)
+        on = self._run_once(node, base, base_node, active=True)
+        assert isinstance(off, AttributeError), f"gate-off expected AttributeError: {off!r}"
+        assert isinstance(on, AttributeError), f"gate-on expected AttributeError: {on!r}"
+        assert str(off) == str(on), f"raise messages differ: {off!r} != {on!r}"
+
+    def test_par_repropagates_non_attribute_error(self) -> None:
+        # Both gates raise the identical RuntimeError: gate-off is the pure
+        # body, gate-on re-propagates it from the seam (issue #1470).
+        node = self._var("node_attr", True)
+        base = self._base("mod.Base")
+        base_node = _BrokenFinalVar("base_attr", RuntimeError)
+        off = self._run_once(node, base, base_node, active=False)
+        on = self._run_once(node, base, base_node, active=True)
+        assert isinstance(off, RuntimeError), f"gate-off expected RuntimeError: {off!r}"
+        assert isinstance(on, RuntimeError), f"gate-on expected RuntimeError: {on!r}"
+        assert str(off) == str(on), f"raise messages differ: {off!r} != {on!r}"
 
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
