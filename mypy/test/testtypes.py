@@ -52403,12 +52403,8 @@ class NativeConditionalStructuralFalseSuite(Suite):
         from mypy.checker import conditional_types
         from mypy.types import CallableType
 
-        current = CallableType(
-            [self.fx.str_type], [ARG_POS], [None], self.fx.a, self.fx.function
-        )
-        proposed = CallableType(
-            [self.fx.str_type], [ARG_POS], [None], self.fx.b, self.fx.function
-        )
+        current = CallableType([self.fx.str_type], [ARG_POS], [None], self.fx.a, self.fx.function)
+        proposed = CallableType([self.fx.str_type], [ARG_POS], [None], self.fx.b, self.fx.function)
         ranges = [TypeRange(proposed, False)]
         off = self._with_gate(False, lambda: conditional_types(current, ranges, None))
         on = self._with_gate(True, lambda: conditional_types(current, ranges, None))
@@ -52485,11 +52481,7 @@ class NativeFormatAliasTopSuite(Suite):
         assert_equal(on, off, f"format_type_bare(alias) parity {typ}")
 
     def _make_alias(
-        self,
-        target: Type,
-        fullname: str = "__main__.A",
-        *,
-        alias_tvars: list[Any] | None = None,
+        self, target: Type, fullname: str = "__main__.A", *, alias_tvars: list[Any] | None = None
     ) -> tuple[TypeAliasType, TypeAlias]:
         from mypy.nodes import TypeAlias as _TypeAlias
 
@@ -52547,9 +52539,7 @@ class NativeFormatAliasTopSuite(Suite):
         from mypy.messages import format_type_bare
 
         inner = TypeAliasType(None, [])
-        alias = TypeAlias(
-            Instance(self.fx.std_listi, [inner]), "__main__.A", "__main__", -1, -1
-        )
+        alias = TypeAlias(Instance(self.fx.std_listi, [inner]), "__main__.A", "__main__", -1, -1)
         inner.alias = alias
         alias._is_recursive = True
         self._rebuild_resolver([alias])
@@ -52681,12 +52671,7 @@ class NativeAmaResidualSuite(Suite):
         return info
 
     def _register_var(
-        self,
-        info: TypeInfo,
-        name: str,
-        typ: Type | None,
-        *,
-        is_initialized_in_class: bool = False,
+        self, info: TypeInfo, name: str, typ: Type | None, *, is_initialized_in_class: bool = False
     ) -> None:
         var = Var(name, typ)
         var.info = info
@@ -52876,3 +52861,133 @@ class NativeAmaResidualSuite(Suite):
         on = self._with_gate(True, run)
         assert off == on, f"enum member gate mismatch: off={off!r} on={on!r}"
         assert "RED" in off
+
+
+class NativeIftaDefinitionRestoreSuite(Suite):
+    """Wave 47 (#1455): ifta solution `definition` restoration.
+
+    The ifta seam decodes solution blobs from the kernel; a wire
+    CallableType carries `name` but not `definition`, and
+    `pretty_callable` (messages.py) renders `def <name>` from it when
+    `name` is None. `_restore_ifta_definitions` reattaches it from the
+    live actuals: a single lower keeps its own definition (Python
+    no-op solve returns the live object), a multi-lower join restores
+    the last sorted lower (the `join_type_list` seam invariant,
+    join.py), and star actuals skip (Python folds over expanded
+    definition-less lowers there).
+    """
+
+    def _typeinfo(self, fullname: str = "mod.A") -> TypeInfo:
+        from mypy.nodes import Block, ClassDef, SymbolTable
+
+        defn = ClassDef(fullname.rsplit(".", 1)[-1], Block([]), None, [])
+        defn.fullname = fullname
+        info = TypeInfo(SymbolTable(), defn, "mod")
+        defn.info = info
+        info.mro = [info]
+        return info
+
+    def setUp(self) -> None:
+        self.function_info = self._typeinfo("builtins.function")
+        self.int_info = self._typeinfo("builtins.int")
+        self.object_info = self._typeinfo("builtins.object")
+        self.tv = TypeVarType(
+            "T",
+            "T",
+            TypeVarId(1),
+            [],
+            Instance(self.object_info, []),
+            AnyType(TypeOfAny.from_omitted_generics),
+        )
+        self.callee = CallableType(
+            [self.tv],
+            [ARG_STAR],
+            [None],
+            Instance(self.object_info, []),
+            Instance(self.function_info, []),
+            name="<list>",
+            variables=[self.tv],
+        )
+
+    def _call(self, name: str, arg_name: str, definition: FuncDef | None) -> CallableType:
+        return CallableType(
+            [Instance(self.int_info, [])],
+            [ARG_NAMED],
+            [arg_name],
+            Instance(self.int_info, []),
+            Instance(self.function_info, []),
+            name=name,
+            definition=definition,
+        )
+
+    def _decoded(self) -> CallableType:
+        return CallableType(
+            [Instance(self.int_info, [])],
+            [ARG_NAMED],
+            ["y"],
+            Instance(self.int_info, []),
+            Instance(self.function_info, []),
+            name=None,
+        )
+
+    def _seam(
+        self,
+        solutions: list[Type | None],
+        pass1_args: list[Type | None],
+        arg_kinds: list[ArgKind],
+        formal_to_actual: list[list[int]],
+    ) -> list[Type | None] | None:
+        from mypy.checkexpr import _restore_ifta_definitions
+
+        return _restore_ifta_definitions(
+            solutions, self.callee, pass1_args, arg_kinds, formal_to_actual
+        )
+
+    def test_multi_lower_restores_last_sorted(self) -> None:
+        c1 = self._call("f1", "x", FuncDef("f1"))
+        c2 = self._call("f2", "y", FuncDef("f2"))
+        out = self._seam([self._decoded()], [c1, c2], [ARG_POS, ARG_POS], [[0, 1]])
+        assert out is not None
+        sol = get_proper_type(out[0])
+        assert isinstance(sol, CallableType)
+        assert sol.definition is c2.definition
+        assert sol.name is None
+
+    def test_single_lower_restores_lower(self) -> None:
+        c1 = self._call("f1", "x", FuncDef("f1"))
+        out = self._seam([self._decoded()], [c1], [ARG_POS], [[0]])
+        assert out is not None
+        sol = get_proper_type(out[0])
+        assert isinstance(sol, CallableType)
+        assert sol.definition is c1.definition
+
+    def test_star_actual_skips(self) -> None:
+        c1 = self._call("f1", "x", FuncDef("f1"))
+        c2 = self._call("f2", "y", FuncDef("f2"))
+        out = self._seam([self._decoded()], [c1, c2], [ARG_STAR, ARG_POS], [[0, 1]])
+        assert out is not None
+        sol = get_proper_type(out[0])
+        assert isinstance(sol, CallableType)
+        assert sol.definition is None
+
+    def test_source_without_definition_untouched(self) -> None:
+        c1 = self._call("f1", "x", None)
+        c2 = self._call("f2", "y", None)
+        out = self._seam([self._decoded()], [c1, c2], [ARG_POS, ARG_POS], [[0, 1]])
+        assert out is not None
+        sol = get_proper_type(out[0])
+        assert isinstance(sol, CallableType)
+        assert sol.definition is None
+
+    def test_non_callable_solution_untouched(self) -> None:
+        inst = Instance(self.int_info, [])
+        out = self._seam([inst], [inst], [ARG_POS], [[0]])
+        assert out is not None and out[0] is inst
+
+    def test_none_solution_untouched(self) -> None:
+        out = self._seam([None], [None], [ARG_POS], [[0]])
+        assert out is not None and out[0] is None
+
+    def test_malformed_shape_returns_none(self) -> None:
+        c1 = self._call("f1", "x", FuncDef("f1"))
+        assert self._seam([], [c1], [ARG_POS], [[0]]) is None

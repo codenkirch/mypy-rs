@@ -832,6 +832,35 @@ including:
   deferral. Exercised by the gate-on/off parity differential of the
   checkexpr suites in `mypy/test/testtypes.py` plus 40 pure unit tests
   in `checkcall.rs`.
+- `rust_infer_function_type_arguments` wire framing (issue #1455): fixed
+  the ifta solution-list output contract (solve.rs). The per-var
+  presence flags were written as raw `push(0|1)` bytes while the
+  Python reader (`_deserialize_optional_type_list`, checkexpr.py)
+  reads the count AND every flag via `mypy.cache.read_int`
+  (LITERAL_INT tag + bare int), so every non-deferred blob failed at
+  flag 0 and the seam delivered 0 true-native results despite the
+  survey reporting "~30% native" (non-None raw counted as native).
+  Flags are now `wire::write_int`. The decoder also runs
+  `fixup_wire_type` on each present solution (type_ref -> live
+  TypeInfo); without it, wire-decoded Instances crash downstream
+  subtype checks with "De-serialization failure: TypeInfo not fixed".
+  Wire-decoded solutions also lose the `definition` slot (the wire
+  CallableType carries `name` but not `definition`), and
+  `pretty_callable` (messages.py) renders `def <name>` from it when
+  `name` is None, so a native join of two named function types
+  rendered nameless (`testListLiteralWithNameOnlyArgsDoesNotEraseNames`
+  regression). `_restore_ifta_definitions` (checkexpr.py) reattaches
+  it from the live pass-1 actuals: a single lower keeps its own
+  definition (the Python no-op solve returns the live object), a
+  multi-lower join takes the last sorted lower (the `join_type_list`
+  seam invariant, join.py), and star actuals skip (Python folds over
+  expanded definition-less lowers). Cold self-check audit
+  (before/after): ifta 188 calls @ 0% true native -> 56 native
+  (~30%); residual defers: var_pspec_tvt 80 (ParamSpec/TypeVarTuple,
+  by design), engine 47, solve 5. Covered by the framing unit test in
+  `solve.rs` (`ifta_solution_list_flag_framing_roundtrips_read_int`),
+  `NativeIftaDefinitionRestoreSuite` in `mypy/test/testtypes.py`, and
+  the testcheck gate-on/off parity differential.
 - `rust_analyze_descriptor_access` (issue #1108) — reworked into a tag
   protocol mirroring the pure guard head of
   `analyze_descriptor_access` (checkmember.py:1376-1432). Rust returns
