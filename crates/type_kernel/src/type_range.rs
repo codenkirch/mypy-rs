@@ -17,6 +17,7 @@
 //! classified; the `builtins.type` `is_subtype` gate rides the `REST` tag
 //! and runs Python-side (it is already native via the subtype resolver).
 
+use pyo3::exceptions::PyAttributeError;
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyType};
 
@@ -108,72 +109,81 @@ pub(crate) fn rust_classify_type_range(
     py: Python<'_>,
     typ: &PyAny,
 ) -> PyResult<Option<(i64, bool)>> {
-    let fl_cls = types_class(py, "FunctionLike")?;
-    let tt_cls = types_class(py, "TypeType")?;
-    let any_cls = types_class(py, "AnyType")?;
-    let inst_cls = types_class(py, "Instance")?;
-    let none_cls = types_class(py, "NoneType")?;
+    let classify: PyResult<Option<(i64, bool)>> = (|| {
+        let fl_cls = types_class(py, "FunctionLike")?;
+        let tt_cls = types_class(py, "TypeType")?;
+        let any_cls = types_class(py, "AnyType")?;
+        let inst_cls = types_class(py, "Instance")?;
+        let none_cls = types_class(py, "NoneType")?;
 
-    if typ.is_instance(fl_cls)? {
-        let is_to = typ.call_method0("is_type_obj")?.extract::<bool>()?;
-        return Ok(Some(classify_type_range(
-            LeafKind::FunctionLike,
-            is_to,
+        if typ.is_instance(fl_cls)? {
+            let is_to = typ.call_method0("is_type_obj")?.extract::<bool>()?;
+            return Ok(Some(classify_type_range(
+                LeafKind::FunctionLike,
+                is_to,
+                false,
+                false,
+                "",
+                0,
+            )));
+        }
+        if typ.is_instance(tt_cls)? {
+            let item = typ.getattr("item")?;
+            let item_is_none = item.is_instance(none_cls)?;
+            let item_is_final = if item.is_instance(inst_cls)? {
+                item.getattr("type")?
+                    .getattr("is_final")?
+                    .extract::<bool>()?
+            } else {
+                false
+            };
+            return Ok(Some(classify_type_range(
+                LeafKind::TypeType,
+                false,
+                item_is_none,
+                item_is_final,
+                "",
+                0,
+            )));
+        }
+        if typ.is_instance(any_cls)? {
+            return Ok(Some(classify_type_range(
+                LeafKind::Any,
+                false,
+                false,
+                false,
+                "",
+                0,
+            )));
+        }
+        if typ.is_instance(inst_cls)? {
+            let fullname: String = typ.getattr("type")?.getattr("fullname")?.extract()?;
+            let args_len: usize = typ.getattr("args")?.len()?;
+            return Ok(Some(classify_type_range(
+                LeafKind::Instance,
+                false,
+                false,
+                false,
+                &fullname,
+                args_len,
+            )));
+        }
+        Ok(Some(classify_type_range(
+            LeafKind::Other,
+            false,
             false,
             false,
             "",
             0,
-        )));
+        )))
+    })();
+    // Contract (#1466): an unreadable attribute defers (None), other PyErrs
+    // stay visible so genuine kernel bugs surface in the parity tests.
+    match classify {
+        Ok(v) => Ok(v),
+        Err(e) if e.is_instance_of::<PyAttributeError>(py) => Ok(None),
+        Err(e) => Err(e),
     }
-    if typ.is_instance(tt_cls)? {
-        let item = typ.getattr("item")?;
-        let item_is_none = item.is_instance(none_cls)?;
-        let item_is_final = if item.is_instance(inst_cls)? {
-            item.getattr("type")?
-                .getattr("is_final")?
-                .extract::<bool>()?
-        } else {
-            false
-        };
-        return Ok(Some(classify_type_range(
-            LeafKind::TypeType,
-            false,
-            item_is_none,
-            item_is_final,
-            "",
-            0,
-        )));
-    }
-    if typ.is_instance(any_cls)? {
-        return Ok(Some(classify_type_range(
-            LeafKind::Any,
-            false,
-            false,
-            false,
-            "",
-            0,
-        )));
-    }
-    if typ.is_instance(inst_cls)? {
-        let fullname: String = typ.getattr("type")?.getattr("fullname")?.extract()?;
-        let args_len: usize = typ.getattr("args")?.len()?;
-        return Ok(Some(classify_type_range(
-            LeafKind::Instance,
-            false,
-            false,
-            false,
-            &fullname,
-            args_len,
-        )));
-    }
-    Ok(Some(classify_type_range(
-        LeafKind::Other,
-        false,
-        false,
-        false,
-        "",
-        0,
-    )))
 }
 
 #[cfg(test)]
