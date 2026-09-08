@@ -52991,3 +52991,277 @@ class NativeIftaDefinitionRestoreSuite(Suite):
     def test_malformed_shape_returns_none(self) -> None:
         c1 = self._call("f1", "x", FuncDef("f1"))
         assert self._seam([], [c1], [ARG_POS], [[0]]) is None
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeTypeRangeSuite(Suite):
+    """Gate-off vs gate-on parity for get_type_range_of_type (issue #1464 C1).
+
+    Runs TypeChecker.get_type_range_of_type on a stub checker (named_type
+    overridden so the REST is_subtype gate resolves) and asserts identical
+    (item, is_upper_bound) results with the native classifier off and on,
+    plus direct seam calls on the live proper types.
+    """
+
+    def setUp(self) -> None:
+        from mypy.checker import _set_native_checker_active
+
+        self.fx = TypeFixture()
+        self._set_active = _set_native_checker_active
+        self._set_active(True)
+
+    def tearDown(self) -> None:
+        self._set_active(False)
+
+    def _with_gate(self, active: bool, fn: Callable[[], Any]) -> Any:
+        self._set_active(active)
+        try:
+            return fn()
+        finally:
+            self._set_active(True)
+
+    def _range(self, typ: Type) -> tuple[str | None, bool | None]:
+        from mypy.checker import TypeChecker
+        from mypy.options import Options
+
+        chk = TypeChecker.__new__(TypeChecker)
+        chk.options = Options()
+        chk.named_type = lambda name: self.fx.type_type  # type: ignore[method-assign]
+        tr = chk.get_type_range_of_type(typ)
+        return (
+            None if tr is None else str(tr.item),
+            tr.is_upper_bound if tr is not None else None,
+        )
+
+    def _par(self, typ: Type) -> None:
+        off = self._with_gate(False, lambda: self._range(typ))
+        on = self._with_gate(True, lambda: self._range(typ))
+        assert off == on, f"get_type_range_of_type parity for typ={typ!r}: {off} != {on}"
+
+    def _seam(self, typ: Type) -> tuple[int, bool]:
+        result = _type_kernel.rust_classify_type_range(get_proper_type(typ))
+        assert result is not None
+        return result
+
+    def _union_instance(self, with_args: bool) -> Instance:
+        info = self.fx.make_type_info("types.UnionType")
+        assert info is not None
+        args = [self.fx.a, self.fx.b] if with_args else []
+        return Instance(info, args)
+
+    def _special_form(self) -> Instance:
+        info = self.fx.make_type_info("typing._SpecialForm")
+        assert info is not None
+        return Instance(info, [])
+
+    def _final_instance(self) -> Instance:
+        info = self.fx.make_type_info("FinalKlass")
+        assert info is not None
+        info.is_final = True
+        return Instance(info, [])
+
+    # --- direct seam: the eight leaf branch tags ---
+
+    def test_seam_fn_typeobj(self) -> None:
+        assert self._seam(self.fx.callable_type(self.fx.a, self.fx.a)) == (1, False)
+
+    def test_seam_fn_rest(self) -> None:
+        assert self._seam(self.fx.callable(self.fx.a, self.fx.o)) == (7, False)
+
+    def test_seam_typetype_upper(self) -> None:
+        assert self._seam(TypeType.make_normalized(self.fx.a)) == (2, True)
+
+    def test_seam_typetype_none(self) -> None:
+        assert self._seam(TypeType.make_normalized(self.fx.nonet)) == (2, False)
+
+    def test_seam_typetype_final(self) -> None:
+        assert self._seam(TypeType.make_normalized(self._final_instance())) == (2, False)
+
+    def test_seam_any(self) -> None:
+        assert self._seam(self.fx.anyt) == (3, False)
+
+    def test_seam_builtins_type(self) -> None:
+        assert self._seam(self.fx.type_type) == (4, False)
+
+    def test_seam_types_union(self) -> None:
+        assert self._seam(self._union_instance(True)) == (5, False)
+
+    def test_seam_types_union_no_args_is_rest(self) -> None:
+        assert self._seam(self._union_instance(False)) == (7, False)
+
+    def test_seam_special_form(self) -> None:
+        assert self._seam(self._special_form()) == (6, False)
+
+    def test_seam_other_instance_is_rest(self) -> None:
+        assert self._seam(self.fx.a) == (7, False)
+
+    def test_seam_none_type_is_rest(self) -> None:
+        assert self._seam(self.fx.nonet) == (7, False)
+
+    # --- gate-off vs gate-on differentials on the captured range ---
+
+    def test_par_fn_typeobj(self) -> None:
+        self._par(self.fx.callable_type(self.fx.a, self.fx.a))
+
+    def test_par_fn_rest(self) -> None:
+        self._par(self.fx.callable(self.fx.a, self.fx.o))
+
+    def test_par_typetype_upper(self) -> None:
+        self._par(TypeType.make_normalized(self.fx.a))
+
+    def test_par_typetype_none(self) -> None:
+        self._par(TypeType.make_normalized(self.fx.nonet))
+
+    def test_par_typetype_final(self) -> None:
+        self._par(TypeType.make_normalized(self._final_instance()))
+
+    def test_par_any(self) -> None:
+        self._par(self.fx.anyt)
+
+    def test_par_builtins_type(self) -> None:
+        self._par(self.fx.type_type)
+
+    def test_par_types_union(self) -> None:
+        self._par(self._union_instance(True))
+
+    def test_par_special_form(self) -> None:
+        self._par(self._special_form())
+
+    def test_par_other_instance(self) -> None:
+        self._par(self.fx.a)
+
+    def test_par_none_type(self) -> None:
+        self._par(self.fx.nonet)
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeTypeobjGateSuite(Suite):
+    """Gate-off vs gate-on parity for the check_callable_call typeobj-fail
+    gate (issue #1464 C2).
+
+    Runs ExpressionChecker.check_callable_call on a type-object callee and
+    asserts identical captured protocol/abstract fails with the native
+    classifier off and on, plus direct seam calls on the live callees.
+    """
+
+    def setUp(self) -> None:
+        from mypy.checkexpr import _set_native_checkexpr_active
+
+        self.fx = TypeFixture()
+        self._set_active = _set_native_checkexpr_active
+        self._set_active(True)
+
+    def tearDown(self) -> None:
+        self._set_active(False)
+
+    def _with_gate(self, active: bool, fn: Callable[[], Any]) -> Any:
+        self._set_active(active)
+        try:
+            return fn()
+        finally:
+            self._set_active(True)
+
+    def _seam(self, callee: CallableType) -> int:
+        result = _type_kernel.rust_classify_typeobj_gate(callee)
+        assert result is not None
+        return result
+
+    def _type_object_callable(self, info: Any, from_type_type: bool = False) -> CallableType:
+        callee = self.fx.callable_type(self.fx.a, Instance(info, []))
+        callee.from_type_type = from_type_type
+        return callee
+
+    def _protocol_info(self) -> Any:
+        info = self.fx.make_type_info("ProtoKlass")
+        assert info is not None
+        info.is_protocol = True
+        return info
+
+    def _abstract_info(self) -> Any:
+        info = self.fx.make_type_info("AbsKlass")
+        assert info is not None
+        info.is_abstract = True
+        return info
+
+    def _run(self, callee: CallableType) -> list[tuple[str, ...]]:
+        from mypy.checker import TypeChecker
+        from mypy.checkexpr import ExpressionChecker
+        from mypy.errors import Errors
+        from mypy.messages import MessageBuilder
+        from mypy.nodes import Context, MypyFile, SymbolTable
+        from mypy.options import Options
+        from mypy.plugin import Plugin
+
+        options = Options()
+        errors = Errors(options)
+        tree = MypyFile([], [])
+        tree.is_stub = True
+        tree.names = SymbolTable()
+        chk = TypeChecker(errors, {}, options, tree, "", Plugin(options), {})
+        msg = MessageBuilder(errors, {})
+        ec = ExpressionChecker(chk, msg, Plugin(options), {})
+        captured: list[tuple[str, ...]] = []
+        ec.chk.fail = lambda m, ctx, code=None: captured.append(  # type: ignore[method-assign, misc, assignment]
+            ("fail", getattr(m, "value", str(m)))
+        )
+        ec.msg.cannot_instantiate_abstract_class = lambda name, attrs, ctx: captured.append(  # type: ignore[method-assign, assignment]
+            ("abs", name, str(sorted(attrs)))
+        )
+        try:
+            ec.check_callable_call(callee, [], [], Context(), None, None, None, None)
+        except Exception as err:
+            captured.append(("exc", repr(err)))
+        return captured
+
+    def _par(self, callee: CallableType) -> None:
+        off = self._with_gate(False, lambda: self._run(callee))
+        on = self._with_gate(True, lambda: self._run(callee))
+        assert off == on, f"typeobj-gate parity for {callee!r}: {off} != {on}"
+
+    # --- direct seam: the gate tags ---
+
+    def test_seam_not_typeobj(self) -> None:
+        assert self._seam(self.fx.callable(self.fx.a, self.fx.o)) == 0
+
+    def test_seam_typeobj_plain(self) -> None:
+        assert self._seam(self.fx.callable_type(self.fx.a, self.fx.b)) == 0
+
+    def test_seam_protocol(self) -> None:
+        assert self._seam(self._type_object_callable(self._protocol_info())) == 1
+
+    def test_seam_protocol_exempt(self) -> None:
+        assert (
+            self._seam(self._type_object_callable(self._protocol_info(), from_type_type=True)) == 0
+        )
+
+    def test_seam_abstract(self) -> None:
+        assert self._seam(self._type_object_callable(self._abstract_info())) == 2
+
+    def test_seam_abstract_exempt_fbany(self) -> None:
+        info = self.fx.make_type_info("AbsKlass2")
+        assert info is not None
+        info.is_abstract = True
+        info.fallback_to_any = True
+        assert self._seam(self._type_object_callable(info)) == 0
+
+    def test_seam_abstract_exempt_from_type_type(self) -> None:
+        assert (
+            self._seam(self._type_object_callable(self._abstract_info(), from_type_type=True)) == 0
+        )
+
+    # --- gate-off vs gate-on differentials on the captured fails ---
+
+    def test_par_protocol(self) -> None:
+        self._par(self._type_object_callable(self._protocol_info()))
+
+    def test_par_abstract(self) -> None:
+        self._par(self._type_object_callable(self._abstract_info()))
+
+    def test_par_not_typeobj(self) -> None:
+        self._par(self.fx.callable(self.fx.a, self.fx.o))
+
+    def test_par_typeobj_plain(self) -> None:
+        self._par(self.fx.callable_type(self.fx.a, self.fx.b))
+
+    def test_par_protocol_exempt(self) -> None:
+        self._par(self._type_object_callable(self._protocol_info(), from_type_type=True))

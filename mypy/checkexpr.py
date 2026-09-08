@@ -257,6 +257,7 @@ try:
         rust_classify_reveal_imported as _rust_classify_reveal_imported,
         rust_classify_super_arg_types as _rust_classify_super_arg_types,
         rust_classify_typeddict_call as _rust_classify_typeddict_call,
+        rust_classify_typeobj_gate as _rust_classify_typeobj_gate,
         rust_classify_visit_op_expr as _rust_classify_visit_op_expr,
         rust_combine_function_signatures as _rust_combine_function_signatures,
         rust_compute_arg_context_indices as _rust_compute_arg_context_indices,
@@ -347,6 +348,7 @@ except ImportError:
     _rust_classify_visit_op_expr = None  # type: ignore[assignment]
     _rust_classify_check_boolean_op = None  # type: ignore[assignment]
     _rust_classify_typeddict_call = None  # type: ignore[assignment]
+    _rust_classify_typeobj_gate = None  # type: ignore[assignment]
     _rust_refers_to_typeddict = None  # type: ignore[assignment]
     _rust_calibrate_type_obj_return = None  # type: ignore[assignment]
     _rust_normalize_callable = None  # type: ignore[assignment]
@@ -386,6 +388,12 @@ NATIVE_SUPER_ARG_NON_POSITIONAL = 5
 NATIVE_SUPER_ARG_SINGLE_ARG = 6
 NATIVE_SUPER_ARG_TWO_ARG_OK = 7
 NATIVE_SUPER_ARG_TOO_MANY = 8
+
+# Decision tags returned by `_rust_classify_typeobj_gate`; must match
+# `TYPEOBJ_GATE_*` in crates/type_kernel/src/checkcall_typeobj.rs.
+NATIVE_TYPEOBJ_GATE_NONE = 0
+NATIVE_TYPEOBJ_GATE_PROTOCOL = 1
+NATIVE_TYPEOBJ_GATE_ABSTRACT = 2
 
 # Decision tags returned by `_rust_classify_visit_op_expr`; must match
 # `VISIT_OP_EXPR_*` in crates/type_kernel/src/checkexpr_functions.rs.
@@ -2938,23 +2946,43 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
             # An Enum() call that failed SemanticAnalyzerPass2.check_enum_call().
             return callee.ret_type, callee
 
+        # Native type_kernel seam (issue #1464 C2): Rust collapses the
+        # if/elif double-evaluation of is_type_obj()/type_object() into one
+        # arm tag; the two fails and the can_return_none fold stay here.
+        tag: int | None = None
         if (
-            callee.is_type_obj()
-            and callee.type_object().is_protocol
-            # Exception for Type[...]
-            and not callee.from_type_type
+            _CHECKEXPR_HAS_TYPE_KERNEL
+            and _native_checkexpr_active
+            and _rust_classify_typeobj_gate is not None
         ):
+            try:
+                tag = _rust_classify_typeobj_gate(callee)
+            except (AssertionError, NotImplementedError, ValueError, TypeError):
+                tag = None
+        if tag is None:
+            if (
+                callee.is_type_obj()
+                and callee.type_object().is_protocol
+                # Exception for Type[...]
+                and not callee.from_type_type
+            ):
+                tag = NATIVE_TYPEOBJ_GATE_PROTOCOL
+            elif (
+                callee.is_type_obj()
+                and callee.type_object().is_abstract
+                # Exception for Type[...]
+                and not callee.from_type_type
+                and not callee.type_object().fallback_to_any
+            ):
+                tag = NATIVE_TYPEOBJ_GATE_ABSTRACT
+            else:
+                tag = NATIVE_TYPEOBJ_GATE_NONE
+        if tag == NATIVE_TYPEOBJ_GATE_PROTOCOL:
             self.chk.fail(
                 message_registry.CANNOT_INSTANTIATE_PROTOCOL.format(callee.type_object().name),
                 context,
             )
-        elif (
-            callee.is_type_obj()
-            and callee.type_object().is_abstract
-            # Exception for Type[...]
-            and not callee.from_type_type
-            and not callee.type_object().fallback_to_any
-        ):
+        elif tag == NATIVE_TYPEOBJ_GATE_ABSTRACT:
             type = callee.type_object()
             # Determine whether the implicitly abstract attributes are functions with
             # None-compatible return types.

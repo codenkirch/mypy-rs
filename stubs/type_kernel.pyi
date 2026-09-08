@@ -231,6 +231,8 @@ __all__ = [
     "rust_check_match_args",
     "rust_classify_comparison_operands",
     "rust_classify_type_check_raise",
+    "rust_classify_type_range",
+    "rust_classify_typeobj_gate",
     "rust_classify_rvalue_count",
     "rust_classify_truthy_type",
     "rust_classify_missing_annotations",
@@ -890,6 +892,8 @@ def rust_classify_comparison_operands(
 def rust_classify_type_check_raise(
     type_bytes: bytes, callee_fullname: str | None
 ) -> int | None: ...
+def rust_classify_type_range(t: Any) -> tuple[int, bool] | None: ...
+def rust_classify_typeobj_gate(callee: Any) -> int | None: ...
 def rust_classify_type_object_type(info: Any) -> tuple[int, bool, bool, bool, Any] | None: ...
 def rust_classify_rvalue_count(
     lvalues: Any, rvalue_count: int, rvalue_unpack: int | None
