@@ -52993,6 +52993,7 @@ class NativeIftaDefinitionRestoreSuite(Suite):
         assert self._seam([], [c1], [ARG_POS], [[0]]) is None
 
 
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeTypeRangeSuite(Suite):
     """Gate-off vs gate-on parity for get_type_range_of_type (issue #1464 C1).
 
@@ -53133,6 +53134,7 @@ class NativeTypeRangeSuite(Suite):
         self._par(self.fx.nonet)
 
 
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeTypeobjGateSuite(Suite):
     """Gate-off vs gate-on parity for the check_callable_call typeobj-fail
     gate (issue #1464 C2).
@@ -53207,8 +53209,8 @@ class NativeTypeobjGateSuite(Suite):
         )
         try:
             ec.check_callable_call(callee, [], [], Context(), None, None, None, None)
-        except Exception:
-            pass
+        except Exception as err:
+            captured.append(("exc", repr(err)))
         return captured
 
     def _par(self, callee: CallableType) -> None:
