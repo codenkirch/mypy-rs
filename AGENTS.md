@@ -2780,6 +2780,50 @@ including:
     ~20, ParamSpec floors. The protocol-member constraints engine
     plus the ambient `infer_polymorphic`/`extra_tvars` channel is a
     multi-wave effort (same class as the #1426 unify port); floor.
+- `rust_classify_type_range` (issue #1464 C1, mypy.checker) — mirrors the
+  leaf-decision dispatch of `TypeChecker.get_type_range_of_type`
+  (checker.py:10408). The `TypeVarType` upper-bound unroll and the
+  `UnionType` item fold are structural recursion and stay Python-side; the
+  *leaf* decision (which branch a non-union, non-typevar proper type hits)
+  is ported here as a zero-wire classifier. Rust reads the live proper type
+  via PyO3 (`FunctionLike` + `is_type_obj`, the `TypeType` item shape
+  (`NoneType` / `Instance` `is_final`), `AnyType`, and `Instance`
+  fullnames) and returns a branch tag plus the `TypeType` `is_upper_bound`
+  arbitration. Tags FN_TYPEOBJ (1) / TYPETYPE (2) / ANY (3) / BUILTINS_TYPE
+  (4) / TYPES_UNION (5) / SPECIAL_FORM (6) / REST (7); REST rides the
+  Python-side `is_subtype(builtins.type, typ)` gate (already native via the
+  subtype resolver) and the can't-conclude `None` tail. The
+  `fill_typevars_with_any` / `erase_typevars` tail stays Python-side. Defers
+  (`None`) only on an unreadable attribute; every reachable leaf is
+  classified. Gated by `_native_checker_active` (existing wiring, no build.py
+  change) and covered by `NativeTypeRangeSuite` in `mypy/test/testtypes.py`
+  (direct seam tag tests for all eight leaves plus a gate-off vs gate-on
+  differential on the captured `(item, is_upper_bound)` pair, REST exercised
+  with a `named_type` override), plus 12 pure decision unit tests in
+  `type_range.rs`. Cold self-check: 9286 `get_type_range_of_type` calls, 100%
+  reaching the head; post-port the seam decides the 9264 non-union leaves at
+  100% native (the 20-union item fold stays Python-side recursion).
+- `rust_classify_typeobj_gate` (issue #1464 C2, mypy.checkexpr) — mirrors the
+  typeobj-fail gate head of `ExpressionChecker.check_callable_call`
+  (checkexpr.py:2941): the `if`/`elif` that fires
+  `CANNOT_INSTANTIATE_PROTOCOL` for a protocol type-object and
+  `cannot_instantiate_abstract_class` for an abstract type-object (not
+  exempt by `fallback_to_any`), both suppressed by `from_type_type` (the
+  `Type[...]` exemption). The original double-evaluates `is_type_obj()` (once
+  in the `if`, once in the `elif`) and re-runs `type_object()` per arm; this
+  port collapses that to one `is_type_obj()` (short-circuiting the
+  `type_object()` call for the ~89% non-type-object callees) and one
+  `type_object()` and returns an arm tag NONE (0) / PROTOCOL (1) / ABSTRACT
+  (2). The two `fail`s and the `can_return_none` abstract-attribute fold stay
+  Python-side. Defers (`None`) only on an unreadable attribute or a
+  `type_object()` assertion. Gated by `_native_checkexpr_active` (existing
+  wiring, no build.py change) and covered by `NativeTypeobjGateSuite` in
+  `mypy/test/testtypes.py` (direct seam tag tests across every arm plus a
+  gate-off vs gate-on differential on the captured protocol/abstract fails
+  through the real `check_callable_call`), plus 9 pure decision unit tests in
+  `checkcall_typeobj.rs`. Cold self-check: 167343 `check_callable_call` calls
+  (88.9% not_typeobj, 11.1% typeobj_none); post-port the seam decides 167437
+  gate calls at 100% native.
 
 ## Pull Requests
 

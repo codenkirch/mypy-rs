@@ -52,6 +52,7 @@ mod builtin_item;
 mod cache;
 mod callable_compat;
 mod checkcall;
+mod checkcall_typeobj;
 mod checker_functions;
 mod checker_helpers;
 mod checker_stmts;
@@ -143,6 +144,7 @@ mod suggestions;
 mod supported_self_type;
 mod traverser;
 mod treetransform;
+mod type_range;
 mod typealias_instantiate;
 mod typeanal_callable;
 mod typeanal_deprec;
@@ -625,6 +627,13 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
     // accept side effects and stage 2 stay in Python.
     module.add_function(wrap_pyfunction!(
         checkexpr_functions::rust_classify_super_arg_types,
+        module
+    )?)?;
+    // Issue #1464 C2: check_callable_call typeobj-fail gate. Rust collapses
+    // the if/elif double-evaluation of is_type_obj()/type_object() into one
+    // arm tag; the two fails and the can_return_none fold stay in Python.
+    module.add_function(wrap_pyfunction!(
+        checkcall_typeobj::rust_classify_typeobj_gate,
         module
     )?)?;
     // Issue #1064: infer_arg_types_in_context index decision. Rust returns
@@ -3235,6 +3244,13 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
     // branch tag; the format_type messages and fail emission stay in Python.
     module.add_function(wrap_pyfunction!(
         checker_functions::rust_classify_truthy_type,
+        module
+    )?)?;
+    // Issue #1464 C1: get_type_range_of_type leaf dispatch. Rust classifies
+    // the non-union, non-typevar proper type into a branch tag; the
+    // fill_typevars/erase tail, is_subtype gate, and union-item fold stay in Python.
+    module.add_function(wrap_pyfunction!(
+        type_range::rust_classify_type_range,
         module
     )?)?;
     // Issue #1004: check_return_stmt two-phase decision port; the accept()

@@ -359,6 +359,7 @@ try:
         rust_classify_simple_assignment as _rust_classify_simple_assignment,
         rust_classify_truthy_type as _rust_classify_truthy_type,
         rust_classify_type_check_raise as _rust_classify_type_check_raise,
+        rust_classify_type_range as _rust_classify_type_range,
         rust_conditional_types as _rust_conditional_types,
         rust_detach_callable as _rust_detach_callable,
         rust_equality_value_info as _rust_equality_value_info,
@@ -448,6 +449,7 @@ except ImportError:
     _rust_classify_simple_assignment = None  # type: ignore[assignment]
     _rust_classify_truthy_type = None  # type: ignore[assignment]
     _rust_classify_type_check_raise = None  # type: ignore[assignment]
+    _rust_classify_type_range = None  # type: ignore[assignment]
     _rust_classify_missing_annotations = None  # type: ignore[assignment]
     _rust_classify_getattr_method = None  # type: ignore[assignment]
     _rust_classify_find_isinstance_head = None  # type: ignore[assignment]
@@ -584,6 +586,16 @@ NATIVE_TRUTHY_FUNCTION = 1
 NATIVE_TRUTHY_UNION = 2
 NATIVE_TRUTHY_ITERABLE = 3
 NATIVE_TRUTHY_OTHER = 4
+
+# Decision tags returned by `_rust_classify_type_range`; must match
+# `TYPE_RANGE_*` in crates/type_kernel/src/type_range.rs.
+NATIVE_TYPE_RANGE_FN_TYPEOBJ = 1
+NATIVE_TYPE_RANGE_TYPETYPE = 2
+NATIVE_TYPE_RANGE_ANY = 3
+NATIVE_TYPE_RANGE_BUILTINS_TYPE = 4
+NATIVE_TYPE_RANGE_TYPES_UNION = 5
+NATIVE_TYPE_RANGE_SPECIAL_FORM = 6
+NATIVE_TYPE_RANGE_REST = 7
 
 # Decision tags returned by `_rust_classify_type_check_raise`; must match
 # `RAISE_*` in crates/type_kernel/src/checker_functions.rs.
@@ -10402,36 +10414,85 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
             type_ranges = [self.get_type_range_of_type(item) for item in typ.items]
             item = make_simplified_union([t.item for t in type_ranges if t is not None])
             return TypeRange(item, is_upper_bound=True)
-        if isinstance(typ, FunctionLike) and typ.is_type_obj():
+
+        # Native type_kernel seam (issue #1464 C1): Rust classifies the leaf
+        # branch into a tag; the fill_typevars/erase tail, the is_subtype
+        # gate, and the union-item fold stay here. None defers to Python.
+        tag: int | None = None
+        upper = False
+        if (
+            _CHECKER_HAS_TYPE_KERNEL
+            and _native_checker_active
+            and _rust_classify_type_range is not None
+        ):
+            try:
+                decided = _rust_classify_type_range(typ)
+            except (AssertionError, NotImplementedError, ValueError, TypeError):
+                decided = None
+            if decided is not None:
+                tag, upper = decided
+
+        if tag is None:
+            # Pure-Python leaf derivation (Rust deferred or gate off): mirrors
+            # classify_type_range's branch order in type_range.rs.
+            if isinstance(typ, FunctionLike):
+                tag = (
+                    NATIVE_TYPE_RANGE_FN_TYPEOBJ
+                    if typ.is_type_obj()
+                    else NATIVE_TYPE_RANGE_REST
+                )
+            elif isinstance(typ, TypeType):
+                upper = True
+                if isinstance(typ.item, NoneType):
+                    # except for Type[None], because "'NoneType' is not an acceptable base type"
+                    upper = False
+                if isinstance(typ.item, Instance) and typ.item.type.is_final:
+                    upper = False
+                tag = NATIVE_TYPE_RANGE_TYPETYPE
+            elif isinstance(typ, AnyType):
+                tag = NATIVE_TYPE_RANGE_ANY
+            elif isinstance(typ, Instance):
+                if typ.type.fullname == "builtins.type":
+                    tag = NATIVE_TYPE_RANGE_BUILTINS_TYPE
+                elif typ.type.fullname == "types.UnionType":
+                    tag = NATIVE_TYPE_RANGE_TYPES_UNION if typ.args else NATIVE_TYPE_RANGE_REST
+                elif typ.type.fullname == "typing._SpecialForm":
+                    tag = NATIVE_TYPE_RANGE_SPECIAL_FORM
+                else:
+                    tag = NATIVE_TYPE_RANGE_REST
+            else:
+                tag = NATIVE_TYPE_RANGE_REST
+
+        if tag == NATIVE_TYPE_RANGE_FN_TYPEOBJ:
+            assert isinstance(typ, FunctionLike)
             # If a type is generic, `isinstance` can only narrow its variables to Any.
             any_parameterized = fill_typevars_with_any(typ.type_object())
             # Tuples may have unattended type variables among their items
-            if isinstance(any_parameterized, TupleType):
-                erased_type = erase_typevars(any_parameterized)
-            else:
-                erased_type = any_parameterized
+            erased_type = (
+                erase_typevars(any_parameterized)
+                if isinstance(any_parameterized, TupleType)
+                else any_parameterized
+            )
             return TypeRange(erased_type, is_upper_bound=False)
-        if isinstance(typ, TypeType):
+        if tag == NATIVE_TYPE_RANGE_TYPETYPE:
+            assert isinstance(typ, TypeType)
             # Type[A] means "any type that is a subtype of A" rather than "precisely type A"
             # we indicate this by setting is_upper_bound flag
-            is_upper_bound = True
-            if isinstance(typ.item, NoneType):
-                # except for Type[None], because "'NoneType' is not an acceptable base type"
-                is_upper_bound = False
-            if isinstance(typ.item, Instance) and typ.item.type.is_final:
-                is_upper_bound = False
-            return TypeRange(typ.item, is_upper_bound=is_upper_bound)
-        if isinstance(typ, AnyType):
+            return TypeRange(typ.item, is_upper_bound=upper)
+        if tag == NATIVE_TYPE_RANGE_ANY:
             return TypeRange(typ, is_upper_bound=False)
-        if isinstance(typ, Instance) and typ.type.fullname == "builtins.type":
+        if tag == NATIVE_TYPE_RANGE_BUILTINS_TYPE:
+            assert isinstance(typ, Instance)
             object_type = Instance(typ.type.mro[-1], [])
             return TypeRange(object_type, is_upper_bound=True)
-        if isinstance(typ, Instance) and typ.type.fullname == "types.UnionType" and typ.args:
+        if tag == NATIVE_TYPE_RANGE_TYPES_UNION:
+            assert isinstance(typ, Instance)
             return TypeRange(UnionType(typ.args), is_upper_bound=False)
-        if isinstance(typ, Instance) and typ.type.fullname == "typing._SpecialForm":
+        if tag == NATIVE_TYPE_RANGE_SPECIAL_FORM:
             # This is probably an alias to a Union object. We don't have the args here so we can't
             # conclude anything
             return None
+        # NATIVE_TYPE_RANGE_REST: is_subtype gate, then the can't-conclude tail.
         if not is_subtype(self.named_type("builtins.type"), typ):
             # We saw something, but it couldn't possibly be valid
             return TypeRange(UninhabitedType(), is_upper_bound=False)
