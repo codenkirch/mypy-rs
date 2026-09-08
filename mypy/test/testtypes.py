@@ -52993,6 +52993,33 @@ class NativeIftaDefinitionRestoreSuite(Suite):
         assert self._seam([], [c1], [ARG_POS], [[0]]) is None
 
 
+class _BrokenAttrInfo(TypeInfo):
+    """TypeInfo stand-in whose getattr of one chosen attribute raises.
+
+    Built for the wave-48 classifier-seam deferral pins (issue #1466): a
+    malformed live TypeInfo whose attribute is unreadable. The seams must
+    map the failed read to a deferral (Ok(None)) so the shim re-runs the
+    pure-Python body, which raises the identical AttributeError on both
+    sides of the gate.
+    """
+
+    def __init__(self, fullname: str, broken_attr: str) -> None:
+        from mypy.nodes import Block, ClassDef
+
+        cd = ClassDef(fullname.rsplit(".", 1)[-1], Block([]), None, [])
+        cd.fullname = fullname
+        self._broken_attr = broken_attr
+        super().__init__(SymbolTable(), cd, fullname.rsplit(".", 1)[0])
+
+    def __getattribute__(self, name: str) -> Any:
+        broken = super().__getattribute__("_broken_attr")
+        if name == "_broken_attr":
+            return broken
+        if name == broken:
+            raise AttributeError(name)
+        return super().__getattribute__(name)
+
+
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeTypeRangeSuite(Suite):
     """Gate-off vs gate-on parity for get_type_range_of_type (issue #1464 C1).
@@ -53097,6 +53124,32 @@ class NativeTypeRangeSuite(Suite):
 
     def test_seam_none_type_is_rest(self) -> None:
         assert self._seam(self.fx.nonet) == (7, False)
+
+    def test_seam_defers_on_unreadable_instance_fullname(self) -> None:
+        # A live Instance whose TypeInfo.fullname read raises AttributeError:
+        # the seam must defer (None) instead of propagating, so the shim
+        # re-runs the pure-Python body (issue #1466 pin).
+        broken = Instance(_BrokenAttrInfo("mod.Broken", "fullname"), [])
+        result = _type_kernel.rust_classify_type_range(broken)
+        assert result is None
+
+    def test_par_unreadable_instance_fullname(self) -> None:
+        # Both gates raise the identical AttributeError: gate-off is the pure
+        # body, gate-on defers the unreadable attribute to it (issue #1466).
+        broken = Instance(_BrokenAttrInfo("mod.Broken", "fullname"), [])
+
+        def run() -> BaseException | None:
+            try:
+                self._range(broken)
+                return None
+            except Exception as err:
+                return err
+
+        off = self._with_gate(False, run)
+        on = run()
+        assert isinstance(off, AttributeError), f"gate-off expected AttributeError: {off!r}"
+        assert isinstance(on, AttributeError), f"gate-on expected AttributeError: {on!r}"
+        assert str(off) == str(on), f"raise messages differ: {off!r} != {on!r}"
 
     # --- gate-off vs gate-on differentials on the captured range ---
 
@@ -53225,6 +53278,20 @@ class NativeTypeobjGateSuite(Suite):
 
     def test_seam_typeobj_plain(self) -> None:
         assert self._seam(self.fx.callable_type(self.fx.a, self.fx.b)) == 0
+
+    def test_seam_defers_on_unreadable_protocol(self) -> None:
+        # A type-object callee whose TypeInfo.is_protocol read raises
+        # AttributeError: the seam must defer (None) instead of propagating,
+        # so the shim re-runs the pure-Python gate (issue #1466 pin).
+        callee = self._type_object_callable(_BrokenAttrInfo("mod.Plain", "is_protocol"))
+        result = _type_kernel.rust_classify_typeobj_gate(callee)
+        assert result is None
+
+    def test_par_unreadable_protocol(self) -> None:
+        # Both gates raise the identical AttributeError: gate-off is the pure
+        # gate, gate-on defers the unreadable attribute to it (issue #1466).
+        callee = self._type_object_callable(_BrokenAttrInfo("mod.Plain", "is_protocol"))
+        self._par(callee)
 
     def test_seam_protocol(self) -> None:
         assert self._seam(self._type_object_callable(self._protocol_info())) == 1

@@ -108,72 +108,78 @@ pub(crate) fn rust_classify_type_range(
     py: Python<'_>,
     typ: &PyAny,
 ) -> PyResult<Option<(i64, bool)>> {
-    let fl_cls = types_class(py, "FunctionLike")?;
-    let tt_cls = types_class(py, "TypeType")?;
-    let any_cls = types_class(py, "AnyType")?;
-    let inst_cls = types_class(py, "Instance")?;
-    let none_cls = types_class(py, "NoneType")?;
+    let classify: PyResult<Option<(i64, bool)>> = (|| {
+        let fl_cls = types_class(py, "FunctionLike")?;
+        let tt_cls = types_class(py, "TypeType")?;
+        let any_cls = types_class(py, "AnyType")?;
+        let inst_cls = types_class(py, "Instance")?;
+        let none_cls = types_class(py, "NoneType")?;
 
-    if typ.is_instance(fl_cls)? {
-        let is_to = typ.call_method0("is_type_obj")?.extract::<bool>()?;
-        return Ok(Some(classify_type_range(
-            LeafKind::FunctionLike,
-            is_to,
+        if typ.is_instance(fl_cls)? {
+            let is_to = typ.call_method0("is_type_obj")?.extract::<bool>()?;
+            return Ok(Some(classify_type_range(
+                LeafKind::FunctionLike,
+                is_to,
+                false,
+                false,
+                "",
+                0,
+            )));
+        }
+        if typ.is_instance(tt_cls)? {
+            let item = typ.getattr("item")?;
+            let item_is_none = item.is_instance(none_cls)?;
+            let item_is_final = if item.is_instance(inst_cls)? {
+                item.getattr("type")?
+                    .getattr("is_final")?
+                    .extract::<bool>()?
+            } else {
+                false
+            };
+            return Ok(Some(classify_type_range(
+                LeafKind::TypeType,
+                false,
+                item_is_none,
+                item_is_final,
+                "",
+                0,
+            )));
+        }
+        if typ.is_instance(any_cls)? {
+            return Ok(Some(classify_type_range(
+                LeafKind::Any,
+                false,
+                false,
+                false,
+                "",
+                0,
+            )));
+        }
+        if typ.is_instance(inst_cls)? {
+            let fullname: String = typ.getattr("type")?.getattr("fullname")?.extract()?;
+            let args_len: usize = typ.getattr("args")?.len()?;
+            return Ok(Some(classify_type_range(
+                LeafKind::Instance,
+                false,
+                false,
+                false,
+                &fullname,
+                args_len,
+            )));
+        }
+        Ok(Some(classify_type_range(
+            LeafKind::Other,
+            false,
             false,
             false,
             "",
             0,
-        )));
-    }
-    if typ.is_instance(tt_cls)? {
-        let item = typ.getattr("item")?;
-        let item_is_none = item.is_instance(none_cls)?;
-        let item_is_final = if item.is_instance(inst_cls)? {
-            item.getattr("type")?
-                .getattr("is_final")?
-                .extract::<bool>()?
-        } else {
-            false
-        };
-        return Ok(Some(classify_type_range(
-            LeafKind::TypeType,
-            false,
-            item_is_none,
-            item_is_final,
-            "",
-            0,
-        )));
-    }
-    if typ.is_instance(any_cls)? {
-        return Ok(Some(classify_type_range(
-            LeafKind::Any,
-            false,
-            false,
-            false,
-            "",
-            0,
-        )));
-    }
-    if typ.is_instance(inst_cls)? {
-        let fullname: String = typ.getattr("type")?.getattr("fullname")?.extract()?;
-        let args_len: usize = typ.getattr("args")?.len()?;
-        return Ok(Some(classify_type_range(
-            LeafKind::Instance,
-            false,
-            false,
-            false,
-            &fullname,
-            args_len,
-        )));
-    }
-    Ok(Some(classify_type_range(
-        LeafKind::Other,
-        false,
-        false,
-        false,
-        "",
-        0,
-    )))
+        )))
+    })();
+    // Strangler-fig contract: `None` defers to Python, so an unreadable
+    // attribute maps to Ok(None) rather than propagating the PyErr (the
+    // shim's except tuple has no AttributeError). Issue #1466.
+    Ok(classify.unwrap_or(None))
 }
 
 #[cfg(test)]

@@ -60,24 +60,30 @@ pub fn classify_typeobj_gate(
 /// assertion so the shim re-runs the pure-Python gate.
 #[pyfunction]
 pub(crate) fn rust_classify_typeobj_gate(callee: &PyAny) -> PyResult<Option<i64>> {
-    let is_to = callee.call_method0("is_type_obj")?.extract::<bool>()?;
-    if !is_to {
-        return Ok(Some(classify_typeobj_gate(
-            false, false, false, false, false,
-        )));
-    }
-    let to = callee.call_method0("type_object")?;
-    let is_protocol = to.getattr("is_protocol")?.extract::<bool>()?;
-    let is_abstract = to.getattr("is_abstract")?.extract::<bool>()?;
-    let fallback_to_any = to.getattr("fallback_to_any")?.extract::<bool>()?;
-    let from_type_type = callee.getattr("from_type_type")?.extract::<bool>()?;
-    Ok(Some(classify_typeobj_gate(
-        is_to,
-        is_protocol,
-        is_abstract,
-        from_type_type,
-        fallback_to_any,
-    )))
+    let classify: PyResult<Option<i64>> = (|| {
+        let is_to = callee.call_method0("is_type_obj")?.extract::<bool>()?;
+        if !is_to {
+            return Ok(Some(classify_typeobj_gate(
+                false, false, false, false, false,
+            )));
+        }
+        let to = callee.call_method0("type_object")?;
+        let is_protocol = to.getattr("is_protocol")?.extract::<bool>()?;
+        let is_abstract = to.getattr("is_abstract")?.extract::<bool>()?;
+        let fallback_to_any = to.getattr("fallback_to_any")?.extract::<bool>()?;
+        let from_type_type = callee.getattr("from_type_type")?.extract::<bool>()?;
+        Ok(Some(classify_typeobj_gate(
+            is_to,
+            is_protocol,
+            is_abstract,
+            from_type_type,
+            fallback_to_any,
+        )))
+    })();
+    // Strangler-fig contract: `None` defers to Python, so an unreadable
+    // attribute maps to Ok(None) rather than propagating the PyErr (the
+    // shim's except tuple has no AttributeError). Issue #1466.
+    Ok(classify.unwrap_or(None))
 }
 
 #[cfg(test)]
