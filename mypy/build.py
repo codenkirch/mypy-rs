@@ -1128,6 +1128,7 @@ class BuildManager:
         # type-returning gate on since the truthiness wire fix (#201).
         from mypy.checker import (
             _set_native_checker_active,
+            _set_native_checker_fake_info_registrar,
             _set_native_checker_resolver,
             _set_native_checker_types_active,
         )
@@ -1151,6 +1152,9 @@ class BuildManager:
         _set_native_checker_active(self.options.native_type_kernel)
         _set_native_checker_types_active(self.options.native_type_kernel)
         _set_native_checker_resolver(None)
+        # Issue #1456: the fake-TypeInfo registrar starts cleared on a
+        # fresh manager; `_build_native_resolvers` installs it.
+        _set_native_checker_fake_info_registrar(None)
         # M20: gate checkmember bind_self_fast (trivial-self binding),
         # instance_fallback, and the resolver-snapshot operator helpers.
         # Rust strips the first arg; *args/**kwargs and non-callable defer.
@@ -1712,9 +1716,16 @@ class BuildManager:
         _set_native_checkexpr_resolver(resolver)
         _set_native_checkmember_resolver(resolver)
         # #387: the checker narrowing kernel shares the same snapshot.
-        from mypy.checker import _set_native_checker_resolver
+        from mypy.checker import (
+            _set_native_checker_fake_info_registrar,
+            _set_native_checker_resolver,
+        )
 
         _set_native_checker_resolver(resolver)
+        # Issue #1456: fake TypeInfos (checker `make_fake_typeinfo` products)
+        # are created during checking, after their SCC snapshot sealed;
+        # a registrar has them register at creation.
+        _set_native_checker_fake_info_registrar(self._register_native_fake_typeinfo)
         # Issue #491: semanal lookup_qualified dot-chain walk.
         from mypy.semanal import _set_native_semanal_resolver
 
@@ -1728,6 +1739,51 @@ class BuildManager:
         from mypy.types import _set_native_visitor_resolver
 
         _set_native_visitor_resolver(resolver)
+
+    def _register_native_fake_typeinfo(self, info: TypeInfo) -> None:
+        """Register a runtime-synthesized checker TypeInfo in the live
+        native snapshot (issue #1456).
+
+        Fake infos (`TypeChecker.make_fake_typeinfo` products: ad-hoc
+        intersections from isinstance narrowing, callable subtypes,
+        protocol-variance dummies) are created during type checking, after
+        their module's SCC snapshot sealed, so the subtype engine deferred
+        I(fake) -> I(real) pairs on a missing left snapshot while Python
+        answered True via nominal has_base. Registering at creation makes
+        the snapshot answer through the same nominal walk as any sealed
+        class.
+
+        Per-build invalidation follows the #1137/#1146 discipline: the
+        held resolver, the accumulated typeinfo map, and the snapshotted
+        set are all reset by `_clear_native_resolvers` at build boundaries
+        and per daemon recheck; `NativeTypeResolver.update` skips fullnames
+        already snapshotted (first seal wins), so a fake registers at most
+        once per build. The fake's bases and MRO are set inside
+        `make_fake_typeinfo`, so its snapshot is final at creation (no
+        inference, so the empty-scc daemon mid-propagation hazard does not
+        apply). The accumulated map grows in place: it is the same dict
+        identity `set_wire_typeinfo_map` installed, so Python-side wire
+        decodes of the fake (e.g. join/meet results crossing back) fix up
+        to the live object. Registration is best-effort accelerator
+        work: a failure rolls both structures back and the fake keeps
+        the pre-#1456 Python-fallback behavior for the rest of the build.
+        """
+        if not self.options.native_type_kernel or self._native_resolver is None:
+            return
+        fullname = info.fullname
+        if fullname in self._native_snapshotted:
+            return
+        self._native_typeinfo_map[fullname] = info
+        self._native_snapshotted.add(fullname)
+        try:
+            self._native_resolver.update([info], [], None, None)
+        except Exception:
+            # Best-effort accelerator: a failure must not break the
+            # build. Roll back both structures so the wire-decode map
+            # and the Rust snapshot stay consistent; the fake then
+            # behaves exactly as before #1456 (seams defer to Python).
+            self._native_snapshotted.discard(fullname)
+            self._native_typeinfo_map.pop(fullname, None)
 
     def _clear_native_resolvers(self) -> None:
         """Clear all native resolver globals so the kernel defers to Python.
@@ -1785,9 +1841,16 @@ class BuildManager:
         from mypy.checkmember import _set_native_checkmember_resolver
 
         _set_native_checkmember_resolver(None)
-        from mypy.checker import _set_native_checker_resolver
+        from mypy.checker import (
+            _set_native_checker_fake_info_registrar,
+            _set_native_checker_resolver,
+        )
 
         _set_native_checker_resolver(None)
+        # Issue #1456: fake-TypeInfo registrations are per-build state;
+        # a daemon recheck must start with the registrar cleared so the
+        # next build's fakes register into the fresh snapshot.
+        _set_native_checker_fake_info_registrar(None)
         from mypy.typeanal import _set_native_typeanal_resolver
 
         _set_native_typeanal_resolver(None)
@@ -5850,9 +5913,16 @@ def _clear_native_kernel_resolvers(manager: BuildManager) -> None:
         from mypy.checkmember import _set_native_checkmember_resolver
 
         _set_native_checkmember_resolver(None)
-        from mypy.checker import _set_native_checker_resolver
+        from mypy.checker import (
+            _set_native_checker_fake_info_registrar,
+            _set_native_checker_resolver,
+        )
 
         _set_native_checker_resolver(None)
+        # Issue #1456: a per-SCC clear must also drop the fake-TypeInfo
+        # registrar; the post-semanal `_build_native_resolvers` install
+        # reinstates it before any checking runs.
+        _set_native_checker_fake_info_registrar(None)
         from mypy.typeanal import _set_native_typeanal_resolver
 
         _set_native_typeanal_resolver(None)
