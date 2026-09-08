@@ -2752,7 +2752,8 @@ including:
   - st nested `TypeAliasType` in tuple/union args (~150): the
     dominant wall; the Rust leaf is not pinned (needs a Rust-side
     leaf-reason audit plus an alias-expansion port, the wave-33
-    segfault risk class). Follow-up issue opened.
+    segfault risk class). Follow-up issue opened. RETIRED in wave 50
+    (#1457), see below.
   - st `I(<fake subclass>) -> I(mypy.nodes.Statement/SymbolNode)`
     24x: runtime-synthesized fake `TypeInfo`s from
     `mypy/checker.py:8067` `_make_fake_typeinfo_and_full_name`
@@ -2780,6 +2781,41 @@ including:
     ~20, ParamSpec floors. The protocol-member constraints engine
     plus the ambient `infer_polymorphic`/`extra_tvars` channel is a
     multi-wave effort (same class as the #1426 unify port); floor.
+- st nested-alias leaf pin + port (wave 50, issue #1457): the
+  dominant wave-47 st wall is retired. Env-gated leaf-reason audit
+  on the cold self-check (`MYPY_TK_ST50_AUDIT`, denoised shape dump
+  at the `rust_is_subtype` FFI entries) pinned the defer at
+  `expand_top_aliases` (`subtypes.rs`): a no-args, no-tvar alias
+  occurrence (mypy.cache.JsonValue, astdiff SnapshotItem/Primitive,
+  test.data FileOperation) ran the full `expand_type_inner`
+  substitution pipeline, whose union arm flattened the target and
+  deferred on a top-level alias item (no FlatAliasGuard in that
+  context): 372/632 whole-call st defers on the wave-50 tree.
+  Fix: mirror Python's `get_proper_type` (types.py:4181-4197) — a
+  no-args, no-tvar occurrence returns the RAW target
+  (`copy_modified(args=[])`), keeping nested alias refs in place;
+  the while-loop still stops at the first non-alias root and the
+  depth cap bounds chains. Result: 632 -> 260 st whole-call defers
+  (-372), alias bucket 0. Registered side effect (wave-33 risk
+  class): with the alias operand now expandable inside the subtype
+  engine, the native join's `visit_union_join` / both-union merge
+  became reachable for recursive-alias content and re-derived the
+  deformed expanded shape (`testRecursiveAliasesJoins`). Fix: a
+  flag-only `contains_recursive_alias` walk (`is_recursive` on the
+  wire node) defers those two join paths to Python, which keeps
+  recursive alias nodes in joined unions (its is_recursive_pair /
+  assumption machinery). Guardrail set green: testRecursiveTuple-
+  Fallback1-5 + testTypeAliasUpdateNonRecursiveToRecursive (Coarse +
+  Fine) + full fine-grained (747) + testcheck exact 8198/15/7 +
+  testtypes 3251/6 + cold self-check clean. Python-side pin updated:
+  `NativeSubtypesDeferralSuite::test_recursive_alias_gate_parity_no_
+  wrong_verdict` now asserts the direct seam answers True (Python
+  parity via the ALIAS_ASSUME guard) instead of None. Residual st
+  buckets unchanged from the wave-47 table: untagged floors ~178
+  (callable-compat generic/owned-tvar/extra_tvars walls, TypeType,
+  protocol-member, serfail families), synthesized-TypeInfo
+  `inst:left_snap_missing` 74 (sibling #1456 resolver-snapshot
+  territory), small union/tuple propagation tails 8.
 - sgc/ct embedded defer audits, floor decisions (wave 48b, issue
   #1462) documentation-only close, zero code change. Env-gated
   defer-bucket audits on `solve_generic_call_core` (sgc) and
