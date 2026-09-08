@@ -2709,6 +2709,48 @@ including:
   and unify-failure blocks) plus 19 new Rust unit tests
   (11 gate-walker descents in `visitor.rs`, 8 `no_extra_tvar_shape`
   / `strip_ret` in `unify.rs`).
+- st/icf residual defer audit, floor decisions (wave 47, issue #1455)
+  documentation-only close, zero code change. Env-gated shape audits
+  on the `rust_is_subtype` (st) and `rust_infer_constraints_full`
+  (icf) seams (`MYPY_TK_ST47_AUDIT` / `MYPY_TK_ICF47_AUDIT`,
+  instrumented cold self-check at `-n0 --no-incremental`; the ini's
+  4 workers killed buffered audit writes, lesson recorded), stripped
+  before landing (tree verified bit-identical to origin/main
+  `f245a14d9`; baselines at that rev: cargo 2699/11, testtypes
+  3201/6, testcheck 8144/69/7, cold self-check clean). Result: st
+  335 / icf 266 residual defers out of ~190k native engine
+  decisions, every bucket classified with origin analysis:
+  - st nested `TypeAliasType` in tuple/union args (~150): the
+    dominant wall; the Rust leaf is not pinned (needs a Rust-side
+    leaf-reason audit plus an alias-expansion port, the wave-33
+    segfault risk class). Follow-up issue opened.
+  - st `I(<fake subclass>) -> I(mypy.nodes.Statement/SymbolNode)`
+    24x: runtime-synthesized fake `TypeInfo`s from
+    `mypy/checker.py:8067` `_make_fake_typeinfo_and_full_name`
+    (truthy-type checking area; other call sites 4316 `<dummy>`,
+    8139, 8421 typing.Collection) are missing from the resolver
+    snapshot, so `visit_instance_nominal` defers
+    (`left_snap is None`, subtypes.rs:2706) while Python answers
+    via nominal `has_base` (True). Fix path: register synthesized
+    `TypeInfo`s into the `NativeTypeResolver` snapshot at creation
+    (per-build invalidation per #1137/#1146 discipline) or a
+    live-PyO3 nominal classifier seam. Follow-up issue opened.
+  - st `I(builtins.type[...]) -> C[...]` 16x: the Python head at
+    subtypes.py:1326-1333 (`find_member("__call__", left,
+    is_operator=True)` -> `_is_subtype(call, right)` / False) left
+    unported: synthesized `type[...]` instances plus operator
+    find_member semantics need a deeper read; floor.
+  - st floors unchanged: serfail `TypeGuardedType` 9, extra_attrs
+    carriers, ParamSpec callables, owned-tvar/extra_tvars generic
+    callable pairs (no kernel channel), LKV tuple items.
+  - icf 266 (SUBTYPE_OF 136 / SUPERTYPE_OF 130; constants
+    constraints.py:617-618): defaultdict-init family ~40,
+    Generator/SupportsNext family ~105 (Instance template with
+    tvar args vs protocol Instance, Python's `visit_instance`
+    protocol-member arm at constraints.py:1405+), Overloaded-actual
+    ~20, ParamSpec floors. The protocol-member constraints engine
+    plus the ambient `infer_polymorphic`/`extra_tvars` channel is a
+    multi-wave effort (same class as the #1426 unify port); floor.
 
 ## Pull Requests
 
