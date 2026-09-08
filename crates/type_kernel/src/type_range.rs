@@ -17,6 +17,7 @@
 //! classified; the `builtins.type` `is_subtype` gate rides the `REST` tag
 //! and runs Python-side (it is already native via the subtype resolver).
 
+use pyo3::exceptions::PyAttributeError;
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyType};
 
@@ -176,10 +177,13 @@ pub(crate) fn rust_classify_type_range(
             0,
         )))
     })();
-    // Strangler-fig contract: `None` defers to Python, so an unreadable
-    // attribute maps to Ok(None) rather than propagating the PyErr (the
-    // shim's except tuple has no AttributeError). Issue #1466.
-    Ok(classify.unwrap_or(None))
+    // Contract (#1466): an unreadable attribute defers (None), other PyErrs
+    // stay visible so genuine kernel bugs surface in the parity tests.
+    match classify {
+        Ok(v) => Ok(v),
+        Err(e) if e.is_instance_of::<PyAttributeError>(py) => Ok(None),
+        Err(e) => Err(e),
+    }
 }
 
 #[cfg(test)]

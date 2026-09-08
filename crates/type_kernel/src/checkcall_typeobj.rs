@@ -20,6 +20,7 @@
 //! `try/except`. Every reachable arm is classified, including the
 //! no-fail tail.
 
+use pyo3::exceptions::PyAttributeError;
 use pyo3::prelude::*;
 use pyo3::types::PyAny;
 
@@ -59,7 +60,7 @@ pub fn classify_typeobj_gate(
 /// flags. Defers (`None`) on an unreadable attribute or a `type_object()`
 /// assertion so the shim re-runs the pure-Python gate.
 #[pyfunction]
-pub(crate) fn rust_classify_typeobj_gate(callee: &PyAny) -> PyResult<Option<i64>> {
+pub(crate) fn rust_classify_typeobj_gate(py: Python<'_>, callee: &PyAny) -> PyResult<Option<i64>> {
     let classify: PyResult<Option<i64>> = (|| {
         let is_to = callee.call_method0("is_type_obj")?.extract::<bool>()?;
         if !is_to {
@@ -80,10 +81,13 @@ pub(crate) fn rust_classify_typeobj_gate(callee: &PyAny) -> PyResult<Option<i64>
             fallback_to_any,
         )))
     })();
-    // Strangler-fig contract: `None` defers to Python, so an unreadable
-    // attribute maps to Ok(None) rather than propagating the PyErr (the
-    // shim's except tuple has no AttributeError). Issue #1466.
-    Ok(classify.unwrap_or(None))
+    // Contract (#1466): an unreadable attribute defers (None), other PyErrs
+    // stay visible so genuine kernel bugs surface in the parity tests.
+    match classify {
+        Ok(v) => Ok(v),
+        Err(e) if e.is_instance_of::<PyAttributeError>(py) => Ok(None),
+        Err(e) => Err(e),
+    }
 }
 
 #[cfg(test)]

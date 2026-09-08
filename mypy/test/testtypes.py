@@ -52999,24 +52999,31 @@ class _BrokenAttrInfo(TypeInfo):
     Built for the wave-48 classifier-seam deferral pins (issue #1466): a
     malformed live TypeInfo whose attribute is unreadable. The seams must
     map the failed read to a deferral (Ok(None)) so the shim re-runs the
-    pure-Python body, which raises the identical AttributeError on both
-    sides of the gate.
+    pure-Python body, which raises the identical exception on both sides
+    of the gate. The `exc` class pins the error-class boundary: only
+    AttributeError defers, anything else re-propagates.
     """
 
-    def __init__(self, fullname: str, broken_attr: str) -> None:
+    def __init__(
+        self, fullname: str, broken_attr: str, exc: type[Exception] = AttributeError
+    ) -> None:
         from mypy.nodes import Block, ClassDef
 
         cd = ClassDef(fullname.rsplit(".", 1)[-1], Block([]), None, [])
         cd.fullname = fullname
         self._broken_attr = broken_attr
+        self._broken_exc = exc
         super().__init__(SymbolTable(), cd, fullname.rsplit(".", 1)[0])
 
     def __getattribute__(self, name: str) -> Any:
         broken = super().__getattribute__("_broken_attr")
+        exc = super().__getattribute__("_broken_exc")
         if name == "_broken_attr":
             return broken
+        if name == "_broken_exc":
+            return exc
         if name == broken:
-            raise AttributeError(name)
+            raise exc(name)
         return super().__getattribute__(name)
 
 
@@ -53149,6 +53156,34 @@ class NativeTypeRangeSuite(Suite):
         on = run()
         assert isinstance(off, AttributeError), f"gate-off expected AttributeError: {off!r}"
         assert isinstance(on, AttributeError), f"gate-on expected AttributeError: {on!r}"
+        assert str(off) == str(on), f"raise messages differ: {off!r} != {on!r}"
+
+    def test_seam_repropagates_non_attribute_error(self) -> None:
+        # A read that raises RuntimeError must NOT be swallowed: the seam
+        # re-propagates it so genuine kernel bugs stay visible (issue #1466
+        # error-class boundary pin).
+        import pytest
+
+        broken = Instance(_BrokenAttrInfo("mod.Broken", "fullname", RuntimeError), [])
+        with pytest.raises(RuntimeError):
+            _type_kernel.rust_classify_type_range(broken)
+
+    def test_par_repropagates_non_attribute_error(self) -> None:
+        # Both gates raise the identical RuntimeError: gate-off is the pure
+        # body, gate-on re-propagates it from the seam (issue #1466).
+        broken = Instance(_BrokenAttrInfo("mod.Broken", "fullname", RuntimeError), [])
+
+        def run() -> BaseException | None:
+            try:
+                self._range(broken)
+                return None
+            except Exception as err:
+                return err
+
+        off = self._with_gate(False, run)
+        on = run()
+        assert isinstance(off, RuntimeError), f"gate-off expected RuntimeError: {off!r}"
+        assert isinstance(on, RuntimeError), f"gate-on expected RuntimeError: {on!r}"
         assert str(off) == str(on), f"raise messages differ: {off!r} != {on!r}"
 
     # --- gate-off vs gate-on differentials on the captured range ---
@@ -53291,6 +53326,27 @@ class NativeTypeobjGateSuite(Suite):
         # Both gates raise the identical AttributeError: gate-off is the pure
         # gate, gate-on defers the unreadable attribute to it (issue #1466).
         callee = self._type_object_callable(_BrokenAttrInfo("mod.Plain", "is_protocol"))
+        self._par(callee)
+
+    def test_seam_repropagates_non_attribute_error(self) -> None:
+        # A type-object callee whose TypeInfo.is_protocol read raises
+        # RuntimeError must NOT be swallowed: the seam re-propagates it
+        # (issue #1466 error-class boundary pin).
+        import pytest
+
+        callee = self._type_object_callable(
+            _BrokenAttrInfo("mod.Plain", "is_protocol", RuntimeError)
+        )
+        with pytest.raises(RuntimeError):
+            _type_kernel.rust_classify_typeobj_gate(callee)
+
+    def test_par_repropagates_non_attribute_error(self) -> None:
+        # Both gates behave identically on a non-AttributeError read: the
+        # pure gate raises RuntimeError, gate-on re-propagates it from the
+        # seam instead of deferring (issue #1466).
+        callee = self._type_object_callable(
+            _BrokenAttrInfo("mod.Plain", "is_protocol", RuntimeError)
+        )
         self._par(callee)
 
     def test_seam_protocol(self) -> None:
