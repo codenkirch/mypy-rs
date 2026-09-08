@@ -53558,6 +53558,31 @@ class NativeFakeInfoRegistrationSuite(Suite):
         assert stub._native_typeinfo_map == {}
         assert fake.fullname not in stub._native_snapshotted
 
+    def test_make_fake_typeinfo_invokes_registrar(self) -> None:
+        from mypy.checker import TypeChecker, _set_native_checker_fake_info_registrar
+        from mypy.errors import Errors
+        from mypy.nodes import MypyFile, SymbolTable
+        from mypy.options import Options
+        from mypy.plugin import Plugin
+
+        registered: list[TypeInfo] = []
+        _set_native_checker_fake_info_registrar(registered.append)
+        try:
+            options = Options()
+            errors = Errors(options)
+            tree = MypyFile([], [])
+            tree.is_stub = True
+            tree.names = SymbolTable()
+            chk = TypeChecker(errors, {}, options, tree, "", Plugin(options), {})
+            _, info = chk.make_fake_typeinfo("mod", "Fake", "Fake", [self.fx.a])
+            # The production call site fires the registrar with the
+            # freshly-built info (bases/MRO already final).
+            assert registered == [info]
+            assert registered[0].fullname == "mod.Fake"
+            assert registered[0].bases == [self.fx.a]
+        finally:
+            _set_native_checker_fake_info_registrar(None)
+
     def test_other_unregistered_fake_still_defers_and_parity_holds(self) -> None:
         from mypy.subtypes import is_subtype
 
