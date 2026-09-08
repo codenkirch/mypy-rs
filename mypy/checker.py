@@ -711,6 +711,22 @@ def _set_native_checker_resolver(resolver: Any) -> None:
     _native_checker_resolver = resolver
 
 
+# Issue #1456: registration callback for runtime-synthesized TypeInfos,
+# installed per-build by `BuildManager._build_native_resolvers` so
+# `make_fake_typeinfo` can register the info at creation.
+_native_checker_fake_info_registrar: Any = None
+
+
+def _set_native_checker_fake_info_registrar(registrar: Any) -> None:
+    """Install/clear the fake-TypeInfo registration callback (issue #1456).
+
+    Cleared with `None` at the same build boundaries that clear
+    `_native_checker_resolver` (per-SCC, daemon recheck, manager reset).
+    """
+    global _native_checker_fake_info_registrar
+    _native_checker_fake_info_registrar = registrar
+
+
 def _try_native_narrow_type_by_identity_equality(
     a: Type, b: Type, operator: str
 ) -> tuple[Type | None, Type | None] | None:
@@ -8026,6 +8042,10 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
         info.bases = bases
         calculate_mro(info)
         info.metaclass_type = info.calculate_metaclass_type()
+        if _native_checker_fake_info_registrar is not None:
+            # Issue #1456: register the synthesized info in the live
+            # native snapshot (missing-left-snapshot deferral fix).
+            _native_checker_fake_info_registrar(info)
         return cdef, info
 
     def intersect_instances(

@@ -53388,3 +53388,163 @@ class NativeTypeobjGateSuite(Suite):
 
     def test_par_protocol_exempt(self) -> None:
         self._par(self._type_object_callable(self._protocol_info(), from_type_type=True))
+
+
+class NativeFakeInfoRegistrationSuite(Suite):
+    """Parity suite for resolver registration of runtime-synthesized
+    TypeInfos (issue #1456).
+
+    `TypeChecker.make_fake_typeinfo` products (ad-hoc intersections from
+    isinstance narrowing, callable subtypes, protocol-variance dummies)
+    are created during type checking, after their module's SCC snapshot
+    sealed, so `visit_instance_nominal` deferred I(fake) -> I(real) pairs
+    on a missing left snapshot. The fix registers them into the live
+    `NativeTypeResolver` snapshot at creation; each test asserts a
+    gate-on/off differential AND a direct seam call proving the Rust side
+    decides (non-None) once the fake is registered. An unregistered fake
+    must still defer (None), preserving the pure-Python fallback.
+    """
+
+    def setUp(self) -> None:
+        from mypy.subtypes import _set_native_subtype_active, _set_native_subtype_resolver
+
+        self.fx = TypeFixture(INVARIANT)
+        self.resolver = self._build_resolver([])
+        _set_native_subtype_resolver(self.resolver)
+        _set_native_subtype_active(True)
+
+    def tearDown(self) -> None:
+        from mypy.subtypes import _set_native_subtype_active, _set_native_subtype_resolver
+
+        _set_native_subtype_active(False)
+        _set_native_subtype_resolver(None)
+
+    def _type_infos(self) -> list[TypeInfo]:
+        infos = []
+        for name in dir(self.fx):
+            if not name.endswith("i"):
+                continue
+            value = getattr(self.fx, name)
+            if _is_type_info(value):
+                infos.append(value)
+        return infos
+
+    def _build_resolver(self, aliases: list[Any]) -> Any:
+        return _type_kernel.build_native_resolver(self._type_infos(), aliases)
+
+    def _set_gate(self, active: bool) -> None:
+        from mypy.subtypes import _set_native_subtype_active
+
+        _set_native_subtype_active(active)
+
+    def _seam(self, left: Any, right: Any) -> Any:
+        from mypy.subtypes import _serialize_type
+
+        return _type_kernel.rust_is_subtype(
+            _serialize_type(left),
+            _serialize_type(right),
+            False,
+            False,
+            False,
+            False,
+            False,
+            True,
+            False,
+            False,
+            self.resolver,
+        )
+
+    def _make_fake_subclass_info(
+        self, gen_name: str, bases: list[Instance]
+    ) -> TypeInfo:
+        from mypy.mro import calculate_mro
+        from mypy.nodes import Block, ClassDef, SymbolTable
+
+        cdef = ClassDef(gen_name, Block([]))
+        cdef.fullname = "mod." + gen_name
+        info = TypeInfo(SymbolTable(), cdef, "mod")
+        cdef.info = info
+        info.bases = bases
+        calculate_mro(info)
+        info.metaclass_type = info.calculate_metaclass_type()
+        return info
+
+    def test_unregistered_fake_left_defers_direct_seam(self) -> None:
+        fake = self._make_fake_subclass_info(
+            '<subclass of "mod.A" and "mod.D">', [self.fx.a, self.fx.d]
+        )
+        left = Instance(fake, [])
+        # Not registered: the engine cannot read the fake's MRO and
+        # defers (None), falling through to the Python body.
+        assert self._seam(left, self.fx.a) is None
+        assert self._seam(left, self.fx.b) is None
+
+    def test_registered_fake_left_answers_true_direct_seam(self) -> None:
+        fake = self._make_fake_subclass_info(
+            '<subclass of "mod.A" and "mod.D">', [self.fx.a, self.fx.d]
+        )
+        left = Instance(fake, [])
+        assert self._seam(left, self.fx.a) is None
+        added, added_alias = self.resolver.update([fake], [], None, None)
+        assert (added, added_alias) == (1, 0)
+        # Registered: the nominal has_base walk answers like Python.
+        assert self._seam(left, self.fx.a) is True
+        assert self._seam(left, self.fx.d) is True
+        # Idempotent: first seal wins, an identical registration is a
+        # no-op for the Rust snapshot.
+        added, added_alias = self.resolver.update([fake], [], None, None)
+        assert (added, added_alias) == (0, 0)
+
+    def test_registered_fake_gate_on_off_parity(self) -> None:
+        from mypy.subtypes import is_subtype
+
+        fake = self._make_fake_subclass_info(
+            '<subclass of "mod.A" and "mod.D">', [self.fx.a, self.fx.d]
+        )
+        self.resolver.update([fake], [], None, None)
+        left = Instance(fake, [])
+        self._set_gate(False)
+        assert is_subtype(left, self.fx.a)
+        self._set_gate(True)
+        assert is_subtype(left, self.fx.a)
+        assert is_subtype(left, self.fx.d)
+
+    def test_manager_registrar_registers_fake_info(self) -> None:
+        from types import SimpleNamespace
+
+        from mypy.build import BuildManager
+
+        fake = self._make_fake_subclass_info(
+            '<subclass of "mod.A" and "mod.D">', [self.fx.a, self.fx.d]
+        )
+        left = Instance(fake, [])
+        stub = SimpleNamespace(
+            options=Options(),
+            _native_resolver=self.resolver,
+            _native_typeinfo_map={},
+            _native_snapshotted=set(),
+        )
+        BuildManager._register_native_fake_typeinfo(stub, fake)  # type: ignore[arg-type]
+        assert stub._native_typeinfo_map == {fake.fullname: fake}
+        assert fake.fullname in stub._native_snapshotted
+        assert self._seam(left, self.fx.a) is True
+        # A duplicate name is a no-op (already snapshotted this build).
+        BuildManager._register_native_fake_typeinfo(stub, fake)  # type: ignore[arg-type]
+        assert fake.fullname in stub._native_snapshotted
+        assert stub._native_typeinfo_map == {fake.fullname: fake}
+
+    def test_other_unregistered_fake_still_defers_and_parity_holds(self) -> None:
+        from mypy.subtypes import is_subtype
+
+        fake = self._make_fake_subclass_info(
+            '<subclass of "mod.B" and "mod.O">', [self.fx.b, self.fx.o]
+        )
+        left = Instance(fake, [])
+        # Distinct fake, never registered: the direct seam still defers
+        # and the public path answers identically through Python.
+        assert self._seam(left, self.fx.b) is None
+        self._set_gate(False)
+        assert is_subtype(left, self.fx.b)
+        self._set_gate(True)
+        assert is_subtype(left, self.fx.b)
+        assert is_subtype(left, self.fx.o)
