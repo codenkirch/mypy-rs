@@ -1,44 +1,45 @@
 # Handoff: strangler-fig Rust migration loop (seam-deferral reduction)
 
-*Written 2026-08-28, refreshed 2026-09-08 (post-wave48: wave 48
-(#1464) closed via #1465 (C1 `get_type_range_of_type` leaf dispatch +
-C2 checkexpr typeobj-fail gate); wave 44 #1444 remains a documented
-negative result). Goal: "migrate all python code to rust, really
-all", pursued as the established measure -> file -> dispatch-agents
--> process-PRs -> gate loop. This file is the resume point.*
+*Written 2026-08-28, refreshed 2026-09-08 (post-wave49: wave 49
+closed #1466 (wave-48 classifier seams now defer only on unreadable
+attributes, with an ocr blocking narrowing round on the PR) and
+#1462 (sgc/ct embedded defer audits, negative close, zero ports));
+wave 44 #1444 remains a documented negative result. Goal: "migrate
+all python code to rust, really all", pursued as the established
+measure -> file -> dispatch-agents -> process-PRs -> gate loop.
+This file is the resume point.*
 
-## Where main stands (2026-09-08, post-wave48)
+## Where main stands (2026-09-08, post-wave49)
 
-- `main` = `4a7f5634a` (`feat(type_kernel): wave 48 - C1
-  get_type_range + C2 typeobj gate ports (#1465)`), local ff'd to
-  origin.
+- `main` = `cf8be3532` (`fix(type_kernel): wave-48 classifier seams
+  defer on unreadable attributes (#1466) (#1468)`) on top of
+  `f6bb80ac9` (#1469, the sgc/ct audit close), local ff'd to origin.
 - Phase state: F0 audit + F1 dual-write mirror + F2 read flip (slices
   1-10, #1393) all landed. F3 (#1397) write flip has Instance +
   CallableType splice ops; the planned tvar/union splice slice was
   profiled with `misc/f3s9_tvar_union.py` and came back EMPTY (zero
   per-field writes on a self-check) - dropped, do not build it.
-- Gates on the wave-48 head `4a7f5634a`: cargo fmt + clippy -p
+- Gates on the merged head `cf8be3532`: cargo fmt + clippy -p
   mypy-type-kernel clean, 2,721 kernel unit tests / 11 ignored;
-  testtypes 3,243/6 (kernel ON); testcheck 8,198/15/7 (exact
-  wave-47 baseline); cold self-check clean (347 files); pr-gate +
-  parity + parity-typeops green on #1465.
-- Shared `.so` rebuilt + codesigned at the wave-48 head content
+  testtypes 3,251/6 (kernel ON, +8 wave-49 deferral pins); testcheck
+  8,198/15/7 exact; cold self-check clean (347 files); pr-gate +
+  parity + parity-typeops green on #1468.
+- Shared `.so` rebuilt + codesigned at the merged head content
   2026-09-08 (`/private/tmp/mypy-rs-local-typekernel`; resolver/ast
   unchanged, still valid).
-- Survey (post-wave48, 2026-09-08, total 7,928,970 seam calls):
-  C1 `rust_classify_type_range` 9,264 @ 100%; C2
-  `rust_classify_typeobj_gate` 167,443 @ 100%; st 25,496 @ 99%
-  (~256, floors documented in AGENTS.md), icf
-  (`rust_infer_constraints_full`) 21,425 @ 99% (~214, floors), roc
-  13,818 @ 99% (~138), ama 12,334 @ 99% (contract floor), ct
-  (`rust_conditional_types`) 8,658 @ 100% (embedded residual 29
-  documented), sgc 8,533 @ 98% (~170 wrapper; #1460 embedded
-  counts 251), ifta 189 @ 30% wrapper-unmoved (embedded: 56 native
-  of 188, floors var_pspec_tvt 80 / engine 47 / solve 5; the
-  50%->30% wrapper share was an audit artifact, never real).
-  Wave-45/38 lesson stands: rank waves by embedded audits, not
-  wrapper movement (ct was the one wrapper-visible mover this wave).
-- Survey caveats (do not chase): `rust_is_subtype_batch` reports 228%
+- Survey (post-wave49, 2026-09-08, total 7,932,083 seam calls):
+  C1 `rust_classify_type_range` 9,268 @ 100%; C2
+  `rust_classify_typeobj_gate` 167,532 @ 100%; st 25,509 @ 99%
+  (~255, floors documented), icf (`rust_infer_constraints_full`)
+  21,437 @ 99% (~214, floors), roc 13,829 @ 99% (~138), ama 12,334
+  @ 99% (contract floor), ct (`rust_conditional_types`) 8,662 @ 100%
+  (embedded residual 29, wave-49 audit), sgc 8,535 @ 98% (~171
+  wrapper; embedded 253 = icf 173 / apply_generic 69 / solve_defer
+  7 / multi_lower 4, wave-49 audit), ifta 189 @ 30% wrapper-unmoved
+  (embedded 56, floors var_pspec_tvt 80 / engine 47 / solve 5).
+  Identical to wave-48 modulo noise: wave 49 ported nothing, it
+  fixed the deferral contract and closed the sgc/ct audits.
+- Survey caveats (do not chase): `rust_is_subtype_batch` reports 226%
   and the total fallback line went NEGATIVE - per-decision counting
   artifacts; discount when ranking.
 - Runner note: the repo's ephemeral runner cannot re-register (403,
@@ -71,6 +72,8 @@ all", pursued as the established measure -> file -> dispatch-agents
 | #1458 | #1455 | wave47-A: st/icf residual audits -> floor decisions, docs-only (agent A) | 0 ports; buckets -> #1456 (fake-TypeInfo snapshot), #1457 (nested-alias wall); icf 266 = protocol-member engine class, multi-wave floor; testtypes 8198-equivalent gates green |
 | #1453 | #1449 | wave46a: ama residual - is_self blanket defer retired, enum head gate retired, latent non-callable `call_type` defer retired. OCR: 1 blocking [bug high] fixed by the agent (stale snapshot `enum_members` -> live read) | embedded 181 -> 120 events = contract floor (taxonomy in project memory `ama-residual-contract-floor.md`); cargo 2,689/11; testtypes 3,201/6 (+10 NativeAmaResidualSuite) |
 | #1465 | #1464 | wave48: C1 `rust_classify_type_range` (`TypeChecker.get_type_range_of_type` leaf dispatch, zero-wire PyO3 classifier; union/typevar folds stay Python) + C2 `rust_classify_typeobj_gate` (`check_callable_call` protocol/abstract typeobj gate, double-eval collapsed to one `is_type_obj`). Orchestrator merged (parity green, ocr-review runner-stuck per #1249); OCR round 2: 2 substantive advisories -> #1466 (open bug, below) | C1 9,264 non-union leaves @ 100% native (9,286 calls; 20-item union fold stays Python); C2 167,443 gate calls @ 100% (88.9% short-circuit before `type_object()`); cargo 2,721/11 (+21); testtypes 3,243/6 (+35 NativeTypeRangeSuite + NativeTypeobjGateSuite); testcheck 8,198/15/7 exact; self-check clean 347 |
+| #1469 | #1462 | wave49: sgc/ct embedded defer audits - re-pin exact (sgc 253 = icf 173 / apply_generic 69 / solve_defer 7 / multi_lower_fnlike 4; ct 29 = concrete_sub_undecided 14 / overlap 13 / restrict_away_2 2), zero ports, negative close with bucket tables + AGENTS.md wave-48b entry (precedent #1458); audit dump via os.write(2,...) (hard_exit swallows atexit output) | sgc/ct floors documented; gates exact (cargo 2,721/11, testtypes 3,243/6, testcheck 8,198/15/7) |
+| #1468 | #1466 | wave49: wave-48 classifier seams deferral-contract gap - `?` PyErr propagation first mapped to a blanket Ok(None) (agent), then narrowed to `is_instance_of::<PyAttributeError>` ONLY after an ocr [bug·high] blocker on the PR (orchestrator fix round); other PyErrs re-propagate so kernel bugs stay visible (mirror.rs read_slot precedent) + error-class boundary pins (`_BrokenAttrInfo` exc param, RuntimeError re-propagates on both seams) | both seams defer on AttributeError only; C1 9,268 / C2 167,532 @ 100%; testtypes 3,251/6 (+8), testcheck exact, self-check clean 347 |
 
 Closed alongside: #1412, #1393 (F2 complete), #1397 (F3 partial,
 Instance/CallableType only), #1300, #1418 (closed 2026-09-05 with the
@@ -84,29 +87,28 @@ auto-closed it), #1444 (wave 44, closed by hand with the
 documented negative result), #1445, #1446, #1447 (#1451
 auto-closed it), #1449 (#1453 auto-closed it), #1450 (#1452
 auto-closed it), #1451, #1452, #1453, #1455 (commented + closed by
-hand), #1459, #1458, #1460, #1464 (#1465 auto-closed it), #1465.
-Open as follow-up: #1466 (bug: wave-48 classifier seams propagate
-PyErr via `?` instead of deferring to `Ok(None)` on an unreadable
-attribute; the Python shims catch only
-AssertionError/NotImplementedError/ValueError/TypeError, so a
-malformed live type object could crash the checker instead of
-falling back - type_range.rs:111-158, checkcall_typeobj.rs:17-73).
+hand), #1459, #1458, #1460, #1464 (#1465 auto-closed it), #1465,
+#1466 (#1468 auto-closed it), #1462 (#1469 auto-closed it), #1468,
+#1469.
 
 ## Open backlog (next waves; dispatch max ~2 port agents)
 
-1. **#1466 (open bug, small)**: wave-48 seams' AttributeError
-   deferral-contract gap - Rust `?` propagation vs Python shim's
-   4-tuple catch. Fix = map attribute-read failures to `Ok(None)`
-   (the documented "None defers" contract) + pin tests; low-risk.
-2. **#1462**: sgc (~251 embedded) + ct (~29) embedded defer audits,
-   unfinished from wave 47.
-3. **#1457**: st nested-alias wall port (biggest single wall).
-4. **#1456**: fake-TypeInfo snapshot registration.
-5. **#624**: meta Phase E1 after the wave-48 C1/C2 slice proved the
+1. **#1457**: st nested-alias wall port (biggest single wall, ~150
+   cold-self-check defers; wave-33 segfault guardrail applies).
+2. **#1456**: fake-TypeInfo snapshot registration (st 24x).
+3. **#1461**: wire.rs CallableType Display indexes `arg_kinds[i]` /
+   `arg_names[i]` unbounded - small robustness fix (latent panic on
+   malformed blobs, surfaced during wave-47 instrumentation).
+4. **#1470**: `rust_classify_final_super` blanket getattr swallow -
+   same contract class wave 49 narrowed; narrow to PyAttributeError
+   (filed out of wave 49, one-line + pin).
+5. **#1459**: 5 dead seams in errors_helpers.rs - wire as part of a
+   B6 errors-render-bundle port or delete (YAGNI).
+6. **#624**: meta Phase E1 after the wave-48 C1/C2 slice proved the
    classifier shape; B1/B3 (build-cache front) and B7 (astdiff) are
    the bytes-heavy follow-ups; semanal candidates are opt-in only.
-6. **#1432**: chore - unify.rs polish. Low priority.
-7. **#1249**: runner 403 - needs admin, skip until credentials change.
+7. **#1432**: chore - unify.rs polish. Low priority.
+8. **#1249**: runner 403 - needs admin, skip until credentials change.
 
 ## Older session record
 
@@ -198,7 +200,21 @@ ports, overload-call fronts); the loop protocol below is unchanged.
 - OCR tool bug: on large diffs the local ocr can fail with
   `file_read failed: invalid line range: start_line N is greater than
   end_line M` (hit 2026-09-07 on wave-45 first attempt and wave-46a
-  runs 2-3). It is resumable: rerun with `--resume <session-id>` (the
-  failure prints the session id), or just rerun fresh; the diff is
-  rerolled and the run usually succeeds. Do not treat the error as a
-  finding.
+  runs 2-3, and twice in a row on the wave-49 diff where the
+  testtypes.py hunks sit far past ~line 3200). It is resumable: rerun
+  with `--resume <session-id>` (the failure prints the session id),
+  or just rerun fresh; the diff is rerolled and the run usually
+  succeeds. Do not treat the error as a finding, but do not trust a
+  "0 comments" summary that still shows the failure - re-verify the
+  previous round's blockers are addressed by the new diff yourself.
+- Deferral-contract seams: map ONLY `PyAttributeError` to `Ok(None)`
+  (mirror.rs read_slot pattern, `e.is_instance_of::<PyAttributeError>
+  (py)`); a blanket `Ok(x.unwrap_or(None))` swallow converts genuine
+  kernel bugs into invisible defers (ocr [bug·high] blocker on #1468,
+  fixed on the PR by narrowing). `rust_classify_final_super` still
+  blanket-swallows (tracked #1470).
+- `agent-wait until github.pr` never converges: it also waits on the
+  `ocr-review` check, stuck `queued` forever (#1249). The operative
+  wait is `agent-wait until github.ci <run-id>` on the
+  native-kernel-parity workflow run (jobs parity + parity-typeops),
+  then merge on pr-gate + that run green.
