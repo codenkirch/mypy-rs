@@ -19,6 +19,7 @@
 //! `try/except` shim around the Rust call. Every reachable branch is
 //! classified, including the implicit trailing `return True`.
 
+use pyo3::exceptions::PyAttributeError;
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyDict, PyList, PyType};
 use std::collections::HashSet;
@@ -129,7 +130,11 @@ pub(crate) fn rust_classify_final_super(
                 Ok(b) => b,
                 Err(_) => return Ok(None),
             },
-            Err(_) => return Ok(None),
+            // Contract (#1466): an unreadable attribute defers (None), any
+            // other PyErr stays visible so the pure-Python body re-raises
+            // it identically on both gates (issue #1470).
+            Err(e) if e.is_instance_of::<PyAttributeError>(py) => return Ok(None),
+            Err(e) => return Err(e),
         }
     } else {
         false
