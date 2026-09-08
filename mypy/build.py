@@ -1764,7 +1764,9 @@ class BuildManager:
         apply). The accumulated map grows in place: it is the same dict
         identity `set_wire_typeinfo_map` installed, so Python-side wire
         decodes of the fake (e.g. join/meet results crossing back) fix up
-        to the live object.
+        to the live object. Registration is best-effort accelerator
+        work: a failure rolls both structures back and the fake keeps
+        the pre-#1456 Python-fallback behavior for the rest of the build.
         """
         if not self.options.native_type_kernel or self._native_resolver is None:
             return
@@ -1777,8 +1779,11 @@ class BuildManager:
             self._native_resolver.update([info], [], None, None)
         except Exception:
             # Best-effort accelerator: a failure must not break the
-            # build; the fake stays out and the seams defer to Python.
+            # build. Roll back both structures so the wire-decode map
+            # and the Rust snapshot stay consistent; the fake then
+            # behaves exactly as before #1456 (seams defer to Python).
             self._native_snapshotted.discard(fullname)
+            self._native_typeinfo_map.pop(fullname, None)
 
     def _clear_native_resolvers(self) -> None:
         """Clear all native resolver globals so the kernel defers to Python.

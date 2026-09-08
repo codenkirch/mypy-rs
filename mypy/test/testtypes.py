@@ -53533,6 +53533,31 @@ class NativeFakeInfoRegistrationSuite(Suite):
         assert fake.fullname in stub._native_snapshotted
         assert stub._native_typeinfo_map == {fake.fullname: fake}
 
+    def test_registrar_rolls_back_on_update_failure(self) -> None:
+        from types import SimpleNamespace
+
+        from mypy.build import BuildManager
+
+        fake = self._make_fake_subclass_info(
+            '<subclass of "mod.A" and "mod.D">', [self.fx.a, self.fx.d]
+        )
+
+        class ExplodingResolver:
+            def update(self, *args: Any) -> None:
+                raise RuntimeError("boom")
+
+        stub = SimpleNamespace(
+            options=Options(),
+            _native_resolver=ExplodingResolver(),
+            _native_typeinfo_map={},
+            _native_snapshotted=set(),
+        )
+        BuildManager._register_native_fake_typeinfo(stub, fake)  # type: ignore[arg-type]
+        # Both structures roll back: the fake keeps the Python-fallback
+        # behavior and stays eligible for a later retry.
+        assert stub._native_typeinfo_map == {}
+        assert fake.fullname not in stub._native_snapshotted
+
     def test_other_unregistered_fake_still_defers_and_parity_holds(self) -> None:
         from mypy.subtypes import is_subtype
 
