@@ -3018,13 +3018,17 @@ pub(crate) fn expand_aliases(
 /// `None` on snapshot miss, variadic target, substitution wall, cyclic
 /// chain, or depth cap: call sites defer the whole comparison.
 ///
-/// Deliberately NO FlatAliasGuard install here (wave42 slice): expanding
-/// a recursive-union-alias target with the live map flattens its inner
-/// union and deforms the operand tree; the join then re-derives a
-/// different shape (testRecursiveAliasesJoins). Alias-bearing targets
-/// keep deferring at the alias-blind flatten until a wave adds Python's
-/// is_recursive pass-through parity (handle_recursive=False arm,
-/// types.py:5920) to flatten_union_expanding_aliases.
+/// Wave 50 (issue #1457): a no-args, no-tvar alias occurrence now
+/// unrolls to its RAW target (`copy_modified(args=[])`, types.py:4181-
+/// 4197) instead of running the full expand_type_inner substitution
+/// pipeline; the pipeline's union arm flattened the target and deferred
+/// on a top-level alias item (no FlatAliasGuard in this context), which
+/// was the nested-alias defer leaf for recursive union aliases (JsonValue,
+/// astdiff SnapshotItem/Primitive, test.data FileOperation). The raw
+/// target keeps nested alias refs in place, exactly like Python's
+/// `get_proper_type`. Deliberately NO FlatAliasGuard install here
+/// (wave42 slice): the tvar-carrying pipeline still defers on
+/// alias-bearing targets instead of flattening them.
 pub(crate) fn expand_top_aliases(
     typ: &Type,
     alias_map: &crate::expandtype::AliasMap,
@@ -3061,6 +3065,11 @@ pub(crate) fn expand_top_aliases(
                     return None;
                 }
             }
+        } else if args.is_empty() && snap.alias_tvars.is_empty() {
+            // Issue #1457 (wave 50): get_proper_type parity -- unroll a
+            // no-args, no-tvar occurrence to its RAW target instead of
+            // the deferred expand_type_inner union pipeline.
+            decode_type(&snap.target)?
         } else {
             let target = match decode_type(&snap.target) {
                 Some(t) => t,
@@ -7339,6 +7348,73 @@ mod tests {
             "mod.A",
         );
         assert_eq!(expand_top_aliases(&input, &ar.shared(), true), None);
+    }
+
+    #[test]
+    fn test_expand_top_aliases_unrolls_no_args_union_target() {
+        // Issue #1457 (wave 50): a no-args, no-tvar alias with a union
+        // target whose items include another alias unrolls to the RAW
+        // target; the nested alias refs survive (get_proper_type shape).
+        let nested = Type::UnionType {
+            items: vec![
+                instance("builtins.str", vec![]),
+                alias_type(vec![], "mod.Inner"),
+            ],
+            uses_pep604_syntax: false,
+            can_be_true: true,
+            can_be_false: true,
+            is_evaluated: true,
+            original_str_expr: None,
+            original_str_fallback: None,
+        };
+        let outer = TypeAliasSnapshot {
+            fullname: "mod.Outer".to_string(),
+            target: encode_for_alias(&nested),
+            no_args: false,
+            ..Default::default()
+        };
+        let inner = TypeAliasSnapshot {
+            fullname: "mod.Inner".to_string(),
+            target: encode_for_alias(&instance("builtins.int", vec![])),
+            no_args: false,
+            ..Default::default()
+        };
+        let ar = make_alias_resolver(vec![outer, inner]);
+        let input = alias_type(vec![], "mod.Outer");
+        // The raw target union is returned verbatim; the nested alias
+        // node survives (the while-loop stops at the non-alias root).
+        assert_eq!(expand_top_aliases(&input, &ar.shared(), true), Some(nested));
+    }
+
+    #[test]
+    fn test_expand_top_aliases_unrolls_recursive_union_target() {
+        // Issue #1457 (wave 50): the recursive self-reference is kept as
+        // a raw alias node; the depth-cap while-loop terminates at the
+        // union root (previously the pipeline's flatten deferred).
+        let target = Type::UnionType {
+            items: vec![
+                instance("builtins.str", vec![]),
+                alias_type(vec![], "mod.R"),
+            ],
+            uses_pep604_syntax: false,
+            can_be_true: true,
+            can_be_false: true,
+            is_evaluated: true,
+            original_str_expr: None,
+            original_str_fallback: None,
+        };
+        let snap = TypeAliasSnapshot {
+            fullname: "mod.R".to_string(),
+            target: encode_for_alias(&target),
+            no_args: false,
+            ..Default::default()
+        };
+        let ar = make_alias_resolver(vec![snap]);
+        let mut input = alias_type(vec![], "mod.R");
+        if let Type::TypeAliasType { is_recursive, .. } = &mut input {
+            *is_recursive = true;
+        }
+        assert_eq!(expand_top_aliases(&input, &ar.shared(), true), Some(target));
     }
 
     #[test]

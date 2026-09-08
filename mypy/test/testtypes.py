@@ -3838,9 +3838,9 @@ class NativeSubtypesDeferralSuite(Suite):
             assert fn() == expected, f"gate-on != gate-off for {label}"
             assert expected, f"both gates must answer True for {label}"
 
-        # Direct seam: expansion now succeeds (the cut terminates it), but
-        # the comparison still defers because an operand reaches a cut
-        # alias node. Assert deferral (never a wrong False).
+        # Direct seam: the wave-50 raw-target unroll (#1457) lets the engine
+        # decide `R <: A` natively -- the ALIAS_ASSUME guard terminates
+        # the recursion and matches the gate-off answer above (True).
         self._set_gate(True)
         rusted = _type_kernel.rust_is_subtype(
             _serialize_type(r),
@@ -3855,7 +3855,7 @@ class NativeSubtypesDeferralSuite(Suite):
             False,
             self.resolver,
         )
-        assert rusted is None
+        assert rusted is True
 
     def test_instance_callable_probe_engages(self) -> None:
         # Issue #1205 (Port B): an Instance parsed across the MRO snapshot

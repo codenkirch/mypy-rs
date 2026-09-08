@@ -270,6 +270,15 @@ pub(crate) fn join_types(
     ctx: &SubtypeContext,
     resolver: &TypeResolver,
 ) -> Option<SetOpResult> {
+    // ISSUE-1457 JOIN GUARD (wave 50): recursive-alias content in a
+    // both-union merge defers to Python, which keeps the recursive alias
+    // node in joined unions (testRecursiveAliasesJoins).
+    if matches!(s, Type::UnionType { .. })
+        && matches!(t, Type::UnionType { .. })
+        && (contains_recursive_alias(s) || contains_recursive_alias(t))
+    {
+        return None;
+    }
     // join.py:505: s = get_proper_type(s). A top-level `TypeAliasType`
     // operand expands through the alias snapshot (chain-resolving +
     // substituting); snapshot miss / cycle / bad shape defers to Python.
@@ -3927,6 +3936,171 @@ fn erase_extra_attrs_in_union(items: &[Type], result: &mut Type) {
     }
 }
 
+/// Depth cap for `contains_recursive_alias`. Generous enough for
+/// legitimate recursive-alias wire shapes (alias target + union items +
+/// callable/instance nesting; kernel peers cap at 50-200); the guarantee
+/// is only that a hostile nester cannot hang the scan, not that deep
+/// trees are classified.
+const MAX_RECURSIVE_ALIAS_SCAN_DEPTH: u32 = 64;
+
+/// Whether a wire `Type` tree carries a `TypeAliasType` node with the
+/// recursion flag set (wave-50 join guard). Flag-only recognition, never
+/// expansion: recursive aliases are the one class the native join's
+/// union paths must hand back to Python, which keeps the recursive
+/// alias node in joined unions through its own is_recursive_pair /
+/// assumption machinery. A truncated scan answers `true` (defer) so the
+/// native path never runs on an unknown shape.
+pub(crate) fn contains_recursive_alias(t: &Type) -> bool {
+    contains_recursive_alias_at(t, 0)
+}
+
+fn contains_recursive_alias_at(t: &Type, depth: u32) -> bool {
+    if depth > MAX_RECURSIVE_ALIAS_SCAN_DEPTH {
+        return true;
+    }
+    match t {
+        Type::TypeAliasType {
+            args, is_recursive, ..
+        } => {
+            *is_recursive
+                || args
+                    .iter()
+                    .any(|a| contains_recursive_alias_at(a, depth + 1))
+        }
+        Type::Instance {
+            args,
+            last_known_value,
+            extra_attrs,
+            ..
+        } => {
+            args.iter()
+                .any(|a| contains_recursive_alias_at(a, depth + 1))
+                || last_known_value
+                    .as_ref()
+                    .is_some_and(|v| contains_recursive_alias_at(v, depth + 1))
+                || extra_attrs.as_ref().is_some_and(|e| {
+                    e.attrs
+                        .values()
+                        .any(|v| contains_recursive_alias_at(v, depth + 1))
+                })
+        }
+        Type::UnionType { items, .. } => items
+            .iter()
+            .any(|i| contains_recursive_alias_at(i, depth + 1)),
+        Type::TupleType {
+            partial_fallback,
+            items,
+            ..
+        } => {
+            contains_recursive_alias_at(partial_fallback, depth + 1)
+                || items
+                    .iter()
+                    .any(|i| contains_recursive_alias_at(i, depth + 1))
+        }
+        Type::CallableType {
+            fallback,
+            instance_type,
+            arg_types,
+            ret_type,
+            variables,
+            type_guard,
+            type_is,
+            ..
+        } => {
+            contains_recursive_alias_at(fallback, depth + 1)
+                || instance_type
+                    .as_ref()
+                    .is_some_and(|i| contains_recursive_alias_at(i, depth + 1))
+                || arg_types
+                    .iter()
+                    .any(|a| contains_recursive_alias_at(a, depth + 1))
+                || contains_recursive_alias_at(ret_type, depth + 1)
+                || variables
+                    .iter()
+                    .any(|v| contains_recursive_alias_at(v, depth + 1))
+                || type_guard
+                    .as_ref()
+                    .is_some_and(|g| contains_recursive_alias_at(g, depth + 1))
+                || type_is
+                    .as_ref()
+                    .is_some_and(|g| contains_recursive_alias_at(g, depth + 1))
+        }
+        Type::Overloaded { items } => items
+            .iter()
+            .any(|i| contains_recursive_alias_at(i, depth + 1)),
+        Type::TypedDictType {
+            fallback, items, ..
+        } => {
+            contains_recursive_alias_at(fallback, depth + 1)
+                || items
+                    .iter()
+                    .any(|(_, v)| contains_recursive_alias_at(v, depth + 1))
+        }
+        Type::LiteralType { fallback, .. } => contains_recursive_alias_at(fallback, depth + 1),
+        Type::TypeType { item, .. } => contains_recursive_alias_at(item, depth + 1),
+        Type::UnpackType { typ, .. } => contains_recursive_alias_at(typ, depth + 1),
+        Type::TypeVarType {
+            values,
+            upper_bound,
+            default,
+            ..
+        } => {
+            values
+                .iter()
+                .any(|v| contains_recursive_alias_at(v, depth + 1))
+                || contains_recursive_alias_at(upper_bound, depth + 1)
+                || contains_recursive_alias_at(default, depth + 1)
+        }
+        Type::ParamSpecType {
+            prefix,
+            upper_bound,
+            default,
+            ..
+        } => {
+            prefix
+                .arg_types
+                .iter()
+                .any(|a| contains_recursive_alias_at(a, depth + 1))
+                || prefix
+                    .variables
+                    .iter()
+                    .any(|a| contains_recursive_alias_at(a, depth + 1))
+                || contains_recursive_alias_at(upper_bound, depth + 1)
+                || contains_recursive_alias_at(default, depth + 1)
+        }
+        Type::TypeVarTupleType {
+            tuple_fallback,
+            upper_bound,
+            default,
+            ..
+        } => {
+            contains_recursive_alias_at(tuple_fallback, depth + 1)
+                || contains_recursive_alias_at(upper_bound, depth + 1)
+                || contains_recursive_alias_at(default, depth + 1)
+        }
+        Type::AnyType { source_any, .. } => source_any
+            .as_ref()
+            .is_some_and(|s| contains_recursive_alias_at(s, depth + 1)),
+        // UnboundType carries args that can hold alias nodes (forward
+        // references); scan them like every other nested carrier.
+        Type::UnboundType { args, .. } => args
+            .iter()
+            .any(|a| contains_recursive_alias_at(a, depth + 1)),
+        Type::NoneType
+        | Type::ErasedType
+        | Type::UninhabitedType { .. }
+        | Type::DeletedType { .. } => false,
+        Type::Parameters(p) => {
+            p.arg_types
+                .iter()
+                .any(|a| contains_recursive_alias_at(a, depth + 1))
+                || p.variables
+                    .iter()
+                    .any(|v| contains_recursive_alias_at(v, depth + 1))
+        }
+    }
+}
+
 /// Alias-aware recursive union flatten for the `make_simplified_union`
 /// step-1 fallback: expands `TypeAliasType` items to their raw targets
 /// and flattens nested unions (both the live ones and the union-shaped
@@ -4159,6 +4333,12 @@ fn visit_union_join(
     ctx: &SubtypeContext,
     resolver: &TypeResolver,
 ) -> Option<SetOpResult> {
+    // ISSUE-1457 JOIN GUARD (wave 50): recursive-alias content here
+    // defers to Python, which keeps the recursive alias node in the
+    // joined union (testRecursiveAliasesJoins).
+    if contains_recursive_alias(s) || items.iter().any(contains_recursive_alias) {
+        return None;
+    }
     // s <: t iff s <: any item of t.
     let mut found_subtype = false;
     for item in items {
@@ -6434,6 +6614,94 @@ mod tests {
             trivial_join(&left, &right, &ctx(true), &r),
             Some(SetOpResult::Object)
         );
+    }
+
+    fn recursive_alias_node() -> Type {
+        Type::TypeAliasType {
+            args: vec![],
+            type_ref: "mod.R".to_string(),
+            is_recursive: true,
+        }
+    }
+
+    fn plain_alias_node() -> Type {
+        Type::TypeAliasType {
+            args: vec![],
+            type_ref: "mod.P".to_string(),
+            is_recursive: false,
+        }
+    }
+
+    fn union_of(items: Vec<Type>) -> Type {
+        Type::UnionType {
+            items,
+            uses_pep604_syntax: false,
+            can_be_true: true,
+            can_be_false: true,
+            is_evaluated: true,
+            original_str_expr: None,
+            original_str_fallback: None,
+        }
+    }
+
+    #[test]
+    fn join_types_defers_both_union_with_recursive_alias() {
+        // Issue #1457 (wave 50): a both-union merge carrying a recursive
+        // alias defers to Python (the native expansion deforms the shape,
+        // testRecursiveAliasesJoins).
+        let r = make_resolver(vec![]);
+        let s = union_of(vec![instance("a.A", vec![]), recursive_alias_node()]);
+        let t = union_of(vec![instance("a.B", vec![])]);
+        assert_eq!(join_types(&s, &t, &ctx(true), &r), None);
+    }
+
+    #[test]
+    fn join_types_both_union_without_recursive_alias_still_works() {
+        // Parity guard: the wave-50 defer fires only on recursive-alias
+        // content; plain both-union merges keep the native path.
+        let r = make_resolver(vec![snap("a.A", "A"), snap("a.B", "B")]);
+        let s = union_of(vec![instance("a.A", vec![])]);
+        let t = union_of(vec![instance("a.B", vec![])]);
+        let result = join_types(&s, &t, &ctx(true), &r);
+        // A and B unrelated: both-union merge -> make_simplified_union
+        // -> U(A, B) Encoded.
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn visit_union_join_defers_recursive_alias_item() {
+        // Issue #1457 (wave 50): a union with a recursive alias item
+        // defers to Python (native msu expansion deforms the shape).
+        let r = make_resolver(vec![snap("a.A", "A")]);
+        let items = vec![recursive_alias_node(), instance("a.B", vec![])];
+        assert_eq!(
+            visit_union_join(&instance("a.A", vec![]), &items, &ctx(true), &r),
+            None
+        );
+    }
+
+    #[test]
+    fn contains_recursive_alias_walks_nested_instances() {
+        // The walker sees a recursive alias nested in Instance args; the
+        // flag on the node itself is the primary signal.
+        let nested = instance("builtins.list", vec![recursive_alias_node()]);
+        assert!(contains_recursive_alias(&nested));
+        // A plain (non-recursive) alias node is not a hit.
+        let plain = instance("builtins.list", vec![plain_alias_node()]);
+        assert!(!contains_recursive_alias(&plain));
+        assert!(contains_recursive_alias(&recursive_alias_node()));
+        // The extra-attrs carrier is scanned too.
+        let mut inst = instance("builtins.list", vec![]);
+        if let Type::Instance { extra_attrs, .. } = &mut inst {
+            *extra_attrs = Some(ExtraAttrs {
+                attrs: vec![("x".to_string(), recursive_alias_node())]
+                    .into_iter()
+                    .collect(),
+                immutable: Default::default(),
+                mod_name: None,
+            });
+        }
+        assert!(contains_recursive_alias(&inst));
     }
 
     #[test]
