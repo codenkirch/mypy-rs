@@ -710,13 +710,17 @@ def _deserialize_solved_callable_from_checkexpr(b: bytes) -> ProperType | None:
 
 
 def _deserialize_optional_type_list(raw: bytes) -> list[Type | None] | None:
-    """Decode a Rust optional-type list blob (`count` + per-var `0|1 + Type`).
+    """Decode the ifta solution-list blob (`count` + per-var `flag + Type`).
 
-    Mirrors `checkcall.rs serialize_optional_types` output; returns None on
-    any decode failure so the caller falls back to Python inference.
+    Count and flags are `read_int` (LITERAL_INT tag + bare int), matching
+    `write_int` on the Rust side (solve.rs); each present solution is
+    `read_type` + `fixup_wire_type` so type_refs resolve to live TypeInfos.
+    Returns None on any decode/fixup failure so the caller falls back to
+    Python inference.
     """
     try:
         from mypy.cache import read_int
+        from mypy.wirefixup import fixup_wire_type
 
         buf = _CheckExprReadBuffer(raw)
         count = read_int(buf)
@@ -724,7 +728,10 @@ def _deserialize_optional_type_list(raw: bytes) -> list[Type | None] | None:
         for _ in range(count):
             has = read_int(buf)
             if has == 1:
-                result.append(_checkexpr_read_type(buf))
+                fixed = fixup_wire_type(_checkexpr_read_type(buf))
+                if fixed is None:
+                    return None
+                result.append(fixed)
             elif has == 0:
                 result.append(None)
             else:
@@ -732,6 +739,64 @@ def _deserialize_optional_type_list(raw: bytes) -> list[Type | None] | None:
         return result
     except (AssertionError, ValueError, NotImplementedError):
         return None
+
+
+def _restore_ifta_definitions(
+    solutions: list[Type | None],
+    callee_type: CallableType,
+    pass1_args: list[Type | None],
+    arg_kinds: list[ArgKind],
+    formal_to_actual: list[list[int]],
+) -> list[Type | None] | None:
+    """Restore `definition` on ifta solutions the wire round-trip drops.
+
+    The wire CallableType carries `name` but not `definition`, and
+    `pretty_callable` (messages.py) renders `def <name>` from
+    `definition` when `name` is None. Python's pure solve keeps it:
+    a single-lower no-op returns the live lower (solve.py), and a
+    multi-lower join folds left-to-right so the last sorted lower
+    supplies it (the `join_type_list` native seam, join.py). Star
+    actuals are expanded before the fold (fresh definition-less
+    objects on the Python side), so per-variable restoration skips
+    them. Returns a new list, or None on a malformed shape so the
+    caller defers to Python inference.
+    """
+    if len(solutions) != len(callee_type.variables):
+        return None
+    from mypy.solve import _join_sorted_key
+
+    formal_tvars = [get_all_type_vars(at) for at in callee_type.arg_types]
+    out = list(solutions)
+    for idx, var in enumerate(callee_type.variables):
+        sol = out[idx]
+        if sol is None:
+            continue
+        psol = get_proper_type(sol)
+        if not isinstance(psol, CallableType) or psol.definition is not None:
+            continue
+        lowers: list[Type] = []
+        star_involved = False
+        for j, actuals in enumerate(formal_to_actual):
+            if not any(tv.id == var.id for tv in formal_tvars[j]):
+                continue
+            for a in actuals:
+                if arg_kinds[a].is_star():
+                    star_involved = True
+                    break
+                t = pass1_args[a]
+                if t is not None:
+                    lowers.append(t)
+            if star_involved:
+                break
+        if star_involved or not lowers:
+            continue
+        if len(lowers) == 1:
+            src = get_proper_type(lowers[0])
+        else:
+            src = get_proper_type(sorted(lowers, key=_join_sorted_key)[-1])
+        if isinstance(src, CallableType) and src.definition is not None:
+            out[idx] = psol.copy_modified(definition=src.definition)
+    return out
 
 
 # bytes -> decoded argtypes-plan cache.  The native argtypes-plan path
@@ -3626,7 +3691,11 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
                     if raw is not None:
                         decoded = _deserialize_optional_type_list(bytes(raw))
                         if decoded is not None and len(decoded) == len(callee_type.variables):
-                            inferred_args = decoded
+                            restored = _restore_ifta_definitions(
+                                decoded, callee_type, pass1_args, arg_kinds, formal_to_actual
+                            )
+                            if restored is not None:
+                                inferred_args = restored
                 except (AssertionError, NotImplementedError, ValueError, TypeError):
                     pass  # Defer to Python.
 

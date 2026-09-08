@@ -2063,7 +2063,9 @@ pub(crate) fn rust_infer_function_type_arguments(
         }
     };
     // Re-encode in `variables` order as an optional-type list. The Python
-    // shim decodes this with `read_int` + `read_type` (count per var).
+    // shim (`_deserialize_optional_type_list`, checkexpr.py) reads the count
+    // and every per-var flag with `read_int` (LITERAL_INT tag + bare int),
+    // then `read_type` per present solution; write flags the same way.
     let solutions = match decode_solve_solutions_here(&sol_blob) {
         Some(s) => s,
         None => {
@@ -2080,10 +2082,12 @@ pub(crate) fn rust_infer_function_type_arguments(
     for tv in &tvids {
         match solutions.iter().find(|(k, _)| k == tv) {
             Some((_, Some(t))) => {
-                out.push(1);
+                wire::write_int(&mut out, 1).ok()?;
                 wire::write_type(&mut out, t).ok()?;
             }
-            _ => out.push(0),
+            _ => {
+                wire::write_int(&mut out, 0).ok()?;
+            }
         }
     }
     Some(out.into_bytes())
@@ -2428,6 +2432,25 @@ mod tests {
     /// Python shim's `read_type` + type_ref resolution).
     fn out_bytes(out: &SolveOut) -> Option<Vec<u8>> {
         out.1.clone()
+    }
+
+    /// ifta solution-list flags use `write_int`, not `push(0|1)`: the
+    /// Python reader (`_deserialize_optional_type_list`, checkexpr.py:712)
+    /// asserts the `LITERAL_INT` tag on the count and on every flag.
+    #[test]
+    fn ifta_solution_list_flag_framing_roundtrips_read_int() {
+        let mut out = WriteBuffer::new();
+        wire::write_int(&mut out, 2).unwrap();
+        wire::write_int(&mut out, 0).unwrap();
+        wire::write_int(&mut out, 1).unwrap();
+        wire::write_type(&mut out, &any_from_error()).unwrap();
+        let blob = out.into_bytes();
+        let mut buf = ReadBuffer::new(&blob);
+        assert_eq!(wire::read_int(&mut buf).unwrap(), 2);
+        assert_eq!(wire::read_int(&mut buf).unwrap(), 0);
+        assert_eq!(wire::read_int(&mut buf).unwrap(), 1);
+        let decoded = wire::read_type(&mut buf, None).unwrap();
+        assert!(matches!(decoded, Type::AnyType { type_of_any: 5, .. }));
     }
 
     #[test]
