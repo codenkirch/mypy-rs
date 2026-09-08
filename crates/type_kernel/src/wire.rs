@@ -1642,11 +1642,13 @@ impl fmt::Display for Type {
                 // and ret first, then prepend `def ` + the variables block.
                 let mut params = String::new();
                 let mut asterisk = false;
-                for i in 0..arg_types.len() {
+                for (i, arg_type) in arg_types.iter().enumerate() {
                     if i > 0 {
                         params.push_str(", ");
                     }
-                    let kind = arg_kinds[i];
+                    // Defaults (ARG_POS / None) keep a shape-mismatched blob
+                    // rendering instead of panicking (issue #1461).
+                    let kind = arg_kinds.get(i).copied().unwrap_or(0);
                     // ARG_NAMED (3) or ARG_NAMED_OPT (5): insert `*, ` once.
                     if (kind == 3 || kind == 5) && !asterisk {
                         params.push_str("*, ");
@@ -1661,7 +1663,7 @@ impl fmt::Display for Type {
                     if kind == 4 {
                         params.push_str("**");
                     }
-                    let name = &arg_names[i];
+                    let name = arg_names.get(i).and_then(|n| n.as_ref());
                     if let Some(n) = name {
                         params.push_str(n);
                         params.push_str(": ");
@@ -1673,7 +1675,7 @@ impl fmt::Display for Type {
                         // type is an UnpackType. We don't have the full
                         // Python check here; mirror the common case.
                     }
-                    let type_str = arg_types[i].to_string();
+                    let type_str = arg_type.to_string();
                     if kind == 4 && *unpack_kwargs {
                         params.push_str(&format!("**{type_str}"));
                     } else {
@@ -1896,11 +1898,12 @@ fn list_str(out: &mut dyn fmt::Write, types: &[Type], use_or_syntax: bool) -> fm
 /// `visit_parameters` (standalone `Parameters`).
 fn write_parameters_inner(f: &mut fmt::Formatter<'_>, p: &Parameters) -> fmt::Result {
     let mut asterisk = false;
-    for i in 0..p.arg_types.len() {
+    for (i, arg_type) in p.arg_types.iter().enumerate() {
         if i > 0 {
             f.write_str(", ")?;
         }
-        let kind = p.arg_kinds[i];
+        // Same shape-mismatch guard as the callable arm (issue #1461).
+        let kind = p.arg_kinds.get(i).copied().unwrap_or(0);
         if (kind == 3 || kind == 5) && !asterisk {
             f.write_str("*, ")?;
             asterisk = true;
@@ -1912,11 +1915,11 @@ fn write_parameters_inner(f: &mut fmt::Formatter<'_>, p: &Parameters) -> fmt::Re
         if kind == 4 {
             f.write_str("**")?;
         }
-        if let Some(n) = &p.arg_names[i] {
+        if let Some(n) = p.arg_names.get(i).and_then(|n| n.as_ref()) {
             f.write_str(n)?;
             f.write_str(": ")?;
         }
-        write!(f, "{}", p.arg_types[i])?;
+        write!(f, "{arg_type}")?;
         if kind == 1 || kind == 5 {
             f.write_str(" =")?;
         }
@@ -4222,5 +4225,69 @@ mod tests {
                 "doc/f0_coverage.md is missing F0 field `{field}`"
             );
         }
+    }
+
+    #[test]
+    fn callable_display_shape_mismatch_does_not_panic() {
+        // A shape-mismatched CallableType (arg_types longer than
+        // arg_kinds/arg_names) must render instead of panicking on the bare
+        // index (issue #1461). Missing kinds/names degrade to ARG_POS/None.
+        let int = Type::Instance {
+            type_ref: "builtins.int".to_string(),
+            args: Vec::new(),
+            last_known_value: None,
+            extra_attrs: None,
+        };
+        let t = Type::CallableType {
+            fallback: Box::new(Type::Instance {
+                type_ref: "builtins.function".to_string(),
+                args: Vec::new(),
+                last_known_value: None,
+                extra_attrs: None,
+            }),
+            instance_type: None,
+            is_ellipsis_args: false,
+            implicit: false,
+            is_bound: false,
+            from_concatenate: false,
+            imprecise_arg_kinds: false,
+            unpack_kwargs: false,
+            from_type_type: false,
+            arg_types: vec![int.clone(), int.clone()],
+            arg_kinds: vec![2], // ARG_STAR only for the first arg.
+            arg_names: vec![Some("a".to_string())],
+            ret_type: Box::new(Type::NoneType),
+            name: None,
+            variables: Vec::new(),
+            type_guard: None,
+            type_is: None,
+            special_sig: None,
+        };
+        // First arg renders `*a: int`; missing kind/name on the second
+        // degrade to ARG_POS/unnamed and still render.
+        assert_eq!(format!("{t}"), "def (*a: builtins.int, builtins.int)");
+    }
+
+    #[test]
+    fn parameters_display_shape_mismatch_does_not_panic() {
+        // Same guard for the standalone Parameters arm (issue #1461).
+        let int = Type::Instance {
+            type_ref: "builtins.int".to_string(),
+            args: Vec::new(),
+            last_known_value: None,
+            extra_attrs: None,
+        };
+        let p = Parameters {
+            arg_types: vec![int.clone(), int],
+            arg_kinds: vec![2],
+            arg_names: vec![Some("a".to_string())],
+            variables: Vec::new(),
+            imprecise_arg_kinds: false,
+            is_ellipsis_args: false,
+        };
+        assert_eq!(
+            format!("{}", Type::Parameters(p)),
+            "[*a: builtins.int, builtins.int]"
+        );
     }
 }
