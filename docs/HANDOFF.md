@@ -102,8 +102,11 @@ hand), #1459, #1458, #1460, #1464 (#1465 auto-closed it), #1465,
 4. **#1470**: `rust_classify_final_super` blanket getattr swallow -
    same contract class wave 49 narrowed; narrow to PyAttributeError
    (filed out of wave 49, one-line + pin).
-5. **#1459**: 5 dead seams in errors_helpers.rs - wire as part of a
-   B6 errors-render-bundle port or delete (YAGNI).
+5. **#1459**: resolved 2026-09-09 by deletion (wave 51): the 5
+   zero-caller seams in errors_helpers.rs were removed (their 6
+   self-pinning unit tests with them). B6 render-bundle port remains
+   design-only per Phase E1; a real port re-creates the 4 B6-relevant
+   seams against a live call contract.
 6. **#624**: meta Phase E1 after the wave-48 C1/C2 slice proved the
    classifier shape; B1/B3 (build-cache front) and B7 (astdiff) are
    the bytes-heavy follow-ups; semanal candidates are opt-in only.
