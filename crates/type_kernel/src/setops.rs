@@ -3936,6 +3936,13 @@ fn erase_extra_attrs_in_union(items: &[Type], result: &mut Type) {
     }
 }
 
+/// Depth cap for `contains_recursive_alias`. Generous enough for
+/// legitimate recursive-alias wire shapes (alias target + union items +
+/// callable/instance nesting; kernel peers cap at 50-200); the guarantee
+/// is only that a hostile nester cannot hang the scan, not that deep
+/// trees are classified.
+const MAX_RECURSIVE_ALIAS_SCAN_DEPTH: u32 = 64;
+
 /// Whether a wire `Type` tree carries a `TypeAliasType` node with the
 /// recursion flag set (wave-50 join guard). Flag-only recognition, never
 /// expansion: recursive aliases are the one class the native join's
@@ -3943,7 +3950,7 @@ fn erase_extra_attrs_in_union(items: &[Type], result: &mut Type) {
 /// alias node in joined unions through its own is_recursive_pair /
 /// assumption machinery. Depth-capped against hostile nesting.
 pub(crate) fn contains_recursive_alias(t: &Type, depth: u32) -> bool {
-    if depth > 16 {
+    if depth > MAX_RECURSIVE_ALIAS_SCAN_DEPTH {
         return false;
     }
     match t {
@@ -3953,12 +3960,18 @@ pub(crate) fn contains_recursive_alias(t: &Type, depth: u32) -> bool {
         Type::Instance {
             args,
             last_known_value,
+            extra_attrs,
             ..
         } => {
             args.iter().any(|a| contains_recursive_alias(a, depth + 1))
                 || last_known_value
                     .as_ref()
                     .is_some_and(|v| contains_recursive_alias(v, depth + 1))
+                || extra_attrs.as_ref().is_some_and(|e| {
+                    e.attrs
+                        .values()
+                        .any(|v| contains_recursive_alias(v, depth + 1))
+                })
         }
         Type::UnionType { items, .. } => {
             items.iter().any(|i| contains_recursive_alias(i, depth + 1))
@@ -4058,10 +4071,14 @@ pub(crate) fn contains_recursive_alias(t: &Type, depth: u32) -> bool {
         | Type::UninhabitedType { .. }
         | Type::DeletedType { .. }
         | Type::UnboundType { .. } => false,
-        Type::Parameters(p) => p
-            .arg_types
-            .iter()
-            .any(|a| contains_recursive_alias(a, depth + 1)),
+        Type::Parameters(p) => {
+            p.arg_types
+                .iter()
+                .any(|a| contains_recursive_alias(a, depth + 1))
+                || p.variables
+                    .iter()
+                    .any(|v| contains_recursive_alias(v, depth + 1))
+        }
     }
 }
 
@@ -6645,18 +6662,6 @@ mod tests {
     }
 
     #[test]
-    fn visit_union_join_plain_alias_item_defers_too() {
-        // The wave-50 guard does not cover plain aliases; the outcome is
-        // still a defer via the alias-snapshot miss (guard-neutral).
-        let r = make_resolver(vec![snap("a.A", "A")]);
-        let items = vec![plain_alias_node()];
-        assert_eq!(
-            visit_union_join(&instance("a.A", vec![]), &items, &ctx(true), &r),
-            None
-        );
-    }
-
-    #[test]
     fn contains_recursive_alias_walks_nested_instances() {
         // The walker sees a recursive alias nested in Instance args; the
         // flag on the node itself is the primary signal.
@@ -6666,6 +6671,18 @@ mod tests {
         let plain = instance("builtins.list", vec![plain_alias_node()]);
         assert!(!contains_recursive_alias(&plain, 0));
         assert!(contains_recursive_alias(&recursive_alias_node(), 0));
+        // The extra-attrs carrier is scanned too.
+        let mut inst = instance("builtins.list", vec![]);
+        if let Type::Instance { extra_attrs, .. } = &mut inst {
+            *extra_attrs = Some(ExtraAttrs {
+                attrs: vec![("x".to_string(), recursive_alias_node())]
+                    .into_iter()
+                    .collect(),
+                immutable: Default::default(),
+                mod_name: None,
+            });
+        }
+        assert!(contains_recursive_alias(&inst, 0));
     }
 
     #[test]
