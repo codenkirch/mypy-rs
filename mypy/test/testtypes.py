@@ -53390,6 +53390,7 @@ class NativeTypeobjGateSuite(Suite):
         self._par(self._type_object_callable(self._protocol_info(), from_type_type=True))
 
 
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeFakeInfoRegistrationSuite(Suite):
     """Parity suite for resolver registration of runtime-synthesized
     TypeInfos (issue #1456).
