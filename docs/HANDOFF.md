@@ -1,45 +1,35 @@
 # Handoff: strangler-fig Rust migration loop (seam-deferral reduction)
 
-*Written 2026-08-28, refreshed 2026-09-07 (post-wave46: waves 45 (#1451)
-and 46a/b (#1452, #1453) on main; wave 44 #1444 closed as a documented
-negative result). Goal: "migrate all python code to rust, really all",
-pursued as the established measure -> file -> dispatch-agents ->
-process-PRs -> gate loop. This file is the resume point.*
+*Written 2026-08-28, refreshed 2026-09-08 (post-wave47: wave 47
+(#1455) closed via #1458 (st/icf floors, docs-only) + #1460 (ifta
+wire-framing fix); wave 44 #1444 remains a documented negative
+result). Goal: "migrate all python code to rust, really all", pursued
+as the established measure -> file -> dispatch-agents -> process-PRs
+-> gate loop. This file is the resume point.*
 
-## Where main stands (2026-09-07, post-wave46)
+## Where main stands (2026-09-08, post-wave47)
 
-- `main` = `4532c89b8` (`perf(type_kernel): wave 46 - retire ama
-  residual defers (#1449) (#1453)`), local ff'd to origin.
+- `main` = `bdef48024` (`fix(type_kernel): wave 47 - ifta wire
+  framing + definition restore (#1455)`), local ff'd to origin.
 - Phase state: F0 audit + F1 dual-write mirror + F2 read flip (slices
   1-10, #1393) all landed. F3 (#1397) write flip has Instance +
   CallableType splice ops; the planned tvar/union splice slice was
   profiled with `misc/f3s9_tvar_union.py` and came back EMPTY (zero
   per-field writes on a self-check) - dropped, do not build it.
-- Gates on the wave-45/46 merged head, per PR commit records + CI:
-  `cargo fmt` + clippy -p mypy-type-kernel clean, 2,689 kernel unit
-  tests / 11 ignored (w46a; 7 new self_substitution_allowed tests);
-  testtypes 3,201 passed / 6 skipped; testcheck 8,144 / 69 / 7 exact;
-  cold self-check clean; pr-gate + parity + parity-typeops all pass.
-- Shared `.so` rebuilt + codesigned at `4532c89b8` content 2026-09-07
-  (`/private/tmp/mypy-rs-local-typekernel|resolver|ast`).
-- Survey (post-wave46, run 2026-09-07): 7,738,162 seam calls total
-  (was 7,723,020). Top residual buckets by absolute fallbacks:
-  `rust_is_subtype` 25,562 @ 99% (~256),
-  `rust_infer_constraints_full` 21,470 @ 99% (~215),
-  `rust_solve_generic_call` 8,521 @ 98% (~170),
-  `rust_check_overload_call` 13,779 @ 99% (~138),
-  `rust_infer_function_type_arguments` 188 @ 30% (~132),
-  `rust_analyze_member_access` 12,310 @ 99% (~123, contract floor per
-  the agent's embedded audit: 120 events; the taxonomy lives in project
-  memory `ama-residual-contract-floor.md`),
-  `rust_remove_redundant_union_items` 10,125 @ 99% (~101),
-  `rust_map_instance_to_supertype` 8,483 @ 99% (~85),
-  `rust_is_singleton_identity_type` 7,007 @ 99% (~70). COMPARED TO
-  post-wave43: every wrapper count is flat within noise EXCEPT
-  `rust_conditional_types` (8,698 @ ~87 -> off the top-22 list; the
-  wave-46b retirement IS wrapper-visible). Wave-45 (fmt) and wave-46a
-  (ama) gains are embedded-only - the wave-38 lesson again, so stop
-  ranking waves by wrapper movement; trust the embedded audit numbers.
+- Gates on the wave-47 head `bdef48024`: cargo fmt + clippy -p
+  mypy-type-kernel clean, 2,700 kernel unit tests / 11 ignored;
+  testtypes 3,208/6; testcheck 8,198/15/7; cold self-check clean
+  (347 files); pr-gate + parity + parity-typeops green on both PRs.
+- Shared `.so` rebuilt + codesigned at the wave-47 head content
+  2026-09-08 (`/private/tmp/mypy-rs-local-typekernel`; resolver/ast
+  unchanged, still valid).
+- Survey (post-wave47, 2026-09-08): st 25,471 @ 99% (~255, = floors
+  documented in AGENTS.md), icf 21,407 @ 99% (~214, floors), roc
+  13,809 @ 99% (~138), rru 10,130 @ 99% (~101), sgc 8,527 @ 98%
+  (~170 wrapper; #1460 embedded counts 251), ifta 189 @ 30%
+  wrapper-unmoved (embedded: 56 native of 188, floors var_pspec_tvt
+  80 / engine 47 / solve 5; the 50%->30% wrapper share was an
+  audit artifact, never real).
 - Survey caveats (do not chase): `rust_is_subtype_batch` reports 228%
   and the total fallback line went NEGATIVE - per-decision counting
   artifacts; discount when ranking.
@@ -69,7 +59,9 @@ process-PRs -> gate loop. This file is the resume point.*
 | - | #1444 | wave44: format/resolve-family seams (~260 defers) - DOCUMENTED NEGATIVE (see wave-45 row for the follow-up) | negative result; follow-up #1447 (wave 45) |
 | #1451 | #1447 | wave45: fmt:alias_top in format-type seams - non-recursive TypeAliasType expands through the alias snapshot (`expand_alias_for_format`: chain resolve + `no_args` instance-swap + tvar-arg substitution) and formats the expanded target byte-identically; recursive aliases / missing snapshot / cycle / variadic shapes defer (`<alias (unfixed)>` shape, wave-33 segfault guardrail: cycles via the `is_recursive` flag, never recursion). OCR: 1 blocking [bug] fixed by the orchestrator (zip truncation on snapshot arity mismatch -> arity guard defers; 2 pin unit tests) + advisory (redundant pre-lookup) applied in the same fix commit (#1440 precedent) | fmt alias defers 42 -> 0; testtypes 3,191/6; testcheck 8,144/69/7 exact |
 | #1452 | #1450 | wave46b: ct residual - `rust_conditional_types` structural-branch `Some(false)` now falls through like Python's `if is_subtype(...)`; only undecided engine shapes defer | 67 -> 29 defers (embedded); wrapper 8,650 calls @ 99.76%; cargo test 2,682/11; testtypes 3,184/6 (+2); testcheck exact |
-| #1453 | #1449 | wave46a: ama residual - is_self blanket defer retired (var-arm rebind branch unreachable; `analyze_var` pre-maps itype onto var.info, so is_self reduces to a pure self_type-shape test), enum head gate retired (full arm + literal-wrap/nonmember-unwrap tail with a LIVE `enum_members` read), latent non-callable `call_type` defer retired. OCR: 1 blocking [bug high] fixed by the agent (stale snapshot `enum_members` could list later-nonmember members -> live read), OCR runs 2-3 hit the tool file-read bug, run 4 clean (0 comments) | embedded 181 -> 120 events; wrapper 12,304 calls @ 99.0% (120 fallbacks) = contract floor (entry-miss 71, desc 22, plugin-hook 8, lvalue 8, bare-self-tvar 5, tuple-fb 3, overload-all 2, type-none 1; full taxonomy in project memory + PR body); cargo test 2,689/11; testtypes 3,201/6 (+10 NativeAmaResidualSuite); testcheck exact; CI parity/parity-typeops/pr-gate all pass |
+| #1460 | #1455 | wave47-B: ifta wire-framing fix + definition restore (agent B) | ifta true-native 0 (decode_mismatch all 56) -> 56 (~30%); floors var_pspec_tvt 80 / engine 47 / solve 5; cargo 2700/11, testtypes 3208/6, testcheck 8198/15/7, self-check clean |
+| #1458 | #1455 | wave47-A: st/icf residual audits -> floor decisions, docs-only (agent A) | 0 ports; buckets -> #1456 (fake-TypeInfo snapshot), #1457 (nested-alias wall); icf 266 = protocol-member engine class, multi-wave floor; testtypes 8198-equivalent gates green |
+| #1453 | #1449 | wave46a: ama residual - is_self blanket defer retired, enum head gate retired, latent non-callable `call_type` defer retired. OCR: 1 blocking [bug high] fixed by the agent (stale snapshot `enum_members` -> live read) | embedded 181 -> 120 events = contract floor (taxonomy in project memory `ama-residual-contract-floor.md`); cargo 2,689/11; testtypes 3,201/6 (+10 NativeAmaResidualSuite) |
 
 Closed alongside: #1412, #1393 (F2 complete), #1397 (F3 partial,
 Instance/CallableType only), #1300, #1418 (closed 2026-09-05 with the
@@ -82,25 +74,26 @@ auto-closed it), #1442 (#1446 auto-closed it), #1443 (#1445
 auto-closed it), #1444 (wave 44, closed by hand with the
 documented negative result), #1445, #1446, #1447 (#1451
 auto-closed it), #1449 (#1453 auto-closed it), #1450 (#1452
-auto-closed it), #1451, #1452, #1453.
+auto-closed it), #1451, #1452, #1453, #1455 (commented + closed by
+hand), #1459, #1458, #1460.
 
 ## Open backlog (next waves; dispatch max ~2 port agents)
 
-1. **Wave 47 (issue to file, dup-check first)**: audit the remaining
-   wrapper buckets from the post-wave46 survey (numbers in the survey
-   block above once refreshed): st ~250, icf ~215, sgc ~170, roc ~130,
-   ifta 188 @ ~30% (~130, un-audited rate outlier in checkcall), ct
-   residual ~29, rru ~100. Each has been audited at least once
-   (waves 39-46); expect the audit-first taxonomy to close more
-   not-planned than decidable; the ama seam is at its contract floor
-   (project memory `ama-residual-contract-floor.md` has the real
-   bucket table, do not re-audit blind).
-2. **#624**: meta Phase E1 - the `visit_*` decision-head program that
-   unlocks the 50%-Rust milestone. The kernel branch/defer surface is
-   exhausted (top rows 100%); this is the next structural front.
-3. **#1432**: chore - unify.rs polish after #1427 (PolyModeGuard
-   save/restore + trailing flag labels). Low priority.
-4. **#1249**: runner 403 - needs admin, skip until credentials change.
+1. **Wave 48 (issue filed as part of Phase E1 #624; plan brief kept at
+   `docs/wave48-candidates.md`, untracked)**: recommended slice C1
+   (`get_type_range_of_type`, checker.py:10396) + C2
+   (checkexpr.py:2856 typeobj-fail gate), production gates; audit-first
+   with negative-audit exit. Bytes metric: 40.2% Rust, gap to 50% is
+   ~2.89M Rust bytes; 1.67M figure in #624 body is stale.
+2. **#1462**: wave 48b - sgc (~251 embedded) + ct (~50) embedded defer
+   audits, unfinished from wave 47.
+3. **#1457**: st nested-alias wall port (biggest single wall).
+4. **#1456**: fake-TypeInfo snapshot registration.
+5. **#624**: meta Phase E1 after the C1/C2 slice proves the shape;
+   B1/B3 (build-cache front) and B7 (astdiff) are the bytes-heavy
+   follow-ups; semanal candidates are opt-in only.
+6. **#1432**: chore - unify.rs polish. Low priority.
+7. **#1249**: runner 403 - needs admin, skip until credentials change.
 
 ## Older session record
 
@@ -184,6 +177,11 @@ ports, overload-call fronts); the loop protocol below is unchanged.
 - OCR: GH `ocr-review` is stuck `queued` forever (runner 403, #1249);
   the operative review gate is local `ocr review`, then pr-gate +
   parity green locally, then `--squash --admin`.
+- Do not idle-wait: run `agent-wait` in the background and stop calling
+  tools until the notification.
+- testtypes gate counts are only meaningful WITH
+  `TEST_NATIVE_TYPE_KERNEL=1`; without it ~3k native-gated cases
+  report as skipped and the count masquerades as pass.
 - OCR tool bug: on large diffs the local ocr can fail with
   `file_read failed: invalid line range: start_line N is greater than
   end_line M` (hit 2026-09-07 on wave-45 first attempt and wave-46a
