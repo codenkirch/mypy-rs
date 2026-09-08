@@ -1,35 +1,43 @@
 # Handoff: strangler-fig Rust migration loop (seam-deferral reduction)
 
-*Written 2026-08-28, refreshed 2026-09-08 (post-wave47: wave 47
-(#1455) closed via #1458 (st/icf floors, docs-only) + #1460 (ifta
-wire-framing fix); wave 44 #1444 remains a documented negative
-result). Goal: "migrate all python code to rust, really all", pursued
-as the established measure -> file -> dispatch-agents -> process-PRs
--> gate loop. This file is the resume point.*
+*Written 2026-08-28, refreshed 2026-09-08 (post-wave48: wave 48
+(#1464) closed via #1465 (C1 `get_type_range_of_type` leaf dispatch +
+C2 checkexpr typeobj-fail gate); wave 44 #1444 remains a documented
+negative result). Goal: "migrate all python code to rust, really
+all", pursued as the established measure -> file -> dispatch-agents
+-> process-PRs -> gate loop. This file is the resume point.*
 
-## Where main stands (2026-09-08, post-wave47)
+## Where main stands (2026-09-08, post-wave48)
 
-- `main` = `bdef48024` (`fix(type_kernel): wave 47 - ifta wire
-  framing + definition restore (#1455)`), local ff'd to origin.
+- `main` = `4a7f5634a` (`feat(type_kernel): wave 48 - C1
+  get_type_range + C2 typeobj gate ports (#1465)`), local ff'd to
+  origin.
 - Phase state: F0 audit + F1 dual-write mirror + F2 read flip (slices
   1-10, #1393) all landed. F3 (#1397) write flip has Instance +
   CallableType splice ops; the planned tvar/union splice slice was
   profiled with `misc/f3s9_tvar_union.py` and came back EMPTY (zero
   per-field writes on a self-check) - dropped, do not build it.
-- Gates on the wave-47 head `bdef48024`: cargo fmt + clippy -p
-  mypy-type-kernel clean, 2,700 kernel unit tests / 11 ignored;
-  testtypes 3,208/6; testcheck 8,198/15/7; cold self-check clean
-  (347 files); pr-gate + parity + parity-typeops green on both PRs.
-- Shared `.so` rebuilt + codesigned at the wave-47 head content
+- Gates on the wave-48 head `4a7f5634a`: cargo fmt + clippy -p
+  mypy-type-kernel clean, 2,721 kernel unit tests / 11 ignored;
+  testtypes 3,243/6 (kernel ON); testcheck 8,198/15/7 (exact
+  wave-47 baseline); cold self-check clean (347 files); pr-gate +
+  parity + parity-typeops green on #1465.
+- Shared `.so` rebuilt + codesigned at the wave-48 head content
   2026-09-08 (`/private/tmp/mypy-rs-local-typekernel`; resolver/ast
   unchanged, still valid).
-- Survey (post-wave47, 2026-09-08): st 25,471 @ 99% (~255, = floors
-  documented in AGENTS.md), icf 21,407 @ 99% (~214, floors), roc
-  13,809 @ 99% (~138), rru 10,130 @ 99% (~101), sgc 8,527 @ 98%
-  (~170 wrapper; #1460 embedded counts 251), ifta 189 @ 30%
-  wrapper-unmoved (embedded: 56 native of 188, floors var_pspec_tvt
-  80 / engine 47 / solve 5; the 50%->30% wrapper share was an
-  audit artifact, never real).
+- Survey (post-wave48, 2026-09-08, total 7,928,970 seam calls):
+  C1 `rust_classify_type_range` 9,264 @ 100%; C2
+  `rust_classify_typeobj_gate` 167,443 @ 100%; st 25,496 @ 99%
+  (~256, floors documented in AGENTS.md), icf
+  (`rust_infer_constraints_full`) 21,425 @ 99% (~214, floors), roc
+  13,818 @ 99% (~138), ama 12,334 @ 99% (contract floor), ct
+  (`rust_conditional_types`) 8,658 @ 100% (embedded residual 29
+  documented), sgc 8,533 @ 98% (~170 wrapper; #1460 embedded
+  counts 251), ifta 189 @ 30% wrapper-unmoved (embedded: 56 native
+  of 188, floors var_pspec_tvt 80 / engine 47 / solve 5; the
+  50%->30% wrapper share was an audit artifact, never real).
+  Wave-45/38 lesson stands: rank waves by embedded audits, not
+  wrapper movement (ct was the one wrapper-visible mover this wave).
 - Survey caveats (do not chase): `rust_is_subtype_batch` reports 228%
   and the total fallback line went NEGATIVE - per-decision counting
   artifacts; discount when ranking.
@@ -39,7 +47,7 @@ as the established measure -> file -> dispatch-agents -> process-PRs
   `ocr review --from origin/main --to <branch> --audience agent`,
   then `gh pr merge --squash --admin` after pr-gate + parity green.
 
-## Waves 33-46 (since the 2026-08-31 refresh)
+## Waves 33-48 (since the 2026-08-31 refresh)
 
 | PR | Issue | What | Numbers |
 |----|-------|------|---------|
@@ -62,6 +70,7 @@ as the established measure -> file -> dispatch-agents -> process-PRs
 | #1460 | #1455 | wave47-B: ifta wire-framing fix + definition restore (agent B) | ifta true-native 0 (decode_mismatch all 56) -> 56 (~30%); floors var_pspec_tvt 80 / engine 47 / solve 5; cargo 2700/11, testtypes 3208/6, testcheck 8198/15/7, self-check clean |
 | #1458 | #1455 | wave47-A: st/icf residual audits -> floor decisions, docs-only (agent A) | 0 ports; buckets -> #1456 (fake-TypeInfo snapshot), #1457 (nested-alias wall); icf 266 = protocol-member engine class, multi-wave floor; testtypes 8198-equivalent gates green |
 | #1453 | #1449 | wave46a: ama residual - is_self blanket defer retired, enum head gate retired, latent non-callable `call_type` defer retired. OCR: 1 blocking [bug high] fixed by the agent (stale snapshot `enum_members` -> live read) | embedded 181 -> 120 events = contract floor (taxonomy in project memory `ama-residual-contract-floor.md`); cargo 2,689/11; testtypes 3,201/6 (+10 NativeAmaResidualSuite) |
+| #1465 | #1464 | wave48: C1 `rust_classify_type_range` (`TypeChecker.get_type_range_of_type` leaf dispatch, zero-wire PyO3 classifier; union/typevar folds stay Python) + C2 `rust_classify_typeobj_gate` (`check_callable_call` protocol/abstract typeobj gate, double-eval collapsed to one `is_type_obj`). Orchestrator merged (parity green, ocr-review runner-stuck per #1249); OCR round 2: 2 substantive advisories -> #1466 (open bug, below) | C1 9,264 non-union leaves @ 100% native (9,286 calls; 20-item union fold stays Python); C2 167,443 gate calls @ 100% (88.9% short-circuit before `type_object()`); cargo 2,721/11 (+21); testtypes 3,243/6 (+35 NativeTypeRangeSuite + NativeTypeobjGateSuite); testcheck 8,198/15/7 exact; self-check clean 347 |
 
 Closed alongside: #1412, #1393 (F2 complete), #1397 (F3 partial,
 Instance/CallableType only), #1300, #1418 (closed 2026-09-05 with the
@@ -75,23 +84,27 @@ auto-closed it), #1444 (wave 44, closed by hand with the
 documented negative result), #1445, #1446, #1447 (#1451
 auto-closed it), #1449 (#1453 auto-closed it), #1450 (#1452
 auto-closed it), #1451, #1452, #1453, #1455 (commented + closed by
-hand), #1459, #1458, #1460.
+hand), #1459, #1458, #1460, #1464 (#1465 auto-closed it), #1465.
+Open as follow-up: #1466 (bug: wave-48 classifier seams propagate
+PyErr via `?` instead of deferring to `Ok(None)` on an unreadable
+attribute; the Python shims catch only
+AssertionError/NotImplementedError/ValueError/TypeError, so a
+malformed live type object could crash the checker instead of
+falling back - type_range.rs:111-158, checkcall_typeobj.rs:17-73).
 
 ## Open backlog (next waves; dispatch max ~2 port agents)
 
-1. **Wave 48 (issue filed as part of Phase E1 #624; plan brief kept at
-   `docs/wave48-candidates.md`, untracked)**: recommended slice C1
-   (`get_type_range_of_type`, checker.py:10396) + C2
-   (checkexpr.py:2856 typeobj-fail gate), production gates; audit-first
-   with negative-audit exit. Bytes metric: 40.2% Rust, gap to 50% is
-   ~2.89M Rust bytes; 1.67M figure in #624 body is stale.
-2. **#1462**: wave 48b - sgc (~251 embedded) + ct (~50) embedded defer
-   audits, unfinished from wave 47.
+1. **#1466 (open bug, small)**: wave-48 seams' AttributeError
+   deferral-contract gap - Rust `?` propagation vs Python shim's
+   4-tuple catch. Fix = map attribute-read failures to `Ok(None)`
+   (the documented "None defers" contract) + pin tests; low-risk.
+2. **#1462**: sgc (~251 embedded) + ct (~29) embedded defer audits,
+   unfinished from wave 47.
 3. **#1457**: st nested-alias wall port (biggest single wall).
 4. **#1456**: fake-TypeInfo snapshot registration.
-5. **#624**: meta Phase E1 after the C1/C2 slice proves the shape;
-   B1/B3 (build-cache front) and B7 (astdiff) are the bytes-heavy
-   follow-ups; semanal candidates are opt-in only.
+5. **#624**: meta Phase E1 after the wave-48 C1/C2 slice proved the
+   classifier shape; B1/B3 (build-cache front) and B7 (astdiff) are
+   the bytes-heavy follow-ups; semanal candidates are opt-in only.
 6. **#1432**: chore - unify.rs polish. Low priority.
 7. **#1249**: runner 403 - needs admin, skip until credentials change.
 
