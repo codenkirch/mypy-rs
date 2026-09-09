@@ -54184,3 +54184,101 @@ class NativePluginFakeRegistrarSuite(Suite):
             assert self_arg.type.fullname == inst.type.fullname
         finally:
             _set_native_expand_type_active(False)
+class NativeCtorBlobGatesSuite(Suite):
+    """`_native_ctor_blob` must clear the expand/maptype gates too (#1484).
+
+    The typeops gate is cleared for the blob window (wave22 #1324); the
+    expand and maptype gates were left active. A blob chain reaching
+    `bind_self`'s generic path or `map_instance_to_supertype` would then
+    round-trip doomed FFI against the stale resolver (the fresh class is
+    not yet in its snapshot table): snap-miss, Python fallback, wasted
+    round-trip. This pins all three gate families off inside the window
+    and the gate-on vs gate-off blob parity (identical bytes).
+    """
+
+    def setUp(self) -> None:
+        from mypy.expandtype import (
+            _set_native_expand_type_active,
+            _set_native_expand_type_resolver,
+        )
+        from mypy.maptype import _set_native_map_active, _set_native_map_resolver
+        from mypy.typeops import _set_native_typeops_active, _set_native_typeops_resolver
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        self.fx = TypeFixture()
+        type_infos = [v for v in vars(self.fx).values() if _is_type_info(v)]
+        self._resolver = _type_kernel.build_native_resolver(type_infos, [])
+        _set_native_typeops_active(True)
+        _set_native_typeops_resolver(self._resolver)
+        _set_native_expand_type_active(True)
+        _set_native_expand_type_resolver(self._resolver)
+        _set_native_map_active(True)
+        _set_native_map_resolver(self._resolver)
+        set_wire_typeinfo_map({info.fullname: info for info in type_infos})
+
+    def tearDown(self) -> None:
+        from mypy.expandtype import (
+            _set_native_expand_type_active,
+            _set_native_expand_type_resolver,
+        )
+        from mypy.maptype import _set_native_map_active, _set_native_map_resolver
+        from mypy.typeops import _set_native_typeops_active, _set_native_typeops_resolver
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        _set_native_typeops_active(False)
+        _set_native_typeops_resolver(None)
+        _set_native_expand_type_active(False)
+        _set_native_expand_type_resolver(None)
+        _set_native_map_active(False)
+        _set_native_map_resolver(None)
+        set_wire_typeinfo_map(None)
+
+    def test_blob_window_clears_all_three_gate_families(self) -> None:
+        from mypy import build, expandtype, maptype, typeops
+        from mypy.nodes import MDEF, Block, FuncDef, SymbolTableNode
+
+        # A fresh class OUT of the snapshot table: the stale-resolver shape
+        # from mid-build (the blob loop runs before the SCC's `update`).
+        info = self.fx.make_type_info("mod.BlobGates")
+        # A metaclass fallback avoids the stdlib typeinfo lookup, which
+        # needs modules_state content unit tests do not populate.
+        info.metaclass_type = Instance(self.fx.type_typei, [])
+        fd = FuncDef("__init__", [], Block([]))
+        fd.info = info
+        info.names["__init__"] = SymbolTableNode(MDEF, fd)
+
+        # Gate-on reference blob: setUp installed all three gates with the
+        # stale resolver (the precisely pre-fix shape).
+        blob_on = build._native_ctor_blob(info)
+        assert blob_on is not None, "ctor blob failed to build"
+
+        observed: dict[str, Any] = {}
+        orig = typeops.type_object_type
+
+        def probe(probe_info: Any) -> Any:
+            observed["typeops_active"] = typeops._native_typeops_active
+            observed["expand_active"] = expandtype._native_expand_type_active
+            observed["expand_resolver"] = expandtype._native_expand_type_resolver
+            observed["map_active"] = maptype._native_map_active
+            observed["map_resolver"] = maptype._native_map_resolver
+            return orig(probe_info)
+
+        typeops.type_object_type = probe  # type: ignore[assignment]
+        try:
+            blob_probed = build._native_ctor_blob(info)
+        finally:
+            typeops.type_object_type = orig
+
+        assert blob_probed == blob_on, "gate-on and gate-off blobs must be identical"
+        assert observed["typeops_active"] is False, "typeops gate must be off in window"
+        assert observed["expand_active"] is False, "expand gate must be off in window"
+        assert observed["expand_resolver"] is None, "expand resolver must clear in window"
+        assert observed["map_active"] is False, "map gate must be off in window"
+        assert observed["map_resolver"] is None, "map resolver must clear in window"
+        # All gates must be restored exactly after the window.
+        assert typeops._native_typeops_active is True
+        assert typeops._native_typeops_resolver is self._resolver
+        assert expandtype._native_expand_type_active is True
+        assert expandtype._native_expand_type_resolver is self._resolver
+        assert maptype._native_map_active is True
+        assert maptype._native_map_resolver is self._resolver
