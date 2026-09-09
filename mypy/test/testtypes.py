@@ -53876,7 +53876,10 @@ class NativeIcfProtocolSubtypeArmSuite(Suite):
             if _is_type_info(value):
                 type_infos.append(value)
         type_infos.extend(extra)
-        live = {i.fullname: i for i in extra}
+        # Full set in both maps: decoded constraint targets reference fixture
+        # TypeInfos too (`T <: A` serializes Instance "A"); a partial map
+        # makes fixup fail and the parity pins compare Python vs Python.
+        live = {i.fullname: i for i in type_infos}
         self.resolver = _type_kernel.build_native_resolver(type_infos, [])
         self.resolver.set_live_typeinfo_map(live)
         set_wire_typeinfo_map(live)

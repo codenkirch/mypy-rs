@@ -1163,8 +1163,12 @@ fn visit_instance_protocol_supertype_native(
 }
 
 /// The SUBTYPE_OF structural-protocol arm of `visit_instance`
-/// (constraints.py:1568-1582): `actual` is a protocol Instance, `template`
-/// is a plain Instance, and both nominal branches missed. Decided when
+/// (constraints.py:1568-1582): `actual` is a protocol Instance and the
+/// nominal branches missed. Python's SUBTYPE_OF arm fires for any
+/// protocol actual, so `template` is usually a plain Instance but may be
+/// a protocol too (both-protocol pairs route here with the template left).
+/// `direction` is always SUBTYPE_OF — the dispatch gate in
+/// `visit_instance_native` is the only production caller. Decided when
 /// `is_protocol_implementation(erased, actual, skip=["__call__"])`
 /// succeeds — the ERASED TEMPLATE left, the protocol INSTANCE right
 /// (constraints.py:1572) — and the member loop's find_member-based
