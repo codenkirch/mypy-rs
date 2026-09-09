@@ -798,20 +798,29 @@ def _native_ctor_blob(info: TypeInfo) -> bytes | None:
     object the checker would build at decision time. Any failure keeps
     the snapshot MRO fast path / Python fallback in charge (defer-only).
 
-    The typeops kernel gate is cleared for the duration: the installed
-    resolver is stale at blob time (the fresh class is not yet in its
-    snapshot table), so a native detour inside type_object_type defers on
-    the missing snapshot and its Python fallback re-enters the same seams
-    (wave22 regression from #1324). The blob is built pure.
+    The typeops, expand, and maptype kernel gates are cleared for the
+    duration: the installed resolver is stale at blob time (the fresh
+    class is not yet in its snapshot table), so a native detour inside
+    type_object_type defers on the missing snapshot and its Python
+    fallback re-enters the same seams (wave22 regression from #1324,
+    wave53 #1484). The blob is built pure.
     """
     from librt.internal import WriteBuffer
 
     import mypy.types as _types
-    from mypy import typeops
+    from mypy import expandtype, maptype, typeops
 
     try:
         active = typeops._native_typeops_active
         typeops._set_native_typeops_active(False)
+        expand_active = expandtype._native_expand_type_active
+        expand_resolver = expandtype._native_expand_type_resolver
+        expandtype._set_native_expand_type_active(False)
+        expandtype._set_native_expand_type_resolver(None)
+        map_active = maptype._native_map_active
+        map_resolver = maptype._native_map_resolver
+        maptype._set_native_map_active(False)
+        maptype._set_native_map_resolver(None)
         # Keep the is_recursive cache untouched by the blob chain: it reads
         # fresh semantic aliases whose identity astmerge may later rebind.
         prev_suppressed = _types._REC_CACHE_SUPPRESSED
@@ -821,6 +830,10 @@ def _native_ctor_blob(info: TypeInfo) -> bytes | None:
         finally:
             _types._REC_CACHE_SUPPRESSED = prev_suppressed
             typeops._set_native_typeops_active(active)
+            expandtype._set_native_expand_type_active(expand_active)
+            expandtype._set_native_expand_type_resolver(expand_resolver)
+            maptype._set_native_map_active(map_active)
+            maptype._set_native_map_resolver(map_resolver)
         buf = WriteBuffer()
         ctor.write(buf)
         return buf.getvalue()

@@ -3007,14 +3007,18 @@ including:
       defer time but not yet in the Rust snapshot (`in_typeinfo_map=
       True`, `in_rust_dict=False`, snap<map, e.g. snap=908 map=926 for
       the itertools batch; `operator.itemgetter` observed entering the
-      snapshot mid-run). Mechanism: `_native_ctor_blob` (build.py,
-      issue #1298) computes `typeops.type_object_type(info)` DURING
-      `_build_native_resolvers`, before the fresh SCC's classes are
-      installed, and clears only the typeops gate — the expand/maptype
-      gates stay active and round-trip doomed FFI against the stale
-      resolver. Correct (Python fallback; parity green), tracked by
-      #1484 (candidate fix: clear the expand/map gates for the blob
-      duration, mirroring the typeops gate).
+      snapshot mid-run). Mechanism is the resolver's snapshot-
+      population timing gap (#1456 family), not the ctor-blob window:
+      an env-gated FFI/seam probe on the wave-53 cold self-check
+      (stripped before landing, #1484) counted ZERO expand/map seam
+      entries or FFI crossings inside `_native_ctor_blob` (build.py,
+      issue #1298) windows even with all gates active, so the 49 were
+      whole-run events in normal checking phases. The blob still
+      clears the typeops/expand/maptype gates for its duration
+      (wave-53 #1484, extending the wave-22 #1324 typeops gate): the
+      installed resolver is stale at blob time, so any future blob
+      chain reaching the expand/map seams would round-trip doomed FFI
+      against the missing fresh class.
     - 10x `functools._SingleDispatchRegisterCallable`: a TypeInfo
       synthesized directly by
       `mypy/plugins/singledispatch.py:make_fake_register_class_instance`
