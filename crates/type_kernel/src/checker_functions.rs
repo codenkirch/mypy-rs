@@ -128,7 +128,11 @@ pub(crate) fn rust_classify_final_super(
         match base_node.getattr("is_final") {
             Ok(v) => match v.is_true() {
                 Ok(b) => b,
-                Err(_) => return Ok(None),
+                // Same contract as the getattr arm (#1470/#1477): a raising
+                // truthiness defers only on AttributeError, other errors
+                // stay visible.
+                Err(e) if e.is_instance_of::<PyAttributeError>(py) => return Ok(None),
+                Err(e) => return Err(e),
             },
             // Contract (#1466): an unreadable attribute defers (None), any
             // other PyErr stays visible so the pure-Python body re-raises

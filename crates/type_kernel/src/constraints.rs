@@ -303,18 +303,24 @@ thread_local! {
 
 /// RAII tri-state install for [`INFER_POLY`] (panic-safe; the mode is
 /// per-thread, so a guard must never outlive the frame that installed it).
-pub(crate) struct PolyModeGuard;
+/// `prev` is captured at install time and restored on `Drop`, mirroring
+/// `unify::InferUnionsGuard`, so a nested install can never silently
+/// downgrade an outer frame if re-entry ever becomes reachable.
+#[must_use]
+pub(crate) struct PolyModeGuard {
+    prev: u8,
+}
 
 impl PolyModeGuard {
     pub(crate) fn install(value: bool) -> Self {
-        INFER_POLY.with(|c| c.set(if value { 1 } else { 2 }));
-        Self
+        let prev = INFER_POLY.with(|c| c.replace(if value { 1 } else { 2 }));
+        Self { prev }
     }
 }
 
 impl Drop for PolyModeGuard {
     fn drop(&mut self) {
-        INFER_POLY.with(|c| c.set(0));
+        INFER_POLY.with(|c| c.set(self.prev));
     }
 }
 
@@ -4929,8 +4935,8 @@ mod tests {
 
     #[test]
     fn test_poly_mode_guard_sequential_unwind() {
-        // The RAII guard resets to Unknown (0), not to a saved previous
-        // value: nesting is unsupported, sequential installs unwind fully.
+        // The RAII guard restores the saved `prev` on drop: sequential
+        // installs unwind fully back to Unknown (0).
         assert_eq!(infer_poly_mode(), 0);
         let g = PolyModeGuard::install(true);
         assert_eq!(infer_poly_mode(), 1);
@@ -4939,6 +4945,22 @@ mod tests {
         let g2 = PolyModeGuard::install(false);
         assert_eq!(infer_poly_mode(), 2);
         drop(g2);
+        assert_eq!(infer_poly_mode(), 0);
+    }
+
+    #[test]
+    fn test_poly_mode_guard_nested_restore() {
+        // A nested install restores the outer frame's mode on drop, not
+        // Unknown (0): the outer frame must never be silently downgraded
+        // (issues #1427/#1432; nesting is unreachable in production).
+        assert_eq!(infer_poly_mode(), 0);
+        let outer = PolyModeGuard::install(true);
+        assert_eq!(infer_poly_mode(), 1);
+        let inner = PolyModeGuard::install(false);
+        assert_eq!(infer_poly_mode(), 2);
+        drop(inner);
+        assert_eq!(infer_poly_mode(), 1);
+        drop(outer);
         assert_eq!(infer_poly_mode(), 0);
     }
 

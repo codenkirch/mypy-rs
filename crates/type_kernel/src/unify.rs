@@ -543,9 +543,9 @@ pub(crate) fn unify_generic_callable_core(
             resolver,
             aliases,
             strict_optional,
-            false,
+            false, // skip_neg_op
             // Python `infer_constraints` wrapper default (constraints.py:802).
-            true,
+            true, // erase_types
         ) {
             Some(cs) => constraints.extend(cs),
             None => return UnifyOutcome::Defer,

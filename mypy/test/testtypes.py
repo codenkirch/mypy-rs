@@ -28317,6 +28317,31 @@ class NativeEnumProtocolClassifierSuite(Suite):
         assert self._tk.rust_classify_protocol_test_callee(c, 2) is None
 
 
+class _RaisingFinalValue:
+    """`is_final` value whose `__bool__` raises `exc`.
+
+    The inner arm of `rust_classify_final_super` calls `is_true()` (the
+    Python truthiness protocol) on the already-read attribute value. The
+    issue #1470 `_BrokenFinalVar` shape raises on the getattr itself and
+    cannot reach that arm, so the #1477 pins need `is_final` to *return* a
+    value whose truthiness raises.
+    """
+
+    def __init__(self, exc: type[Exception] = AttributeError) -> None:
+        self._exc = exc
+
+    def __bool__(self) -> bool:
+        raise self._exc("is_final bool")
+
+
+class _BrokenFinalValueVar(Var):
+    """Var whose `is_final` returns a value with a raising `__bool__`."""
+
+    def __init__(self, name: str, exc: type[Exception] = AttributeError) -> None:
+        super().__init__(name)
+        self.is_final = _RaisingFinalValue(exc)  # type: ignore[assignment]
+
+
 class _BrokenFinalVar(Var):
     """Var stand-in whose `is_final` read raises `exc`.
 
@@ -28561,6 +28586,49 @@ class NativeFinalSuperSuite(Suite):
         node = self._var("node_attr", True)
         base = self._base("mod.Base")
         base_node = _BrokenFinalVar("base_attr", RuntimeError)
+        off = self._run_once(node, base, base_node, active=False)
+        on = self._run_once(node, base, base_node, active=True)
+        assert isinstance(off, RuntimeError), f"gate-off expected RuntimeError: {off!r}"
+        assert isinstance(on, RuntimeError), f"gate-on expected RuntimeError: {on!r}"
+        assert str(off) == str(on), f"raise messages differ: {off!r} != {on!r}"
+
+    def test_seam_defers_on_inner_unreadable_bool(self) -> None:
+        # An AttributeError from the truthiness of the already-read
+        # `is_final` value must defer (None), like the getattr arm (issue
+        # #1477 pin).
+        base_node = _BrokenFinalValueVar("base_attr")
+        assert self._tag(base_node, True, "attr", "mod.Base") is None
+
+    def test_seam_repropagates_inner_non_attribute_error(self) -> None:
+        # A RuntimeError from the truthiness of the `is_final` value must
+        # NOT be swallowed into a deferral: it re-propagates from the seam
+        # (issue #1477 pin).
+        import pytest
+
+        base_node = _BrokenFinalValueVar("base_attr", RuntimeError)
+        with pytest.raises(RuntimeError):
+            self._tag(base_node, True, "attr", "mod.Base")
+
+    def test_par_inner_unreadable_bool(self) -> None:
+        # Both gates raise the identical AttributeError: gate-off truthiness
+        # in the pure body, gate-on defers the unreadable bool to it (issue
+        # #1477).
+        node = self._var("node_attr", True)
+        base = self._base("mod.Base")
+        base_node = _BrokenFinalValueVar("base_attr")
+        off = self._run_once(node, base, base_node, active=False)
+        on = self._run_once(node, base, base_node, active=True)
+        assert isinstance(off, AttributeError), f"gate-off expected AttributeError: {off!r}"
+        assert isinstance(on, AttributeError), f"gate-on expected AttributeError: {on!r}"
+        assert str(off) == str(on), f"raise messages differ: {off!r} != {on!r}"
+
+    def test_par_inner_repropagates_non_attribute_error(self) -> None:
+        # Both gates raise the identical RuntimeError: gate-off truthiness in
+        # the pure body, gate-on re-propagates it from the seam (issue
+        # #1477).
+        node = self._var("node_attr", True)
+        base = self._base("mod.Base")
+        base_node = _BrokenFinalValueVar("base_attr", RuntimeError)
         off = self._run_once(node, base, base_node, active=False)
         on = self._run_once(node, base, base_node, active=True)
         assert isinstance(off, RuntimeError), f"gate-off expected RuntimeError: {off!r}"
