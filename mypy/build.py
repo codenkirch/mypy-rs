@@ -1155,6 +1155,11 @@ class BuildManager:
         # Issue #1456: the fake-TypeInfo registrar starts cleared on a
         # fresh manager; `_build_native_resolvers` installs it.
         _set_native_checker_fake_info_registrar(None)
+        # Issue #1485: the plugin fake-TypeInfo registrar (singledispatch
+        # register hook) starts cleared too; installed per build below.
+        from mypy.plugins.singledispatch import _set_native_fake_info_registrar
+
+        _set_native_fake_info_registrar(None)
         # M20: gate checkmember bind_self_fast (trivial-self binding),
         # instance_fallback, and the resolver-snapshot operator helpers.
         # Rust strips the first arg; *args/**kwargs and non-callable defer.
@@ -1726,6 +1731,12 @@ class BuildManager:
         # are created during checking, after their SCC snapshot sealed;
         # a registrar has them register at creation.
         _set_native_checker_fake_info_registrar(self._register_native_fake_typeinfo)
+        # Issue #1485: plugin-synthesized fakes (singledispatch's register
+        # hook) bypass make_fake_typeinfo; the plugin registrar fires the
+        # same #1456 registrar at the plugin creation site.
+        from mypy.plugins.singledispatch import _set_native_fake_info_registrar
+
+        _set_native_fake_info_registrar(self._register_native_fake_typeinfo)
         # Issue #491: semanal lookup_qualified dot-chain walk.
         from mypy.semanal import _set_native_semanal_resolver
 
@@ -1780,8 +1791,7 @@ class BuildManager:
         except Exception:
             # Best-effort accelerator: a failure must not break the
             # build. Roll back both structures so the wire-decode map
-            # and the Rust snapshot stay consistent; the fake then
-            # behaves exactly as before #1456 (seams defer to Python).
+            # and Rust snapshot stay consistent (pre-#1456 behavior).
             self._native_snapshotted.discard(fullname)
             self._native_typeinfo_map.pop(fullname, None)
 
@@ -1851,6 +1861,11 @@ class BuildManager:
         # a daemon recheck must start with the registrar cleared so the
         # next build's fakes register into the fresh snapshot.
         _set_native_checker_fake_info_registrar(None)
+        # Issue #1485: the plugin fake-TypeInfo registrar clears with the
+        # same per-build reset; the next install re-registers fakes.
+        from mypy.plugins.singledispatch import _set_native_fake_info_registrar
+
+        _set_native_fake_info_registrar(None)
         from mypy.typeanal import _set_native_typeanal_resolver
 
         _set_native_typeanal_resolver(None)
@@ -5923,6 +5938,11 @@ def _clear_native_kernel_resolvers(manager: BuildManager) -> None:
         # registrar; the post-semanal `_build_native_resolvers` install
         # reinstates it before any checking runs.
         _set_native_checker_fake_info_registrar(None)
+        # Issue #1485: the plugin fake-TypeInfo registrar drops too; the
+        # next `_build_native_resolvers` install reinstates it.
+        from mypy.plugins.singledispatch import _set_native_fake_info_registrar
+
+        _set_native_fake_info_registrar(None)
         from mypy.typeanal import _set_native_typeanal_resolver
 
         _set_native_typeanal_resolver(None)

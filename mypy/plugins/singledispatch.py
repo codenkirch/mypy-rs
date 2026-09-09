@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from typing import NamedTuple, TypeAlias as _TypeAlias, TypeVar
 
 from mypy.messages import format_type
@@ -39,6 +39,26 @@ def get_singledispatch_info(typ: Instance) -> SingledispatchTypeVars | None:
     return None
 
 
+# Issue #1485: plugin-synthesized TypeInfos (the register-hook fake
+# built in `make_fake_register_class_instance`) bypass the #1456
+# checker funnel, so the registrar must reach the plugin creation site.
+
+# First seal wins inside the manager registrar, so repeated register
+# calls on the same fullname are no-ops after the first.
+_native_fake_info_registrar: Callable[[TypeInfo], None] | None = None
+
+
+def _set_native_fake_info_registrar(registrar: Callable[[TypeInfo], None] | None) -> None:
+    """Install/clear the fake-TypeInfo registration callback (issue #1485).
+
+    Cleared with `None` at the same build boundaries that clear the
+    checker fake-info registrar (per-SCC, daemon recheck, manager
+    reset); `_build_native_resolvers` installs it each build.
+    """
+    global _native_fake_info_registrar
+    _native_fake_info_registrar = registrar
+
+
 T = TypeVar("T")
 
 
@@ -62,6 +82,12 @@ def make_fake_register_class_instance(
 
     func_arg = Argument(Var("name"), AnyType(TypeOfAny.implementation_artifact), None, ARG_POS)
     add_method_to_class(api, defn, "__call__", [func_arg], NoneType())
+
+    if _native_fake_info_registrar is not None:
+        # Issue #1485: register the plugin fake in the live native
+        # snapshot (#1456 pattern); the fake never enters self.modules,
+        # so the resolver must see it before member-access binding.
+        _native_fake_info_registrar(info)
 
     return Instance(info, type_args)
 

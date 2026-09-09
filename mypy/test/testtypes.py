@@ -53988,3 +53988,199 @@ class NativeIcfProtocolSubtypeArmSuite(Suite):
         actual = Instance(p2, [self.fx.a])
         self._assert_par(template, actual, SUBTYPE_OF)
         self._assert_defers(template, actual, SUBTYPE_OF)
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativePluginFakeRegistrarSuite(Suite):
+    """Parity suite for registrar registration of plugin-synthesized
+    TypeInfos (issue #1485).
+
+    `make_fake_register_class_instance` (mypy/plugins/singledispatch.py)
+    builds the register-hook fake directly, bypassing the #1456
+    `TypeChecker.make_fake_typeinfo` funnel, and the fake never enters
+    `BuildManager.modules`, so no incremental walk reaches it. The
+    creation site now fires the same #1456 manager registrar; each test
+    asserts the fake lands in the resolver snapshot (direct seam) and
+    the gate-on / gate-off expansion answers identically through the
+    real `expand_type_by_instance` path.
+    """
+
+    def setUp(self) -> None:
+        from mypy.subtypes import _set_native_subtype_active, _set_native_subtype_resolver
+
+        self.fx = TypeFixture(INVARIANT)
+        self.resolver = _type_kernel.build_native_resolver(self._type_infos(), [])
+        _set_native_subtype_resolver(self.resolver)
+        _set_native_subtype_active(True)
+        self._expand_installed = False
+
+    def tearDown(self) -> None:
+        from mypy.plugins.singledispatch import _set_native_fake_info_registrar
+        from mypy.subtypes import _set_native_subtype_active, _set_native_subtype_resolver
+
+        _set_native_subtype_active(False)
+        _set_native_subtype_resolver(None)
+        _set_native_fake_info_registrar(None)
+        if self._expand_installed:
+            from mypy.expandtype import (
+                _set_native_expand_type_active,
+                _set_native_expand_type_resolver,
+                _set_native_expand_type_typeinfo_map,
+            )
+
+            _set_native_expand_type_active(False)
+            _set_native_expand_type_resolver(None)
+            _set_native_expand_type_typeinfo_map(None)
+
+    def _type_infos(self) -> list[TypeInfo]:
+        infos = []
+        for name in dir(self.fx):
+            if not name.endswith("i"):
+                continue
+            value = getattr(self.fx, name)
+            if _is_type_info(value):
+                infos.append(value)
+        return infos
+
+    def _api(self) -> Any:
+        from mypy.types import Instance
+
+        class FakePluginApi:
+            fx: Any
+
+            def __init__(self, fx: Any) -> None:
+                self.fx = fx
+
+            def named_generic_type(self, fullname: str, args: Sequence[Type]) -> Instance:
+                if fullname == "builtins.object":
+                    return Instance(self.fx.oi, [])
+                if fullname == "builtins.function":
+                    return Instance(self.fx.functioni, [])
+                raise AssertionError(f"unexpected {fullname}")
+
+        return FakePluginApi(self.fx)
+
+    def _make_fake(self) -> tuple[Any, CallableType]:
+        from mypy.plugins.singledispatch import make_fake_register_class_instance
+
+        inst = make_fake_register_class_instance(self._api(), (self.fx.a, self.fx.o))
+        sym = inst.type.names["__call__"]
+        assert sym.node is not None
+        assert isinstance(sym.node, FuncDef)
+        assert isinstance(sym.node.type, CallableType)
+        return inst, sym.node.type
+
+    def _expand_seam(self, sig: Type, inst: Any) -> Any:
+        from mypy.expandtype import _serialize_type
+
+        return _type_kernel.rust_expand_type_by_instance(
+            self.resolver, _serialize_type(sig), _serialize_type(inst), False
+        )
+
+    def test_plugin_fake_fires_registrar_at_creation(self) -> None:
+        from mypy.plugins.singledispatch import (
+            _set_native_fake_info_registrar,
+            make_fake_register_class_instance,
+        )
+        from mypy.types import Instance
+
+        registered: list[TypeInfo] = []
+        _set_native_fake_info_registrar(registered.append)
+        try:
+            inst = make_fake_register_class_instance(self._api(), (self.fx.a, self.fx.o))
+            # The plugin creation site fires the registrar with the
+            # freshly-built info (bases/MRO already final).
+            assert registered == [inst.type]
+            assert registered[0].fullname == "functools._SingleDispatchRegisterCallable"
+            assert registered[0].bases == [Instance(self.fx.oi, [])]
+        finally:
+            _set_native_fake_info_registrar(None)
+        # Cleared: a later fake is not registered (falls back to Python).
+        inst2 = make_fake_register_class_instance(self._api(), (self.fx.a, self.fx.o))
+        assert inst2.type.fullname == "functools._SingleDispatchRegisterCallable"
+
+    def test_plugin_fake_unregistered_defers_direct_seam(self) -> None:
+        inst, sig = self._make_fake()
+        # Not registered: the engine cannot read the fake's class facts
+        # from the snapshot and defers (None), falling to the Python body.
+        assert self._expand_seam(sig, inst) is None
+
+    def test_plugin_fake_registered_answers_direct_seam(self) -> None:
+        inst, sig = self._make_fake()
+        assert self._expand_seam(sig, inst) is None
+        added, added_alias = self.resolver.update([inst.type], [], None, None)
+        assert (added, added_alias) == (1, 0)
+        result = self._expand_seam(sig, inst)
+        assert result is not None
+        # The native expansion round-trips back to the live signature.
+        from librt.internal import ReadBuffer
+
+        from mypy.expandtype import _resync_definitions
+        from mypy.types import read_type
+        from mypy.wirefixup import fixup_wire_type, set_wire_typeinfo_map
+
+        typeinfo_map = {info.fullname: info for info in self._type_infos()}
+        typeinfo_map[inst.type.fullname] = inst.type
+        set_wire_typeinfo_map(typeinfo_map)
+        decoded = read_type(ReadBuffer(bytes(result)))
+        fixed = fixup_wire_type(decoded, resolve_aliases=True)
+        assert isinstance(fixed, ProperType)
+        relinked = get_proper_type(_resync_definitions(sig, fixed))
+        assert isinstance(relinked, CallableType)
+        assert str(relinked) == str(sig)
+        self_arg = get_proper_type(relinked.arg_types[0])
+        assert isinstance(self_arg, Instance)
+        assert self_arg.type.fullname == inst.type.fullname
+
+    def test_plugin_fake_manager_registrar_first_seal_wins(self) -> None:
+        from types import SimpleNamespace
+
+        from mypy.build import BuildManager
+        from mypy.options import Options
+        from mypy.plugins.singledispatch import make_fake_register_class_instance
+
+        stub = SimpleNamespace(
+            options=Options(),
+            _native_resolver=self.resolver,
+            _native_typeinfo_map={},
+            _native_snapshotted=set(),
+        )
+        first = make_fake_register_class_instance(self._api(), (self.fx.a, self.fx.o))
+        second = make_fake_register_class_instance(self._api(), (self.fx.d, self.fx.b))
+        # Distinct fakes share the fullname; first seal wins for the build.
+        assert first.type.fullname == second.type.fullname == "functools._SingleDispatchRegisterCallable"
+        assert first.type is not second.type
+        BuildManager._register_native_fake_typeinfo(stub, first.type)  # type: ignore[arg-type]
+        BuildManager._register_native_fake_typeinfo(stub, second.type)  # type: ignore[arg-type]
+        assert stub._native_typeinfo_map == {first.type.fullname: first.type}
+        assert first.type.fullname in stub._native_snapshotted
+
+    def test_plugin_fake_expansion_gate_on_off_parity(self) -> None:
+        from mypy.expandtype import (
+            _set_native_expand_type_active,
+            _set_native_expand_type_resolver,
+            _set_native_expand_type_typeinfo_map,
+            expand_type_by_instance,
+        )
+
+        inst, sig = self._make_fake()
+        self.resolver.update([inst.type], [], None, None)
+        typeinfo_map = {info.fullname: info for info in self._type_infos()}
+        typeinfo_map[inst.type.fullname] = inst.type
+        _set_native_expand_type_typeinfo_map(typeinfo_map)
+        _set_native_expand_type_resolver(self.resolver)
+        _set_native_expand_type_active(False)
+        self._expand_installed = True
+        try:
+            off = expand_type_by_instance(sig, inst)
+            _set_native_expand_type_active(True)
+            on = expand_type_by_instance(sig, inst)
+            assert isinstance(on, CallableType)
+            assert str(on) == str(off)
+            assert (on.line, on.column) == (off.line, off.column)
+            assert on.fallback.type.fullname == "builtins.function"
+            self_arg = get_proper_type(on.arg_types[0])
+            assert isinstance(self_arg, Instance)
+            assert self_arg.type.fullname == inst.type.fullname
+        finally:
+            _set_native_expand_type_active(False)

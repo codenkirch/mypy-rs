@@ -2482,6 +2482,26 @@ including:
   (seam engagement, gate-off/on parity, `on.args[0] is off.args[0] is
   self.fx.t` identity), plus the existing expand_type gate-on/off
   differentials.
+- plugin-synthesized fake registrar (issue #1485) — extends the #1456
+  pattern to plugin-built TypeInfos. `mypy/plugins/singledispatch.py:
+  make_fake_register_class_instance` constructs the register-hook fake
+  directly (fresh TypeInfo for `functools._SingleDispatchRegisterCallable`,
+  never entering `self.modules`), bypassing the `make_fake_typeinfo`
+  funnel, so `expand_type_by_instance` deferred I(fake) -> Instance args
+  on a missing resolver snapshot (10 cold-self-check calls). The creation
+  site now fires the same `_register_native_fake_typeinfo` registrar
+  through a plugin-module hook (`_native_fake_info_registrar`, installed
+  and cleared at the same build boundaries as the checker registrar):
+  bases/MRO are final there, so the snapshot is conclusive; first seal
+  wins across repeated register calls on the shared fullname. Measured
+  (env-gated cold self-check, stripped before landing): those 10 member
+  accesses now answer natively at the upstream
+  `rust_analyze_instance_member_dispatch` seam (which needs the fake in
+  the resolver), `expand_type_by_instance` no longer sees the fake at
+  all. Covered by `NativePluginFakeRegistrarSuite` in
+  `mypy/test/testtypes.py` (creation-site firing, direct seam
+  defer/answer, manager-registrar first-seal-wins, and gate-on/off
+  parity through the real `expand_type_by_instance`).
 - checkmember/expand alias round-trip (issue #1224) — the IAMA defer
   audit (temporary `MYPY_TK_IAMA_AUDIT` dump, stripped before landing)
   found the two dominant alias defer classes in the member-access
