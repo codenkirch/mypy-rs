@@ -1003,9 +1003,9 @@ fn visit_instance_native(
             }
             return Some(res);
         }
-        // Structural-protocol branch (constraints.py:1540-1581): the
-        // SUPERTYPE_OF arm with a non-protocol instance is decided in
-        // Rust; protocol-left and other actual kinds still defer.
+        // Structural-protocol branch (constraints.py:1540-1582): the
+        // SUPERTYPE_OF arm (non-protocol instance) and the SUBTYPE_OF arm
+        // (protocol actual) decide in Rust; others defer to Python.
         if template_snap.is_protocol || a_snap.is_protocol {
             if template_snap.is_protocol && !a_snap.is_protocol {
                 if direction == SUPERTYPE_OF {
@@ -1020,14 +1020,26 @@ fn visit_instance_native(
                     );
                 }
                 if direction == SUBTYPE_OF {
-                    // Python: both nominal branches miss, the SUPERTYPE_OF
-                    // structural arm does not fire, and the tail's elif
-                    // chain matches no Instance arm, so `return []`.
+                    // Python: the SUBTYPE_OF structural arm requires the ACTUAL to be a
+                    // protocol; here it is not, so both structural arms miss
+                    // and the tail matches no Instance arm — `return []`.
                     return Some(vec![]);
                 }
             }
-            // Protocol-template / protocol-actual pairs beyond the ported
-            // arms are Python-side (the structural protocol tail).
+            if a_snap.is_protocol && direction == SUBTYPE_OF {
+                // constraints.py:1568-1582: actual is a protocol Instance,
+                // template a plain Instance, both nominal branches missed.
+                return visit_instance_protocol_subtype_native(
+                    template,
+                    actual,
+                    direction,
+                    resolver,
+                    aliases,
+                    strict_optional,
+                );
+            }
+            // Protocol-actual SUPERTYPE_OF pairs and both-protocol
+            // SUPERTYPE_OF pairs are Python-side (the structural tail).
             return None;
         }
         // Fall through to the tail (actual is a non-protocol instance).
@@ -1044,21 +1056,23 @@ fn visit_instance_native(
 
 thread_local! {
     /// Per-protocol-class inferring mirror (constraints.py `template.type.
-    /// inferring`): a template already on the stack suppresses the
-    /// structural protocol arm (`any(template == t for t in
-    /// reversed(...))`, verified by structural equality, and the
+    /// inferring`, wired from the TemplateProtocol guard; the SUBTYPE_OF
+    /// arm's `instance.type.inferring` rides the SAME TypeInfo attribute
+    /// in Python, so both arms share this stack): an entered protocol
+    /// instance suppresses either structural arm (`any(t == entry for t
+    /// in reversed(...))`), verified by structural equality, and the
     /// type_ref inside the Instance keeps entries of different protocol
-    /// classes apart).
+    /// classes apart.
     static PROTOCOL_INFERRING: RefCell<Vec<Type>> = const { RefCell::new(Vec::new()) };
 }
 
-/// RAII guard mirroring `template.type.inferring.append/pop` around the
-/// member loop (constraints.py:1553-1571).
+/// RAII guard mirroring the protocol `inferring` append/pop around the
+/// member loop (constraints.py:1553-1571, 1577-1581).
 struct ProtocolInferringPush;
 
 impl ProtocolInferringPush {
-    fn new(template: &Type) -> Self {
-        PROTOCOL_INFERRING.with(|s| s.borrow_mut().push(template.clone()));
+    fn new(protocol: &Type) -> Self {
+        PROTOCOL_INFERRING.with(|s| s.borrow_mut().push(protocol.clone()));
         Self
     }
 }
@@ -1134,6 +1148,86 @@ fn visit_instance_protocol_supertype_native(
                     template,
                     original_actual,
                     template,
+                    false,
+                    direction,
+                    resolver,
+                    aliases,
+                    strict_optional,
+                    None,
+                )
+            })?;
+            Some(res)
+        }
+        None => None,
+    }
+}
+
+/// The SUBTYPE_OF structural-protocol arm of `visit_instance`
+/// (constraints.py:1568-1582): `actual` is a protocol Instance, `template`
+/// is a plain Instance, and both nominal branches missed. Decided when
+/// `is_protocol_implementation(erased, actual, skip=["__call__"])`
+/// succeeds — the ERASED TEMPLATE left, the protocol INSTANCE right
+/// (constraints.py:1572) — and the member loop's find_member-based
+/// fetches decide (same `get_protocol_member_inner` seam as the
+/// SUPERTYPE_OF arm).
+fn visit_instance_protocol_subtype_native(
+    template: &Type,
+    actual: &Type,
+    direction: i64,
+    resolver: &TypeResolver,
+    aliases: &crate::aliases::TypeAliasResolver,
+    strict_optional: bool,
+) -> Option<Vec<Constraint>> {
+    // Inferring guard (constraints.py:1573): the check rides the ACTUAL's
+    // protocol inferring list, shared with the SUPERTYPE_OF arm (same
+    // TypeInfo attribute in Python). Runs before the engine gate.
+    let already_on_stack = PROTOCOL_INFERRING.with(|s| s.borrow().contains(actual));
+    if already_on_stack {
+        // Python falls out of the instance block with an empty `res`,
+        // reaches the tail, which returns [] for an Instance actual.
+        return Some(vec![]);
+    }
+    // The engine and the member loop both need the live TypeInfo map for
+    // the dependency record + member-flag reads (subtypes.py:1885,
+    // :2025-2055); without it, defer straight to the pure-Python body.
+    if !resolver.has_live_info_map() {
+        return None;
+    }
+    // erased = erase_typevars(template) (constraints.py:1422).
+    let erased = erase_typevars_inner(template, None, &crate::erase_typevars::make_any());
+    let erased = erased?;
+    let skip = vec!["__call__".to_string()];
+    let ctx = SubtypeContext::default();
+    let verdict = pyo3::Python::with_gil(|py| {
+        crate::protocols::is_protocol_implementation_inner(
+            py, &erased, &erased, actual, &skip, &ctx, resolver,
+        )
+    });
+    match verdict {
+        Some(false) => {
+            // Python: the arm's `and` chain fails, control falls out of
+            // the instance block; the tail then returns [] for an
+            // Instance actual (constraints.py:1583-1641).
+            visit_instance_tail_native(
+                template,
+                actual,
+                direction,
+                resolver,
+                aliases,
+                strict_optional,
+            )
+        }
+        Some(true) => {
+            let _guard = ProtocolInferringPush::new(actual);
+            // Python passes `(instance, template, template, instance)` —
+            // subtype is the template, protocol is the actual.
+            let res = pyo3::Python::with_gil(|py| {
+                infer_constraints_from_protocol_members_native(
+                    py,
+                    actual,
+                    template,
+                    template,
+                    actual,
                     false,
                     direction,
                     resolver,
@@ -5176,5 +5270,106 @@ mod tests {
         let template = tt_template(type_var(1, "T"));
         let actual = ctor_callable("mod.Ctor", alias_type("mod.Missing"), None);
         assert!(tt_constraints(&resolver, &aliases, &template, &actual, true).is_none());
+    }
+
+    // ---- visit_instance_protocol_subtype_native (icf SUBTYPE_OF arm) ----
+
+    /// Plain generic class `mod.Iter[T]` plus a protocol `mod.P[T]` with
+    /// one member `x`, both nominal-independent (neither is a base of the
+    /// other).
+    fn protocol_plain_resolver() -> TypeResolver {
+        let mut r = builtin_resolver();
+        r.insert("mod.Iter".to_string(), nominal_snap_n("mod.Iter", 1));
+        let mut p = nominal_snap_n("mod.P", 1);
+        p.is_protocol = true;
+        p.protocol_members.push("x".to_string());
+        r.insert("mod.P".to_string(), p);
+        r
+    }
+
+    fn inst(ref_name: &str, args: Vec<Type>) -> Type {
+        Type::Instance {
+            type_ref: ref_name.to_string(),
+            args,
+            last_known_value: None,
+            extra_attrs: None,
+        }
+    }
+
+    #[test]
+    fn test_protocol_subtype_actual_dispatch_defers_without_live_map() {
+        // nominal-miss + protocol-actual + SUBTYPE_OF routes into the new
+        // arm. Without a live TypeInfo map the engine cannot decide, so
+        // the whole call defers (the pre-port shape, now via the arm).
+        let resolver = protocol_plain_resolver();
+        let aliases = crate::aliases::TypeAliasResolver::new();
+        let template = inst("mod.Iter", vec![type_var(1, "T")]);
+        let actual = inst("mod.P", vec![instance_int()]);
+        assert!(visit_instance_protocol_subtype_native(
+            &template, &actual, SUBTYPE_OF, &resolver, &aliases, true,
+        )
+        .is_none());
+        // SUPERTYPE_OF with a protocol actual stays deferred (the port did
+        // not widen the opposite direction).
+        assert!(visit_instance_protocol_subtype_native(
+            &template,
+            &actual,
+            SUPERTYPE_OF,
+            &resolver,
+            &aliases,
+            true,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn test_protocol_subtype_actual_arm_guard_suppresses_reentry() {
+        // A protocol actual already on the shared inferring stack answers
+        // [] without touching the engine (constraints.py:1573-1576), even
+        // without a live TypeInfo map.
+        let resolver = protocol_plain_resolver();
+        let aliases = crate::aliases::TypeAliasResolver::new();
+        let template = inst("mod.Iter", vec![type_var(1, "T")]);
+        let actual = inst("mod.P", vec![instance_int()]);
+        let _guard = ProtocolInferringPush::new(&actual);
+        let res = visit_instance_protocol_subtype_native(
+            &template, &actual, SUBTYPE_OF, &resolver, &aliases, true,
+        );
+        assert_eq!(res, Some(vec![]));
+    }
+
+    #[test]
+    fn test_protocol_arms_share_inferring_stack() {
+        // Both arms share Python's single per-protocol TypeInfo.inferring
+        // list: a SUPERTYPE_OF-arm push (protocol TEMPLATE) also suppresses
+        // the SUBTYPE_OF arm for the same protocol INSTANCE.
+        let resolver = protocol_plain_resolver();
+        let aliases = crate::aliases::TypeAliasResolver::new();
+        let prot = inst("mod.P", vec![type_var(1, "T")]);
+        let plain = inst("mod.Iter", vec![instance_int()]);
+        let _guard = ProtocolInferringPush::new(&prot);
+        let res = visit_instance_protocol_subtype_native(
+            &plain, &prot, SUBTYPE_OF, &resolver, &aliases, true,
+        );
+        assert_eq!(res, Some(vec![]));
+        // A DIFFERENT protocol instance (different args) is not suppressed:
+        // the engine gate still defers without a live map.
+        let other = inst("mod.P", vec![instance_str()]);
+        assert!(visit_instance_protocol_subtype_native(
+            &plain, &other, SUBTYPE_OF, &resolver, &aliases, true,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn test_protocol_subtype_template_protocol_plain_actual_still_empty() {
+        // The template-protocol + plain-actual SUBTYPE_OF miss returns []
+        // (Python: neither structural arm fires, tail returns []).
+        let resolver = protocol_plain_resolver();
+        let aliases = crate::aliases::TypeAliasResolver::new();
+        let template = inst("mod.P", vec![type_var(1, "T")]);
+        let actual = inst("mod.Iter", vec![instance_int()]);
+        let res = visit_instance_native(&template, &actual, SUBTYPE_OF, &resolver, &aliases, true);
+        assert_eq!(res, Some(vec![]));
     }
 }

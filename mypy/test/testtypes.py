@@ -53760,3 +53760,228 @@ class NativeFakeInfoRegistrationSuite(Suite):
         self._set_gate(True)
         assert is_subtype(left, self.fx.b)
         assert is_subtype(left, self.fx.o)
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeIcfProtocolSubtypeArmSuite(Suite):
+    """Parity suite for the icf SUBTYPE_OF structural-protocol ACTUAL arm.
+
+    `_try_native_constraint_builder` routes the full ConstraintBuilderVisitor
+    through Rust; before wave 53 the (plain template Instance, protocol
+    actual Instance, SUBTYPE_OF) shape deferred the whole call to Python at
+    the structural-protocol branch (constraints.rs). The ported arm mirrors
+    constraints.py:1568-1582: `is_protocol_implementation(erased(template),
+    actual, skip=["__call__"])` (erased template LEFT, protocol actual
+    RIGHT), then the member loop constrains template-side members against
+    actual-side members, guarded by the actual's shared inferring stack.
+
+    Differential harness (NativeConstraintsDeferralSuite pattern): runs
+    `infer_constraints` with the gate on (resolver + live TypeInfo map +
+    wire map installed) and off (pure Python), asserting equal constraint
+    lists; a direct `rust_infer_constraints_full` call proves native
+    engagement (blobs) or deferral (None).
+
+    Fixtures: `mod.IterInfo[T]` (plain, generic, `def f(self) -> T`) and
+    `mod.PInfo[T]` (protocol, generic, `def f(self) -> T`), neither a base
+    of the other, both registered in the resolver: the nominal SUBTYPE_OF /
+    SUPERTYPE_OF branches must miss, so the structural arm is the path
+    under test.
+    """
+
+    def setUp(self) -> None:
+        from mypy.checkexpr import _set_native_plugin_hook_registry
+        from mypy.constraints import _set_native_constraints_active
+        from mypy.options import Options
+        from mypy.plugins.default import DEFAULT_HOOK_FULLNAMES_BY_KIND, DefaultPlugin
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        self.fx = TypeFixture()
+        self._set_active = _set_native_constraints_active
+        # The Var-member fetch resolves attribute hooks through the live
+        # plugin snapshot; install a defaults-only chain (NativeProtocol
+        # Suite pattern) so synthetic member fullnames are unhooked.
+        registry = _type_kernel.PluginHookRegistry(
+            {kind: list(names) for kind, names in DEFAULT_HOOK_FULLNAMES_BY_KIND.items()}
+        )
+        _set_native_plugin_hook_registry(registry, False, [DefaultPlugin(Options())])
+        self._plugin_installed = True
+        self.iter_info, self.iter_t = self._generic_info("mod.IterInfo")
+        self.p_info, self.p_t = self._generic_info("mod.PInfo")
+        self.p_info.is_protocol = True
+        self._add_method(self.iter_info, "f", self.iter_t)
+        self._add_method(self.p_info, "f", self.p_t)
+        # A non-implementing plain class (no member f) for the false arm.
+        self.other_info, self.other_t = self._generic_info("mod.Other")
+        # Safe default so a mismatched gate never crosses suites.
+        self._set_active(False)
+
+    def tearDown(self) -> None:
+        from mypy.checkexpr import _set_native_plugin_hook_registry
+        from mypy.constraints import _set_native_constraints_resolver
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        self._set_active(False)
+        _set_native_constraints_resolver(None)
+        set_wire_typeinfo_map(None)
+        if self._plugin_installed:
+            _set_native_plugin_hook_registry(None, False)
+            self._plugin_installed = False
+
+    def _generic_info(self, name: str) -> tuple[TypeInfo, Any]:
+        """A generic class `mod.X[T]` with MRO [X, object] and one tvar.
+
+        Production class typevars bind `TypeVarId(raw_id, namespace=<class
+        fullname>)` (types.py:554); mirror that (like the checkmember
+        suites) so the tvar matches the Rust expand env keyed on the
+        instance type_ref.
+        """
+        from mypy.types import TypeVarId, TypeVarType
+
+        info = self.fx.make_type_info(name, typevars=["T"])
+        tvar = info.defn.type_vars[0]
+        assert isinstance(tvar, TypeVarType)
+        tvar.id = TypeVarId(tvar.id.raw_id, namespace=info.fullname)
+        return info, tvar
+
+    def _add_method(self, info: TypeInfo, name: str, ret: Any) -> None:
+        from mypy.types import CallableType, Instance
+
+        node = FuncDef(name, [], None, None)
+        node.info = info
+        tvar = info.defn.type_vars[0]
+        sig = CallableType([Instance(info, [tvar])], [ARG_POS], [None], ret, self.fx.function)
+        sig.variables = (tvar,)
+        node.type = sig
+        node.line = 1
+        node.column = 1
+        info.names[name] = SymbolTableNode(MDEF, node)
+
+    def _add_var(self, info: TypeInfo, name: str, typ: Any) -> None:
+        v = Var(name)
+        v.info = info
+        v.type = typ
+        v.is_ready = True
+        v.is_inferred = True
+        info.names[name] = SymbolTableNode(MDEF, v)
+
+    def _build_resolver(self, *extra: TypeInfo) -> None:
+        from mypy.constraints import _set_native_constraints_resolver
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        type_infos = []
+        for nm in dir(self.fx):
+            if not nm.endswith("i"):
+                continue
+            value = getattr(self.fx, nm)
+            if _is_type_info(value):
+                type_infos.append(value)
+        type_infos.extend(extra)
+        live = {i.fullname: i for i in extra}
+        self.resolver = _type_kernel.build_native_resolver(type_infos, [])
+        self.resolver.set_live_typeinfo_map(live)
+        set_wire_typeinfo_map(live)
+        _set_native_constraints_resolver(self.resolver)
+
+    def _constraints(
+        self, template: Type, actual: Type, direction: int, native: bool
+    ) -> list[Any]:
+        from mypy.constraints import _set_native_constraints_resolver, infer_constraints
+
+        self._set_active(native)
+        if native:
+            _set_native_constraints_resolver(self.resolver)
+        else:
+            _set_native_constraints_resolver(None)
+        return infer_constraints(template, actual, direction)
+
+    def _assert_par(self, template: Type, actual: Type, direction: int = SUBTYPE_OF) -> None:
+        native = self._constraints(template, actual, direction, native=True)
+        python = self._constraints(template, actual, direction, native=False)
+        assert_equal(native, python, f"native={native!r} python={python!r}")
+
+    def _bytes_of(self, t: Type) -> bytes:
+        buf = _WriteBuffer()
+        t.write(buf)
+        return buf.getvalue()
+
+    def _rust(self, template: Type, actual: Type, direction: int = SUBTYPE_OF) -> Any:
+        return _type_kernel.rust_infer_constraints_full(
+            self.resolver,
+            self._bytes_of(template),
+            self._bytes_of(actual),
+            direction,
+            False,
+            False,
+            strict_optional_flag(),
+            True,
+        )
+
+    def _assert_engages(self, template: Type, actual: Type, direction: int = SUBTYPE_OF) -> None:
+        raw = self._rust(template, actual, direction)
+        assert raw is not None, f"Rust seam must engage for template={template!r}"
+
+    def _assert_defers(self, template: Type, actual: Type, direction: int = SUBTYPE_OF) -> None:
+        raw = self._rust(template, actual, direction)
+        assert raw is None, f"Rust seam must defer for template={template!r}"
+
+    # --- arm-2 decided / parity shapes ---
+
+    def test_method_member_protocol_actual_subtype_of_decides(self) -> None:
+        # The Generator/SupportsNext shape: plain generic template vs
+        # protocol actual, nominal branches miss, the structural arm
+        # decides T <: int through the member loop (ret constraint).
+        self._build_resolver(self.iter_info, self.p_info, self.other_info)
+        template = Instance(self.iter_info, [self.iter_t])
+        actual = Instance(self.p_info, [self.fx.a])
+        self._assert_par(template, actual, SUBTYPE_OF)
+        self._assert_engages(template, actual, SUBTYPE_OF)
+
+    def test_direction_supertype_of_still_defers(self) -> None:
+        # The port did not widen the opposite direction: protocol-actual
+        # SUPERTYPE_OF pairs stay a whole-call deferral to Python.
+        self._build_resolver(self.iter_info, self.p_info, self.other_info)
+        template = Instance(self.iter_info, [self.iter_t])
+        actual = Instance(self.p_info, [self.fx.a])
+        self._assert_defers(template, actual, SUPERTYPE_OF)
+
+    def test_non_implementing_template_falls_to_tail(self) -> None:
+        # `mod.Other[T]` declares no `f`, so is_protocol_implementation(erased,
+        # PInfo[int]) is False: Python drops out of the instance block and
+        # the tail returns []. The native arm decides the same [].
+        self._build_resolver(self.iter_info, self.p_info, self.other_info)
+        template = Instance(self.other_info, [self.other_t])
+        actual = Instance(self.p_info, [self.fx.a])
+        self._assert_par(template, actual, SUBTYPE_OF)
+        self._assert_engages(template, actual, SUBTYPE_OF)
+
+    def test_recursive_member_guard_suppresses_reentry(self) -> None:
+        # A protocol member whose type re-enters the arm with the SAME actual
+        # (P[T].f -> P[T] binds to P[int]) is suppressed by the inferring
+        # guard on both sides, so the recursion contributes no constraints.
+        it2, it2_t = self._generic_info("mod.IterRec")
+        p2, p2_t = self._generic_info("mod.PRec")
+        p2.is_protocol = True
+        self._add_method(it2, "f", Instance(it2, [it2_t]))
+        self._add_method(p2, "f", Instance(p2, [p2_t]))
+        self._build_resolver(it2, p2)
+        template = Instance(it2, [it2_t])
+        actual = Instance(p2, [self.fx.a])
+        self._assert_par(template, actual, SUBTYPE_OF)
+        self._assert_engages(template, actual, SUBTYPE_OF)
+
+    def test_settable_var_member_parity_holds_fetch_defers(self) -> None:
+        # A plain (non-final) Var member is IS_SETTABLE (flags decide),
+        # but the member FETCH of a generic attribute defers: the Var
+        # tail rejects tvar-carrying expanded results (checker_helpers).
+        from mypy.types import Instance
+
+        it2, it2_t = self._generic_info("mod.IterVar")
+        p2, p2_t = self._generic_info("mod.PVar")
+        p2.is_protocol = True
+        self._add_var(it2, "x", it2_t)
+        self._add_var(p2, "x", p2_t)
+        self._build_resolver(it2, p2)
+        template = Instance(it2, [it2_t])
+        actual = Instance(p2, [self.fx.a])
+        self._assert_par(template, actual, SUBTYPE_OF)
+        self._assert_defers(template, actual, SUBTYPE_OF)
