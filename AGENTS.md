@@ -2958,6 +2958,53 @@ including:
   `checkcall_typeobj.rs`. Cold self-check: 167343 `check_callable_call` calls
   (88.9% not_typeobj, 11.1% typeobj_none); post-port the seam decides 167437
   gate calls at 100% native.
+- `rust_expand_type_by_instance` residual defer audit, floor decisions
+  (wave 53, issue #1483): documentation-only close, zero code change.
+  Env-gated FFI audit of the by-instance expansion seam plus a Python
+  shim probe (`MYPY_TK_XB_AUDIT`, instrumented cold self-check at
+  `MYPY_NUM_WORKERS=0 --no-incremental`, stripped before landing; tree
+  verified clean: cold self-check 0 errors). Result: 669 FFI calls @
+  92.5% native (619 OK / 50 DEFER = 49 `snap-miss` + 1 `call-unpack`).
+  - The issue's working hypotheses are DISPROVEN: the #1203 union-arm
+    alias flatten is already live on the by-instance path
+    (`rust_expand_type_by_instance` installs `FlatAliasGuard` at the
+    FFI entry; zero `fa-*`/`union-flat` buckets in 669 calls; pinned by
+    `ebi_relink_flattens_alias_union_item` + the flatten unit tests),
+    and the #1215 relink contract is threaded (`relink_ok=true` via
+    `expand_type_by_instance_relink`; the shim runs
+    `resync_var_identities` + `_resync_definitions`). No alias buckets
+    exist in this corpus.
+  - `snap-miss` 49 (callers: `typeops.type_object_type_from_function`
+    26x, `maptype._native_map_step_frontier` 13x,
+    `checkmember._analyze_member_access` 10x): the instance class is
+    absent from the Rust `TypeResolver` snapshot at expand time. Two
+    sub-classes, both resolver-architecture walls, no expandtype.rs
+    decision exists (every missed instance is a generic class whose
+    env binding requires the snapshot's `defn.type_vars` raw_ids; the
+    wire instance carries args but no tvar-keying, so a snapshot-less
+    fast path could not keep parity):
+    - 39x: the class IS in the build's live `_native_typeinfo_map` at
+      defer time but not yet in the Rust snapshot (`in_typeinfo_map=
+      True`, `in_rust_dict=False`, snap<map, e.g. snap=908 map=926 for
+      the itertools batch; `operator.itemgetter` observed entering the
+      snapshot mid-run). Mechanism: `_native_ctor_blob` (build.py,
+      issue #1298) computes `typeops.type_object_type(info)` DURING
+      `_build_native_resolvers`, before the fresh SCC's classes are
+      installed, and clears only the typeops gate — the expand/maptype
+      gates stay active and round-trip doomed FFI against the stale
+      resolver. Correct (Python fallback; parity green), tracked by
+      #1484 (candidate fix: clear the expand/map gates for the blob
+      duration, mirroring the typeops gate).
+    - 10x `functools._SingleDispatchRegisterCallable`: a TypeInfo
+      synthesized directly by
+      `mypy/plugins/singledispatch.py:make_fake_register_class_instance`
+      (never enters `self.modules`, bypasses the #1456
+      `make_fake_typeinfo` registrar funnel, absent from the live map
+      too). Tracked by #1485 (extend the #1456 registrar pattern to
+      plugin-synthesized infos).
+  - `call-unpack` 1: a callable signature carrying a bare UnpackType
+    var-arg (expandtype.py:482-488 `interpolate_args_for_unpack`, a
+    documented not-ported branch); single cold-self-check hit.
 
 ## Pull Requests
 
