@@ -2864,6 +2864,56 @@ including:
   issue with the bucket tables; the next wave must not re-derive
   the sgc/ct strata; any sgc/ct work is icf engine, st engine,
   meet overlap, or emission-channel porting, not seam-local.
+- errors render-bundle legacy-path audit, negative close (wave 52,
+  issue #1479) documentation-only, zero code change. Env-gated
+  call-count audit of the errors.py:1118-1323 render bundle
+  (`MYPY_TK_B6_AUDIT`, report rewritten to the env path on every
+  bump so `hard_exit` cannot strand it) on the cold self-check at
+  `-n0 --no-incremental` plus an error-heavy synthetic corpus
+  (1,600 lines, 1,200 errors), stripped before landing (errors.py
+  verified bit-identical to origin/main `e594a8bd7`, zero probe
+  leftovers). Result: the B6 legacy paths have zero measured
+  traffic on the gate corpus; no port earns its parity burden; the
+  4 deleted #1459 seams stay dead (YAGNI).
+  - Cold self-check (347 files, clean): the pipeline misses by
+    construction - `file_messages` 347 calls all early-return
+    (`path not in error_info_map`, zero entries), `sort_messages`
+    / `sort_within_context` / `remove_duplicates` / `render_messages`
+    / `create_errors` / `new_messages` 0 calls; `format_messages`
+    347 @ 0 tuples, all served by the already-ported green path
+    (`rust_format_messages_default*` 347 FFI crossings @ 0
+    entries); `remove_path_prefix` 347 (via `simplify_path`). The
+    run's real errors-side work is report-side: 5,081 throwaway
+    `Errors(Options())` constructions from
+    `semanal.isolated_error_analysis` (type-expression probing)
+    with 2,697 records discarded into them - ~4.1us each (~21ms,
+    0.26% of the run), measured: noise, not a finding, no issue
+    filed.
+  - Error-heavy corpus (1,200 rendered): `sort_messages` 1 @ 1,200,
+    `sort_within_context` 1,200 @ 1,200 (per-position-group runs),
+    `remove_duplicates` 1 @ 1,200 / 0 removed, `render_messages` 1
+    @ 1,200 (+800 local-context notes with `--show-error-context`),
+    `remove_path_prefix` 2, `format_messages_default` 1 @ 1,200.
+    Per-file once, sub-millisecond, orders below the report-side
+    message building (`records` 2,060 incl. discarded).
+  - Taxonomy / floors: `sort_messages` + `sort_within_context`
+    portable-in-principle (wire-safe fields; a permutation-back
+    boundary preserves live-object identity) but no corpus value: a
+    kernel seam would add FFI cost to 347 empty self-check calls
+    (the measured case) and per-entry ErrorInfo serialization beats
+    the Python tuple-key sort on error runs; `remove_duplicates`
+    floor - `parent_error` live-object identity (`ErrorInfo.write`
+    asserts `parent_error is None`), dedupe semantics break across
+    the wire; `render_messages` floor - note-string parity (message
+    TEXT is the testcheck exact-match risk), `simplify_path` /
+    `show_error_context` live-state dependence; `create_errors`
+    floor - `--output` formatter path only, 0 calls on every gate
+    corpus (the deleted #1459 seam must not be re-created).
+  Resolution per #1455/#1458/#1469 precedent: docs-only negative
+  close. Next-wave rule: any B6 work is report-side (ErrorInfo
+  construction / message-string building in `mypy/messages.py`),
+  not the render bundle; render-bundle seams need a corpus that
+  exercises them before a port is warranted.
 - `rust_classify_type_range` (issue #1464 C1, mypy.checker) — mirrors the
   leaf-decision dispatch of `TypeChecker.get_type_range_of_type`
   (checker.py:10408). The `TypeVarType` upper-bound unroll and the
