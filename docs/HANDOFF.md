@@ -1,61 +1,48 @@
 # Handoff: strangler-fig Rust migration loop (seam-deferral reduction)
 
-*Written 2026-08-28, refreshed 2026-09-08 (post-wave51: wave 50
-retired the rust_is_subtype nested-alias defer leaf (#1457, embedded
-632 -> 260, -59%) + registered runtime-synthesized TypeInfos in the
-resolver snapshot (#1456, 78 -> 0 fake-info defers); wave 51 cleared
-the small-fix queue (#1470 final_super getattr narrowing, #1461 wire
-Display bounds, #1459 dead-seam deletion, all self-merged by the
-agents)); wave 44 #1444 remains a documented negative result. Goal:
-"migrate all python code to rust, really all", pursued as the
+*Written 2026-08-28, refreshed 2026-09-10 (post-wave55: waves 52-55
+landed the st find_member/unpack/apply-report ports (#1492, embedded
+112 -> 61, -45.5%), the icf SUBTYPE_OF protocol-actual structural arm
+(#1487), the plugin-synthesized TypeInfo registrar (#1489), the
+ctor-blob gate clearing (#1488), and two docs-only negative closes
+(B6 render bundle #1481; maptype timing-gap residual #1494 - 5 events
+left, on-demand sealing rejected on PEP 695 variance finality; the
+function-local wire-ref gap surfaced by that audit is filed as #1493)).
+Goal: "migrate all python code to rust, really all", pursued as the
 established measure -> file -> dispatch-agents -> process-PRs -> gate
 loop. This file is the resume point.*
 
-## Where main stands (2026-09-08, post-wave51)
+## Where main stands (2026-09-10, post-wave55)
 
-- `main` = `e594a8bd7` (`fix(type_kernel): wire CallableType Display
-  bounds arg_kinds/arg_names access (#1461) (#1476)`), on top of
-  `ca45fff75` (#1475, #1470) and `00f828c80` (#1474, #1459); local
-  ff'd to origin.
-- Phase state: F0 audit + F1 dual-write mirror + F2 read flip (slices
-  1-10, #1393) all landed. F3 (#1397) write flip has Instance +
-  CallableType splice ops; the planned tvar/union splice slice was
-  profiled with `misc/f3s9_tvar_union.py` and came back EMPTY (zero
-  per-field writes on a self-check) - dropped, do not build it.
-- Gates on the merged head `e594a8bd7`: cargo fmt + clippy -p
-  mypy-type-kernel clean, 2,723 kernel unit tests / 11 ignored
-  (2,727 post-wave50 + 2 wire tests - 6 dead-seam tests);
-  testtypes 3,262/6 (kernel ON, +4 wave-51 pins on the wave-50
-  3,258/6); testcheck 8,198/15/7 exact; cold self-check clean (347
-  files); pr-gate + parity + parity-typeops green on #1474/#1475/
-  #1476.
-- Shared `.so` rebuilt + codesigned at the merged head content
-  2026-09-08 (`/private/tmp/mypy-rs-local-typekernel`; resolver/ast
-  unchanged, still valid).
-- Survey (post-wave51, 2026-09-08, total 7,937,339 seam calls):
-  C1 `rust_classify_type_range` 9,272 @ 100%; C2
-  `rust_classify_typeobj_gate` 167,721 @ 100%; st 25,247 @ 100%
-  wrapper (embedded 260 post-wave50 = ~178 untagged callable-compat
-  generic/owned-tvar/extra_tvars/TypeType/protocol-member/serfail
-  floors + 8 propagation tails; the nested-alias bucket and the 74
-  left_snap fake-info buckets are retired), icf
-  (`rust_infer_constraints_full`) 21,467 @ 99% (~214, floors), roc
-  13,845 @ 99% (~138), ama 12,345 @ 99% (contract floor), ct
-  (`rust_conditional_types`) 8,662 @ 100% (embedded residual 29),
-  sgc 8,546 @ 98% (~170 wrapper; embedded 253 floors), ifta 189 @
-  30% wrapper-unmoved (embedded 56, floors var_pspec_tvt 80 /
-  engine 47 / solve 5). C1/C2/st wrapper counts moved only via the
-  wave-50 engine port + noise; the C2/st wrapper class is now 100%.
-- Survey caveats (do not chase): `rust_is_subtype_batch` reports 227%
-  and the total fallback line went NEGATIVE - per-decision counting
-  artifacts; discount when ranking.
-- Runner note: the repo's ephemeral runner cannot re-register (403,
-  admin-blocked; #1249 open). GH `ocr-review` jobs stay `queued`
-  forever; the operative review gate is the local
+- `main` = `5a5038ad2` (docs `#1494`, #1490) on top of `83f0b6706`
+  (`#1492`, #1491), `f5364c7ba` (`#1488`, #1484), `e4af2dc26` (`#1489`,
+  #1485) and `201b2831e` (`#1487`, #1482); local ff'd to origin.
+- Phase state: unchanged since the wave-51 refresh (F0 audit + F1
+  dual-write mirror + F2 read flip landed; F3 write flip has Instance +
+  CallableType splice ops; the tvar/union splice slice profiled EMPTY
+  with `misc/f3s9_tvar_union.py` - not built).
+- Gates on the merged head `5a5038ad2`: cargo 2,736/11 ignored (wave-55
+  port +13 units); testtypes 3,279/6 skipped (kernel ON); testcheck
+  8,198/15/7 exact; cold self-check clean (347 files); pr-gate +
+  parity + parity-typeops green on #1492; OCR local review clean after
+  the tearDown advisory fix (`1daf86a84`).
+- Shared `.so` unchanged since the 2026-09-08 rebuild (wave 55 touched
+  no Rust); `/private/tmp/mypy-rs-local-typekernel` still valid.
+- Survey: the wave-55 `#1491` port moved the st embedded defer count
+  112 -> 61 (-45.5%, 31 find_member fetch + 9
+  callable_corresponding_argument + 13 apply-report + 4 unpack/tuple).
+  Residual st floors: 19 serfail + 42 kernel (18 `uds-var-unsafe`
+  owned/meta-tvar wire identity, 10 `cbd-expand-other`, 9
+  `ud-infer-args`, 3 protocol member binding, 1 `cb-proto-typeobj`,
+  1 `ud-tvar-clash`). C1/C2/ama/ct/roc wrapper classes stay at or near
+  100% (unchanged).
+- Runner note unchanged: the repo runner cannot re-register (403,
+  admin-blocked; #1249 open); GH `ocr-review` jobs stay `queued`
+  forever. The operative review gate is the local
   `ocr review --from origin/main --to <branch> --audience agent`,
   then `gh pr merge --squash --admin` after pr-gate + parity green.
 
-## Waves 33-51 (since the 2026-08-31 refresh)
+## Waves 33-55 (since the 2026-08-31 refresh)
 
 | PR | Issue | What | Numbers |
 |----|-------|------|---------|
@@ -86,6 +73,14 @@ loop. This file is the resume point.*
 | #1474 | #1459 | wave51: delete 5 zero-caller seams in errors_helpers.rs (dead kernel surface, YAGNI + Phase E1 design-only directive; B6 decision recorded: the 4 B6-relevant ones get re-created against a live contract when the errors render bundle ports) + 6 self-pinning unit tests + .pyi stub lines + lib.rs registrations | gates EXACT post-deletion: cargo 2,721/11 (-6 removed tests), testtypes 3,258/6, testcheck 8,198/15/7, self-check clean |
 | #1475 | #1470 | wave51: `rust_classify_final_super` getattr swallow narrowed to `is_instance_of::<PyAttributeError>` only (wave-49 pattern; inner `v.is_true()` swallow left per issue, tracked #1477); `_BrokenFinalVar` + 4 pins (seam defers on AttributeError, re-propagates RuntimeError, gate-off/on parity both classes) | testtypes 3,262/6 (+4); cargo 2,729/11; testcheck exact; self-check clean |
 | #1476 | #1461 | wave51: wire CallableType Display (and shared `write_parameters_inner`) bound `arg_kinds`/`arg_names` via `.get(i)` -> ARG_POS default / unnamed, enumerate rewrite (clippy needless_range_loop), 2 Rust pins for the fallback render | no panic on shape-mismatched blobs; cargo 2,729/11 (+2); gates exact otherwise |
+| #1480 | #1477 | wave52: `rust_classify_final_super` INNER `v.is_true()` blanket swallow narrowed to `is_instance_of::<PyAttributeError>` only (wave-49 pattern) + `_BrokenFinalVar`/RuntimeError pins | contract-class arm closed; testtypes +4; gates exact |
+| #1481 | #1479 | wave52: B6 errors render-bundle audit - documented NEGATIVE, zero legacy-path traffic on the gate corpus | docs-only; the 4 deleted #1459 seams stay dead |
+| #1486 | #1483 | wave53: `rust_expand_type_by_instance` residual audit - 49 snap-miss + 1 call-unpack; issue hypotheses disproven; floors routed to #1484/#1485/#1490 | docs-only; 0 ports |
+| #1487 | #1482 | wave53b: icf SUBTYPE_OF protocol-actual structural arm (native protocol-member constraints for the Instance-vs-protocol-template dispatch) | icf SUBTYPE_OF arm native; gates exact |
+| #1488 | #1484 | wave54: clear the expand/maptype gates inside `_native_ctor_blob` (extend wave-22 #1324), zero doomed FFI round-trips in the blob window | no seam entries in blob windows (probe) |
+| #1489 | #1485 | wave54: register plugin-synthesized TypeInfos (`make_fake_register_class_instance`) via the #1456 registrar | `functools._SingleDispatchRegisterCallable` class closed; testtypes +7 |
+| #1492 | #1491 | wave55: st find_member fetch semantics (`find_member_semantics=true`), `visit_unpack_type`, `callable_corresponding_argument` meet subset, `APPLY_REPORTED` channel; local OCR advisory (test tearDown wire-map leak) fixed in `1daf86a84` | st embedded 112 -> 61 (-45.5%); cargo 2,736/11 (+13); testtypes 3,279/6; testcheck 8,198/15/7 exact; self-check clean 347 |
+| #1494 | #1490 | wave55: maptype timing-gap residual audit - documented floor (5 events; on-demand sealing rejected: mid-SCC PEP 695 variance finality, 4-test regression) | docs-only; function-local wire-ref gap filed #1493 |
 
 Closed alongside: #1412, #1393 (F2 complete), #1397 (F3 partial,
 Instance/CallableType only), #1300, #1418 (closed 2026-09-05 with the
@@ -103,30 +98,37 @@ hand), #1458, #1460, #1464 (#1465 auto-closed it), #1465,
 #1466 (#1468 auto-closed it), #1462 (#1469 auto-closed it), #1468,
 #1469, #1456 (#1472 auto-closed it), #1457 (#1473 auto-closed it),
 #1459 (resolved by #1474, deleted), #1470 (#1475 auto-closed it),
-#1461 (#1476 auto-closed it), #1472, #1473, #1474, #1475, #1476.
+#1461 (#1476 auto-closed it), #1472, #1473, #1474, #1475, #1476,
+#1477 (#1480 auto-closed it), #1479 (#1481 auto-closed it), #1482
+(#1487 auto-closed it), #1483 (#1486 auto-closed it), #1484 (#1488
+auto-closed it), #1485 (#1489 auto-closed it), #1490 (#1494
+auto-closed it), #1491 (#1492 auto-closed it), #1432 (unify.rs
+PolyModeGuard prev-restore + boolean labels, `dc1da15a4`).
 
 ## Open backlog (next waves; dispatch max ~2 port agents)
 
-1. **#1477**: `rust_classify_final_super` INNER `v.is_true()` blanket
-   swallow - the remaining contract-class arm after #1470 fixed the
-   getattr one (filed out of wave 51); one-line + optional pin.
-2. **#1432**: chore - unify.rs polish. Low priority.
-3. **#624**: meta Phase E1. The classifier shape is proven (waves
-   48-51); concrete slices: B6 errors render-bundle port (the 4
-   deleted seams get re-created against a live call contract, #1459's
-   recorded decision), B1/B3 (build-cache front), B7 (astdiff);
-   semanal candidates opt-in only.
-4. **#1249**: runner 403 - needs admin, skip until credentials change.
+1. **#1493**: function-local (`Name@line`) TypeInfos absent from the
+   per-build wire map - 60 typeobj composite `decode_None`
+   fall-throughs found by the #1490 audit. Needs a creation-site
+   registrar (semanal/checker class-analysis funnel, with the #1456
+   finality discipline) or a serialization pre-gate; do not just
+   widen `_collect_incremental` to walk local scopes.
+2. **#624**: meta Phase E1. Concrete slices: B6 errors render-bundle
+   port (the 4 deleted seams get re-created against a live call
+   contract, #1459/#1479 decisions), B1/B3 (build-cache front), B7
+   (astdiff); semanal candidates opt-in only.
+3. **#1249**: runner 403 - needs admin, skip until credentials change.
 
 Standing audited floors (do NOT re-audit blind; the mechanism that
-would unlock each is noted): st ~178 untagged (callable-compat
-generic / owned-tvar / extra_tvars walls - needs a kernel extra_tvars
-channel beyond #1430's, TypeType, protocol-member, serfail families);
-icf 266 (protocol-member engine class, multi-wave); sgc 253 (icf 173
-/ apply_generic 69 / solve_defer 7 / multi_lower 4); ct 29; ifta
-var_pspec_tvt 80 / engine 47 / solve 5; dc-final-overlap 67 (overlap
-kernel); join lkv wall 39; ama 120 contract floor. Bucket tables in
-AGENTS.md (wave-47/48a/48b/49 entries) - do not re-derive.
+would unlock each is noted): st 61 embedded (19 serfail + 42 kernel:
+18 `uds-var-unsafe` owned/meta-tvar wire identity - needs the fuller
+owned-tvar/extra_tvars channel; 10 `cbd-expand-other`; 9
+`ud-infer-args`); icf 266 (protocol-member engine class, multi-wave);
+sgc 253 (icf 173 / apply_generic 69 / solve_defer 7 / multi_lower 4);
+ct 29; ifta var_pspec_tvt 80 / engine 47 / solve 5; dc-final-overlap
+67 (overlap kernel); join lkv wall 39; ama 120 contract floor; maptype
+timing-gap 5 (documented #1490 floor). Bucket tables in AGENTS.md
+(wave-47/48a/48b/49/53/55 entries) - do not re-derive.
 
 ## Older session record
 
