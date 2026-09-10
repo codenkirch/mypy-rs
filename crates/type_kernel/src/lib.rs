@@ -45,6 +45,7 @@ mod aliases;
 mod applytype;
 mod argapprox;
 mod argmap;
+mod astdiff_snapshot;
 mod astwire;
 mod attrs;
 mod binder;
@@ -2050,6 +2051,11 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(serverdeps::rust_has_user_bases, module)?)?;
     module.add_function(wrap_pyfunction!(
         serverdeps::rust_compare_symbol_table_snapshots,
+        module
+    )?)?;
+    // B7 slice 1 (#1497): native astdiff type-snapshot builder.
+    module.add_function(wrap_pyfunction!(
+        astdiff_snapshot::rust_snapshot_type,
         module
     )?)?;
     module.add_function(wrap_pyfunction!(

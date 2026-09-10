@@ -54544,3 +54544,186 @@ class NativeTypeObjectAliasDecodeSuite(Suite):
             assert_equal(str(on), str(off), "type_object_type alias-map-missing parity")
         finally:
             set_wire_alias_map({self.alias.fullname: self.alias})
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeAstdiffSnapshotSuite(Suite):
+    """Issue #1497 (B7 slice 1): native `astdiff.snapshot_type` port.
+
+    The Rust seam mirrors `SnapshotTypeVisitor` for every non-generic type
+    arm; the direct seam calls prove engagement, the defer arms (generic
+    `CallableType`, `PartialType`, unhandled shapes), and the gate-off vs
+    gate-on differential proves the public `snapshot_type` answers
+    identically in equality and hash across a spread of TypeFixture shapes.
+    """
+
+    def setUp(self) -> None:
+        from mypy.server import astdiff
+
+        self.astdiff = astdiff
+        self.fx = TypeFixture()
+        self._prev_active = astdiff._native_astdiff_active
+        astdiff._set_native_astdiff_active(True)
+
+    def tearDown(self) -> None:
+        self.astdiff._set_native_astdiff_active(self._prev_active)
+
+    def _snapshot(self, typ: Any, active: bool) -> Any:
+        self.astdiff._set_native_astdiff_active(active)
+        try:
+            return self.astdiff.snapshot_type(typ)
+        finally:
+            self.astdiff._set_native_astdiff_active(True)
+
+    def _assert_parity(self, label: str, typ: Any) -> Any:
+        off = self._snapshot(typ, False)
+        on = self._snapshot(typ, True)
+        assert_equal(on, off, f"{label}: gate-on snapshot differs ({typ!r})")
+        assert hash(on) == hash(off), f"{label}: gate-on snapshot hash differs"
+        return on
+
+    def _alias(self) -> TypeAlias:
+        return TypeAlias(
+            Instance(self.fx.std_listi, [self.fx.t]), "mod.SnapAlias", "mod", -1, -1
+        )
+
+    def _callable(self, *, generic: bool = False) -> CallableType:
+        return CallableType(
+            [self.fx.a],
+            [ARG_POS],
+            ["x"],
+            self.fx.b,
+            self.fx.function,
+            is_ellipsis_args=False,
+            is_bound=True,
+            type_guard=self.fx.b,
+            type_is=self.fx.a,
+            instance_type=self.fx.a,
+            variables=[self.fx.t] if generic else None,
+        )
+
+    def _cases(self) -> list[tuple[str, Any]]:
+        from mypy.types import ExtraAttrs
+
+        fx = self.fx
+        return [
+            ("AnyType", AnyType(TypeOfAny.special_form)),
+            ("NoneType", NoneType()),
+            ("UninhabitedType", UninhabitedType()),
+            ("ErasedType", ErasedType()),
+            ("DeletedType", DeletedType("x")),
+            ("UnboundType", UnboundType("Foo")),
+            (
+                "UnboundType-full",
+                UnboundType("Foo", [fx.a], optional=True, empty_tuple_index=True),
+            ),
+            ("Instance", fx.a),
+            ("Instance-generic", fx.ga),
+            ("Instance-lkv", fx.lit1_inst),
+            (
+                "Instance-extra-attrs",
+                Instance(
+                    fx.ai, [], extra_attrs=ExtraAttrs({"y": fx.b, "x": fx.a}, {"x"})
+                ),
+            ),
+            ("TypeVarType", fx.t),
+            (
+                "TypeVarType-values",
+                TypeVarType("V", "V", TypeVarId(7), [fx.a, fx.b], fx.o, fx.anyt, COVARIANT),
+            ),
+            (
+                "ParamSpecType",
+                ParamSpecType("P", "P", TypeVarId(-1), ParamSpecFlavor.BARE, fx.o, fx.anyt),
+            ),
+            ("TypeVarTupleType", fx.ts),
+            ("UnpackType", UnpackType(fx.ts)),
+            ("Parameters", Parameters([fx.a, fx.b], [ARG_POS, ARG_STAR], ["x", None])),
+            ("CallableType", self._callable()),
+            ("TupleType", TupleType([fx.a, fx.b], fx.std_tuple)),
+            (
+                "TypedDictType",
+                TypedDictType({"b": fx.b, "a": fx.a}, {"b"}, {"a"}, fx.o, is_closed=True),
+            ),
+            ("LiteralType-int", fx.lit1),
+            ("LiteralType-str", fx.lit_str1),
+            ("UnionType", UnionType([fx.b, fx.a, fx.b, NoneType()])),
+            ("Overloaded", Overloaded([self._callable(), self._callable()])),
+            ("TypeType", TypeType.make_normalized(fx.a)),
+            ("TypeType-form", TypeType(fx.a, is_type_form=True)),
+            ("TypeAliasType", TypeAliasType(self._alias(), [fx.a])),
+        ]
+
+    def test_gate_off_on_parity(self) -> None:
+        for label, typ in self._cases():
+            self._assert_parity(label, typ)
+
+    def test_engagement_plain_instance(self) -> None:
+        raw = _type_kernel.rust_snapshot_type(self.fx.a)
+        assert raw is not None, "Rust snapshot_type did not engage for a plain Instance"
+        assert isinstance(raw, tuple)
+        assert_equal(raw, self._snapshot(self.fx.a, False))
+
+    def test_optional_and_sequence_helpers_route_through_seam(self) -> None:
+        assert_equal(self.astdiff.snapshot_optional_type(None), ("<not set>",))
+        assert_equal(
+            self.astdiff.snapshot_optional_type(self.fx.a),
+            self._snapshot(self.fx.a, True),
+        )
+        assert_equal(
+            self.astdiff.snapshot_types([self.fx.a, self.fx.b]),
+            (self._snapshot(self.fx.a, True), self._snapshot(self.fx.b, True)),
+        )
+
+    def test_union_sorted_and_deduped(self) -> None:
+        s1 = self._assert_parity("union1", UnionType([self.fx.b, self.fx.a, self.fx.b]))
+        s2 = self._assert_parity("union2", UnionType([self.fx.a, self.fx.b]))
+        assert_equal(s1, s2, "union snapshots must be order/dedup insensitive")
+        items = s1[1]
+        assert items == tuple(sorted(items)), "union items must be sorted"
+        assert len(items) == 2, "duplicate union items must be removed"
+
+    def test_typed_dict_item_order_and_sorted_keys(self) -> None:
+        td = TypedDictType(
+            {"b": self.fx.b, "a": self.fx.a}, {"b", "a"}, {"b"}, self.fx.o
+        )
+        snap = self._assert_parity("typeddict", td)
+        assert [key for key, _ in snap[1]] == ["b", "a"], "items preserve dict order"
+        assert snap[2] == ("a", "b"), "required keys are sorted"
+        assert snap[3] == ("b",), "readonly keys are sorted"
+        assert snap[4] is False
+
+    def test_extra_attrs_sorted_pairs(self) -> None:
+        from mypy.types import ExtraAttrs
+
+        inst = Instance(
+            self.fx.ai, [], extra_attrs=ExtraAttrs({"y": self.fx.b, "x": self.fx.a}, {"x"})
+        )
+        snap = self._assert_parity("extra-attrs", inst)
+        pairs, immutable = snap[4]
+        assert [key for key, _ in pairs] == ["x", "y"], "extra attrs sorted by key"
+        assert set(immutable) == {"x"}
+
+    def test_generic_callable_defers(self) -> None:
+        generic = self._callable(generic=True)
+        assert _type_kernel.rust_snapshot_type(generic) is None
+        snap = self._assert_parity("generic-callable", generic)
+        assert snap[0] == "CallableType"
+        # The Python fallback normalizes tvar ids to -1 - i.
+        assert snap[7][0][3] == -1
+
+    def test_partial_type_defers(self) -> None:
+        from mypy.types import PartialType
+
+        partial = PartialType(None, Var("x"))
+        assert _type_kernel.rust_snapshot_type(partial) is None
+        with self.assertRaises(RuntimeError):
+            self._snapshot(partial, True)
+        with self.assertRaises(RuntimeError):
+            self._snapshot(partial, False)
+
+    def test_unhandled_shape_defers(self) -> None:
+        # A non-Type object: the seam defers so the Python path raises the
+        # same AttributeError.
+        assert _type_kernel.rust_snapshot_type(42) is None
+        with self.assertRaises(AttributeError):
+            self._snapshot(42, True)
