@@ -3075,6 +3075,50 @@ including:
     8198/15/7 exact, cold self-check clean 347; clippy -D warnings +
     fmt clean.
 
+- maptype timing-gap residual, floor decision (wave 55, issue #1490):
+  documentation-only close, zero code change. Env-gated probes
+  (`MYPY_TK_W55_AUDIT` shims on the maptype/typeops/expand fall-throughs,
+  instrumented cold self-check at `-n0 --no-incremental`, stripped
+  before landing; cold self-check 0 errors) re-measured the #1483
+  snap-miss class at the post-#1484/#1485 head. Result: only 5
+  residual events remain, all in `_native_map_instance_to_supertype`,
+  all `in_map=True in_snap=False` with snap<map
+  (`email.message.EmailMessage -> email.message.Message`,
+  `ctypes.wintypes.WPARAM/LPARAM -> _ctypes._SimpleCData`,
+  `unittest.runner._TextTestStream -> _typeshed.SupportsWrite` x2).
+  So 44/49 of the #1483 audit is closed by #1484 (ctor-blob gate
+  clearing) + #1485 (plugin registrar).
+  - The residual window is inherent to the #1115 design:
+    `_install_semal_wirefixup` publishes a module's TypeInfos to the
+    Python wire map at its top-level completion, while the Rust
+    snapshot is only fed per SCC post-semanal, so a semanal-time seam
+    inside the class's own SCC sees the map grow before the snapshot
+    does.
+  - Fix candidates evaluated and rejected. (a) On-demand sealing via a
+    maptype registrar (the #1456/#1485 pattern: seal the class plus its
+    missing MRO chain, retry once) restores all 5 natively but regresses
+    4 PEP 695 variance tests (`testPEP695InferVarianceWithInheritedSelf`,
+    `testPEP695InheritInvariant`, `testPEP695InheritanceMakesInvariant`,
+    `testPEP695InheritCoOrContravariant`): a mid-SCC class can carry
+    pre-inference variance (`__main__.Subclass.T` read COVARIANT at
+    registration and becomes INVARIANT after `infer_class_variances`),
+    and first-seal pins it. Guards that make sealing safe (skip
+    current-SCC modules, `Name@line` function-local classes, and
+    `VARIANCE_NOT_READY` tvars) drop every registration on the
+    self-check (0 `MYPY_TK_W55_REG_DEBUG` hits), so the registrar is
+    dead weight. (b) A Rust live-object mapping fallback (walk the live
+    TypeInfo's MRO via PyO3 instead of the snapshot) is parity-safe by
+    construction but a large kernel change for 5 calls/self-check.
+    Decision: document the window as a floor; the Python
+    `map_instance_to_supertype` fallback answers correctly.
+  - The same audit classified the other 95 fall-through events as NOT
+    timing-gap: 32 `typeobj:kernel_none` (Rust composite defer) and 60
+    `typeobj:decode_None` where the wire payload references
+    function-local class fullnames (`Name@line`, e.g.
+    `mypy.traverser.Counter@1350`, `_pytest.pytester.reprec@1195`)
+    absent from the wire map because `_collect_incremental` only walks
+    module symbol tables. Tracked separately as #1493.
+
 ## Pull Requests
 
 The default branch on this fork is `main` (not `master`). Always target
