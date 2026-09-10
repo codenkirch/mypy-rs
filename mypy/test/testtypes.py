@@ -53616,9 +53616,7 @@ class NativeFakeInfoRegistrationSuite(Suite):
             self.resolver,
         )
 
-    def _make_fake_subclass_info(
-        self, gen_name: str, bases: list[Instance]
-    ) -> TypeInfo:
+    def _make_fake_subclass_info(self, gen_name: str, bases: list[Instance]) -> TypeInfo:
         from mypy.mro import calculate_mro
         from mypy.nodes import Block, ClassDef, SymbolTable
 
@@ -53793,7 +53791,6 @@ class NativeIcfProtocolSubtypeArmSuite(Suite):
         from mypy.constraints import _set_native_constraints_active
         from mypy.options import Options
         from mypy.plugins.default import DEFAULT_HOOK_FULLNAMES_BY_KIND, DefaultPlugin
-        from mypy.wirefixup import set_wire_typeinfo_map
 
         self.fx = TypeFixture()
         self._set_active = _set_native_constraints_active
@@ -54148,7 +54145,11 @@ class NativePluginFakeRegistrarSuite(Suite):
         first = make_fake_register_class_instance(self._api(), (self.fx.a, self.fx.o))
         second = make_fake_register_class_instance(self._api(), (self.fx.d, self.fx.b))
         # Distinct fakes share the fullname; first seal wins for the build.
-        assert first.type.fullname == second.type.fullname == "functools._SingleDispatchRegisterCallable"
+        assert (
+            first.type.fullname
+            == second.type.fullname
+            == "functools._SingleDispatchRegisterCallable"
+        )
         assert first.type is not second.type
         BuildManager._register_native_fake_typeinfo(stub, first.type)  # type: ignore[arg-type]
         BuildManager._register_native_fake_typeinfo(stub, second.type)  # type: ignore[arg-type]
@@ -54184,6 +54185,8 @@ class NativePluginFakeRegistrarSuite(Suite):
             assert self_arg.type.fullname == inst.type.fullname
         finally:
             _set_native_expand_type_active(False)
+
+
 class NativeCtorBlobGatesSuite(Suite):
     """`_native_ctor_blob` must clear the expand/maptype gates too (#1484).
 
@@ -54400,3 +54403,144 @@ class NativeFindMemberCallFetchSuite(Suite):
             assert self._seam_call(left, right) is False
         finally:
             _set_native_subtype_active(False)
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeTypeObjectAliasDecodeSuite(Suite):
+    """Alias-aware decode for the type-object composite seam (issue #1493).
+
+    `type_object_type_from_function` mirrors the pure-Python body, which
+    preserves live `TypeAliasType` nodes (bind_self / map_type_from_supertype
+    only expand alias args). The shim's `_deserialize_type` runs with
+    `resolve_aliases=False`, so every signature carrying an alias decoded to
+    None: the whole Rust composite round-trip was wasted and the Python body
+    re-ran. The wave-56 audit pinned all 60 cold-self-check `decode_None`
+    events to aliases (e.g. `ast._ConstantValue`, `logging._FormatStyle`),
+    not to missing TypeInfos.
+
+    The seam now retries once through `_deserialize_type_with_aliases`, the
+    #1309/#1224 contract (re-link decoded aliases through the per-build alias
+    map, re-unify fresh vars), and the existing `resync_var_identities` /
+    definition-restamp tail runs unchanged. Gate-off vs gate-on results must
+    agree, the retry must re-link the live alias, and a missing alias map
+    must still fall back cleanly to the pure-Python body.
+    """
+
+    def setUp(self) -> None:
+        from mypy.typeops import _set_native_typeops_active, _set_native_typeops_resolver
+        from mypy.wirefixup import set_wire_alias_map, set_wire_typeinfo_map
+
+        self.fx = TypeFixture()
+        self._type_infos = []
+        for name in dir(self.fx):
+            if not name.endswith("i"):
+                continue
+            value = getattr(self.fx, name)
+            if _is_type_info(value):
+                self._type_infos.append(value)
+        self.alias = TypeAlias(
+            Instance(self.fx.std_listi, [self.fx.t]), "mod.AliasArg", "mod", -1, -1
+        )
+        self._resolver = _type_kernel.build_native_resolver(self._type_infos, [self.alias])
+        set_wire_typeinfo_map({info.fullname: info for info in self._type_infos})
+        set_wire_alias_map({self.alias.fullname: self.alias})
+        _set_native_typeops_active(True)
+        _set_native_typeops_resolver(self._resolver)
+
+    def tearDown(self) -> None:
+        from mypy.typeops import _set_native_typeops_active, _set_native_typeops_resolver
+        from mypy.wirefixup import set_wire_alias_map, set_wire_typeinfo_map
+
+        _set_native_typeops_active(False)
+        _set_native_typeops_resolver(None)
+        set_wire_typeinfo_map(None)
+        set_wire_alias_map(None)
+
+    def _init_sig(self, info: TypeInfo) -> CallableType:
+        # def __init__(self, x: AliasArg[T]) -> None, with AliasArg = list[T].
+        return CallableType(
+            [Instance(info, []), TypeAliasType(self.alias, [self.fx.t])],
+            [ARG_POS, ARG_POS],
+            [None, None],
+            NoneType(),
+            self.fx.function,
+            name="<init>",
+        )
+
+    def _type_object(self, sig: FunctionLike, info: TypeInfo) -> FunctionLike:
+        from mypy.typeops import type_object_type_from_function
+
+        return type_object_type_from_function(sig, info, info, self.fx.type_type, False)
+
+    def _with_gate(self, active: bool, fn: Callable[[], T]) -> T:
+        from mypy.typeops import _set_native_typeops_active
+
+        _set_native_typeops_active(active)
+        try:
+            return fn()
+        finally:
+            _set_native_typeops_active(True)
+
+    def _raw_seam_result(self) -> bytes:
+        from mypy.typeops import _serialize_type
+
+        info = self.fx.ai
+        result = _type_kernel.rust_type_object_type_from_function(
+            _serialize_type(self._init_sig(info)),
+            info,
+            info,
+            _serialize_type(self.fx.type_type),
+            False,
+            state.strict_optional,
+            False,
+            self._resolver,
+        )
+        assert result is not None, "Rust type_object_type_from_function did not engage"
+        return bytes(result)
+
+    def test_alias_signature_gate_parity(self) -> None:
+        info = self.fx.ai
+        sig = self._init_sig(info)
+        off = self._with_gate(False, lambda: self._type_object(sig, info))
+        on = self._with_gate(True, lambda: self._type_object(sig, info))
+        assert_equal(str(on), str(off), "type_object_type alias-signature parity")
+        # The pure-Python body preserves the live alias node (bind_self /
+        # map only expand alias args); the native path must too.
+        assert isinstance(off, CallableType) and isinstance(on, CallableType)
+        # bind_self strips the self parameter, so the alias is arg 0.
+        off_arg = off.arg_types[0]
+        on_arg = on.arg_types[0]
+        assert isinstance(off_arg, TypeAliasType) and off_arg.alias is self.alias
+        assert isinstance(on_arg, TypeAliasType) and on_arg.alias is self.alias
+
+    def test_alias_decode_retry_engages(self) -> None:
+        from mypy.typeops import _deserialize_type, _deserialize_type_with_aliases
+
+        raw = self._raw_seam_result()
+        # The plain decoder defers on any decoded alias; the retry resolves
+        # it through the per-build alias map and re-links the live node.
+        assert _deserialize_type(raw) is None
+        fixed = _deserialize_type_with_aliases(raw)
+        assert fixed is not None
+        assert isinstance(fixed, FunctionLike)
+        assert isinstance(fixed, CallableType)
+        alias_arg = fixed.arg_types[0]
+        assert isinstance(alias_arg, TypeAliasType), f"alias node lost: {alias_arg!r}"
+        assert alias_arg.alias is self.alias, "decoded alias not re-linked to live node"
+        assert alias_arg.type_ref is None
+
+    def test_missing_alias_map_falls_back(self) -> None:
+        from mypy.typeops import _deserialize_type_with_aliases
+        from mypy.wirefixup import set_wire_alias_map
+
+        raw = self._raw_seam_result()
+        set_wire_alias_map(None)
+        try:
+            assert _deserialize_type_with_aliases(raw) is None
+            info = self.fx.ai
+            sig = self._init_sig(info)
+            off = self._with_gate(False, lambda: self._type_object(sig, info))
+            on = self._with_gate(True, lambda: self._type_object(sig, info))
+            assert_equal(str(on), str(off), "type_object_type alias-map-missing parity")
+        finally:
+            set_wire_alias_map({self.alias.fullname: self.alias})

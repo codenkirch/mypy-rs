@@ -3119,6 +3119,31 @@ including:
     absent from the wire map because `_collect_incremental` only walks
     module symbol tables. Tracked separately as #1493.
 
+- typeobj wire-seam alias decode (wave 56, issue #1493): the #1490
+  audit's `decode_None` diagnosis corrected and fixed. An env-gated
+  `_TypeRefFixer` reason probe (instrumented cold self-check at `-n0
+  --no-incremental`, stripped before landing; self-check clean 347)
+  showed all 60 `typeobj:decode_None` events are ALIAS-caused, not
+  missing TypeInfos: the Rust composite mirrors the pure-Python
+  bind/map path, which preserves live `TypeAliasType` nodes, while
+  the shim's `_deserialize_type` decodes with `resolve_aliases=False`
+  and defers on every decoded alias (e.g. `ast._ConstantValue`,
+  `logging._FormatStyle`, `_typeshed.AnnotationForm`).
+  Zero events had an Instance `type_ref` absent from the wire map, so
+  the issue's local-class registrar / seed-map hypothesis is disproven
+  (and was dropped: dead weight).
+  - Fix: `type_object_type_from_function` retries the decode once
+    through `_deserialize_type_with_aliases`, the #1309/#1224 contract
+    (re-link decoded aliases through the per-build alias map, re-unify
+    fresh vars), then the existing `resync_var_identities` /
+    definition-restamp tail runs unchanged. Uncached by design (fresh
+    alias-arg vars must not leak across callers, #1180/#1198). No Rust
+    changes, no snapshot/registrar work.
+  - Audit before/after: `decode_None` 60 -> 0 (32 `kernel_none`
+    unchanged); alias-signature parity pinned structurally (live alias
+    node, not just `str`) by `NativeTypeObjectAliasDecodeSuite` in
+    `mypy/test/testtypes.py`.
+
 ## Pull Requests
 
 The default branch on this fork is `main` (not `master`). Always target
