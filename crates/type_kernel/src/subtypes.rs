@@ -1371,6 +1371,21 @@ pub(crate) fn is_subtype(
         }
         return Some(false);
     }
+    // visit_unpack_type (subtypes.py:1416-1422): an UnpackType is not a
+    // real type; its target compares against an UnpackType right's target,
+    // builtins.object accepts, everything else is False.
+    if let Type::UnpackType {
+        typ: left_inner, ..
+    } = left
+    {
+        return match right {
+            Type::UnpackType {
+                typ: right_inner, ..
+            } => is_subtype(left_inner, right_inner, ctx, resolver),
+            Type::Instance { type_ref, .. } if type_ref == "builtins.object" => Some(true),
+            _ => Some(false),
+        };
+    }
     let (left_ref, left_args) = match left {
         Type::Instance { type_ref, args, .. } => (type_ref.as_str(), args.as_slice()),
         _ => {
@@ -1876,15 +1891,20 @@ fn visit_instance_noninstance_right(
             if resolver.has_live_info_map() {
                 let fetch = pyo3::Python::with_gil(|py| {
                     crate::checker_helpers::get_protocol_member_inner(
-                        py, left, left, "__call__", false, false, resolver,
+                        py, left, left, "__call__", false, false, true, resolver,
                     )
                 });
                 match fetch {
                     Some(crate::checker_helpers::GetProtocolMemberResult::Found(call)) => {
                         return is_subtype(&call, right, ctx, resolver);
                     }
+                    // find_member semantics (operator lookup): a None
+                    // member makes Python's `if call:` answer False
+                    // (subtypes.py:1372-1375).
+                    Some(crate::checker_helpers::GetProtocolMemberResult::NoneVal) => {
+                        return Some(false);
+                    }
                     Some(crate::checker_helpers::GetProtocolMemberResult::Defer) => {}
-                    Some(crate::checker_helpers::GetProtocolMemberResult::NoneVal) => {}
                     None => {}
                 }
             }
@@ -2640,7 +2660,7 @@ fn callable_protocol_call_check(
     }
     let call = match pyo3::Python::with_gil(|py| {
         crate::checker_helpers::get_protocol_member_inner(
-            py, right, right, "__call__", false, false, resolver,
+            py, right, right, "__call__", false, false, false, resolver,
         )
     }) {
         Some(crate::checker_helpers::GetProtocolMemberResult::Found(t)) => t,
@@ -4846,10 +4866,57 @@ mod tests {
     }
 
     #[test]
-    fn unpack_left_erased_right_defers() {
+    fn unpack_left_object_right_true() {
+        // visit_unpack_type: a builtins.object right accepts any unpack.
+        let r = make_resolver(vec![snap("builtins.object", "object")]);
+        let left = Type::UnpackType {
+            typ: Box::new(instance("a.A", vec![])),
+            from_star_syntax: false,
+        };
+        assert_eq!(
+            is_subtype(
+                &left,
+                &instance("builtins.object", vec![]),
+                &ctx_nominal(),
+                &r
+            ),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn unpack_left_unpack_right_recurses() {
+        // visit_unpack_type: both sides unpack -> compare the targets.
+        let r = make_resolver(vec![snap("a.A", "A")]);
+        let left = Type::UnpackType {
+            typ: Box::new(instance("a.A", vec![])),
+            from_star_syntax: false,
+        };
+        let same = Type::UnpackType {
+            typ: Box::new(instance("a.A", vec![])),
+            from_star_syntax: false,
+        };
+        assert_eq!(is_subtype(&left, &same, &ctx_nominal(), &r), Some(true));
+        let different = Type::UnpackType {
+            typ: Box::new(instance("a.B", vec![])),
+            from_star_syntax: false,
+        };
+        let r2 = make_resolver(vec![
+            snap("a.A", "A"),
+            snap("a.B", "B"),
+            snap("builtins.object", "object"),
+        ]);
+        assert_eq!(
+            is_subtype(&left, &different, &ctx_nominal(), &r2),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn unpack_left_erased_right_false() {
         // Python's fast-path guard is `not isinstance(left, UnpackType)`
-        // (subtypes.py:757-760); mirror it as a defer so the pure-Python
-        // body decides the rare Unpack-vs-Erased pair.
+        // (subtypes.py:757-760); left is an UnpackType so the guard is
+        // skipped and visit_unpack_type answers False (subtypes.py:1422).
         let r = make_resolver(vec![snap("a.A", "A")]);
         let left = Type::UnpackType {
             typ: Box::new(instance("a.A", vec![])),
@@ -4857,7 +4924,7 @@ mod tests {
         };
         assert_eq!(
             is_subtype(&left, &Type::ErasedType, &ctx_nominal(), &r),
-            None
+            Some(false)
         );
     }
 
@@ -5631,9 +5698,10 @@ mod tests {
     }
 
     #[test]
-    fn tuple_left_defer_on_variadic_unpack() {
-        // *tuple[X, ...] in the items: variadic path not ported, so defer
-        // to Python (subtypes.py:1004-1005).
+    fn tuple_left_unpack_vs_fixed_item_false() {
+        // (*tuple[A, ...],) vs (A,): the right has no unpack so the
+        // variadic helper falls through (subtypes.py:1611-1613); the item
+        // comparison hits visit_unpack_type, False for a non-object right.
         let r = make_resolver(vec![snap("a.A", "A")]);
         let unpack = Type::UnpackType {
             typ: Box::new(instance("builtins.tuple", vec![instance("a.A", vec![])])),
@@ -5641,7 +5709,7 @@ mod tests {
         };
         let left = tuple_type(vec![unpack]);
         let right = tuple_type(vec![instance("a.A", vec![])]);
-        assert_eq!(is_subtype(&left, &right, &ctx_nominal(), &r), None);
+        assert_eq!(is_subtype(&left, &right, &ctx_nominal(), &r), Some(false));
     }
 
     #[test]

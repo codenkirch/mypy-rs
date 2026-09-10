@@ -1185,6 +1185,7 @@ pub(crate) fn get_protocol_member_inner(
     member: &str,
     class_obj: bool,
     is_lvalue: bool,
+    find_member_semantics: bool,
     resolver: &TypeResolver,
 ) -> Option<GetProtocolMemberResult> {
     let Type::Instance {
@@ -1209,8 +1210,12 @@ pub(crate) fn get_protocol_member_inner(
         // a plain miss as None: the accessor scan is skipped on extra_attrs.
 
         // Keep the deferral for every other shape: an attrs hit needs
-        // the live Type, a MRO hit rides the member-access tail.
-        if !class_obj
+        // the live Type, a MRO hit rides the member-access tail. Plain
+        // `find_member` semantics skip this prelude on operator lookups.
+        if find_member_semantics {
+            // Fall through to the MRO walk; the miss tail below mirrors
+            // find_member's operator path (Any / attrs / None).
+        } else if !class_obj
             && !is_lvalue
             && member != "__call__"
             && member != "__init__"
@@ -1232,7 +1237,7 @@ pub(crate) fn get_protocol_member_inner(
         return Some(GetProtocolMemberResult::Defer);
     }
 
-    if member == "__call__" && is_metaclass_precise(snap, resolver) {
+    if member == "__call__" && is_metaclass_precise(snap, resolver) && !find_member_semantics {
         // Avoid falling back to metaclass __call__; return None.
         return Some(GetProtocolMemberResult::NoneVal);
     }
@@ -1279,6 +1284,7 @@ pub(crate) fn get_protocol_member_inner(
                 left,
                 self_type,
                 live_strict_optional(py),
+                find_member_semantics,
             );
         }
     };
@@ -1302,6 +1308,7 @@ pub(crate) fn get_protocol_member_inner(
             left,
             self_type,
             live_strict_optional(py),
+            find_member_semantics,
         );
     }
     let class_name = node_ref.get_type().name().unwrap_or("").to_string();
@@ -1566,17 +1573,19 @@ fn member_miss_decision(
     left: &Type,
     self_type: &Type,
     strict_optional: bool,
+    operator_find: bool,
 ) -> Option<GetProtocolMemberResult> {
     // Python skips the accessor scan for extra_attrs-bearing instances
     // (subtypes.py:2198 `itype.extra_attrs is None` gate, the ModuleType
     // case), and the attrs hit was already excluded upstream.
-    let skip_accessors = matches!(
-        left,
-        Type::Instance {
-            extra_attrs: Some(_),
-            ..
-        }
-    );
+    let skip_accessors = operator_find
+        || matches!(
+            left,
+            Type::Instance {
+                extra_attrs: Some(_),
+                ..
+            }
+        );
     if !skip_accessors && !matches!(member, "__getattr__" | "__setattr__" | "__getattribute__") {
         for method_name in ["__getattribute__", "__getattr__"] {
             let def = get_method_definer(py, info, method_name);
@@ -1653,6 +1662,20 @@ fn member_miss_decision(
             source_any: None,
             missing_import_name: None,
         }));
+    }
+    if operator_find {
+        // find_member's operator miss path (subtypes.py:2193-2201): the
+        // accessor scan is skipped, an extra_attrs hit still returns the
+        // live attr type, else None.
+        if let Type::Instance {
+            extra_attrs: Some(ea),
+            ..
+        } = left
+        {
+            if let Some(t) = ea.attrs.get(member) {
+                return Some(GetProtocolMemberResult::Found(t.clone()));
+            }
+        }
     }
     Some(GetProtocolMemberResult::NoneVal)
 }
@@ -1917,6 +1940,7 @@ pub(crate) fn rust_get_protocol_member(
         member,
         class_obj,
         is_lvalue,
+        false,
         resolver.resolver(),
     )? {
         GetProtocolMemberResult::NoneVal => Some(Vec::new()),
@@ -2571,8 +2595,16 @@ mod tests {
                 "builtins.type",
             ));
             let left = make_instance("builtins.type", vec![]);
-            let res =
-                get_protocol_member_inner(py, &left, &left, "__call__", false, false, r.resolver());
+            let res = get_protocol_member_inner(
+                py,
+                &left,
+                &left,
+                "__call__",
+                false,
+                false,
+                false,
+                r.resolver(),
+            );
             assert!(matches!(res, Some(GetProtocolMemberResult::NoneVal)));
         });
     }
@@ -2583,8 +2615,16 @@ mod tests {
         Python::with_gil(|py| {
             let r = make_native(make_resolver_with_metaclass("mymod.Foo", "builtins.type"));
             let left = make_instance("mymod.Foo", vec![]);
-            let res =
-                get_protocol_member_inner(py, &left, &left, "__call__", false, false, r.resolver());
+            let res = get_protocol_member_inner(
+                py,
+                &left,
+                &left,
+                "__call__",
+                false,
+                false,
+                false,
+                r.resolver(),
+            );
             assert!(matches!(res, Some(GetProtocolMemberResult::Defer)));
         });
     }
@@ -2595,8 +2635,16 @@ mod tests {
         Python::with_gil(|py| {
             let r = make_native(make_resolver_with_metaclass("mymod.Foo", "builtins.type"));
             let left = make_instance("mymod.Foo", vec![]);
-            let res =
-                get_protocol_member_inner(py, &left, &left, "__call__", true, false, r.resolver());
+            let res = get_protocol_member_inner(
+                py,
+                &left,
+                &left,
+                "__call__",
+                true,
+                false,
+                false,
+                r.resolver(),
+            );
             assert!(matches!(res, Some(GetProtocolMemberResult::Defer)));
         });
     }
@@ -2607,8 +2655,16 @@ mod tests {
         Python::with_gil(|py| {
             let r = make_native(TypeResolver::new());
             let left = make_instance("mymod.NotFound", vec![]);
-            let res =
-                get_protocol_member_inner(py, &left, &left, "__call__", false, false, r.resolver());
+            let res = get_protocol_member_inner(
+                py,
+                &left,
+                &left,
+                "__call__",
+                false,
+                false,
+                false,
+                r.resolver(),
+            );
             assert!(res.is_none());
         });
     }
@@ -2623,8 +2679,16 @@ mod tests {
                 source_any: None,
                 missing_import_name: None,
             };
-            let res =
-                get_protocol_member_inner(py, &left, &left, "__call__", false, false, r.resolver());
+            let res = get_protocol_member_inner(
+                py,
+                &left,
+                &left,
+                "__call__",
+                false,
+                false,
+                false,
+                r.resolver(),
+            );
             assert!(res.is_none());
         });
     }
@@ -2673,8 +2737,17 @@ info.mro = [Cls()]
             let r = TypeResolver::new();
             let snap = mock_snapshot("mymod.Foo");
             let left = make_instance("mymod.Foo", vec![]);
-            let res =
-                member_miss_decision(py, info.as_ref(py), "attr", &snap, &r, &left, &left, true);
+            let res = member_miss_decision(
+                py,
+                info.as_ref(py),
+                "attr",
+                &snap,
+                &r,
+                &left,
+                &left,
+                true,
+                false,
+            );
             assert!(matches!(res, Some(GetProtocolMemberResult::NoneVal)));
         });
     }
@@ -2688,8 +2761,17 @@ info.mro = [Cls()]
             snap.fallback_to_any = true;
             let r = TypeResolver::new();
             let left = make_instance("mymod.Foo", vec![]);
-            let res =
-                member_miss_decision(py, info.as_ref(py), "attr", &snap, &r, &left, &left, true);
+            let res = member_miss_decision(
+                py,
+                info.as_ref(py),
+                "attr",
+                &snap,
+                &r,
+                &left,
+                &left,
+                true,
+                false,
+            );
             assert!(matches!(res, Some(GetProtocolMemberResult::Found(_))));
         });
     }
@@ -2711,6 +2793,7 @@ info.mro = [Cls()]
                 &left,
                 &left,
                 true,
+                false,
             );
             assert!(matches!(res, Some(GetProtocolMemberResult::NoneVal)));
         });
@@ -2724,8 +2807,16 @@ info.mro = [Cls()]
             let left = make_instance("mymod.Foo", vec![]);
             // __init__ access filters to final/super; Rust defers so Python
             // decides CANNOT_ACCESS_INIT.
-            let res =
-                get_protocol_member_inner(py, &left, &left, "__init__", false, false, r.resolver());
+            let res = get_protocol_member_inner(
+                py,
+                &left,
+                &left,
+                "__init__",
+                false,
+                false,
+                false,
+                r.resolver(),
+            );
             assert!(matches!(res, Some(GetProtocolMemberResult::Defer)));
         });
     }
@@ -2737,8 +2828,92 @@ info.mro = [Cls()]
             let r = make_native(make_resolver_with_metaclass("mymod.Foo", "builtins.type"));
             let left = make_instance("mymod.Foo", vec![]);
             // lvalue needs setter / assignment paths -> defer.
-            let res = get_protocol_member_inner(py, &left, &left, "foo", false, true, r.resolver());
+            let res = get_protocol_member_inner(
+                py,
+                &left,
+                &left,
+                "foo",
+                false,
+                true,
+                false,
+                r.resolver(),
+            );
             assert!(matches!(res, Some(GetProtocolMemberResult::Defer)));
+        });
+    }
+
+    #[test]
+    fn test_get_protocol_member_find_member_metaclass_call_not_none() {
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|py| {
+            let r = make_native(make_resolver_with_metaclass(
+                "builtins.type",
+                "builtins.type",
+            ));
+            let left = make_instance("builtins.type", vec![]);
+            // Plain find_member semantics skip the metaclass-precise None
+            // special case (`type.__call__` exists); without a live map the
+            // lookup proceeds to the MRO walk and defers there instead.
+            let res = get_protocol_member_inner(
+                py,
+                &left,
+                &left,
+                "__call__",
+                false,
+                false,
+                true,
+                r.resolver(),
+            );
+            assert!(matches!(res, Some(GetProtocolMemberResult::Defer)));
+        });
+    }
+
+    #[test]
+    fn test_miss_decision_operator_extra_attrs_hit() {
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|py| {
+            let info = flat_info(py);
+            let r = TypeResolver::new();
+            let snap = mock_snapshot("mymod.Foo");
+            let mut attrs = std::collections::HashMap::new();
+            attrs.insert(
+                "attr".to_string(),
+                Type::Instance {
+                    type_ref: "builtins.int".to_string(),
+                    args: vec![],
+                    last_known_value: None,
+                    extra_attrs: None,
+                },
+            );
+            let left = Type::Instance {
+                type_ref: "mymod.Foo".to_string(),
+                args: vec![],
+                last_known_value: None,
+                extra_attrs: Some(crate::wire::ExtraAttrs {
+                    attrs,
+                    immutable: std::collections::HashSet::new(),
+                    mod_name: None,
+                }),
+            };
+            // find_member operator miss path: the extra_attrs hit returns
+            // the live attr type instead of None.
+            let res = member_miss_decision(
+                py,
+                info.as_ref(py),
+                "attr",
+                &snap,
+                &r,
+                &left,
+                &left,
+                true,
+                true,
+            );
+            match res {
+                Some(GetProtocolMemberResult::Found(Type::Instance { type_ref, .. })) => {
+                    assert_eq!(type_ref, "builtins.int");
+                }
+                other => panic!("expected Found(int), got {other:?}"),
+            }
         });
     }
 

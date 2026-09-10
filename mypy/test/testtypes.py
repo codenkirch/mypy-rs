@@ -54282,3 +54282,121 @@ class NativeCtorBlobGatesSuite(Suite):
         assert expandtype._native_expand_type_resolver is self._resolver
         assert maptype._native_map_active is True
         assert maptype._native_map_resolver is self._resolver
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeFindMemberCallFetchSuite(Suite):
+    """Engagement for the Instance-left / FunctionLike-right find_member fetch.
+
+    Issue #1491 (wave 55): the `visit_instance` FunctionLike arm runs
+    `find_member("__call__", left, left, is_operator=True)`. The fetch reused
+    the `get_protocol_member` helper, whose precise-metaclass special case
+    answers None and whose extra_attrs prelude defers, so receivers like
+    `builtins.type`, `types.FunctionType` and `functools.partial` fell back to
+    Python. The fetch now runs plain find_member semantics
+    (`find_member_semantics=True`): the member is read from the live MRO,
+    bound via `member_method_inner`, and compared against the right callable.
+    """
+
+    def setUp(self) -> None:
+        self.fx = TypeFixture()
+        self._live_info: dict[str, TypeInfo] = {}
+
+    def tearDown(self) -> None:
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        set_wire_typeinfo_map(None)
+
+    def _build_resolver(self) -> None:
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        type_infos = []
+        for name in dir(self.fx):
+            if not name.endswith("i"):
+                continue
+            value = getattr(self.fx, name)
+            if _is_type_info(value):
+                type_infos.append(value)
+        type_infos.extend(list(self._live_info.values()))
+        self.resolver = _type_kernel.build_native_resolver(type_infos, [])
+        self.resolver.set_live_typeinfo_map(dict(self._live_info))
+        set_wire_typeinfo_map(dict(self._live_info))
+
+    def _method_call(self, info: TypeInfo, ret: Type) -> CallableType:
+        any_t = AnyType(TypeOfAny.explicit)
+        return CallableType(
+            [Instance(info, []), any_t, any_t],
+            [ARG_POS, ARG_STAR, ARG_STAR2],
+            [None, None, None],
+            ret,
+            self.fx.function,
+        )
+
+    def _class_with_call(self, fullname: str, ret: Type) -> TypeInfo:
+        info = self.fx.make_type_info(fullname)
+        info.mro = [info, self.fx.oi]
+        node = FuncDef("__call__", [], None, None)
+        node.info = info
+        node.type = self._method_call(info, ret)
+        node.line = 1
+        node.column = 1
+        info.names["__call__"] = SymbolTableNode(MDEF, node)
+        self._live_info[fullname] = info
+        return info
+
+    def _seam_call(self, left: Type, right: Type) -> bool | None:
+        from mypy.subtypes import _serialize_type
+
+        return _type_kernel.rust_is_subtype(
+            _serialize_type(left),
+            _serialize_type(right),
+            False,
+            False,
+            False,
+            False,
+            False,
+            True,
+            False,
+            False,
+            self.resolver,
+        )
+
+    def test_instance_star_call_fetch_engages(self) -> None:
+        # `def __call__(self, *args: Any, **kwargs: Any) -> A` on the
+        # receiver: the fetched bound callable accepts `(A) -> A` natively.
+        self._live_info = {}
+        info = self._class_with_call("mod.StarCall", self.fx.a)
+        self._build_resolver()
+        right = self.fx.callable(self.fx.a, self.fx.a)
+        left = Instance(info, [])
+        from mypy.subtypes import _set_native_subtype_active
+
+        _set_native_subtype_active(False)
+        expected = is_subtype(left, right)
+        _set_native_subtype_active(True)
+        try:
+            assert is_subtype(left, right) == expected
+            assert self._seam_call(left, right) is True
+        finally:
+            _set_native_subtype_active(False)
+
+    def test_instance_call_incompatible_ret_false(self) -> None:
+        # `def __call__(self, *args: Any, **kwargs: Any) -> object` is not
+        # a subtype of `(A) -> A`: the native fetch decides False, not a
+        # deferral.
+        self._live_info = {}
+        info = self._class_with_call("mod.ObjCall", self.fx.o)
+        self._build_resolver()
+        right = self.fx.callable(self.fx.a, self.fx.a)
+        left = Instance(info, [])
+        from mypy.subtypes import _set_native_subtype_active
+
+        _set_native_subtype_active(False)
+        expected = is_subtype(left, right)
+        _set_native_subtype_active(True)
+        try:
+            assert is_subtype(left, right) == expected
+            assert not expected
+            assert self._seam_call(left, right) is False
+        finally:
+            _set_native_subtype_active(False)

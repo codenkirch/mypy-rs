@@ -114,28 +114,30 @@ pub(crate) fn is_protocol_implementation_inner(
         // Python (subtypes.py:1906-1909): subtype = get_protocol_member(left,
         // original_left, ...); supertype = find_member(member, right, original_left).
         // self_type is original_left on both (left for instance; tuple fallback).
-        let sub =
-            match get_protocol_member_inner(py, left, self_type, member, false, false, resolver) {
-                Some(GetProtocolMemberResult::Found(t)) => Some(t),
-                Some(GetProtocolMemberResult::NoneVal) => None,
-                Some(GetProtocolMemberResult::Defer) => {
-                    return None;
-                }
-                None => {
-                    return None;
-                }
-            };
-        let sup =
-            match get_protocol_member_inner(py, right, self_type, member, false, false, resolver) {
-                Some(GetProtocolMemberResult::Found(t)) => Some(t),
-                Some(GetProtocolMemberResult::NoneVal) => None,
-                Some(GetProtocolMemberResult::Defer) => {
-                    return None;
-                }
-                None => {
-                    return None;
-                }
-            };
+        let sub = match get_protocol_member_inner(
+            py, left, self_type, member, false, false, false, resolver,
+        ) {
+            Some(GetProtocolMemberResult::Found(t)) => Some(t),
+            Some(GetProtocolMemberResult::NoneVal) => None,
+            Some(GetProtocolMemberResult::Defer) => {
+                return None;
+            }
+            None => {
+                return None;
+            }
+        };
+        let sup = match get_protocol_member_inner(
+            py, right, self_type, member, false, false, false, resolver,
+        ) {
+            Some(GetProtocolMemberResult::Found(t)) => Some(t),
+            Some(GetProtocolMemberResult::NoneVal) => None,
+            Some(GetProtocolMemberResult::Defer) => {
+                return None;
+            }
+            None => {
+                return None;
+            }
+        };
         // Missing member on either side: not an implementation.
         let (sub, sup) = match (sub, sup) {
             (Some(s), Some(p)) => (s, p),

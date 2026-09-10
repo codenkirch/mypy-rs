@@ -3029,6 +3029,51 @@ including:
   - `call-unpack` 1: a callable signature carrying a bare UnpackType
     var-arg (expandtype.py:482-488 `interpolate_args_for_unpack`, a
     documented not-ported branch); single cold-self-check hit.
+- st callable-compat wall: find_member fetch + Unpack arm + arg merge
+  (wave 55, issue #1491) — the wave-47 standing floor. Env-gated
+  leaf-reason audit (`MYPY_TK_W55RUST_AUDIT`, instrumented cold
+  self-check at `-n0 --no-incremental`, stripped before landing; tree
+  verified clean) ranked the `rust_is_subtype` embedded defers 112 ->
+  **61** events (-51, -45.5%). Landed ports:
+  - Instance-left / FunctionLike-right `find_member("__call__", left,
+    left, is_operator=True)` now runs plain find_member semantics in
+    `get_protocol_member_inner` (`find_member_semantics=true`): the
+    precise-metaclass NoneVal and the extra_attrs prelude defer are
+    skipped on this path, `member_miss_decision` mirrors the operator
+    miss tail (no accessor scan; fallback_to_any Any; extra_attrs hit;
+    else None), and the caller maps NoneVal to `Some(false)`. Retired
+    the 31 `I(builtins.type|types.FunctionType|types.BuiltinFunctionType|
+    functools.partial) -> CallableTypen` fetch defers.
+  - `visit_unpack_type` (subtypes.py:1416-1422) ported: Unpack-vs-Unpack
+    recurses on targets, builtins.object accepts, else False. Retired
+    the `UnpackType -> I(builtins.int)` and tuple-item defers (the
+    variadic helper's fixed-length fallthrough now decides).
+  - `callable_corresponding_argument` merge subset
+    (typeops.py:1190-1201): the optional pos-only/name-only merge gate
+    is answered with a resolver-free `meet_types` subset (identical
+    proper types via `py_type_eq`, Any absorbs, Uninhabited bottom);
+    the non-merge gate answers by_name. Retired the 9
+    `CallableTypen -> CallableTypen` `apc-corr-merge` defers and the
+    adjacent join var-arg defer (SameS natively).
+  - `APPLY_REPORTED` thread-local (applytype.rs) + `unify.rs` mapping:
+    `get_target_type`'s `skip_unsatisfied=false` report arms are
+    Python's `had_errors -> unify None -> is_callable_compatible False`
+    verdict, now answered NoUnify instead of deferring. Retired the 13
+    `ud-target-report-{bound,values}` events.
+  - Remaining floors (61 = 19 serfail + 42 kernel): 18 `uds-var-unsafe`
+    (the named owned/meta-tvar wire-identity wall, solve.rs
+    `wire_unsafe_reason` on the solved target — needs the fuller
+    owned-tvar/extra_tvars channel); 10 `cbd-expand-other` (ctor-blob
+    expansion of `type[X]` callables outside the snapshot/alias
+    buckets); 9 `ud-infer-args` (constraints engine
+    `infer_constraints_full_inner`); 3 `pip-sub-fetch`/`gpm-method-none`
+    (protocol member method binding); 1 `cb-proto-typeobj` (type-object
+    `is_protocol_implementation(class_obj)`); 1 `ud-tvar-clash`
+    (freshening); 19 serfail (Union operands raising in
+    `_serialize_type` before the FFI). Gates: cargo 2736/11, testtypes
+    3279/6-skips (+2 NativeFindMemberCallFetchSuite), testcheck
+    8198/15/7 exact, cold self-check clean 347; clippy -D warnings +
+    fmt clean.
 
 ## Pull Requests
 
