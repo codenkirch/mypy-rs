@@ -280,6 +280,39 @@ def _deserialize_type(data: bytes) -> ProperType | None:
     return fixed
 
 
+def _deserialize_type_with_aliases(data: bytes) -> ProperType | None:
+    """Alias-resolving decode for seams whose result may keep alias nodes.
+
+    The Rust composites mirror the pure-Python expand/bind path, which
+    preserves live `TypeAliasType` nodes; `_deserialize_type` defers on
+    every decoded alias (`resolve_aliases=False`). This retry re-links
+    decoded aliases through the per-build alias map, the contract the
+    `map_type_from_supertype` shim (#1309) and the expand-family seams
+    (#1224) already use. Callers must run the identity-repair tail
+    (`resync_var_identities` / `canonicalize_fresh_vars`), which the
+    callers of this helper do.
+
+    Deliberately uncached: alias-bearing decoded trees may share fresh
+    TypeVar objects across occurrences (#1180/#1198), and a later caller
+    freezing an object in place must not leak into callers of the same
+    blob. Also clears the process-global primitive decode singletons
+    after `read_type` (same NOT_READY hygiene as `_deserialize_type`).
+    """
+    from mypy.types import instance_cache
+    from mypy.wirefixup import canonicalize_fresh_vars, fixup_wire_type
+
+    decoded = _read_type(_ReadBuffer(data))
+    instance_cache.int_type = None
+    instance_cache.str_type = None
+    instance_cache.bool_type = None
+    instance_cache.object_type = None
+    instance_cache.function_type = None
+    fixed = fixup_wire_type(decoded, resolve_aliases=True)
+    if fixed is None:
+        return None
+    return cast(ProperType, canonicalize_fresh_vars(fixed))
+
+
 def _deserialize_type_list(data: bytes) -> list[Type] | None:
     """Deserialize wire bytes to a list of Types, fixing type_ref strings.
 
@@ -675,6 +708,11 @@ def type_object_type_from_function(
             )
             if result is not None:
                 decoded = _deserialize_type(bytes(result))
+                if decoded is None:
+                    # The composite preserves alias nodes (Python's bind/map
+                    # do too), so a signature carrying a type alias decodes
+                    # only through the alias map. Retry once before deferring.
+                    decoded = _deserialize_type_with_aliases(bytes(result))
                 if decoded is not None and isinstance(decoded, FunctionLike):
                     # Expansion may leave leftover TypeVars; re-link their
                     # identities to the live originals. A resync defer (None)
