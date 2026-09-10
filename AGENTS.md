@@ -3144,6 +3144,30 @@ including:
     node, not just `str`) by `NativeTypeObjectAliasDecodeSuite` in
     `mypy/test/testtypes.py`.
 
+- astdiff type-snapshot builder, B7 slice 1 (wave 57, issue #1497):
+  new `rust_snapshot_type(typ)` pyfunction
+  (`crates/type_kernel/src/astdiff_snapshot.rs`) mirrors
+  `SnapshotTypeVisitor` (astdiff.py:389-557) for every non-generic arm:
+  simple types, UnboundType, Instance (lkv + extra_attrs), TypeVarType,
+  ParamSpecType, TypeVarTupleType, UnpackType, Parameters,
+  CallableType, TupleType, TypedDictType, LiteralType, UnionType,
+  Overloaded, TypeType, TypeAliasType. Order-sensitive arms call
+  Python's own `set`/`sorted` on the constructed tuples (union
+  dedup+sort, extra_attrs pairs, TypedDict required/readonly) so the
+  snapshot stays byte-for-byte the Python one. `snapshot_type` routes
+  through the seam when `_native_astdiff_active`; deferrals (`None`)
+  are generic `CallableType` (`normalize_callable_variables` needs
+  `expand_type`), `PartialType` (Python raises RuntimeError,
+  unchanged), a `TypeAliasType` without alias, unhandled kinds, and
+  `PyAttributeError` only (#1466/#1468 contract). Measured on the
+  fine-grained corpus (env-gated audit, stripped before landing):
+  testfinegrained 75,713 calls @ 98.3% native (1,263 defers, 100%
+  generic-callable); testfinegrainedcache 31,120 @ 98.05% (607, all
+  generic-callable); testdaemon 631 @ 100%. Gates: cargo 2,736/11,
+  testtypes 3,291/6 (+9 `NativeAstdiffSnapshotSuite`), testcheck
+  8,198/15/7 exact, fine-grained 747/27, daemon 37, finegrainedcache
+  549/229, cold self-check clean 347.
+
 ## Pull Requests
 
 The default branch on this fork is `main` (not `master`). Always target

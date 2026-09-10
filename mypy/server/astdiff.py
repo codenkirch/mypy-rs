@@ -108,11 +108,13 @@ from mypy.util import get_prefix
 try:
     from type_kernel import (
         rust_compare_symbol_table_snapshots as _rust_compare_symbol_table_snapshots,
+        rust_snapshot_type as _rust_snapshot_type,
     )
 
     _HAS_TYPE_KERNEL = True
 except ImportError:
     _rust_compare_symbol_table_snapshots = None  # type: ignore[assignment]
+    _rust_snapshot_type = None  # type: ignore[assignment]
     _HAS_TYPE_KERNEL = False
 
 _native_astdiff_active: bool = False
@@ -335,14 +337,9 @@ def snapshot_definition(node: SymbolNode | None, common: SymbolSnapshot) -> Symb
             snapshot_optional_type(node.tuple_type),
             snapshot_optional_type(node.typeddict_type),
             [base.fullname for base in node.mro],
-            # Note that the structure of type variables is a part of the external interface,
-            # since creating instances might fail, for example:
-            #     T = TypeVar('T', bound=int)
-            #     class C(Generic[T]):
-            #         ...
-            #     x: C[str] <- this is invalid, and needs to be re-checked if `T` changes.
-            # An alternative would be to create both deps: <...> -> C, and <...> -> <C>,
-            # but this currently seems a bit ad hoc.
+            # Type variable structure is part of the external interface:
+            # `C[str]` may become invalid when `T`'s bound changes, so
+            # tvars are snapshotted even though they look internal.
             tuple(snapshot_type(tdef) for tdef in node.defn.type_vars),
             [snapshot_type(base) for base in node.bases],
             [snapshot_type(p) for p in node._promote],
@@ -361,6 +358,11 @@ def snapshot_definition(node: SymbolNode | None, common: SymbolSnapshot) -> Symb
 
 def snapshot_type(typ: Type) -> SnapshotItem:
     """Create a snapshot representation of a type using nested tuples."""
+    # B7 slice 1 (#1497): native builder; `None` defers to the visitor.
+    if _HAS_TYPE_KERNEL and _native_astdiff_active:
+        native = _rust_snapshot_type(typ)
+        if native is not None:
+            return native
     return typ.accept(SnapshotTypeVisitor())
 
 
