@@ -1,48 +1,55 @@
 # Handoff: strangler-fig Rust migration loop (seam-deferral reduction)
 
-*Written 2026-08-28, refreshed 2026-09-10 (post-wave55: waves 52-55
+*Written 2026-08-28, refreshed 2026-09-10 (post-wave57: waves 52-57
 landed the st find_member/unpack/apply-report ports (#1492, embedded
-112 -> 61, -45.5%), the icf SUBTYPE_OF protocol-actual structural arm
-(#1487), the plugin-synthesized TypeInfo registrar (#1489), the
-ctor-blob gate clearing (#1488), and two docs-only negative closes
-(B6 render bundle #1481; maptype timing-gap residual #1494 - 5 events
-left, on-demand sealing rejected on PEP 695 variance finality; the
-function-local wire-ref gap surfaced by that audit is filed as #1493)).
-Goal: "migrate all python code to rust, really all", pursued as the
-established measure -> file -> dispatch-agents -> process-PRs -> gate
-loop. This file is the resume point.*
+112 -> 61), the icf SUBTYPE_OF protocol-actual arm (#1487), the
+plugin-synthesized TypeInfo registrar (#1489), the ctor-blob gate
+clearing (#1488), the alias-aware typeobj decode (#1496, decode_None
+60 -> 0), and the astdiff type-snapshot builder port (#1498, 98%+
+native on the fine-grained corpora); two docs-only negative closes
+also landed (B6 render bundle #1481; maptype timing-gap #1494 - the
+#1493 audit that followed disproved its own hypothesis and landed the
+alias-decode fix #1496 instead). Goal: "migrate all python code to
+rust, really all", pursued as the established measure -> file ->
+dispatch-agents -> process-PRs -> gate loop. This file is the resume
+point.*
 
-## Where main stands (2026-09-10, post-wave55)
+## Where main stands (2026-09-10, post-wave57)
 
-- `main` = `5a5038ad2` (docs `#1494`, #1490) on top of `83f0b6706`
-  (`#1492`, #1491), `f5364c7ba` (`#1488`, #1484), `e4af2dc26` (`#1489`,
-  #1485) and `201b2831e` (`#1487`, #1482); local ff'd to origin.
+- `main` = `e7205b87e` (astdiff type-snapshot builder, `#1498`) on top
+  of `89f161b91` (`#1496`, #1493), `fc9892ab4` (`#1495`) and
+  `5a5038ad2` (`#1494`, #1490); local ff'd to origin.
 - Phase state: unchanged since the wave-51 refresh (F0 audit + F1
   dual-write mirror + F2 read flip landed; F3 write flip has Instance +
-  CallableType splice ops; the tvar/union splice slice profiled EMPTY
-  with `misc/f3s9_tvar_union.py` - not built).
-- Gates on the merged head `5a5038ad2`: cargo 2,736/11 ignored (wave-55
-  port +13 units); testtypes 3,279/6 skipped (kernel ON); testcheck
-  8,198/15/7 exact; cold self-check clean (347 files); pr-gate +
-  parity + parity-typeops green on #1492; OCR local review clean after
-  the tearDown advisory fix (`1daf86a84`).
-- Shared `.so` unchanged since the 2026-09-08 rebuild (wave 55 touched
-  no Rust); `/private/tmp/mypy-rs-local-typekernel` still valid.
-- Survey: the wave-55 `#1491` port moved the st embedded defer count
-  112 -> 61 (-45.5%, 31 find_member fetch + 9
-  callable_corresponding_argument + 13 apply-report + 4 unpack/tuple).
-  Residual st floors: 19 serfail + 42 kernel (18 `uds-var-unsafe`
-  owned/meta-tvar wire identity, 10 `cbd-expand-other`, 9
-  `ud-infer-args`, 3 protocol member binding, 1 `cb-proto-typeobj`,
-  1 `ud-tvar-clash`). C1/C2/ama/ct/roc wrapper classes stay at or near
-  100% (unchanged).
+  CallableType splice ops; the tvar/union splice slice profiled EMPTY -
+  not built).
+- Gates on the merged head `e7205b87e`: cargo 2,736/11 ignored; testtypes
+  3,291/6 skipped (kernel ON); testcheck 8,198/15/7 exact; cold
+  self-check clean (347 files); pr-gate + parity + parity-typeops green
+  on #1492/#1496/#1498; local OCR clean on all three.
+- Shared `.so` rebuilt 2026-09-10 at the merged head content (wave-57
+  Rust, codesigned, includes `rust_snapshot_type`);
+  `/private/tmp/mypy-rs-local-typekernel`.
+- Wave-56: the alias-aware typeobj decode retry
+  (`_deserialize_type_with_aliases`, the #1224/#1309 contract) retired
+  all 60 cold-self-check `decode_None` events; the wave-55 "missing
+  TypeInfo" attribution was a module-global probe artifact - the real
+  cause is alias-bearing composites; 32 `kernel_none` unchanged.
+- Wave-57: astdiff `snapshot_type` ported to `rust_snapshot_type`
+  (`crates/type_kernel/src/astdiff_snapshot.rs`); testfinegrained
+  75,713 calls @ 98.3% (1,263 defers), testfinegrainedcache 31,120 @
+  98.05% (607), testdaemon 631 @ 100%. All defers are generic
+  `CallableType` (`normalize_callable_variables` needs
+  `expand_type`/`strict_optional_set`) - the designed wall; slice 2
+  (`snapshot_symbol_table`/`snapshot_definition`/`snapshot_untyped_signature`)
+  remains Python.
 - Runner note unchanged: the repo runner cannot re-register (403,
   admin-blocked; #1249 open); GH `ocr-review` jobs stay `queued`
   forever. The operative review gate is the local
   `ocr review --from origin/main --to <branch> --audience agent`,
   then `gh pr merge --squash --admin` after pr-gate + parity green.
 
-## Waves 33-55 (since the 2026-08-31 refresh)
+## Waves 33-57 (since the 2026-08-31 refresh)
 
 | PR | Issue | What | Numbers |
 |----|-------|------|---------|
@@ -81,6 +88,8 @@ loop. This file is the resume point.*
 | #1489 | #1485 | wave54: register plugin-synthesized TypeInfos (`make_fake_register_class_instance`) via the #1456 registrar | `functools._SingleDispatchRegisterCallable` class closed; testtypes +7 |
 | #1492 | #1491 | wave55: st find_member fetch semantics (`find_member_semantics=true`), `visit_unpack_type`, `callable_corresponding_argument` meet subset, `APPLY_REPORTED` channel; local OCR advisory (test tearDown wire-map leak) fixed in `1daf86a84` | st embedded 112 -> 61 (-45.5%); cargo 2,736/11 (+13); testtypes 3,279/6; testcheck 8,198/15/7 exact; self-check clean 347 |
 | #1494 | #1490 | wave55: maptype timing-gap residual audit - documented floor (5 events; on-demand sealing rejected: mid-SCC PEP 695 variance finality, 4-test regression) | docs-only; function-local wire-ref gap filed #1493 |
+| #1496 | #1493 | wave56: alias-aware typeobj decode retry (`_deserialize_type_with_aliases`, #1224/#1309 contract) - the #1493 hypothesis (missing/local TypeInfos) was disproven by a per-fixer probe; the real cause was alias-bearing composites | `decode_None` 60 -> 0 (32 `kernel_none` unchanged); testtypes 3,282/6 (+3 NativeTypeObjectAliasDecodeSuite); testcheck 8,198/15/7 exact; self-check clean |
+| #1498 | #1497 | wave57: astdiff type-snapshot builder port (`rust_snapshot_type`, new `astdiff_snapshot.rs` ~630 lines; order-sensitive arms call Python `set`/`sorted`; generic-Callable/Partial defer) | testfinegrained 75,713 @ 98.3% (1,263 defers, 100% generic CallableType), finegrainedcache 31,120 @ 98.05%, daemon 631 @ 100%; cargo 2,736/11; testtypes 3,291/6 (+9 NativeAstdiffSnapshotSuite); testcheck exact; self-check clean |
 
 Closed alongside: #1412, #1393 (F2 complete), #1397 (F3 partial,
 Instance/CallableType only), #1300, #1418 (closed 2026-09-05 with the
@@ -103,20 +112,22 @@ hand), #1458, #1460, #1464 (#1465 auto-closed it), #1465,
 (#1487 auto-closed it), #1483 (#1486 auto-closed it), #1484 (#1488
 auto-closed it), #1485 (#1489 auto-closed it), #1490 (#1494
 auto-closed it), #1491 (#1492 auto-closed it), #1432 (unify.rs
-PolyModeGuard prev-restore + boolean labels, `dc1da15a4`).
+PolyModeGuard prev-restore + boolean labels, `dc1da15a4`), #1493
+(#1496 auto-closed it), #1497 (#1498 auto-closed it).
 
 ## Open backlog (next waves; dispatch max ~2 port agents)
 
-1. **#1493**: function-local (`Name@line`) TypeInfos absent from the
-   per-build wire map - 60 typeobj composite `decode_None`
-   fall-throughs found by the #1490 audit. Needs a creation-site
-   registrar (semanal/checker class-analysis funnel, with the #1456
-   finality discipline) or a serialization pre-gate; do not just
-   widen `_collect_incremental` to walk local scopes.
-2. **#624**: meta Phase E1. Concrete slices: B6 errors render-bundle
-   port (the 4 deleted seams get re-created against a live call
-   contract, #1459/#1479 decisions), B1/B3 (build-cache front), B7
-   (astdiff); semanal candidates opt-in only.
+1. **#624 (B7 slice 2)**: port `snapshot_symbol_table` /
+   `snapshot_definition` / `snapshot_untyped_signature`
+   (`mypy/server/astdiff.py`) behind the same `_native_astdiff_active`
+   gate; slice 1 (`snapshot_type`) is native with a
+   generic-Callable-only defer wall. File the scoped issue when
+   starting.
+2. **#624 (other slices)**: B6 errors render-bundle port (the 4 deleted
+   seams get re-created against a live call contract, #1459/#1479
+   decisions), B1/B3 (build-cache front); semanal candidates opt-in
+   only (`MYPY_ENABLE_NATIVE_SEMANAL`, perf-negative until the
+   serialize cost is cut).
 3. **#1249**: runner 403 - needs admin, skip until credentials change.
 
 Standing audited floors (do NOT re-audit blind; the mechanism that
@@ -128,7 +139,7 @@ sgc 253 (icf 173 / apply_generic 69 / solve_defer 7 / multi_lower 4);
 ct 29; ifta var_pspec_tvt 80 / engine 47 / solve 5; dc-final-overlap
 67 (overlap kernel); join lkv wall 39; ama 120 contract floor; maptype
 timing-gap 5 (documented #1490 floor). Bucket tables in AGENTS.md
-(wave-47/48a/48b/49/53/55 entries) - do not re-derive.
+(wave-47/48a/48b/49/53/55/56/57 entries) - do not re-derive.
 
 ## Older session record
 
