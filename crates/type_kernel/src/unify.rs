@@ -328,6 +328,34 @@ mod tests {
         assert_eq!(outcome, UnifyOutcome::NoUnify);
     }
 
+    fn tvar_bound(raw_id: i64, bound: &str) -> Type {
+        let mut t = tvar(raw_id);
+        if let Type::TypeVarType { upper_bound, .. } = &mut t {
+            *upper_bound = Box::new(instance(bound, vec![]));
+        }
+        t
+    }
+
+    #[test]
+    fn test_unify_report_flag_drives_no_unify() {
+        // T's bound is a.A, the solved target is a.B (not a subtype): the
+        // apply bound check hits Python's report callback, so the caller
+        // answers False (NoUnify), never a deferral.
+        let left = callable_with(
+            vec![tvar_bound(1, "a.A")],
+            vec![tvar(1)],
+            instance("a.B", vec![]),
+        );
+        let right = callable_with(
+            vec![],
+            vec![instance("a.B", vec![])],
+            instance("a.B", vec![]),
+        );
+        let r = resolver_with(&["a.A", "a.B", "builtins.function", "builtins.object"]);
+        let outcome = unify_generic_callable_core(&left, &right, false, true, &r, &empty_aliases());
+        assert_eq!(outcome, UnifyOutcome::NoUnify);
+    }
+
     #[test]
     fn test_unify_unified_substitutes_right_actuals() {
         // T's single constraint points at builtins.int: unified left gets
@@ -358,9 +386,8 @@ mod tests {
     #[test]
     fn test_unify_generic_right_arg_frame_unifies() {
         // The wave-37 no_extra_tvar_shape gate deferred every pair whose
-        // right callable declared its own type variables, even when the
-        // tree was clean. With the extras channel (#1427) the generic arg
-        // frame decides: T is constrained by str and substituted.
+        // right callable declared its own type variables; the extras
+        // channel (#1427) now decides: T is constrained by str and substituted.
         let left = callable_with(
             vec![tvar(5)],
             vec![tvar(5)],
@@ -391,9 +418,8 @@ mod tests {
 
     #[test]
     fn test_unify_ret_frame_extras_end_to_end() {
-        // ignore_return=false: the nested generic arg frame enters
-        // callable-vs-callable with the ambient reverse gate live, whose
-        // reverse inference attaches right's own variables as extras; the
+        // ignore_return=false: the ambient reverse gate attaches right's
+        // own variables as extras in the nested generic arg frame; the
         // unified result still substitutes the inner arg.
         let left = callable_with(
             vec![tvar(5)],
@@ -445,7 +471,9 @@ mod tests {
 /// Defers (`Defer`) where Python's freshening would be needed (a
 /// type-variable clash between `left`'s variables and `target`'s tree,
 /// 1/236 measured) or where any kernel step cannot decide; the Python
-/// fallback reproduces the call.
+/// fallback reproduces the call. The reverse-inference gate installs
+/// Known(true); under old_type_inference the kernel may infer where
+/// Python defers back, an argc-unify-only accepted divergence.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn unify_generic_callable_core(
     left: &Type,
@@ -460,12 +488,8 @@ pub(crate) fn unify_generic_callable_core(
     };
 
     // The polymorphic reverse-inference gate (constraints.py:1712/1768)
-    // reads the ambient `type_state.infer_polymorphic`, True for ordinary
-    // checking (checkexpr.py:1325). Installing Known(true) is faithful for
-    // the production callers; under old_type_inference=True (ambient False)
-    // the kernel may infer where Python defers back to unify_generic_
-    // callable, which is argc-unify-only and cannot change a subtype
-    // verdict (accepted divergence, see PR notes).
+    // reads ambient `type_state.infer_polymorphic`; Known(true) is faithful
+    // for production callers (the divergence is argc-unify-only).
     let _poly = crate::constraints::PolyModeGuard::install(true);
 
     // subtypes.py:2966-2969: freshen when `type.type_var_ids()` clashes with
@@ -571,12 +595,10 @@ pub(crate) fn unify_generic_callable_core(
     }
     let orig_types: Vec<Option<Type>> = solutions.into_iter().flatten().map(Some).collect();
 
-    // subtypes.py:3006-3010: `apply_generic_arguments(type, solutions,
-    // report, context=target)`. `skip_unsatisfied=False`.
-
-    // The kernel apply has no report channel: a `None` there conflates the
-    // `had_errors` verdict with an undecided shape, so it defers and the
-    // Python fallback reproduces the `had_errors -> None -> False` tail.
+    // subtypes.py:3006-3010: `apply_generic_arguments(..., report, ...)`
+    // with `skip_unsatisfied=False`. The report flag separates Python's
+    // `had_errors` -> False verdict from a genuine undecided shape.
+    crate::applytype::clear_apply_reported();
     match crate::applytype::apply_generic_arguments_inner(
         left,
         &orig_types,
@@ -586,6 +608,12 @@ pub(crate) fn unify_generic_callable_core(
         aliases,
     ) {
         Some(t) => UnifyOutcome::Unified(t),
-        None => UnifyOutcome::Defer,
+        None => {
+            if crate::applytype::take_apply_reported() {
+                UnifyOutcome::NoUnify
+            } else {
+                UnifyOutcome::Defer
+            }
+        }
     }
 }

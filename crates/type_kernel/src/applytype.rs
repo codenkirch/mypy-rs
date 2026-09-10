@@ -86,6 +86,28 @@ pub(crate) fn rust_apply_generic_arguments(
     encode_type(&result)
 }
 
+thread_local! {
+    /// Set when `get_target_type` hits the `skip_unsatisfied=false`
+    /// unsatisfied-bound / no-match report arm. In `unify_generic_callable`
+    /// Python's report callback sets `had_errors`, which turns the whole
+    /// unify into None; the caller maps that to a decided False.
+    static APPLY_REPORTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Reset the report flag before an apply driven by `unify_generic_callable`.
+pub(crate) fn clear_apply_reported() {
+    APPLY_REPORTED.with(|c| c.set(false));
+}
+
+/// Consume the report flag (true = Python's report callback fired).
+pub(crate) fn take_apply_reported() -> bool {
+    APPLY_REPORTED.with(|c| c.replace(false))
+}
+
+fn note_apply_report() {
+    APPLY_REPORTED.with(|c| c.set(true));
+}
+
 /// Core logic for `apply_generic_arguments`. Mirrors applytype.py:88-193.
 ///
 /// `r` drives the subtype checks; `aliases` expands alias upper bounds
@@ -336,6 +358,7 @@ fn get_target_type(
                             Some(None)
                         } else {
                             // Must report error via callback. Defer.
+                            note_apply_report();
                             None
                         }
                     }
@@ -413,6 +436,7 @@ fn get_target_type_with_values(
             Some(None)
         } else {
             // Must report error. Defer.
+            note_apply_report();
             None
         }
     }

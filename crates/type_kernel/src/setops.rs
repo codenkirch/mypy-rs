@@ -10873,10 +10873,10 @@ mod tests {
             assert_eq!(is_subtype(&c3, &c2, &cc, &r), Some(true));
             assert_eq!(join_types(&c2, &c3, &cc, &r), Some(SetOpResult::SameS));
 
-            // The var-arg pair still defers to the Python fallback (the
-            // kernel does not model the is_var_arg swap branch); Python
-            // answers `def (Any, a: Any =) -> Any` there, i.e. SameS.
-            assert_eq!(join_types(&c2, &cv, &cc, &r), None);
+            // Wave 55: the var-arg pair now joins natively. The
+            // `callable_corresponding_argument` merge subset answers the
+            // `*args`/`**kwargs` merge, so Python's answer (SameS) holds.
+            assert_eq!(join_types(&c2, &cv, &cc, &r), Some(SetOpResult::SameS));
         }
 
         // --- wave33: alias-aware join / union-flatten entry ---

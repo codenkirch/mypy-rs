@@ -321,13 +321,11 @@ pub(crate) fn callable_fields(t: &Type) -> Option<CallableFields<'_>> {
     }
 }
 
-/// `mypy.typeops.callable_corresponding_argument` (typeops.py:635-669).
-/// Returns `None` both for "no corresponding arg" and — via the exact merge
-/// case — "Rust cannot resolve the by-name/by-pos disagreement". The caller
-/// (Phase 1b) treats a `None` as "no corresponding argument", so to distinguish
-/// deferral we signal through a sentinel: `Deferred` is only produced by the
-/// merge case, and `None` remains "no arg". The Python code returns the merged
-/// `meet_types` arg there; it defers until meet_types support lands.
+/// `mypy.typeops.callable_corresponding_argument` (typeops.py:1170-1204).
+/// `Err(Defer)` marks the one remaining undecidable merge: a `meet_types`
+/// call outside the resolver-free subset (identical proper types, Any,
+/// Uninhabited). Python returns by_name whenever the merge gate does not
+/// hold, so that arm is answered directly.
 pub(crate) fn callable_corresponding_argument(
     arg_types: &[Type],
     arg_kinds: &[i64],
@@ -345,13 +343,38 @@ pub(crate) fn callable_corresponding_argument(
         (None, None) => Ok(None),
         (Some(a), Some(b)) if a == b => Ok(Some(a.clone())),
         (Some(a), Some(b)) => {
-            // Distinct by-name and by-pos: Python merges only when both are
-            // optional, by_name pos-only, by_pos name-only, and neither typ is
-            // an UnpackType. The merged type is `meet_types(by_name.typ,
-
-            // by_pos.typ)` — unreconstructible from `SetOpResult`, so defer.
-            let _ = (a, b);
-            Err(Defer)
+            if !a.required
+                && !b.required
+                && b.name.is_none()
+                && a.pos.is_none()
+                && !matches!(a.typ, Type::UnpackType { .. })
+                && !matches!(b.typ, Type::UnpackType { .. })
+            {
+                // typeops.py:1190-1201: meet_types(by_name.typ, by_pos.typ)
+                // over the resolver-free subset (identical types, Any,
+                // Uninhabited); anything else defers to Python.
+                let typ = if matches!(a.typ, Type::UninhabitedType { .. }) {
+                    a.typ.clone()
+                } else if matches!(b.typ, Type::UninhabitedType { .. })
+                    || matches!(a.typ, Type::AnyType { .. })
+                {
+                    b.typ.clone()
+                } else if matches!(b.typ, Type::AnyType { .. })
+                    || crate::wire::py_type_eq(&a.typ, &b.typ)
+                {
+                    a.typ.clone()
+                } else {
+                    return Err(Defer);
+                };
+                Ok(Some(FormalArgument {
+                    name: a.name.clone(),
+                    pos: b.pos,
+                    typ,
+                    required: false,
+                }))
+            } else {
+                Ok(Some(a.clone()))
+            }
         }
         (Some(a), None) => Ok(Some(a.clone())),
         (None, Some(b)) => Ok(Some(b.clone())),
@@ -1336,5 +1359,70 @@ mod tests {
             &[int.clone(), any_type(), any_type()],
             &[ARG_POS, ARG_STAR, ARG_STAR2]
         ));
+    }
+
+    fn formal(name: Option<&str>, pos: Option<usize>, typ: Type, required: bool) -> FormalArgument {
+        FormalArgument {
+            name: name.map(|n| n.to_string()),
+            pos,
+            typ,
+            required,
+        }
+    }
+
+    #[test]
+    fn corresponding_argument_merges_any_star_pair() {
+        // `def (*args: Any, **kwargs: Any)` against a model arg: by_pos
+        // comes from `*args`, by_name from `**kwargs`; the optional
+        // pos-only/name-only pair merges through the resolver-free meet.
+        let arg_types = vec![any_type(), any_type()];
+        let arg_kinds = [ARG_STAR, ARG_STAR2];
+        let arg_names: Vec<Option<String>> = vec![None, None];
+        let model = formal(Some("x"), Some(0), class_type("int"), false);
+        let got = callable_corresponding_argument(&arg_types, &arg_kinds, &arg_names, &model);
+        match got {
+            Ok(Some(a)) => {
+                assert_eq!(a.name.as_deref(), Some("x"));
+                assert_eq!(a.pos, Some(0));
+                assert!(matches!(a.typ, Type::AnyType { .. }));
+                assert!(!a.required);
+            }
+            other => panic!("expected merged Any arg, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn corresponding_argument_non_merge_returns_by_name() {
+        // `def (z: int, x: int)` against a model at position 0 named "x":
+        // by_name is optional (ARG_NAMED) and by_pos is required, so the
+        // merge gate fails and Python returns by_name.
+        let int = class_type("int");
+        let arg_types = vec![int.clone(), int.clone()];
+        let arg_kinds = [ARG_POS, ARG_NAMED];
+        let arg_names = vec![Some("z".to_string()), Some("x".to_string())];
+        let model = formal(Some("x"), Some(0), class_type("str"), false);
+        let got = callable_corresponding_argument(&arg_types, &arg_kinds, &arg_names, &model);
+        match got {
+            Ok(Some(a)) => {
+                assert_eq!(a.name.as_deref(), Some("x"));
+                assert_eq!(a.pos, None);
+                assert!(
+                    matches!(a.typ, Type::Instance { ref type_ref, .. } if type_ref == "builtins.int")
+                );
+            }
+            other => panic!("expected by_name int arg, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn corresponding_argument_defers_on_unrelated_merge() {
+        // Same merge gate but unrelated concrete types: meet_types is
+        // outside the resolver-free subset, so the caller falls back.
+        let arg_types = vec![class_type("int"), class_type("str")];
+        let arg_kinds = [ARG_STAR, ARG_STAR2];
+        let arg_names: Vec<Option<String>> = vec![None, None];
+        let model = formal(Some("x"), Some(0), any_type(), false);
+        let got = callable_corresponding_argument(&arg_types, &arg_kinds, &arg_names, &model);
+        assert!(matches!(got, Err(Defer)));
     }
 }

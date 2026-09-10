@@ -71,9 +71,8 @@ pub(crate) struct Constraint {
 }
 
 // Python `Constraint.__eq__` compares exactly (type_var, op, target)
-// (constraints.py:608-611): `extra_tvars` must stay out of equality or the
-// remove-set filters in solve would diverge whenever a constraint happens
-// to carry extras.
+// (constraints.py:608-611): `extra_tvars` must stay out of equality or
+// the solve remove-set filters would diverge on extras carriers.
 impl PartialEq for Constraint {
     fn eq(&self, other: &Self) -> bool {
         self.origin_type_var == other.origin_type_var
@@ -1299,7 +1298,7 @@ fn infer_constraints_from_protocol_members_native(
             return None;
         }
         let inst = match get_protocol_member_inner(
-            py, instance, subtype, member, class_obj, false, resolver,
+            py, instance, subtype, member, class_obj, false, false, resolver,
         ) {
             Some(GetProtocolMemberResult::Found(t)) => Some(t),
             Some(GetProtocolMemberResult::NoneVal) => None,
@@ -1309,7 +1308,7 @@ fn infer_constraints_from_protocol_members_native(
             }
         };
         let temp = match get_protocol_member_inner(
-            py, template, subtype, member, false, false, resolver,
+            py, template, subtype, member, false, false, false, resolver,
         ) {
             Some(GetProtocolMemberResult::Found(t)) => Some(t),
             Some(GetProtocolMemberResult::NoneVal) => None,
