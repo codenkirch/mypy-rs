@@ -54302,6 +54302,11 @@ class NativeFindMemberCallFetchSuite(Suite):
         self.fx = TypeFixture()
         self._live_info: dict[str, TypeInfo] = {}
 
+    def tearDown(self) -> None:
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        set_wire_typeinfo_map(None)
+
     def _build_resolver(self) -> None:
         from mypy.wirefixup import set_wire_typeinfo_map
 
