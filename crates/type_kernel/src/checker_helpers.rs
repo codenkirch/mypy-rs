@@ -146,23 +146,6 @@ fn mro_get(py: Python<'_>, info: &PyAny, name: &str) -> Option<(PyObject, PyObje
     None
 }
 
-/// Safe read of the plugin-hook absence flag from `mypy.checkexpr`.
-fn plugin_get_attribute_hook_absent(py: Python<'_>) -> bool {
-    py.import("mypy.checkexpr")
-        .and_then(|m| m.getattr("plugin_hook_known_absent"))
-        .and_then(|f| f.call1(("get_attribute_hook", "protocol-member-dummy")))
-        .and_then(|r| r.extract::<bool>())
-        .unwrap_or(false)
-}
-
-/// Read `fullname -> TypeInfo` map presence for the plugin-hook registry.
-fn live_plugin_registry_absent(py: Python<'_>) -> bool {
-    py.import("mypy.checkexpr")
-        .and_then(|m| m.getattr("_native_plugin_hook_has_user_plugins"))
-        .and_then(|v| v.extract::<bool>())
-        .unwrap_or(false)
-}
-
 /// Does the attribute hook at `fullname` resolve on the live checker?
 /// find_member has two tails: without a checker (unit fixtures and other
 /// pre-checking contexts) `find_member_simple` never consults hooks, so
@@ -929,6 +912,19 @@ fn join_instance_pair_via_core(
     ctx: &SubtypeContext,
     resolver: &TypeResolver,
 ) -> Option<Type> {
+    // The nominal core has no `TypeJoinVisitor.visit_instance` structural
+    // protocol preference (join.py:757-772): a protocol operand defers so
+    // the Python visitor applies nominal + structural together.
+    if let Type::Instance { type_ref, .. } = left {
+        if resolver.get(type_ref).is_some_and(|s| s.is_protocol) {
+            return None;
+        }
+    }
+    if let Type::Instance { type_ref, .. } = right {
+        if resolver.get(type_ref).is_some_and(|s| s.is_protocol) {
+            return None;
+        }
+    }
     let mut seen: crate::setops::SeenInstances = Vec::new();
     crate::setops::join_instances_core(left, right, ctx, resolver, &mut seen)
         .and_then(|res| map_core_result(res, left, right))
@@ -1423,22 +1419,21 @@ pub(crate) fn get_protocol_member_inner(
             if get_bool_flag(py, var, "is_initialized_in_class") != Some(true) {
                 return Some(GetProtocolMemberResult::Defer);
             }
-            // var.info.self_type: expand_self_type (checkmember.py:1737)
-            // needs the Var; defer on a Self-typed member (same guard as
-            // live_var_plain).
+            // var.info.self_type: the class-level Self tvar. For a property
+            // `expand_self_type` is a no-op (expandtype.py:1345), but the
+            // getter type can still mention Self; defer only in that case.
             let var_info = match var.getattr("info") {
                 Ok(i) => i,
                 Err(_) => {
                     return Some(GetProtocolMemberResult::Defer);
                 }
             };
-            let self_type_none = match var_info.getattr("self_type") {
-                Ok(s) => s.is_none(),
-                Err(_) => false,
+            let self_key = match live_self_tvar_key(py, var) {
+                Some(k) => k,
+                None => {
+                    return Some(GetProtocolMemberResult::Defer);
+                }
             };
-            if !self_type_none {
-                return Some(GetProtocolMemberResult::Defer);
-            }
             let var_type_obj = match var.getattr("type") {
                 Ok(t) => t,
                 Err(_) => {
@@ -1459,6 +1454,11 @@ pub(crate) fn get_protocol_member_inner(
                     return Some(GetProtocolMemberResult::Defer);
                 }
             };
+            if let Some((raw_id, namespace)) = self_key {
+                if crate::checkmember::contains_tvar_key(&signature, raw_id, &namespace) {
+                    return Some(GetProtocolMemberResult::Defer);
+                }
+            }
             let method_fullname = match get_opt_str_attr(var_info, "fullname") {
                 Some(f) => f,
                 None => {
@@ -1546,6 +1546,62 @@ pub(crate) fn get_protocol_member_inner(
                     return Some(GetProtocolMemberResult::Defer);
                 }
             };
+            // Class-level Self: `expand_self_type` substitutes it in the
+            // member type (this Var is not a property). Defer only when
+            // the type actually mentions that tvar (issue #1517).
+            match live_self_tvar_key(py, node_ref) {
+                Some(None) => {}
+                Some(Some((raw_id, namespace))) => {
+                    if crate::checkmember::contains_tvar_key(&typ, raw_id, &namespace) {
+                        return Some(GetProtocolMemberResult::Defer);
+                    }
+                }
+                None => {
+                    return Some(GetProtocolMemberResult::Defer);
+                }
+            }
+            // `analyze_var`'s FunctionLike call_type bind (checkmember.py:
+            // 1852-1866) is not modeled here; a callable member defers.
+            // An unresolved alias cannot be shape-checked either.
+            match get_proper_or_none(&typ) {
+                Some(proper) => {
+                    if matches!(proper, Type::CallableType { .. } | Type::Overloaded { .. }) {
+                        return Some(GetProtocolMemberResult::Defer);
+                    }
+                }
+                None => {
+                    return Some(GetProtocolMemberResult::Defer);
+                }
+            }
+            // Enum member access wraps a Literal last_known_value
+            // (checkmember.py:1884-1899); conservative defer.
+            let var_info_obj = match node_ref.getattr("info") {
+                Ok(i) => i,
+                Err(_) => {
+                    return Some(GetProtocolMemberResult::Defer);
+                }
+            };
+            if get_bool_flag(py, var_info_obj, "is_enum") == Some(true) {
+                return Some(GetProtocolMemberResult::Defer);
+            }
+            // Attribute-hook resolution on the live chain
+            // (analyze_var's `chk.plugin.get_attribute_hook`): a hit
+            // transforms the result, so Rust defers; all-None is the answer.
+            let var_fullname = match get_opt_str_attr(var_info_obj, "fullname") {
+                Some(f) => f,
+                None => {
+                    return Some(GetProtocolMemberResult::Defer);
+                }
+            };
+            match plugin_get_attribute_hook_hits(py, &format!("{var_fullname}.{member}")) {
+                Some(true) => {
+                    return Some(GetProtocolMemberResult::Defer);
+                }
+                Some(false) => {}
+                None => {
+                    return Some(GetProtocolMemberResult::Defer);
+                }
+            }
             // expand_without_binding with preserve_type_var_ids=True
             // (checkmember.py:1498-1503): no freshen / Self; wire fast-path
             // + identity map == plain expand_type_by_instance.
@@ -1772,13 +1828,32 @@ pub(crate) fn live_strict_optional(py: Python<'_>) -> bool {
         .unwrap_or(true)
 }
 
+/// Read `var.info.self_type` (the PEP 673 class `Self` tvar, or None).
+/// `Some(None)` = no class Self; `Some(Some((raw_id, namespace)))` = key;
+/// `None` = unreadable or non-TypeVar shape (caller defers).
+fn live_self_tvar_key(py: Python<'_>, var: &PyAny) -> Option<Option<(i64, String)>> {
+    let info = var.getattr("info").ok()?;
+    let self_type = info.getattr("self_type").ok()?;
+    if self_type.is_none() {
+        return Some(None);
+    }
+    let bytes = serialize_type_to_bytes(py, self_type)?;
+    match decode_type(&bytes)? {
+        Type::TypeVarType {
+            raw_id, namespace, ..
+        } => Some(Some((raw_id, namespace))),
+        _ => None,
+    }
+}
+
 /// The Var gate of the protocol-member var path: `true` iff the live Var
 /// can be answered by plain expand_type_by_instance.
 ///
 /// Mirrors find_node_type's Var tail (subtypes.py:2117-2124) +
 /// analyze_var's non-callable decision (checkmember.py:1377-1422) + the
-/// descriptor / plugin hooks that Rust cannot run (defer on those instead
-/// of guessing). All must hold else the whole member lookup defers.
+/// descriptor gate. The class-Self and attribute-hook checks are
+/// caller-side (`live_self_tvar_key` / `plugin_get_attribute_hook_hits`).
+/// All must hold else the whole member lookup defers.
 #[allow(clippy::too_many_arguments)]
 fn live_var_plain(
     py: Python<'_>,
@@ -1831,30 +1906,13 @@ fn live_var_plain(
         Some(b) => b,
         None => return false,
     };
-    if !is_inferred {
+    if is_inferred {
         return false;
     }
-    // var.info.self_type must be None (expand_self_type would need the Var).
-    let info = match var.getattr("info").ok() {
-        Some(i) => i,
-        None => return false,
-    };
-    let self_type = match info.getattr("self_type") {
-        Ok(t) => t,
-        Err(_) => return false,
-    };
-    if !self_type.is_none() {
-        return false;
-    }
-    // Attribute hook absence: a hook would need the AttributeContext +
-    // live checker in Python.
-    if !plugin_get_attribute_hook_absent(py) {
-        return false;
-    }
-    if live_plugin_registry_absent(py) {
-        // user plugins present -> the Python chain is the source of truth.
-        return false;
-    }
+    // A non-None class Self no longer rejects the member: the caller reads
+    // `var.info.self_type` and defers only when the member type mentions it
+    // (issue #1517); the attribute-hook probe is caller-side now too.
+
     // Descriptor gate (checkmember.py:1451-1452): descriptor access runs
     // when result is non-None and not (implicit or protocol-instance-var).
     // Read the `implicit` flag of the defining symbol.
@@ -3146,6 +3204,72 @@ info.mro = [Cls()]
         assert_eq!(
             join_type_list_inner(&[outer, make_instance("builtins.list", vec![])], true, &r),
             None
+        );
+    }
+
+    #[test]
+    fn test_join_type_list_protocol_pairs_defer() {
+        // A protocol operand defers the fold: the kernel's nominal core
+        // lacks `TypeJoinVisitor.visit_instance`'s structural protocol
+        // preference (join.py:757-772), so Python must decide.
+        let mut r = TypeResolver::new();
+        let mut p1 = TypeInfoSnapshot {
+            fullname: "m.P1".to_string(),
+            name: "P1".to_string(),
+            is_protocol: true,
+            ..Default::default()
+        };
+        p1.mro.push("m.P1".to_string());
+        p1.mro.push("builtins.object".to_string());
+        let mut p2 = p1.clone();
+        p2.fullname = "m.P2".to_string();
+        p2.name = "P2".to_string();
+        r.insert("m.P1".to_string(), p1);
+        r.insert("m.P2".to_string(), p2);
+        let a = make_instance("m.P1", vec![]);
+        let b = make_instance("m.P2", vec![]);
+        assert_eq!(join_type_list_inner(&[a, b], true, &r), None);
+    }
+
+    #[test]
+    fn test_join_type_list_protocol_same_ref_prejoin_decides() {
+        // A same-ref protocol pair still decides through the prejoin
+        // shortcut: Python's tie-break prefers the nominal `Instance`,
+        // the operand itself when no LKV is present.
+        let mut r = TypeResolver::new();
+        let mut p = TypeInfoSnapshot {
+            fullname: "m.P".to_string(),
+            name: "P".to_string(),
+            is_protocol: true,
+            ..Default::default()
+        };
+        p.mro.push("m.P".to_string());
+        p.mro.push("builtins.object".to_string());
+        r.insert("m.P".to_string(), p);
+        let a = make_instance("m.P", vec![]);
+        let b = make_instance("m.P", vec![]);
+        assert_eq!(join_type_list_inner(&[a.clone(), b], true, &r), Some(a),);
+    }
+
+    #[test]
+    fn test_join_type_list_plain_pair_still_decides() {
+        // Control: a plain pair still joins natively (int <: object).
+        let mut r = TypeResolver::new();
+        for (fullname, name) in [("builtins.int", "int"), ("builtins.object", "object")] {
+            let mut s = TypeInfoSnapshot {
+                fullname: fullname.to_string(),
+                name: name.to_string(),
+                ..Default::default()
+            };
+            s.mro.push(fullname.to_string());
+            s.has_base.insert(fullname.to_string());
+            r.insert(fullname.to_string(), s);
+        }
+        let a = make_instance("builtins.int", vec![]);
+        let b = make_instance("builtins.object", vec![]);
+        assert_eq!(
+            join_type_list_inner(&[a, b], true, &r),
+            Some(make_instance("builtins.object", vec![]))
         );
     }
 

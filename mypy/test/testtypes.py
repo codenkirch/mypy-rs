@@ -48984,6 +48984,270 @@ class NativeProtocolMemberMissSuite(Suite):
 
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeProtocolMemberSelfGateSuite(Suite):
+    """Issue #1517: precise class-Self gate for protocol member lookups.
+
+    `get_protocol_member_inner` used to defer every Var / Decorator member
+    when `var.info.self_type` was set (a PEP 673 class `Self`), even though
+    `expand_self_type` (expandtype.py:1345) no-ops for properties and only
+    substitutes the Self tvar where it actually occurs. The gate is now
+    precise: the seam decides when the member type does not mention the
+    class Self and still defers when it does.
+
+    The suite also pins two latent Var-arm engagement bugs: the
+    `is_instance_var` polarity (`not var.is_inferred`, the old guard
+    required the inferred flag) and the attribute-hook gate, which now
+    probes the live `chk.plugin.get_attribute_hook` chain like the
+    Decorator arm instead of refusing whenever user plugins are
+    configured (the self-check runs `mypy.plugins.proper_plugin`).
+
+    Gate-off vs gate-on differentials run the public
+    `mypy.subtypes.get_protocol_member`; direct seam calls prove which
+    verdict the Rust side reached (None = defer, empty = decided miss,
+    bytes = found).
+    """
+
+    def setUp(self) -> None:
+        from mypy.checker_state import checker_state
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        self.fx = TypeFixture()
+        self._live_info: dict[str, Any] = {}
+        self._checker_state = checker_state
+        self._saved_checker = checker_state.type_checker
+        set_wire_typeinfo_map({})
+
+    def tearDown(self) -> None:
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        self._checker_state.type_checker = self._saved_checker
+        set_wire_typeinfo_map(None)
+
+    def _class(self, fullname: str, self_tvar: Any | None = None) -> Any:
+        info = self.fx.make_type_info(fullname)
+        info.mro = [info, self.fx.oi]
+        if self_tvar is not None:
+            info.self_type = self_tvar
+        self._live_info[fullname] = info
+        return info
+
+    def _self_tvar(self, fullname: str) -> Any:
+        from mypy.types import AnyType, TypeOfAny, TypeVarId, TypeVarType
+
+        return TypeVarType(
+            "Self",
+            f"{fullname}.Self",
+            TypeVarId(0, namespace=f"{fullname}.Self"),
+            [],
+            self.fx.o,
+            AnyType(TypeOfAny.special_form),
+        )
+
+    def _property(self, name: str, ret: Any, owner: Any, *, self_arg: Any | None = None) -> Any:
+        from mypy.nodes import Block, Decorator, FuncDef
+        from mypy.types import CallableType, Instance
+
+        fd = FuncDef(name, [], Block([]))
+        fd.info = owner
+        v = Var(name)
+        v.info = owner
+        v.is_property = True
+        v.is_initialized_in_class = True
+        v.is_ready = True
+        v.is_inferred = False
+        arg = self_arg if self_arg is not None else Instance(owner, [])
+        v.type = CallableType([arg], [ARG_POS], [None], ret, self.fx.function)
+        return Decorator(fd, [], v)
+
+    def _plain_var(self, name: str, typ: Any, owner: Any, *, inferred: bool = False) -> Any:
+        v = Var(name)
+        v.info = owner
+        v.is_initialized_in_class = True
+        v.is_ready = True
+        v.is_inferred = inferred
+        v.type = typ
+        return v
+
+    def _build_resolver(self) -> None:
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        type_infos = []
+        for name in dir(self.fx):
+            value = getattr(self.fx, name)
+            if _is_type_info(value):
+                type_infos.append(value)
+        type_infos.extend(list(self._live_info.values()))
+        self.resolver = _type_kernel.build_native_resolver(type_infos, [])
+        self.resolver.set_live_typeinfo_map(dict(self._live_info))
+        set_wire_typeinfo_map(dict(self._live_info))
+
+    def _serialize(self, typ: Any) -> bytes:
+        from mypy.subtypes import _serialize_type
+
+        return _serialize_type(typ)
+
+    def _raw(self, itype: Any, member: str) -> Any:
+        """Direct seam call: None = defer, empty = decided miss, bytes = found."""
+        return _type_kernel.rust_get_protocol_member(
+            self._serialize(itype), self._serialize(itype), member, False, False, self.resolver
+        )
+
+    def _parity(self, itype: Any, member: str) -> tuple[Any, Any]:
+        from mypy import subtypes
+
+        subtypes._set_native_subtype_active(False)
+        off = subtypes.get_protocol_member(itype, itype, member, False)
+        subtypes._set_native_subtype_resolver(self.resolver)
+        subtypes._set_native_subtype_active(True)
+        try:
+            on = subtypes.get_protocol_member(itype, itype, member, False)
+        finally:
+            subtypes._set_native_subtype_active(False)
+            subtypes._set_native_subtype_resolver(None)
+        return off, on
+
+    def test_property_with_class_self_decides_parity(self) -> None:
+        """A bool property on a class whose `info.self_type` is set (the
+        `_io.FileIO.closed` shape) is decided: the getter type mentions no
+        Self, so `expand_self_type` cannot change the answer."""
+        info = self._class("mod.PropSelf", self._self_tvar("mod.PropSelf"))
+        info.names["closed"] = SymbolTableNode(
+            MDEF, self._property("closed", self.fx.bool_type, info)
+        )
+        self._build_resolver()
+        itype = Instance(info, [])
+        off, on = self._parity(itype, "closed")
+        assert str(off) == str(on) == "builtins.bool", f"property mismatch: {off!r} vs {on!r}"
+        raw = self._raw(itype, "closed")
+        assert raw is not None and len(raw) > 0, f"expected found bytes, got {raw!r}"
+
+    def test_plain_var_with_class_self_decides_parity(self) -> None:
+        """A plain `name: A` Var on a class with `info.self_type` set (the
+        `_io.FileIO.name` shape) is decided; the class Self is absent from
+        the member type."""
+        info = self._class("mod.VarSelf", self._self_tvar("mod.VarSelf"))
+        info.names["name"] = SymbolTableNode(MDEF, self._plain_var("name", self.fx.a, info))
+        self._build_resolver()
+        itype = Instance(info, [])
+        off, on = self._parity(itype, "name")
+        assert str(off) == str(on) == "A", f"var mismatch: {off!r} vs {on!r}"
+        raw = self._raw(itype, "name")
+        assert raw is not None and len(raw) > 0, f"expected found bytes, got {raw!r}"
+
+    def test_plain_var_without_class_self_decides_parity(self) -> None:
+        """Var-arm engagement pin (`is_instance_var` polarity): a ready,
+        non-inferred, non-descriptor Var decides natively."""
+        info = self._class("mod.PlainVar")
+        info.names["name"] = SymbolTableNode(MDEF, self._plain_var("name", self.fx.a, info))
+        self._build_resolver()
+        itype = Instance(info, [])
+        off, on = self._parity(itype, "name")
+        assert str(off) == str(on) == "A", f"var mismatch: {off!r} vs {on!r}"
+        raw = self._raw(itype, "name")
+        assert raw is not None and len(raw) > 0, f"expected found bytes, got {raw!r}"
+
+    def test_var_typed_self_defers(self) -> None:
+        """`x: Self` needs `expand_self_type`'s substitution; the seam
+        must defer so the pure-Python walk rebinds it."""
+        info = self._class("mod.VarIsSelf", self._self_tvar("mod.VarIsSelf"))
+        tvar = info.self_type
+        info.names["x"] = SymbolTableNode(MDEF, self._plain_var("x", tvar, info))
+        self._build_resolver()
+        itype = Instance(info, [])
+        assert self._raw(itype, "x") is None
+        off, on = self._parity(itype, "x")
+        assert str(off) == str(on), f"Self var mismatch: {off!r} vs {on!r}"
+
+    def test_property_getter_typed_self_defers(self) -> None:
+        """A property whose getter returns the class Self defers."""
+        info = self._class("mod.PropIsSelf", self._self_tvar("mod.PropIsSelf"))
+        tvar = info.self_type
+        info.names["me"] = SymbolTableNode(MDEF, self._property("me", tvar, info))
+        self._build_resolver()
+        itype = Instance(info, [])
+        assert self._raw(itype, "me") is None
+        off, on = self._parity(itype, "me")
+        assert str(off) == str(on), f"Self property mismatch: {off!r} vs {on!r}"
+
+    def test_inferred_var_defers(self) -> None:
+        """`is_instance_var` excludes inferred vars; the gate must defer."""
+        info = self._class("mod.InferredVar")
+        info.names["name"] = SymbolTableNode(
+            MDEF, self._plain_var("name", self.fx.a, info, inferred=True)
+        )
+        self._build_resolver()
+        itype = Instance(info, [])
+        assert self._raw(itype, "name") is None
+
+    def test_callable_var_defers(self) -> None:
+        """A callable Var can bind self in `analyze_var`'s call_type path;
+        the seam defers rather than returning the unbound callable."""
+        from mypy.types import CallableType
+
+        info = self._class("mod.CallableVar")
+        sig = CallableType([self.fx.a], [ARG_POS], [None], self.fx.b, self.fx.function)
+        info.names["alias"] = SymbolTableNode(MDEF, self._plain_var("alias", sig, info))
+        self._build_resolver()
+        itype = Instance(info, [])
+        assert self._raw(itype, "alias") is None
+
+    def test_enum_var_defers(self) -> None:
+        """Enum member access wraps a Literal last_known_value; the seam
+        defers instead of returning the raw member type."""
+        info = self._class("mod.EnumVar")
+        info.is_enum = True
+        info.names["member"] = SymbolTableNode(MDEF, self._plain_var("member", self.fx.a, info))
+        self._build_resolver()
+        itype = Instance(info, [])
+        assert self._raw(itype, "member") is None
+
+    def test_attribute_hook_hit_defers(self) -> None:
+        """A live `get_attribute_hook` hit transforms the member; the seam
+        must defer (the Decorator arm's live probe, now used by the Var
+        arm instead of the user-plugin registry refusal)."""
+        from types import SimpleNamespace
+
+        info = self._class("mod.HookedVar")
+        info.names["name"] = SymbolTableNode(MDEF, self._plain_var("name", self.fx.a, info))
+        self._build_resolver()
+        itype = Instance(info, [])
+
+        def hook(fullname: str) -> Any:
+            assert fullname == "mod.HookedVar.name"
+            return object()
+
+        self._checker_state.type_checker = SimpleNamespace(  # type: ignore[assignment]
+            plugin=SimpleNamespace(get_attribute_hook=hook)
+        )
+        try:
+            assert self._raw(itype, "name") is None
+        finally:
+            self._checker_state.type_checker = self._saved_checker
+
+    def test_attribute_hook_miss_engages(self) -> None:
+        """A live chain that proves no hook leaves the Var arm engaged.
+        The gate-off differential with a fake checker needs a full
+        TypeChecker (`MemberContext` reads `chk.msg`), so this pins the
+        direct seam answer only; the no-checker parity case is covered by
+        `test_plain_var_without_class_self_decides_parity`."""
+        from types import SimpleNamespace
+
+        info = self._class("mod.UnhookedVar")
+        info.names["name"] = SymbolTableNode(MDEF, self._plain_var("name", self.fx.a, info))
+        self._build_resolver()
+        itype = Instance(info, [])
+
+        self._checker_state.type_checker = SimpleNamespace(  # type: ignore[assignment]
+            plugin=SimpleNamespace(get_attribute_hook=lambda fullname: None)
+        )
+        try:
+            raw = self._raw(itype, "name")
+            assert raw is not None and len(raw) > 0, f"expected found bytes, got {raw!r}"
+        finally:
+            self._checker_state.type_checker = self._saved_checker
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeDecidedNoneSuite(Suite):
     """Issue #1101: the binder/constant_fold seams return a (decided, value)
     wire answer so a genuine no-result answer skips the Python walk.
