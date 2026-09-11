@@ -1,13 +1,24 @@
-# F3 slice 9 profiling (#1397): count TypeVarType + UnionType per-field writes on
-# a self-check run, after the Instance/CallableType splice ops landed.
+"""F3 slice 9 profiling (#1397): TypeVarType + UnionType per-field writes.
 
-# Usage: PYTHONPATH=<mirror dirs> uv run --no-sync python misc/f3s9_tvar_union.py
-#   -- --config-file mypy_self_check.ini -n0 --no-incremental -p mypy
+Per-field setattr counts come from the mirror's own report counters
+(`setattr_captured.<fam>.<field>` / `setattr_spliced.` / `setattr_noop.`):
+a hand-installed `cls.__setattr__` hook is dead here because
+`types_mirror.activate()` overwrites `__setattr__` on the family classes,
+which is exactly the trap this script used to fall into. Only
+`copy_modified` remains instrumented locally, since the mirror does not
+count construction. Audit is forced on so `report()` is populated.
 
+Usage: PYTHONPATH=<mirror dirs> uv run --no-sync python misc/f3s9_tvar_union.py
+  -- --config-file mypy_self_check.ini -n0 --no-incremental -p mypy
+"""
+
+import os
 import sys
 import time
 from collections import Counter
 from typing import Any
+
+os.environ.setdefault("MYPY_TK_MIRROR_AUDIT", "1")
 
 from mypy.options import Options
 
@@ -26,30 +37,13 @@ Options.__init__ = _init  # type: ignore[method-assign]
 import mypy.types as types_mod
 
 _counters: Counter[str] = Counter()
-_TARGETS: tuple[tuple[type, str], ...] = (
-    (types_mod.TypeVarType, "tvar"),
-    (types_mod.UnionType, "union"),
-)
-
-
-def _hook(cls: type, fam: str) -> None:
-    orig_set = cls.__setattr__
-
-    def counting_set(self: Any, name: str, value: Any) -> None:
-        _counters[f"{fam}.{name}"] += 1
-        orig_set(self, name, value)
-
-    cls.__setattr__ = counting_set  # type: ignore[method-assign]
-
-
-for cls, fam in _TARGETS:
-    _hook(cls, fam)
 
 _orig_union_copy = getattr(types_mod.UnionType, "copy_modified", None)
 
 
 if _orig_union_copy is None:
-    # UnionType has no copy_modified; measure its writes via __setattr__ only.
+    # UnionType has no copy_modified; its setattr traffic is only in the
+    # mirror report below (`setattr_*` counters).
     pass
 else:
 

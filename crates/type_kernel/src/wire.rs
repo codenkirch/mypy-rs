@@ -65,7 +65,7 @@ pub(crate) const TUPLE_GEN: u8 = 24;
 pub(crate) const DICT_STR_GEN: u8 = 30;
 
 // Misc class tags (cache.py:322-325).
-const EXTRA_ATTRS: u8 = 150;
+pub(crate) const EXTRA_ATTRS: u8 = 150;
 
 // Reserved / end markers (cache.py:327-328).
 pub(crate) const END_TAG: u8 = 255;
@@ -143,8 +143,19 @@ impl<'a> ReadBuffer<'a> {
     }
 
     /// Number of bytes remaining unread.
-    fn remaining(&self) -> usize {
+    pub(crate) fn remaining(&self) -> usize {
         self.data.len().saturating_sub(self.pos)
+    }
+
+    /// Current cursor offset (raw-record capture).
+    pub(crate) fn position(&self) -> usize {
+        self.pos
+    }
+
+    /// Bytes consumed since `start` (raw-record capture). Panics only on a
+    /// caller bug (`start` ordered after the cursor), never on wire data.
+    pub(crate) fn consumed_from(&self, start: usize) -> &'a [u8] {
+        &self.data[start..self.pos]
     }
 
     /// Ensure at least `n` bytes are available, else `Truncated`.
@@ -591,12 +602,30 @@ fn read_int_literal(buf: &mut ReadBuffer<'_>) -> Result<LiteralValue, WireError>
 // ---------------------------------------------------------------------------
 
 /// `mypy.types.ExtraAttrs` — module-attribute summary attached to `Instance`.
-#[derive(Debug, Clone, PartialEq)]
+///
+/// `raw` preserves the exact encoded record when the value was decoded from
+/// the wire. Python's `write_type_map` iterates dict insertion order while a
+/// `HashMap` cannot, so re-encoding a decoded record would reorder keys and
+/// break byte identity at the mirror splices; the raw record is written
+/// verbatim instead. Kernel-constructed values leave it `None` and encode
+/// sorted (the prior behavior).
+#[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub(crate) struct ExtraAttrs {
     pub attrs: HashMap<String, Type>,
     pub immutable: HashSet<String>,
     pub mod_name: Option<String>,
+    pub raw: Option<Vec<u8>>,
+}
+
+/// Value equality mirrors the pre-`raw` derive (attrs + immutable + mod_name);
+/// the `mod_name`-exempt Python `__eq__` contract is `extra_attrs_py_eq`.
+impl PartialEq for ExtraAttrs {
+    fn eq(&self, other: &Self) -> bool {
+        self.attrs == other.attrs
+            && self.immutable == other.immutable
+            && self.mod_name == other.mod_name
+    }
 }
 
 /// `mypy.types.Parameters` — a standalone parameter list (used by
@@ -852,7 +881,7 @@ fn read_type_var_likes(buf: &mut ReadBuffer<'_>) -> Result<Vec<Type>, WireError>
 }
 
 /// Read an `ExtraAttrs` record (tag already consumed by the caller).
-fn read_extra_attrs(buf: &mut ReadBuffer<'_>) -> Result<ExtraAttrs, WireError> {
+pub(crate) fn read_extra_attrs(buf: &mut ReadBuffer<'_>) -> Result<ExtraAttrs, WireError> {
     let attrs_map = read_type_map(buf)?;
     let immutable_list = read_str_list(buf)?;
     let mod_name = read_str_opt(buf)?;
@@ -861,6 +890,7 @@ fn read_extra_attrs(buf: &mut ReadBuffer<'_>) -> Result<ExtraAttrs, WireError> {
         attrs: attrs_map.into_iter().collect(),
         immutable: immutable_list.into_iter().collect(),
         mod_name,
+        raw: None,
     })
 }
 
@@ -882,9 +912,16 @@ fn read_instance(buf: &mut ReadBuffer<'_>) -> Result<Type, WireError> {
             let type_ref = read_str(buf)?;
             let args = read_type_list(buf)?;
             let last_known_value = read_type_opt(buf)?;
+            let ea_start = buf.position();
             let extra_attrs = match read_tag(buf)? {
                 LITERAL_NONE => None,
-                EXTRA_ATTRS => Some(read_extra_attrs(buf)?),
+                EXTRA_ATTRS => {
+                    let mut ea = read_extra_attrs(buf)?;
+                    // Preserve the exact encoded record: HashMap order cannot
+                    // reproduce Python's dict insertion order on re-encode.
+                    ea.raw = Some(buf.consumed_from(ea_start).to_vec());
+                    Some(ea)
+                }
                 other => {
                     return Err(WireError::invalid(format!(
                         "expected LITERAL_NONE or EXTRA_ATTRS, got tag {other}"
@@ -2254,6 +2291,37 @@ pub(crate) fn write_type_list(buf: &mut WriteBuffer, items: &[Type]) -> Result<(
     Ok(())
 }
 
+/// `write_extra_attrs`: emit one `ExtraAttrs` record (tag included). A
+/// decoded record with preserved `raw` bytes is written verbatim so Python
+/// dict insertion order survives; constructed values encode keys sorted
+/// (HashMap order is nondeterministic) mirroring Python's element order
+/// attrs map, sorted(immutable), mod_name, END_TAG.
+pub(crate) fn write_extra_attrs(buf: &mut WriteBuffer, ea: &ExtraAttrs) -> Result<(), WireError> {
+    if let Some(raw) = &ea.raw {
+        buf.extend(raw);
+        return Ok(());
+    }
+    write_tag(buf, EXTRA_ATTRS);
+    let mut attrs: Vec<(&String, &Type)> = ea.attrs.iter().collect();
+    attrs.sort_unstable_by(|a, b| a.0.cmp(b.0));
+    write_tag(buf, DICT_STR_GEN);
+    write_int_bare(buf, attrs.len() as i64)?;
+    for (key, value) in attrs {
+        write_str_bare(buf, key)?;
+        write_type(buf, value)?;
+    }
+    let mut immutable: Vec<&String> = ea.immutable.iter().collect();
+    immutable.sort();
+    write_tag(buf, LIST_STR);
+    write_int_bare(buf, immutable.len() as i64)?;
+    for item in immutable {
+        write_str_bare(buf, item)?;
+    }
+    write_str_opt(buf, ea.mod_name.as_deref())?;
+    write_tag(buf, END_TAG);
+    Ok(())
+}
+
 /// `write_int_list`: `LIST_INT` + bare size + N bare ints. Inverse of
 /// `read_int_list` (wire.rs:343-359). Used for `CallableType.arg_kinds`.
 pub(crate) fn write_int_list(buf: &mut WriteBuffer, items: &[i64]) -> Result<(), WireError> {
@@ -2388,29 +2456,7 @@ pub(crate) fn write_type(buf: &mut WriteBuffer, t: &Type) -> Result<(), WireErro
                 write_type_opt(buf, last_known_value.as_deref())?;
                 match extra_attrs {
                     None => write_tag(buf, LITERAL_NONE),
-                    Some(ea) => {
-                        // Mirror Python's ExtraAttrs.write element order:
-                        // attrs map, sorted(immutable), mod_name, END_TAG.
-                        // Keys sorted: HashMap order is nondeterministic.
-                        write_tag(buf, EXTRA_ATTRS);
-                        let mut attrs: Vec<(&String, &Type)> = ea.attrs.iter().collect();
-                        attrs.sort_unstable_by(|a, b| a.0.cmp(b.0));
-                        write_tag(buf, DICT_STR_GEN);
-                        write_int_bare(buf, attrs.len() as i64)?;
-                        for (key, value) in attrs {
-                            write_str_bare(buf, key)?;
-                            write_type(buf, value)?;
-                        }
-                        let mut immutable: Vec<&String> = ea.immutable.iter().collect();
-                        immutable.sort();
-                        write_tag(buf, LIST_STR);
-                        write_int_bare(buf, immutable.len() as i64)?;
-                        for item in immutable {
-                            write_str_bare(buf, item)?;
-                        }
-                        write_str_opt(buf, ea.mod_name.as_deref())?;
-                        write_tag(buf, END_TAG);
-                    }
+                    Some(ea) => write_extra_attrs(buf, ea)?,
                 }
                 write_tag(buf, END_TAG);
                 Ok(())
@@ -3154,6 +3200,33 @@ fn extra_attrs_py_eq(a: &ExtraAttrs, b: &ExtraAttrs) -> bool {
         && a.immutable.iter().all(|k| b.immutable.contains(k))
 }
 
+/// Test-only: encode an `ExtraAttrs` record with attrs in the given order,
+/// bypassing the sorted write path, so callers can produce the insertion-
+/// order bytes Python emits (a Rust `HashMap` cannot express them).
+#[cfg(test)]
+pub(crate) fn extra_attrs_record_in_order(
+    entries: &[(&str, Type)],
+    immutable: &[&str],
+    mod_name: Option<&str>,
+) -> Vec<u8> {
+    let mut w = WriteBuffer::new();
+    write_tag(&mut w, EXTRA_ATTRS);
+    write_tag(&mut w, DICT_STR_GEN);
+    write_int_bare(&mut w, entries.len() as i64).unwrap();
+    for (k, v) in entries {
+        write_str_bare(&mut w, k).unwrap();
+        write_type(&mut w, v).unwrap();
+    }
+    write_tag(&mut w, LIST_STR);
+    write_int_bare(&mut w, immutable.len() as i64).unwrap();
+    for k in immutable {
+        write_str_bare(&mut w, k).unwrap();
+    }
+    write_str_opt(&mut w, mod_name).unwrap();
+    write_tag(&mut w, END_TAG);
+    w.into_bytes()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3700,6 +3773,78 @@ mod tests {
         assert_eq!(read_tag(&mut rbuf).unwrap(), END_TAG);
     }
 
+    /// A decoded `ExtraAttrs` record must round-trip byte-identically even
+    /// when its attrs keys are in Python insertion order ("unset" before
+    /// "func"): the `raw` capture is written verbatim instead of re-encoding
+    /// the HashMap (which sorts and would reorder the bytes).
+    #[test]
+    fn decoded_extra_attrs_preserves_python_dict_order() {
+        let any_bytes = {
+            let mut w = WriteBuffer::new();
+            write_type(
+                &mut w,
+                &Type::AnyType {
+                    type_of_any: 2,
+                    source_any: None,
+                    missing_import_name: None,
+                },
+            )
+            .unwrap();
+            w.into_bytes()
+        };
+        let none_bytes = {
+            let mut w = WriteBuffer::new();
+            write_type(&mut w, &Type::NoneType).unwrap();
+            w.into_bytes()
+        };
+        let mut bytes = WriteBuffer::new();
+        write_tag(&mut bytes, INSTANCE);
+        write_tag(&mut bytes, INSTANCE_GENERIC);
+        write_str(&mut bytes, "mypy.util").unwrap();
+        write_type_list(&mut bytes, &[]).unwrap();
+        write_type_opt(&mut bytes, None).unwrap();
+        write_tag(&mut bytes, EXTRA_ATTRS);
+        write_tag(&mut bytes, DICT_STR_GEN);
+        write_int_bare(&mut bytes, 2).unwrap();
+        write_str_bare(&mut bytes, "unset").unwrap();
+        bytes.extend(&none_bytes);
+        write_str_bare(&mut bytes, "func").unwrap();
+        bytes.extend(&any_bytes);
+        write_tag(&mut bytes, LIST_STR);
+        write_int_bare(&mut bytes, 1).unwrap();
+        write_str_bare(&mut bytes, "func").unwrap();
+        write_str_opt(&mut bytes, Some("mypy.util")).unwrap();
+        write_tag(&mut bytes, END_TAG);
+        write_tag(&mut bytes, END_TAG);
+        let original = bytes.into_bytes();
+
+        let mut rbuf = ReadBuffer::new(&original);
+        let decoded = read_type(&mut rbuf, None).unwrap();
+        let Type::Instance {
+            extra_attrs: Some(ea),
+            ..
+        } = &decoded
+        else {
+            panic!("expected an Instance carrying extra_attrs");
+        };
+        assert!(ea.raw.is_some(), "raw record must be captured on read");
+
+        let mut w2 = WriteBuffer::new();
+        write_type(&mut w2, &decoded).unwrap();
+        assert_eq!(w2.into_bytes(), original);
+
+        // Meaningful: the same value without raw re-encodes sorted, which
+        // flips the two keys, so byte identity would not have held.
+        let sorted = {
+            let mut ea2 = ea.clone();
+            ea2.raw = None;
+            let mut w = WriteBuffer::new();
+            write_extra_attrs(&mut w, &ea2).unwrap();
+            w.into_bytes()
+        };
+        assert_ne!(ea.raw.as_deref().unwrap(), sorted.as_slice());
+    }
+
     fn module_instance_with_extra_attrs() -> Type {
         let mut attrs: HashMap<String, Type> = HashMap::new();
         attrs.insert(
@@ -3719,6 +3864,7 @@ mod tests {
                 attrs,
                 immutable: HashSet::from(["func".to_string(), "unset".to_string()]),
                 mod_name: Some("mypy.util".to_string()),
+                raw: None,
             }),
         }
     }

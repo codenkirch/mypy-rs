@@ -2980,6 +2980,7 @@ info.mro = [Cls()]
                     attrs,
                     immutable: std::collections::HashSet::new(),
                     mod_name: None,
+                    raw: None,
                 }),
             };
             // find_member operator miss path: the extra_attrs hit returns

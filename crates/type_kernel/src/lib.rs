@@ -3392,6 +3392,11 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         mirror::rust_mirror_patch_instance_lkv,
         module
     )?)?;
+    // F3 close-out (#1527): `extra_attrs` (raw-record preserving splice).
+    module.add_function(wrap_pyfunction!(
+        mirror::rust_mirror_patch_instance_extra_attrs,
+        module
+    )?)?;
     // Phase F3 slice 6 (#1397): unprotected-write epoch stamps for the
     // write-funnel assert skip.
     module.add_function(wrap_pyfunction!(mirror::rust_mirror_write_skip, module)?)?;

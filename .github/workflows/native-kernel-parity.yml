@@ -1,21 +1,15 @@
 name: native-kernel-parity
 
-# Parity gates for the Rust type-kernel. Each job runs the full testcheck
-# corpus with TEST_NATIVE_TYPE_KERNEL=1 and the Stage 3c resolvers.
-# The base resolvers install in mypy/test/conftest.py; graduated stages
-# (expand_type) install unconditionally in mypy/build.py.
+# Parity gates for the Rust type-kernel: jobs run the full testcheck corpus
+# with TEST_NATIVE_TYPE_KERNEL=1 plus the Stage 3c resolvers (base resolvers
+# install in mypy/test/conftest.py; expand_type installs in mypy/build.py).
 
-# STATUS: gating. The corpus passes 8205/0 (8187 with -k "not slow")
-# on current main. No continue-on-error: keep green before merging.
-# Pre-existing failures (issue #585): 8 testcheck tests fail with
-# "TypeInfo not fixed" on clean main. Deselected until #585 is fixed.
+# STATUS: gating, no continue-on-error. Pre-existing failures (issue #585)
+# are deselected until fixed.
 
-# env-var -> issue (conftest.py): base = Stage 3c subtype/join/mro/solve.
-# TYPEOPS -> #203 (M16, graduated); CHECKER_STMTS -> #207 (M17 Phase 1).
-# ERASEVARS/COPYTYPE/VISITOR_TYPES/CHECKEXPR_TYPES -> #201 (M14).
-# expand_type graduated (#199): no gate. All jobs build the full
-# extension set (type_kernel + ast_serialize + module_resolver) so the
-# native parser/resolver paths are exercised in CI too.
+# env-var -> issue (conftest.py): base = Stage 3c subtype/join/mro/solve;
+# TYPEOPS -> #203, CHECKER_STMTS -> #207, the M14 families -> #201.
+# All jobs build type_kernel + ast_serialize + module_resolver for CI.
 
 on:
   pull_request:
@@ -37,7 +31,11 @@ on:
       - mypy/test/conftest.py
       - mypy/checkexpr.py
       - mypy/solve.py
+      - mypy/types.py
+      - mypy/types_mirror.py
       - mypy/test/testcheck.py
+      - mypy/test/testtypes.py
+      - mypy/test/testfinegrained.py
       - mypy/test/testinfer.py
       - .github/workflows/native-kernel-parity.yml
   workflow_dispatch:
@@ -130,12 +128,9 @@ jobs:
           MYPY_NATIVE_TYPE_KERNEL_REQUIRED: "1"
         run: uv run python -m pytest mypy/test/testinfer.py -q --timeout=30 --timeout-method=thread
 
-      # Reversed-order combined run (#336): testcheck before testtypes in a
-      # single xdist invocation shares workers across both suites, so a
-      # leak of module-level native-gate globals from a testcheck build into
-      # a later pure-Python testtypes suite reproduces as ~17-25 failures.
-      # The runtest-hook isolation in mypy/test/conftest.py restores the
-      # snapshot per test; this step keeps the contamination gated.
+      # Reversed-order combined run (#336): testcheck before testtypes in one
+      # xdist invocation shares workers, so a native-gate global leak shows
+      # as ~17-25 failures; the conftest hook restores the snapshot per test.
       - name: Parity reversed-order isolation (testcheck+testtypes, #336)
         env:
           PYTHONPATH: ${{ env.SCRATCH }}
@@ -148,6 +143,100 @@ jobs:
           MYPY_NATIVE_TYPE_KERNEL_REQUIRED: "1"
         run: |
           uv run python -m pytest mypy/test/testcheck.py mypy/test/testtypes.py -q -k "not slow" -n4 --timeout=30 --timeout-method=thread
+
+  parity-mirror:
+    # F1/F2 mirror coverage (#1527): TEST_NATIVE_TYPE_MIRROR never ran in
+    # CI. Capture + read flip exercise testtypes, testcheck, and the
+    # fine-grained path (testcheck alone misses mirror identity cases).
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Python 3.13
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          version: "0.11.14"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-parity-${{ runner.os }}-${{ hashFiles('**/Cargo.toml') }}
+          restore-keys: cargo-parity-${{ runner.os }}-
+
+      - name: Sync Python deps (uv)
+        run: uv sync --group test
+
+      - name: Build type_kernel extension
+        run: |
+          SCRATCH=/tmp/type-kernel-ext
+          mkdir -p "$SCRATCH"
+          cargo rustc -p mypy-type-kernel --features extension-module \
+            --lib --crate-type cdylib --release
+          EXT_SUFFIX=$(uv run python -c "import sysconfig; print(sysconfig.get_config_var('EXT_SUFFIX'))")
+          cp target/release/libtype_kernel.so "$SCRATCH/type_kernel${EXT_SUFFIX}" 2>/dev/null || cp target/release/libtype_kernel.dylib "$SCRATCH/type_kernel${EXT_SUFFIX}"
+          echo "SCRATCH=$SCRATCH" >> "$GITHUB_ENV"
+          echo "EXT_SUFFIX=$EXT_SUFFIX" >> "$GITHUB_ENV"
+
+      - name: Build ast_serialize extension
+        run: |
+          cargo rustc -p mypy-ast-serialize --features extension-module \
+            --lib --crate-type cdylib --release
+          EXT_SUFFIX=$(uv run python -c "import sysconfig; print(sysconfig.get_config_var('EXT_SUFFIX'))")
+          cp target/release/libast_serialize.so "${{ env.SCRATCH }}/ast_serialize${EXT_SUFFIX}" 2>/dev/null || cp target/release/libast_serialize.dylib "${{ env.SCRATCH }}/ast_serialize${EXT_SUFFIX}"
+
+      - name: Build module_resolver extension
+        run: |
+          cargo rustc -p mypy-module-resolver --features extension-module \
+            --lib --crate-type cdylib --release
+          EXT_SUFFIX=$(uv run python -c "import sysconfig; print(sysconfig.get_config_var('EXT_SUFFIX'))")
+          cp target/release/libmodule_resolver.so "${{ env.SCRATCH }}/module_resolver${EXT_SUFFIX}" 2>/dev/null || cp target/release/libmodule_resolver.dylib "${{ env.SCRATCH }}/module_resolver${EXT_SUFFIX}"
+
+      - name: Mirror capture testtypes
+        env:
+          PYTHONPATH: ${{ env.SCRATCH }}
+          TEST_NATIVE_TYPE_KERNEL: "1"
+          TEST_NATIVE_TYPE_MIRROR: "1"
+          MYPY_NATIVE_TYPE_KERNEL_REQUIRED: "1"
+        run: uv run python -m pytest mypy/test/testtypes.py -q -n4 --timeout=30 --timeout-method=thread
+
+      - name: Mirror capture+read testcheck
+        env:
+          PYTHONPATH: ${{ env.SCRATCH }}
+          TEST_NATIVE_TYPE_KERNEL: "1"
+          TEST_NATIVE_TYPE_MIRROR: "1"
+          TEST_NATIVE_TYPE_MIRROR_READ: "1"
+          MYPY_NATIVE_TYPE_KERNEL_REQUIRED: "1"
+        # Pre-existing F2 read-flip stale-blob bug (#1530): capture-only is
+        # green, so the stale-blob cases (macOS testVariadicStarArgsCall,
+        # linux testRevealBoundParamSpecArgs) are deselected until it lands.
+        run: |
+          uv run python -m pytest mypy/test/testcheck.py -q -n4 \
+            -k "not slow and not testVariadicStarArgsCallNoCrash and not testRevealBoundParamSpecArgs" \
+            --timeout=30 --timeout-method=thread
+
+      - name: Mirror capture+read fine-grained
+        env:
+          PYTHONPATH: ${{ env.SCRATCH }}
+          TEST_NATIVE_TYPE_KERNEL: "1"
+          TEST_NATIVE_TYPE_MIRROR: "1"
+          TEST_NATIVE_TYPE_MIRROR_READ: "1"
+          MYPY_NATIVE_TYPE_KERNEL_REQUIRED: "1"
+        run: uv run python -m pytest mypy/test/testfinegrained.py -q -n4 --timeout=30 --timeout-method=thread
 
   parity-typeops:
     # Gating: typeops graduation (#203, M16) shipped; the truthiness fix

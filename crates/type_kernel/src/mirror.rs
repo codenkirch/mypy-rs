@@ -20,7 +20,10 @@ use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 
 use crate::identity;
-use crate::wire::{read_type, read_type_list, write_type, ReadBuffer, Type, WriteBuffer};
+use crate::wire::{
+    read_extra_attrs, read_tag, read_type, read_type_list, write_type, ReadBuffer, Type,
+    WriteBuffer, EXTRA_ATTRS,
+};
 
 pub(crate) struct MirrorEntry {
     pub(crate) family: String,
@@ -442,6 +445,74 @@ pub(crate) fn rust_mirror_patch_instance_lkv(
     lkv_blob: Option<&[u8]>,
 ) -> Option<Vec<u8>> {
     patch_instance_lkv(handle, lkv_blob)
+}
+
+/// Splice `Instance.extra_attrs` into the stored blob (F3 close-out,
+/// #1527). `attrs_blob` is one `ExtraAttrs.write` record (`EXTRA_ATTRS` ...
+/// `END_TAG`) or `None` (the absent-attribute clear).
+///
+/// The payload's exact bytes are preserved on the decoded value (`raw`), so
+/// re-encoding cannot reorder Python's dict insertion order; a HashMap alone
+/// would sort the keys and drift from `_fresh_bytes`. Same return protocol
+/// as the other Instance splice ops: stored blob on noop, new blob on
+/// change, `None` to defer (unregistered handle, undecodable stored blob or
+/// payload, trailing bytes, or a non-Instance stored family).
+pub(crate) fn patch_instance_extra_attrs(
+    handle: u64,
+    attrs_blob: Option<&[u8]>,
+) -> Option<Vec<u8>> {
+    let old = entry_bytes(handle)?;
+    let stored = {
+        let mut buf = ReadBuffer::new(&old);
+        read_type(&mut buf, None).ok()?
+    };
+    let new_attrs = match attrs_blob {
+        None => None,
+        Some(b) => {
+            let mut buf = ReadBuffer::new(b);
+            if read_tag(&mut buf).ok()? != EXTRA_ATTRS {
+                return None;
+            }
+            let mut ea = read_extra_attrs(&mut buf).ok()?;
+            if buf.remaining() != 0 {
+                return None;
+            }
+            ea.raw = Some(b.to_vec());
+            Some(ea)
+        }
+    };
+    let Type::Instance {
+        type_ref,
+        args,
+        last_known_value,
+        ..
+    } = stored
+    else {
+        return None;
+    };
+    let patched = Type::Instance {
+        type_ref,
+        args,
+        last_known_value,
+        extra_attrs: new_attrs,
+    };
+    let mut wbuf = WriteBuffer::new();
+    write_type(&mut wbuf, &patched).ok()?;
+    let blob = wbuf.into_bytes();
+    if blob == old {
+        return Some(old);
+    }
+    update(handle, blob.clone()).ok()?;
+    Some(blob)
+}
+
+#[pyfunction]
+#[pyo3(signature = (handle, attrs_blob))]
+pub(crate) fn rust_mirror_patch_instance_extra_attrs(
+    handle: u64,
+    attrs_blob: Option<&[u8]>,
+) -> Option<Vec<u8>> {
+    patch_instance_extra_attrs(handle, attrs_blob)
 }
 
 // ---- CallableType splice ops (F3 slice 8, #1397) ----
@@ -1141,7 +1212,7 @@ pub(crate) fn rust_mirror_walk_indices(py: Python, root: &PyAny) -> Option<WalkL
 #[cfg(test)]
 mod mirror_tests {
     use super::*;
-    use crate::wire::{write_type_list, LiteralValue};
+    use crate::wire::{extra_attrs_record_in_order, write_type_list, LiteralValue};
     use pyo3::types::PyModule;
     fn with_py<T>(f: impl FnOnce(Python<'_>) -> T) -> T {
         pyo3::prepare_freethreaded_python();
@@ -1488,6 +1559,70 @@ mod mirror_tests {
     }
 
     #[test]
+    fn test_patch_instance_extra_attrs_roundtrip_and_preserves_order() {
+        with_py(|py| {
+            reset();
+            let obj = fresh(py);
+            let h = register(obj, "instance", single_blob(&int_fallback()), vec![]).unwrap();
+            let payload = extra_attrs_record_in_order(
+                &[("unset", Type::NoneType), ("func", anyt())],
+                &["func"],
+                Some("mypy.util"),
+            );
+            let new = patch_instance_extra_attrs(h, Some(&payload)).unwrap();
+            match decode(h) {
+                Type::Instance {
+                    extra_attrs: Some(ea),
+                    ..
+                } => {
+                    assert_eq!(ea.raw.as_deref(), Some(payload.as_slice()));
+                    assert_eq!(ea.mod_name.as_deref(), Some("mypy.util"));
+                }
+                _ => panic!("not an Instance with attrs"),
+            }
+            // Full re-encode of the stored blob is byte-stable: the raw
+            // record is written verbatim, so the Python insertion order
+            // ("unset" before "func") survives.
+            let mut w = WriteBuffer::new();
+            write_type(&mut w, &decode(h)).unwrap();
+            assert_eq!(w.into_bytes(), new);
+            // Clear: back to the no-attrs shape.
+            let cleared = patch_instance_extra_attrs(h, None).unwrap();
+            match decode(h) {
+                Type::Instance { extra_attrs, .. } => assert!(extra_attrs.is_none()),
+                _ => panic!("not an Instance after clear"),
+            }
+            // Noop: clearing again returns the same stored bytes.
+            assert_eq!(patch_instance_extra_attrs(h, None).unwrap(), cleared);
+        });
+    }
+
+    #[test]
+    fn test_patch_instance_extra_attrs_defers_on_bad_shapes() {
+        with_py(|py| {
+            reset();
+            let payload = extra_attrs_record_in_order(&[("x", Type::NoneType)], &[], None);
+            // Garbage stored blob: both branches defer.
+            let h = register(fresh(py), "instance", b"garbage".to_vec(), vec![]).unwrap();
+            assert_eq!(patch_instance_extra_attrs(h, Some(&payload)), None);
+            assert_eq!(patch_instance_extra_attrs(h, None), None);
+            // Unregistered handles defer.
+            assert_eq!(patch_instance_extra_attrs(h + 5, None), None);
+            // Registered instance: bad tag and trailing bytes defer.
+            let h2 = register(fresh(py), "instance", lkv_instance_blob(None), vec![]).unwrap();
+            assert_eq!(patch_instance_extra_attrs(h2, Some(&[9])), None);
+            let mut with_trailing = payload.clone();
+            with_trailing.push(7);
+            assert_eq!(patch_instance_extra_attrs(h2, Some(&with_trailing)), None);
+            // Non-Instance stored family defers instead of retyping.
+            let mut w = WriteBuffer::new();
+            write_type(&mut w, &tvt("T")).unwrap();
+            let h3 = register(fresh(py), "tvar", w.into_bytes(), vec![]).unwrap();
+            assert_eq!(patch_instance_extra_attrs(h3, Some(&payload)), None);
+        });
+    }
+
+    #[test]
     fn test_write_skip_and_stamp_semantics() {
         with_py(|py| {
             reset();
@@ -1577,8 +1712,6 @@ mod mirror_tests {
             .unwrap();
         cls.call0().unwrap()
     }
-
-    // ---- CallableType splice ops (F3 slice 8, #1397) ----
 
     /// Wire-legal non-callable carrier for deferral checks: a TVar.
     fn tvt(name: &str) -> Type {

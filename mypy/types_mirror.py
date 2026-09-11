@@ -119,7 +119,9 @@ _read_mode = False
 # by _mirror_setattr is pushed into the stored blob by the per-field Rust
 # splice op; a splice that drifts surfaces at the next serial funnel.
 _write_flip = False
-_FLIP_FIELDS: Final[frozenset[str]] = frozenset({"args", "type", "last_known_value"})
+_FLIP_FIELDS: Final[frozenset[str]] = frozenset(
+    {"args", "type", "last_known_value", "extra_attrs"}
+)
 # Wire fields a splice op handles for CallableType (slice 8): the wire
 # write order of the seven bools matters to the flags op only.
 _MUTABLE_CALLABLE_FLAGS: Final[frozenset[str]] = frozenset(
@@ -153,6 +155,10 @@ _ORIG_SETATTR: Any = None
 _originals: dict[type, dict[str, Any]] = {}
 # handle -> live object (strong pin until reset).
 _BY_HANDLE: dict[int, Any] = {}
+# id(object) -> handle for every registered object. Mirrors the Rust
+# identity map without an FFI crossing; `_register_tree` is the only
+# minting path, and `_BY_HANDLE` pins the id() keys until reset.
+_HANDLE_BY_ID: dict[int, int] = {}
 # Registered objects whose captured write could not be serialized at
 # mutation time; the capture is deferred to a later funnel that drains
 # them (see `_drain_pending_captures`). Bounded FIFO like the strike memo.
@@ -441,6 +447,10 @@ def _short_stack() -> str:
 
 
 def _count(key: str, n: int = 1) -> None:
+    # Counters exist for the audit dumps and test assertions; the default
+    # (non-audit) run pays only this guard instead of 20M dict updates.
+    if not _audit_mode:
+        return
     _audit[key] = _audit.get(key, 0) + n
 
 
@@ -736,11 +746,45 @@ def _single_type_bytes(t: Type) -> bytes | None:
         _set(prev)
 
 
+def _extra_attrs_bytes(value: Any) -> bytes | None:
+    """Serialize one `ExtraAttrs` record (Instance splice input, #1527).
+
+    Same suppression trio as `_single_type_bytes`: the record's attr Types
+    serialize through their own `write` bodies, which must not re-enter the
+    mirror. Returns None when the value cannot serialize yet.
+    """
+    global _in_serialize
+    from librt.internal import WriteBuffer
+
+    import mypy.types as _types_mod
+    from mypy.types import _set_type_wire_cache_enabled as _set
+
+    prev = _wire_cache_enabled()
+    _set(False)
+    prev_serialize = _in_serialize
+    prev_cache = _types_mod._REC_CACHE_SUPPRESSED
+    _in_serialize = True
+    _types_mod._REC_CACHE_SUPPRESSED = True
+    try:
+        buf = WriteBuffer()
+        value.write(buf)
+        return buf.getvalue()
+    except Exception:
+        return None
+    finally:
+        _in_serialize = prev_serialize
+        _types_mod._REC_CACHE_SUPPRESSED = prev_cache
+        _set(prev)
+
+
 # ---- registration / adoption / cascade ----
 
 
 def _handle_of(t: Any) -> int | None:
-    return cast("int | None", _kernel_mod.rust_mirror_handle_of(t))
+    # Pure-Python mirror of `identity::handle_of`: `_register_tree` is the
+    # only minting path, and it records the mapping here, so this avoids an
+    # FFI crossing on every funnel/registration (60M calls per self-check).
+    return _HANDLE_BY_ID.get(id(t))
 
 
 def read_fresh_bytes(t: Type) -> bytes | None:
@@ -799,6 +843,7 @@ def _register_tree(t: Type, fresh: bytes | None = None) -> int | None:
         return None
     handle = _kernel_mod.rust_mirror_register(t, fam, fresh, child_handles)
     _BY_HANDLE[handle] = t
+    _HANDLE_BY_ID[id(t)] = handle
     # A later successful adoption clears the failed one: the strike memo is
     # only about "cannot adopt yet", not "never capture writes again".
     _note_successful_adoption(t)
@@ -999,7 +1044,7 @@ def _check_splice(t: Type, blob: bytes) -> None:
     """
     if _PENDING_CAPTURE:
         _drain_pending_captures()
-    if not _rules_ok(t):
+    if not _active or _in_serialize or type(t) not in FAMILY_NAME:
         return
     fam = FAMILY_NAME[type(t)]
     h = _handle_of(t)
@@ -1053,14 +1098,10 @@ def _note_mismatch_key(handle: int, fresh: bytes, msg: str) -> None:
 # ---- class patching ----
 
 
-def _rules_ok(t: Type) -> bool:
-    # Single cheap gate for every funnel invocation.
-    return _active and not _in_serialize and type(t) in FAMILY_NAME
-
-
 def _make_write_wrapper(orig_write: Any, family: str) -> Any:
     def write(self: Type, data: Any) -> None:
-        if _rules_ok(self):
+        # Inlined gate (the wrapper on `write` is hot: ~22M calls).
+        if _active and not _in_serialize and type(self) in FAMILY_NAME:
             _assert_fresh(self, "write")
         orig_write(self, data)
 
@@ -1079,7 +1120,7 @@ def _make_init_wrapper(orig_init: Any, family: str) -> Any:
         # Capture only counts here. Registration is lazy: semanal needs
         # partial fallbacks that cannot serialize yet, so every object
         # enters the mirror at its first serialization funnel instead.
-        if _rules_ok(self):
+        if _audit_mode and _active and not _in_serialize and type(self) in FAMILY_NAME:
             _count(f"init.{family}")
 
     init.__name__ = f"mirror_{family}_init"
@@ -1122,6 +1163,14 @@ def _instance_splice_blob(self: Instance, h: int, name: str, value: Any) -> Any:
             new_ref = None
         if new_ref is not None:
             return _kernel_mod.rust_mirror_patch_instance_type(h, new_ref)
+    elif name == "extra_attrs":
+        # The Rust op preserves the record's exact bytes, so Python's dict
+        # insertion order survives the splice (#1527).
+        if value is None:
+            return _kernel_mod.rust_mirror_patch_instance_extra_attrs(h, None)
+        attrs_blob = _extra_attrs_bytes(value)
+        if attrs_blob is not None:
+            return _kernel_mod.rust_mirror_patch_instance_extra_attrs(h, attrs_blob)
     else:  # last_known_value
         if value is None:
             # A None write is the write_type_opt LITERAL_NONE clear.
@@ -1198,43 +1247,53 @@ def _callable_splice_blob(self: CallableType, h: int, name: str) -> Any:
 
 
 def _mirror_setattr(self: Type, name: str, value: Any) -> None:
-    hook = _rules_ok(self) and _construction == 0 and name not in SKIP_ATTRS
-    if not hook and _active and type(self) in FAMILY_NAME and name not in SKIP_ATTRS:
-        # Suppression-window setattr on a REGISTERED object: blobs embedding
+    # This is the hottest wrapper in the mirror (100M calls on the
+    # self-check): order the checks cheapest-first and keep every normal
+    # construction write on the single `_ORIG_SETATTR` fast path.
+    if _construction or not _active or _in_serialize:
+        # Suppression-window write: a registered target's blobs embedding
         # these bytes were not captured, so force their next funnel to
-        # verify. Unregistered targets cannot corrupt storage (see below).
-        if _handle_of(self) is not None:
+        # verify; unregistered targets cannot corrupt storage.
+        if (
+            _active
+            and name not in SKIP_ATTRS
+            and type(self) in FAMILY_NAME
+            and id(self) in _HANDLE_BY_ID
+        ):
             _bump_unprot("setattr_window")
-    if hook and id(self) in _ADOPT_STRIKE:
-        # The strike memo is per-object id: a write on an object that has
-        # since become registrable is a real mirror mutation (capture it);
-        # only still-unregistrable objects stay gagged.
-        if _handle_of(self) is not None:
-            _ADOPT_STRIKE.remove(id(self))
-            _count("strike_captured_late")
-        elif _ADOPT_STRIKE.incr(id(self)) % _STRIKE_RETRY_INTERVAL == 0:
-            # Bounded probe (see _assert_fresh): retest registrability.
-            # A filled-in placeholder resumes ordinary capture; a still
-            # partial object just re-strikes through the helpers.
+        _ORIG_SETATTR(self, name, value)
+        return
+    if type(self) not in FAMILY_NAME or name in SKIP_ATTRS:
+        _ORIG_SETATTR(self, name, value)
+        return
+    h = _HANDLE_BY_ID.get(id(self))
+    if h is None:
+        # A write on an unregistered object matters only when a registered
+        # blob embeds its bytes (the hidden-embed index); otherwise the
+        # first funnel snapshots the already-mutated state (lazy adoption).
+        if id(self) not in _HIDDEN_EMBED:
+            _ORIG_SETATTR(self, name, value)
+            _count("setattr_untracked." + FAMILY_NAME[type(self)])
+            return
+        if id(self) in _ADOPT_STRIKE:
+            # Still-unregistrable partial: bounded probe cadence (see
+            # _assert_fresh); only the probe interval attempts a re-register.
+            if _ADOPT_STRIKE.incr(id(self)) % _STRIKE_RETRY_INTERVAL:
+                _ORIG_SETATTR(self, name, value)
+                _count("strike_gag_uncaptured")
+                return
             probe = _register_tree(self)
             if probe is None:
                 _note_failed_adoption(self)
-                hook = False
+                _ORIG_SETATTR(self, name, value)
                 _count("strike_gag_uncaptured")
+                return
+            h = probe
         else:
-            hook = False
-            # Still gagged: the raw write lands uncaptured, but no stored
-            # blob can embed a struck object (deriving through it fails
-            # serialization), so no epoch bump.
-            _count("strike_gag_uncaptured")
-    h = None
-    if hook:
-        h = _handle_of(self)
-        if h is None:
             h = _register_tree(self)
             if h is None:
                 # A partial object fresh serialization cannot handle yet
-                # (unfilled semanal fallback). Memo the failure: the bounded
+                # (unfilled semanal fallback). Memo the failure; the bounded
                 # probe re-tests registrability every interval (see _assert_fresh).
                 fam = FAMILY_NAME[type(self)]
                 _count(f"setattr_gagged.{fam}")
@@ -1248,13 +1307,13 @@ def _mirror_setattr(self: Type, name: str, value: Any) -> None:
                 # only capture bookkeeping (a dropped write lost .name here).
                 _ORIG_SETATTR(self, name, value)
                 return
+    elif id(self) in _ADOPT_STRIKE:
+        # A registered object that still carries a strike: a real mirror
+        # mutation, so drop the stale strike and capture normally.
+        _ADOPT_STRIKE.remove(id(self))
+        _count("strike_captured_late")
     _ORIG_SETATTR(self, name, value)
-    if not hook:
-        return
     fam = FAMILY_NAME[type(self)]
-    if h is None:
-        _count("post_setattr_unregistered." + fam)
-        return
     if _write_flip and type(self) is Instance and name in _FLIP_FIELDS:
         # F3 (#1397): push the changed field into the stored blob via the
         # Rust splice op (decode + swap + re-encode) instead of Python
@@ -1406,6 +1465,11 @@ def activate(
     """Patch family classes to mirror construction/mutation into Rust."""
     global _active, _strict, _audit_mode, _ORIG_SETATTR, _kernel_mod
     if _active:
+        # Activation is one-shot (un-patching is unsupported), but a later
+        # suite may still ask for counters: enable them retroactively so the
+        # guard in `_count` cannot silently starve test assertions.
+        if audit:
+            _audit_mode = True
         return
     try:
         import type_kernel as _km
@@ -1482,6 +1546,7 @@ def reset(*, clear_counts: bool = False) -> None:
     if _kernel_mod is not None:
         _kernel_mod.rust_mirror_reset()
     _BY_HANDLE.clear()
+    _HANDLE_BY_ID.clear()
     _ADOPT_STRIKE.clear()
     _PENDING_CAPTURE.clear()
     _PENDING_CAPTURE_Q.clear()
