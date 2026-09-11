@@ -1,34 +1,36 @@
 # Handoff: strangler-fig Rust migration loop (seam-deferral reduction)
 
-*Written 2026-08-28, refreshed 2026-09-11 (post-wave58: waves 52-58
+*Written 2026-08-28, refreshed 2026-09-11 (post-wave59: waves 52-59
 landed the st find_member/unpack/apply-report ports (#1492, embedded
 112 -> 61), the icf SUBTYPE_OF protocol-actual arm (#1487), the
 plugin-synthesized TypeInfo registrar (#1489), the ctor-blob gate
 clearing (#1488), the alias-aware typeobj decode (#1496, decode_None
-60 -> 0), and the two astdiff snapshot-builder slices (#1498 type half
-98%+ native; #1501 symbol/definition half 100% native on the
-fine-grained corpora); two docs-only negative closes also landed (B6
-render bundle #1481; maptype timing-gap #1494 - the #1493 audit that
-followed disproved its own hypothesis and landed the alias-decode fix
-#1496 instead). Goal: "migrate all python code to rust, really all",
+60 -> 0), the two astdiff snapshot-builder slices (#1498 type half
+98%+ native; #1501 symbol/definition half 100% native), and the
+fixed-format cache meta writer (#1504, byte-parity, 100% of cold-run
+meta writes); two docs-only negative closes also landed (B6 render
+bundle #1481; maptype timing-gap #1494 - the #1493 audit that followed
+disproved its own hypothesis and landed the alias-decode fix #1496
+instead). Goal: "migrate all python code to rust, really all",
 pursued as the established measure -> file -> dispatch-agents ->
 process-PRs -> gate loop. This file is the resume point.*
 
-## Where main stands (2026-09-11, post-wave58)
+## Where main stands (2026-09-11, post-wave59)
 
-- `main` = `19ab01862` (astdiff symbol snapshots, `#1501`) on top of
-  `f112dca00` (`#1499`), `e7205b87e` (`#1498`, #1497), `89f161b91`
-  (`#1496`, #1493), `fc9892ab4` (`#1495`) and `5a5038ad2` (`#1494`,
-  #1490); local ff'd to origin.
+- `main` = `2a4f638fd` (cache meta writer, `#1504`) on top of
+  `fc7a61dba` (`#1502`), `19ab01862` (`#1501`, #1500), `f112dca00`
+  (`#1499`), `e7205b87e` (`#1498`, #1497), `89f161b91` (`#1496`,
+  #1493), `fc9892ab4` (`#1495`) and `5a5038ad2` (`#1494`, #1490);
+  local ff'd to origin.
 - Phase state: unchanged since the wave-51 refresh (F0 audit + F1
   dual-write mirror + F2 read flip landed; F3 write flip has Instance +
   CallableType splice ops; the tvar/union splice slice profiled EMPTY -
   not built).
-- Gates on the merged head `19ab01862`: cargo 2,736/11 ignored; testtypes
-  3,298/6 skipped (kernel ON); testcheck 8,198/15/7 exact; cold
+- Gates on the merged head `2a4f638fd`: cargo 2,739/11 ignored; testtypes
+  3,309/6 skipped (kernel ON); testcheck 8,198/15/7 exact; cold
   self-check clean (347 files); pr-gate + parity + parity-typeops green
-  on #1492/#1496/#1498/#1501.
-- Shared `.so` rebuilt 2026-09-11 at the merged head content (waves 57-58
+  on #1492/#1496/#1498/#1501/#1504.
+- Shared `.so` rebuilt 2026-09-11 at the merged head content (waves 57-59
   Rust, codesigned); `/private/tmp/mypy-rs-local-typekernel`.
 - Wave-56: the alias-aware typeobj decode retry
   (`_deserialize_type_with_aliases`, the #1224/#1309 contract) retired
@@ -47,16 +49,24 @@ process-PRs -> gate loop. This file is the resume point.*
   7,580 calls @ 100%, finegrainedcache 3,384 @ 100%, daemon 97 @ 100%,
   zero whole-table defers. The only non-native leaf is the slice-1
   generic-CallableType callback. B7 is now complete for both halves.
+- Wave-59: fixed-format cache meta writer ported
+  (`rust_write_cache_meta` / `_ex`, cache.rs; new wire primitives
+  `write_bytes*`, `write_str_list`, `write_big_int`, tagged JSON writer).
+  Byte-parity battery + nativeread round-trip; cold self-check 808+808
+  meta writes @ 100% native; warm run consumes the Rust-written cache.
+  Cache read+write are now native; the DATA payload (`tree.write` /
+  node deserialization) remains Phase G. OCR healthy again (1 low
+  advisory: unused `ex` param in `NativeCacheMetaWriterSuite._ref` -
+  trivial future cleanup).
 - Runner note unchanged: the repo runner cannot re-register (403,
   admin-blocked; #1249 open); GH `ocr-review` jobs stay `queued`
   forever. The operative review gate is the local
   `ocr review --from origin/main --to <branch> --audience agent`,
   then `gh pr merge --squash --admin` after pr-gate + parity green.
-  NOTE (2026-09-11): the local OCR backend failed provider-level (0
-  tokens, all files, two attempts) on #1501; a manual diff review
-  substituted that time. Re-check OCR health before the next merge.
+  The 2026-09-11 provider-level OCR outage was transient; wave 59
+  reviewed normally.
 
-## Waves 33-58 (since the 2026-08-31 refresh)
+## Waves 33-59 (since the 2026-08-31 refresh)
 
 | PR | Issue | What | Numbers |
 |----|-------|------|---------|
@@ -98,6 +108,7 @@ process-PRs -> gate loop. This file is the resume point.*
 | #1496 | #1493 | wave56: alias-aware typeobj decode retry (`_deserialize_type_with_aliases`, #1224/#1309 contract) - the #1493 hypothesis (missing/local TypeInfos) was disproven by a per-fixer probe; the real cause was alias-bearing composites | `decode_None` 60 -> 0 (32 `kernel_none` unchanged); testtypes 3,282/6 (+3 NativeTypeObjectAliasDecodeSuite); testcheck 8,198/15/7 exact; self-check clean |
 | #1498 | #1497 | wave57: astdiff type-snapshot builder port (`rust_snapshot_type`, new `astdiff_snapshot.rs` ~630 lines; order-sensitive arms call Python `set`/`sorted`; generic-Callable/Partial defer) | testfinegrained 75,713 @ 98.3% (1,263 defers, 100% generic CallableType), finegrainedcache 31,120 @ 98.05%, daemon 631 @ 100%; cargo 2,736/11; testtypes 3,291/6 (+9 NativeAstdiffSnapshotSuite); testcheck exact; self-check clean |
 | #1501 | #1500 | wave58: astdiff symbol/definition snapshot builder port (`rust_snapshot_symbol_table`, new `astdiff_symbols.rs` ~570 lines; slice-1 walk factored `pub(crate)`; per-node Python callback only for the generic-CallableType leaf) | testfinegrained 7,580 @ 100%, finegrainedcache 3,384 @ 100%, daemon 97 @ 100%, 0 whole-table defers; cargo 2,736/11; testtypes 3,298/6 (+7); testcheck exact; fine-grained 747/27, daemon 37, merge 41/1, diff 79; self-check clean. OCR provider-level failure -> manual review |
+| #1504 | #1503 | wave59: fixed-format cache meta writer port (`rust_write_cache_meta`/`_ex` live-object walkers + `write_errors`/`write_json*`; cache.rs; wire.rs gains `write_bytes*`/`write_str_list`/`write_big_int`/tagged JSON writer; build.py native-first with Python `WriteBuffer` fallback; version prefix stays Python) | byte-parity battery + native-read round-trip; cold self-check 808+808 meta writes @ 100% native, 0 defers; warm run consumes Rust-written cache; cargo 2,739/11 (+3); testtypes 3,309/6 (+11); testcheck 8,198/15/7 exact; fine-grained 747/27, daemon 37, finegrainedcache 549/229; self-check clean |
 
 Closed alongside: #1412, #1393 (F2 complete), #1397 (F3 partial,
 Instance/CallableType only), #1300, #1418 (closed 2026-09-05 with the
@@ -122,16 +133,19 @@ auto-closed it), #1485 (#1489 auto-closed it), #1490 (#1494
 auto-closed it), #1491 (#1492 auto-closed it), #1432 (unify.rs
 PolyModeGuard prev-restore + boolean labels, `dc1da15a4`), #1493
 (#1496 auto-closed it), #1497 (#1498 auto-closed it), #1500 (shipped
-in #1501, closed by hand).
+in #1501, closed by hand), #1503 (#1504 auto-closed it).
 
 ## Open backlog (next waves; dispatch max ~2 port agents)
 
-1. **#624 (next slice)**: B7 is complete (both astdiff halves native).
-   Candidate: B1/B3 build-cache front (`BuildManager.read_cache` /
-   `write_cache` + `mypy/cache.py`) - audit-first: split pure
-   serialization from live-graph walking before filing a scoped issue,
-   and remember the cache format is versioned (CACHE_VERSION bumps are
-   allowed; the daemon/fine-grained suites gate every change).
+1. **#624 (next slice)**: B1/B3 slice 1 shipped (meta writer; cache
+   read+write both native). Slice 2 (the module DATA payload:
+   `tree.write` / node deserialization, 45 `serialize()` methods in
+   nodes.py/types.py) is Phase G territory - it moves the graph
+   serialization the F/G plan owns, so do not slice it ad hoc. Other
+   candidates need a fresh audit: checkexpr/checker remaining seam
+   floors (see standing table) or a new module sweep
+   (`scripts/measure_native_share.py` per-seam table, rank non-100%
+   lines by absolute fallbacks).
 2. **#624 (audited / deprioritized)**: B6 errors render-bundle is a
    documented negative (#1481: zero legacy-path traffic on the gate
    corpus) - do not rebuild speculatively. Semanal candidates stay
@@ -148,7 +162,7 @@ sgc 253 (icf 173 / apply_generic 69 / solve_defer 7 / multi_lower 4);
 ct 29; ifta var_pspec_tvt 80 / engine 47 / solve 5; dc-final-overlap
 67 (overlap kernel); join lkv wall 39; ama 120 contract floor; maptype
 timing-gap 5 (documented #1490 floor). Bucket tables in AGENTS.md
-(wave-47/48a/48b/49/53/55/56/57/58 entries) - do not re-derive.
+(wave-47/48a/48b/49/53/55/56/57/58/59 entries) - do not re-derive.
 
 ## Older session record
 
