@@ -4464,6 +4464,14 @@ pub(crate) fn visit_instance_join(
             return None;
         };
     }
+    // `TypeJoinVisitor.visit_instance` (join.py:757-772) prefers a
+    // structural protocol result over the nominal join; the kernel only
+    // models the nominal walk, so a protocol operand defers.
+    if resolver.get(s_ref).is_some_and(|s| s.is_protocol)
+        || resolver.get(t_ref).is_some_and(|s| s.is_protocol)
+    {
+        return None;
+    }
     if t_ref == s_ref {
         if s_args.is_empty() && t_args.is_empty() {
             // join.py:281 constructs `Instance(t.type, [])` — a
@@ -11160,6 +11168,51 @@ mod tests {
                     extra_attrs: None,
                 }
             );
+        }
+
+        #[test]
+        fn visit_instance_join_protocol_pair_defers() {
+            // `TypeJoinVisitor.visit_instance` (join.py:757-772) prefers
+            // a structural protocol result; the kernel only models the
+            // nominal walk, so any protocol operand defers.
+            let mut p1 = snap("m.P1", "P1");
+            p1.is_protocol = true;
+            let mut p2 = snap("m.P2", "P2");
+            p2.is_protocol = true;
+            let r = make_resolver(vec![p1, p2]);
+            let s = instance("m.P1", vec![]);
+            let t = instance("m.P2", vec![]);
+            assert_eq!(visit_instance_join(&s, &t, &ctx(true), &r), None);
+        }
+
+        #[test]
+        fn visit_instance_join_protocol_vs_plain_defers() {
+            // One protocol operand is enough: Python's structural
+            // preference consults the protocol side.
+            let mut p = snap("m.P", "P");
+            p.is_protocol = true;
+            let a = snap("m.A", "A");
+            let r = make_resolver(vec![p, a]);
+            let s = instance("m.P", vec![]);
+            let t = instance("m.A", vec![]);
+            assert_eq!(visit_instance_join(&s, &t, &ctx(true), &r), None);
+        }
+
+        #[test]
+        fn visit_instance_join_plain_pair_still_decides() {
+            // Control: the protocol gate leaves plain pairs untouched
+            // (the args-less nominal walk still answers via the shared
+            // object base).
+            let obj = instance("builtins.object", vec![]);
+            let obj_blob = encode_type(&obj).unwrap();
+            let mut a = snap("m.A", "A");
+            a.bases = vec![obj_blob.clone()];
+            let mut b = snap("m.B", "B");
+            b.bases = vec![obj_blob];
+            let r = make_resolver(vec![a, b, snap("builtins.object", "object")]);
+            let s = instance("m.A", vec![]);
+            let t = instance("m.B", vec![]);
+            assert!(visit_instance_join(&s, &t, &ctx(true), &r).is_some());
         }
     }
 }

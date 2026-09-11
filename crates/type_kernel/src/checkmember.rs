@@ -844,6 +844,16 @@ fn collect_tvar_keys(typ: &Type, keys: &mut Vec<BindTVarKey>) {
     for_each_child(typ, &mut |c| collect_tvar_keys(c, keys));
 }
 
+/// Whether `typ` mentions a typevar-like node with the given identity
+/// (raw_id + namespace; meta level ignored, mirroring Python's
+/// `TypeVarId`-keyed `expand_type` substitution).
+pub(crate) fn contains_tvar_key(typ: &Type, raw_id: i64, namespace: &str) -> bool {
+    let mut keys = Vec::new();
+    collect_tvar_keys(typ, &mut keys);
+    keys.iter()
+        .any(|(r, _, ns)| *r == raw_id && ns == namespace)
+}
+
 /// TEMPORARY w32 audit: describe the nodes that fail the survivor gate.
 #[allow(dead_code)]
 fn describe_survivor_failures(

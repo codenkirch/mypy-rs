@@ -3488,6 +3488,51 @@ including:
   Gates: cargo 2,750/11, fmt + clippy clean, cold self-check clean 347,
   testtypes 3,355/6 (+12), testcheck 8,198/15/7 exact, fine-grained
   747/27, daemon 37, finegrainedcache 549/229.
+- wave-62B checkmember/IAMA residue audit + protocol-member ports (wave 62,
+  issue #1517): audit-first, `MYPY_TK_W62B_AUDIT` probes (shim counters +
+  Rust leaf tags) on the cold self-check at `-n0 --no-incremental`,
+  stripped before landing. Surveyed seams: `analyze_union_member_access`
+  1,063 / 25 fallbacks, `analyze_none_member_access` 902 / 5,
+  `get_protocol_member` 106 / 7, `analyze_member_method` 27 / 24.
+  - `rust_get_protocol_member` 106 / 7 -> 92 / 3: three decidable arms
+    ported. (a) The class-Self gate is precise: `live_var_plain` no longer
+    rejects every member when `info.self_type` is set; the caller reads the
+    PEP 673 Self key (`live_self_tvar_key`) and defers only when the member
+    type mentions that tvar (`contains_tvar_key`). `expand_self_type`
+    (expandtype.py:1345) no-ops for properties, so `_io.FileIO.closed`
+    (bool property on a class inheriting `__enter__ -> Self`) and
+    `name: Any` decide natively. (b) `live_var_plain`'s `is_instance_var`
+    polarity was inverted (`if !is_inferred` required the inferred flag),
+    leaving the Var arm dead; fixed to `if is_inferred`. (c) The Var arm's
+    attribute-hook gate used `plugin_get_attribute_hook_absent` with a
+    dummy fullname plus a user-plugin refusal, deferring every Var lookup
+    whenever the build loaded any plugin (the self-check's
+    `mypy.plugins.proper_plugin`); it now probes the live
+    `chk.plugin.get_attribute_hook(fullname)` chain like the Decorator arm
+    (`plugin_get_attribute_hook_hits`), with new guards for callable/alias
+    vars (unmodeled `analyze_var` bind) and enum vars (Literal
+    last_known_value wrap).
+  - Join structural-protocol guard: engaging the Var arm let the subtype
+    engine decide protocol pairs that previously deferred, exposing the
+    missing `TypeJoinVisitor.visit_instance` structural preference
+    (join.py:757-772) in `visit_instance_join` /
+    `join_instance_pair_via_core` - `[x: P, y: P2]` joined to `list[object]`
+    instead of `list[P]` (testJoinProtocolWithProtocol / WithNormal).
+    Protocol operands now defer the nominal kernel so Python applies
+    nominal + structural together (3 new setops units).
+  - Floors with evidence: union 25 = 100% lvalue unions (message-coupled
+    per-item lvalue/super semantics stay in Python); none 5 = `builtins.object`
+    missing-attribute paths that must emit `has_no_attr` / match
+    `# type: ignore[union-attr]` (`Options`/`HS_FLAG_*`/`lvalue_type.var`);
+    AMM 24 = 19 bare-recv-tvar (#1214 wall) + 5 `mmm:freeze`
+    (`enum.EnumMeta.__iter__`, tvar identity wall); protocol 3 = 2 fd-mmm
+    (EnumMeta `__iter__` freeze/map) + 1 class-obj metaclass path.
+  Pins: `NativeProtocolMemberSelfGateSuite` (10 tests: direct seam +
+  gate-off/on parity for property/class-Self, var/class-Self, Self-typed
+  members, inferred/callable/enum vars, live hook hit/miss).
+  Gates: cargo 2,752/11 (+6 units), fmt + clippy clean, testtypes
+  3,353/6 (+10 tests), testcheck 8,198/15/7 exact, fine-grained 747/27,
+  daemon 37, cold self-check clean 347.
 
 ## Pull Requests
 
