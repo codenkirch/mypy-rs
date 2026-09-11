@@ -1,37 +1,41 @@
 # Handoff: strangler-fig Rust migration loop (seam-deferral reduction)
 
-*Written 2026-08-28, refreshed 2026-09-11 (post-wave59: waves 52-59
+*Written 2026-08-28, refreshed 2026-09-11 (post-wave60: waves 52-60
 landed the st find_member/unpack/apply-report ports (#1492, embedded
 112 -> 61), the icf SUBTYPE_OF protocol-actual arm (#1487), the
 plugin-synthesized TypeInfo registrar (#1489), the ctor-blob gate
 clearing (#1488), the alias-aware typeobj decode (#1496, decode_None
 60 -> 0), the two astdiff snapshot-builder slices (#1498 type half
-98%+ native; #1501 symbol/definition half 100% native), and the
-fixed-format cache meta writer (#1504, byte-parity, 100% of cold-run
-meta writes); two docs-only negative closes also landed (B6 render
-bundle #1481; maptype timing-gap #1494 - the #1493 audit that followed
-disproved its own hypothesis and landed the alias-decode fix #1496
-instead). Goal: "migrate all python code to rust, really all",
-pursued as the established measure -> file -> dispatch-agents ->
-process-PRs -> gate loop. This file is the resume point.*
+98%+ native; #1501 symbol/definition half 100% native), the
+fixed-format cache meta writer (#1504, byte-parity), and the wave-60
+engagement audit + top-bucket ports (#1508 zero ports, all 151
+fallbacks classified, no ifta-class gate bug; #1509 singleton identity
+48 -> 0, container 36 -> 17, format 53 -> 38). Two docs-only negative
+closes also landed (B6 render bundle #1481; maptype timing-gap #1494 -
+the #1493 audit that followed disproved its own hypothesis and landed
+the alias-decode fix #1496 instead). Goal: "migrate all python code to
+rust, really all", pursued as the established measure -> file ->
+dispatch-agents -> process-PRs -> gate loop. This file is the resume
+point.*
 
-## Where main stands (2026-09-11, post-wave59)
+## Where main stands (2026-09-11, post-wave60)
 
-- `main` = `2a4f638fd` (cache meta writer, `#1504`) on top of
-  `fc7a61dba` (`#1502`), `19ab01862` (`#1501`, #1500), `f112dca00`
-  (`#1499`), `e7205b87e` (`#1498`, #1497), `89f161b91` (`#1496`,
-  #1493), `fc9892ab4` (`#1495`) and `5a5038ad2` (`#1494`, #1490);
-  local ff'd to origin.
+- `main` = `6f74795ce` (wave-60B ports, `#1509`) on top of `dacf5f2d2`
+  (`#1508`, #1506), `e37d7a7b6` (`#1505`), `2a4f638fd` (`#1504`,
+  #1503), `fc7a61dba` (`#1502`), `19ab01862` (`#1501`, #1500),
+  `f112dca00` (`#1499`), `e7205b87e` (`#1498`, #1497), `89f161b91`
+  (`#1496`, #1493), `fc9892ab4` (`#1495`) and `5a5038ad2` (`#1494`,
+  #1490); local ff'd to origin.
 - Phase state: unchanged since the wave-51 refresh (F0 audit + F1
   dual-write mirror + F2 read flip landed; F3 write flip has Instance +
   CallableType splice ops; the tvar/union splice slice profiled EMPTY -
   not built).
-- Gates on the merged head `2a4f638fd`: cargo 2,739/11 ignored; testtypes
-  3,309/6 skipped (kernel ON); testcheck 8,198/15/7 exact; cold
+- Gates on the merged head `6f74795ce`: cargo 2,741/11 ignored; testtypes
+  3,321/6 skipped (kernel ON); testcheck 8,198/15/7 exact; cold
   self-check clean (347 files); pr-gate + parity + parity-typeops green
-  on #1492/#1496/#1498/#1501/#1504.
-- Shared `.so` rebuilt 2026-09-11 at the merged head content (waves 57-59
-  Rust, codesigned); `/private/tmp/mypy-rs-local-typekernel`.
+  on #1508/#1509.
+- Shared `.so` rebuilt 2026-09-11 15:00 at the merged head content
+  (wave-60B Rust, codesigned); `/private/tmp/mypy-rs-local-typekernel`.
 - Wave-56: the alias-aware typeobj decode retry
   (`_deserialize_type_with_aliases`, the #1224/#1309 contract) retired
   all 60 cold-self-check `decode_None` events; the wave-55 "missing
@@ -58,15 +62,33 @@ process-PRs -> gate loop. This file is the resume point.*
   node deserialization) remains Phase G. OCR healthy again (1 low
   advisory: unused `ex` param in `NativeCacheMetaWriterSuite._ref` -
   trivial future cleanup).
+- Wave-60A (audit, #1506): engagement audit of the 0-40% native-share
+  seams - ZERO ports, all 151 fallbacks across the 12 targets
+  classified; no engagement/gate regression of the #1455 ifta class.
+  Bucket table in the AGENTS.md wave-60A entry (not-delitem scope
+  floor, linearize snap-miss, covers/restrict floors, remove_dups
+  alias identity, bare-recv-tvar, icf protocol/union engine, join
+  lkv/args walls, icf expand floors). Do not re-audit these blind.
+- Wave-60B (ports, #1507): `rust_is_singleton_identity_type` 48 -> 0
+  fallbacks (FunctionLike singleton arm + type-object `is_final`
+  cascade), `rust_container_type` 36 -> 17 (decided-none sentinel skips
+  the duplicate Python join), `rust_format_type_distinctly` 44 -> 37 +
+  `rust_format_type_bare` 9 -> 1 (definition-free pretty delegation
+  gated by `_pretty_wire_safe`); `rust_instantiate_type_alias` 68 stays
+  a documented floor (bare-generic `set_any_tvars` with defaulted alias
+  tvars). OCR rounds fixed the singleton cascade and the
+  `_pretty_wire_safe` TypedDict traversal gap.
 - Runner note unchanged: the repo runner cannot re-register (403,
   admin-blocked; #1249 open); GH `ocr-review` jobs stay `queued`
   forever. The operative review gate is the local
   `ocr review --from origin/main --to <branch> --audience agent`,
   then `gh pr merge --squash --admin` after pr-gate + parity green.
-  The 2026-09-11 provider-level OCR outage was transient; wave 59
-  reviewed normally.
+  The 2026-09-11 provider-level OCR outage was transient; waves 59-60
+  reviewed normally. After parallel agents, CHECK the main checkout:
+  wave 60 left stray formatter churn in 5 files (wrong line length +
+  isort reorder); discarded with `git checkout --` before pulling.
 
-## Waves 33-59 (since the 2026-08-31 refresh)
+## Waves 33-60 (since the 2026-08-31 refresh)
 
 | PR | Issue | What | Numbers |
 |----|-------|------|---------|
@@ -109,6 +131,8 @@ process-PRs -> gate loop. This file is the resume point.*
 | #1498 | #1497 | wave57: astdiff type-snapshot builder port (`rust_snapshot_type`, new `astdiff_snapshot.rs` ~630 lines; order-sensitive arms call Python `set`/`sorted`; generic-Callable/Partial defer) | testfinegrained 75,713 @ 98.3% (1,263 defers, 100% generic CallableType), finegrainedcache 31,120 @ 98.05%, daemon 631 @ 100%; cargo 2,736/11; testtypes 3,291/6 (+9 NativeAstdiffSnapshotSuite); testcheck exact; self-check clean |
 | #1501 | #1500 | wave58: astdiff symbol/definition snapshot builder port (`rust_snapshot_symbol_table`, new `astdiff_symbols.rs` ~570 lines; slice-1 walk factored `pub(crate)`; per-node Python callback only for the generic-CallableType leaf) | testfinegrained 7,580 @ 100%, finegrainedcache 3,384 @ 100%, daemon 97 @ 100%, 0 whole-table defers; cargo 2,736/11; testtypes 3,298/6 (+7); testcheck exact; fine-grained 747/27, daemon 37, merge 41/1, diff 79; self-check clean. OCR provider-level failure -> manual review |
 | #1504 | #1503 | wave59: fixed-format cache meta writer port (`rust_write_cache_meta`/`_ex` live-object walkers + `write_errors`/`write_json*`; cache.rs; wire.rs gains `write_bytes*`/`write_str_list`/`write_big_int`/tagged JSON writer; build.py native-first with Python `WriteBuffer` fallback; version prefix stays Python) | byte-parity battery + native-read round-trip; cold self-check 808+808 meta writes @ 100% native, 0 defers; warm run consumes Rust-written cache; cargo 2,739/11 (+3); testtypes 3,309/6 (+11); testcheck 8,198/15/7 exact; fine-grained 747/27, daemon 37, finegrainedcache 549/229; self-check clean |
+| #1508 | #1506 | wave60A: engagement audit of the 0-40% share seams (`MYPY_TK_W60A_AUDIT` probes, stripped) - 12 targets / 151 fallbacks classified; no ifta-class gate bug | docs-only; bucket table in AGENTS.md; gates exact (cargo 2,739/11, testtypes 3,309/6, testcheck 8,198/15/7, self-check clean) |
+| #1509 | #1507 | wave60B: singleton identity (`is_singleton_identity_type` FunctionLike arm + type-object `is_final` cascade), container decided-none sentinel, definition-free pretty delegation via `_pretty_wire_safe`; OCR fixes (singleton cascade + TypedDict traversal) | singleton 48 -> 0, container 36 -> 17, distinctly 44 -> 37, bare 9 -> 1, instantiate 68 floor; cargo 2,741/11 (+2); testtypes 3,321/6 (+12); testcheck 8,198/15/7 exact; fine-grained 747/27, daemon 37, finegrainedcache 549/229; self-check clean |
 
 Closed alongside: #1412, #1393 (F2 complete), #1397 (F3 partial,
 Instance/CallableType only), #1300, #1418 (closed 2026-09-05 with the
@@ -133,19 +157,20 @@ auto-closed it), #1485 (#1489 auto-closed it), #1490 (#1494
 auto-closed it), #1491 (#1492 auto-closed it), #1432 (unify.rs
 PolyModeGuard prev-restore + boolean labels, `dc1da15a4`), #1493
 (#1496 auto-closed it), #1497 (#1498 auto-closed it), #1500 (shipped
-in #1501, closed by hand), #1503 (#1504 auto-closed it).
+in #1501, closed by hand), #1503 (#1504 auto-closed it), #1506
+(#1508 auto-closed it), #1507 (#1509 + manual close).
 
 ## Open backlog (next waves; dispatch max ~2 port agents)
 
-1. **#624 (next slice)**: B1/B3 slice 1 shipped (meta writer; cache
-   read+write both native). Slice 2 (the module DATA payload:
-   `tree.write` / node deserialization, 45 `serialize()` methods in
-   nodes.py/types.py) is Phase G territory - it moves the graph
-   serialization the F/G plan owns, so do not slice it ad hoc. Other
-   candidates need a fresh audit: checkexpr/checker remaining seam
-   floors (see standing table) or a new module sweep
-   (`scripts/measure_native_share.py` per-seam table, rank non-100%
-   lines by absolute fallbacks).
+1. **#624 (next slice)**: the wave-60B surface is done (one floor:
+   instantiate_type_alias 68 = defaulted-alias-tvar `set_any_tvars`).
+   Remaining candidates: the wave-60A bucket table names a few
+   decidable-but-unlanded items (`restrict_subtype_away` check2 at 2
+   calls, `remove_dups` alias identity, `map_type_from_supertype`
+   ParamSpec/Overloaded expands) - small; or a fresh per-seam audit on
+   the next survey run. The module DATA payload (`tree.write` / node
+   deserialization, 45 `serialize()` methods) is Phase G - do not slice
+   ad hoc.
 2. **#624 (audited / deprioritized)**: B6 errors render-bundle is a
    documented negative (#1481: zero legacy-path traffic on the gate
    corpus) - do not rebuild speculatively. Semanal candidates stay
@@ -162,7 +187,8 @@ sgc 253 (icf 173 / apply_generic 69 / solve_defer 7 / multi_lower 4);
 ct 29; ifta var_pspec_tvt 80 / engine 47 / solve 5; dc-final-overlap
 67 (overlap kernel); join lkv wall 39; ama 120 contract floor; maptype
 timing-gap 5 (documented #1490 floor). Bucket tables in AGENTS.md
-(wave-47/48a/48b/49/53/55/56/57/58/59 entries) - do not re-derive.
+(wave-47/48a/48b/49/53/55/56/57/58/59 plus the wave-60A bucket table
+for the 12 small seams) - do not re-derive.
 
 ## Older session record
 
