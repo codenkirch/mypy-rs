@@ -11,19 +11,19 @@
 //! strangler-fig per-call contract).
 //!
 //! Deferred (return None):
-//!   * Overloaded, TypeAliasType, Parameters (unwritable after freshen).
-//!   * CallableType with a ParamSpecType variable (mirrors the expand path's
-//!     ParamSpec deferral; fresh ParamSpecs need prefix handling).
+//!   * Parameters (not freshened by the all-functions visitor).
 //!   * Instance with `extra_attrs` set.
 //!   * translated `last_known_value` that is not a LiteralType.
+//!   * alias expansion holes (missing snapshot / cycle) when a union arm
+//!     needs the resolver alias map.
 
 use std::collections::HashMap;
 
 use pyo3::prelude::*;
 
-use crate::expandtype::{expand_type_inner, make_type_normalized, EnvKey};
+use crate::expandtype::{expand_type_inner, make_type_normalized, EnvKey, FlatAliasGuard};
 use crate::setops::{union_item_can_be_false, union_item_can_be_true};
-use crate::typeinfo::TypeResolver;
+use crate::typeinfo::{NativeTypeResolver, TypeResolver};
 use crate::wire::{read_type, write_type, ReadBuffer, Type, WriteBuffer};
 
 /// `#[pyfunction]` entry for `freshen_all_functions_type_vars`. Returns
@@ -31,13 +31,19 @@ use crate::wire::{read_type, write_type, ReadBuffer, Type, WriteBuffer};
 /// non-generic fast path; `None` (Python `None`) when Rust cannot handle it.
 /// The Python shim advances `TypeVarId.next_raw_id` when `changed` and only
 /// decodes `wire_bytes` then.
+///
+/// The resolver installs the alias map for the internal expand arms (union
+/// flatten expands alias items, #1203); the shim re-links alias nodes in the
+/// decoded result through the same per-build map.
 #[pyfunction]
 #[allow(clippy::too_many_arguments, dead_code)]
 pub(crate) fn rust_freshen_all_functions_type_vars(
     start_raw_id: i64,
     type_bytes: &[u8],
     strict_optional: bool,
+    resolver: &NativeTypeResolver,
 ) -> Option<(i64, bool, Vec<u8>)> {
+    let _flat_alias_guard = FlatAliasGuard::install(resolver);
     let typ = read_type(&mut ReadBuffer::new(type_bytes), None).ok()?;
     let mut next_raw_id = start_raw_id;
     let mut changed = false;
@@ -458,8 +464,23 @@ pub(crate) fn freshen_type(
             })
         }
 
-        // Deferred: Overloaded handled above; Parameters (unwritable).
-        Type::Overloaded { .. } | Type::Parameters(_) => None,
+        // visit_overloaded (type_visitor.py:299-300): an Overloaded root
+        // reaches this visitor directly and each CallableType item is
+        // translated + freshened by this same arm.
+        Type::Overloaded { items } => {
+            let mut new_items = Vec::with_capacity(items.len());
+            for item in items {
+                let freshened = freshen_type(item, next_raw_id, changed, strict_optional)?;
+                // Overloaded items are CallableType by construction; a
+                // divergent shape defers to the Python visitor.
+                if !matches!(freshened, Type::CallableType { .. }) {
+                    return None;
+                }
+                new_items.push(freshened);
+            }
+            Some(Type::Overloaded { items: new_items })
+        }
+        Type::Parameters(_) => None,
 
         // visit_type_alias_type (expandtype.py:640-642): only the alias's
         // args are translated; the alias node itself is kept, so the wire
@@ -647,14 +668,11 @@ pub(crate) fn freshen_type(
                 return Some(translated);
             }
             // Freshen the declared type vars (expandtype.py:384-393).
+            // `new_unification_variable` is generic over the three kinds
+            // (types.py:770-772): fresh id (meta_level=1), fields kept.
             let mut tvmap: HashMap<EnvKey, Type> = HashMap::with_capacity(variables.len());
             let mut tvs: Vec<Type> = Vec::with_capacity(variables.len());
             for v in variables {
-                // ParamSpec fresh vars need prefix handling; defer to Python
-                // (mirrors the expand path's ParamSpec deferral).
-                if !matches!(v, Type::TypeVarType { .. }) {
-                    return None;
-                }
                 let key = var_env_key(v);
                 let mut fresh = fresh_type_var(v, *next_raw_id);
                 *next_raw_id += 1;
@@ -675,7 +693,8 @@ pub(crate) fn freshen_type(
     }
 }
 
-/// `TypeVarType.__eq__` env key: `(raw_id, meta_level, namespace)`.
+/// TypeVar-like env key: `(raw_id, meta_level, namespace)`, mirroring the
+/// shared `TypeVarId` comparison for all three kinds.
 fn var_env_key(v: &Type) -> EnvKey {
     match v {
         Type::TypeVarType {
@@ -683,14 +702,26 @@ fn var_env_key(v: &Type) -> EnvKey {
             meta_level,
             namespace,
             ..
+        }
+        | Type::ParamSpecType {
+            raw_id,
+            meta_level,
+            namespace,
+            ..
+        }
+        | Type::TypeVarTupleType {
+            raw_id,
+            meta_level,
+            namespace,
+            ..
         } => (*raw_id, *meta_level, namespace.clone()),
-        _ => unreachable!("freshen: non-TypeVarType variable"),
+        _ => unreachable!("freshen: non-TypeVarLike variable"),
     }
 }
 
 /// `new_unification_variable` + `TypeVarId.new(meta_level=1)`
-/// (types.py:631-633, 560-563): a TypeVarType with a fresh `raw_id` and
-/// `meta_level` 1 (so `namespace` reads as "" on wire encode).
+/// (types.py:770-772): every field kept, the id replaced by a fresh
+/// `(raw_id, meta_level=1, namespace="")` for all three type-var kinds.
 fn fresh_type_var(v: &Type, raw_id: i64) -> Type {
     match v {
         Type::TypeVarType {
@@ -712,11 +743,49 @@ fn fresh_type_var(v: &Type, raw_id: i64) -> Type {
             variance: *variance,
             meta_level: 1,
         },
-        _ => unreachable!("freshen: non-TypeVarType variable"),
+        Type::ParamSpecType {
+            prefix,
+            name,
+            fullname,
+            flavor,
+            upper_bound,
+            default,
+            ..
+        } => Type::ParamSpecType {
+            prefix: prefix.clone(),
+            name: name.clone(),
+            fullname: fullname.clone(),
+            raw_id,
+            namespace: String::new(),
+            flavor: *flavor,
+            upper_bound: upper_bound.clone(),
+            default: default.clone(),
+            meta_level: 1,
+        },
+        Type::TypeVarTupleType {
+            tuple_fallback,
+            name,
+            fullname,
+            upper_bound,
+            default,
+            min_len,
+            ..
+        } => Type::TypeVarTupleType {
+            tuple_fallback: tuple_fallback.clone(),
+            name: name.clone(),
+            fullname: fullname.clone(),
+            raw_id,
+            namespace: String::new(),
+            upper_bound: upper_bound.clone(),
+            default: default.clone(),
+            min_len: *min_len,
+            meta_level: 1,
+        },
+        _ => unreachable!("freshen: non-TypeVarLike variable"),
     }
 }
 
-/// `has_default` (types.py:635-637): false only for an AnyType with
+/// `has_default` (types.py:774-776): false only for an AnyType with
 /// `TypeOfAny.from_omitted_generics` (4).
 fn tvar_has_default(t: &Type) -> bool {
     let default = tvar_default(t);
@@ -726,7 +795,7 @@ fn tvar_has_default(t: &Type) -> bool {
     true
 }
 
-/// Set a TypeVarType's (already-expanded) default.
+/// Set a type variable's (already-expanded) default.
 fn set_typevar_default(t: Type, new_default: Type) -> Type {
     match t {
         Type::TypeVarType {
@@ -750,7 +819,49 @@ fn set_typevar_default(t: Type, new_default: Type) -> Type {
             variance,
             meta_level,
         },
-        _ => unreachable!("freshen: non-TypeVarType variable"),
+        Type::ParamSpecType {
+            prefix,
+            name,
+            fullname,
+            raw_id,
+            namespace,
+            flavor,
+            upper_bound,
+            meta_level,
+            default: _,
+        } => Type::ParamSpecType {
+            prefix,
+            name,
+            fullname,
+            raw_id,
+            namespace,
+            flavor,
+            upper_bound,
+            default: Box::new(new_default),
+            meta_level,
+        },
+        Type::TypeVarTupleType {
+            tuple_fallback,
+            name,
+            fullname,
+            raw_id,
+            namespace,
+            upper_bound,
+            min_len,
+            meta_level,
+            default: _,
+        } => Type::TypeVarTupleType {
+            tuple_fallback,
+            name,
+            fullname,
+            raw_id,
+            namespace,
+            upper_bound,
+            default: Box::new(new_default),
+            min_len,
+            meta_level,
+        },
+        _ => unreachable!("freshen: non-TypeVarLike variable"),
     }
 }
 
@@ -800,11 +911,13 @@ fn set_callable_variables(t: Type, tvs: Vec<Type>) -> Type {
     }
 }
 
-/// Unwrap a TypeVarType's `default`.
+/// Unwrap a type variable's `default`.
 fn tvar_default(t: &Type) -> &Type {
     match t {
-        Type::TypeVarType { default, .. } => default.as_ref(),
-        _ => unreachable!("freshen: non-TypeVarType variable"),
+        Type::TypeVarType { default, .. }
+        | Type::ParamSpecType { default, .. }
+        | Type::TypeVarTupleType { default, .. } => default.as_ref(),
+        _ => unreachable!("freshen: non-TypeVarLike variable"),
     }
 }
 

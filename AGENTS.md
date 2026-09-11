@@ -3443,6 +3443,52 @@ including:
     self-check clean 347, testtypes 3,350/6 (+7), testcheck
     8,198/15/7 exact, fine-grained 747/27, daemon 37.
 
+- wave-62C fresh/identity residue audit + ports (issue #1518): env-gated
+  leaf-reason probes (`MYPY_TK_W62C_AUDIT`, stripped before landing) on
+  the cold self-check ranked the three seams' post-wave-61 defers, then
+  all three retired natively.
+  - `rust_freshen_all_functions_type_vars` 33 -> 0 defers (779 calls,
+    100%): (a) top-level `Overloaded` items map through the visitor
+    (type_visitor.py:299-300) instead of deferring the root (7);
+    (b) `fresh_type_var`/`var_env_key`/`tvar_default`/`set_typevar_default`
+    generalized to ParamSpec/TypeVarTuple (types.py:770-772
+    `new_unification_variable` keeps every field and re-ids), retiring the
+    non-TypeVar `variables` defer (5); (c) the FFI gained the resolver
+    (`FlatAliasGuard` install), so the internal expand union arm expands
+    alias items (#1203), and the shim retries the decode once with
+    `fixup_wire_type(resolve_aliases=True)` (the #1224 contract) for
+    alias-surviving results (21).
+  - `rust_remove_dups` 26 -> 0 defers (41 calls, 100%): the FFI dedup now
+    uses `py_type_eq` (Python `__eq__` semantics: AnyType isinstance-only,
+    UnionType frozenset order-insensitive, CallableType flag exclusions)
+    and accepts alias-bearing rows; the shim gates on
+    `_dedup_alias_identity_sound` (one live alias object per fullname, so
+    the structural `(fullname, args)` key is injective) and retries the
+    list decode with `resolve_aliases=True`; `_restore_dedup_identity`
+    still returns the live first-occurrence rows. The two in-engine
+    `remove_dups` mirrors (`try_expanding_sum_type_to_union`,
+    `expand_for_target`) switched to the same py-eq helper.
+  - `rust_type_object_type_from_function` 18 -> 0 (1,838 calls, 100%):
+    15 `bind-self/expand` defers retired by `alias_ok=true` +
+    FlatAliasGuard at the composite entry (the #1496 alias decode already
+    re-links survivors), and 7 `alias-in-self` defers retired by alias
+    expansion in `collect_query_tvars` (resolver chain + the Python
+    `seen_aliases` guard). One `typeobj:map` event (named-tuple
+    `datetime._IsoCalendarDate` -> builtins.tuple) stays a Python-side
+    floor: the maptype element-preserving tuple fallback (maptype.py:226)
+    is not ported.
+  - `_resync_definitions_inner` (expandtype.py) tolerates the union-length
+    divergence alias-union flattening creates when the original subtree
+    carries no definitions, and pairs TypeAliasType args positionally.
+  Pins: `NativeFreshenSuite` (Overloaded, ParamSpec, alias union),
+  `NativeExpandTypeAliasSuite` (freshen alias union + direct alias),
+  `NativeRemoveDupsSuite` (6: identity end-to-end, unsound-alias
+  fallback, py-eq differentials), `NativeTypeObjectAliasDecodeSuite`
+  generic-self alias; plus 4 Rust `remove_dups_py_eq_inner` unit tests.
+  Gates: cargo 2,750/11, fmt + clippy clean, cold self-check clean 347,
+  testtypes 3,355/6 (+12), testcheck 8,198/15/7 exact, fine-grained
+  747/27, daemon 37, finegrainedcache 549/229.
+
 ## Pull Requests
 
 The default branch on this fork is `main` (not `master`). Always target

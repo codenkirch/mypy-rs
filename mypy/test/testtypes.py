@@ -1950,6 +1950,9 @@ class NativeFreshenSuite(Suite):
         self.fx = TypeFixture()
         self._old_active = mypy.expandtype._native_expand_type_active
         mypy.expandtype._set_native_expand_type_active(False)
+        # The freshen seam takes the resolver for its internal alias map;
+        # this fixture carries no aliases.
+        self.resolver = _type_kernel.build_native_resolver([], [])
 
     def tearDown(self) -> None:
         mypy.expandtype._set_native_expand_type_active(self._old_active)
@@ -1959,13 +1962,13 @@ class NativeFreshenSuite(Suite):
         t.write(buf)
         return buf.getvalue()
 
-    def assert_fresh_par(self, t: Type) -> None:
+    def assert_fresh_par(self, t: Type, resolver: Any = None) -> None:
         from mypy.expandtype import freshen_all_functions_type_vars
         from mypy.types import read_type as _read_type
 
         expected = freshen_all_functions_type_vars(t)
         call = _type_kernel.rust_freshen_all_functions_type_vars(
-            1000000, self._bytes_of(t), state.strict_optional
+            1000000, self._bytes_of(t), state.strict_optional, resolver or self.resolver
         )
         assert call is not None, f"rust freshen None for {t!r}"
         next_raw_id, changed, serialized = call
@@ -1979,12 +1982,17 @@ class NativeFreshenSuite(Suite):
         from librt.internal import ReadBuffer
 
         rt = _read_type(ReadBuffer(bytes(serialized)))
-        assert isinstance(rt, ProperType) and isinstance(rt, CallableType), str(rt)
-        for v in rt.variables:
-            assert v.id.meta_level == 1, f"var {v!r} not meta_level 1"
-            # TypeVarId.new() uses next_raw_id then increments (types.py:561),
-            # so the first fresh var gets exactly start_raw_id.
-            assert v.id.raw_id >= 1000000, f"var {v!r} raw_id not fresh"
+        if isinstance(rt, Overloaded):  # type: ignore[misc]
+            items = rt.items
+        else:
+            assert isinstance(rt, ProperType) and isinstance(rt, CallableType), str(rt)
+            items = [rt]
+        for item in items:
+            for v in item.variables:
+                assert v.id.meta_level == 1, f"var {v!r} not meta_level 1"
+                # TypeVarId.new() uses next_raw_id then increments (types.py:561),
+                # so the first fresh var gets exactly start_raw_id.
+                assert v.id.raw_id >= 1000000, f"var {v!r} raw_id not fresh"
 
     def test_generic_simple(self) -> None:
         c = CallableType(
@@ -2001,7 +2009,7 @@ class NativeFreshenSuite(Suite):
     def test_non_generic_changed_false(self) -> None:
         c = CallableType([self.fx.b], [ARG_POS], [None], self.fx.b, self.fx.function)
         call = _type_kernel.rust_freshen_all_functions_type_vars(
-            1000000, self._bytes_of(c), state.strict_optional
+            1000000, self._bytes_of(c), state.strict_optional, self.resolver
         )
         assert call is not None
         next_raw_id, changed, serialized = call
@@ -2037,6 +2045,75 @@ class NativeFreshenSuite(Suite):
         ret_union = UnionType.make_union([inner, self.fx.type_type])
         c = CallableType([self.fx.gt], [ARG_POS], [None], ret_union, self.fx.function)
         self.assert_fresh_par(c)
+
+    def test_overloaded_items(self) -> None:
+        # The all-functions visitor translates Overloaded roots through
+        # TypeTranslator.visit_overloaded and freshens each item; the seam
+        # used to defer the whole root.
+        c1 = CallableType(
+            [self.fx.t], [ARG_POS], [None], self.fx.t, self.fx.function, variables=[self.fx.t]
+        )
+        c2 = CallableType(
+            [self.fx.s], [ARG_POS], [None], self.fx.s, self.fx.function, variables=[self.fx.s]
+        )
+        self.assert_fresh_par(Overloaded([c1, c2]))
+
+    def test_paramspec_variables(self) -> None:
+        # ParamSpec `variables` take the generic new_unification_variable
+        # path (types.py:770-772) and P.args/P.kwargs splice; rendered
+        # through Python (the Rust renderer prints bare `*P`, pre-existing).
+        from mypy.expandtype import freshen_all_functions_type_vars
+        from mypy.types import read_type as _read_type
+
+        ps = ParamSpecType(
+            "P",
+            "P",
+            TypeVarId(5),
+            ParamSpecFlavor.BARE,
+            self.fx.o,
+            AnyType(TypeOfAny.special_form),
+        )
+        c = CallableType(
+            [ps.with_flavor(ParamSpecFlavor.ARGS), ps.with_flavor(ParamSpecFlavor.KWARGS)],
+            [ARG_STAR, ARG_STAR2],
+            [None, None],
+            self.fx.t,
+            self.fx.function,
+            variables=[ps],
+        )
+        expected = freshen_all_functions_type_vars(c)
+        call = _type_kernel.rust_freshen_all_functions_type_vars(
+            1000000, self._bytes_of(c), state.strict_optional, self.resolver
+        )
+        assert call is not None, f"rust freshen None for {c!r}"
+        next_raw_id, changed, serialized = call
+        assert changed and next_raw_id > 1000000
+        from librt.internal import ReadBuffer
+
+        rt = _read_type(ReadBuffer(bytes(serialized)))
+        assert isinstance(rt, ProperType) and isinstance(rt, CallableType)
+        assert_equal(str(rt), str(expected), "freshen ParamSpec signature")
+        assert isinstance(rt.variables[0], ParamSpecType)
+        assert rt.variables[0].id.meta_level == 1
+        assert rt.variables[0].id.raw_id >= 1000000
+
+    def test_alias_union_argument(self) -> None:
+        # Union[U, None] with U = Union[A, B]: the union arm expands the
+        # alias through the resolver snapshot and flattens it (#1203);
+        # `_resync_definitions` tolerates the item-count change (no defs).
+        alias = TypeAlias(
+            UnionType([self.fx.a, self.fx.b]), "mod.FreshenUnionAlias", "mod", -1, -1
+        )
+        resolver = _type_kernel.build_native_resolver([], [alias])
+        c = CallableType(
+            [UnionType([TypeAliasType(alias, []), NoneType()])],
+            [ARG_POS],
+            [None],
+            self.fx.a,
+            self.fx.function,
+            variables=[self.fx.t],
+        )
+        self.assert_fresh_par(c, resolver)
 
 
 class FreshVarCanonicalizerSuite(Suite):
@@ -5265,7 +5342,10 @@ class NativeExpandTypeDefinitionGateSuite(Suite):
         from mypy.expandtype import _serialize_type
 
         call = _type_kernel.rust_freshen_all_functions_type_vars(
-            TypeVarId.next_raw_id, _serialize_type(self._callee), state.strict_optional
+            TypeVarId.next_raw_id,
+            _serialize_type(self._callee),
+            state.strict_optional,
+            self._resolver,
         )
         assert call is not None, "Rust freshen_all deferred on definition-carrying callable"
         _next_raw_id, changed, _serialized = call
@@ -5501,6 +5581,65 @@ class NativeExpandTypeAliasSuite(Suite):
             self._assert_par(alias_t)
         finally:
             set_wire_alias_map({self.alias.fullname: self.alias})
+
+    def _freshen_par(self, typ: Type) -> Type:
+        from mypy.expandtype import freshen_all_functions_type_vars
+
+        on_result = cast(
+            Type, self._with_gate(True, lambda: freshen_all_functions_type_vars(typ))
+        )
+        off = str(self._with_gate(False, lambda: freshen_all_functions_type_vars(typ)))
+        assert_equal(str(on_result), off, f"freshen_all(alias) parity {typ}")
+        return on_result
+
+    def test_freshen_alias_union_argument(self) -> None:
+        # Union[U, None] with U = Union[A, B]: the union arm expands the
+        # alias through the resolver snapshot and flattens it (#1203), so
+        # `_resync_definitions` must ride the 2 -> 3 item change (no defs).
+        from mypy.nodes import TypeAlias
+        from mypy.wirefixup import set_wire_alias_map
+
+        union_alias = TypeAlias(UnionType([self.fx.a, self.fx.b]), "mod.U", "mod", -1, -1)
+        self._rebuild_resolver([self.alias, union_alias])
+        set_wire_alias_map({self.alias.fullname: self.alias, union_alias.fullname: union_alias})
+        try:
+            c = CallableType(
+                [UnionType([TypeAliasType(union_alias, []), NoneType()])],
+                [ARG_POS],
+                [None],
+                self.fx.a,
+                self.fx.function,
+                variables=[self.fx.t],
+            )
+            result = get_proper_type(self._freshen_par(c))
+            assert isinstance(result, CallableType)
+            arg = get_proper_type(result.arg_types[0])
+            assert isinstance(arg, UnionType)
+            assert len(arg.items) == 3
+            assert all(
+                type(i) is not TypeAliasType for i in arg.items
+            ), f"alias survived the flatten: {arg}"
+        finally:
+            self._rebuild_resolver([self.alias])
+            set_wire_alias_map({self.alias.fullname: self.alias})
+
+    def test_freshen_direct_alias_argument(self) -> None:
+        # A direct alias arg survives expansion (visit_type_alias_type
+        # keeps the node); the shim's alias-decode retry re-links the live
+        # TypeAlias and `_resync_definitions` pairs the alias args.
+        c = CallableType(
+            [TypeAliasType(self.alias, [self.fx.t])],
+            [ARG_POS],
+            [None],
+            self.fx.a,
+            self.fx.function,
+            variables=[self.fx.t],
+        )
+        result = get_proper_type(self._freshen_par(c))
+        assert isinstance(result, CallableType)
+        arg = result.arg_types[0]
+        assert isinstance(arg, TypeAliasType)
+        assert arg.alias is self.alias, "decoded alias not re-linked to live node"
 
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
@@ -10944,6 +11083,136 @@ class NativeTypeImplTruthinessSuite(Suite):
                 )
                 is not None
             ), f"rust_can_be_true_default_live did not engage for {t!r}"
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeRemoveDupsSuite(Suite):
+    """Parity for the alias-bearing `remove_dups` native path (#1518).
+
+    The Rust dedup speaks Python `__eq__` semantics (`py_type_eq`) and
+    accepts alias-bearing rows; the shim gates on an alias-identity
+    precondition (every fullname in the list maps to one live alias object)
+    that makes the structural `(fullname, args)` key equivalent to Python's
+    object-identity `TypeAliasType.__eq__`. When the precondition fails the
+    pure-Python body decides. Result rows re-link to the live input rows, so
+    the seam preserves identity end-to-end.
+    """
+
+    def setUp(self) -> None:
+        from librt.internal import ReadBuffer, WriteBuffer
+
+        import mypy.types as _types_mod
+
+        self._types_mod = _types_mod
+        # Bind the seam names the module-level try would have bound.
+        _types_mod._VisitorWriteBuffer = WriteBuffer  # type: ignore[attr-defined]
+        _types_mod._ReadBuffer = ReadBuffer  # type: ignore[attr-defined]
+        _types_mod.__dict__.setdefault("_rust_remove_dups", _type_kernel.rust_remove_dups)
+        self._orig_kernel_flag = _types_mod._VISITOR_HAS_TYPE_KERNEL
+        _types_mod._VISITOR_HAS_TYPE_KERNEL = True
+        self._orig_visitor_gate = _types_mod._native_visitor_active
+        self._orig_types_gate = _types_mod._native_visitor_types_active
+
+        from mypy.types import _set_native_visitor_resolver
+        from mypy.wirefixup import set_wire_alias_map, set_wire_typeinfo_map
+
+        self.fx = TypeFixture()
+        self.type_infos = _base_infos(self.fx)
+        self.alias = TypeAlias(
+            Instance(self.fx.std_listi, [self.fx.t]), "mod.DupAlias", "mod", -1, -1
+        )
+        self.resolver = _type_kernel.build_native_resolver(self.type_infos, [self.alias])
+        self.resolver.set_live_typeinfo_map({info.fullname: info for info in self.type_infos})
+        _set_native_visitor_resolver(self.resolver)
+        set_wire_typeinfo_map({info.fullname: info for info in self.type_infos})
+        set_wire_alias_map({self.alias.fullname: self.alias})
+        self._set_gates(True, True)
+
+    def tearDown(self) -> None:
+        from mypy.types import _set_native_visitor_resolver
+        from mypy.wirefixup import set_wire_alias_map, set_wire_typeinfo_map
+
+        set_wire_typeinfo_map(None)
+        set_wire_alias_map(None)
+        _set_native_visitor_resolver(None)
+        self._types_mod._VISITOR_HAS_TYPE_KERNEL = self._orig_kernel_flag
+        self._set_gates(self._orig_visitor_gate, self._orig_types_gate)
+
+    def _set_gates(self, visitor: bool, types: bool) -> None:
+        from mypy.types import _set_native_visitor_active, _set_native_visitor_types_active
+
+        _set_native_visitor_active(visitor)
+        _set_native_visitor_types_active(types)
+
+    def _dedup(self, types: list[Type], active: bool) -> list[Type]:
+        from mypy.types import remove_dups
+
+        self._set_gates(True, active)
+        try:
+            return remove_dups(types)
+        finally:
+            self._set_gates(True, self._orig_types_gate)
+
+    def _assert_par(self, types: list[Type]) -> list[Type]:
+        on = self._dedup(list(types), True)
+        off = self._dedup(list(types), False)
+        assert_equal([str(t) for t in on], [str(t) for t in off], "remove_dups parity")
+        return on
+
+    def test_alias_rows_parity_and_identity(self) -> None:
+        first = TypeAliasType(self.alias, [])
+        duplicate = TypeAliasType(self.alias, [])
+        none_row = NoneType()
+        result = self._assert_par([first, none_row, duplicate, self.fx.a])
+        assert len(result) == 3
+        # Native rows map back to the live first occurrences.
+        assert result[0] is first
+        assert result[1] is none_row
+        assert result[2] is self.fx.a
+
+    def test_alias_args_dedup(self) -> None:
+        a1 = TypeAliasType(self.alias, [self.fx.a])
+        a2 = TypeAliasType(self.alias, [self.fx.a])
+        a3 = TypeAliasType(self.alias, [self.fx.b])
+        result = self._assert_par([a1, a2, a3])
+        assert len(result) == 2
+        assert result[0] is a1 and result[1] is a3
+
+    def test_distinct_alias_objects_same_fullname_fall_back(self) -> None:
+        # Python's `TypeAliasType.__eq__` compares the alias OBJECT; two
+        # distinct objects sharing a fullname are unequal, so the shim's
+        # structural-key precondition must route to the pure-Python body.
+        other = TypeAlias(
+            Instance(self.fx.std_listi, [self.fx.t]), "mod.DupAlias", "mod", -1, -1
+        )
+        first = TypeAliasType(self.alias, [])
+        second = TypeAliasType(other, [])
+        from mypy.types import _dedup_alias_identity_sound
+
+        assert not _dedup_alias_identity_sound([first, second])
+        result = self._assert_par([first, second])
+        assert len(result) == 2
+        assert result[0] is first and result[1] is second
+
+    def test_py_eq_any_collapse(self) -> None:
+        # AnyType.__eq__ is isinstance-only: every Any equals every Any.
+        a1 = AnyType(TypeOfAny.special_form)
+        a2 = AnyType(TypeOfAny.from_error)
+        result = self._assert_par([a1, a2])
+        assert len(result) == 1 and result[0] is a1
+
+    def test_py_eq_union_order_insensitive(self) -> None:
+        # UnionType.__eq__ is frozenset(items): item order does not matter.
+        u1 = UnionType([self.fx.a, self.fx.b])
+        u2 = UnionType([self.fx.b, self.fx.a])
+        result = self._assert_par([u1, u2])
+        assert len(result) == 1 and result[0] is u1
+
+    def test_alias_nested_in_instance(self) -> None:
+        row1 = Instance(self.fx.gi, [TypeAliasType(self.alias, [self.fx.a])])
+        row2 = Instance(self.fx.gi, [TypeAliasType(self.alias, [self.fx.a])])
+        result = self._assert_par([row1, row2, self.fx.a])
+        assert len(result) == 2 and result[0] is row1
 
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
@@ -54857,6 +55126,49 @@ class NativeTypeObjectAliasDecodeSuite(Suite):
             assert_equal(str(on), str(off), "type_object_type alias-map-missing parity")
         finally:
             set_wire_alias_map({self.alias.fullname: self.alias})
+
+    def test_bind_self_generic_alias_argument(self) -> None:
+        # Generic self (`self: T`) with an alias argument: the bind_self
+        # solve arm expands with alias survivors allowed (alias_ok) and the
+        # parity tail re-links the live node (it used to defer pre-solve).
+        from mypy.typeops import _serialize_type
+
+        info = self.fx.ai
+        self_tv = TypeVarType(
+            "T",
+            "T",
+            TypeVarId(-1),
+            [],
+            Instance(info, []),
+            AnyType(TypeOfAny.from_omitted_generics),
+        )
+        sig = CallableType(
+            [self_tv, TypeAliasType(self.alias, [self.fx.t])],
+            [ARG_POS, ARG_POS],
+            [None, None],
+            NoneType(),
+            self.fx.function,
+            name="<init>",
+            variables=[self_tv],
+        )
+        raw = _type_kernel.rust_type_object_type_from_function(
+            _serialize_type(sig),
+            info,
+            info,
+            _serialize_type(self.fx.type_type),
+            False,
+            state.strict_optional,
+            False,
+            self._resolver,
+        )
+        assert raw is not None, "alias-bearing generic-self composite deferred"
+        off = self._with_gate(False, lambda: self._type_object(sig, info))
+        on = self._with_gate(True, lambda: self._type_object(sig, info))
+        assert_equal(str(on), str(off), "type_object_type generic-self alias parity")
+        assert isinstance(on, CallableType)
+        alias_arg = on.arg_types[0]
+        assert isinstance(alias_arg, TypeAliasType)
+        assert alias_arg.alias is self.alias, "decoded alias not re-linked to live node"
 
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
