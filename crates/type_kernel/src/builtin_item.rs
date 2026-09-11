@@ -33,9 +33,9 @@
 //! whose Python answer is `None`, plus any other type (the Python body
 //! falls off the end).
 //!
-//! Deferred (`decided=false` -> the pure-Python path re-runs): a
-//! `TypeAliasType` at any position where `get_proper_type` expansion is
-//! needed (the wire cannot resolve live aliases or snapshots), an
+//! A top-level `TypeAliasType` expands through the resolver's alias
+//! snapshot (an unsubstitutable alias or missing snapshot defers).
+//! Deferred (`decided=false` -> the pure-Python path re-runs): an
 //! `UnpackType` that does not normalize to a `builtins.tuple` instance
 //! (Python asserts there), a missing resolver snapshot (mro / bases /
 //! derivation path), a `make_simplified_union` /
@@ -72,13 +72,11 @@ fn encode_type(typ: &Type) -> Option<Vec<u8>> {
     Some(wbuf.into_bytes())
 }
 
-/// Wire `get_proper_type`: `TypeAliasType` cannot be expanded (live alias
-/// resolution is Python-only), so defer; every other variant is proper.
-fn get_proper_or_defer(typ: &Type) -> Option<&Type> {
-    match typ {
-        Type::TypeAliasType { .. } => None,
-        t => Some(t),
-    }
+/// Wire `get_proper_type`: expand a top-level `TypeAliasType` through the
+/// alias snapshot so the resulting type decodes without alias nodes; a
+/// missing snapshot / unsubstitutable alias defers.
+fn proper_or_expand(typ: &Type, resolver: &NativeTypeResolver) -> Option<Type> {
+    crate::checkexpr_functions::get_proper_or_expand(typ, resolver.alias_resolver())
 }
 
 /// Wire `isinstance(it, AnyType)` (checker.py:9526).
@@ -98,11 +96,9 @@ fn builtin_item_type_inner(
 ) -> Option<Option<Type>> {
     let r = resolver.resolver();
     match t {
-        // Instance: one of the 7 builtin containers with a non-empty args
-        // list and a first arg that is not Any -> that arg (checker.py:
-        // 9497-9511). Not-a-container / empty-args / Any are decided-None
-        // (Python's answer is None in all three); a TypeAliasType first
-        // arg defers (get_proper_type needs the live alias).
+        // Instance: one of the 7 builtin containers with a first arg that
+        // is not Any -> that arg (checker.py:9497-9511); not-a-container /
+        // empty-args / Any are decided-None. Aliases expand to the target.
         Type::Instance { type_ref, args, .. } => {
             if !BUILTIN_CONTAINERS.contains(&type_ref.as_str()) {
                 return Some(None);
@@ -112,26 +108,25 @@ fn builtin_item_type_inner(
                 // Unparameterized container: Python returns None.
                 None => return Some(None),
             };
-            let proper = get_proper_or_defer(first)?;
-            if is_any(proper) {
+            let proper = proper_or_expand(first, resolver)?;
+            if is_any(&proper) {
                 return Some(None);
             }
-            Some(Some(first.clone()))
+            Some(Some(proper))
         }
         // TupleType: normalize unpacks, then make_simplified_union of the
-        // items if none is Any (checker.py:9512-9527). An Any item is
-        // decided-None; a TypeAliasType item defers (get_proper_types
-        // would expand it from the live alias).
+        // items if none is Any (checker.py:9512-9527); Any is decided-None,
+        // alias items expand (the consumer calls get_proper_type).
         Type::TupleType { items, .. } => {
             let mut normalized = Vec::with_capacity(items.len());
             for it in items {
                 let item = match it {
                     Type::UnpackType { typ, .. } => {
-                        let unpacked = get_proper_or_defer(typ)?;
+                        let unpacked = proper_or_expand(typ, resolver)?;
                         // TypeVarTuple unpacks through its upper_bound.
                         let unpacked = match unpacked {
                             Type::TypeVarTupleType { upper_bound, .. } => {
-                                get_proper_or_defer(upper_bound)?
+                                proper_or_expand(upper_bound.as_ref(), resolver)?
                             }
                             other => other,
                         };
@@ -151,8 +146,8 @@ fn builtin_item_type_inner(
                 normalized.push(item);
             }
             for it in &normalized {
-                let proper = get_proper_or_defer(it)?;
-                if is_any(proper) {
+                let proper = proper_or_expand(it, resolver)?;
+                if is_any(&proper) {
                     return Some(None);
                 }
             }
@@ -163,7 +158,8 @@ fn builtin_item_type_inner(
         // fallback's mro (checker.py:9528-9534). No Mapping base in the
         // mro is decided-None (the Python loop falls through to None).
         Type::TypedDictType { fallback, .. } => {
-            let Type::Instance { type_ref, args, .. } = fallback.as_ref() else {
+            let proper_fallback = proper_or_expand(fallback, resolver)?;
+            let Type::Instance { type_ref, args, .. } = &proper_fallback else {
                 return None;
             };
             let snap = r.get(type_ref)?;

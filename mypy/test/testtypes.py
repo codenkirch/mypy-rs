@@ -55439,3 +55439,572 @@ class NativeCacheMetaWriterSuite(Suite):
         assert rust_writes[1][1] == self._ref(meta_ex, ex=True)
         # Gate off vs gate on produce identical files.
         assert_equal([(p, d) for p, d in rust_writes], [(p, d) for p, d in python_writes])
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeArgApproxAliasSuite(Suite):
+    """Wave-61B: alias expansion for `arg_approximate_similarity` (#1512).
+
+    The wave-61 audit pinned all 20 cold-self-check fallbacks to a
+    `TypeAliasType` operand reaching `get_proper_or_defer` (the wire alias
+    was treated as unexpandable). The seam expands a top-level alias
+    through the resolver's alias snapshot before the shape comparison; a
+    resolver without the snapshot still defers. Gate-off vs gate-on must
+    agree through the real `arg_approximate_similarity`.
+    """
+
+    def setUp(self) -> None:
+        from mypy.checkexpr import _set_native_checkexpr_active, _set_native_checkexpr_resolver
+        from mypy.nodes import TypeAlias
+
+        self.fx = TypeFixture()
+        self.alias = TypeAlias(self.fx.a, "mod.ArgAlias", "mod", -1, -1)
+        self._resolver = _type_kernel.build_native_resolver(_base_infos(self.fx), [self.alias])
+        _set_native_checkexpr_active(True)
+        _set_native_checkexpr_resolver(self._resolver)
+
+    def tearDown(self) -> None:
+        from mypy.checkexpr import _set_native_checkexpr_active, _set_native_checkexpr_resolver
+
+        _set_native_checkexpr_active(False)
+        _set_native_checkexpr_resolver(None)
+
+    def _with_gate(self, active: bool, fn: Callable[[], T]) -> T:
+        from mypy.checkexpr import _set_native_checkexpr_active
+
+        _set_native_checkexpr_active(active)
+        try:
+            return fn()
+        finally:
+            _set_native_checkexpr_active(True)
+
+    def _run(self, actual: Type, formal: Type) -> tuple[bool, bool]:
+        from mypy.checkexpr import arg_approximate_similarity
+
+        off = self._with_gate(False, lambda: arg_approximate_similarity(actual, formal))
+        on = self._with_gate(True, lambda: arg_approximate_similarity(actual, formal))
+        return off, on
+
+    def _seam(self, actual: Type, formal: Type, resolver: Any | None = None) -> bool | None:
+        from mypy.checkexpr import _serialize_type_for_checkexpr
+
+        return _type_kernel.rust_arg_approximate_similarity(
+            _serialize_type_for_checkexpr(actual),
+            _serialize_type_for_checkexpr(formal),
+            True,
+            resolver if resolver is not None else self._resolver,
+            False,
+        )
+
+    def test_seam_alias_operand_engages(self) -> None:
+        alias_t = TypeAliasType(self.alias, [])
+        assert self._seam(alias_t, self.fx.a) is True
+        assert self._seam(self.fx.a, alias_t) is True
+
+    def test_seam_alias_to_object_engages(self) -> None:
+        from mypy.nodes import TypeAlias
+
+        obj_alias = TypeAlias(self.fx.o, "mod.ObjAlias", "mod", -1, -1)
+        resolver = _type_kernel.build_native_resolver(_base_infos(self.fx), [obj_alias])
+        # A's MRO reaches object: formal=object, actual=A.
+        assert self._seam(self.fx.a, TypeAliasType(obj_alias, []), resolver) is True
+
+    def test_seam_defers_without_alias_snapshot(self) -> None:
+        empty = _type_kernel.build_native_resolver([], [])
+        assert self._seam(TypeAliasType(self.alias, []), self.fx.a, empty) is None
+
+    def test_gate_parity_alias_operand(self) -> None:
+        alias_t = TypeAliasType(self.alias, [])
+        off, on = self._run(alias_t, self.fx.a)
+        assert on == off
+        assert off is True
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeBuiltinItemAliasSuite(Suite):
+    """Wave-61B: alias expansion for `builtin_item_type` (#1512).
+
+    The wave-61 audit pinned all 17 cold-self-check fallbacks to alias
+    first args / tuple items. Python checks `get_proper_type(args[0])`
+    for Any and returns the arg; the only consumer immediately calls
+    `get_proper_type` on the result, so expanding the alias in Rust is
+    the same result through the public interface. The suite compares
+    `get_proper_type(result)` gate-off vs gate-on and asserts the direct
+    seam decides instead of deferring.
+    """
+
+    def setUp(self) -> None:
+        from mypy.checker import _set_native_checker_active, _set_native_checker_resolver
+        from mypy.nodes import TypeAlias
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        self.fx = TypeFixture()
+        self._type_infos = _base_infos(self.fx)
+        self.alias = TypeAlias(self.fx.a, "mod.ItemAlias", "mod", -1, -1)
+        self.any_alias = TypeAlias(AnyType(TypeOfAny.explicit), "mod.AnyItemAlias", "mod", -1, -1)
+        self._resolver = _type_kernel.build_native_resolver(
+            self._type_infos, [self.alias, self.any_alias]
+        )
+        _set_native_checker_active(True)
+        _set_native_checker_resolver(self._resolver)
+        set_wire_typeinfo_map({info.fullname: info for info in self._type_infos})
+
+    def tearDown(self) -> None:
+        from mypy.checker import _set_native_checker_active, _set_native_checker_resolver
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        _set_native_checker_active(False)
+        _set_native_checker_resolver(None)
+        set_wire_typeinfo_map(None)
+
+    def _with_gate(self, active: bool, fn: Callable[[], T]) -> T:
+        from mypy.checker import _set_native_checker_active
+
+        _set_native_checker_active(active)
+        try:
+            return fn()
+        finally:
+            _set_native_checker_active(True)
+
+    def _seam(self, typ: Type) -> tuple[bool, bytes | None] | None:
+        from mypy.checker import _serialize_type_for_checker
+
+        result = _type_kernel.rust_builtin_item_type(
+            _serialize_type_for_checker(typ), True, self._resolver
+        )
+        if result is None:
+            return None
+        decided, value = result
+        assert decided
+        return decided, None if value is None else bytes(value)
+
+    def _parity_str(self, typ: Type) -> str | None:
+        from mypy.checker import builtin_item_type
+
+        off = self._with_gate(False, lambda: builtin_item_type(typ))
+        on = self._with_gate(True, lambda: builtin_item_type(typ))
+        off_p = None if off is None else get_proper_type(off)
+        on_p = None if on is None else get_proper_type(on)
+        assert str(on_p) == str(off_p), f"builtin_item_type parity {typ!r}: {off_p!r} vs {on_p!r}"
+        return None if off_p is None else str(off_p)
+
+    def test_seam_instance_alias_returns_expanded_target(self) -> None:
+        from mypy.checker import _deserialize_type_from_checker
+
+        tp = Instance(self.fx.std_listi, [TypeAliasType(self.alias, [])])
+        result = self._seam(tp)
+        assert result is not None
+        _decided, value = result
+        assert value is not None
+        decoded = get_proper_type(_deserialize_type_from_checker(value))
+        assert isinstance(decoded, Instance)
+        assert str(decoded) == str(self.fx.a)
+
+    def test_seam_alias_to_any_decided_none(self) -> None:
+        tp = Instance(self.fx.std_listi, [TypeAliasType(self.any_alias, [])])
+        result = self._seam(tp)
+        assert result == (True, None)
+
+    def test_seam_tuple_alias_item_engages(self) -> None:
+        tp = TupleType([TypeAliasType(self.alias, []), self.fx.b], self.fx.std_tuple)
+        result = self._seam(tp)
+        assert result is not None
+        _decided, value = result
+        assert value is not None
+
+    def test_seam_defers_without_alias_snapshot(self) -> None:
+        from mypy.checker import _serialize_type_for_checker
+
+        empty = _type_kernel.build_native_resolver([], [])
+        tp = Instance(self.fx.std_listi, [TypeAliasType(self.alias, [])])
+        assert (
+            _type_kernel.rust_builtin_item_type(
+                _serialize_type_for_checker(tp), True, empty
+            )
+            is None
+        )
+
+    def test_gate_parity_instance_alias(self) -> None:
+        tp = Instance(self.fx.std_listi, [TypeAliasType(self.alias, [])])
+        assert self._parity_str(tp) == str(self.fx.a)
+
+    def test_gate_parity_alias_to_any(self) -> None:
+        tp = Instance(self.fx.std_listi, [TypeAliasType(self.any_alias, [])])
+        assert self._parity_str(tp) is None
+
+    def test_gate_parity_tuple_alias_item(self) -> None:
+        tp = TupleType([TypeAliasType(self.alias, []), self.fx.b], self.fx.std_tuple)
+        assert self._parity_str(tp) is not None
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeNarrowWithLenAliasSuite(Suite):
+    """Wave-61B: alias expansion for `narrow_with_len` (#1512).
+
+    The wave-61 audit pinned 7 of 11 cold-self-check fallbacks to the
+    entry `get_proper_type` on a `TypeAliasType` and 4 more to a union
+    item the `can_be_narrowed_with_len` recursion could not expand. Both
+    helpers now expand through the alias snapshot, mirroring Python's
+    `get_proper_type`, and `can_be_narrowed_with_len` expands the type
+    before the `custom_special_method` check (Python expands inside it).
+    """
+
+    def setUp(self) -> None:
+        from mypy.checker import (
+            _set_native_checker_active,
+            _set_native_checker_resolver,
+            _set_native_checker_types_active,
+        )
+        from mypy.nodes import TypeAlias
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        self.fx = TypeFixture()
+        self._type_infos = _base_infos(self.fx)
+        self.tup = TupleType([self.fx.a, self.fx.b], self.fx.std_tuple)
+        self.alias = TypeAlias(self.tup, "mod.TupAlias", "mod", -1, -1)
+        self._resolver = _type_kernel.build_native_resolver(self._type_infos, [self.alias])
+        _set_native_checker_active(True)
+        _set_native_checker_types_active(True)
+        _set_native_checker_resolver(self._resolver)
+        set_wire_typeinfo_map({info.fullname: info for info in self._type_infos})
+
+    def tearDown(self) -> None:
+        from mypy.checker import (
+            _set_native_checker_active,
+            _set_native_checker_resolver,
+            _set_native_checker_types_active,
+        )
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        _set_native_checker_active(False)
+        _set_native_checker_types_active(False)
+        _set_native_checker_resolver(None)
+        set_wire_typeinfo_map(None)
+
+    def _with_gate(self, active: bool, fn: Callable[[], T]) -> T:
+        from mypy.checker import _set_native_checker_active
+
+        _set_native_checker_active(active)
+        try:
+            return fn()
+        finally:
+            _set_native_checker_active(True)
+
+    def _seam(self, typ: Type, op: str, size: int, resolver: Any | None = None) -> Any:
+        from mypy.checker import _serialize_type_for_checker
+
+        return _type_kernel.rust_narrow_with_len(
+            _serialize_type_for_checker(typ),
+            op,
+            size,
+            True,
+            False,
+            resolver if resolver is not None else self._resolver,
+        )
+
+    def test_seam_alias_engages(self) -> None:
+        from mypy.checker import _deserialize_type_from_checker
+
+        alias_t = TypeAliasType(self.alias, [])
+        result = self._seam(alias_t, "==", 2)
+        assert result is not None
+        yes_bytes, no_bytes = result
+        yes = _deserialize_type_from_checker(bytes(yes_bytes))
+        no = _deserialize_type_from_checker(bytes(no_bytes))
+        assert str(yes) == str(self.tup)
+        assert isinstance(get_proper_type(no), UninhabitedType)
+
+    def test_seam_defers_without_alias_snapshot(self) -> None:
+        empty = _type_kernel.build_native_resolver([], [])
+        assert self._seam(TypeAliasType(self.alias, []), "==", 2, empty) is None
+
+    def test_seam_union_alias_item_engages(self) -> None:
+        from mypy.checker import _deserialize_type_from_checker
+
+        u = UnionType([TypeAliasType(self.alias, []), self.fx.a])
+        result = self._seam(u, "==", 2)
+        assert result is not None, "union item alias did not expand"
+        yes_bytes, no_bytes = result
+        assert _deserialize_type_from_checker(bytes(yes_bytes)) is not None
+        assert _deserialize_type_from_checker(bytes(no_bytes)) is not None
+
+    def test_can_be_narrowed_alias_engages(self) -> None:
+        from mypy.checker import _serialize_type_for_checker
+
+        result = _type_kernel.rust_can_be_narrowed_with_len(
+            _serialize_type_for_checker(TypeAliasType(self.alias, [])), self._resolver
+        )
+        assert result is True
+
+    def test_gate_parity_alias(self) -> None:
+        chk = TypeChecker.__new__(TypeChecker)
+        chk.options = Options()
+        alias_t = TypeAliasType(self.alias, [])
+
+        def run() -> tuple[Type, Type]:
+            return chk.narrow_with_len(alias_t, "==", 2)
+
+        off = self._with_gate(False, run)
+        on = self._with_gate(True, run)
+        assert str(on[0]) == str(off[0])
+        assert str(on[1]) == str(off[1])
+        assert str(off[0]) == str(self.tup)
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeOverlapCallableInstanceSuite(Suite):
+    """Wave-61B: `find_member("__call__")` arm of `is_overlapping_types`.
+
+    The wave-61 audit pinned 12 of 16 fallbacks to the
+    `CallableType`-vs-`Instance` arm that deferred because the operator
+    `find_member` fetch was unported. The arm now runs the live
+    `get_protocol_member_inner` fetch with find_member semantics and
+    recurses with the fetched callable, mirroring meet.py:783-792; the
+    callable side still degrades to its fallback when the fetched member
+    is not FunctionLike.
+    """
+
+    def setUp(self) -> None:
+        from mypy.join import (
+            _set_native_join_active,
+            _set_native_join_resolver,
+            _set_native_join_typeinfo_map,
+        )
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        self.fx = TypeFixture()
+        self._live_info: dict[str, TypeInfo] = {}
+        self._set_native_join_active = _set_native_join_active
+        self.info = self._class_with_call("mod.MeetCallableBox")
+        infos = _base_infos(self.fx) + list(self._live_info.values())
+        self._resolver = _type_kernel.build_native_resolver(infos, [])
+        self._resolver.set_live_typeinfo_map(dict(self._live_info))
+        typeinfo_map = {info.fullname: info for info in infos}
+        set_wire_typeinfo_map(typeinfo_map)
+        _set_native_join_active(True)
+        _set_native_join_resolver(self._resolver)
+        _set_native_join_typeinfo_map(typeinfo_map)
+
+    def tearDown(self) -> None:
+        from mypy.join import (
+            _set_native_join_active,
+            _set_native_join_resolver,
+            _set_native_join_typeinfo_map,
+        )
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        _set_native_join_active(False)
+        _set_native_join_resolver(None)
+        _set_native_join_typeinfo_map(None)
+        set_wire_typeinfo_map(None)
+
+    def _class_with_call(self, fullname: str) -> TypeInfo:
+        info = self.fx.make_type_info(fullname)
+        info.mro = [info, self.fx.oi]
+        node = FuncDef("__call__", [], None, None)
+        node.info = info
+        node.type = CallableType(
+            [Instance(info, []), self.fx.a],
+            [ARG_POS, ARG_POS],
+            ["self", "x"],
+            self.fx.o,
+            self.fx.function,
+        )
+        node.line = 1
+        node.column = 1
+        info.names["__call__"] = SymbolTableNode(MDEF, node)
+        self._live_info[fullname] = info
+        return info
+
+    def _with_gate(self, active: bool, fn: Callable[[], T]) -> T:
+        self._set_native_join_active(active)
+        try:
+            return fn()
+        finally:
+            self._set_native_join_active(True)
+
+    def _parity(self, left: Type, right: Type) -> bool:
+        off = self._with_gate(False, lambda: is_overlapping_types(left, right))
+        on = self._with_gate(True, lambda: is_overlapping_types(left, right))
+        assert on == off, f"is_overlapping_types parity: off={off} on={on}"
+        return on
+
+    def test_callable_instance_arm_engages(self) -> None:
+        from mypy.join import _serialize_type
+
+        left = Instance(self.info, [])
+        right = CallableType([self.fx.a], [ARG_POS], ["x"], self.fx.b, self.fx.function)
+        result = _type_kernel.rust_is_overlapping_types(
+            _serialize_type(left),
+            _serialize_type(right),
+            False,
+            False,
+            True,
+            self._resolver,
+        )
+        assert result is not None, "callable/instance overlap arm did not engage"
+        assert self._parity(left, right) == result
+
+    def test_callable_instance_arm_false_engages(self) -> None:
+        from mypy.join import _serialize_type
+
+        info = self.fx.make_type_info("mod.MeetUnrelatedBox")
+        info.mro = [info, self.fx.oi]
+        node = FuncDef("__call__", [], None, None)
+        node.info = info
+        node.type = CallableType(
+            [Instance(info, []), self.fx.b],
+            [ARG_POS, ARG_POS],
+            ["self", "x"],
+            self.fx.a,
+            self.fx.function,
+        )
+        node.line = 1
+        node.column = 1
+        info.names["__call__"] = SymbolTableNode(MDEF, node)
+        self._live_info[info.fullname] = info
+        infos = _base_infos(self.fx) + list(self._live_info.values())
+        resolver = _type_kernel.build_native_resolver(infos, [])
+        resolver.set_live_typeinfo_map(dict(self._live_info))
+
+        left = Instance(info, [])
+        right = CallableType([self.fx.a], [ARG_POS], ["x"], self.fx.b, self.fx.function)
+        result = _type_kernel.rust_is_overlapping_types(
+            _serialize_type(left), _serialize_type(right), False, False, True, resolver
+        )
+        assert result is not None, "callable/instance overlap arm did not engage"
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeAddClassTvarsFreeSuite(Suite):
+    """Wave-61B: free-result expansion in `add_class_tvars` (#1512).
+
+    The audit pinned all 8 cold-self-check fallbacks to
+    `expand_type_by_instance_core_alias` returning None: a bound
+    classmethod signature carrying its own fresh TypeVar (e.g.
+    `dict.fromkeys`) left that var unbound after substituting the
+    receiver's class vars. Python's `expand_type_by_instance` never
+    defers there; the following `freeze_all_type_vars` (already run by
+    the shim on the decoded result) reifies the leftover var. The
+    CallableType arm now uses the free variant, matching the IAMA member
+    tail. Gate-off vs gate-on must produce the same rendered type.
+    """
+
+    def setUp(self) -> None:
+        from mypy.checkmember import (
+            _set_native_checkmember_active,
+            _set_native_checkmember_resolver,
+        )
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        self.fx = TypeFixture()
+        self._type_infos = _base_infos(self.fx)
+        self._resolver = _type_kernel.build_native_resolver(self._type_infos, [])
+        _set_native_checkmember_active(True)
+        _set_native_checkmember_resolver(self._resolver)
+        set_wire_typeinfo_map({info.fullname: info for info in self._type_infos})
+        # Production class tvars carry the class fullname as namespace;
+        # make_type_info leaves it empty, and the Rust env keys class tvars
+        # by (raw_id, class fullname). Namespace the fixture tvar.
+        self.ns_t = self.fx.gi.defn.type_vars[0]
+        self.ns_t.id.namespace = self.fx.gi.fullname
+        self.s = TypeVarType(
+            "S", "S", TypeVarId(50), [], self.fx.o, AnyType(TypeOfAny.special_form)
+        )
+        self.method = CallableType(
+            [Instance(self.fx.gi, [self.ns_t]), self.s],
+            [ARG_POS, ARG_POS],
+            ["cls", "x"],
+            Instance(self.fx.gi, [self.ns_t]),
+            self.fx.function,
+            variables=[self.s],
+        )
+        self.isuper = Instance(self.fx.gi, [self.fx.a])
+
+    def tearDown(self) -> None:
+        from mypy.checkmember import (
+            _set_native_checkmember_active,
+            _set_native_checkmember_resolver,
+        )
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        _set_native_checkmember_active(False)
+        _set_native_checkmember_resolver(None)
+        set_wire_typeinfo_map(None)
+
+    def _with_gate(self, active: bool, fn: Callable[[], T]) -> T:
+        from mypy.checkmember import _set_native_checkmember_active
+
+        _set_native_checkmember_active(active)
+        try:
+            return fn()
+        finally:
+            _set_native_checkmember_active(True)
+
+    def _mx(self) -> Any:
+        import contextlib
+
+        from mypy.checkmember import MemberContext
+
+        return MemberContext(
+            is_lvalue=False,
+            is_super=False,
+            is_operator=False,
+            original_type=self.method,
+            context=NameExpr("x"),
+            chk=cast(
+                Any,
+                SimpleNamespace(
+                    msg=SimpleNamespace(
+                        fail=lambda *a: None,
+                        note=lambda *a: None,
+                        filter_errors=lambda *a, **kw: contextlib.nullcontext(),
+                        disable_type_names=lambda: contextlib.nullcontext(),
+                    )
+                ),
+            ),
+            self_type=self.isuper,
+        )
+
+    def test_seam_free_expansion_engages(self) -> None:
+        from mypy.checkmember import (
+            _deserialize_type_for_checkmember,
+            _serialize_type_for_checkmember,
+            add_class_tvars,
+        )
+        from mypy.typeops import freeze_all_type_vars
+
+        expected = self._with_gate(
+            False, lambda: add_class_tvars(self.method, self.isuper, True, self._mx(), is_trivial_self=True)
+        )
+        result = _type_kernel.rust_add_class_tvars(
+            self._resolver,
+            _serialize_type_for_checkmember(self.method),
+            _serialize_type_for_checkmember(self.isuper),
+            True,
+            True,
+            False,
+            b"",
+            TypeVarId.next_raw_id,
+            True,
+        )
+        assert result is not None, "free expansion deferred on a leftover method tvar"
+        _next_raw_id, _changed, wire_bytes = result
+        decoded = _deserialize_type_for_checkmember(bytes(wire_bytes), freeze=True)
+        assert decoded is not None
+        freeze_all_type_vars(decoded)
+        assert str(decoded) == str(expected)
+
+    def test_gate_parity_leftover_method_tvar(self) -> None:
+        from mypy.checkmember import add_class_tvars
+
+        mx = self._mx()
+
+        def run() -> Type:
+            return add_class_tvars(
+                self.method, self.isuper, True, mx, is_trivial_self=True
+            )
+
+        off = self._with_gate(False, run)
+        on = self._with_gate(True, run)
+        assert str(on) == str(off), f"add_class_tvars parity: {off!r} vs {on!r}"

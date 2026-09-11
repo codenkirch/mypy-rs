@@ -89,7 +89,7 @@ fn get_proper_or_none(typ: &Type) -> Option<&Type> {
 /// callers and checker_helpers alias expansion).
 pub(crate) fn get_proper_or_expand(
     typ: &Type,
-    aliases: &crate::aliases::TypeAliasResolver,
+    aliases: &dyn crate::aliases::AliasLookup,
 ) -> Option<Type> {
     match typ {
         Type::TypeAliasType { .. } => {
@@ -97,6 +97,21 @@ pub(crate) fn get_proper_or_expand(
             Some(target)
         }
         _ => Some(typ.clone()),
+    }
+}
+
+/// `get_proper_type` for a `&TypeResolver`: expand a top-level
+/// `TypeAliasType` through the resolver's shared alias snapshot (the
+/// `TypeResolver.install_aliases` view) and return the proper type. Defers
+/// (`None`) when the snapshot is missing or the expansion cannot be
+/// performed exactly; every non-alias type is already proper.
+pub(crate) fn proper_or_expand_resolver(typ: &Type, res: &TypeResolver) -> Option<Type> {
+    match res.aliases() {
+        Some(aliases) => get_proper_or_expand(typ, &aliases),
+        None => match typ {
+            Type::TypeAliasType { .. } => None,
+            _ => Some(typ.clone()),
+        },
     }
 }
 

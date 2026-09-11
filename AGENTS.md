@@ -3361,6 +3361,49 @@ including:
     testcheck 8,198/15/7 exact, fine-grained 747/27, daemon 37,
     finegrainedcache 549/229, merge+diff 120/1, cold self-check clean
     347.
+- wave-61B audit + ports, five un-audited seams (wave 61, issue #1512):
+  env-gated defer-reason probes (`MYPY_TK_W61_AUDIT`, stripped before
+  landing; cold self-check, exact event counts). The audit pinned every
+  fallback to a single leaf reason per seam; the ports retired 68 of 72.
+  - `rust_arg_approximate_similarity` 144 / 20 -> 116 / 0: all 20 were
+    `TypeAliasType` operands at `get_proper_or_defer`; the seam expands
+    top-level aliases through the resolver snapshot (the call drop is the
+    retired Python fallback re-entries).
+  - `rust_builtin_item_type` 1,427 / 17 -> 1,427 / 0: all 17 were alias
+    first args / tuple items; the alias expands to its target, which the
+    only consumer immediately recovers with `get_proper_type`.
+  - `rust_add_class_tvars` 1,309 / 8 -> 1,314 / 0: all 8 were
+    `expand_type_by_instance_core_alias` defers where the bound
+    classmethod carries its own fresh tvar (`dict.fromkeys` 6,
+    `_pytest._code.code.ExceptionInfo.for_later` 2); the CallableType arm
+    now uses `expand_type_by_instance_free`, matching Python's
+    no-defer `expand_type_by_instance` + the shim's
+    `freeze_all_type_vars` (IAMA-tail pattern). The non-callable arm keeps
+    the core variant (Python does not freeze there).
+  - `rust_narrow_with_len` 273 / 11 -> 273 / 0: 7 entry aliases + 4
+    union-item alias recursions. `get_proper_type` expands through the
+    resolver snapshot, `can_be_narrowed_with_len` expands before
+    `custom_special_method` (Python expands inside it), and the union
+    loop passes the expanded item into the recursion. The shared
+    `custom_special_method_inner` TupleType arm reads the partial
+    fallback's definer directly instead of building `tuple_fallback`'s
+    item union (the union build deferred on alias items for no answer
+    change).
+  - `rust_is_overlapping_types` 968 / 16 -> 898 / 4: the 12
+    CallableType-vs-Instance defers now run the live
+    `find_member("__call__", instance, instance, is_operator=True)` fetch
+    (`get_protocol_member_inner`, find_member semantics) and recurse into
+    the fetched FunctionLike, mirroring meet.py:783-792. Floor: 4 step-6
+    `is_subtype` engine defers, all TypeType-left (3 `Type[...]` vs
+    `Callable(Extension)`, 1 `Union[Type[...]]` vs `Overloaded`) - the st
+    TypeType-vs-FunctionLike wall, untouched.
+  Pins: `NativeArgApproxAliasSuite`, `NativeBuiltinItemAliasSuite`,
+  `NativeNarrowWithLenAliasSuite`, `NativeOverlapCallableInstanceSuite`,
+  `NativeAddClassTvarsFreeSuite` (direct seam + gate-off/on parity,
+  alias-map-missing defers).
+  Gates: cargo 2,741/11, fmt + clippy clean, cold self-check clean 347,
+  testtypes 3,341/6 (+20 tests), testcheck 8,198/15/7 exact,
+  fine-grained 747/27, daemon 37, finegrainedcache 549/229.
 
 ## Pull Requests
 

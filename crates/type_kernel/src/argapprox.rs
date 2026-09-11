@@ -5,12 +5,11 @@
 //! function is deliberately loose: two types are similar when their shapes
 //! plausibly match.
 //!
-//! The wire `Type` enum cannot express `TypeAliasType` targets,
-//! `ErasedType`, `PartialType`, or `TypeGuardedType`, so every variant that
-//! would need `get_proper_type` expansion or a live `TypeInfo` reconstruction
-//! defers by returning `None`; the Python gate then falls through to the
-//! pure-Python implementation unchanged. This is the strangler-fig per-call
-//! gate: Rust decides only the cases it can decide with certainty.
+//! A top-level `TypeAliasType` expands through the resolver's alias
+//! snapshot (mirroring `get_proper_type`); a missing snapshot or a live
+//! `TypeInfo` reconstruction defers by returning `None`, and the Python
+//! gate falls through to the pure-Python implementation unchanged. This is
+//! the strangler-fig per-call gate.
 
 use pyo3::prelude::*;
 
@@ -33,13 +32,11 @@ fn decode(bytes: &[u8]) -> Option<Type> {
     read_type(&mut buf, None).ok()
 }
 
-/// `get_proper_type` for the wire format (checkexpr.py:7867-7868). The wire
-/// cannot expand `TypeAliasType` (no resolved target), so aliases defer.
-fn get_proper_or_defer(typ: &Type) -> Option<&Type> {
-    match typ {
-        Type::TypeAliasType { .. } => None,
-        t => Some(t),
-    }
+/// `get_proper_type` for the wire format (checkexpr.py:7867-7868). A
+/// `TypeAliasType` expands through the resolver's alias snapshot (mirroring
+/// the live `get_proper_type` chain); a missing snapshot defers.
+fn proper_or_defer(typ: &Type, res: &TypeResolver) -> Option<Type> {
+    crate::checkexpr_functions::proper_or_expand_resolver(typ, res)
 }
 
 fn any_type(type_of_any: i64) -> Type {
@@ -67,9 +64,9 @@ fn approx_union_any(
     for item in items {
         if !strict_optional {
             // relevant_items (types.py:3517-3522): when strict_optional is
-            // off, drop items whose proper type is NoneType. get_proper_type
-            // on a TypeAliasType is unexpandable -> defer.
-            let proper = get_proper_or_defer(item)?;
+            // off, drop items whose proper type is NoneType; a top-level
+            // alias expands through the resolver snapshot.
+            let proper = proper_or_defer(item, res)?;
             if matches!(proper, Type::NoneType) {
                 continue;
             }
@@ -151,12 +148,7 @@ fn erase_typevar(t: &Type, strict_optional: bool, res: &TypeResolver) -> Option<
                     false,
                 )
             } else {
-                let ub = match get_proper_or_defer(upper_bound.as_ref()) {
-                    Some(u) => u.clone(),
-                    None => {
-                        return None;
-                    }
-                };
+                let ub = proper_or_defer(upper_bound.as_ref(), res)?;
                 Some(ub)
             }
         }
@@ -197,15 +189,15 @@ fn tuple_fallback(t: &Type, strict_optional: bool, res: &TypeResolver) -> Option
         match item {
             Type::UnpackType { typ: inner, .. } => {
                 // get_proper_type(item.type) (typeops.py:201).
-                let unpacked = get_proper_or_defer(inner)?;
+                let unpacked = proper_or_defer(inner, res)?;
                 let unpacked = match unpacked {
                     Type::TypeVarTupleType { upper_bound, .. } => {
                         // get_proper_type(unpacked_type.upper_bound).
-                        get_proper_or_defer(upper_bound.as_ref())?
+                        proper_or_defer(upper_bound.as_ref(), res)?
                     }
                     t => t,
                 };
-                let Type::Instance { type_ref, args, .. } = unpacked else {
+                let Type::Instance { type_ref, args, .. } = &unpacked else {
                     return None; // raise NotImplementedError
                 };
                 if type_ref != "builtins.tuple" {
@@ -486,12 +478,12 @@ fn approx_proper(a: &Type, f: &Type, strict_optional: bool, res: &TypeResolver) 
 
 /// `arg_approximate_similarity` (checkexpr.py:7856-7916), full wire port.
 fn approx(a: &Type, f: &Type, strict_optional: bool, res: &TypeResolver) -> Option<bool> {
-    // get_proper_type (checkexpr.py:7867-7868): aliases defer.
-    let a = get_proper_or_defer(a)?;
-    let f = get_proper_or_defer(f)?;
+    // get_proper_type (checkexpr.py:7867-7868): aliases expand.
+    let a = proper_or_defer(a, res)?;
+    let f = proper_or_defer(f, res)?;
     // Erase typevars (checkexpr.py:7871-7874).
-    let a = erase_typevar(a, strict_optional, res)?;
-    let f = erase_typevar(f, strict_optional, res)?;
+    let a = erase_typevar(&a, strict_optional, res)?;
+    let f = erase_typevar(&f, strict_optional, res)?;
     approx_proper(&a, &f, strict_optional, res)
 }
 
@@ -523,8 +515,7 @@ pub(crate) fn rust_arg_approximate_similarity(
             return None;
         }
     };
-    let r = approx(&actual, &formal, strict_optional, resolver.resolver());
-    r
+    approx(&actual, &formal, strict_optional, resolver.resolver())
 }
 
 #[cfg(test)]

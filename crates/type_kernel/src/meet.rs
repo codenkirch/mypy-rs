@@ -2,11 +2,12 @@
 //!
 //! Mirrors `meet.py:450-774` on the wire `Type` enum. Returns `Some(bool)`
 //! when Rust fully decides, `None` so the Python shim falls through when a
-//! case needs a live `TypeInfo` (`TypeAliasType` expansion,
-//! `map_instance_to_supertype` of an unseen class, `find_member`,
-//! `are_parameters_compatible`, `is_callable_compatible`) or a recursive
-//! alias. This is the strangler-fig per-call gate; parity is asserted both
-//! directions in `mypy/test/testsubtypes.py::NativeOverlapSuite`.
+//! case needs a live `TypeInfo` (`map_instance_to_supertype` of an unseen
+//! class, `are_parameters_compatible`, `is_callable_compatible`) or a
+//! recursive alias. A top-level `TypeAliasType` operand expands through the
+//! resolver snapshot; the Callable-vs-Instance arm uses the live
+//! `find_member("__call__")` fetch. Parity is asserted in
+//! `mypy/test/testsubtypes.py::NativeOverlapSuite`.
 
 use std::collections::HashMap;
 
@@ -649,9 +650,49 @@ fn overlap_impl(
     if matches!(left, Type::CallableType { .. }) && matches!(right, Type::Instance { .. })
         || matches!(right, Type::CallableType { .. }) && matches!(left, Type::Instance { .. })
     {
-        // find_member("__call__") not ported -> defer.
-
-        return None;
+        // meet.py:783-792: find_member("__call__", instance, instance,
+        // is_operator=True); a FunctionLike member recurses the overlap
+        // with it, otherwise the callable side degrades to its fallback.
+        let (callable, instance) = if matches!(left, Type::CallableType { .. }) {
+            (&left, &right)
+        } else {
+            (&right, &left)
+        };
+        if !res.has_live_info_map() {
+            return None;
+        }
+        let fetch = pyo3::Python::with_gil(|py| {
+            crate::checker_helpers::get_protocol_member_inner(
+                py, instance, instance, "__call__", false, false, true, res,
+            )
+        });
+        match fetch {
+            Some(crate::checker_helpers::GetProtocolMemberResult::Found(call)) => {
+                let call_proper = match aliases {
+                    Some(a) => crate::checkexpr_functions::get_proper_or_expand(&call, a)?,
+                    None => get_proper(&call)?.clone(),
+                };
+                if matches!(
+                    call_proper,
+                    Type::CallableType { .. } | Type::Overloaded { .. }
+                ) {
+                    return overlap_impl(
+                        &call,
+                        callable,
+                        strict_optional,
+                        ignore_promotions,
+                        overlap_for_overloads,
+                        res,
+                        aliases,
+                        depth + 1,
+                    );
+                }
+            }
+            Some(crate::checker_helpers::GetProtocolMemberResult::NoneVal) => {}
+            Some(crate::checker_helpers::GetProtocolMemberResult::Defer) | None => {
+                return None;
+            }
+        }
     }
     let left = if let Type::CallableType { fallback, .. } = &left {
         fallback.as_ref().clone()
