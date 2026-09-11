@@ -3313,6 +3313,10 @@ def _pretty_wire_safe(typ: Type) -> bool:
             stack.extend(proper.items)
         elif isinstance(proper, TupleType):
             stack.extend(proper.items)
+        elif isinstance(proper, TypedDictType):
+            # The Rust formatter recurses into TypedDict item values with
+            # the pretty path enabled, so the guard must too.
+            stack.extend(proper.items.values())
         elif isinstance(proper, TypeType):
             stack.append(proper.item)
         elif isinstance(proper, UnpackType):

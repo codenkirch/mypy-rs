@@ -1992,9 +1992,12 @@ fn function_like_type_object_is_final(
     Some(read_bool_attr(info, "is_final").unwrap_or(false))
 }
 
-/// Mirror of `get_proper_type` for the wire: expand a top-level alias
-/// through the alias snapshot (chain + argument substitution); every other
-/// shape is returned as-is. `None` defers on a missing snapshot / cycle.
+/// Partial mirror of `get_proper_type` for the wire: expand a top-level
+/// alias through the alias snapshot (chain + argument substitution); every
+/// other shape is returned as-is. Unlike Python's `get_proper_type`,
+/// `TypeGuardedType` is not unwrapped (it is not expected as a callable
+/// `ret_type` / `upper_bound` in this path). `None` defers on a missing
+/// snapshot / cycle.
 fn proper_type_of(t: &Type, resolver: &NativeTypeResolver) -> Option<Type> {
     if matches!(t, Type::TypeAliasType { .. }) {
         let (target, _, _) =
