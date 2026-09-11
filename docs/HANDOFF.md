@@ -1,41 +1,46 @@
 # Handoff: strangler-fig Rust migration loop (seam-deferral reduction)
 
-*Written 2026-08-28, refreshed 2026-09-11 (post-wave61: waves 52-61
+*Written 2026-08-28, refreshed 2026-09-11 (post-wave62: waves 52-62
 landed the st find_member/unpack/apply-report ports (#1492, embedded
 112 -> 61), the icf SUBTYPE_OF protocol-actual arm (#1487), the
 plugin-synthesized TypeInfo registrar (#1489), the ctor-blob gate
 clearing (#1488), the alias-aware typeobj decode (#1496, decode_None
-60 -> 0), the two astdiff snapshot-builder slices (#1498/#1501, type
-98%+ and symbol 100% native), the fixed-format cache meta writer
-(#1504, byte-parity), the wave-60 audit + top-bucket ports (#1508 zero
-ports/no gate bug; #1509 singleton 48 -> 0, container 36 -> 17, format
-53 -> 38), and the wave-61 leftovers + five-seam retire (#1514
-restrict/maptype/covers; #1513 five un-audited seams 72 -> 4). Two
-docs-only negative closes also landed (B6 render bundle #1481; maptype
-timing-gap #1494 - the #1493 audit that followed disproved its own
-hypothesis and landed the alias-decode fix #1496 instead). Goal:
-"migrate all python code to rust, really all", pursued as the
-established measure -> file -> dispatch-agents -> process-PRs -> gate
-loop. This file is the resume point.*
+60 -> 0), the astdiff snapshot builders (#1498/#1501), the
+fixed-format cache meta writer (#1504, byte-parity), the wave-60/61
+audit + retire waves (#1508/#1509, #1513/#1514), and the wave-62
+max-parallel wave (D #1521 alias instantiation 68 -> 0 + pretty 37 ->
+0; C #1522 fresh 31 -> 0, remove_dups 26 -> 0, typeobj 18 -> 0; B
+#1523 protocol-member 7 -> 3; A #1524 join/meet 58 -> 22 net, with the
+wave-33 msu defer restored after a combined-tree fine-grained
+segfault). Two docs-only negative closes also landed (B6 render bundle
+#1481; maptype timing-gap #1494 - the #1493 audit that followed
+disproved its own hypothesis and landed the alias-decode fix #1496
+instead). Goal: "migrate all python code to rust, really all", pursued
+as the established measure -> file -> dispatch-agents -> process-PRs ->
+gate loop. This file is the resume point.*
 
-## Where main stands (2026-09-11, post-wave61)
+## Where main stands (2026-09-11, post-wave62)
 
-- `main` = `6f8a031e1` (wave-61B, `#1513`) on top of `530919b65`
-  (`#1514`, #1511), `65bb5d49e` (`#1510`), `6f74795ce` (`#1509`,
-  #1507), `dacf5f2d2` (`#1508`, #1506), `e37d7a7b6` (`#1505`),
-  `2a4f638fd` (`#1504`, #1503), `fc7a61dba` (`#1502`), `19ab01862`
-  (`#1501`, #1500), `f112dca00` (`#1499`), `e7205b87e` (`#1498`,
-  #1497), `89f161b91` (`#1496`, #1493), `fc9892ab4` (`#1495`) and
-  `5a5038ad2` (`#1494`, #1490); local ff'd to origin.
-- Phase state: unchanged since the wave-51 refresh (F0 audit + F1
-  dual-write mirror + F2 read flip landed; F3 write flip has Instance +
-  CallableType splice ops; the tvar/union splice slice profiled EMPTY -
-  not built).
-- Gates on the merged head `6f8a031e1`: cargo 2,746/11 ignored;
-  testtypes 3,343/6 skipped (kernel ON); testcheck 8,198/15/7 exact;
-  cold self-check clean (347 files); pr-gate + parity + parity-typeops
-  green on #1513/#1514.
-- Shared `.so` rebuilt 2026-09-11 at the merged head content (wave-61
+- `main` = `3d9b3b8fb` (Phase F brief, `#1525`) on top of `13e9e9f7b`
+  (`#1524`, #1516), `19d68949c` (`#1523`, #1517), `81a8149dd` (`#1522`,
+  #1518), `0bb6827cb` (`#1521`, #1519), `66e709794` (`#1515`),
+  `6f8a031e1` (`#1513`, #1512), `530919b65` (`#1514`, #1511),
+  `65bb5d49e` (`#1510`), `6f74795ce` (`#1509`, #1507), `dacf5f2d2`
+  (`#1508`, #1506), `e37d7a7b6` (`#1505`), `2a4f638fd` (`#1504`,
+  #1503), `fc7a61dba` (`#1502`), `19ab01862` (`#1501`, #1500),
+  `f112dca00` (`#1499`), `e7205b87e` (`#1498`, #1497), `89f161b91`
+  (`#1496`, #1493), `fc9892ab4` (`#1495`) and `5a5038ad2` (`#1494`,
+  #1490); local ff'd to origin.
+- Phase state: F3 is complete as implemented (Instance + CallableType
+  splices; the tvar/union slice is EMPTY, extra_attrs the only gap);
+  F4 cache-writer-first is rejected by the wave-62E brief - see
+  `docs/plans/2026-09-11-phase-f-next-steps.md` for the P1-P5 sequence
+  and follow-ups #1526/#1527/#1528.
+- Gates on the merged head `3d9b3b8fb`: cargo 2,769/11 ignored;
+  testtypes 3,381/6 skipped (kernel ON); testcheck 8,198/15/7 exact;
+  cold self-check clean (347 files); fine-grained 747/27, daemon 37;
+  pr-gate + parity + parity-typeops green on #1521-#1524.
+- Shared `.so` rebuilt 2026-09-11 at the merged head content (wave-62
   Rust, codesigned); `/private/tmp/mypy-rs-local-typekernel`.
 - Wave-56: the alias-aware typeobj decode retry
   (`_deserialize_type_with_aliases`, the #1224/#1309 contract) retired
@@ -95,6 +100,27 @@ loop. This file is the resume point.*
   gates re-run on the combined tree (a shared-file overlap in
   `argapprox.rs`/`checker_helpers.rs` auto-merged; cargo + testcheck +
   self-check verified).
+- Wave-62 (max-parallel, 4 agents + 1 brief): D (#1521)
+  `instantiate_type_alias` 68 -> 0 (defaults-only `set_any_tvars` tag
+  with native `expand_type` per default) and `format_type_distinctly`
+  37 -> 0 (per-callable `(func_name, first_arg)` hints via
+  `_pretty_hint`); C (#1522) `freshen_all_functions_type_vars` 31 -> 0,
+  `remove_dups` 26 -> 0 (`py_type_eq` + `_dedup_alias_identity_sound`
+  precondition), `type_object_type_from_function` kernel_none 18 -> 0;
+  B (#1523) `get_protocol_member` 7 -> 3 (class-Self key gate, inverted
+  `is_instance_var` polarity fixed, live attribute-hook probe) with
+  union/none/member-method floors re-affirmed; A (#1524) join/meet
+  58 -> 22 net (meet tuple arm 6 -> 0, cross-arm joins, nested alias
+  materialization) - its `msu(handle_recursive=False)` alias-expansion
+  sub-feature was REVERTED during merge: the combined tree segfaulted
+  in `testfinegrained` via exactly the wave-33
+  `join -> tuple_fallback -> msu -> is_subtype` loop, and the
+  `None => defer` guardrail is restored with its regression test.
+- Wave-62E (#1520/#1525): Phase F brief persisted at
+  `docs/plans/2026-09-11-phase-f-next-steps.md`; follow-ups #1526
+  (librt `write_raw_bytes` missing, wire cache inert), #1527 (mirror
+  graduation audit: capture 2.5-2.6x vs 10% gate, no CI coverage, dead
+  profiler hook), #1528 (daemon-stable handles blocked on weakrefs).
 - Runner note unchanged: the repo runner cannot re-register (403,
   admin-blocked; #1249 open); GH `ocr-review` jobs stay `queued`
   forever. The operative review gate is the local
@@ -104,10 +130,18 @@ loop. This file is the resume point.*
   reviewed normally. After parallel agents, CHECK the main checkout:
   wave 60 left stray formatter churn in 5 files (wrong line length +
   isort reorder); discarded with `git checkout --` before pulling.
-  Draft PRs must be `gh pr ready` before `gh pr merge` (wave 61A hit
-  the "still a draft" error once).
+  Draft PRs must be `gh pr ready` before `gh pr merge` (waves 61A/62A
+  hit the "still a draft" error once each). After a multi-PR rebase
+  chain, run the FINE-GRAINED suite on the combined tree, not just
+  cargo/testcheck/self-check: wave 62A's
+  `msu(handle_recursive=False)` alias expansion merged cleanly but
+  segfaulted the combined tree via the wave-33
+  join/tuple_fallback/msu loop, caught only by `testfinegrained`. The
+  local pre-commit comment-block hook (max 3 consecutive comment
+  lines) also blocks on otherwise-fine Rust comments; keep added
+  comment runs at 3 lines.
 
-## Waves 33-61 (since the 2026-08-31 refresh)
+## Waves 33-62 (since the 2026-08-31 refresh)
 
 | PR | Issue | What | Numbers |
 |----|-------|------|---------|
@@ -154,6 +188,11 @@ loop. This file is the resume point.*
 | #1509 | #1507 | wave60B: singleton identity (`is_singleton_identity_type` FunctionLike arm + type-object `is_final` cascade), container decided-none sentinel, definition-free pretty delegation via `_pretty_wire_safe`; OCR fixes (singleton cascade + TypedDict traversal) | singleton 48 -> 0, container 36 -> 17, distinctly 44 -> 37, bare 9 -> 1, instantiate 68 floor; cargo 2,741/11 (+2); testtypes 3,321/6 (+12); testcheck 8,198/15/7 exact; fine-grained 747/27, daemon 37, finegrainedcache 549/229; self-check clean |
 | #1514 | #1511 | wave61A: restrict check2 (`erase_instances=True`), maptype expand arms (FlatAliasGuard alias-union, ParamSpec splice, unpack interpolation/TVT default), covers Overloaded erase; latent `with_normalized_var_args` TVT fix | restrict 2 -> 0, maptype expand 10 -> 0, covers 1 -> 0; floors untouched (12 snap-miss, 1 tuple-super, 2 covers); cargo 2,746/11 (+5); testtypes 3,323/6; testcheck 8,198/15/7 exact; fine-grained family green; self-check clean; OCR 2 low advisories |
 | #1513 | #1512 | wave61B: five un-audited seams - alias expansion (arg similarity, builtin item), `expand_type_by_instance_free` for class tvars, alias/union len-narrow with proper-first special method, live `__call__` fetch for overlap | net 72 -> 4 fallbacks (arg 20->0, builtin 17->0, class tvars 8->0, narrow 11->0, overlap 16->4); cargo 2,746/11; testtypes 3,343/6 (+20); testcheck exact; rebased over #1514 with all gates re-run |
+| #1521 | #1519 | wave62D: defaulted alias-tvar fill tag (native `expand_type` per default) + per-callable pretty hints (`_pretty_hint` -> `apply_pretty_hint`) | instantiate_type_alias 68 -> 0, format_type_distinctly 37 -> 0; cargo 2,808/11; testtypes 3,350/6; testcheck exact; fine-grained 747/27, daemon 37 |
+| #1522 | #1518 | wave62C: freshen Overloaded/ParamSpec/TVT + resolver/alias decode retry; remove_dups `py_type_eq` + alias-identity precondition; typeobj `alias_ok` + FlatAliasGuard + `collect_query_tvars` alias chain | freshen 31 -> 0, remove_dups 26 -> 0, typeobj 18 -> 0; cargo 2,750/11; testtypes 3,355/6; testcheck exact; fine-grained 747/27, daemon 37 |
+| #1523 | #1517 | wave62B: protocol-member class-Self key gate + inverted `is_instance_var` fix + live attribute-hook probe; join structural-protocol parity guard | get_protocol_member 7 -> 3; union/none/AMM floors re-affirmed; cargo 2,752/11; testtypes 3,353/6; testcheck exact; fine-grained 747/27, daemon 37 |
+| #1524 | #1516 | wave62A: meet tuple arm, cross-arm instance joins with remap, nested alias materialization, TypeType default-arm parity fix; `msu(handle_recursive=False)` alias expansion REVERTED (wave-33 guardrail restored after a combined-tree fine-grained segfault) | join_types 21 -> 7, join_instances 17 -> 7, join_type_list 10 -> 7, meet_types 6 -> 0, join_tuples 4 -> 1; cargo 2,769/11; testtypes 3,352/6; testcheck exact; fine-grained 784/27 (fg+daemon) after the revert |
+| #1525 | #1520 | wave62E: Phase F next-steps scoping brief persisted (docs/plans/2026-09-11-phase-f-next-steps.md); follow-ups #1526/#1527/#1528 | docs-only |
 
 Closed alongside: #1412, #1393 (F2 complete), #1397 (F3 partial,
 Instance/CallableType only), #1300, #1418 (closed 2026-09-05 with the
@@ -180,25 +219,26 @@ PolyModeGuard prev-restore + boolean labels, `dc1da15a4`), #1493
 (#1496 auto-closed it), #1497 (#1498 auto-closed it), #1500 (shipped
 in #1501, closed by hand), #1503 (#1504 auto-closed it), #1506
 (#1508 auto-closed it), #1507 (#1509 + manual close), #1511 (#1514
-merged; closed by hand), #1512 (#1513 merged; closed by hand).
+merged; closed by hand), #1512 (#1513 merged; closed by hand), #1516,
+#1517, #1518 (closed by hand after the wave-62 merges), #1519 (#1521
+auto-closed it), #1520 (#1525 auto-closed it).
 
 ## Open backlog (next waves; dispatch max ~2 port agents)
 
-1. **#624 (next slice)**: wave 61 closed the wave-60A leftover list
-   except the documented floors. Remaining candidates: run the next
-   survey (`scripts/measure_native_share.py`) and rank the residual
-   non-100% seams again (the wave-61 ports shift the landscape); the
-   named un-audited items are nearly exhausted. The module DATA payload
-   (`tree.write` / node deserialization, 45 `serialize()` methods) is
-   Phase G - do not slice ad hoc. Two low OCR advisories left in
-   wave-61A (`argapprox.rs` stale Overloaded doc, `expandtype.rs`
-   `n - 2 + 2` allocation expression).
-2. **#624 (audited / deprioritized)**: B6 errors render-bundle is a
-   documented negative (#1481: zero legacy-path traffic on the gate
-   corpus) - do not rebuild speculatively. Semanal candidates stay
-   opt-in (`MYPY_ENABLE_NATIVE_SEMANAL`, perf-negative until the
-   serialize cost is cut).
-3. **#1249**: runner 403 - needs admin, skip until credentials change.
+1. **Phase F P1-P4** (recommended first): mirror graduation audit
+   (#1527), then CI coverage + F3 close-out, capture-overhead cut,
+   read-flip default-on; the cache-writer-first path is rejected (brief
+   #1520). Daemon-stable handles (#1528) come after; the librt
+   `write_raw_bytes` gap (#1526) blocks the cache splice until fixed.
+2. **#624 (seam work)**: wave 62 drained the fresh/join/alias/format
+   and five-seam lists; the residual seam fallbacks are the documented
+   engine floors (st extra_tvars channel, icf protocol-member engine,
+   IAMA contract floor, sgc/roc/ifta). Next seam wave needs a fresh
+   survey; do not re-audit the floors blind.
+3. **#624 (deprioritized)**: B6 errors render-bundle is a documented
+   negative (#1481). Semanal candidates stay opt-in
+   (`MYPY_ENABLE_NATIVE_SEMANAL`, perf-negative).
+4. **#1249**: runner 403 - needs admin, skip until credentials change.
 
 Standing audited floors (do NOT re-audit blind; the mechanism that
 would unlock each is noted): st 61 embedded (19 serfail + 42 kernel:
@@ -209,10 +249,12 @@ sgc 253 (icf 173 / apply_generic 69 / solve_defer 7 / multi_lower 4);
 ct 29; ifta var_pspec_tvt 80 / engine 47 / solve 5; dc-final-overlap
 67 (overlap kernel); join lkv wall 39; ama 120 contract floor; maptype
 timing-gap 5 (documented #1490 floor); is_overlapping_types 4 (st
-TypeType-left); instantiate_type_alias 68 (defaulted alias tvars);
-astdiff slice-1 generic-Callable callback. Bucket tables in AGENTS.md
-(wave-47/48a/48b/49/53/55/56/57/58/59/60A/61A/61B entries) - do not
-re-derive.
+TypeType-left); join residual 22 (st protocol-right 19, via-supertype
+generic tvar, wave-43 lkv guard, one NOT_READY wire-map entry); TD
+access 14 (checker-state `__setitem__`/`get`); astdiff slice-1
+generic-Callable callback. Bucket tables in AGENTS.md
+(wave-47/48a/48b/49/53/55/56/57/58/59/60A/61A/61B/62A-D entries) - do
+not re-derive.
 
 ## Older session record
 
