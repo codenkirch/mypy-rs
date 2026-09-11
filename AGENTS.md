@@ -3589,6 +3589,38 @@ including:
   747/27, daemon 37 (one flake on the first -n4 run, green on rerun),
   finegrainedcache 549/229.
 
+- wave 63A mirror graduation audit (#1527): first CI coverage for the
+  F1/F2 mirror (`parity-mirror` job: capture testtypes, capture+read
+  testcheck with the #1530 case deselected, capture+read fine-grained;
+  path filters add `mypy/types_mirror.py` / `mypy/types.py`), the
+  `Instance.extra_attrs` splice (`_FLIP_FIELDS` +
+  `rust_mirror_patch_instance_extra_attrs`), and an `ExtraAttrs.raw` wire
+  refinement so decoded records re-encode byte-exact (Python's
+  `write_type_map` insertion order cannot survive a `HashMap` round
+  trip; without it any multi-key splice reorders and drifts, a latent
+  bug the existing Instance ops shared). Capture cuts, all on the
+  opt-in path only: Python `_HANDLE_BY_ID` replaces the
+  `rust_mirror_handle_of` FFI on hot paths (59.8M crossings/self-check),
+  `_mirror_setattr` restructure with a construction fast path,
+  `_count` audit-gated, and mutation-time registration skipped for
+  objects no stored blob embeds (strike interactions 5.58M -> 0,
+  failed setattr serializations 0.77M -> 0, write-funnel strike skips
+  1.92M -> 0). Same-harness cold capture A/B: 290.1s -> 226.0s (-22.1%,
+  audit on); audit-free post-cut 217.4s vs 91.9s mirror-off. The
+  within-10% gate is NOT reachable by hot-path tuning; decision record
+  at `docs/plans/2026-09-11-mirror-capture-audit.md` (capture stays an
+  opt-in audit tool; ADR-0004 proxy is the graduation path; P4
+  default-on blocked on #1530). The first CI run found #1530: the F2
+  read flip serves pre-mutation blobs after in-place list writes
+  (typeanal.py:2069-2070), deselected in CI until fixed.
+  `misc/f3s9_tvar_union.py` dead `__setattr__` hook retired (the mirror
+  report is the per-field truth). Lazy recursive child registration was
+  tried and reverted: nested `write` calls re-adopt the child, so it
+  serializes twice per parent funnel instead of once. Gates: cargo
+  2,772/11 (+3), fmt + clippy clean, cold self-check 347, testtypes
+  3,385/6 both gate states, testcheck 8,198/15/7 exact both states,
+  fine-grained 747/27 + daemon 37 mirror-on (capture+read).
+
 ## Pull Requests
 
 The default branch on this fork is `main` (not `master`). Always target
