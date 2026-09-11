@@ -35,6 +35,7 @@ on:
       - mypy/types_mirror.py
       - mypy/test/testcheck.py
       - mypy/test/testtypes.py
+      - mypy/test/testfinegrained.py
       - mypy/test/testinfer.py
       - .github/workflows/native-kernel-parity.yml
   workflow_dispatch:
@@ -148,6 +149,7 @@ jobs:
     # CI. Capture + read flip exercise testtypes, testcheck, and the
     # fine-grained path (testcheck alone misses mirror identity cases).
     runs-on: ubuntu-latest
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
         with:
@@ -219,11 +221,9 @@ jobs:
           TEST_NATIVE_TYPE_MIRROR: "1"
           TEST_NATIVE_TYPE_MIRROR_READ: "1"
           MYPY_NATIVE_TYPE_KERNEL_REQUIRED: "1"
-        # Pre-existing F2 read-flip stale-blob bug (#1530): after in-place
-        # list writes the flip serves a pre-mutation blob; capture-only is
-        # green, so the known cases are deselected until #1530 lands
-        # (testVariadicStarArgsCallNoCrash on macOS, the parameter-spec
-        # case on linux).
+        # Pre-existing F2 read-flip stale-blob bug (#1530): capture-only is
+        # green, so the stale-blob cases (macOS testVariadicStarArgsCall,
+        # linux testRevealBoundParamSpecArgs) are deselected until it lands.
         run: |
           uv run python -m pytest mypy/test/testcheck.py -q -n4 \
             -k "not slow and not testVariadicStarArgsCallNoCrash and not testRevealBoundParamSpecArgs" \
