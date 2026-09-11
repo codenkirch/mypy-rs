@@ -108,12 +108,14 @@ from mypy.util import get_prefix
 try:
     from type_kernel import (
         rust_compare_symbol_table_snapshots as _rust_compare_symbol_table_snapshots,
+        rust_snapshot_symbol_table as _rust_snapshot_symbol_table,
         rust_snapshot_type as _rust_snapshot_type,
     )
 
     _HAS_TYPE_KERNEL = True
 except ImportError:
     _rust_compare_symbol_table_snapshots = None  # type: ignore[assignment]
+    _rust_snapshot_symbol_table = None  # type: ignore[assignment]
     _rust_snapshot_type = None  # type: ignore[assignment]
     _HAS_TYPE_KERNEL = False
 
@@ -202,6 +204,11 @@ def snapshot_symbol_table(name_prefix: str, table: SymbolTable) -> dict[str, Sym
     things defined in other modules are represented just by the names of
     the targets.
     """
+    # B7 slice 2 (#1500): native builder; `None` defers to the pure-Python body.
+    if _HAS_TYPE_KERNEL and _native_astdiff_active:
+        native = _rust_snapshot_symbol_table(name_prefix, table)
+        if native is not None:
+            return native
     result: dict[str, SymbolSnapshot] = {}
     for name, symbol in table.items():
         node = symbol.node

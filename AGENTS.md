@@ -3167,6 +3167,36 @@ including:
   testtypes 3,291/6 (+9 `NativeAstdiffSnapshotSuite`), testcheck
   8,198/15/7 exact, fine-grained 747/27, daemon 37, finegrainedcache
   549/229, cold self-check clean 347.
+- astdiff symbol/definition snapshot builders, B7 slice 2 (wave 58,
+  issue #1500): new `rust_snapshot_symbol_table(name_prefix, table)`
+  pyfunction (`crates/type_kernel/src/astdiff_symbols.rs`) mirrors
+  `snapshot_symbol_table` / `snapshot_definition` /
+  `snapshot_untyped_signature` (astdiff.py:195-583), building the
+  Python `dict[str, SymbolSnapshot]` in `table.items()` order. Node
+  dispatch: MypyFile (Moduleref), TypeVarExpr, TypeAlias,
+  ParamSpecExpr, TypeVarTupleExpr, then CrossRef vs definition by
+  `get_prefix(node.fullname) != name_prefix`; the definition arms
+  cover SYMBOL_FUNCBASE_TYPES (FuncDef / OverloadedFuncDef: `node.type`
+  signature else `snapshot_untyped_signature`, impl / property
+  setter_type / deprecated list / dataclass-transform spec), Var,
+  Decorator (recursive), and TypeInfo (attrs tuple, recursively
+  snapshotted nested table, sorted `(abstract)` entry). Type leaves
+  reuse the slice-1 walk; when it defers (generic `CallableType`) the
+  node is handed to the Python `astdiff.snapshot_type` callback so the
+  enclosing symbol snapshot still completes natively (per-node
+  fallback chosen over whole-call deferral; measured 0 whole-table
+  defers). `find_dataclass_transform_spec` is called through the live
+  Python function, keeping its own gate authoritative. Deferrals
+  (`None`): unknown / `None` node kinds (Python asserts), an
+  `UNBOUND_IMPORTED` kind, a non-str `fullname`, unreadable
+  attributes; `PyAttributeError` only maps to a defer (#1466/#1468).
+  Measured (env-gated audit on the fine-grained corpora, stripped
+  before landing): testfinegrained 7,580 calls @ 100% native /
+  0 defers; testfinegrainedcache 3,384 @ 100% / 0; testdaemon 97 @
+  100% / 0. Gates: cargo 2,736/11, fmt + clippy clean, testtypes
+  3,298/6 (+7 `NativeAstdiffSymbolSnapshotSuite`), testcheck
+  8,198/15/7 exact, fine-grained 747/27, daemon 37, finegrainedcache
+  549/229, testdiff 79, testmerge 41/1, cold self-check clean 347.
 
 ## Pull Requests
 

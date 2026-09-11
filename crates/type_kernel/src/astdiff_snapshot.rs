@@ -16,6 +16,11 @@
 //! kind, and any unreadable attribute. Per the #1466/#1468 contract only
 //! `PyAttributeError` maps to a defer; other PyErrs propagate so kernel
 //! bugs stay visible.
+//!
+//! B7 slice 2 (#1500) reuses the recursive walk (`SnapshotRefs`,
+//! `snapshot_value`, `snapshot_types`, `snapshot_optional`) from
+//! `astdiff_symbols.rs` for the signature/type fields of a symbol
+//! snapshot.
 
 use pyo3::exceptions::PyAttributeError;
 use pyo3::prelude::*;
@@ -25,7 +30,7 @@ use crate::refs::is_instance;
 
 /// `mypy.types` class objects plus builtins.sorted, resolved once per
 /// seam entry.
-struct SnapshotRefs<'py> {
+pub(crate) struct SnapshotRefs<'py> {
     unbound_type: &'py PyType,
     any_type: &'py PyType,
     none_type: &'py PyType,
@@ -51,7 +56,7 @@ struct SnapshotRefs<'py> {
 }
 
 impl<'py> SnapshotRefs<'py> {
-    fn try_new(py: Python<'py>) -> PyResult<Self> {
+    pub(crate) fn try_new(py: Python<'py>) -> PyResult<Self> {
         let types_mod = py.import("mypy.types")?;
         macro_rules! class {
             ($name:literal) => {{
@@ -101,7 +106,7 @@ pub(crate) fn rust_snapshot_type(py: Python<'_>, typ: &PyAny) -> PyResult<Option
 }
 
 /// Recursive dispatch mirroring `Type.accept(SnapshotTypeVisitor())`.
-fn snapshot_value(
+pub(crate) fn snapshot_value(
     py: Python<'_>,
     typ: &PyAny,
     refs: &SnapshotRefs<'_>,
@@ -235,7 +240,7 @@ fn snapshot_simple(py: Python<'_>, typ: &PyAny) -> PyResult<PyObject> {
 }
 
 /// `snapshot_types`: tuple of recursive snapshots.
-fn snapshot_types(
+pub(crate) fn snapshot_types(
     py: Python<'_>,
     seq: &PyAny,
     refs: &SnapshotRefs<'_>,
@@ -252,7 +257,7 @@ fn snapshot_types(
 
 /// `snapshot_optional_type`: truthiness gate then snapshot, else
 /// `("<not set>",)`.
-fn snapshot_optional(
+pub(crate) fn snapshot_optional(
     py: Python<'_>,
     typ: &PyAny,
     refs: &SnapshotRefs<'_>,
@@ -594,7 +599,11 @@ fn snapshot_union(
 
 /// `tuple(sorted(values))` via Python's own sort (set iteration order does
 /// not survive a Rust-side sort of the live object).
-fn sorted_tuple(py: Python<'_>, values: &PyAny, refs: &SnapshotRefs<'_>) -> PyResult<PyObject> {
+pub(crate) fn sorted_tuple(
+    py: Python<'_>,
+    values: &PyAny,
+    refs: &SnapshotRefs<'_>,
+) -> PyResult<PyObject> {
     let sorted = refs.sorted.call1((values,))?;
     sequence_to_tuple(py, sorted)
 }
@@ -627,6 +636,6 @@ fn sequence_to_tuple(py: Python<'_>, seq: &PyAny) -> PyResult<PyObject> {
 }
 
 /// Build a Python tuple from already-built elements.
-fn tuple_from(py: Python<'_>, elements: Vec<PyObject>) -> PyObject {
+pub(crate) fn tuple_from(py: Python<'_>, elements: Vec<PyObject>) -> PyObject {
     PyTuple::new(py, &elements).into()
 }

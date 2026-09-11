@@ -54727,3 +54727,231 @@ class NativeAstdiffSnapshotSuite(Suite):
         assert _type_kernel.rust_snapshot_type(42) is None
         with self.assertRaises(AttributeError):
             self._snapshot(42, True)
+
+
+class NativeAstdiffSymbolSnapshotSuite(Suite):
+    """Issue #1500 (B7 slice 2): native `astdiff.snapshot_symbol_table` port.
+
+    The direct seam call proves engagement; the gate-off vs gate-on
+    differential proves recursive dict/tuple equality (including the
+    nested class table and `(abstract)` entry) and `table.items()` order;
+    the generic-CallableType case proves the per-node Python type-snapshot
+    fallback still completes the symbol snapshot natively; the unknown /
+    ``None`` node cases prove the deferral contract (the pure-Python
+    fallback raises the identical AssertionError).
+    """
+
+    def setUp(self) -> None:
+        from mypy.server import astdiff
+
+        self.astdiff = astdiff
+        self.fx = TypeFixture()
+        self._prev_active = astdiff._native_astdiff_active
+        astdiff._set_native_astdiff_active(True)
+
+    def tearDown(self) -> None:
+        self.astdiff._set_native_astdiff_active(self._prev_active)
+
+    def _snapshot(self, prefix: str, table: Any, active: bool) -> Any:
+        self.astdiff._set_native_astdiff_active(active)
+        try:
+            return self.astdiff.snapshot_symbol_table(prefix, table)
+        finally:
+            self.astdiff._set_native_astdiff_active(True)
+
+    def _assert_parity(self, prefix: str, table: Any) -> Any:
+        off = self._snapshot(prefix, table, False)
+        on = self._snapshot(prefix, table, True)
+        assert_equal(on, off, "gate-on symbol snapshot differs")
+        assert list(on) == list(table), "snapshot must preserve table.items() order"
+        return on
+
+    def _func(
+        self,
+        name: str,
+        fullname: str,
+        typ: Any = None,
+        *,
+        is_property: bool = False,
+        is_trivial_body: bool = False,
+        deprecated: str | None = None,
+    ) -> FuncDef:
+        from mypy.nodes import Block
+
+        func = FuncDef(name, [Argument(Var("x"), self.fx.a, None, ARG_POS)], Block([]), typ)
+        func._fullname = fullname
+        func.is_property = is_property
+        func.is_trivial_body = is_trivial_body
+        func.deprecated = deprecated
+        return func
+
+    def _var(self, name: str, fullname: str, typ: Any = None) -> Var:
+        var = Var(name)
+        var._fullname = fullname
+        var.type = typ
+        return var
+
+    def _generic_callable(self) -> Any:
+        from mypy.types import CallableType
+
+        return CallableType(
+            [self.fx.a],
+            [ARG_POS],
+            ["x"],
+            self.fx.b,
+            self.fx.function,
+            variables=[self.fx.t],
+        )
+
+    def _type_info(self) -> TypeInfo:
+        from mypy.mro import calculate_mro
+        from mypy.nodes import Block, ClassDef, DataclassTransformSpec
+
+        nested = SymbolTable()
+        nested["m"] = SymbolTableNode(MDEF, self._func("m", "mod.C.m"))
+        # Property overload whose first item's func carries a spec, so the
+        # recursive Python find_dataclass_transform_spec fallback and the
+        # setter_type arm both run.
+        getter = self._func("prop", "mod.C.prop", is_property=True)
+        getter.dataclass_transform_spec = DataclassTransformSpec(field_specifiers=("x",))
+        getter_dec = Decorator(getter, [], self._var("prop", "mod.C.prop"))
+        getter_dec.var.setter_type = self.fx.callable(self.fx.a)
+        setter = self._func("prop", "mod.C.prop")
+        overloaded = OverloadedFuncDef(
+            [getter_dec, Decorator(setter, [], self._var("prop", "mod.C.prop"))]
+        )
+        overloaded._fullname = "mod.C.prop"
+        overloaded.deprecated = "use q"
+        nested["prop"] = SymbolTableNode(MDEF, overloaded)
+        # Generic signature: the slice-1 type walk defers and the shim
+        # must fall back to Python's snapshot_type for this node only.
+        nested["g"] = SymbolTableNode(MDEF, self._func("g", "mod.C.g", self._generic_callable()))
+        decorated = Decorator(
+            self._func("d", "mod.C.d"), [], self._var("d", "mod.C.d", self.fx.a)
+        )
+        nested["d"] = SymbolTableNode(MDEF, decorated)
+
+        cdef = ClassDef("C", Block([]))
+        cdef.fullname = "mod.C"
+        info = TypeInfo(nested, cdef, "mod")
+        cdef.info = info
+        info.bases = [self.fx.a]
+        calculate_mro(info)
+        info.metaclass_type = info.calculate_metaclass_type()
+        info.abstract_attributes = [("b", 2), ("a", 1)]
+        info.dataclass_transform_spec = DataclassTransformSpec(eq_default=True)
+        return info
+
+    def _table(self) -> SymbolTable:
+        from mypy.nodes import (
+            DataclassTransformSpec,
+            ParamSpecExpr,
+            TypeAlias,
+            TypeVarExpr,
+            TypeVarTupleExpr,
+        )
+        from mypy.types import Instance
+
+        table = SymbolTable()
+        table["f"] = SymbolTableNode(
+            GDEF, self._func("f", "mod.f", self._generic_callable())
+        )
+        untyped = self._func("uf", "mod.uf", is_trivial_body=True, deprecated="d")
+        untyped.dataclass_transform_spec = DataclassTransformSpec(order_default=True)
+        table["uf"] = SymbolTableNode(GDEF, untyped)
+        table["v"] = SymbolTableNode(MDEF, self._var("v", "mod.v", self.fx.a))
+        table["T"] = SymbolTableNode(
+            GDEF, TypeVarExpr("T", "mod.T", [self.fx.a], self.fx.o, self.fx.anyt, INVARIANT)
+        )
+        table["P"] = SymbolTableNode(
+            GDEF, ParamSpecExpr("P", "mod.P", self.fx.o, self.fx.anyt, INVARIANT)
+        )
+        table["Ts"] = SymbolTableNode(
+            GDEF,
+            TypeVarTupleExpr(
+                "Ts", "mod.Ts", self.fx.o, self.fx.std_tuple, self.fx.anyt, INVARIANT
+            ),
+        )
+        table["A"] = SymbolTableNode(
+            GDEF, TypeAlias(Instance(self.fx.std_listi, [self.fx.t]), "mod.A", "mod", -1, -1)
+        )
+        table["cross"] = SymbolTableNode(GDEF, self._func("c", "other.c"))
+        mod_file = MypyFile([], [])
+        mod_file._fullname = "other.mod"
+        table["modref"] = SymbolTableNode(GDEF, mod_file)
+        table["C"] = SymbolTableNode(GDEF, self._type_info())
+        return table
+
+    def test_gate_off_on_parity_full_fixture(self) -> None:
+        table = self._table()
+        snap = self._assert_parity("mod", table)
+        assert snap["cross"][0] == "CrossRef"
+        assert snap["cross"][2] == "FuncDef"
+        assert snap["modref"][0] == "Moduleref"
+        assert snap["T"][0] == "TypeVar"
+        assert snap["P"][0] == "ParamSpec"
+        assert snap["Ts"][0] == "TypeVarTuple"
+        assert snap["A"][0] == "TypeAlias"
+        assert snap["uf"][0] == "Func"
+        assert snap["uf"][7] is True, "is_trivial_body"
+        assert snap["uf"][9] == "d", "FuncDef.deprecated"
+        assert snap["v"][0] == "Var"
+
+    def test_type_info_nested_table_and_abstract(self) -> None:
+        snap = self._assert_parity("mod", self._table())
+        info_snap = snap["C"]
+        assert info_snap[0] == "TypeInfo"
+        nested = info_snap[3]
+        assert list(nested) == ["m", "prop", "g", "d", "(abstract)"], "nested order preserved"
+        assert nested["(abstract)"] == ("Abstract", (("a", 1), ("b", 2))), "abstract attrs sorted"
+        assert nested["m"][0] == "Func"
+        assert nested["d"][0] == "Decorator"
+        assert nested["d"][2][0] == "Instance", "Decorator var type snapshotted"
+        # dataclass-transform specs (overloaded first item; TypeInfo attr)
+        assert nested["prop"][8]["field_specifiers"] == ["x"]
+        assert info_snap[2][14]["eq_default"] is True
+        overloaded = nested["prop"]
+        assert overloaded[0] == "Func"
+        assert overloaded[9] == ["use q", None, None], "decorator deprecations collected"
+        # multi-part property setter type captured
+        assert overloaded[10][0] == "CallableType"
+
+    def test_engagement_direct_seam(self) -> None:
+        table = self._table()
+        raw = _type_kernel.rust_snapshot_symbol_table("mod", table)
+        assert raw is not None, "Rust snapshot_symbol_table did not engage"
+        assert isinstance(raw, dict)
+        assert_equal(raw, self._snapshot("mod", table, False))
+
+    def test_generic_signature_falls_back_per_node(self) -> None:
+        table = self._table()
+        generic = cast(Any, table["f"].node).type
+        assert _type_kernel.rust_snapshot_type(generic) is None
+        snap = self._assert_parity("mod", table)
+        # The symbol table is native even though the type leaf deferred.
+        assert _type_kernel.rust_snapshot_symbol_table("mod", table) is not None
+        assert snap["f"][6][0] == "CallableType"
+        assert snap["C"][3]["g"][6][0] == "CallableType"
+
+    def test_empty_table_is_native(self) -> None:
+        table = SymbolTable()
+        assert _type_kernel.rust_snapshot_symbol_table("mod", table) == {}
+        assert self._snapshot("mod", table, True) == {}
+
+    def test_unknown_node_defers(self) -> None:
+        from mypy.nodes import PlaceholderNode
+
+        table = SymbolTable()
+        table["p"] = SymbolTableNode(GDEF, PlaceholderNode("mod.p", Var("dummy"), -1))
+        assert _type_kernel.rust_snapshot_symbol_table("mod", table) is None
+        with self.assertRaises(AssertionError):
+            self._snapshot("mod", table, True)
+        with self.assertRaises(AssertionError):
+            self._snapshot("mod", table, False)
+
+    def test_none_node_defers(self) -> None:
+        table = SymbolTable()
+        table["x"] = SymbolTableNode(GDEF, None)
+        assert _type_kernel.rust_snapshot_symbol_table("mod", table) is None
+        with self.assertRaises(AssertionError):
+            self._snapshot("mod", table, True)
