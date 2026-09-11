@@ -3612,7 +3612,9 @@ including:
   opt-in audit tool; ADR-0004 proxy is the graduation path; P4
   default-on blocked on #1530). The first CI run found #1530: the F2
   read flip serves pre-mutation blobs after in-place list writes
-  (typeanal.py:2069-2070), deselected in CI until fixed.
+  (typeanal.py:2069-2070; macOS `testVariadicStarArgsCallNoCrash`,
+  linux `testRevealBoundParamSpecArgs`), both deselected in CI until
+  fixed.
   `misc/f3s9_tvar_union.py` dead `__setattr__` hook retired (the mirror
   report is the per-field truth). Lazy recursive child registration was
   tried and reverted: nested `write` calls re-adopt the child, so it

@@ -150,7 +150,8 @@ a field-preservation case that interleaves `args` / `last_known_value`.
 
 `native-kernel-parity.yml` gains a `parity-mirror` job:
 capture-only `testtypes`, capture+read `testcheck` (the known #1530
-case deselected), and capture+read fine-grained. `mypy/types_mirror.py`
-and `mypy/types.py` join the path filters. This is the first CI the
-mirror env has ever had; it immediately caught #1530, which was
-invisible on main.
+cases deselected: `testVariadicStarArgsCallNoCrash` on macOS,
+`testRevealBoundParamSpecArgs` on linux), and capture+read fine-grained.
+`mypy/types_mirror.py` and `mypy/types.py` join the path filters. This is
+the first CI the mirror env has ever had; it immediately caught #1530,
+which was invisible on main.
