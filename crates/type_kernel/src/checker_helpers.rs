@@ -753,6 +753,11 @@ fn join_one_pair(
     ctx: &SubtypeContext,
     resolver: &TypeResolver,
 ) -> Option<Type> {
+    // Python's join_types expands a top-level TypeAliasType operand at
+    // entry (get_proper_type); do it once here so every SameS/SameT
+    // mapping names the expanded operand, not the alias node.
+    let (left_p, right_p) = crate::setops::expand_top_alias_pair(left, right, resolver)?;
+    let (left, right) = (&left_p, &right_p);
     // Instance-Instance args-less nominal prejoin. Python's join_types
     // on such a pair never builds a fresh type: same-ref -> the left
     // operand, subtype -> the supertype, else the common ancestor.
