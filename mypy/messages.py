@@ -3266,6 +3266,60 @@ def find_type_overlaps(*types: Type) -> set[str]:
     return overlaps
 
 
+def _callable_pretty_wire_safe(c: CallableType) -> bool:
+    """True when `pretty_callable(c, options)` renders identically without
+    `c.definition` (which the wire format drops).
+
+    `pretty_callable` consults the definition for exactly two things: the
+    function name when `c.name` is empty, and a prepended special first
+    argument (`self`/`cls`) when the definition declares more parameters
+    than the callable's own signature. Everything else comes from the
+    callable fields the wire carries.
+    """
+    definition = get_func_def(c)
+    if definition is None:
+        return True
+    if c.name is None and isinstance(definition, FuncDef):
+        return False
+    if c.from_concatenate or not isinstance(definition, FuncDef):
+        first_arg = get_first_arg(c)
+    elif hasattr(definition, "arguments"):
+        names = [arg.variable.name for arg in definition.arguments]
+        first_arg = names[0] if len(names) > len(c.arg_names) and names[0] else None
+    else:
+        first_arg = get_first_arg(c)
+    return not (first_arg and not c.is_type_obj())
+
+
+def _pretty_wire_safe(typ: Type) -> bool:
+    """True when every callable in `typ` renders the same with the wire's
+    dropped `definition` (see `_callable_pretty_wire_safe`)."""
+    stack: list[Type] = [typ]
+    seen: set[int] = set()
+    while stack:
+        t = stack.pop()
+        proper = get_proper_type(t)
+        if id(proper) in seen:
+            continue
+        seen.add(id(proper))
+        if isinstance(proper, CallableType):
+            if not _callable_pretty_wire_safe(proper):
+                return False
+            stack.append(proper.ret_type)
+            stack.extend(proper.arg_types)
+        elif isinstance(proper, Instance):
+            stack.extend(proper.args)
+        elif isinstance(proper, UnionType):
+            stack.extend(proper.items)
+        elif isinstance(proper, TupleType):
+            stack.extend(proper.items)
+        elif isinstance(proper, TypeType):
+            stack.append(proper.item)
+        elif isinstance(proper, UnpackType):
+            stack.append(proper.type)
+    return True
+
+
 def format_type(
     typ: Type, options: Options, verbosity: int = 0, module_names: bool = False
 ) -> str:
@@ -3287,6 +3341,8 @@ def format_type(
                 verbosity,
                 module_names,
                 options.use_star_unpack(),
+                options.reveal_verbose_types,
+                _pretty_wire_safe(typ),
             )
             if result is not None:
                 return result
@@ -3317,6 +3373,8 @@ def format_type_bare(
                 verbosity,
                 module_names,
                 options.use_star_unpack(),
+                options.reveal_verbose_types,
+                _pretty_wire_safe(typ),
             )
             if result is not None:
                 return result
@@ -3341,7 +3399,12 @@ def format_type_distinctly(*types: Type, options: Options, bare: bool = False) -
         try:
             type_bytes_list = [_serialize_type_for_messages(t) for t in types]
             result = _type_kernel.rust_format_type_distinctly(
-                type_bytes_list, _native_messages_resolver, bare, options.use_star_unpack()
+                type_bytes_list,
+                _native_messages_resolver,
+                bare,
+                options.use_star_unpack(),
+                options.reveal_verbose_types,
+                all(_pretty_wire_safe(_t) for _t in types),
             )
             if result is not None:
                 return tuple(result)

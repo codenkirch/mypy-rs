@@ -2143,7 +2143,11 @@ fn conditional_join_inner(
 /// `rust_container_type`: join + node construction for list/set/dict literal types.
 ///
 /// Receives a tag ("list", "set", "dict") + already-serialized item types.
-/// Returns the container node serialized, or None to defer.
+/// Returns the container node serialized; `None` to defer to Python; Python
+/// `False` when the join was decided but the joined type fails
+/// `allow_fast_container_literal`, i.e. Python's `_first_or_join_fast_item`
+/// would return None too. The shim maps the `False` sentinel to "no
+/// container type" without re-running the pure-Python join.
 ///
 /// For list/set: `elements` is a flat list of serialized item types.
 /// For dict: `elements` is a flat list where the first `n_keys` elements
@@ -2152,14 +2156,14 @@ fn conditional_join_inner(
 #[pyfunction]
 #[pyo3(signature = (resolver, tag, elements, _ctx, n_keys))]
 #[allow(clippy::needless_pass_by_value)]
-pub(crate) fn rust_container_type<'py>(
-    py: Python<'py>,
+pub(crate) fn rust_container_type(
+    py: Python<'_>,
     resolver: &NativeTypeResolver,
     tag: &str,
     elements: Vec<Vec<u8>>,
     _ctx: Option<Vec<u8>>,
     n_keys: i64,
-) -> PyResult<Option<&'py PyBytes>> {
+) -> PyResult<Option<PyObject>> {
     let original_len = elements.len();
     // Decode all items; if any fail, treat as unsupported → defer.
     let items: Vec<Type> = elements
@@ -2178,10 +2182,10 @@ pub(crate) fn rust_container_type<'py>(
                 _ => unreachable!(),
             };
 
-            let vt = first_or_join_fast_item_inner(&items, resolver);
-            match vt {
-                None => Ok(None),
-                Some(vt) => {
+            match first_or_join_fast_item_inner(&items, resolver) {
+                FastItemOutcome::Defer => Ok(None),
+                FastItemOutcome::DecidedNone => Ok(Some(false.into_py(py))),
+                FastItemOutcome::Item(vt) => {
                     let t = Type::Instance {
                         type_ref: container_fullname.to_string(),
                         // Python's `named_generic_type` strips LKV from
@@ -2192,18 +2196,38 @@ pub(crate) fn rust_container_type<'py>(
                         extra_attrs: None,
                     };
                     match encode_type(&t) {
-                        Some(b) => Ok(Some(PyBytes::new(py, &b))),
+                        Some(b) => Ok(Some(PyBytes::new(py, &b).into_py(py))),
                         None => Ok(None),
                     }
                 }
             }
         }
         "dict" => match build_dict_type(resolver, &items, n_keys) {
-            None => Ok(None),
-            Some(bytes) => Ok(Some(PyBytes::new(py, &bytes))),
+            ContainerOutcome::Defer => Ok(None),
+            ContainerOutcome::DecidedNone => Ok(Some(false.into_py(py))),
+            ContainerOutcome::Bytes(b) => Ok(Some(PyBytes::new(py, &b).into_py(py))),
         },
         _ => Ok(None),
     }
+}
+
+/// Outcome of `first_or_join_fast_item_inner`.
+enum FastItemOutcome {
+    /// A decidable item/join; the container type is built from it.
+    Item(Type),
+    /// The join was decided but the joined type fails
+    /// `allow_fast_container_literal`, so Python's
+    /// `_first_or_join_fast_item` returns None; the caller skips it.
+    DecidedNone,
+    /// Undecidable here; the pure-Python fallback must run.
+    Defer,
+}
+
+/// Outcome of the dict builder: bytes, decided-none, or defer.
+enum ContainerOutcome {
+    Bytes(Vec<u8>),
+    DecidedNone,
+    Defer,
 }
 
 /// Strip `last_known_value` from a wire `Type`, mirroring
@@ -2234,31 +2258,42 @@ fn build_dict_type(
     resolver: &NativeTypeResolver,
     elements: &[Type],
     n_keys: i64,
-) -> Option<Vec<u8>> {
+) -> ContainerOutcome {
     if elements.is_empty() {
-        return None;
+        return ContainerOutcome::Defer;
     }
     if n_keys < 0 || n_keys as usize > elements.len() || n_keys >= elements.len() as i64 {
         // Must have at least one key and one value.
-        return None;
+        return ContainerOutcome::Defer;
     }
     let keys: Vec<Type> = elements[..n_keys as usize].to_vec();
     let values: Vec<Type> = elements[n_keys as usize..].to_vec();
     if keys.is_empty() || values.is_empty() {
-        return None;
+        return ContainerOutcome::Defer;
     }
 
-    let kt = first_or_join_fast_item_inner(&keys, resolver)?;
-    let vt = first_or_join_fast_item_inner(&values, resolver)?;
+    let kt = match first_or_join_fast_item_inner(&keys, resolver) {
+        FastItemOutcome::Item(t) => t,
+        FastItemOutcome::DecidedNone => return ContainerOutcome::DecidedNone,
+        FastItemOutcome::Defer => return ContainerOutcome::Defer,
+    };
+    let vt = match first_or_join_fast_item_inner(&values, resolver) {
+        FastItemOutcome::Item(t) => t,
+        FastItemOutcome::DecidedNone => return ContainerOutcome::DecidedNone,
+        FastItemOutcome::Defer => return ContainerOutcome::Defer,
+    };
 
-    encode_type(&Type::Instance {
+    match encode_type(&Type::Instance {
         type_ref: "builtins.dict".to_string(),
         // Python's `named_generic_type` strips LKV from dict args too;
         // mirror that on both key and value.
         args: vec![strip_lkv(&kt), strip_lkv(&vt)],
         last_known_value: None,
         extra_attrs: None,
-    })
+    }) {
+        Some(b) => ContainerOutcome::Bytes(b),
+        None => ContainerOutcome::Defer,
+    }
 }
 
 /// Join a list of types, mirroring `join.join_type_list`.
@@ -2424,24 +2459,32 @@ fn instance_join_result_to_type(
 }
 
 /// `_first_or_join_fast_item` inner: mirroring the Python version.
-fn first_or_join_fast_item_inner(items: &[Type], resolver: &NativeTypeResolver) -> Option<Type> {
+///
+/// For a single item Python returns it directly; Rust defers when it is a
+/// type object (the fallback then returns it, so no decision is claimed).
+/// For multiple items the join runs; a decided join whose result fails
+/// `allow_fast_container_literal` is a *decided none* because Python's own
+/// `_first_or_join_fast_item` returns None after the same join.
+fn first_or_join_fast_item_inner(items: &[Type], resolver: &NativeTypeResolver) -> FastItemOutcome {
     if items.len() == 1 {
         if is_type_obj_callable(&items[0], resolver.resolver()) {
-            return None;
+            return FastItemOutcome::Defer;
         }
-        return Some(items[0].clone());
+        return FastItemOutcome::Item(items[0].clone());
     }
-    let typ = join_type_list_inner(items, resolver);
-    let joined = typ?;
+    let Some(joined) = join_type_list_inner(items, resolver) else {
+        return FastItemOutcome::Defer;
+    };
     if items
         .iter()
         .any(|item| is_type_obj_callable(item, resolver.resolver()))
     {
-        return None;
+        return FastItemOutcome::Defer;
     }
     match allow_fast_container_literal_inner(&joined, resolver.alias_resolver()) {
-        Some(true) => Some(joined),
-        _ => None,
+        Some(true) => FastItemOutcome::Item(joined),
+        Some(false) => FastItemOutcome::DecidedNone,
+        None => FastItemOutcome::Defer,
     }
 }
 
@@ -6038,21 +6081,31 @@ mod tests {
 
     // -- first_or_join_fast_item_inner --
 
+    fn fast_item_type(outcome: FastItemOutcome) -> Option<Type> {
+        match outcome {
+            FastItemOutcome::Item(t) => Some(t),
+            FastItemOutcome::DecidedNone | FastItemOutcome::Defer => None,
+        }
+    }
+
     #[test]
     fn test_first_or_join_fast_item_single_instance() {
         let i = make_instance("builtins.int", vec![]);
         assert_eq!(
-            first_or_join_fast_item_inner(std::slice::from_ref(&i), &make_native_resolver()),
+            fast_item_type(first_or_join_fast_item_inner(
+                std::slice::from_ref(&i),
+                &make_native_resolver()
+            )),
             Some(i)
         );
     }
 
     #[test]
     fn test_first_or_join_fast_item_empty_defers() {
-        assert_eq!(
+        assert!(matches!(
             first_or_join_fast_item_inner(&[], &make_native_resolver()),
-            None
-        );
+            FastItemOutcome::Defer
+        ));
     }
 
     // -- build_dict_type --
@@ -6061,7 +6114,10 @@ mod tests {
     fn test_build_dict_type_simple() {
         let kt = make_instance("builtins.str", vec![]);
         let vt = make_instance("builtins.int", vec![]);
-        let out = build_dict_type(&make_native_resolver(), &[kt, vt], 1).unwrap();
+        let ContainerOutcome::Bytes(out) = build_dict_type(&make_native_resolver(), &[kt, vt], 1)
+        else {
+            panic!("expected a decided dict type");
+        };
         match decode_type(&out).unwrap() {
             Type::Instance { type_ref, args, .. } => {
                 assert_eq!(type_ref, "builtins.dict");
@@ -6101,7 +6157,10 @@ mod tests {
 
     #[test]
     fn test_build_dict_type_empty_defers() {
-        assert_eq!(build_dict_type(&make_native_resolver(), &[], 0), None);
+        assert!(matches!(
+            build_dict_type(&make_native_resolver(), &[], 0),
+            ContainerOutcome::Defer
+        ));
     }
 
     #[test]
@@ -6109,7 +6168,10 @@ mod tests {
         let kt = make_instance("builtins.str", vec![]);
         let vt = make_instance("builtins.int", vec![]);
         // n_keys == len(elements) leaves no values → defer.
-        assert_eq!(build_dict_type(&make_native_resolver(), &[kt, vt], 2), None);
+        assert!(matches!(
+            build_dict_type(&make_native_resolver(), &[kt, vt], 2),
+            ContainerOutcome::Defer
+        ));
     }
 
     #[test]

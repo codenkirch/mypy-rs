@@ -380,7 +380,7 @@ pub(crate) fn read_bool_attr(obj: &PyAny, attr: &str) -> Option<bool> {
 }
 
 /// Read a `str` attribute, or `None` on failure.
-fn read_str_attr(obj: &PyAny, attr: &str) -> Option<String> {
+pub(crate) fn read_str_attr(obj: &PyAny, attr: &str) -> Option<String> {
     obj.getattr(attr).and_then(|v| v.extract::<String>()).ok()
 }
 
