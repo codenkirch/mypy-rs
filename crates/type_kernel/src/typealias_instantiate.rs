@@ -14,11 +14,15 @@
 //!   `Instance(target.type, [])`.
 //! - A generic alias instantiation with a correct argument count returns
 //!   `TypeAliasType(node, args)`.
-//! - Every error/deferral path (`set_any_tvars`, `fail` emission,
-//!   `unknown_unpack`, split TypeVarTuples, `from_error` fallbacks)
-//!   returns `None` so the Python shim runs the full pure-Python body.
+//! - A bare generic alias whose TypeVars all carry defaults (and no
+//!   TypeVarTuple) takes the `set_any_tvars` defaults-only fill; the
+//!   Python shim applies the gradual `expand_type` per default.
+//! - Every other error/deferral path (`set_any_tvars` Any fills, `fail`
+//!   emission, `unknown_unpack`, split TypeVarTuples, `from_error`
+//!   fallbacks) returns `None` so the Python shim runs the full
+//!   pure-Python body.
 //!
-//! The result crossing the wire is a single branch tag (0/1/2); the
+//! The result crossing the wire is a single branch tag (0/1/2/3); the
 //! Python shim rebuilds the live result object from its own `node`,
 //! `args` and `ctx`, so no location data or argument blobs need to
 //! round-trip (this mirrors the established idiom where Python rebuilds
@@ -42,12 +46,20 @@ use crate::wire::Type;
 /// - `2` — step 12 plain success: `TypeAliasType(node, args, line,
 ///   column)` (both the step-6 non-eager empty case and the generic
 ///   correct-count case), then the `FlexibleAlias` unwrap.
+/// - `3` — step 5 bare-generic fill where every alias TypeVar carries a
+///   default and none is a TypeVarTuple: `set_any_tvars` takes its
+///   defaults-only path, so no Any type and no fail/note is possible.
+///   Python runs the per-default gradual `expand_type` (native seam) and
+///   rebuilds `TypeAliasType(node, args, line, column)`, returning
+///   `used_default == False` (`analyzing_tvar_def` is False by the tag
+///   condition).
 ///
 /// `None` defers to the full pure-Python body (every error /
 /// `set_any_tvars` path).
 const TAG_EAGER_EMPTY: i64 = 0;
 const TAG_EAGER_ARGS: i64 = 1;
 const TAG_ALIAS: i64 = 2;
+const TAG_DEFAULTS_FILL: i64 = 3;
 
 /// `mypy.typeanal.instantiate_type_alias` — mirror of typeanal.py:2217-2388.
 ///
@@ -69,8 +81,16 @@ pub(crate) fn rust_instantiate_type_alias(
     arg_blobs: Vec<Vec<u8>>,
     no_args: bool,
     empty_tuple_index: bool,
+    analyzing_tvar_def: bool,
 ) -> PyResult<Option<i64>> {
-    match instantiate_type_alias_inner(py, node, arg_blobs, no_args, empty_tuple_index) {
+    match instantiate_type_alias_inner(
+        py,
+        node,
+        arg_blobs,
+        no_args,
+        empty_tuple_index,
+        analyzing_tvar_def,
+    ) {
         Ok(result) => Ok(result),
         Err(DeferError) => Ok(None),
     }
@@ -82,6 +102,7 @@ fn instantiate_type_alias_inner(
     arg_blobs: Vec<Vec<u8>>,
     no_args: bool,
     empty_tuple_index: bool,
+    analyzing_tvar_def: bool,
 ) -> Result<Option<i64>, DeferError> {
     let refs = TypeRefs::try_new(py).map_err(|_| DeferError)?;
     let args = match decode_arg_list(&arg_blobs) {
@@ -105,10 +126,14 @@ fn instantiate_type_alias_inner(
     let max_tv_count = alias_tvars_count(node)?;
     let act_len = args.len();
 
-    // Step 5 (Python): missing args on a generic alias -> Any fill
-    // (set_any_tvars). Defer.
+    // Step 5: with every alias TypeVar defaulted and no TypeVarTuple the
+    // fill is defaults-only (no Any/fail/note); Python applies the gradual
+    // `expand_type` per default and rebuilds the alias.
     if max_tv_count > 0 && act_len == 0 && !(empty_tuple_index && tvar_tuple_index(node)?.is_some())
     {
+        if !analyzing_tvar_def && all_tvars_defaulted_without_tvt(node, &refs)? {
+            return Ok(Some(TAG_DEFAULTS_FILL));
+        }
         return Ok(None);
     }
 
@@ -295,6 +320,19 @@ fn tv_has_default(tv: &PyAny) -> bool {
     tv.call_method0("has_default")
         .map(|v| v.is_true().unwrap_or(true))
         .unwrap_or(true)
+}
+
+/// True when every alias TypeVar has a default and none is a
+/// TypeVarTuple. `set_any_tvars` then never builds an Any type
+/// (`used_any_type` stays False) and takes the defaults-only fill path.
+fn all_tvars_defaulted_without_tvt(node: &PyAny, refs: &TypeRefs<'_>) -> Result<bool, DeferError> {
+    let tvars = sequence_to_vec(get_attr_or_defer(node, "alias_tvars")?)?;
+    for tv in tvars {
+        if !tv_has_default(tv) || is_instance(tv, refs.type_var_tuple_type) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 // ---------------------------------------------------------------------------

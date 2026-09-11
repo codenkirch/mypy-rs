@@ -3451,7 +3451,11 @@ def instantiate_type_alias(
     if _TYPEANAL_HAS_KERNEL and _native_typeanal_active:
         try:
             result = _rust_instantiate_type_alias(
-                node, [_serialize_typeanal_type(a) for a in args], no_args, empty_tuple_index
+                node,
+                [_serialize_typeanal_type(a) for a in args],
+                no_args,
+                empty_tuple_index,
+                analyzing_tvar_def,
             )
             if result == 0:
                 # non-generic alias, no args, no_args: eager expansion.
@@ -3479,6 +3483,26 @@ def instantiate_type_alias(
                     assert isinstance(exp, Instance)
                     return exp.args[-1], False
                 return typ, False
+            if result == 3:
+                # Tag 3: step-5 fill where every alias TypeVar has a default.
+                # Mirror the set_any_tvars defaults loop with the native
+                # expand_type per default; no Any/fail/note is possible.
+                fill_args: list[Type] = []
+                env: dict[TypeVarId, Type] = {}
+                for tv in node.alias_tvars:
+                    arg = tv.default
+                    if isinstance(arg, UnpackType) and isinstance(
+                        unpack := get_proper_type(arg.type), TupleType
+                    ):
+                        unpacked = unpack.items
+                    else:
+                        unpacked = [arg]
+                    for arg in unpacked:
+                        with state.strict_optional_set(options.strict_optional):
+                            arg = expand_type(arg, env)
+                            env[tv.id] = arg
+                        fill_args.append(arg)
+                return TypeAliasType(node, fill_args, ctx.line, ctx.column), False
         except (AssertionError, NotImplementedError):
             pass
     if any(unknown_unpack(a) for a in args):
