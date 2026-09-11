@@ -7383,6 +7383,25 @@ class NativeCoerceLiteralSingletonSuite(Suite):
         self._assert_singleton_par(c)
         assert self._with_gate(True, lambda: is_singleton_identity_type(c))
 
+    def test_singleton_typevar_over_tuple_ret_engages(self) -> None:
+        # force_fallback unwraps a TypeVar upper bound once and then applies
+        # the TupleType fallback check (types.py:2667-2675); the type object
+        # is the final tuple fallback class, so the answer is true.
+        from mypy.typeops import _serialize_type
+
+        ret = TypeVarType(
+            "T",
+            "T",
+            TypeVarId(1),
+            [],
+            TupleType([self.fx.a], self.final_inst),
+            AnyType(TypeOfAny.from_omitted_generics),
+        )
+        c = self.fx.callable_type(self.fx.a, ret)
+        self._assert_singleton_par(c)
+        r = _type_kernel.rust_is_singleton_identity_type(_serialize_type(c), self._resolver)
+        assert r is True, "Rust TypeVar-over-tuple cascade did not engage"
+
     def test_singleton_callable_arm_engages_direct(self) -> None:
         from mypy.typeops import _serialize_type
 

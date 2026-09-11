@@ -1925,8 +1925,9 @@ fn is_singleton_identity_inner(
 /// `FunctionLike` arm of `is_singleton_identity_type` (typeops.py:1996):
 /// true when the callable is a type object (`is_type_obj()`) whose
 /// `type_object().is_final` is set. Returns `Some(false)` for a decidable
-/// non-type-object callable; `None` when the type object or its live
-/// `is_final` cannot be read (the shim falls back to Python).
+/// non-type-object callable; `None` when the type object cannot be resolved
+/// (missing snapshot / alias / live TypeInfo). An unreadable live `is_final`
+/// defaults to false, matching the `TypeType` arm above.
 fn function_like_type_object_is_final(
     py: Python<'_>,
     typ: &Type,
@@ -1967,13 +1968,16 @@ fn function_like_type_object_is_final(
         return Some(false);
     }
     // get_instance_type(force_fallback=True): prefer instance_type, else the
-    // proper ret unwrapped through typevar/tuple/typeddict/literal.
+    // proper ret. Python unwraps a TypeVar upper bound once and then applies
+    // the Tuple/TypedDict/Literal fallback checks (types.py:2667-2675).
     let mut instance = match instance_type {
         Some(it) => (**it).clone(),
         None => proper_ret,
     };
+    if let Type::TypeVarType { upper_bound, .. } = &instance {
+        instance = proper_type_of(upper_bound, resolver)?;
+    }
     instance = match instance {
-        Type::TypeVarType { upper_bound, .. } => proper_type_of(&upper_bound, resolver)?,
         Type::TupleType {
             partial_fallback, ..
         } => (*partial_fallback).clone(),

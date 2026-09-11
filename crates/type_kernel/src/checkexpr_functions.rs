@@ -6108,6 +6108,45 @@ mod tests {
         ));
     }
 
+    fn make_union_type(items: Vec<Type>) -> Type {
+        Type::UnionType {
+            items,
+            uses_pep604_syntax: false,
+            can_be_true: true,
+            can_be_false: true,
+            is_evaluated: true,
+            original_str_expr: None,
+            original_str_fallback: None,
+        }
+    }
+
+    #[test]
+    fn test_first_or_join_fast_item_decided_none() {
+        // join(Union[A, B], A) collapses to the union (A is a member); a
+        // union fails allow_fast_container_literal, and Python's fallback
+        // returns None after the same join -> DecidedNone.
+        let a = make_instance("builtins.int", vec![]);
+        let b = make_instance("builtins.str", vec![]);
+        let u = make_union_type(vec![a.clone(), b]);
+        assert!(matches!(
+            first_or_join_fast_item_inner(&[u, a], &make_native_resolver()),
+            FastItemOutcome::DecidedNone
+        ));
+    }
+
+    #[test]
+    fn test_build_dict_type_decided_none() {
+        // keys = [Union[A, B], A] decides none; no value type is consulted.
+        let a = make_instance("builtins.int", vec![]);
+        let b = make_instance("builtins.str", vec![]);
+        let u = make_union_type(vec![a.clone(), b]);
+        let v = make_instance("builtins.float", vec![]);
+        assert!(matches!(
+            build_dict_type(&make_native_resolver(), &[u, a, v], 2),
+            ContainerOutcome::DecidedNone
+        ));
+    }
+
     // -- build_dict_type --
 
     #[test]

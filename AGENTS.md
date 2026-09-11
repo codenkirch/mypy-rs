@@ -3279,8 +3279,9 @@ including:
     fallbacks: the `FunctionLike` arm deferred every callable; now a
     non-type-object callable is decided `false` and a type object
     resolves `type_object().is_final` natively (`get_instance_type` with
-    `force_fallback=True`: `instance_type` or the proper `ret_type`
-    unwrapped through TypeVar/Tuple/TypedDict/Literal) plus the live
+    `force_fallback=True`: `instance_type` or the proper `ret_type`, with
+    the TypeVar upper-bound unwrap cascading into the Tuple / TypedDict /
+    Literal fallback checks like Python's `if` chain) plus the live
     TypeInfo map (`is_final` is not snapshotted). Deferral remains only
     when the alias snapshot / live TypeInfo read is missing.
   - `rust_container_type` (checkexpr.py) 1,806 / 36 -> 17: decided-none
@@ -3310,12 +3311,15 @@ including:
     defaults=True`): gradual `expand_type(arg, env)` over live
     `tv.default`s plus `used_default` / note side effects, exactly the
     deferral the Rust module documented from the start.
-  Pins: FunctionLike-arm + direct-engagement tests in
-  `NativeCoerceLiteralSingletonSuite`, `_pretty_wire_safe` /
-  definition-defer tests in `NativeMessagesDeferralSuite`, decided-none +
-  type-object-defer tests in `NativeCheckexprJoinAndTupleSuite`.
-  Gates: cargo 2,739/11, fmt + clippy clean, cold self-check clean 347,
-  testtypes 3,320/6 (+11 tests), testcheck 8,198/15/7 exact,
+  Pins: FunctionLike-arm (incl. the TypeVar-over-tuple cascade) +
+  direct-engagement tests in `NativeCoerceLiteralSingletonSuite`,
+  `_pretty_wire_safe` / definition-defer tests in
+  `NativeMessagesDeferralSuite`, decided-none + type-object-defer tests
+  in `NativeCheckexprJoinAndTupleSuite`, plus Rust unit tests for the
+  `FastItemOutcome::DecidedNone` / `ContainerOutcome::DecidedNone`
+  outcomes.
+  Gates: cargo 2,741/11, fmt + clippy clean, cold self-check clean 347,
+  testtypes 3,321/6 (+12 tests), testcheck 8,198/15/7 exact,
   fine-grained 747/27, daemon 37, finegrainedcache 549/229.
 
 ## Pull Requests
