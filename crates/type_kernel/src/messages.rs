@@ -166,6 +166,17 @@ fn format_options() -> Option<FormatOptions> {
     FORMAT_OPTIONS.with(|c| c.get())
 }
 
+/// Definition-derived scalars `pretty_callable` needs that the wire drops:
+/// the function name when `CallableType.name` is empty, and the prepended
+/// special first argument (`self`/`cls`, `messages.py:3543-3562`). The
+/// Python shim (`_pretty_hint`) computes them for the sole callable that
+/// `_callable_pretty_wire_safe` rejected when it is the raw top-level node.
+#[derive(Clone, Debug)]
+struct PrettyHint {
+    func_name: Option<String>,
+    first_arg: Option<String>,
+}
+
 /// Format a type to its bare string (unquoted), using the native resolver.
 ///
 /// Mirrors `format_type_bare(typ, options, verbosity, module_names)`.
@@ -275,7 +286,8 @@ fn callable_pair_min_verbosity(types: &[Type], resolver: &TypeResolver) -> Optio
 /// Takes serialized type bytes for each type plus the resolver.
 /// Returns `None` if any type cannot be formatted.
 #[pyfunction]
-#[pyo3(signature = (type_bytes_list, resolver, bare, use_star_unpack, reveal_verbose_types = false, pretty_wire_safe = false))]
+#[pyo3(signature = (type_bytes_list, resolver, bare, use_star_unpack, reveal_verbose_types = false, pretty_wire_safe = false, hints = Vec::new()))]
+#[allow(clippy::too_many_arguments)]
 pub fn rust_format_type_distinctly(
     py: Python<'_>,
     type_bytes_list: Vec<Vec<u8>>,
@@ -284,11 +296,21 @@ pub fn rust_format_type_distinctly(
     use_star_unpack: bool,
     reveal_verbose_types: bool,
     pretty_wire_safe: bool,
+    hints: Vec<Option<(Option<String>, Option<String>)>>,
 ) -> Option<Vec<String>> {
     let _guard = FormatOptionsGuard::install(FormatOptions {
         reveal_verbose_types,
         pretty_wire_safe,
     });
+    let pretty_hints: Vec<Option<PrettyHint>> = hints
+        .into_iter()
+        .map(|h| {
+            h.map(|(func_name, first_arg)| PrettyHint {
+                func_name,
+                first_arg,
+            })
+        })
+        .collect();
     let mut types = Vec::with_capacity(type_bytes_list.len());
     for bytes in &type_bytes_list {
         types.push(wire::read_type(&mut ReadBuffer::new(bytes), None).ok()?);
@@ -324,8 +346,9 @@ pub fn rust_format_type_distinctly(
     for verbosity in min_verbosity..2 {
         strs.clear();
         let mut all_ok = true;
-        for t in &types {
-            match format_type_inner(
+        for (i, t) in types.iter().enumerate() {
+            let hint = pretty_hints.get(i).and_then(|h| h.as_ref());
+            match format_type_inner_hint(
                 py,
                 t,
                 verbosity,
@@ -334,6 +357,7 @@ pub fn rust_format_type_distinctly(
                 resolver,
                 true,
                 use_star_unpack,
+                hint,
             ) {
                 Some(s) => strs.push(s),
                 None => {
@@ -597,6 +621,35 @@ fn format_type_inner(
     resolver: &NativeTypeResolver,
     use_pretty_callable: bool,
     use_star_unpack: bool,
+) -> Option<String> {
+    format_type_inner_hint(
+        py,
+        typ,
+        verbosity,
+        module_names,
+        fullnames,
+        resolver,
+        use_pretty_callable,
+        use_star_unpack,
+        None,
+    )
+}
+
+/// `format_type_inner` with an optional top-node `PrettyHint`. The hint is
+/// consumed only by the callable arm of the node it is attached to;
+/// recursive calls go through the wrapper (no hint), so a nested callable
+/// can never consume a top-level hint.
+#[allow(clippy::too_many_arguments)]
+fn format_type_inner_hint(
+    py: Python<'_>,
+    typ: &Type,
+    verbosity: i64,
+    module_names: bool,
+    fullnames: &HashSet<String>,
+    resolver: &NativeTypeResolver,
+    use_pretty_callable: bool,
+    use_star_unpack: bool,
+    hint: Option<&PrettyHint>,
 ) -> Option<String> {
     // TypeAliasType (messages.py:3003-3015): recursive aliases render
     // from the live alias node (the wire has no display name, so they
@@ -1053,7 +1106,7 @@ fn format_type_inner(
                 if needs_pretty {
                     let _ = (name, variables);
                     let opts = format_options()?;
-                    if !opts.pretty_wire_safe {
+                    if !opts.pretty_wire_safe && hint.is_none() {
                         return None;
                     }
                     return pretty_callable_inner(
@@ -1062,6 +1115,7 @@ fn format_type_inner(
                         resolver,
                         opts.reveal_verbose_types,
                         use_star_unpack,
+                        hint,
                     );
                 }
             }
@@ -1838,6 +1892,35 @@ fn arg_kind_is_positional(kind: i64) -> bool {
     matches!(kind, 0 | 1)
 }
 
+/// Apply the definition-derived pretty-callable facts to a rendered body:
+/// prepend the special first argument (`self`/`cls`) unless the callable is
+/// a type object, then wrap with the function name preferring the wire
+/// `tp.name` and falling back to the hint (messages.py:3534-3564).
+fn apply_pretty_hint(
+    body: String,
+    wire_name: Option<&str>,
+    is_type_obj: bool,
+    hint: Option<&PrettyHint>,
+) -> String {
+    let mut s = body;
+    if let Some(fa) = hint.and_then(|h| h.first_arg.as_deref()) {
+        if !is_type_obj {
+            if !s.is_empty() {
+                s = format!(", {s}");
+            }
+            s = format!("{fa}{s}");
+        }
+    }
+    let func_name = wire_name
+        .and_then(|n| n.split_whitespace().next())
+        .or_else(|| hint.and_then(|h| h.func_name.as_deref()));
+    if let Some(fname) = func_name {
+        format!("{fname}({s})")
+    } else {
+        format!("({s})")
+    }
+}
+
 /// Render a callable without a FuncDef definition (messages.py:3111).
 /// Wire format has no definition; name is the first token of `tp.name`,
 /// no leading `self`/`cls`. Defers on non-TypeVarType variables.
@@ -1847,6 +1930,7 @@ fn pretty_callable_inner(
     resolver: &NativeTypeResolver,
     reveal_verbose_types: bool,
     use_star_unpack: bool,
+    hint: Option<&PrettyHint>,
 ) -> Option<String> {
     let Type::CallableType {
         arg_types,
@@ -1928,14 +2012,16 @@ fn pretty_callable_inner(
         }
     }
 
-    // No definition on the wire: `get_func_def(tp) is None`, so the function
-    // name is the first whitespace token of `tp.name`, never a `self`/`cls`.
-    let func_name = name.as_deref().and_then(|n| n.split_whitespace().next());
-    if let Some(fname) = func_name {
-        s = format!("{fname}({s})");
-    } else {
-        s = format!("({s})");
-    }
+    // Definition-derived facts arrive as the shim's explicit hint (the
+    // wire carries no `definition`, messages.py:3534-3562); without one
+    // the render is the definition-free one.
+    let is_type_obj = match hint {
+        Some(h) if h.first_arg.is_some() => {
+            crate::callable_compat::is_type_obj(tp, resolver.resolver())?
+        }
+        _ => false,
+    };
+    s = apply_pretty_hint(s, name.as_deref(), is_type_obj, hint);
 
     s.push_str(" -> ");
     if let Some(tg) = type_guard {
@@ -2070,7 +2156,14 @@ pub fn rust_pretty_callable(
     use_star_unpack: bool,
 ) -> Option<String> {
     let tp = wire::read_type(&mut ReadBuffer::new(callable_bytes), None).ok()?;
-    pretty_callable_inner(py, &tp, resolver, reveal_verbose_types, use_star_unpack)
+    pretty_callable_inner(
+        py,
+        &tp,
+        resolver,
+        reveal_verbose_types,
+        use_star_unpack,
+        None,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -3781,5 +3874,68 @@ mod tests {
             &lst_int_int,
             &[true, false]
         ));
+    }
+
+    fn hint(func_name: Option<&str>, first_arg: Option<&str>) -> PrettyHint {
+        PrettyHint {
+            func_name: func_name.map(str::to_string),
+            first_arg: first_arg.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn test_apply_pretty_hint_name_fallback() {
+        // Wire name empty: the hint supplies the definition name.
+        let h = hint(Some("f"), None);
+        assert_eq!(
+            apply_pretty_hint("x: int".to_string(), None, false, Some(&h)),
+            "f(x: int)"
+        );
+    }
+
+    #[test]
+    fn test_apply_pretty_hint_wire_name_wins() {
+        // The wire `tp.name` is preferred; only its first token is kept.
+        let h = hint(Some("ignored"), None);
+        assert_eq!(
+            apply_pretty_hint("x: int".to_string(), Some("g of C"), false, Some(&h)),
+            "g(x: int)"
+        );
+    }
+
+    #[test]
+    fn test_apply_pretty_hint_first_arg_prepends() {
+        let h = hint(Some("g"), Some("self"));
+        assert_eq!(
+            apply_pretty_hint("x: int".to_string(), None, false, Some(&h)),
+            "g(self, x: int)"
+        );
+    }
+
+    #[test]
+    fn test_apply_pretty_hint_first_arg_empty_body() {
+        // No args rendered: the prepend carries no leading separator.
+        let h = hint(Some("g"), Some("self"));
+        assert_eq!(
+            apply_pretty_hint(String::new(), None, false, Some(&h)),
+            "g(self)"
+        );
+    }
+
+    #[test]
+    fn test_apply_pretty_hint_type_obj_skips_first_arg() {
+        let h = hint(Some("C"), Some("self"));
+        assert_eq!(
+            apply_pretty_hint("x: int".to_string(), None, true, Some(&h)),
+            "C(x: int)"
+        );
+    }
+
+    #[test]
+    fn test_apply_pretty_hint_absent_renders_definition_free() {
+        assert_eq!(
+            apply_pretty_hint("x: int".to_string(), None, false, None),
+            "(x: int)"
+        );
     }
 }

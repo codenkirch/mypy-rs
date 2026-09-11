@@ -3404,6 +3404,44 @@ including:
   Gates: cargo 2,741/11, fmt + clippy clean, cold self-check clean 347,
   testtypes 3,341/6 (+20 tests), testcheck 8,198/15/7 exact,
   fine-grained 747/27, daemon 37, finegrainedcache 549/229.
+- wave-62D non-engine floors: defaulted alias fill + distinct pretty
+  definition hints (wave 62, issue #1519): audit-first env-gated probes
+  (`MYPY_TK_W62D_AUDIT`, stripped before landing; cold self-check at
+  `-n0 --no-incremental`) pinned every fallback of both seams to a single
+  leaf reason before any port.
+  - `rust_instantiate_type_alias` 5,867 / 68 -> 5,867 / 0: all 68 were
+    the step-5 bare-generic `set_any_tvars` fill with `max_tv=1`, every
+    alias tvar defaulted (`no_default=0`), no TypeVarTuple, no default
+    cross-references, `disallow_any=False`, `analyzing_tvar_def=False`.
+    New tag 3 = defaults-only fill: Rust proves every alias TypeVar has a
+    default and none is a TypeVarTuple (deferring on
+    `analyzing_tvar_def`), and the Python shim mirrors the `set_any_tvars`
+    defaults loop with the existing native `expand_type` per default
+    (empty/no-op env in the measured corpus). Floors: Any fills
+    (undefaulted tvar), TypeVarTuple, `analyzing_tvar_def`, and the
+    error paths.
+  - `rust_format_type_distinctly` 931 / 37 -> 931 / 0: all 37 were n=2
+    pairs whose sole unsafe pretty callable was the raw top-level node
+    (`first_arg_fdef` / `name_none`, depth 0; 0 nested). The seam gains a
+    per-type `hints` channel (parallel to the wire blobs) carrying the
+    definition-derived `(func_name, first_arg)` scalars (`_pretty_hint`);
+    Rust's `pretty_callable` port applies them (`apply_pretty_hint`), and
+    `callable_compat::is_type_obj` gates the `self`/`cls` prepend. A
+    nested unsafe callable has no live cursor in Rust and keeps the
+    pure-Python fallback (`_distinctly_pretty_plan` returns
+    `(False, None)`). Side effect: the 37 retired Python fallbacks no
+    longer re-enter `format_type_bare` / `find_type_overlaps`
+    (330 -> 87 calls; the 1 residual `rust_format_type_bare` fallback is
+    the pre-existing `_pytest.raises.AbstractRaises[Any]` snapshot miss
+    with `_pretty_wire_safe` true, unchanged).
+  - Pins: `NativeInstantiateTypeAliasSuite` +4 (default fill
+    single / crossref / mixed-defaults defer / analyzing defer),
+    `NativeMessagesDeferralSuite` +3 (name hint, first-arg hint, nested
+    defer) plus 5 Rust `apply_pretty_hint` units.
+  - Gates: cargo 2,808 passed / 11 ignored (type_kernel 2,752/11),
+    fmt + clippy (`-p mypy-type-kernel --lib -D warnings`) clean, cold
+    self-check clean 347, testtypes 3,350/6 (+7), testcheck
+    8,198/15/7 exact, fine-grained 747/27, daemon 37.
 
 ## Pull Requests
 

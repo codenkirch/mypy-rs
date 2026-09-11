@@ -11213,15 +11213,18 @@ class NativeInstantiateTypeAliasSuite(Suite):
             f"instantiate_type_alias parity {node.name} args={args}",
         )
 
-    def _assert_engages(self, node: TypeAlias, args: list[Type], no_args: bool) -> None:
+    def _rust_tag(self, node: TypeAlias, args: list[Type], no_args: bool) -> int | None:
         from mypy.typeanal import (  # type: ignore[attr-defined]
             _rust_instantiate_type_alias,
             _serialize_typeanal_type,
         )
 
-        result = _rust_instantiate_type_alias(
-            node, [_serialize_typeanal_type(a) for a in args], no_args, False
+        return _rust_instantiate_type_alias(
+            node, [_serialize_typeanal_type(a) for a in args], no_args, False, False
         )
+
+    def _assert_engages(self, node: TypeAlias, args: list[Type], no_args: bool) -> None:
+        result = self._rust_tag(node, args, no_args)
         assert result is not None, f"Rust instantiate_type_alias did not engage for {node.name}"
 
     def test_non_generic_alias(self) -> None:
@@ -11255,10 +11258,51 @@ class NativeInstantiateTypeAliasSuite(Suite):
         self._assert_engages(node, [self.fx.a], False)
 
     def test_generic_alias_missing_args_defers(self) -> None:
-        # G[T] used bare -> Python fills Any (set_any_tvars); Rust defers.
+        # G[T] used bare with an undefaulted T -> Python fills Any
+        # (set_any_tvars); Rust defers.
         node = self._make_alias(Instance(self.fx.gi, [self.fx.t]), alias_tvars=[self.fx.t])
         # Parity holds even though the path defers to Python.
         self._assert_par(node, [], False)
+        assert self._rust_tag(node, [], False) is None
+
+    def test_generic_alias_default_fill_single(self) -> None:
+        # G[T = A] used bare: every alias tvar has a default, so
+        # set_any_tvars takes its defaults-only path (tag 3); the shim runs
+        # the per-default native expand_type and rebuilds the alias.
+        tv = self.fx.t.copy_modified(default=self.fx.a)
+        node = self._make_alias(Instance(self.fx.gi, [tv]), alias_tvars=[tv])
+        self._assert_par(node, [], False)
+        assert self._rust_tag(node, [], False) == 3
+
+    def test_generic_alias_default_fill_crossref(self) -> None:
+        # S's default references the earlier T; the gradual env built by
+        # the shim must substitute T's resolved default into S's.
+        t = self.fx.t.copy_modified(default=self.fx.a)
+        s = self.fx.s.copy_modified(default=Instance(self.fx.std_listi, [t]))
+        node = self._make_alias(Instance(self.fx.gi, [t, s]), alias_tvars=[t, s])
+        self._assert_par(node, [], False)
+        assert self._rust_tag(node, [], False) == 3
+
+    def test_generic_alias_mixed_defaults_defers(self) -> None:
+        # T has no default, so the fill constructs an Any type; Rust
+        # defers and the pure-Python set_any_tvars body stays single-sourced.
+        t = self.fx.t
+        s = self.fx.s.copy_modified(default=self.fx.a)
+        node = self._make_alias(Instance(self.fx.gi, [t, s]), alias_tvars=[t, s])
+        self._assert_par(node, [], False)
+        assert self._rust_tag(node, [], False) is None
+
+    def test_generic_alias_analyzing_tvar_def_defers(self) -> None:
+        # While analyzing another tvar default the fill records
+        # used_default and checks default recursion: Rust keeps the
+        # pure-Python path (tag must stay None).
+        from mypy.typeanal import (  # type: ignore[attr-defined]
+            _rust_instantiate_type_alias,
+        )
+
+        tv = self.fx.t.copy_modified(default=self.fx.a)
+        node = self._make_alias(Instance(self.fx.gi, [tv]), alias_tvars=[tv])
+        assert _rust_instantiate_type_alias(node, [], False, False, True) is None
 
     def test_generic_alias_bad_count_defers(self) -> None:
         # G[T] with two args -> error + Any fill; Rust defers.
@@ -19125,6 +19169,73 @@ class NativeMessagesDeferralSuite(Suite):
             self._bytes_of(c), self.resolver, 0, False, True, False, True
         )
         assert raw is not None, "Rust pretty path did not engage for a safe definition"
+
+    def _def_dependent(self, name: str, arg_names: list[str], call_name: str | None) -> CallableType:
+        from mypy.nodes import ARG_POS, Argument, Block, FuncDef, Var
+
+        fdef = FuncDef(
+            name, [Argument(Var(a), None, None, ARG_POS) for a in arg_names], Block([])
+        )
+        c = self._named_arg_callable()
+        c.name = call_name
+        c.definition = fdef
+        return c
+
+    def test_definition_name_hint_engages(self) -> None:
+        # name=None means pretty_callable takes the function name from the
+        # definition; the shim hands Rust that scalar instead of deferring.
+        from mypy.messages import format_type_distinctly
+
+        c = self._def_dependent("f", ["x"], None)
+        off = self._with_gate(
+            False, lambda: format_type_distinctly(c, options=self.options, bare=True)
+        )
+        on = self._with_gate(
+            True, lambda: format_type_distinctly(c, options=self.options, bare=True)
+        )
+        assert_equal(on, off)
+        raw = _type_kernel.rust_format_type_distinctly(
+            [self._bytes_of(c)], self.resolver, True, True, False, True, [("f", None)]
+        )
+        assert raw == list(off), "Rust name-hint render diverged"
+
+    def test_definition_first_arg_hint_engages(self) -> None:
+        # The definition declares an extra leading parameter, so
+        # pretty_callable prepends `self`; the hint carries it.
+        from mypy.messages import format_type_distinctly
+
+        c = self._def_dependent("g", ["self", "x"], None)
+        off = self._with_gate(
+            False, lambda: format_type_distinctly(c, options=self.options, bare=True)
+        )
+        on = self._with_gate(
+            True, lambda: format_type_distinctly(c, options=self.options, bare=True)
+        )
+        assert_equal(on, off)
+        raw = _type_kernel.rust_format_type_distinctly(
+            [self._bytes_of(c)], self.resolver, True, True, False, True, [("g", "self")]
+        )
+        assert raw == list(off), "Rust first-arg-hint render diverged"
+
+    def test_nested_definition_dependent_callable_defers(self) -> None:
+        # A definition-dependent callable nested under another type has no
+        # live cursor in Rust: the shim must keep the pure-Python fallback.
+        from mypy.messages import _pretty_wire_safe, format_type_distinctly
+
+        c = self._def_dependent("f", ["x"], None)
+        outer = Instance(self.fx.std_listi, [c])
+        assert not _pretty_wire_safe(outer)
+        off = self._with_gate(
+            False, lambda: format_type_distinctly(outer, options=self.options, bare=True)
+        )
+        on = self._with_gate(
+            True, lambda: format_type_distinctly(outer, options=self.options, bare=True)
+        )
+        assert_equal(on, off)
+        raw = _type_kernel.rust_format_type_distinctly(
+            [self._bytes_of(outer)], self.resolver, True, True, False, False, [None]
+        )
+        assert raw is None, "nested definition-dependent render must defer"
 
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")

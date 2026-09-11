@@ -3387,6 +3387,98 @@ def format_type_bare(
     return format_type_inner(typ, verbosity, options, find_type_overlaps(typ), module_names)
 
 
+def _pretty_hint(c: CallableType) -> tuple[str | None, str | None] | None:
+    """Definition-derived `(func_name, first_arg)` that `pretty_callable`
+    reads from the live `definition` node and the wire format drops.
+
+    Returns None when a fact cannot be read; the caller then keeps the
+    pure-Python fallback. `_callable_pretty_wire_safe` already proved the
+    callable needs the definition, so the pair is only built for those.
+    """
+    try:
+        definition = get_func_def(c)
+        func_name: str | None = None
+        if c.name is None and isinstance(definition, FuncDef):
+            func_name = definition.name
+        first_arg: str | None = None
+        if (
+            isinstance(definition, FuncDef)
+            and hasattr(definition, "arguments")
+            and not c.from_concatenate
+        ):
+            definition_arg_names = [arg.variable.name for arg in definition.arguments]
+            if len(definition_arg_names) > len(c.arg_names) and definition_arg_names[0]:
+                first_arg = definition_arg_names[0]
+        else:
+            first_arg = get_first_arg(c)
+        return func_name, first_arg
+    except (AttributeError, NotImplementedError, AssertionError):
+        return None
+
+
+def _unsafe_pretty_callables(typ: Type) -> list[CallableType]:
+    """Every callable in `typ` whose pretty render needs `definition`.
+
+    Walks exactly the node kinds `_pretty_wire_safe` walks, so the two
+    guards agree on which trees are unsafe.
+    """
+    out: list[CallableType] = []
+    stack: list[Type] = [typ]
+    seen: set[int] = set()
+    while stack:
+        t = stack.pop()
+        proper = get_proper_type(t)
+        if id(proper) in seen:
+            continue
+        seen.add(id(proper))
+        if isinstance(proper, CallableType):
+            if not _callable_pretty_wire_safe(proper):
+                out.append(proper)
+            stack.append(proper.ret_type)
+            stack.extend(proper.arg_types)
+        elif isinstance(proper, Instance):
+            stack.extend(proper.args)
+        elif isinstance(proper, UnionType):
+            stack.extend(proper.items)
+        elif isinstance(proper, TupleType):
+            stack.extend(proper.items)
+        elif isinstance(proper, TypedDictType):
+            stack.extend(proper.items.values())
+        elif isinstance(proper, TypeType):
+            stack.append(proper.item)
+        elif isinstance(proper, UnpackType):
+            stack.append(proper.type)
+    return out
+
+
+def _distinctly_pretty_plan(
+    types: Sequence[Type],
+) -> tuple[bool, list[tuple[str | None, str | None] | None] | None]:
+    """Decide the Rust distinct-formatting gate.
+
+    Returns `(pretty_wire_safe, hints)`: hints is aligned with `types` and
+    hands the Rust `pretty_callable` port the definition scalars for the
+    sole unsafe callable when it is the raw top-level node. `(False, None)`
+    means the shapes are not covered and the Rust seam must keep deferring
+    the whole call (nested unsafe callables need a live cursor Rust does
+    not have).
+    """
+    hints: list[tuple[str | None, str | None] | None] = []
+    for t in types:
+        if _pretty_wire_safe(t):
+            hints.append(None)
+            continue
+        unsafe = _unsafe_pretty_callables(t)
+        if len(unsafe) == 1 and unsafe[0] is t:
+            hint = _pretty_hint(t)
+            if hint is None:
+                return False, None
+            hints.append(hint)
+        else:
+            return False, None
+    return True, hints
+
+
 def format_type_distinctly(*types: Type, options: Options, bare: bool = False) -> tuple[str, ...]:
     """Jointly format types to distinct strings.
 
@@ -3402,13 +3494,20 @@ def format_type_distinctly(*types: Type, options: Options, bare: bool = False) -
     if _HAS_TYPE_KERNEL and _native_messages_active and _native_messages_resolver is not None:
         try:
             type_bytes_list = [_serialize_type_for_messages(t) for t in types]
+            wire_safe, plan_hints = _distinctly_pretty_plan(types)
+            hints: list[tuple[str | None, str | None] | None]
+            if plan_hints is None:
+                hints = [None] * len(types)
+            else:
+                hints = plan_hints
             result = _type_kernel.rust_format_type_distinctly(
                 type_bytes_list,
                 _native_messages_resolver,
                 bare,
                 options.use_star_unpack(),
                 options.reveal_verbose_types,
-                all(_pretty_wire_safe(_t) for _t in types),
+                wire_safe,
+                hints,
             )
             if result is not None:
                 return tuple(result)
