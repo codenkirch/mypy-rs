@@ -51757,9 +51757,9 @@ class NativeWriteFunnelSkipSuite(Suite):
         before = dict(self._m.report())
         struck.args = (self.fx.o,)
         delta = self._delta(before)
-        # The write lands raw on an adoption-struck, never-serialized
-        # object: recorded, but no epoch bump (no stored blob exists).
-        assert delta.get("strike_gag_uncaptured") == 1, delta
+        # Nothing registered embeds the object, so the write lands raw:
+        # no strike interaction, no epoch bump (lazy adoption).
+        assert delta.get("setattr_untracked.instance") == 1, delta
         assert not any(k.startswith("unprot_bump") for k in delta), delta
         before = dict(self._m.report())
         struck.write(WriteBuffer())
@@ -52178,7 +52178,7 @@ class NativeMirrorWalkIndicesRustSuite(Suite):
         """A deferring kernel seam routes `_walk_indices` to the
         pure-Python body with identical results. A stub stands in for the
         kernel: Nones-out `_kernel_mod` while the mirror lives on would
-        crash unrelated funnels in `_handle_of`."""
+        crash unrelated funnels."""
         import types as _types_mod
 
         stub = _types_mod.SimpleNamespace(
@@ -52668,6 +52668,69 @@ class NativeInstanceWriteSuite(Suite):
         assert "setattr_spliced.instance.last_known_value" not in delta, delta
         self._blob_matches_fresh(inst)
 
+    def _attrs_instance(self) -> Instance:
+        from librt.internal import WriteBuffer
+
+        inst = self._list_instance(self.fx.o)
+        inst.write(WriteBuffer())  # adoption funnel registers the object
+        return inst
+
+    def test_spliced_extra_attrs_write_matches_fresh_bytes(self) -> None:
+        from mypy.types import ExtraAttrs
+
+        inst = self._attrs_instance()
+        self._m._write_flip = True
+        before = dict(self._m.report())
+        # Two keys in reverse-sorted insertion order: a HashMap re-encode
+        # would sort them, so byte identity proves the raw record survives.
+        inst.extra_attrs = ExtraAttrs({"b": self.fx.anyt, "a": self.fx.o}, set(), "m")
+        delta = self._delta(before)
+        assert delta.get("setattr_spliced.instance.extra_attrs") == 1, delta
+        assert not any(k.startswith(("mismatch.", "unserializable.")) for k in delta), delta
+        self._blob_matches_fresh(inst)
+        # A second, identical assignment is a noop that leaves the blob alone.
+        before = dict(self._m.report())
+        inst.extra_attrs = inst.extra_attrs
+        delta = self._delta(before)
+        assert delta.get("setattr_noop.instance.extra_attrs") == 1, delta
+        self._blob_matches_fresh(inst)
+        # Clear: back to the no-attribute shape.
+        before = dict(self._m.report())
+        inst.extra_attrs = None
+        delta = self._delta(before)
+        assert delta.get("setattr_spliced.instance.extra_attrs") == 1, delta
+        self._blob_matches_fresh(inst)
+
+    def test_extra_attrs_splice_preserves_existing_fields(self) -> None:
+        from mypy.types import ExtraAttrs, LiteralType
+
+        bool_inst = Instance(self.fx.bool_type_info, [])
+        inst = self._list_instance(self.fx.str_type, lkv=LiteralType(True, bool_inst))
+        from librt.internal import WriteBuffer
+
+        inst.write(WriteBuffer())
+        self._m._write_flip = True
+        inst.extra_attrs = ExtraAttrs({"x": self.fx.anyt}, set(), None)
+        # If the splice had dropped args or last_known_value, the stored
+        # blob would drift from a full fresh serialization.
+        self._blob_matches_fresh(inst)
+        inst.args = (self.fx.o,)
+        self._blob_matches_fresh(inst)
+        inst.last_known_value = None
+        self._blob_matches_fresh(inst)
+
+    def test_gate_off_extra_attrs_keeps_full_capture_path(self) -> None:
+        from mypy.types import ExtraAttrs
+
+        inst = self._attrs_instance()
+        self._m._write_flip = False
+        before = dict(self._m.report())
+        inst.extra_attrs = ExtraAttrs({"x": self.fx.anyt}, set(), None)
+        delta = self._delta(before)
+        assert delta.get("setattr_captured.instance.extra_attrs") == 1, delta
+        assert "setattr_spliced.instance.extra_attrs" not in delta, delta
+        self._blob_matches_fresh(inst)
+
 
 class NativeInvisibleFieldSuite(Suite):
     """Wire-invisible field writes stay outside the mirror capture funnel.
@@ -53127,8 +53190,38 @@ class NativeMirrorAdoptionFastPathSuite(Suite):
         self._m._fresh_bytes = raiser  # type: ignore[assignment]
         return orig, calls
 
+    def _mark_hidden_embed(self, obj: Any) -> None:
+        # Mutation-time registration now engages only for objects some
+        # registered blob embeds (the lazy-adoption cut); seed the index
+        # with a fake parent handle to exercise the strike fast paths.
+        self._m._HIDDEN_EMBED[id(obj)] = (obj, {0})
+
+    def test_untracked_setattr_defers_adoption_to_funnel(self) -> None:
+        from librt.internal import WriteBuffer
+
+        inst = Instance(self.fx.std_tuplei, [self.fx.a])
+        orig, calls = self._raise_for_target(inst)
+        try:
+            inst.args = (self.fx.o,)
+            # Nothing registered embeds the object: no registration
+            # attempt, no strike; the first funnel snapshots the final
+            # state and adopts.
+            assert all(c is not inst for c in calls), calls
+            assert self._m._handle_of(inst) is None
+            assert id(inst) not in self._m._ADOPT_STRIKE
+            delta = self._delta({})
+            assert delta.get("setattr_untracked.instance") == 1, delta
+        finally:
+            self._m._fresh_bytes = orig
+        before = dict(self._m.report())
+        inst.write(WriteBuffer())
+        delta = self._delta(before)
+        assert delta.get("adopt.instance.write") == 1, delta
+        assert self._m._handle_of(inst) is not None
+
     def test_failed_registration_publishes_strike_and_funnel_skips(self) -> None:
         inst = Instance(self.fx.std_tuplei, [self.fx.a])
+        self._mark_hidden_embed(inst)
         orig, calls = self._raise_for_target(inst)
         try:
             inst.args = (self.fx.o,)  # setattr adopts -> fails -> memo
@@ -53191,6 +53284,7 @@ class NativeMirrorAdoptionFastPathSuite(Suite):
 
     def test_gagged_setattr_probe_retries_and_adopts(self) -> None:
         inst = Instance(self.fx.std_tuplei, [self.fx.a])
+        self._mark_hidden_embed(inst)
         orig, calls = self._raise_for_target(inst)
         try:
             inst.args = (self.fx.o,)  # first attempt: still partial -> strike
@@ -53216,6 +53310,7 @@ class NativeMirrorAdoptionFastPathSuite(Suite):
         from librt.internal import WriteBuffer
 
         inst = Instance(self.fx.std_tuplei, [self.fx.a])
+        self._mark_hidden_embed(inst)
         orig, calls = self._raise_for_target(inst)
         try:
             inst.args = (self.fx.o,)  # still partial -> strike
