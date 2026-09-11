@@ -46,6 +46,7 @@ mod applytype;
 mod argapprox;
 mod argmap;
 mod astdiff_snapshot;
+mod astdiff_symbols;
 mod astwire;
 mod attrs;
 mod binder;
@@ -2056,6 +2057,11 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
     // B7 slice 1 (#1497): native astdiff type-snapshot builder.
     module.add_function(wrap_pyfunction!(
         astdiff_snapshot::rust_snapshot_type,
+        module
+    )?)?;
+    // B7 slice 2 (#1500): native astdiff symbol-table snapshot builder.
+    module.add_function(wrap_pyfunction!(
+        astdiff_symbols::rust_snapshot_symbol_table,
         module
     )?)?;
     module.add_function(wrap_pyfunction!(
