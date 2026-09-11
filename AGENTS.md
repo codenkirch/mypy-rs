@@ -3322,6 +3322,46 @@ including:
   testtypes 3,321/6 (+12 tests), testcheck 8,198/15/7 exact,
   fine-grained 747/27, daemon 37, finegrainedcache 549/229.
 
+- wave 61A decidable leftovers (issue #1511): audit-first retirement of
+  the wave-60A bucket leftovers (env-gated `MYPY_TK_W61_AUDIT` probes at
+  the three seams, stripped before landing; cold self-check
+  `-n0 --no-incremental` reproduced every bucket, then re-measured).
+  - `rust_restrict_subtype_away` 2 -> 0 fallbacks: the
+    `consider_runtime_isinstance=False` branch now runs Python's second
+    check natively (`subtypes::is_subtype` with
+    `SubtypeContext.erase_instances = true`) after the
+    non-generic/non-protocol shortcut. Protocol-right pairs with a
+    recorded base relation still defer (join-kernel floor).
+  - `rust_map_type_from_supertype` 10 `expand` -> 0: (a) the seam
+    installs `FlatAliasGuard` around the by-instance expand (the #1203
+    alias-union flatten was live for `rust_expand_type`, missing here),
+    retiring the alias-union cases (tempfile / subprocess /
+    zip_longest / filterfalse / pathspec); (b) the ParamSpec-to-ParamSpec
+    callable splice (`param_spec_callable_arm`) is restored, wire-safe
+    because `ParamSpecType.id.meta_level` round-trips since #1417,
+    retiring the staticmethod / classmethod / abstract* wrappers; (c)
+    `interpolate_args_for_unpack` (plain `Unpack[Ts]`) + the
+    unmatched-TVT `expand_unpack` default (`variables.get(id, t.type)`,
+    expandtype.py:1097) + the `with_normalized_var_args` handoff retire
+    operator.itemgetter. The 12 `snap-miss` + 1 `tuple-super` buckets
+    stay the documented #1490/#1486 floors. Also fixes a latent
+    `with_normalized_var_args` divergence: the TypeVarTuple branch
+    pushed the bare `TypeVarTupleType` instead of Python's enclosing
+    `UnpackType` (types.py:2608-2610).
+  - `rust_covers_at_runtime` erase-item 1 -> 0: `argapprox::erase_type`
+    ports `visit_overloaded` (`items[0].fallback`, erasetype.py:218-219);
+    the 2 `subtype-none` calls stay the documented floor.
+  - Pins: 5 Rust units (Overloaded erase x2, TVT normalization,
+    unmatched-TVT default, interpolation) + 2 Python suite tests
+    (`test_alias_union_arg_flattens`,
+    `test_overloaded_item_erases_via_first_item_fallback`) and 2
+    reworked defer pins (`test_splice_with_paramspec_repl`,
+    `test_generic_supertype_check2_decides`).
+  - Gates: cargo 2,746/11, fmt + clippy clean, testtypes 3,323/6,
+    testcheck 8,198/15/7 exact, fine-grained 747/27, daemon 37,
+    finegrainedcache 549/229, merge+diff 120/1, cold self-check clean
+    347.
+
 ## Pull Requests
 
 The default branch on this fork is `main` (not `master`). Always target

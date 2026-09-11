@@ -210,7 +210,9 @@ fn with_unpacked_kwargs(base: &mut CallableBase) -> Result<(), WireError> {
 }
 
 /// `with_normalized_var_args`: expand `*args: *Tuple[...]` into fixed args.
-fn with_normalized_var_args(base: &mut CallableBase) -> Result<(), WireError> {
+/// Shared with the `expand_type` Callable arm (expandtype.rs), which applies
+/// it to an interpolated unpack var-arg (expandtype.py:1215-1216).
+pub(crate) fn with_normalized_var_args(base: &mut CallableBase) -> Result<(), WireError> {
     let var_arg_index = base.arg_kinds.iter().position(|&k| k == ARG_STAR);
     let unpacked_items = match var_arg_index {
         Some(idx) => match &base.arg_types[idx] {
@@ -264,7 +266,10 @@ fn with_normalized_var_args(base: &mut CallableBase) -> Result<(), WireError> {
                     names_middle.push(base.arg_names[ui].clone());
                 }
                 Type::TypeVarTupleType { .. } => {
-                    types_middle.push(nested_unpacked.clone());
+                    // Python keeps the enclosing UnpackType: new_unpack =
+                    // nested_unpack (types.py:2608-2610), so `*Tuple[*Ts]`
+                    // becomes `*Ts` (an UnpackType), not a bare Ts.
+                    types_middle.push(unpacked_items[ui_idx].clone());
                     kinds_middle.push(ARG_STAR);
                     names_middle.push(base.arg_names[ui].clone());
                 }
@@ -1038,13 +1043,9 @@ pub(crate) fn solve_generic_call_core(
         }
     }
 
-    // Empty constraints are still solvable: the solver fills every
-    // unconstrained var with strict Never / lax Any (solve.py:277-289),
-    // matching Python's empty-cmap fill (#382 path). No deferral needed.
-    // A var with multiple lowers is joined by the solver. When the joined
-    // solution nests a FunctionLike, the nested FuncDef definitions do not
-    // survive the wire (pretty_callable needs them): defer those joins.
-    // Identity keys go through the shared solve_typevar_key helper.
+    // Empty constraints are still solvable (strict Never / lax Any fill,
+    // solve.py:277-289). Multi-lower joins whose solution nests a
+    // FunctionLike defer: the wire drops nested FuncDef definitions.
     let mut lowers_by_var: std::collections::HashMap<(i64, i64, String), usize> =
         std::collections::HashMap::new();
     for c in &all_constraints {
@@ -1764,6 +1765,46 @@ mod tests {
                 )]
             ))
         );
+    }
+
+    #[test]
+    fn normalize_var_args_tvt_keeps_unpack_wrapper() {
+        // *args: *Tuple[*Ts] -> *args: *Ts: Python keeps the enclosing
+        // UnpackType (types.py:2608-2610), not a bare TypeVarTupleType.
+        let tvt = Type::TypeVarTupleType {
+            tuple_fallback: Box::new(instance()),
+            name: "Ts".to_string(),
+            fullname: "__main__.Ts".to_string(),
+            raw_id: 7,
+            namespace: String::new(),
+            upper_bound: Box::new(any_type()),
+            default: Box::new(any_type()),
+            min_len: 0,
+            meta_level: 0,
+        };
+        let t = callable_with(
+            false,
+            vec![(
+                unpack(tuple_of(vec![unpack(tvt)])),
+                ARG_STAR,
+                Some("args".into()),
+            )],
+        );
+        let out = normalize_bytes(&t).unwrap();
+        let Type::CallableType {
+            arg_types,
+            arg_kinds,
+            ..
+        } = out
+        else {
+            panic!("expected CallableType");
+        };
+        assert_eq!(arg_kinds, vec![ARG_STAR]);
+        assert!(matches!(
+            &arg_types[0],
+            Type::UnpackType { typ, .. }
+                if matches!(&**typ, Type::TypeVarTupleType { .. })
+        ));
     }
 
     fn none_type() -> Type {
