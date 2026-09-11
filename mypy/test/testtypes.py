@@ -56695,3 +56695,213 @@ class NativeAddClassTvarsFreeSuite(Suite):
         off = self._with_gate(False, run)
         on = self._with_gate(True, run)
         assert str(on) == str(off), f"add_class_tvars parity: {off!r} vs {on!r}"
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeJoinMeetWave62Suite(Suite):
+    """Wave-62A join/meet residual ports (issue #1516).
+
+    Covers the residual defer arms the wave-60A audit classified:
+
+    - `visit_instance_join` s non-Instance cross arms (join.py:437-454):
+      FunctionLike -> `join_types(t, s.fallback)`; TypeType / TypedDict /
+      Tuple / Literal -> `join_types(t, s)`; every other shape ->
+      `join_default(s)`.
+    - `visit_meet` tuple arm (meet.py:1355-1361), including the
+      structural Bottom cases (unequal fixed arity, fixed shorter than
+      the variadic prefix+suffix).
+    - nested join materialization against EXPANDED alias operands
+      (`rust_join_types_inner`), and the `tuple_fallback` union
+      (handle_recursive=False) expanding NON-recursive aliases while
+      keeping recursive alias nodes folded (wave-33 guardrail).
+
+    Every case asserts gate-off vs gate-on parity; the decided cases
+    also pin a direct seam call (non-None) so a gate regression cannot
+    hide behind the Python fallback.
+    """
+
+    def setUp(self) -> None:
+        from mypy.join import (
+            _set_native_join_active,
+            _set_native_join_resolver,
+            _set_native_join_typeinfo_map,
+        )
+
+        self.fx = TypeFixture()
+        self._base_infos = [
+            self.fx.oi,
+            self.fx.ai,
+            self.fx.bi,
+            self.fx.str_type_info,
+            self.fx.bool_type_info,
+            self.fx.functioni,
+            self.fx.std_tuplei,
+            self.fx.std_listi,
+        ]
+        self._active = _set_native_join_active
+        self._resolver_seam = _set_native_join_resolver
+        self._map_seam = _set_native_join_typeinfo_map
+        self._install(self._base_infos, [])
+        self._active(True)
+
+    def _install(self, infos: list[Any], aliases: list[Any]) -> None:
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        self._resolver = _type_kernel.build_native_resolver(infos, aliases)
+        self._resolver_seam(self._resolver)
+        self._typeinfo_map = {info.fullname: info for info in infos}
+        self._map_seam(self._typeinfo_map)
+        set_wire_typeinfo_map(self._typeinfo_map)
+        self._set_wire_map = set_wire_typeinfo_map
+
+    def tearDown(self) -> None:
+        self._active(False)
+        self._resolver_seam(None)
+        self._map_seam(None)
+        self._set_wire_map(None)
+
+    def _with_gate(self, active: bool, fn: Callable[[], T]) -> T:
+        self._active(active)
+        try:
+            return fn()
+        finally:
+            self._active(True)
+
+    def _make_alias(self, fullname: str, target: Type) -> Any:
+        from mypy.nodes import TypeAlias
+
+        return TypeAlias(target, fullname, "mod", -1, -1)
+
+    def _assert_join_parity(self, s: Type, t: Type) -> object:
+        off = self._with_gate(False, lambda: join_types(s, t))
+        on = self._with_gate(True, lambda: join_types(s, t))
+        assert_equal(on, off)
+        return on
+
+    def _assert_meet_parity(self, s: Type, t: Type) -> object:
+        off = self._with_gate(False, lambda: meet_types(s, t))
+        on = self._with_gate(True, lambda: meet_types(s, t))
+        assert_equal(on, off)
+        return on
+
+    def _seam_join(self, s: Type, t: Type) -> Any:
+        from mypy.join import _serialize_type
+
+        return _type_kernel.rust_join_types(
+            _serialize_type(s), _serialize_type(t), True, self._resolver
+        )
+
+    def _seam_meet(self, s: Type, t: Type) -> Any:
+        from mypy.join import _serialize_type
+
+        return _type_kernel.rust_meet_types(
+            _serialize_type(s), _serialize_type(t), True, self._resolver
+        )
+
+    def _seam_join_type_list(self, types: list[Type]) -> Any:
+        from mypy.join import _serialize_type
+
+        return _type_kernel.rust_join_type_list(
+            [_serialize_type(t) for t in types], True, self._resolver
+        )
+
+    def test_instance_with_functionlike_cross_arm(self) -> None:
+        # join(Callable, function): the cross arm recurses
+        # join_types(t, s.fallback); the result is the function instance
+        # (SameT in the outer frame).
+        c = self.fx.callable(self.fx.a, self.fx.b)
+        on = self._assert_join_parity(c, self.fx.function)
+        assert_equal(on, self.fx.function)
+        assert self._seam_join(c, self.fx.function) is not None
+
+    def test_instance_with_type_type_cross_arm(self) -> None:
+        # join(Callable, Type[None]): the arm defaults s; the kernel
+        # encodes the s-derived object (the t-derived Object disc would
+        # be Any for a TypeType t - the pre-fix gate-on divergence).
+        tt = TypeType.make_normalized(NoneType())
+        c = self.fx.callable(self.fx.a, self.fx.b)
+        assert_equal(self._assert_join_parity(c, tt), self.fx.o)
+        assert_equal(self._assert_join_parity(tt, c), self.fx.o)
+        assert self._seam_join(c, tt) is not None
+
+    def test_join_instance_with_parameters_parity(self) -> None:
+        # Discovered while porting wave-62A: the Object disc is
+        # t-derived, so join(Instance, Parameters) diverged gate-on
+        # (Any vs Python's object); the arm now encodes default(s).
+        p = Parameters([self.fx.a], [ARG_POS], [None])
+        assert_equal(self._assert_join_parity(self.fx.a, p), self.fx.o)
+
+    def test_instance_with_tuple_cross_arm(self) -> None:
+        # join(Tuple[A, B], A): the Tuple cross arm recurses
+        # join_types(t, s) and resolves through the tuple fallback.
+        tup = TupleType([self.fx.a, self.fx.b], Instance(self.fx.std_tuplei, []))
+        self._assert_join_parity(tup, self.fx.a)
+        self._assert_join_parity(self.fx.a, tup)
+        assert self._seam_join(tup, self.fx.a) is not None
+
+    def test_instance_with_typeddict_cross_arm(self) -> None:
+        # join(TypedDict, A): the TypedDict cross arm recurses
+        # join_types(t, s) -> visit_typeddict_type -> fallback join
+        # (the fallback is A) -> A.
+        td = TypedDictType({"x": self.fx.o}, {"x"}, set(), self.fx.a)
+        assert_equal(self._assert_join_parity(td, self.fx.a), self.fx.a)
+        self._assert_join_parity(self.fx.a, td)
+        assert self._seam_join(td, self.fx.a) is not None
+
+    def test_meet_tuple_fixed_parity(self) -> None:
+        # meet(Tuple[A, B], Tuple[B, A]): itemwise tuple arm; B <: A so
+        # both items meet to B.
+        s = TupleType([self.fx.a, self.fx.b], Instance(self.fx.std_tuplei, []))
+        t = TupleType([self.fx.b, self.fx.a], Instance(self.fx.std_tuplei, []))
+        self._assert_meet_parity(s, t)
+        assert self._seam_meet(s, t) is not None
+
+    def test_meet_tuple_structural_bottom(self) -> None:
+        # tuple[A] vs tuple[A, A, *tuple[A, ...]]: meet_tuples returns
+        # None (fixed shorter than variadic.length()-1) -> default(s) =
+        # Bottom; the Rust seam must decide rather than defer.
+        s = TupleType([self.fx.a], Instance(self.fx.std_tuplei, []))
+        t = TupleType(
+            [
+                self.fx.a,
+                self.fx.a,
+                UnpackType(Instance(self.fx.std_tuplei, [self.fx.a])),
+            ],
+            Instance(self.fx.std_tuplei, []),
+        )
+        self._assert_meet_parity(s, t)
+        seam = self._seam_meet(s, t)
+        assert seam is not None, "Rust deferred on the structural-None tuple meet"
+        assert seam[0] == 3, f"expected Bottom disc, got {seam[0]}"
+
+    def test_join_type_list_nonrecursive_alias_expands(self) -> None:
+        # join_type_list([A-alias, A]) -> A: the alias item expands like
+        # get_proper_type, and the nested materialization must name the
+        # expanded operand, never leak the alias node.
+        from mypy.join import _deserialize_type, join_type_list
+
+        alias = self._make_alias("mod.TA", self.fx.a)
+        self._install(self._base_infos, [alias])
+        alias_t = TypeAliasType(alias, [])
+        off = self._with_gate(False, lambda: join_type_list([alias_t, self.fx.a]))
+        on = self._with_gate(True, lambda: join_type_list([alias_t, self.fx.a]))
+        assert_equal(on, off)
+        assert_equal(on, self.fx.a)
+        rusted = self._seam_join_type_list([alias_t, self.fx.a])
+        assert rusted is not None, "Rust deferred on a non-recursive alias item"
+        decoded = _deserialize_type(bytes(rusted))
+        assert decoded is not None
+        assert_equal(decoded, self.fx.a)
+
+    def test_join_type_list_recursive_alias_parity(self) -> None:
+        # Wave-33 guardrail: a recursive alias item must never be
+        # unfolded into a different result; gate-off/on must agree.
+        from mypy.join import join_type_list
+
+        alias = self._make_alias("mod.R", self.fx.a)
+        alias.target = UnionType([self.fx.a, TypeAliasType(alias, [])], False)
+        self._install(self._base_infos, [alias])
+        r = TypeAliasType(alias, [])
+        off = self._with_gate(False, lambda: join_type_list([r, self.fx.a]))
+        on = self._with_gate(True, lambda: join_type_list([r, self.fx.a]))
+        assert_equal(on, off)

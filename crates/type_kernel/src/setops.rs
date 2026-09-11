@@ -815,7 +815,45 @@ fn visit_meet(
             }
         }
 
-        // Full visitors (callable, typeddict, tuple,
+        // visit_tuple_type (meet.py:1355-1361): Python's structural
+        // None cases answer default(self.s) = Bottom (meet.py:1501);
+        // any other inner None defers (tuple-like s arm defers too).
+        Type::TupleType { items: t_items, .. } => {
+            let Type::TupleType { items: s_items, .. } = s else {
+                return None;
+            };
+            let s_unpack = find_unpack_in_list_like_python(s_items);
+            let t_unpack = find_unpack_in_list_like_python(t_items);
+            if s_unpack.is_some() != find_unpack(s_items).is_some()
+                || t_unpack.is_some() != find_unpack(t_items).is_some()
+            {
+                // Multiple unpack items: Python's find_unpack_in_list
+                // returns None where `find_unpack` finds the first -> the
+                // inner walk's variadic classification would diverge.
+                return None;
+            }
+            let python_none = match (s_unpack, t_unpack) {
+                (None, None) => s_items.len() != t_items.len(),
+                (Some(si), Some(ti)) => s_items.len() != t_items.len() || si != ti,
+                (Some(_), None) => t_items.len() + 1 < s_items.len(),
+                (None, Some(_)) => s_items.len() + 1 < t_items.len(),
+            };
+            if python_none {
+                return Some(SetOpResult::Bottom);
+            }
+            let items = meet_tuples_inner(s_items, t_items, ctx.strict_optional, resolver)?;
+            let fallback = crate::typeops::tuple_fallback(t, resolver)?;
+            let result = Type::TupleType {
+                partial_fallback: Box::new(fallback),
+                items,
+                implicit: false,
+            };
+            let mut wbuf = WriteBuffer::new();
+            wire::write_type(&mut wbuf, &result).ok()?;
+            Some(SetOpResult::Encoded(wbuf.into_bytes()))
+        }
+
+        // Full visitors (callable, typeddict,
         // typevartuple, overloaded) — deferred. The both-FunctionLike
         // case is already deferred by meet_types pre-dispatch. The
 
@@ -1522,6 +1560,58 @@ fn join_default(s: &Type, resolver: &TypeResolver) -> Option<SetOpResult> {
             None => None,
         },
         _ => Some(SetOpResult::Any),
+    }
+}
+
+/// `join_default(s)` for a visitor arm whose `t` is NOT an Instance
+/// (TypeType / ParamSpec / Parameters). The shim maps the `Object` disc
+/// to `object_or_any_from_type(t)` (t-derived), which diverges from
+/// Python's `default(s)` (s-derived) for those t shapes. Encode the
+/// concrete object/default result instead; the `Any` disc is absolute
+/// and passes through.
+fn join_default_encoded(s: &Type, t: &Type, resolver: &TypeResolver) -> Option<SetOpResult> {
+    let r = join_default(s, resolver)?;
+    if !matches!(r, SetOpResult::Object) {
+        return Some(r);
+    }
+    let typ = setop_result_to_type(Some(r), s, t)?;
+    let mut wbuf = WriteBuffer::new();
+    wire::write_type(&mut wbuf, &typ).ok()?;
+    Some(SetOpResult::Encoded(wbuf.into_bytes()))
+}
+
+/// Remap a recursive `join_types(first, second)` result into the outer
+/// `(outer_s, outer_t)` visitor frame. `SameS` in the recursive frame
+/// names `first`; `SameT` names `second`. The outer frame can only name
+/// `outer_s` / `outer_t`, so any other concrete answer is rebuilt via
+/// `setop_result_to_type` and encoded (`disc=7`). Absolute results
+/// (Ancestor / Object / Any / Bottom / Encoded) pass through unchanged.
+fn remap_result_to_outer(
+    r: SetOpResult,
+    first: &Type,
+    second: &Type,
+    outer_s: &Type,
+    outer_t: &Type,
+) -> Option<SetOpResult> {
+    let concrete = match &r {
+        SetOpResult::SameS => first,
+        SetOpResult::SameT => second,
+        SetOpResult::SameTypeWithArgs { .. } => {
+            let typ = setop_result_to_type(Some(r.clone()), first, second)?;
+            let mut wbuf = WriteBuffer::new();
+            wire::write_type(&mut wbuf, &typ).ok()?;
+            return Some(SetOpResult::Encoded(wbuf.into_bytes()));
+        }
+        other => return Some(other.clone()),
+    };
+    if concrete == outer_t {
+        Some(SetOpResult::SameT)
+    } else if concrete == outer_s {
+        Some(SetOpResult::SameS)
+    } else {
+        let mut wbuf = WriteBuffer::new();
+        wire::write_type(&mut wbuf, concrete).ok()?;
+        Some(SetOpResult::Encoded(wbuf.into_bytes()))
     }
 }
 
@@ -2630,7 +2720,10 @@ fn visit_join_inner(
                 wire::write_type(&mut wbuf, &joined).ok()?;
                 return Some(SetOpResult::Encoded(wbuf.into_bytes()));
             }
-            None
+            // join.py:864: else -> self.default(self.s). t is a
+            // TypeType here, so the Object disc's t-derived shim mapping
+            // would diverge; encode the concrete default result.
+            join_default_encoded(s, t, resolver)
         }
 
         // visit_literal_type (join.py:928-938). Cases:
@@ -3124,7 +3217,7 @@ fn visit_join_inner(
             if paramspec_eq(s, t) {
                 Some(SetOpResult::SameT)
             } else {
-                join_default(s, resolver)
+                join_default_encoded(s, t, resolver)
             }
         }
 
@@ -3164,8 +3257,10 @@ fn visit_join_inner(
                 wire::write_type(&mut wbuf, &result).ok()?;
                 Some(SetOpResult::Encoded(wbuf.into_bytes()))
             } else {
-                // s not Parameters -> default(s).
-                join_default(s, resolver)
+                // s not Parameters -> default(s); t is Parameters, so
+                // encode the concrete s-derived result (see
+                // join_default_encoded).
+                join_default_encoded(s, t, resolver)
             }
         }
 
@@ -4148,6 +4243,61 @@ fn flatten_alias_union_items(
     true
 }
 
+/// handle_recursive=False flatten (`tuple_fallback`'s union,
+/// typeops.py:392): Python's get_proper_type expands NON-recursive
+/// alias items and keeps recursive alias nodes folded (types.py:5109).
+/// Mirror that split exactly: expand non-recursive aliases to their raw
+/// chain-resolved targets, push a recursive alias node unchanged.
+/// Returns `false` to defer on a missing snapshot, an alias cycle, or
+/// an unsubstitutable shape (arg-bearing / tvar-carrying alias).
+fn flatten_alias_union_items_keep_recursive(
+    items: &[Type],
+    aliases: &dyn crate::aliases::AliasLookup,
+    out: &mut Vec<Type>,
+    active: &mut Vec<String>,
+) -> bool {
+    for t in items {
+        match t {
+            Type::TypeAliasType {
+                type_ref,
+                is_recursive,
+                ..
+            } => {
+                if *is_recursive {
+                    // Wave-33 guardrail: never unfold a recursive alias.
+                    out.push(t.clone());
+                    continue;
+                }
+                if active.contains(type_ref) {
+                    return false;
+                }
+                let Some(target) = crate::checkexpr_functions::expand_alias_target_raw(t, aliases)
+                else {
+                    return false;
+                };
+                active.push(type_ref.clone());
+                let ok = if let Type::UnionType { items: inner, .. } = &target {
+                    flatten_alias_union_items_keep_recursive(inner, aliases, out, active)
+                } else {
+                    out.push(target);
+                    true
+                };
+                active.pop();
+                if !ok {
+                    return false;
+                }
+            }
+            Type::UnionType { items: inner, .. } => {
+                if !flatten_alias_union_items_keep_recursive(inner, aliases, out, active) {
+                    return false;
+                }
+            }
+            _ => out.push(t.clone()),
+        }
+    }
+    true
+}
+
 /// `make_simplified_union` (typeops.py:605-692), Rust subset.
 ///
 /// Steps ported: flatten nested unions (step 1), single-item fast
@@ -4184,9 +4334,9 @@ pub(crate) fn make_simplified_union_expanded(
     keep_erased: bool,
     expand_aliases: bool,
 ) -> Option<Type> {
-    // Step 1: flatten nested unions. A top-level alias item expands to
-    // its raw target; union targets recurse, missing snapshot or cycle
-    // defers; under expand_aliases=false the fallback must not engage.
+    // Step 1: flatten nested unions. expand_aliases=false (the
+    // `tuple_fallback` union) still expands NON-recursive aliases and
+    // keeps recursive nodes folded (types.py:5109).
     let flat = match flatten_nested_unions(items) {
         Some(f) => f,
         None if expand_aliases => {
@@ -4199,7 +4349,13 @@ pub(crate) fn make_simplified_union_expanded(
             flat
         }
         None => {
-            return None;
+            let aliases = resolver.aliases()?;
+            let mut flat: Vec<Type> = Vec::with_capacity(items.len());
+            let mut active: std::vec::Vec<String> = Vec::new();
+            if !flatten_alias_union_items_keep_recursive(items, &aliases, &mut flat, &mut active) {
+                return None;
+            }
+            flat
         }
     };
     // Step 2: single-item fast path.
@@ -4426,6 +4582,12 @@ fn visit_union_join(
 /// - Different type with args -> defer (the via_supertype path with
 ///   args needs `expand_type_by_instance` on each base, deferred).
 ///
+/// s non-Instance cross arms (join.py:437-454): FunctionLike ->
+/// `join_types(t, s.fallback)` (defer on a `__call__` protocol);
+/// TypeType / TypedDictType / TupleType / LiteralType ->
+/// `join_types(t, s)`; a TypeVarTupleType whose bound is a subtype of
+/// t -> SameT; every other shape -> `join_default(s)`.
+///
 /// Returns `None` (defer to Python) when args are present but the
 /// specific arg-shape is not handled, or when a promote/blob decode
 /// fails.
@@ -4435,14 +4597,60 @@ pub(crate) fn visit_instance_join(
     ctx: &SubtypeContext,
     resolver: &TypeResolver,
 ) -> Option<SetOpResult> {
-    let (s_ref, s_args) = match s {
-        Type::Instance { type_ref, args, .. } => (type_ref.as_str(), args.as_slice()),
-        // s is not an Instance: the FunctionLike/TypeType/TypedDict/
-        // Tuple/Literal/TypeVarTuple branches (join.py:437-454) all
-        // recurse into join_types — defer to Python.
+    let t_ref = match t {
+        Type::Instance { type_ref, .. } => type_ref.as_str(),
         _ => {
             return None;
         }
+    };
+    let (s_ref, s_args) = match s {
+        Type::Instance { type_ref, args, .. } => (type_ref.as_str(), args.as_slice()),
+        // join.py:437-441: FunctionLike s: recurse
+        // join_types(t, s.fallback) (defer only on a `__call__` protocol
+        // t), remapped from the nested frame into the outer (s, t).
+        Type::CallableType { fallback, .. } => {
+            let protocol_call = resolver
+                .get(t_ref)
+                .is_some_and(|snap| snap.is_protocol && snap.protocol_members == ["__call__"]);
+            if protocol_call {
+                return None;
+            }
+            let r = join_types(t, fallback, ctx, resolver)?;
+            return remap_result_to_outer(r, t, fallback, s, t);
+        }
+        Type::Overloaded { items } => {
+            let protocol_call = resolver
+                .get(t_ref)
+                .is_some_and(|snap| snap.is_protocol && snap.protocol_members == ["__call__"]);
+            if protocol_call {
+                return None;
+            }
+            let first = items.first()?;
+            let Type::CallableType { fallback, .. } = first else {
+                return None;
+            };
+            let r = join_types(t, fallback, ctx, resolver)?;
+            return remap_result_to_outer(r, t, fallback, s, t);
+        }
+        // join.py:443-450: recurse join_types(t, s) for the is_type-form,
+        // TypedDict, Tuple, and Literal s shapes.
+        Type::TypeType { .. }
+        | Type::TypedDictType { .. }
+        | Type::TupleType { .. }
+        | Type::LiteralType { .. } => {
+            let r = join_types(t, s, ctx, resolver)?;
+            return remap_result_to_outer(r, t, s, s, t);
+        }
+        // join.py:451-452: TypeVarTupleType bound accepted by t -> t.
+        Type::TypeVarTupleType { upper_bound, .. } => {
+            return match is_subtype(upper_bound, t, ctx, resolver) {
+                Some(true) => Some(SetOpResult::SameT),
+                Some(false) => join_default(s, resolver),
+                None => None,
+            };
+        }
+        // join.py:453-454: else -> self.default(self.s).
+        _ => return join_default(s, resolver),
     };
     let (t_ref, t_args) = match t {
         Type::Instance { type_ref, args, .. } => (type_ref.as_str(), args.as_slice()),
@@ -6301,6 +6509,23 @@ fn find_unpack(items: &[Type]) -> Option<usize> {
         .position(|t| matches!(t, Type::UnpackType { .. }))
 }
 
+/// `mypy.types.find_unpack_in_list` (types.py): the single unpack index,
+/// or `None` for zero OR multiple unpack items. `find_unpack` returns the
+/// first index even with multiple unpacks; the meet structural guards
+/// must mirror Python's `None`-on-multiple semantics.
+fn find_unpack_in_list_like_python(items: &[Type]) -> Option<usize> {
+    let mut found: Option<usize> = None;
+    for (i, item) in items.iter().enumerate() {
+        if matches!(item, Type::UnpackType { .. }) {
+            if found.is_some() {
+                return None;
+            }
+            found = Some(i);
+        }
+    }
+    found
+}
+
 /// Extract the inner type of an `UnpackType`.
 fn get_unpack_type(unpack: &Type) -> &Type {
     match unpack {
@@ -6336,6 +6561,26 @@ fn encode_items(items: &[Type]) -> Option<Vec<u8>> {
     Some(buf.into_bytes())
 }
 
+/// `get_proper_type`-style top-level expansion of a pair before a nested
+/// join/meet recurse. Python's `join_types`/`meet_types` expand a
+/// top-level `TypeAliasType` operand at entry, so a nested result that
+/// names an operand (SameS/SameT) names the EXPANDED type. Materializing
+/// against the original alias would leak the alias node into a result
+/// Python returns expanded. Non-alias pairs return clones.
+pub(crate) fn expand_top_alias_pair(
+    s: &Type,
+    t: &Type,
+    resolver: &TypeResolver,
+) -> Option<(Type, Type)> {
+    if !matches!(s, Type::TypeAliasType { .. }) && !matches!(t, Type::TypeAliasType { .. }) {
+        return Some((s.clone(), t.clone()));
+    }
+    let aliases = resolver.aliases()?;
+    let s_p = proper_top(s, &aliases)?;
+    let t_p = proper_top(t, &aliases)?;
+    Some((s_p, t_p))
+}
+
 /// Inner join_types dispatcher — returns `None` (defer) when Rust
 /// doesn't handle the case, `Some(Type)` when it does.
 fn rust_join_types_inner(
@@ -6344,13 +6589,14 @@ fn rust_join_types_inner(
     strict_optional: bool,
     resolver: &TypeResolver,
 ) -> Option<Type> {
+    let (s_p, t_p) = expand_top_alias_pair(s, t, resolver)?;
     join_types(
-        s,
-        t,
+        &s_p,
+        &t_p,
         &SubtypeContext::new(false, false, false, false, false, strict_optional),
         resolver,
     )
-    .and_then(|r| materialize_join(s, t, r, resolver))
+    .and_then(|r| materialize_join(&s_p, &t_p, r, resolver))
 }
 
 /// Inner meet_types dispatcher — returns `None` (defer) when Rust
@@ -6361,13 +6607,14 @@ fn rust_meet_types_inner(
     strict_optional: bool,
     resolver: &TypeResolver,
 ) -> Option<Type> {
+    let (s_p, t_p) = expand_top_alias_pair(s, t, resolver)?;
     match meet_types(
-        s,
-        t,
+        &s_p,
+        &t_p,
         &SubtypeContext::new(false, false, false, false, false, strict_optional),
         resolver,
     ) {
-        Some(r) => setop_result_to_type(Some(r), s, t),
+        Some(r) => setop_result_to_type(Some(r), &s_p, &t_p),
         None => None,
     }
 }
@@ -7905,16 +8152,89 @@ mod tests {
     }
 
     #[test]
-    fn join_type_type_with_other_instance_defers() {
-        // visit_type_type case 3 (join.py:863-864 -> default): s is
-        // Instance that is NOT builtins.type. default(s) walks the
-        // fallback chain. Defer (default is complex).
+    fn join_type_type_with_other_instance_defaults_to_object() {
+        // visit_type_type case 3 (join.py:863-864 -> default): s is an
+        // Instance that is NOT builtins.type. default(s) for an
+        // Instance is object_from_instance -> Object.
         let o = snap("builtins.object", "object");
         let a = snap("a.A", "A");
         let r = make_resolver(vec![o, a]);
         let s = instance("a.A", vec![]);
         let t = type_type("builtins.object");
-        assert_eq!(join_types(&s, &t, &ctx(true), &r), None);
+        let got = join_types(&s, &t, &ctx(true), &r).unwrap();
+        let SetOpResult::Encoded(bytes) = got else {
+            panic!("expected Encoded, got {got:?}");
+        };
+        assert_eq!(
+            decode_type(&bytes).unwrap(),
+            instance("builtins.object", vec![])
+        );
+    }
+
+    #[test]
+    fn join_instance_with_functionlike_s_returns_fallback_join() {
+        // join(Callable, builtins.function): the FunctionLike cross arm
+        // recurses join_types(t, s.fallback) to the same-ref Instance
+        // join -> remapped to SameT (the outer t).
+        let r = make_resolver(vec![
+            snap("builtins.function", "function"),
+            snap("builtins.object", "object"),
+        ]);
+        let s = callable(
+            "builtins.function",
+            vec![instance("builtins.object", vec![])],
+            instance("builtins.object", vec![]),
+        );
+        let t = instance("builtins.function", vec![]);
+        assert_eq!(join_types(&s, &t, &ctx(true), &r), Some(SetOpResult::SameT));
+    }
+
+    #[test]
+    fn join_instance_with_type_type_s_cross_recurses() {
+        // join(Type[object], a.A): visit_instance cross arm TypeType ->
+        // join_types(t, s) -> visit_type_type with s=a.A (not
+        // builtins.type) -> default(s) encoded as object.
+        let r = make_resolver(vec![
+            snap("a.A", "A"),
+            snap("builtins.object", "object"),
+            snap("builtins.type", "type"),
+        ]);
+        let s = type_type("builtins.object");
+        let t = instance("a.A", vec![]);
+        let got = join_types(&s, &t, &ctx(true), &r).unwrap();
+        let SetOpResult::Encoded(bytes) = got else {
+            panic!("expected Encoded, got {got:?}");
+        };
+        assert_eq!(
+            decode_type(&bytes).unwrap(),
+            instance("builtins.object", vec![])
+        );
+    }
+
+    #[test]
+    fn remap_result_encodes_nonoperand_second() {
+        // Nested SameS names `first` (the outer t) -> outer SameT.
+        // Nested SameT names `second`; when that is neither outer
+        // operand it is encoded; when it is outer_s it maps to SameS.
+        let outer_s = instance("a.A", vec![]);
+        let outer_t = instance("a.B", vec![]);
+        let first = outer_t.clone();
+        let second = instance("builtins.function", vec![]);
+        let got =
+            remap_result_to_outer(SetOpResult::SameT, &first, &second, &outer_s, &outer_t).unwrap();
+        let SetOpResult::Encoded(bytes) = got else {
+            panic!("expected Encoded, got {got:?}");
+        };
+        assert_eq!(decode_type(&bytes).unwrap(), second);
+        assert_eq!(
+            remap_result_to_outer(SetOpResult::SameS, &first, &second, &outer_s, &outer_t).unwrap(),
+            SetOpResult::SameT
+        );
+        assert_eq!(
+            remap_result_to_outer(SetOpResult::SameT, &first, &outer_s, &outer_s, &outer_t)
+                .unwrap(),
+            SetOpResult::SameS
+        );
     }
 
     #[test]
@@ -8409,13 +8729,10 @@ mod tests {
     }
 
     #[test]
-    fn visit_instance_s_not_instance_defers() {
-        // s is AnyType, t is Instance -> the visit_instance Instance
-        // branch requires s to be Instance; AnyType s falls to the
-        // else branch (join.py:453 default). But AnyType s is caught
-
-        // by the AnyType short-circuit BEFORE visit_join. So this test
-        // uses UnboundType s (not AnyType, not Instance).
+    fn visit_instance_s_unbound_defaults_to_any() {
+        // s is UnboundType, t is Instance -> the visit_instance cross
+        // arm falls to the else branch (join.py:453-454 default(s));
+        // default(UnboundType) -> AnyType(special_form) -> Any.
         let r = make_resolver(vec![snap("a.A", "A")]);
         let s = Type::UnboundType {
             name: "X".to_string(),
@@ -8426,8 +8743,7 @@ mod tests {
             optional: false,
         };
         let t = instance("a.A", vec![]);
-        // visit_instance with s=UnboundType -> not Instance -> defer.
-        assert_eq!(join_types(&s, &t, &ctx(true), &r), None);
+        assert_eq!(join_types(&s, &t, &ctx(true), &r), Some(SetOpResult::Any));
     }
 
     // ---- visit_instance with args (M8g) ----
@@ -9114,6 +9430,87 @@ mod tests {
         let s = instance("a.A", vec![]);
         let t = Type::UninhabitedType { ambiguous: false };
         assert_eq!(meet_types(&s, &t, &ctx(true), &r), Some(SetOpResult::SameT));
+    }
+
+    #[test]
+    fn meet_tuple_fixed_arity_mismatch_returns_bottom() {
+        // visit_tuple_type (meet.py:1356-1361) + default (meet.py:1501):
+        // both fixed tuples with different arity -> Python's
+        // meet_tuples returns None -> default(self.s) = Bottom.
+        let r = make_resolver(vec![snap("builtins.int", "int")]);
+        let s = tuple_type("builtins.tuple", vec![]);
+        let t = tuple_type("builtins.tuple", vec![instance("builtins.int", vec![])]);
+        assert_eq!(
+            meet_types(&s, &t, &ctx(true), &r),
+            Some(SetOpResult::Bottom)
+        );
+    }
+
+    #[test]
+    fn meet_tuple_fixed_shorter_than_variadic_returns_bottom() {
+        // tuple[int, int, *tuple[int, ...]] vs tuple[int]: Python's
+        // fixed.length() (1) < variadic.length() - 1 (2) -> None ->
+        // default(self.s) -> Bottom.
+        let r = make_resolver(vec![
+            snap("builtins.int", "int"),
+            snap("builtins.tuple", "tuple"),
+        ]);
+        let int_t = instance("builtins.int", vec![]);
+        let variadic = tuple_type(
+            "builtins.tuple",
+            vec![
+                int_t.clone(),
+                int_t.clone(),
+                Type::UnpackType {
+                    typ: Box::new(instance("builtins.tuple", vec![int_t.clone()])),
+                    from_star_syntax: false,
+                },
+            ],
+        );
+        let fixed = tuple_type("builtins.tuple", vec![int_t]);
+        assert_eq!(
+            meet_types(&variadic, &fixed, &ctx(true), &r),
+            Some(SetOpResult::Bottom)
+        );
+    }
+
+    #[test]
+    fn meet_tuple_same_length_itemwise_encodes() {
+        // Both fixed tuples with cross item types: the pre-dispatch
+        // cannot decide, meet_tuples meets items pairwise, and the
+        // result encodes as TupleType(items, tuple_fallback(t)).
+        let r = make_resolver(vec![
+            snap("builtins.int", "int"),
+            snap("builtins.str", "str"),
+            snap("builtins.tuple", "tuple"),
+            snap("builtins.object", "object"),
+        ]);
+        let s = tuple_type(
+            "builtins.tuple",
+            vec![
+                instance("builtins.int", vec![]),
+                instance("builtins.str", vec![]),
+            ],
+        );
+        let t = tuple_type(
+            "builtins.tuple",
+            vec![
+                instance("builtins.str", vec![]),
+                instance("builtins.int", vec![]),
+            ],
+        );
+        let got = meet_types(&s, &t, &ctx(true), &r).unwrap();
+        let SetOpResult::Encoded(bytes) = got else {
+            panic!("expected Encoded, got {got:?}");
+        };
+        let decoded = decode_type(&bytes).unwrap();
+        let Type::TupleType { items, .. } = decoded else {
+            panic!("expected TupleType");
+        };
+        assert_eq!(items.len(), 2);
+        assert!(items
+            .iter()
+            .all(|i| matches!(i, Type::UninhabitedType { .. })));
     }
 
     #[test]
@@ -10350,9 +10747,13 @@ mod tests {
         let r = make_resolver(vec![snap("a.A", "A")]);
         let s = instance("a.A", vec![]);
         let t = param_spec(1, "~", instance("builtins.object", vec![]));
+        let got = join_types(&s, &t, &ctx(true), &r).unwrap();
+        let SetOpResult::Encoded(bytes) = got else {
+            panic!("expected Encoded, got {got:?}");
+        };
         assert_eq!(
-            join_types(&s, &t, &ctx(true), &r),
-            Some(SetOpResult::Object)
+            decode_type(&bytes).unwrap(),
+            instance("builtins.object", vec![])
         );
     }
 
@@ -10411,9 +10812,13 @@ mod tests {
         let r = make_resolver(vec![snap("a.A", "A")]);
         let s = instance("a.A", vec![]);
         let t = parameters(vec![instance("builtins.int", vec![])], vec![0]);
+        let got = join_types(&s, &t, &ctx(true), &r).unwrap();
+        let SetOpResult::Encoded(bytes) = got else {
+            panic!("expected Encoded, got {got:?}");
+        };
         assert_eq!(
-            join_types(&s, &t, &ctx(true), &r),
-            Some(SetOpResult::Object)
+            decode_type(&bytes).unwrap(),
+            instance("builtins.object", vec![])
         );
     }
 
@@ -11108,19 +11513,18 @@ mod tests {
         }
 
         #[test]
-        fn msu_expand_aliases_false_defers_on_alias_item() {
-            // The tuple_fallback shape (handle_recursive=False): Python
-            // keeps even a plain alias item in its step-1 flat list, so
-            // the kernel defers instead of substituting the target.
+        fn msu_expand_aliases_false_expands_nonrecursive_alias_item() {
+            // handle_recursive=False still expands a NON-recursive alias
+            // item (types.py:5109 keeps only `is_recursive` aliases
+            // folded); the kernel substitutes the target and simplifies.
             let r = join_resolver(vec![alias_snap(
                 "testmod.A",
                 &instance("builtins.int", vec![]),
             )]);
             let items = vec![alias_type("testmod.A", vec![]), int_inst()];
-            assert_eq!(
-                make_simplified_union_expanded(&items, &ctx(true), &r, false, false, false),
-                None
-            );
+            let got = make_simplified_union_expanded(&items, &ctx(true), &r, false, false, false)
+                .unwrap();
+            assert_eq!(got, int_inst());
         }
 
         #[test]
@@ -11132,6 +11536,20 @@ mod tests {
             let got = make_simplified_union_expanded(&items, &ctx(true), &r, false, false, false)
                 .unwrap();
             assert_eq!(got, union(vec![int_inst(), str_inst()]));
+        }
+
+        #[test]
+        fn rust_join_types_inner_materializes_expanded_alias_operand() {
+            // A nested fast-path join must name the EXPANDED operand on
+            // SameS/SameT (Python's join_types applies get_proper_type
+            // at entry), never leak the alias node into the result.
+            let r = join_resolver(vec![alias_snap(
+                "testmod.A",
+                &instance("builtins.int", vec![]),
+            )]);
+            let alias = alias_type("testmod.A", vec![]);
+            let got = rust_join_types_inner(&alias, &alias, true, &r).unwrap();
+            assert_eq!(got, instance("builtins.int", vec![]));
         }
 
         #[test]
@@ -11149,8 +11567,28 @@ mod tests {
                 implicit: false,
             };
             assert_eq!(crate::typeops::tuple_fallback(&tup, &r), None);
-            // Non-recursive alias tuple items defer too (hr=false):
-            // plain-item tuples still join natively and answer the
+            // Non-recursive alias items expand under hr=false (Python's
+            // get_proper_type substitutes them); the union simplifies.
+            let r3 = join_resolver(vec![alias_snap(
+                "testmod.A",
+                &instance("builtins.int", vec![]),
+            )]);
+            let tup3 = Type::TupleType {
+                partial_fallback: Box::new(instance("builtins.tuple", vec![])),
+                items: vec![alias_type("testmod.A", vec![]), int_inst()],
+                implicit: false,
+            };
+            let got3 = crate::typeops::tuple_fallback(&tup3, &r3).unwrap();
+            assert_eq!(
+                got3,
+                Type::Instance {
+                    type_ref: "builtins.tuple".to_string(),
+                    args: vec![int_inst()],
+                    last_known_value: None,
+                    extra_attrs: None,
+                }
+            );
+            // Plain-item tuples still join natively and answer the
             // union fallback.
             let r2 = join_resolver(vec![]);
             let tup2 = Type::TupleType {

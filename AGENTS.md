@@ -3533,6 +3533,61 @@ including:
   Gates: cargo 2,752/11 (+6 units), fmt + clippy clean, testtypes
   3,353/6 (+10 tests), testcheck 8,198/15/7 exact, fine-grained 747/27,
   daemon 37, cold self-check clean 347.
+- wave-62A join/meet family residue (wave 62, issue #1516):
+  audit-first (`MYPY_TK_W62A_AUDIT` leaf probes, stripped) + four
+  ports. Before -> after (cold self-check survey, same-proxy):
+  `rust_join_types` 21/208 -> 7/163 (96% native), `rust_join_instances`
+  17/28 -> 7/14 (50%), `rust_join_type_list` 10/25 -> 7/20 (65%),
+  `rust_meet_types` 6/17 -> 0/11 (100%), `rust_join_tuples` 4/7 ->
+  1/4 (75%): 58 -> 22 fallbacks.
+  - `visit_meet` tuple arm (meet.py:1355-1361): both-fixed/variadic
+    shapes run `meet_tuples_inner`; Python's structural None cases
+    (unequal fixed arity, misaligned unpacks, fixed shorter than the
+    variadic prefix+suffix) answer `default(self.s)` = Bottom, any
+    other inner None defers. `find_unpack_in_list_like_python` mirrors
+    Python's None-on-multiple-unpacks. Retires all 6 meet fallbacks.
+  - `visit_instance_join` s non-Instance cross arms (join.py:437-454):
+    FunctionLike -> `join_types(t, s.fallback)` (defer only on a
+    `__call__` protocol t); TypeType/TypedDict/Tuple/Literal ->
+    `join_types(t, s)`; TypeVarTuple bound accepted -> SameT; else
+    `join_default(s)`. Nested results remap from the recursive frame
+    onto the outer `(s, t)` frame (`remap_result_to_outer`, encoding
+    concrete non-operand answers).
+  - `visit_type_type` case 3 (join.py:864) no longer defers: it encodes
+    `default(s)`. Pre-existing parity bug discovered while porting: the
+    Object disc is t-derived in the shim, so the TypeType / ParamSpec /
+    Parameters default arms diverged gate-on (`join(Instance,
+    Parameters)` returned Any vs Python object); all three now encode
+    the concrete s-derived result (`join_default_encoded`, 3 Rust-unit
+    re-pins + a Python parity pin).
+  - Nested join/meet materialization expands top-level alias operands
+    first (`expand_top_alias_pair` in `rust_join_types_inner` /
+    `rust_meet_types_inner` / `join_one_pair`): SameS/SameT must name
+    the EXPANDED operand (Python's `get_proper_type` at join entry), so
+    an alias node can no longer leak into a result the shim then fails
+    to decode (retired the 4 mypyc SlotTable/SlotGenerator
+    `join_tuples_decode` events).
+  - `make_simplified_union(handle_recursive=False)` (the
+    `tuple_fallback` union) expands NON-recursive alias items and keeps
+    recursive alias nodes folded (`is_recursive`), mirroring
+    types.py:5109; the wave-33 `contains_recursive_alias` /
+    handle_recursive=False guardrails stay (recursive alias
+    tuple-fallback still defers).
+  - Floors (audited, do not re-audit): st protocol-right/left engine
+    (`is_subtype(Context/object, typing.Reversible)` -> None, 19
+    embedded events: the via-supertype collection / Callable-ret
+    family), `join_instances_via_supertype` generic-ancestor with tvars
+    (`Literal['x']?` vs `Literal[b'y']?` -> typing.Sequence), the
+    wave-43 whole-list LKV guard in `join_type_list_inner` (SlotTable
+    tuple pair), and a NOT_READY wire-map entry (`types.ModuleType`
+    join_type_list decode). Every residual fallback classifies here.
+  Pins: `NativeJoinMeetWave62Suite` (+9 Python parity/seam tests) + 12
+  Rust units (meet tuple arm, cross arms, remap, alias materialization,
+  non-recursive expansion).
+  Gates: cargo 2,753/11, fmt + clippy clean, cold self-check clean 347,
+  testtypes 3,352/6 (+9), testcheck 8,198/15/7 exact, fine-grained
+  747/27, daemon 37 (one flake on the first -n4 run, green on rerun),
+  finegrainedcache 549/229.
 
 ## Pull Requests
 
