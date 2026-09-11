@@ -7048,6 +7048,7 @@ mod tests {
                 attrs: attrs.into_iter().map(|(k, v)| (k.to_string(), v)).collect(),
                 immutable: HashSet::new(),
                 mod_name: None,
+                raw: None,
             }),
         }
     }

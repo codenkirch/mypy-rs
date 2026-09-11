@@ -6637,6 +6637,7 @@ mod tests {
                 attrs: attrs.into_iter().map(|(k, v)| (k.to_string(), v)).collect(),
                 immutable: immutable.into_iter().map(String::from).collect(),
                 mod_name: None,
+                raw: None,
             }),
         }
     }
@@ -6896,6 +6897,7 @@ mod tests {
                     .collect(),
                 immutable: Default::default(),
                 mod_name: None,
+                raw: None,
             });
         }
         assert!(contains_recursive_alias(&inst));

@@ -967,10 +967,9 @@ fn find_self_type_inner(
         let fb = get_attr_or_defer(obj, "partial_fallback")?;
         return find_self_type_inner(py, fb, ctx);
     }
-    // TypedDictType: recurse items values only (visit_typeddict_type in
-    // type_visitor.py does not descend into the fallback; #1122).
-    // HasAnyFromUnimportedType overrides visit_typeddict_type to False
-    // (a TypedDict is checked during its own declaration, not here).
+    // TypedDictType: recurse items values only (visit_typeddict_type does
+    // not descend into the fallback, #1122; HasAnyFromUnimportedType
+    // overrides it to False, since the TypedDict is checked later).
     if is_instance(obj, ctx.refs.typed_dict_type) {
         if matches!(ctx.kind, QueryKind::HasUnimportedAny) {
             return Ok(false);
@@ -994,11 +993,9 @@ fn find_self_type_inner(
         let item = get_attr_or_defer(obj, "item")?;
         return find_self_type_inner(py, item, ctx);
     }
-    // TypeAliasType: expand through the alias snapshot (issue #1157);
-    // with no snapshot (the pre-first-SCC semanal window) take the live
-    // expansion instead (see self_type_visit_alias_live). The snapshot
-    // path's wire walk answers HasSelfType semantics, so HAFU mode
-    // always takes the live expansion.
+    // TypeAliasType: expand through the alias snapshot (issue #1157); with
+    // no snapshot (pre-first-SCC semanal) take the live expansion instead
+    // (self_type_visit_alias_live). HAFU mode always takes the live one.
     if is_instance(obj, ctx.refs.type_alias_type) {
         if ctx.aliases.is_some() && matches!(ctx.kind, QueryKind::FindSelf) {
             return self_type_visit_alias(py, obj, ctx);
@@ -2124,9 +2121,8 @@ fn detect_diverging_alias_inner(
     let is_recursive = node.getattr("_is_recursive").map_err(|_| DeferError)?;
     let is_rec: bool = if is_recursive.is_none() {
         // node._is_recursive is None: compute via a Rust port of
-        // CollectAliasesVisitor (types.py:4463-4483) walking node.target
-        // (typeanal.py:3691-3693). No cache write: Python only caches the
-        // positive case on the node (and that write happens below).
+        // CollectAliasesVisitor (types.py:4463-4483) over node.target;
+        // no cache write, since Python caches only the positive case.
         let node_target = node.getattr("target").map_err(|_| DeferError)?;
         let mut alias_seen: HashSet<usize> = HashSet::new();
         let mut aliases: HashSet<usize> = HashSet::new();
@@ -2206,12 +2202,9 @@ fn diverging_visit_alias_type(
         }
         return Ok(());
     }
-    // Not in seen: mirror typeanal.py:3652 —
-    // `get_proper_type(t).accept(visitor)`. Expand via the real Python
-    // get_proper_type (substitutes t.args into the alias target, no_args
-    // handling included) instead of reading `alias.target` raw, then walk
-    // the expansion with the extended seen set. Python does not visit
-    // t.args separately on this branch; the expansion already carries them.
+    // Not in seen: mirror typeanal.py:3652 (`get_proper_type(t).accept`).
+    // Expand via the real Python get_proper_type rather than `alias.target`
+    // raw, then walk the expansion; t.args are carried by the expansion.
     let mut new_seen = seen.clone();
     new_seen.insert(alias_ptr);
     let expanded = get_proper_type_py(py, obj)?;
@@ -3131,6 +3124,7 @@ fn analyze_type_inner(
                         attrs,
                         immutable: ea.immutable.clone(),
                         mod_name: ea.mod_name.clone(),
+                        raw: None,
                     })
                 }),
             })
