@@ -284,9 +284,16 @@ pub(crate) fn erase_type(t: &Type, strict_optional: bool, res: &TypeResolver) ->
             type_is: None,
             special_sig: None,
         }),
-        // visit_overloaded (erasetype.py:218-219): `t.fallback.accept(self)`.
-        // The wire `Overloaded` carries no fallback, so defer.
-        Type::Overloaded { .. } => None,
+        // visit_overloaded (erasetype.py:218-219): `t.fallback.accept(self)`,
+        // where `Overloaded.fallback` is `items[0].fallback`. An empty items
+        // list would raise IndexError in Python; defer.
+        Type::Overloaded { items } => {
+            let first = items.first()?;
+            let Type::CallableType { fallback, .. } = first else {
+                return None;
+            };
+            erase_type(fallback, strict_optional, res)
+        }
         Type::TupleType {
             partial_fallback, ..
         } => erase_type(partial_fallback, strict_optional, res),
@@ -518,4 +525,78 @@ pub(crate) fn rust_arg_approximate_similarity(
     };
     let r = approx(&actual, &formal, strict_optional, resolver.resolver());
     r
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::typeinfo::TypeInfoSnapshot;
+
+    fn instance(type_ref: &str) -> Type {
+        Type::Instance {
+            type_ref: type_ref.to_string(),
+            args: vec![],
+            last_known_value: None,
+            extra_attrs: None,
+        }
+    }
+
+    fn snap(fullname: &str) -> TypeInfoSnapshot {
+        let mut s = TypeInfoSnapshot {
+            fullname: fullname.to_string(),
+            name: fullname.to_string(),
+            ..Default::default()
+        };
+        s.mro.push(fullname.to_string());
+        s.has_base.insert(fullname.to_string());
+        s
+    }
+
+    fn callable_with_fallback(fallback: Type) -> Type {
+        Type::CallableType {
+            fallback: Box::new(fallback),
+            instance_type: None,
+            is_ellipsis_args: false,
+            implicit: false,
+            is_bound: false,
+            from_concatenate: false,
+            imprecise_arg_kinds: false,
+            unpack_kwargs: false,
+            from_type_type: false,
+            arg_types: vec![],
+            arg_kinds: vec![],
+            arg_names: vec![],
+            ret_type: Box::new(Type::NoneType),
+            name: None,
+            variables: vec![],
+            type_guard: None,
+            type_is: None,
+            special_sig: None,
+        }
+    }
+
+    #[test]
+    fn erase_overloaded_uses_first_item_fallback() {
+        // EraseTypeVisitor.visit_overloaded (erasetype.py:218-219) is
+        // `t.fallback.accept(self)`, i.e. items[0].fallback.
+        let mut res = TypeResolver::new();
+        res.insert("builtins.function".to_string(), snap("builtins.function"));
+        let ov = Type::Overloaded {
+            items: vec![
+                callable_with_fallback(instance("builtins.function")),
+                callable_with_fallback(instance("builtins.function")),
+            ],
+        };
+        let out = erase_type(&ov, true, &res).expect("erase must decide");
+        assert!(
+            matches!(out, Type::Instance { ref type_ref, .. } if type_ref == "builtins.function")
+        );
+    }
+
+    #[test]
+    fn erase_overloaded_empty_defers() {
+        // Python would raise IndexError on `items[0]`; defer instead.
+        let res = TypeResolver::new();
+        assert!(erase_type(&Type::Overloaded { items: vec![] }, true, &res).is_none());
+    }
 }

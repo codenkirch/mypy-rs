@@ -1731,6 +1731,7 @@ fn map_type_from_supertype_inner(
     // allow_free=true (the typeobj composite) returns leftover TypeVars like
     // Python's expand_type_by_instance; the composite's Python tail re-links
     // their identities via wirefixup.
+    let _flat_alias_guard = crate::expandtype::FlatAliasGuard::install(resolver);
     if allow_free {
         crate::expandtype::expand_type_by_instance_free(
             typ,

@@ -15,11 +15,14 @@
 //!   * `visit_param_spec` ARGS/KWARGS flavors and non-Instance upper
 //!     bounds (`_possible_callable_varargs`/`_possible_callable_kwargs`).
 //!   * `visit_callable_type` ParamSpec splices carrying an UnpackType
-//!     result (Python's `normalize_trivial_unpack` is not ported).
+//!     result (Python's `normalize_trivial_unpack` is not ported) and the
+//!     TupleType/Instance `interpolate_args_for_unpack` shapes (only the
+//!     plain `Unpack[Ts]` arm is ported).
 //!   * Fresh (meta-level 1) ParamSpec substitutes the wire cannot key.
-//!   * Splice or leaf results embedding a `ParamSpecType` (the wire drops
-//!     its meta_level, so a fresh origin round-trips at meta level 0 and
-//!     the constraint solver mis-keys the constraint origin).
+//!   * `param_spec_leaf` results embedding a `ParamSpecType` (the repl is
+//!     another ParamSpec). The callable ParamSpec-to-ParamSpec splice is
+//!     ported and relies on the wire carrying `ParamSpecType.id.meta_level`
+//!     (#1417); `contains_param_spec` remains for the leaf.
 //!   * `visit_type_var_tuple` (expandtype.py:355-368) raises
 //!     `NotImplementedError` in Python for non-trivial replacements; we
 //!     defer those to Python rather than raise over FFI.
@@ -38,6 +41,9 @@ use crate::wire::{
     read_int_bare, read_str_bare, read_type, read_type_list, write_type, write_type_list,
     ReadBuffer, Type, WriteBuffer,
 };
+
+/// `ArgKind.ARG_STAR` (nodes.py ArgKind).
+const ARG_STAR: i64 = 2;
 
 // Alias-expanding union flatten (`flatten_nested_unions`, types.py:5057,
 // with handle_type_alias_type=True). Seams that reach `expand_type_inner`
@@ -589,12 +595,10 @@ fn encode_type(typ: &Type) -> Option<Vec<u8>> {
 
 /// Fresh-var parity guard for ParamSpec env lookups in the
 /// `param_spec_callable_arm` splice (the leaf defers on any env miss,
-/// issue #1359). The wire drops meta_level on ParamSpecType
-/// occurrences, so a fresh (meta-level 1) substitute is invisible here;
-/// meta vars allocate their own raw ids (types.py:645-648), so any env
-/// key matching the raw id + namespace at a nonzero meta level can only
-/// be a fresh substitute, which callers defer rather than answer with
-/// the wrong id.
+/// issue #1359). The arm keys the env at meta level 0 only; a nonzero-meta
+/// entry at the same raw id + namespace is a fresh substitute it must not
+/// answer with (meta vars allocate their own raw ids, types.py:645-648).
+/// Deferring leaves the live-tree answer to Python.
 fn has_fresh_param_spec_key(raw_id: i64, namespace: &str, env: &HashMap<EnvKey, Type>) -> bool {
     env.keys()
         .any(|k| k.0 == raw_id && k.1 != 0 && k.2 == namespace)
@@ -602,14 +606,11 @@ fn has_fresh_param_spec_key(raw_id: i64, namespace: &str, env: &HashMap<EnvKey, 
 
 /// Does `t` embed a `ParamSpecType` anywhere?
 ///
-/// The wire format does not carry `meta_level` on `ParamSpecType` ids (it
-/// does on `TypeVarType`), so any splice result that embeds one cannot
-/// round-trip: a fresh (meta-level 1) call-site ParamSpec comes back at
-/// meta level 0 and the constraint solver then mis-keys the constraint
-/// against the solve variables (see `_rebuild_wire_origin` /
-/// `_try_native_constraint_builder` in mypy/constraints.py). Splice arms
-/// that would produce an embedded ParamSpecType defer to Python instead
-/// of answering with the flattened id.
+/// Used by the `param_spec_leaf` splice and the Parameters-repl arm: those
+/// arms can embed ParamSpec ids whose occurrence identity the caller
+/// cannot key, so they defer to Python (issue #1359). The callable
+/// ParamSpec-to-ParamSpec splice is exempt: it relies on the wire carrying
+/// `ParamSpecType.id.meta_level` (#1417) and on the shim's identity repair.
 fn contains_param_spec(t: &Type) -> bool {
     match t {
         // The node itself is an occurrence: always true.
@@ -692,8 +693,8 @@ fn contains_param_spec_in_params(p: &crate::wire::Parameters) -> bool {
 /// `None` when the leaf defers to Python (no meta-level-0 env entry:
 /// Python's get(t.id, default) answer embeds a ParamSpecType, ARGS/
 /// KWARGS flavors, a non-Instance upper bound, an unpack in the
-/// expanded prefix, or a result embedding a ParamSpecType whose
-/// meta_level the wire drops).
+/// expanded prefix, or a result embedding a ParamSpecType the caller
+/// cannot key identity-safely).
 fn param_spec_leaf(t: &Type, env: &HashMap<EnvKey, Type>, strict_optional: bool) -> Option<Type> {
     let Type::ParamSpecType {
         prefix,
@@ -707,8 +708,8 @@ fn param_spec_leaf(t: &Type, env: &HashMap<EnvKey, Type>, strict_optional: bool)
         return None;
     };
     // No meta-level-0 env entry: both the fresh-key substitute and the
-    // get(t.id, default) fallback embed a ParamSpecType the wire drops
-    // meta_level on (issue #1359). Parity: expandtype.py:963-996.
+    // get(t.id, default) fallback embed a ParamSpecType the leaf cannot
+    // answer with (issue #1359). Parity: expandtype.py:963-996.
     let repl: &Type = env.get(&(*raw_id, 0, namespace.to_string()))?;
     let res = match repl {
         Type::ParamSpecType { .. } => {
@@ -748,8 +749,8 @@ fn param_spec_leaf(t: &Type, env: &HashMap<EnvKey, Type>, strict_optional: bool)
     };
     if let Some(r) = &res {
         if contains_param_spec(r) {
-            // The wire round-trip flattens any embedded ParamSpecType to
-            // meta level 0; defer so Python answers with the live tree.
+            // An embedded ParamSpecType the leaf cannot key identity-safely;
+            // defer so Python answers with the live tree.
             return None;
         }
     }
@@ -760,11 +761,9 @@ fn param_spec_leaf(t: &Type, env: &HashMap<EnvKey, Type>, strict_optional: bool)
 /// (expandtype.py:1149-1195). Returns `Some(Some(t))` when the splice
 /// ran, `Some(None)` when the case defers to Python (an UnpackType in
 /// the splice result, a fresh meta var substitute the wire cannot
-/// key, a splice result embedding a ParamSpecType whose meta_level
-/// the wire drops, or a ParamSpec substituted by another ParamSpec:
-/// the arg-splice construction always fails the contains_param_spec
-/// tail guard), and `None` when there is no ParamSpec replacement in
-/// the env (the caller continues with the generic expansion path).
+/// key, or an ARGS/KWARGS ParamSpec leaf the Parameters arm cannot
+/// key), and `None` when there is no ParamSpec replacement in the env
+/// (the caller continues with the generic expansion path).
 fn param_spec_callable_arm(
     t: &Type,
     env: &HashMap<EnvKey, Type>,
@@ -859,13 +858,119 @@ fn param_spec_callable_arm(
             Some(Some(res))
         }
         // Substituting one ParamSpec for another (expandtype.py:1178-1195):
-        // the clean ARGS/KWARGS nodes embed ParamSpecTypes the wire drops
-        // meta_level on, so defer before building (issue #1359).
-        Type::ParamSpecType { .. } => Some(None),
+        // the prefix merges and the last two args become ARGS/KWARGS of a
+        // prefix-cleared copy (meta_level round-trips since #1417).
+        Type::ParamSpecType {
+            prefix: repl_prefix,
+            name: repl_name,
+            fullname: repl_fullname,
+            raw_id: repl_raw_id,
+            namespace: repl_namespace,
+            upper_bound: repl_upper_bound,
+            default: repl_default,
+            meta_level: repl_meta_level,
+            ..
+        } => {
+            let n = arg_types.len();
+            let mut new_arg_types = Vec::with_capacity(n - 2 + 2 + repl_prefix.arg_types.len());
+            for at in &arg_types[..n - 2] {
+                new_arg_types.push(expand_type_inner(at, env, strict_optional)?);
+            }
+            new_arg_types.extend(repl_prefix.arg_types.iter().cloned());
+            let clean_prefix = crate::wire::Parameters {
+                arg_types: Vec::new(),
+                arg_kinds: Vec::new(),
+                arg_names: Vec::new(),
+                variables: Vec::new(),
+                imprecise_arg_kinds: false,
+                is_ellipsis_args: false,
+            };
+            let clean_repl = |flavor: i64| Type::ParamSpecType {
+                prefix: Box::new(clean_prefix.clone()),
+                name: repl_name.clone(),
+                fullname: repl_fullname.clone(),
+                raw_id: *repl_raw_id,
+                namespace: repl_namespace.clone(),
+                flavor,
+                upper_bound: repl_upper_bound.clone(),
+                default: repl_default.clone(),
+                meta_level: *repl_meta_level,
+            };
+            new_arg_types.push(clean_repl(1)); // ParamSpecFlavor.ARGS
+            new_arg_types.push(clean_repl(2)); // ParamSpecFlavor.KWARGS
+            let mut new_arg_kinds = arg_kinds[..n - 2].to_vec();
+            new_arg_kinds.extend(repl_prefix.arg_kinds.iter().copied());
+            new_arg_kinds.extend(arg_kinds[n - 2..].to_vec());
+            let mut new_arg_names = arg_names[..n - 2].to_vec();
+            new_arg_names.extend(repl_prefix.arg_names.iter().cloned());
+            new_arg_names.extend(arg_names[n - 2..].to_vec());
+            let new_ret = expand_type_inner(ret_type, env, strict_optional)?;
+            let mut res = t.clone();
+            if let Type::CallableType {
+                arg_types,
+                arg_kinds,
+                arg_names,
+                ret_type,
+                from_concatenate,
+                imprecise_arg_kinds,
+                ..
+            } = &mut res
+            {
+                *arg_types = new_arg_types;
+                *arg_kinds = new_arg_kinds;
+                *arg_names = new_arg_names;
+                *ret_type = new_ret.into();
+                *from_concatenate = *from_concatenate || !repl_prefix.arg_types.is_empty();
+                *imprecise_arg_kinds = *imprecise_arg_kinds || repl_prefix.imprecise_arg_kinds;
+            }
+            Some(Some(res))
+        }
         // An env replacement of another shape (e.g. Any): Python falls
         // through to the generic expansion path too.
         _ => None,
     }
+}
+
+/// `ExpandTypeVisitor.interpolate_args_for_unpack` (expandtype.py:1118-1146),
+/// ported for the plain `Unpack[Ts]` var-arg case. The `TupleType` and
+/// `Instance` var-arg shapes (and invalid replacements) defer (`None`) to
+/// the pure-Python body.
+fn interpolate_args_for_unpack(
+    arg_types: &[Type],
+    var_arg_index: usize,
+    env: &HashMap<EnvKey, Type>,
+    strict_optional: bool,
+) -> Option<Vec<Type>> {
+    let Type::UnpackType { typ: inner, .. } = arg_types.get(var_arg_index)? else {
+        return None;
+    };
+    // get_proper_type(var_arg.type) (expandtype.py:1123): the wire alias has
+    // no resolved target, so an alias defers.
+    let Type::TypeVarTupleType { tuple_fallback, .. } = inner.as_ref() else {
+        return None;
+    };
+    let mut prefix = Vec::with_capacity(var_arg_index);
+    for at in &arg_types[..var_arg_index] {
+        prefix.push(expand_type_inner(at, env, strict_optional)?);
+    }
+    let mut suffix = Vec::with_capacity(arg_types.len() - var_arg_index - 1);
+    for at in &arg_types[var_arg_index + 1..] {
+        suffix.push(expand_type_inner(at, env, strict_optional)?);
+    }
+    // expanded_items = self.expand_unpack(var_arg) (expandtype.py:1135):
+    // `new_unpack = UnpackType(TupleType(expanded_items, fallback))`.
+    let expanded_items = expand_unpack(inner, env)?;
+    let new_unpack = Type::UnpackType {
+        typ: Box::new(Type::TupleType {
+            partial_fallback: tuple_fallback.clone(),
+            items: expanded_items,
+            implicit: false,
+        }),
+        from_star_syntax: false,
+    };
+    prefix.push(new_unpack);
+    prefix.extend(suffix);
+    Some(prefix)
 }
 
 /// Substitute TypeVar references in `typ` using `env`, mirroring
@@ -1117,14 +1222,38 @@ pub(crate) fn expand_type_inner(
             // `is_bound` needs no special handling here: it survives
             // copy_modified unchanged and expansion never branches on it.
 
-            // The Unpack interpolation branch
-            // (expandtype.py:482-488, interpolate_args_for_unpack) is
-            // deferred: if a var_arg is an UnpackType, defer to Python.
-            for at in arg_types {
-                if matches!(at, Type::UnpackType { .. }) {
-                    return None;
+            // Unpack interpolation (expandtype.py:1197-1203): when the
+            // `*args` formal is an UnpackType, interpolate its expansion,
+            // then normalize via `with_normalized_var_args` (:1215-1216).
+            let var_arg = arg_kinds.iter().position(|&k| k == ARG_STAR);
+            let (new_arg_types, normalize) = match var_arg {
+                Some(ui)
+                    if arg_types
+                        .get(ui)
+                        .is_some_and(|t| matches!(t, Type::UnpackType { .. })) =>
+                {
+                    match interpolate_args_for_unpack(arg_types, ui, env, strict_optional) {
+                        Some(args) => (args, true),
+                        None => {
+                            return None;
+                        }
+                    }
                 }
-            }
+                _ => {
+                    // Unported Unpack positions (non-star args, or
+                    // interpolation shapes the port declines): defer.
+                    for at in arg_types {
+                        if matches!(at, Type::UnpackType { .. }) {
+                            return None;
+                        }
+                    }
+                    let mut out = Vec::with_capacity(arg_types.len());
+                    for at in arg_types {
+                        out.push(expand_type_inner(at, env, strict_optional)?);
+                    }
+                    (out, false)
+                }
+            };
             // ExpandTypeVisitor (expandtype.py:676) expands arg_types, ret_type,
             // type_guard, type_is, instance_type. Does NOT expand fallback or
             // variables (declared type vars are definitions).
@@ -1132,10 +1261,6 @@ pub(crate) fn expand_type_inner(
                 Some(it) => Some(Box::new(expand_type_inner(it, env, strict_optional)?)),
                 None => None,
             };
-            let mut new_arg_types = Vec::with_capacity(arg_types.len());
-            for at in arg_types {
-                new_arg_types.push(expand_type_inner(at, env, strict_optional)?);
-            }
             let new_ret_type = Box::new(expand_type_inner(ret_type, env, strict_optional)?);
             let new_type_guard = match type_guard {
                 Some(tg) => Some(Box::new(expand_type_inner(tg, env, strict_optional)?)),
@@ -1145,7 +1270,7 @@ pub(crate) fn expand_type_inner(
                 Some(ti) => Some(Box::new(expand_type_inner(ti, env, strict_optional)?)),
                 None => None,
             };
-            Some(Type::CallableType {
+            let res = Type::CallableType {
                 fallback: fallback.clone(),
                 instance_type: new_instance_type,
                 is_ellipsis_args: *is_ellipsis_args,
@@ -1164,7 +1289,13 @@ pub(crate) fn expand_type_inner(
                 type_guard: new_type_guard,
                 type_is: new_type_is,
                 special_sig: None,
-            })
+            };
+            if normalize {
+                let mut base = crate::checkcall::callable_base(&res).ok()?;
+                crate::checkcall::with_normalized_var_args(&mut base).ok()?;
+                return Some(base.into_type());
+            }
+            Some(res)
         }
 
         Type::UnpackType { typ, .. } => {
@@ -1409,32 +1540,29 @@ pub(crate) fn rust_remove_trivial(
 /// Returns None for any other replacement (defer to Python, which would
 /// raise RuntimeError).
 fn expand_unpack(tvt: &Type, env: &HashMap<EnvKey, Type>) -> Option<Vec<Type>> {
-    let tvt = if let Type::TypeVarTupleType {
-        raw_id,
-        namespace,
-        meta_level,
-        ..
-    } = tvt
-    {
-        // Python keys the env by full TypeVarId (meta_level included); the
-        // wire round-trips meta_level on TypeVarTupleType.
-        let key = (*raw_id, *meta_level, namespace.clone());
-        // Unmatched TypeVarTuple: defer to Python.
-        match env.get(&key) {
-            Some(r) => r,
-            None => {
-                return None;
-            }
+    let (raw_id, namespace, meta_level) = match tvt {
+        Type::TypeVarTupleType {
+            raw_id,
+            namespace,
+            meta_level,
+            ..
+        } => (*raw_id, namespace.clone(), *meta_level),
+        _ => {
+            return None;
         }
-    } else {
-        return None;
+    };
+    // Python keys the env by full TypeVarId (meta_level included); an
+    // unmatched TypeVarTuple falls back to `t.type` (expandtype.py:1097).
+    let repl: &Type = match env.get(&(raw_id, meta_level, namespace)) {
+        Some(r) => r,
+        None => tvt,
     };
     // If the replacement is itself an UnpackType, unwrap once
     // (expandtype.py:385-386).
-    let repl = if let Type::UnpackType { typ: inner, .. } = tvt {
+    let repl = if let Type::UnpackType { typ: inner, .. } = repl {
         inner.as_ref()
     } else {
-        tvt
+        repl
     };
     match repl {
         Type::TupleType { items, .. } => Some(items.clone()),
@@ -1917,6 +2045,75 @@ mod tests {
         match out {
             Type::TypeVarTupleType { raw_id, .. } => assert_eq!(raw_id, 7),
             _ => panic!("expected TypeVarTupleType"),
+        }
+    }
+
+    #[test]
+    fn expand_unpack_unmatched_tvt_keeps_itself() {
+        // expandtype.py:1097 uses `variables.get(t.type.id, t.type)`:
+        // an unmatched TypeVarTuple resolves to itself, so the splice is
+        // [UnpackType(Ts)].
+        let tvt = type_var_tuple(7);
+        let env: HashMap<EnvKey, Type> = HashMap::new();
+        let out = expand_unpack(&tvt, &env).expect("default repl must decide");
+        assert_eq!(out.len(), 1);
+        assert!(matches!(
+            &out[0],
+            Type::UnpackType { typ, .. }
+                if matches!(&**typ, Type::TypeVarTupleType { raw_id, .. } if *raw_id == 7)
+        ));
+    }
+
+    #[test]
+    fn callable_unpack_var_arg_interpolates_and_normalizes() {
+        // `(T1, T2, *Ts) -> Any` with *Ts unmatched: interpolation +
+        // normalization collapse `*args: *Tuple[*Ts]` back to
+        // `*args: *Ts` while keeping the lead args (types.py:2600-2613).
+        let tvt = type_var_tuple(7);
+        let typ = Type::CallableType {
+            fallback: Box::new(instance("builtins.function", vec![])),
+            instance_type: None,
+            is_ellipsis_args: false,
+            implicit: false,
+            is_bound: false,
+            from_concatenate: false,
+            imprecise_arg_kinds: false,
+            unpack_kwargs: false,
+            from_type_type: false,
+            arg_types: vec![
+                tvar(1),
+                tvar(2),
+                Type::UnpackType {
+                    typ: Box::new(tvt),
+                    from_star_syntax: false,
+                },
+            ],
+            arg_kinds: vec![0, 0, ARG_STAR],
+            arg_names: vec![None, None, Some("args".to_string())],
+            ret_type: Box::new(any()),
+            name: None,
+            variables: vec![],
+            type_guard: None,
+            type_is: None,
+            special_sig: None,
+        };
+        let env: HashMap<EnvKey, Type> = HashMap::new();
+        let out = expand_type_inner(&typ, &env, false).expect("interpolation must decide");
+        match out {
+            Type::CallableType {
+                arg_types,
+                arg_kinds,
+                ..
+            } => {
+                assert_eq!(arg_types.len(), 3);
+                assert_eq!(arg_kinds, vec![0, 0, ARG_STAR]);
+                assert!(matches!(
+                    &arg_types[2],
+                    Type::UnpackType { typ, .. }
+                        if matches!(&**typ, Type::TypeVarTupleType { .. })
+                ));
+            }
+            other => panic!("expected CallableType, got {:?}", other),
         }
     }
 
@@ -2595,24 +2792,61 @@ mod tests {
     }
 
     #[test]
-    fn ps_splice_callable_with_paramspec_repl_defers() {
-        // P -> Q splice output embeds clean Q.args/Q.kwargs
-        // ParamSpecTypes; the wire drops their meta_level, so a fresh
-        // origin round-trips at meta level 0 (issue #1343). Defer.
+    fn ps_splice_callable_with_paramspec_repl_builds_clean_args_kwargs() {
+        // P -> Q splice (expandtype.py:1178-1195): the prefix merges and
+        // the last two args become ARGS/KWARGS of a prefix-cleared copy
+        // whose clean nodes copy Q's meta_level (round-trips since #1417).
         let typ = ps_callable(1, vec![instance("builtins.int", vec![])], any());
-        let env: HashMap<EnvKey, Type> = HashMap::from([(
-            (1, 0, String::new()),
-            param_spec_node(
-                2,
-                0,
-                params_of(vec![instance("builtins.str", vec![])], vec![]),
-            ),
-        )]);
-        assert!(matches!(
-            param_spec_callable_arm(&typ, &env, false),
-            Some(None)
-        ));
-        assert!(expand_type_inner(&typ, &env, false).is_none());
+        let repl = Type::ParamSpecType {
+            prefix: Box::new(params_of(vec![instance("builtins.str", vec![])], vec![])),
+            name: "Q".to_string(),
+            fullname: "__main__.Q".to_string(),
+            raw_id: 2,
+            namespace: String::new(),
+            flavor: 0,
+            upper_bound: Box::new(any()),
+            default: Box::new(any()),
+            meta_level: 1,
+        };
+        let env: HashMap<EnvKey, Type> = HashMap::from([((1, 0, String::new()), repl.clone())]);
+        let out = param_spec_callable_arm(&typ, &env, false)
+            .expect("splice arm must engage")
+            .expect("splice must decide");
+        match out {
+            Type::CallableType {
+                arg_types,
+                arg_kinds,
+                ..
+            } => {
+                assert_eq!(arg_types.len(), 4);
+                assert!(matches!(&arg_types[0], Type::Instance { type_ref, .. }
+                    if type_ref == "builtins.int"));
+                assert!(matches!(&arg_types[1], Type::Instance { type_ref, .. }
+                    if type_ref == "builtins.str"));
+                assert_eq!(arg_kinds, vec![0, 0, 2, 4]);
+                for (idx, expected_flavor) in [(2usize, 1i64), (3, 2)] {
+                    match &arg_types[idx] {
+                        Type::ParamSpecType {
+                            flavor,
+                            raw_id,
+                            meta_level,
+                            prefix,
+                            ..
+                        } => {
+                            assert_eq!(*flavor, expected_flavor);
+                            assert_eq!(*raw_id, 2);
+                            assert_eq!(*meta_level, 1);
+                            assert!(prefix.arg_types.is_empty());
+                        }
+                        other => panic!("expected ParamSpecType, got {:?}", other),
+                    }
+                }
+            }
+            other => panic!("expected CallableType, got {:?}", other),
+        }
+        // Plain (non-relink) callers still defer through the env gate: the
+        // ParamSpec survivors need the Python-side identity repair.
+        assert!(expand_type_with_env(&typ, &env, false).is_none());
     }
 
     #[test]

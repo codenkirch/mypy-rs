@@ -5615,10 +5615,10 @@ class NativeExpandParamSpecSpliceSuite(Suite):
         assert self._engaged(callee, env), "paramspec splice deferred"
         self._assert_par(callee, env)
 
-    def test_splice_with_paramspec_repl_defers(self) -> None:
-        # P -> Q with a prefix: the splice output embeds clean
-        # Q.args/**Q.kwargs ParamSpecTypes the wire would flatten
-        # (meta_level dropped). Defer to Python (issue #1343).
+    def test_splice_with_paramspec_repl(self) -> None:
+        # P -> Q with a prefix: the splice builds clean Q.args/**Q.kwargs
+        # nodes carrying Q's meta_level, which round-trips on the wire
+        # (ParamSpecType.id.meta_level since #1417), so the seam decides.
         from mypy.types import Parameters
 
         ps = self._param_spec()
@@ -5633,7 +5633,7 @@ class NativeExpandParamSpecSpliceSuite(Suite):
         )
         callee = self._splice_callable(ps, [self.fx.a])
         env = {ps.id: repl}
-        assert not self._engaged(callee, env), "paramspec splice engaged"
+        assert self._engaged(callee, env), "paramspec splice deferred"
         self._assert_par(callee, env)
 
     def test_splice_without_repl_defers(self) -> None:
@@ -6268,6 +6268,53 @@ class NativeMapTypeFromSupertypeSuite(Suite):
         assert isinstance(on, Instance), str(on)  # type: ignore[misc]
         assert isinstance(off, Instance), str(off)  # type: ignore[misc]
         assert on.args[0] is off.args[0] is self.fx.t, "decoded TypeVar must relink to original"
+
+    def test_alias_union_arg_flattens(self) -> None:
+        # `Alias[T] | None` with Alias = G[T]: the union arm must expand
+        # the top-level alias through the snapshot (FlatAliasGuard,
+        # #1203/#1446) instead of deferring the whole map.
+        from mypy.nodes import TypeAlias
+        from mypy.typeops import (
+            _serialize_type,
+            _set_native_typeops_resolver,
+            map_type_from_supertype,
+        )
+        from mypy.types import NoneType, TypeVarId, TypeVarType, UnionType
+        from mypy.wirefixup import set_wire_alias_map, set_wire_typeinfo_map
+
+        # Production class typevars bind TypeVarId(raw_id, namespace=<class
+        # fullname>) on both the defn tvars and the base-arg occurrences;
+        # stamp the fixture so the Rust map env keys line up.
+        for info in (self.fx.gi, self.fx.gs2i):
+            for tv in info.defn.type_vars:
+                tv.id = TypeVarId(tv.id.raw_id, namespace=info.fullname)
+            for base in info.bases:
+                for arg in base.args:
+                    if isinstance(arg, TypeVarType):
+                        arg.id = TypeVarId(arg.id.raw_id, namespace=info.fullname)
+        alias = TypeAlias(Instance(self.fx.gi, [self.fx.t]), "mod.U", "mod", -1, -1)
+        union = UnionType.make_union([TypeAliasType(alias, []), NoneType()])
+        callable = CallableType([union], [ARG_POS], [None], self.fx.anyt, self.fx.function)
+        resolver = _type_kernel.build_native_resolver(self._type_infos, [alias])
+        try:
+            set_wire_alias_map({alias.fullname: alias})
+            set_wire_typeinfo_map(self._live_map)
+            _set_native_typeops_resolver(resolver)
+            result = _type_kernel.rust_map_type_from_supertype(
+                resolver, self.fx.gs2i, self.fx.gi, _serialize_type(callable), True
+            )
+            assert result is not None, "alias-union map_type_from_supertype must decide"
+            off = self._with_gate(
+                False, lambda: map_type_from_supertype(callable, self.fx.gs2i, self.fx.gi)
+            )
+            on = self._with_gate(
+                True, lambda: map_type_from_supertype(callable, self.fx.gs2i, self.fx.gi)
+            )
+            assert_equal(str(on), str(off), "map_type_from_supertype parity (alias union)")
+        finally:
+            _set_native_typeops_resolver(self._resolver)
+            set_wire_typeinfo_map(self._live_map)
+            set_wire_alias_map(None)
 
     def test_alias_typ_object_parity_and_engagement(self) -> None:
         # Issue #1309 (mfs): mod.A = List[T] rides through the seam unchanged
@@ -22621,6 +22668,16 @@ class NativeCoversAtRuntimeSuite(Suite):
         assert self.assert_engages(self.fx.b, self.fx.a) is True
         assert self.assert_engages(self.fx.b, self.fx.d) is False
 
+    def test_overloaded_item_erases_via_first_item_fallback(self) -> None:
+        # erase_type(Overloaded) recurses through items[0].fallback
+        # (erasetype.py visit_overloaded); the Overloaded no longer defers
+        # the erase, so isinstance(x, object) engages and answers True.
+        from mypy.types import Overloaded
+
+        item = Overloaded([CallableType([], [], [], self.fx.a, self.fx.a)])
+        self.assert_par(item, self.fx.o)
+        assert self.assert_engages(item, self.fx.o) is True
+
     def _rebuild_resolver_with_aliases(self, aliases: list[Any]) -> None:
         type_infos = self._collect_type_infos()
         self.resolver = _type_kernel.build_native_resolver(type_infos, aliases)
@@ -22785,21 +22842,19 @@ class NativeRestrictSubtypeAwaySuite(Suite):
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeCheckerHelpersDeferralSuite(Suite):
-    """Parity for the `restrict_subtype_away` erase_instances defer (#885).
+    """Parity for the `restrict_subtype_away` erase_instances check (#885).
 
     The `consider_runtime_isinstance=False` path in `restrict_subtype_away`
     runs a second `is_proper_subtype(..., erase_instances=True)` check after
-    the plain proper-subtype check. The Rust kernel cannot represent
-    `erase_instances`, so it previously deferred the whole call whenever the
-    first check was `Some(false)`. This is wire-portable for a non-generic,
-    non-protocol Instance supertype: erasure only erases Instance args inside
-    `visit_instance`'s nominal branch, and a supertype with no type parameters
-    has no argument recursion, so the erased check is provably identical to
-    the first. The seam now answers `t` natively for that case.
+    the plain proper-subtype check. The kernel now runs it directly
+    (`SubtypeContext.erase_instances`): a first-check `Some(false)` plus an
+    erased-check `Some(false)` means Python returns `t` and the seam agrees.
+    Pairs the kernel cannot decide (protocol members, missing snapshots with
+    a recorded base relation) still defer and the Python body answers.
 
     Gate-on vs gate-off differential: Rust and pure Python must agree on the
-    same t/s pairs, including pairs that still defer (generic / protocol
-    supertypes), where the Python body is the source of truth.
+    same t/s pairs, including pairs that still defer, where the Python body
+    is the source of truth.
     """
 
     def setUp(self) -> None:
@@ -22887,11 +22942,16 @@ class NativeCheckerHelpersDeferralSuite(Suite):
         actual = _deserialize_type(seam)
         assert actual == self.fx.a
 
-    def test_generic_supertype_still_defers(self) -> None:
-        # s = G[T] is generic: erasure could differ inside the nominal arg
-        # recursion, so the kernel must still defer; the Python body answers.
+    def test_generic_supertype_check2_decides(self) -> None:
+        # s = G[T] is generic: the second erase_instances check now runs
+        # natively and decides Some(false) (no recorded base relation), so
+        # the seam answers t; the Python body agrees.
+        from mypy.join import _deserialize_type
+
         self.assert_par(self.fx.a, self.fx.gt)
-        assert self.seam_result(self.fx.a, self.fx.gt) is None
+        seam = self.seam_result(self.fx.a, self.fx.gt)
+        assert seam is not None
+        assert _deserialize_type(seam) == self.fx.a
 
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")

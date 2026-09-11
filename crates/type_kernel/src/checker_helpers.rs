@@ -568,19 +568,35 @@ pub(crate) fn restrict_subtype_away_inner(
                     None => return None,
                     Some(false) => {}
                 }
-                // erase_instances=True: the erased check is provably identical
-                // to the plain check when `s` is non-generic/non-protocol, so
-                // answer `t` natively (see should_restrict_to_t_no_erase).
-                if should_restrict_to_t_no_erase(s, resolver)? {
+                // erase_instances=True: when `s` is non-generic/non-protocol
+                // the erased check is provably identical to the plain check,
+                // so answer `t` natively (see should_restrict_to_t_no_erase).
+                if should_restrict_to_t_no_erase(s, resolver) == Some(true) {
                     return Some(t.clone());
                 }
-                None
+                // Generic / protocol right (or missing snapshot): Python's
+                // second check is_proper_subtype(t, s, ignore_promotions=True,
+                // erase_instances=True) (subtypes.py:3119-3120).
+                let mut ctx2 = crate::subtypes::SubtypeContext::new(
+                    false,
+                    false,
+                    false,
+                    true,
+                    true,
+                    strict_optional,
+                );
+                ctx2.erase_instances = true;
+                match crate::subtypes::is_subtype(p_t, s, &ctx2, resolver) {
+                    Some(true) => Some(Type::UninhabitedType { ambiguous: false }),
+                    Some(false) => Some(t.clone()),
+                    None => None,
+                }
             }
         }
     }
 }
 
-/// Decides `erase_instances` parity for `restrict_subtype_away`'s
+/// Decides the `erase_instances` shortcut for `restrict_subtype_away`'s
 /// ``consider_runtime_isinstance=False`` branch. Python's second check
 /// `is_proper_subtype(t, s, ignore_promotions=True, erase_instances=True)`
 /// erases the left Instance *only* inside `visit_instance`'s nominal
@@ -590,8 +606,9 @@ pub(crate) fn restrict_subtype_away_inner(
 /// comparison has no parameter recursion, so erasing is a no-op for every
 /// reachable subtype check: `Some(false)` from check 1 implies check 2 is
 /// also false and Python returns `t` unchanged. Returns `Some(true)` to
-/// answer `t` natively, `Some(false)` to keep deferring, or `None` (a
-/// missing right snapshot) to propagate the existing deferral.
+/// answer `t` natively, `Some(false)` when the caller must run check 2
+/// (generic / protocol right), or `None` (a missing right snapshot) when
+/// check 2 should still be attempted.
 fn should_restrict_to_t_no_erase(s: &Type, resolver: &TypeResolver) -> Option<bool> {
     let Type::Instance { type_ref, .. } = s else {
         return Some(false);
@@ -3519,22 +3536,40 @@ info.mro = [Cls()]
     }
 
     #[test]
-    fn test_restrict_subtype_away_consider_false_missing_right_snapshot_defers() {
-        // s Instance with no snapshot: should_restrict_to_t_no_erase defers
-        // (returns None) instead of guessing an erase parity.
+    fn test_restrict_subtype_away_consider_false_missing_right_snapshot_decides_via_check2() {
+        // s Instance with no snapshot and no recorded base relation: the
+        // second check (erase_instances) decides Some(false) because the
+        // nominal branch does not apply, so Python returns t.
         let mut r = TypeResolver::new();
         insert_plain_class(&mut r, "builtins.int");
         let t = make_instance("builtins.int", vec![]);
         let s = make_instance("mymod.NotFound", vec![]);
         let result =
             restrict_subtype_away_inner(&t, &s, false, true, &r, &TypeAliasResolver::new());
-        assert_eq!(result, None);
+        assert_eq!(result, Some(t.clone()));
+
+        // With a recorded base relation the mapping needs the right
+        // snapshot: the kernel defers and Python decides.
+        let mut base_r = TypeResolver::new();
+        let mut int_snap = TypeInfoSnapshot {
+            fullname: "builtins.int".to_string(),
+            name: "int".to_string(),
+            ..Default::default()
+        };
+        int_snap.mro.push("builtins.int".to_string());
+        int_snap.has_base.insert("builtins.int".to_string());
+        int_snap.has_base.insert("mymod.NotFound".to_string());
+        base_r.insert("builtins.int".to_string(), int_snap);
+        let deferred =
+            restrict_subtype_away_inner(&t, &s, false, true, &base_r, &TypeAliasResolver::new());
+        assert_eq!(deferred, None);
     }
 
     #[test]
-    fn test_restrict_subtype_away_consider_false_generic_right_defers() {
-        // s is a generic Instance (List with a type var): erase could differ
-        // (the nominal arg recursion would re-compare erased args), so defer.
+    fn test_restrict_subtype_away_consider_false_generic_right_decides_via_check2() {
+        // s is a generic Instance (List with a type var) but int has no
+        // recorded base relation to it: the second check (erase_instances)
+        // decides Some(false), so Python returns t.
         let mut r = TypeResolver::new();
         insert_plain_class(&mut r, "builtins.int");
         // builtins.list[list[int]] snapshot marked generic.
@@ -3557,7 +3592,7 @@ info.mro = [Cls()]
         );
         let result =
             restrict_subtype_away_inner(&t, &s, false, true, &r, &TypeAliasResolver::new());
-        assert_eq!(result, None);
+        assert_eq!(result, Some(t));
     }
 
     #[test]
