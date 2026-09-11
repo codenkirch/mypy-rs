@@ -1912,13 +1912,99 @@ fn is_singleton_identity_inner(
             }
             _ => Some(false),
         },
-        // FunctionLike type-object branch needs
-        // `CallableType.type_object()` force_fallback Instance resolution
-        // (get_instance_type over instance_type/ret_type chains), which the
-
-        // wire does not carry; defer to Python.
-        Type::CallableType { .. } | Type::Overloaded { .. } => None,
+        // Python: `isinstance(typ, FunctionLike) and typ.is_type_obj() and
+        // typ.type_object().is_final`. A non-type-object callable is false;
+        // a type object reads the live `is_final` (not snapshotted).
+        Type::CallableType { .. } | Type::Overloaded { .. } => {
+            function_like_type_object_is_final(py, typ, resolver)
+        }
         _ => Some(false),
+    }
+}
+
+/// `FunctionLike` arm of `is_singleton_identity_type` (typeops.py:1996):
+/// true when the callable is a type object (`is_type_obj()`) whose
+/// `type_object().is_final` is set. Returns `Some(false)` for a decidable
+/// non-type-object callable; `None` when the type object cannot be resolved
+/// (missing snapshot / alias / live TypeInfo). An unreadable live `is_final`
+/// defaults to false, matching the `TypeType` arm above.
+fn function_like_type_object_is_final(
+    py: Python<'_>,
+    typ: &Type,
+    resolver: &NativeTypeResolver,
+) -> Option<bool> {
+    // Overloaded delegates is_type_obj()/type_object() to items[0]
+    // (types.py:3117/3122).
+    let item = match typ {
+        Type::Overloaded { items } => items.first()?,
+        _ => typ,
+    };
+    let Type::CallableType {
+        fallback,
+        ret_type,
+        instance_type,
+        ..
+    } = item
+    else {
+        return None;
+    };
+    // is_type_obj(): fallback.type.is_metaclass() and not
+    // isinstance(get_proper_type(ret_type), UninhabitedType).
+    let Type::Instance {
+        type_ref: fallback_ref,
+        ..
+    } = fallback.as_ref()
+    else {
+        return Some(false);
+    };
+    let snap = resolver.resolver().get(fallback_ref)?;
+    let is_meta =
+        snap.has_base("builtins.type") || snap.fullname == "abc.ABCMeta" || snap.fallback_to_any;
+    if !is_meta {
+        return Some(false);
+    }
+    let proper_ret = proper_type_of(ret_type, resolver)?;
+    if matches!(proper_ret, Type::UninhabitedType { .. }) {
+        return Some(false);
+    }
+    // get_instance_type(force_fallback=True): prefer instance_type, else the
+    // proper ret. Python unwraps a TypeVar upper bound once and then applies
+    // the Tuple/TypedDict/Literal fallback checks (types.py:2667-2675).
+    let mut instance = match instance_type {
+        Some(it) => (**it).clone(),
+        None => proper_ret,
+    };
+    if let Type::TypeVarType { upper_bound, .. } = &instance {
+        instance = proper_type_of(upper_bound, resolver)?;
+    }
+    instance = match instance {
+        Type::TupleType {
+            partial_fallback, ..
+        } => (*partial_fallback).clone(),
+        Type::TypedDictType { fallback, .. } => (*fallback).clone(),
+        Type::LiteralType { fallback, .. } => (*fallback).clone(),
+        other => other,
+    };
+    let Type::Instance { type_ref, .. } = instance else {
+        return None;
+    };
+    let info = resolver.live_typeinfo(py, &type_ref)?;
+    Some(read_bool_attr(info, "is_final").unwrap_or(false))
+}
+
+/// Partial mirror of `get_proper_type` for the wire: expand a top-level
+/// alias through the alias snapshot (chain + argument substitution); every
+/// other shape is returned as-is. Unlike Python's `get_proper_type`,
+/// `TypeGuardedType` is not unwrapped (it is not expected as a callable
+/// `ret_type` / `upper_bound` in this path). `None` defers on a missing
+/// snapshot / cycle.
+fn proper_type_of(t: &Type, resolver: &NativeTypeResolver) -> Option<Type> {
+    if matches!(t, Type::TypeAliasType { .. }) {
+        let (target, _, _) =
+            crate::checkexpr_functions::expanded_alias_target(t, resolver.alias_resolver())?;
+        Some(target)
+    } else {
+        Some(t.clone())
     }
 }
 

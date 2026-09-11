@@ -20,7 +20,7 @@ Stage 2: ``remove_instance_last_known_values`` mirrors
 from __future__ import annotations
 
 from collections.abc import Callable, Sized
-from typing import Any, TypeVar
+from typing import Any, Literal, TypeVar
 
 from mypy.nodes import (
     AssignmentStmt,
@@ -964,7 +964,7 @@ def rust_container_type(
     elements: list[bytes],
     ctx: list[bytes] | None,
     n_keys: int,
-) -> bytes | None: ...
+) -> bytes | Literal[False] | None: ...
 def rust_tuple_context_matches(elements_tags: list[int], ctx_bytes: bytes) -> bool | None: ...
 def rust_build_tuple_type(items_bytes: list[bytes], seen_unpack: int) -> bytes | None: ...
 def rust_star_expr(type_bytes: bytes) -> bytes | None: ...
@@ -1222,6 +1222,8 @@ def rust_format_type_bare(
     verbosity: int,
     module_names: bool,
     use_star_unpack: bool,
+    reveal_verbose_types: bool = ...,
+    pretty_wire_safe: bool = ...,
 ) -> str | None: ...
 def rust_format_type(
     type_bytes: bytes,
@@ -1229,9 +1231,16 @@ def rust_format_type(
     verbosity: int,
     module_names: bool,
     use_star_unpack: bool,
+    reveal_verbose_types: bool = ...,
+    pretty_wire_safe: bool = ...,
 ) -> str | None: ...
 def rust_format_type_distinctly(
-    type_bytes_list: list[bytes], resolver: NativeTypeResolver, bare: bool, use_star_unpack: bool
+    type_bytes_list: list[bytes],
+    resolver: NativeTypeResolver,
+    bare: bool,
+    use_star_unpack: bool,
+    reveal_verbose_types: bool = ...,
+    pretty_wire_safe: bool = ...,
 ) -> list[str] | None: ...
 def rust_append_invariance_notes(
     arg_bytes: bytes, expected_bytes: bytes, resolver: NativeTypeResolver

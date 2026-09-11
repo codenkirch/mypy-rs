@@ -3271,6 +3271,56 @@ including:
   case). Gates: docs-only (tree == origin/main + this bullet), cargo
   2,739/11, testtypes 3,309/6, testcheck 8,198/15/7 exact, cold
   self-check clean 347.
+- wave 60B top un-audited defer buckets (issue #1507): audit-first port
+  of five seams (env-gated defer-reason probes, stripped before landing;
+  exact before/after measured with the survey proxy on the same
+  revision).
+  - `rust_is_singleton_identity_type` (typeops.py) 7,103 calls / 48 -> 0
+    fallbacks: the `FunctionLike` arm deferred every callable; now a
+    non-type-object callable is decided `false` and a type object
+    resolves `type_object().is_final` natively (`get_instance_type` with
+    `force_fallback=True`: `instance_type` or the proper `ret_type`, with
+    the TypeVar upper-bound unwrap cascading into the Tuple / TypedDict /
+    Literal fallback checks like Python's `if` chain) plus the live
+    TypeInfo map (`is_final` is not snapshotted). Deferral remains only
+    when the alias snapshot / live TypeInfo read is missing.
+  - `rust_container_type` (checkexpr.py) 1,806 / 36 -> 17: decided-none
+    protocol. A multi-item join Rust decides but that fails
+    `allow_fast_container_literal` means Python's own
+    `_first_or_join_fast_item` would return None after the same join;
+    Rust now returns a Python `False` sentinel and the shim skips the
+    duplicate pure-Python join (19 calls). Floors: 9 type-object
+    callable joins (`join_similar_callables` `from_type_type` handling),
+    7 join-engine-undecided pairs, 1 join-decided-but-allow-undecided.
+  - `rust_format_type_bare` / `rust_format_type_distinctly`
+    (messages.py) 353 / 9 -> 1 and 931 / 44 -> 37: the
+    `format_type_inner` pretty path now delegates to the
+    definition-free `pretty_callable_inner` when the shim proves every
+    callable in the tree renders identically without its wire-dropped
+    `definition` (`_pretty_wire_safe`: callable name present, no
+    prepended self/cls), threading
+    `reveal_verbose_types` / `pretty_wire_safe` through a per-call TLS
+    guard (defaults keep unit tests deferring). Snapshot-missing
+    Instances read the live TypeInfo `name` instead of deferring.
+    Floors: 37 definition-dependent pretty callables, 1 instance absent
+    from both the snapshot and the live map; the 25 `PartialType`
+    serialization exceptions never reach the seam.
+  - `rust_instantiate_type_alias` (typeanal.py) 5,862 / 68 -> 68: floor.
+    Every deferred call is the bare-generic `set_any_tvars` fill with at
+    least one defaulted alias tvar (`disallow_any=False, tvt=False,
+    defaults=True`): gradual `expand_type(arg, env)` over live
+    `tv.default`s plus `used_default` / note side effects, exactly the
+    deferral the Rust module documented from the start.
+  Pins: FunctionLike-arm (incl. the TypeVar-over-tuple cascade) +
+  direct-engagement tests in `NativeCoerceLiteralSingletonSuite`,
+  `_pretty_wire_safe` / definition-defer tests in
+  `NativeMessagesDeferralSuite`, decided-none + type-object-defer tests
+  in `NativeCheckexprJoinAndTupleSuite`, plus Rust unit tests for the
+  `FastItemOutcome::DecidedNone` / `ContainerOutcome::DecidedNone`
+  outcomes.
+  Gates: cargo 2,741/11, fmt + clippy clean, cold self-check clean 347,
+  testtypes 3,321/6 (+12 tests), testcheck 8,198/15/7 exact,
+  fine-grained 747/27, daemon 37, finegrainedcache 549/229.
 
 ## Pull Requests
 

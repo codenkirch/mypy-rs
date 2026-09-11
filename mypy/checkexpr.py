@@ -9,7 +9,7 @@ import time
 from collections import defaultdict
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from contextlib import contextmanager, nullcontext
-from typing import Any, ClassVar, Final, TypeAlias as _TypeAlias, cast, overload
+from typing import Any, ClassVar, Final, Literal, TypeAlias as _TypeAlias, cast, overload
 from typing_extensions import assert_never
 
 import mypy.checker
@@ -1032,11 +1032,15 @@ def _try_native_conditional_expr_join(if_bytes: bytes, else_bytes: bytes) -> byt
         return None
 
 
-def _try_native_container_type(tag: str, items: list[Type], n_keys: int = 0) -> Type | None:
+def _try_native_container_type(
+    tag: str, items: list[Type], n_keys: int = 0
+) -> Type | Literal[False] | None:
     """Compute the container type for a list/set/dict literal via the Rust kernel.
 
     Given a tag ("list", "set", "dict") and the item types, returns
-    the container type, or None to defer to Python.
+    the container type, `False` when Rust proved the pure-Python
+    `_first_or_join_fast_item` join would produce no container type
+    either (so the caller skips it), or None to defer to Python.
 
     For list/set, `items` is the list of element types.
     For dict, `items` is [key1, key2, ..., val1, val2, ...]
@@ -1052,12 +1056,14 @@ def _try_native_container_type(tag: str, items: list[Type], n_keys: int = 0) -> 
         return None
     try:
         items_bytes = [_serialize_type_for_checkexpr(v) for v in items]
-        rust_bytes = _rust_container_type(
+        rust_result = _rust_container_type(
             _native_checkexpr_resolver, tag, items_bytes, None, n_keys
         )
-        if rust_bytes is None:
+        if rust_result is None:
             return None
-        return _deserialize_type_from_checkexpr(rust_bytes)
+        if rust_result is False:
+            return False
+        return _deserialize_type_from_checkexpr(rust_result)
     except (AssertionError, NotImplementedError, ValueError):
         return None
 
@@ -7488,6 +7494,9 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
 
         # Try the native kernel join + node construction.
         rust_result = _try_native_container_type(container_fullname.split(".")[-1], values)
+        if rust_result is False:
+            # Rust proved the Python fallback join yields no container type.
+            return None
         if rust_result is not None:
             return rust_result
 
@@ -7730,6 +7739,9 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
         # non-None result skip the Python join below.
         if stargs is None:
             rust_result = _try_native_container_type("dict", keys + values, len(keys))
+            if rust_result is False:
+                # Rust proved the Python fallback join yields no container type.
+                return None
             if rust_result is not None:
                 return rust_result
 

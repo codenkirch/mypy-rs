@@ -24,6 +24,7 @@
 //! Returns `None` for any type the Rust path does not handle, so the
 //! Python caller falls back to the pure-Python formatter.
 
+use std::cell::Cell;
 use std::collections::HashSet;
 
 use pyo3::prelude::*;
@@ -126,12 +127,53 @@ pub fn rust_format_key_list(keys: Vec<String>, short: bool) -> String {
     format_key_list(&keys, short)
 }
 
+/// Per-FFI-format-call options that `format_type_inner` cannot take as
+/// parameters (it has ~40 recursive call sites): the `pretty_callable`
+/// delegation is only parity-safe when every callable in the formatted
+/// tree renders identically without its wire-dropped `definition`
+/// (`pretty_wire_safe`), and the render mirrors
+/// `options.reveal_verbose_types`.
+#[derive(Clone, Copy)]
+struct FormatOptions {
+    reveal_verbose_types: bool,
+    pretty_wire_safe: bool,
+}
+
+thread_local! {
+    static FORMAT_OPTIONS: Cell<Option<FormatOptions>> = const { Cell::new(None) };
+}
+
+/// RAII guard installing [`FormatOptions`] for one format call; restores the
+/// previous value on drop so nested entry points cannot leak state.
+struct FormatOptionsGuard(Option<FormatOptions>);
+
+impl FormatOptionsGuard {
+    fn install(opts: FormatOptions) -> Self {
+        let prev = FORMAT_OPTIONS.with(|c| c.replace(Some(opts)));
+        Self(prev)
+    }
+}
+
+impl Drop for FormatOptionsGuard {
+    fn drop(&mut self) {
+        FORMAT_OPTIONS.with(|c| c.set(self.0));
+    }
+}
+
+/// `None` when no format call is in progress (e.g. direct kernel unit
+/// tests): the pretty path then keeps deferring to Python.
+fn format_options() -> Option<FormatOptions> {
+    FORMAT_OPTIONS.with(|c| c.get())
+}
+
 /// Format a type to its bare string (unquoted), using the native resolver.
 ///
 /// Mirrors `format_type_bare(typ, options, verbosity, module_names)`.
 /// Returns `None` if the type contains a variant the Rust path does not
 /// handle, so the Python caller falls back.
 #[pyfunction]
+#[pyo3(signature = (bytes, resolver, verbosity, module_names, use_star_unpack, reveal_verbose_types = false, pretty_wire_safe = false))]
+#[allow(clippy::too_many_arguments)]
 pub fn rust_format_type_bare(
     py: Python<'_>,
     bytes: &[u8],
@@ -139,7 +181,13 @@ pub fn rust_format_type_bare(
     verbosity: i64,
     module_names: bool,
     use_star_unpack: bool,
+    reveal_verbose_types: bool,
+    pretty_wire_safe: bool,
 ) -> Option<String> {
+    let _guard = FormatOptionsGuard::install(FormatOptions {
+        reveal_verbose_types,
+        pretty_wire_safe,
+    });
     let typ = wire::read_type(&mut ReadBuffer::new(bytes), None).ok()?;
     let fullnames = find_type_overlaps(&typ, resolver);
     format_type_inner(
@@ -158,6 +206,8 @@ pub fn rust_format_type_bare(
 ///
 /// Mirrors `format_type(typ, options, verbosity, module_names)`.
 #[pyfunction]
+#[pyo3(signature = (bytes, resolver, verbosity, module_names, use_star_unpack, reveal_verbose_types = false, pretty_wire_safe = false))]
+#[allow(clippy::too_many_arguments)]
 pub fn rust_format_type(
     py: Python<'_>,
     bytes: &[u8],
@@ -165,6 +215,8 @@ pub fn rust_format_type(
     verbosity: i64,
     module_names: bool,
     use_star_unpack: bool,
+    reveal_verbose_types: bool,
+    pretty_wire_safe: bool,
 ) -> Option<String> {
     let bare = rust_format_type_bare(
         py,
@@ -173,6 +225,8 @@ pub fn rust_format_type(
         verbosity,
         module_names,
         use_star_unpack,
+        reveal_verbose_types,
+        pretty_wire_safe,
     )?;
     Some(quote_type_string(&bare))
 }
@@ -221,13 +275,20 @@ fn callable_pair_min_verbosity(types: &[Type], resolver: &TypeResolver) -> Optio
 /// Takes serialized type bytes for each type plus the resolver.
 /// Returns `None` if any type cannot be formatted.
 #[pyfunction]
+#[pyo3(signature = (type_bytes_list, resolver, bare, use_star_unpack, reveal_verbose_types = false, pretty_wire_safe = false))]
 pub fn rust_format_type_distinctly(
     py: Python<'_>,
     type_bytes_list: Vec<Vec<u8>>,
     resolver: &mut NativeTypeResolver,
     bare: bool,
     use_star_unpack: bool,
+    reveal_verbose_types: bool,
+    pretty_wire_safe: bool,
 ) -> Option<Vec<String>> {
+    let _guard = FormatOptionsGuard::install(FormatOptions {
+        reveal_verbose_types,
+        pretty_wire_safe,
+    });
     let mut types = Vec::with_capacity(type_bytes_list.len());
     for bytes in &type_bytes_list {
         types.push(wire::read_type(&mut ReadBuffer::new(bytes), None).ok()?);
@@ -597,14 +658,14 @@ fn format_type_inner(
             // or overlap -> fullname; else `itype.type.name` (short).
             let base_str = if verbosity >= 2 || fullnames.contains(type_ref) {
                 type_ref.clone()
-            } else {
-                let s = snap?;
-                // No resolver entry: the TypeInfo was likely created at
-                // runtime (e.g. intersect_instance_callable's fake type)
-                // after the resolver snapshot was built. Defer to Python
-
-                // so it can access itype.type.name directly.
+            } else if let Some(s) = snap {
                 s.name.clone()
+            } else {
+                // No resolver snapshot entry (e.g. a runtime-created class,
+                // or a module the snapshot build did not reach): read the
+                // live TypeInfo's `name`, absent too -> defer to Python.
+                let info = resolver.live_typeinfo(py, type_ref)?;
+                crate::typeinfo::read_str_attr(info, "name")?
             };
 
             if args.is_empty() {
@@ -982,10 +1043,8 @@ fn format_type_inner(
             }
 
             // Use pretty_callable for complex signatures (messages.py:2852).
-            // pretty_callable needs FuncDef/definition data not present in
-            // the wire format, and renders named/optional/star args with a
-
-            // `def (name: T, ...) -> R` shape. Defer to Python.
+            // `definition` is dropped on the wire, so delegate to the
+            // definition-free port only when the shim proved it irrelevant.
             if use_pretty_callable {
                 let needs_pretty = arg_kinds
                     .iter()
@@ -993,7 +1052,17 @@ fn format_type_inner(
                     .any(|(k, n)| !should_format_arg_as_type(*k, n.as_deref(), verbosity));
                 if needs_pretty {
                     let _ = (name, variables);
-                    return None;
+                    let opts = format_options()?;
+                    if !opts.pretty_wire_safe {
+                        return None;
+                    }
+                    return pretty_callable_inner(
+                        py,
+                        typ,
+                        resolver,
+                        opts.reveal_verbose_types,
+                        use_star_unpack,
+                    );
                 }
             }
 

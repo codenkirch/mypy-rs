@@ -7352,6 +7352,70 @@ class NativeCoerceLiteralSingletonSuite(Suite):
             True, lambda: is_singleton_identity_type(TypeType(Instance(self.fx.ai, [])))
         )
 
+    def test_singleton_non_typeobj_callable(self) -> None:
+        # Fallback builtins.function is not a metaclass, so python is false
+        # without consulting type_object() (wave-60B FunctionLike arm).
+        c = self.fx.callable(self.fx.a, self.fx.nonet)
+        self._assert_singleton_par(c)
+        assert not self._with_gate(True, lambda: is_singleton_identity_type(c))
+
+    def test_singleton_typeobj_callable_final(self) -> None:
+        # Callable[..., Final] is a type object; type_object() is the final
+        # class, so the identity-singleton answer is true.
+        c = self.fx.callable_type(self.fx.a, self.final_inst)
+        self._assert_singleton_par(c)
+        assert self._with_gate(True, lambda: is_singleton_identity_type(c))
+
+    def test_singleton_typeobj_callable_nonfinal(self) -> None:
+        c = self.fx.callable_type(self.fx.a, self.fx.a)
+        self._assert_singleton_par(c)
+        assert not self._with_gate(True, lambda: is_singleton_identity_type(c))
+
+    def test_singleton_typeobj_callable_uninhabited_ret(self) -> None:
+        # Uninhabited ret_type: is_type_obj() is false, so python is false.
+        c = self.fx.callable_type(self.fx.a, UninhabitedType())
+        self._assert_singleton_par(c)
+        assert not self._with_gate(True, lambda: is_singleton_identity_type(c))
+
+    def test_singleton_overloaded_typeobj_final(self) -> None:
+        # Overloaded delegates is_type_obj()/type_object() to items[0].
+        c = Overloaded([self.fx.callable_type(self.fx.a, self.final_inst)])
+        self._assert_singleton_par(c)
+        assert self._with_gate(True, lambda: is_singleton_identity_type(c))
+
+    def test_singleton_typevar_over_tuple_ret_engages(self) -> None:
+        # force_fallback unwraps a TypeVar upper bound once and then applies
+        # the TupleType fallback check (types.py:2667-2675); the type object
+        # is the final tuple fallback class, so the answer is true.
+        from mypy.typeops import _serialize_type
+
+        ret = TypeVarType(
+            "T",
+            "T",
+            TypeVarId(1),
+            [],
+            TupleType([self.fx.a], self.final_inst),
+            AnyType(TypeOfAny.from_omitted_generics),
+        )
+        c = self.fx.callable_type(self.fx.a, ret)
+        self._assert_singleton_par(c)
+        r = _type_kernel.rust_is_singleton_identity_type(_serialize_type(c), self._resolver)
+        assert r is True, "Rust TypeVar-over-tuple cascade did not engage"
+
+    def test_singleton_callable_arm_engages_direct(self) -> None:
+        from mypy.typeops import _serialize_type
+
+        c = self.fx.callable_type(self.fx.a, self.final_inst)
+        r = _type_kernel.rust_is_singleton_identity_type(_serialize_type(c), self._resolver)
+        assert r is True, "Rust singleton FunctionLike arm did not engage"
+        non_final = self.fx.callable_type(self.fx.a, self.fx.a)
+        assert (
+            _type_kernel.rust_is_singleton_identity_type(
+                _serialize_type(non_final), self._resolver
+            )
+            is False
+        )
+
     def test_seams_engage_direct(self) -> None:
         # Call the Rust seams directly and confirm they return non-None.
         from mypy.typeops import _serialize_type
@@ -18880,10 +18944,10 @@ class NativeMessagesDeferralSuite(Suite):
 
     Each test compares the gate-off (pure-Python) and gate-on (Rust seam) results
     of `format_type_distinctly` for representative pairs and asserts parity. Named-
-    arg callables still defer at the format step (pretty_callable needs FuncDef
-    data the wire cannot carry), so both gates resolve through Python there; the
-    differential guards against a regression while the Rust unit tests prove the
-    decision logic itself.
+    arg callables now render through the Rust `pretty_callable` port when the
+    shim proves the wire-dropped `definition` cannot change the output
+    (`_pretty_wire_safe`); definition-dependent callables still defer to the
+    pure-Python formatter, and the differential guards both paths.
     """
 
     def setUp(self) -> None:
@@ -18960,6 +19024,60 @@ class NativeMessagesDeferralSuite(Suite):
         # One callable, one instance: no verbosity bump, must stay in parity.
         c = CallableType([self.fx.a], [ARG_POS], [None], self.fx.o, self.fx.function)
         self._assert_distinctly_par(c, self.fx.b)
+
+    def _named_arg_callable(self) -> CallableType:
+        return CallableType([self.fx.a], [ARG_NAMED], ["x"], self.fx.o, self.fx.function)
+
+    def test_named_arg_callable_engages_native_pretty(self) -> None:
+        # A named/optional signature takes the pretty path. Without a
+        # definition the wire is lossless, so the Rust pretty_callable port
+        # renders it and the shim must not defer.
+        from mypy.messages import format_type_bare
+
+        c = self._named_arg_callable()
+        off = self._with_gate(False, lambda: format_type_bare(c, self.options))
+        on = self._with_gate(True, lambda: format_type_bare(c, self.options))
+        assert_equal(on, off)
+        raw = _type_kernel.rust_format_type_bare(
+            self._bytes_of(c), self.resolver, 0, False, True, False, True
+        )
+        assert raw is not None, "Rust pretty path did not engage"
+
+    def test_definition_dependent_callable_defers(self) -> None:
+        # name=None means pretty_callable falls back to definition.name; the
+        # wire cannot carry it, so the shim marks the tree unsafe and Rust
+        # keeps deferring (parity through the pure-Python formatter).
+        from mypy.messages import _pretty_wire_safe, format_type_bare
+        from mypy.nodes import ARG_POS, Argument, Block, FuncDef, Var
+
+        fdef = FuncDef("f", [Argument(Var("x"), None, None, ARG_POS)], Block([]))
+        c = self._named_arg_callable()
+        c.definition = fdef
+        assert not _pretty_wire_safe(c)
+        off = self._with_gate(False, lambda: format_type_bare(c, self.options))
+        on = self._with_gate(True, lambda: format_type_bare(c, self.options))
+        assert_equal(on, off)
+        raw = _type_kernel.rust_format_type_bare(
+            self._bytes_of(c), self.resolver, 0, False, True, False, False
+        )
+        assert raw is None, "Rust rendered a definition-dependent pretty callable"
+
+    def test_definition_wire_safe_callable_engages(self) -> None:
+        # With a callable name present and no extra special first parameter,
+        # the definition is irrelevant to pretty_callable, so the native
+        # pretty path stays parity-safe and engages.
+        from mypy.messages import _pretty_wire_safe
+        from mypy.nodes import ARG_POS, Argument, Block, FuncDef, Var
+
+        fdef = FuncDef("f", [Argument(Var("x"), None, None, ARG_POS)], Block([]))
+        c = self._named_arg_callable()
+        c.name = "f"
+        c.definition = fdef
+        assert _pretty_wire_safe(c)
+        raw = _type_kernel.rust_format_type_bare(
+            self._bytes_of(c), self.resolver, 0, False, True, False, True
+        )
+        assert raw is not None, "Rust pretty path did not engage for a safe definition"
 
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
@@ -34088,7 +34206,7 @@ class NativeCheckexprJoinAndTupleSuite(Suite):
         from mypy.types import Instance
 
         result = _try_native_container_type("list", [if_type, else_type])
-        if result is None:
+        if result is None or result is False:
             return None
         # The container seam returns `list[joined]`; extract the element.
         result = get_proper_type(result)
@@ -34158,6 +34276,30 @@ class NativeCheckexprJoinAndTupleSuite(Suite):
         # Args-bearing Instances (List[A], List[B]) skip the args-less
         # prejoin; the general join_type_list fold decides (list[A]).
         self._assert_join_parity(self.fx.lsta, self.fx.lstb, engage=True)
+
+    def test_container_decided_none_engages(self) -> None:
+        # Two callables join to a Callable, which fails
+        # `allow_fast_container_literal`; Python's own fallback join returns
+        # None too, so Rust returns the `False` decided-none sentinel.
+        from mypy.checkexpr import _try_native_container_type, allow_fast_container_literal
+        from mypy.join import join_type_list
+
+        c1 = self.fx.callable(self.fx.a, self.fx.nonet)
+        c2 = self.fx.callable(self.fx.b, self.fx.nonet)
+        result = _try_native_container_type("list", [c1, c2])
+        assert result is False, f"expected decided-none sentinel, got {result!r}"
+        joined = get_proper_type(join_type_list([c1, c2]))
+        assert not allow_fast_container_literal(joined)
+
+    def test_container_typeobj_join_still_defers(self) -> None:
+        # Type-object callables need join_similar_callables' from_type_type
+        # handling, so the seam keeps deferring; the fallback owns the
+        # outcome and the shim must not claim a decision.
+        from mypy.checkexpr import _try_native_container_type
+
+        c1 = self.fx.callable_type(self.fx.a, self.fx.a)
+        c2 = self.fx.callable_type(self.fx.b, self.fx.b)
+        assert _try_native_container_type("list", [c1, c2]) is None
 
     def test_unpack_single_tuple_instance_normalizes(self) -> None:
         # Tuple[*tuple[A, ...]] expands to the tuple[A, ...] Instance.
