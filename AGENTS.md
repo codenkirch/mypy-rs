@@ -3224,6 +3224,54 @@ including:
   self-check clean 347, warm clean and cache-consuming. No cache
   format or CACHE_VERSION change.
 
+- wave-60A engagement audit of the 0-40% native-share seams (wave 60,
+  issue #1506): audit-first, zero ports. All 151 fallbacks across the
+  12 survey seams were classified with env-gated shim + Rust leaf
+  probes (`MYPY_TK_W60A_AUDIT`, stripped before landing; cold
+  self-check, survey numbers reproduced exactly). No engagement/gate
+  regression of the #1455 ifta class exists; every fallback is a
+  documented partial-port wall or floor. Per seam (calls/native ->
+  fallback buckets):
+  `rust_analyze_typeddict_access` 14/0 -> 14 `not-delitem` (Rust ports
+  only `__delitem__`; the corpus is `get` x10 + `__setitem__` x4, and
+  `get` recurses into the native IAMA path) - scope floor;
+  `rust_linearize_hierarchy` 6/0 -> 6 `snap-miss`, all fake TypeInfos
+  whose `calculate_mro` (checker.py:8043) precedes the #1456 registrar
+  (checker.py:8048), plus 2,981 semanal gate skips (`build.py:6002`
+  clears resolvers per SCC by design) and 4,161 cached -> the MRO port
+  has ~0 production coverage, no correctness impact (Python computes);
+  `rust_covers_at_runtime` 3/0 -> 1 `erase-item` (Overloaded absent
+  from `argapprox::erase_type`) + 2 `subtype-none` (Callable vs
+  TypeType); `rust_restrict_subtype_away` 2/0 -> 2 `erase-parity`
+  (`consider_runtime_isinstance=False`: the second
+  `erase_instances=True` proper-subtype check is decidable but
+  unlanded at 2 calls); `rust_filter_satisfiable` 4/2 -> 2
+  `subtype-none` (`is_subtype(target, upper_bound)` - st engine
+  floor); `rust_remove_dups` 41/15 -> 26 alias-guard
+  (`decode_types_for_list_return` defers on any TypeAliasType; the
+  wire cannot carry Python's `alias ==` object identity);
+  `rust_analyze_member_method` 27/3 -> 24 = 19 `bare-recv-tvar`
+  (#1214 bare-Self vs tvar-receiver wall) + 5 `freeze`
+  (`EnumMeta.__iter__` env miss); `rust_infer_directed_arg_constraints`
+  30/6 -> 24 `infer-none` (18 `SupportsKeysAndGetItem` vs
+  `Union[Callable, None]`, 6 `str` vs `Union[SupportsIndex, None]`;
+  the wave-47 icf protocol/union engine class); `rust_join_instances`
+  28/11 -> 17 = 8 via-supertype nested sub-join + 6
+  same-type-with-args (`visit_instance_with_args`) + 3 nominal
+  args-less; `rust_join_tuples` 7/3 -> 4 `fixed-item-join` (1 mypyc
+  `SlotTable` alias pair, 2 `Mapping[..., Callable]` joins, 1
+  `ModuleNotFoundReason ~ str`); `rust_meet_types` 17/11 -> 6
+  `inner-none` (2 Tuple x Union, 4 Tuple x variadic Tuple);
+  `rust_map_type_from_supertype` 52/29 -> 23 = 10 `expand` (ParamSpec
+  `abstractclassmethod`/`staticmethod` wrappers + 4 Overloaded), 12
+  `snap-miss` (pathspec Re2/Hyperscan classes absent from the Rust
+  snapshot at `dataclasses.expand_typevar_from_subtype` time;
+  #1490/#1486 timing-gap family), 1 `tuple-super`
+  (`datetime._IsoCalendarDate` -> `builtins.tuple` maptype special
+  case). Gates: docs-only (tree == origin/main + this bullet), cargo
+  2,739/11, testtypes 3,309/6, testcheck 8,198/15/7 exact, cold
+  self-check clean 347.
+
 ## Pull Requests
 
 The default branch on this fork is `main` (not `master`). Always target
