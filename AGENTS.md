@@ -3198,6 +3198,32 @@ including:
   8,198/15/7 exact, fine-grained 747/27, daemon 37, finegrainedcache
   549/229, testdiff 79, testmerge 41/1, cold self-check clean 347.
 
+- fixed-format cache meta writer, B1/B3 slice 1 (wave 59, issue #1503):
+  new `rust_write_cache_meta(meta)` / `rust_write_cache_meta_ex(meta_ex)`
+  pyfunctions (`crates/type_kernel/src/cache.rs`) mirror
+  `CacheMeta.write` / `CacheMetaEx.write` (cache.py:274/366) and their
+  helpers on live Python objects: `write_errors`, `write_json`,
+  `write_json_value` (tags / bare sizes / sorted str keys, list vs
+  tuple preserved), plus the wire primitives `write_bytes`,
+  `write_bytes_list`, `write_str_list`, `write_float_bare`, and
+  `write_big_int` (arbitrary-precision via `BigInt::from_le_bytes`).
+  Shim at `mypy/build.py:write_cache_meta` / `write_cache_meta_ex`:
+  `_try_native_write_cache_meta*` (cache.py) engage when
+  `fixed_format_cache` and `_HAS_TYPE_KERNEL and _native_cache_active`;
+  on `None` the original `WriteBuffer` body runs, and the
+  `bytes([cache_version(), CACHE_VERSION])` prefix stays Python.
+  Deferrals: unsupported `plugin_data` / non-str dict keys /
+  non-list-tuple sequences / bad field types; only `PyAttributeError`
+  maps to `None`, other PyErrs propagate (#1466/#1468). Measured
+  (env-gated audit, stripped before landing): cold self-check 808 meta
+  + 808 meta_ex writes @ 100% native, 0 defers; warm incremental
+  re-runs 0 writes (cache consumed). Gates: cargo 2,739/11 (+3 units),
+  fmt + clippy clean, testtypes 3,309/6 (+11
+  `NativeCacheMetaWriterSuite`), testcheck 8,198/15/7 exact,
+  fine-grained 747/27, daemon 37, finegrainedcache 549/229, cold
+  self-check clean 347, warm clean and cache-consuming. No cache
+  format or CACHE_VERSION change.
+
 ## Pull Requests
 
 The default branch on this fork is `main` (not `master`). Always target

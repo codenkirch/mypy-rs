@@ -71,6 +71,8 @@ from mypy.cache import (
     WriteBuffer,
     _try_native_read_cache_meta,
     _try_native_read_cache_meta_ex,
+    _try_native_write_cache_meta,
+    _try_native_write_cache_meta_ex,
     read_bytes,
     read_int,
     read_int_list,
@@ -3504,11 +3506,14 @@ def write_cache_meta(meta: CacheMeta, manager: BuildManager, meta_file: str) -> 
     # Write meta cache file
     metastore = manager.metastore
     if manager.options.fixed_format_cache:
-        data_io = WriteBuffer()
-        meta.write(data_io)
+        data_bytes = _try_native_write_cache_meta(meta)
+        if data_bytes is None:
+            data_io = WriteBuffer()
+            meta.write(data_io)
+            data_bytes = data_io.getvalue()
         # Prefix with both low- and high-level cache format versions for future validation.
         # TODO: switch to something like librt.internal.write_byte() if this is slow.
-        meta_bytes = bytes([cache_version(), CACHE_VERSION]) + data_io.getvalue()
+        meta_bytes = bytes([cache_version(), CACHE_VERSION]) + data_bytes
     else:
         meta_dict = meta.serialize()
         meta_bytes = json_dumps(meta_dict, manager.options.debug_cache)
@@ -3524,9 +3529,12 @@ def write_cache_meta_ex(meta_file: str, meta_ex: CacheMetaEx, manager: BuildMana
     meta_ex_file = get_meta_ex_name(meta_file)
     metastore = manager.metastore
     if manager.options.fixed_format_cache:
-        data_io = WriteBuffer()
-        meta_ex.write(data_io)
-        meta_bytes = data_io.getvalue()
+        data_bytes = _try_native_write_cache_meta_ex(meta_ex)
+        if data_bytes is None:
+            data_io = WriteBuffer()
+            meta_ex.write(data_io)
+            data_bytes = data_io.getvalue()
+        meta_bytes = data_bytes
     else:
         # Some generic JSON helpers require top-level to be a dict.
         meta_bytes = json_dumps(meta_ex.serialize(), manager.options.debug_cache)

@@ -95,7 +95,7 @@ _native_cache_active: bool = False
 
 
 def _set_native_cache_active(active: bool) -> None:
-    """Enable/disable the Rust fixed-format cache read seam."""
+    """Enable/disable the Rust fixed-format cache read/write seams."""
     global _native_cache_active
     _native_cache_active = active
 
@@ -160,6 +160,31 @@ def _try_native_read_cache_meta_ex(blob: bytes) -> CacheMetaEx | None:
             error_lines=decoded["error_lines"],
         )
     except (KeyError, TypeError):
+        return None
+
+
+def _try_native_write_cache_meta(meta: CacheMeta) -> bytes | None:
+    """Serialize cache meta via the Rust kernel; None on any failure.
+
+    Mirrors the Rust `CacheMeta.write` byte-for-byte. A shape the kernel
+    cannot encode (e.g. a non-JSON `plugin_data`) returns None so the
+    caller runs the pure-Python writer, which raises the same exception.
+    """
+    if not (_HAS_TYPE_KERNEL and _native_cache_active):
+        return None
+    try:
+        return _type_kernel.rust_write_cache_meta(meta)
+    except (AssertionError, NotImplementedError, ValueError, OverflowError):
+        return None
+
+
+def _try_native_write_cache_meta_ex(meta_ex: CacheMetaEx) -> bytes | None:
+    """Serialize cache meta_ex via the Rust kernel; None on any failure."""
+    if not (_HAS_TYPE_KERNEL and _native_cache_active):
+        return None
+    try:
+        return _type_kernel.rust_write_cache_meta_ex(meta_ex)
+    except (AssertionError, NotImplementedError, ValueError, OverflowError):
         return None
 
 

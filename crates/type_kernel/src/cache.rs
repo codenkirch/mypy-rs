@@ -8,28 +8,24 @@
 //!
 //! The decoded payloads are returned as Python dicts built with PyO3, so
 //! the caller consumes them without a new type format.
+//!
+//! The writer half (`rust_write_cache_meta` / `rust_write_cache_meta_ex`,
+//! issue #1503) mirrors `CacheMeta.write` / `CacheMetaEx.write`
+//! byte-for-byte on live Python objects; a shape the format cannot encode
+//! returns `None` so the Python body runs and raises the identical
+//! exception.
 
+use pyo3::exceptions::PyAttributeError;
 use pyo3::prelude::*;
-use pyo3::types::{PyBytes, PyDict, PyList, PyTuple};
+use pyo3::types::{PyBool, PyBytes, PyDict, PyFloat, PyList, PyLong, PyString, PyTuple};
 
 use crate::wire::{
     read_bool, read_int, read_int_bare, read_int_list, read_str, read_str_bare, read_str_opt,
-    ReadBuffer, WireError,
+    write_big_int, write_bool, write_bytes, write_bytes_list, write_float_bare, write_int_bare,
+    write_str, write_str_bare, write_str_list, write_tag, BigInt, ReadBuffer, WireError,
+    WriteBuffer, DICT_STR_GEN, LIST_BYTES, LIST_GEN, LIST_INT, LITERAL_BYTES, LITERAL_FALSE,
+    LITERAL_FLOAT, LITERAL_INT, LITERAL_NONE, LITERAL_STR, LITERAL_TRUE, TUPLE_GEN,
 };
-
-// Collection tags used by the cache format but not defined in wire.rs
-// (cache.py:313-324).
-const LIST_GEN: u8 = 20;
-const LIST_BYTES: u8 = 23;
-const TUPLE_GEN: u8 = 24;
-const DICT_STR_GEN: u8 = 30;
-const LITERAL_NONE: u8 = 2;
-const LITERAL_FALSE: u8 = 0;
-const LITERAL_TRUE: u8 = 1;
-const LITERAL_INT: u8 = 3;
-const LITERAL_STR: u8 = 4;
-const LITERAL_BYTES: u8 = 5;
-const LITERAL_FLOAT: u8 = 6;
 
 // ---------------------------------------------------------------------------
 // FF-format readers (mirror cache.py read_* helpers)
@@ -452,6 +448,384 @@ pub(crate) fn rust_read_cache_meta_ex(py: Python<'_>, blob: &[u8]) -> PyResult<O
     }
 }
 
+// ---------------------------------------------------------------------------
+// FF-format writers (mirror cache.py write_* helpers)
+// ---------------------------------------------------------------------------
+
+/// Write a tagged `str` field. `Ok(false)` defers on a non-str or an
+/// encoding failure.
+fn write_py_str(buf: &mut WriteBuffer, value: &PyAny) -> PyResult<bool> {
+    match value.downcast::<PyString>() {
+        Ok(s) => match s.to_str() {
+            Ok(text) => Ok(write_str(buf, text).is_ok()),
+            Err(_) => Ok(false),
+        },
+        Err(_) => Ok(false),
+    }
+}
+
+/// `write_str_opt`: `LITERAL_NONE` or a tagged str.
+fn write_py_str_opt(buf: &mut WriteBuffer, value: &PyAny) -> PyResult<bool> {
+    if value.is_none() {
+        write_tag(buf, LITERAL_NONE);
+        return Ok(true);
+    }
+    write_py_str(buf, value)
+}
+
+/// Tagged `LITERAL_BYTES` + bare bytes.
+fn write_py_bytes(buf: &mut WriteBuffer, value: &PyAny) -> PyResult<bool> {
+    match value.downcast::<PyBytes>() {
+        Ok(b) => Ok(write_bytes(buf, b.as_bytes()).is_ok()),
+        Err(_) => Ok(false),
+    }
+}
+
+/// List/tuple items in Python iteration order; `Ok(None)` defers on any
+/// other sequence kind.
+fn sequence_items(value: &PyAny) -> PyResult<Option<Vec<&PyAny>>> {
+    if let Ok(list) = value.downcast::<PyList>() {
+        return Ok(Some(list.iter().collect()));
+    }
+    if let Ok(tuple) = value.downcast::<PyTuple>() {
+        return Ok(Some(tuple.iter().collect()));
+    }
+    Ok(None)
+}
+
+/// `write_str_list`: `LIST_STR` + bare size + N bare strs.
+fn write_py_str_list(buf: &mut WriteBuffer, value: &PyAny) -> PyResult<bool> {
+    let mut strings = Vec::new();
+    match sequence_items(value)? {
+        Some(items) => {
+            for item in items {
+                match item.downcast::<PyString>() {
+                    Ok(s) => match s.to_str() {
+                        Ok(text) => strings.push(text.to_string()),
+                        Err(_) => return Ok(false),
+                    },
+                    Err(_) => return Ok(false),
+                }
+            }
+        }
+        None => return Ok(false),
+    }
+    Ok(write_str_list(buf, &strings).is_ok())
+}
+
+/// Bare Python int, including arbitrary-precision values via the C writer's
+/// long-int path.
+fn write_py_int_bare(buf: &mut WriteBuffer, value: &PyAny) -> PyResult<bool> {
+    if !value.is_instance_of::<PyLong>() {
+        return Ok(false);
+    }
+    if let Ok(v) = value.extract::<i64>() {
+        return Ok(write_int_bare(buf, v).is_ok());
+    }
+    // |value| > i64::MAX: the wire form is (size << 1 | sign) followed by a
+    // minimal little-endian magnitude, so read the magnitude from Python.
+    let abs = value.call_method0("__abs__")?;
+    let bits: i64 = match abs.call_method0("bit_length")?.extract() {
+        Ok(b) => b,
+        Err(_) => return Ok(false),
+    };
+    let nbytes = ((bits + 7) / 8).max(1);
+    let raw = abs.call_method1("to_bytes", (nbytes, "little"))?;
+    let magnitude: Vec<u8> = match raw.extract() {
+        Ok(b) => b,
+        Err(_) => return Ok(false),
+    };
+    let neg = value.call_method1("__lt__", (0i64,))?.is_true()?;
+    let big = BigInt::from_le_bytes(&magnitude, neg);
+    Ok(write_big_int(buf, &big).is_ok())
+}
+
+/// `write_int`: tagged `LITERAL_INT` + bare int.
+fn write_py_int(buf: &mut WriteBuffer, value: &PyAny) -> PyResult<bool> {
+    write_tag(buf, LITERAL_INT);
+    write_py_int_bare(buf, value)
+}
+
+/// `write_int_list`: `LIST_INT` + bare size + N bare ints.
+fn write_py_int_list(buf: &mut WriteBuffer, value: &PyAny) -> PyResult<bool> {
+    let items = match sequence_items(value)? {
+        Some(items) => items,
+        None => return Ok(false),
+    };
+    write_tag(buf, LIST_INT);
+    if write_int_bare(buf, items.len() as i64).is_err() {
+        return Ok(false);
+    }
+    for item in items {
+        if !write_py_int_bare(buf, item)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// `write_bytes_list`: `LIST_BYTES` + bare size + N bare bytes.
+fn write_py_bytes_list(buf: &mut WriteBuffer, value: &PyAny) -> PyResult<bool> {
+    let items = match sequence_items(value)? {
+        Some(items) => items,
+        None => return Ok(false),
+    };
+    let mut parts = Vec::with_capacity(items.len());
+    for item in items {
+        match item.downcast::<PyBytes>() {
+            Ok(b) => parts.push(b.as_bytes().to_vec()),
+            Err(_) => return Ok(false),
+        }
+    }
+    Ok(write_bytes_list(buf, &parts).is_ok())
+}
+
+/// `write_json_value`: a single tagged JSON value (cache.py:604-635).
+/// Unsupported types defer (`Ok(false)`).
+fn write_json_value(buf: &mut WriteBuffer, value: &PyAny) -> PyResult<bool> {
+    if value.is_none() {
+        write_tag(buf, LITERAL_NONE);
+        return Ok(true);
+    }
+    if value.is_instance_of::<PyBool>() {
+        write_bool(buf, value.is_true()?);
+        return Ok(true);
+    }
+    if value.is_instance_of::<PyLong>() {
+        return write_py_int(buf, value);
+    }
+    if let Ok(s) = value.downcast::<PyString>() {
+        return match s.to_str() {
+            Ok(text) => Ok(write_str(buf, text).is_ok()),
+            Err(_) => Ok(false),
+        };
+    }
+    if let Ok(dict) = value.downcast::<PyDict>() {
+        return write_json_dict(buf, dict);
+    }
+    if let Ok(list) = value.downcast::<PyList>() {
+        return write_json_sequence(buf, list.iter(), LIST_GEN);
+    }
+    if let Ok(tuple) = value.downcast::<PyTuple>() {
+        return write_json_sequence(buf, tuple.iter(), TUPLE_GEN);
+    }
+    if value.is_instance_of::<PyFloat>() {
+        return match value.extract::<f64>() {
+            Ok(f) => {
+                write_tag(buf, LITERAL_FLOAT);
+                Ok(write_float_bare(buf, f).is_ok())
+            }
+            Err(_) => Ok(false),
+        };
+    }
+    Ok(false)
+}
+
+/// `write_json_value` list/tuple arm: tag + bare size + N values.
+fn write_json_sequence<'py, I>(buf: &mut WriteBuffer, items: I, tag: u8) -> PyResult<bool>
+where
+    I: Iterator<Item = &'py PyAny>,
+{
+    let items: Vec<&PyAny> = items.collect();
+    write_tag(buf, tag);
+    if write_int_bare(buf, items.len() as i64).is_err() {
+        return Ok(false);
+    }
+    for item in items {
+        if !write_json_value(buf, item)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// `write_json_value` dict arm / `write_json` (cache.py:625-651): bare
+/// size, then keys in Python `sorted()` order (Rust `str` order equals
+/// Python code-point order for UTF-8).
+fn write_json_dict(buf: &mut WriteBuffer, dict: &PyDict) -> PyResult<bool> {
+    let mut entries: Vec<(String, &PyAny)> = Vec::with_capacity(dict.len());
+    for (key, value) in dict.iter() {
+        match key.downcast::<PyString>() {
+            Ok(s) => match s.to_str() {
+                Ok(text) => entries.push((text.to_string(), value)),
+                Err(_) => return Ok(false),
+            },
+            Err(_) => return Ok(false),
+        }
+    }
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+    write_tag(buf, DICT_STR_GEN);
+    if write_int_bare(buf, entries.len() as i64).is_err() {
+        return Ok(false);
+    }
+    for (key, value) in entries {
+        if write_str_bare(buf, &key).is_err() {
+            return Ok(false);
+        }
+        if !write_json_value(buf, value)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// `write_json`: a `dict[str, Any]` at the top level.
+fn write_json(buf: &mut WriteBuffer, value: &PyAny) -> PyResult<bool> {
+    match value.downcast::<PyDict>() {
+        Ok(dict) => write_json_dict(buf, dict),
+        Err(_) => Ok(false),
+    }
+}
+
+/// `write_errors`: `LIST_GEN` of 8-element error tuples (cache.py:668-680).
+fn write_errors_live(buf: &mut WriteBuffer, errs: &PyAny) -> PyResult<bool> {
+    let items = match sequence_items(errs)? {
+        Some(items) => items,
+        None => return Ok(false),
+    };
+    write_tag(buf, LIST_GEN);
+    if write_int_bare(buf, items.len() as i64).is_err() {
+        return Ok(false);
+    }
+    for err in items {
+        let fields = match sequence_items(err)? {
+            Some(fields) if fields.len() == 8 => fields,
+            _ => return Ok(false),
+        };
+        write_tag(buf, TUPLE_GEN);
+        let written = write_py_str_opt(buf, fields[0])?
+            && write_py_int(buf, fields[1])?
+            && write_py_int(buf, fields[2])?
+            && write_py_int(buf, fields[3])?
+            && write_py_int(buf, fields[4])?
+            && write_py_str(buf, fields[5])?
+            && write_py_str(buf, fields[6])?
+            && write_py_str_opt(buf, fields[7])?;
+        if !written {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// Serialize a live `CacheMeta`; `Ok(None)` defers to the Python body.
+/// Field order must match `CacheMeta.write` (cache.py:274-298).
+fn cache_meta_bytes(meta: &PyAny) -> PyResult<Option<Vec<u8>>> {
+    let mut buf = WriteBuffer::new();
+    if !write_py_str(&mut buf, meta.getattr("id")?)? {
+        return Ok(None);
+    }
+    if !write_py_str(&mut buf, meta.getattr("path")?)? {
+        return Ok(None);
+    }
+    if !write_py_int(&mut buf, meta.getattr("mtime")?)? {
+        return Ok(None);
+    }
+    if !write_py_int(&mut buf, meta.getattr("size")?)? {
+        return Ok(None);
+    }
+    if !write_py_str(&mut buf, meta.getattr("hash")?)? {
+        return Ok(None);
+    }
+    if !write_py_str_list(&mut buf, meta.getattr("dependencies")?)? {
+        return Ok(None);
+    }
+    if !write_py_int(&mut buf, meta.getattr("data_mtime")?)? {
+        return Ok(None);
+    }
+    if !write_py_str_list(&mut buf, meta.getattr("suppressed")?)? {
+        return Ok(None);
+    }
+    let imports_ignored = match meta.getattr("imports_ignored")?.downcast::<PyDict>() {
+        Ok(dict) => dict,
+        Err(_) => return Ok(None),
+    };
+    if write_int_bare(&mut buf, imports_ignored.len() as i64).is_err() {
+        return Ok(None);
+    }
+    for (line, codes) in imports_ignored.iter() {
+        if !write_py_int(&mut buf, line)? || !write_py_str_list(&mut buf, codes)? {
+            return Ok(None);
+        }
+    }
+    if !write_json(&mut buf, meta.getattr("options")?)? {
+        return Ok(None);
+    }
+    if !write_py_bytes(&mut buf, meta.getattr("suppressed_deps_opts")?)? {
+        return Ok(None);
+    }
+    if !write_py_int_list(&mut buf, meta.getattr("dep_prios")?)? {
+        return Ok(None);
+    }
+    if !write_py_int_list(&mut buf, meta.getattr("dep_lines")?)? {
+        return Ok(None);
+    }
+    if !write_py_bytes_list(&mut buf, meta.getattr("dep_hashes")?)? {
+        return Ok(None);
+    }
+    if !write_py_bytes(&mut buf, meta.getattr("interface_hash")?)? {
+        return Ok(None);
+    }
+    if !write_py_bytes(&mut buf, meta.getattr("trans_dep_hash")?)? {
+        return Ok(None);
+    }
+    if !write_py_str(&mut buf, meta.getattr("version_id")?)? {
+        return Ok(None);
+    }
+    write_bool(&mut buf, meta.getattr("ignore_all")?.is_true()?);
+    if !write_json_value(&mut buf, meta.getattr("plugin_data")?)? {
+        return Ok(None);
+    }
+    Ok(Some(buf.into_bytes()))
+}
+
+/// Serialize a live `CacheMetaEx`; `Ok(None)` defers to the Python body.
+fn cache_meta_ex_bytes(meta_ex: &PyAny) -> PyResult<Option<Vec<u8>>> {
+    let mut buf = WriteBuffer::new();
+    if !write_py_str_list(&mut buf, meta_ex.getattr("dependencies")?)? {
+        return Ok(None);
+    }
+    if !write_py_str_list(&mut buf, meta_ex.getattr("suppressed")?)? {
+        return Ok(None);
+    }
+    if !write_py_bytes_list(&mut buf, meta_ex.getattr("dep_hashes")?)? {
+        return Ok(None);
+    }
+    if !write_errors_live(&mut buf, meta_ex.getattr("error_lines")?)? {
+        return Ok(None);
+    }
+    Ok(Some(buf.into_bytes()))
+}
+
+/// `#[pyfunction]` entry for `CacheMeta.write` (cache.py:274). Returns the
+/// exact bytes the Python `write` method would produce, or `None` to
+/// defer. Per the #1466/#1468 contract only `PyAttributeError` maps to a
+/// defer; other PyErrs propagate so kernel bugs stay visible.
+#[pyfunction]
+pub(crate) fn rust_write_cache_meta(py: Python<'_>, meta: &PyAny) -> PyResult<Option<Py<PyBytes>>> {
+    match cache_meta_bytes(meta) {
+        Ok(Some(bytes)) => Ok(Some(PyBytes::new(py, &bytes).into())),
+        Ok(None) => Ok(None),
+        Err(e) if e.is_instance_of::<PyAttributeError>(py) => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// `#[pyfunction]` entry for `CacheMetaEx.write` (cache.py:366). Mirrors
+/// `rust_write_cache_meta`'s defer contract.
+#[pyfunction]
+pub(crate) fn rust_write_cache_meta_ex(
+    py: Python<'_>,
+    meta_ex: &PyAny,
+) -> PyResult<Option<Py<PyBytes>>> {
+    match cache_meta_ex_bytes(meta_ex) {
+        Ok(Some(bytes)) => Ok(Some(PyBytes::new(py, &bytes).into())),
+        Ok(None) => Ok(None),
+        Err(e) if e.is_instance_of::<PyAttributeError>(py) => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -468,5 +842,51 @@ mod tests {
         let blob = wbuf.into_bytes();
         let mut rbuf = ReadBuffer::new(&blob);
         assert_eq!(read_bytes(&mut rbuf).unwrap(), b"hello");
+    }
+
+    #[test]
+    fn write_bytes_and_list_roundtrip() {
+        let mut wbuf = WriteBuffer::new();
+        write_bytes(&mut wbuf, b"hello").unwrap();
+        let blob = wbuf.into_bytes();
+        let mut rbuf = ReadBuffer::new(&blob);
+        assert_eq!(read_bytes(&mut rbuf).unwrap(), b"hello");
+
+        let mut wbuf = WriteBuffer::new();
+        write_bytes_list(&mut wbuf, &[b"a".to_vec(), b"bc".to_vec(), Vec::new()]).unwrap();
+        let blob = wbuf.into_bytes();
+        let mut rbuf = ReadBuffer::new(&blob);
+        assert_eq!(
+            read_bytes_list(&mut rbuf).unwrap(),
+            vec![b"a".to_vec(), b"bc".to_vec(), Vec::new()]
+        );
+    }
+
+    #[test]
+    fn write_str_list_roundtrip() {
+        let mut wbuf = WriteBuffer::new();
+        write_str_list(
+            &mut wbuf,
+            &["x".to_string(), String::new(), "yz".to_string()],
+        )
+        .unwrap();
+        let blob = wbuf.into_bytes();
+        let mut rbuf = ReadBuffer::new(&blob);
+        assert_eq!(read_str_list(&mut rbuf).unwrap(), vec!["x", "", "yz"]);
+    }
+
+    #[test]
+    fn write_big_int_roundtrip() {
+        // 2**88 (> i64) encoded through the long-int path; read back with
+        // the shared arbitrary-precision reader.
+        let mut magnitude = [0u8; 12];
+        magnitude[11] = 1;
+        let big = BigInt::from_le_bytes(&magnitude, false);
+        let mut wbuf = WriteBuffer::new();
+        write_big_int(&mut wbuf, &big).unwrap();
+        let blob = wbuf.into_bytes();
+        let mut rbuf = ReadBuffer::new(&blob);
+        assert_eq!(rbuf.read_u8().unwrap(), crate::wire::LONG_INT_TRAILER);
+        assert_eq!(crate::wire::read_long_int_big(&mut rbuf).unwrap(), big);
     }
 }

@@ -183,6 +183,8 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
     )?)?;
     module.add_function(wrap_pyfunction!(cache::rust_read_cache_meta, module)?)?;
     module.add_function(wrap_pyfunction!(cache::rust_read_cache_meta_ex, module)?)?;
+    module.add_function(wrap_pyfunction!(cache::rust_write_cache_meta, module)?)?;
+    module.add_function(wrap_pyfunction!(cache::rust_write_cache_meta_ex, module)?)?;
     module.add_function(wrap_pyfunction!(wire::read_type_to_str, module)?)?;
     module.add_function(wrap_pyfunction!(wire::read_alias_recursion_flag, module)?)?;
     module.add_function(wrap_pyfunction!(
