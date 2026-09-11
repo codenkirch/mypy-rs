@@ -45,21 +45,23 @@ const TWO_BYTES_INT_BIT: u8 = 1;
 const FOUR_BYTES_INT_BIT: u8 = 2;
 #[allow(dead_code)]
 const FOUR_BYTES_INT_TRAILER: u8 = 3;
-const LONG_INT_TRAILER: u8 = 15;
+pub(crate) const LONG_INT_TRAILER: u8 = 15;
 
 // Primitive literal tags (cache.py:303-310).
-const LITERAL_FALSE: u8 = 0;
-const LITERAL_TRUE: u8 = 1;
+pub(crate) const LITERAL_FALSE: u8 = 0;
+pub(crate) const LITERAL_TRUE: u8 = 1;
 pub(crate) const LITERAL_NONE: u8 = 2;
-const LITERAL_INT: u8 = 3;
+pub(crate) const LITERAL_INT: u8 = 3;
 pub(crate) const LITERAL_STR: u8 = 4;
-const LITERAL_BYTES: u8 = 5;
-const LITERAL_FLOAT: u8 = 6;
+pub(crate) const LITERAL_BYTES: u8 = 5;
+pub(crate) const LITERAL_FLOAT: u8 = 6;
 
 // Collection tags (cache.py:313-318).
 pub(crate) const LIST_GEN: u8 = 20;
 pub(crate) const LIST_INT: u8 = 21;
 pub(crate) const LIST_STR: u8 = 22;
+pub(crate) const LIST_BYTES: u8 = 23;
+pub(crate) const TUPLE_GEN: u8 = 24;
 pub(crate) const DICT_STR_GEN: u8 = 30;
 
 // Misc class tags (cache.py:322-325).
@@ -239,7 +241,7 @@ fn read_long_int(buf: &mut ReadBuffer<'_>) -> Result<i64, WireError> {
 /// magnitude is unbounded, so this is the primitive shared by
 /// `read_long_int` (i64 fail-fast for non-literal fields) and the
 /// literal reader, which carries the full value (issue #1329).
-fn read_long_int_big(buf: &mut ReadBuffer<'_>) -> Result<BigInt, WireError> {
+pub(crate) fn read_long_int_big(buf: &mut ReadBuffer<'_>) -> Result<BigInt, WireError> {
     // Short-int encoding: (size << 1) | sign.
     // read_short_int returns raw value, so we extract directly:
     let first = buf.read_u8()?;
@@ -432,7 +434,7 @@ impl BigInt {
     /// Build from raw little-endian unsigned magnitude bytes plus a sign,
     /// normalizing zero and any non-canonical leading zero bytes (the
     /// C writer never emits them, but defensive parity is cheap).
-    fn from_le_bytes(bytes: &[u8], neg: bool) -> BigInt {
+    pub(crate) fn from_le_bytes(bytes: &[u8], neg: bool) -> BigInt {
         let mut magnitude = bytes.to_vec();
         while let Some(&0) = magnitude.last() {
             magnitude.pop();
@@ -2142,6 +2144,37 @@ pub(crate) fn write_int(buf: &mut WriteBuffer, value: i64) -> Result<(), WireErr
     write_int_bare(buf, value)
 }
 
+/// `write_bytes`: tagged `LITERAL_BYTES` + bare bytes. Mirrors cache.py
+/// `write_bytes` (cache.py:479-481).
+pub(crate) fn write_bytes(buf: &mut WriteBuffer, bytes: &[u8]) -> Result<(), WireError> {
+    write_tag(buf, LITERAL_BYTES);
+    write_bytes_bare(buf, bytes)
+}
+
+/// `write_bytes_list`: `LIST_BYTES` + bare size + N bare bytes. Mirrors
+/// cache.py `write_bytes_list` (cache.py:548-552); used for
+/// `CacheMeta.dep_hashes`.
+pub(crate) fn write_bytes_list(buf: &mut WriteBuffer, items: &[Vec<u8>]) -> Result<(), WireError> {
+    write_tag(buf, LIST_BYTES);
+    write_int_bare(buf, items.len() as i64)?;
+    for item in items {
+        write_bytes_bare(buf, item)?;
+    }
+    Ok(())
+}
+
+/// `write_str_list`: `LIST_STR` + bare size + N bare strs. Mirrors
+/// cache.py `write_str_list` (cache.py:535-539); used for the cache meta
+/// string lists.
+pub(crate) fn write_str_list(buf: &mut WriteBuffer, items: &[String]) -> Result<(), WireError> {
+    write_tag(buf, LIST_STR);
+    write_int_bare(buf, items.len() as i64)?;
+    for item in items {
+        write_str_bare(buf, item)?;
+    }
+    Ok(())
+}
+
 /// `write_bytes_bare`: short-int length prefix + body. Inverse of
 /// `read_bytes_bare` (wire.rs:279-290).
 fn write_bytes_bare(buf: &mut WriteBuffer, bytes: &[u8]) -> Result<(), WireError> {
@@ -2152,9 +2185,15 @@ fn write_bytes_bare(buf: &mut WriteBuffer, bytes: &[u8]) -> Result<(), WireError
 
 /// `write_float_bare`: 8 bytes IEEE-754 little-endian. Inverse of
 /// `read_float_bare` (wire.rs:294-300).
-fn write_float_bare(buf: &mut WriteBuffer, value: f64) -> Result<(), WireError> {
+pub(crate) fn write_float_bare(buf: &mut WriteBuffer, value: f64) -> Result<(), WireError> {
     buf.extend(&value.to_le_bytes());
     Ok(())
+}
+
+/// `write_big_int`: the long-int encoding for an arbitrary-precision
+/// magnitude. Inverse of the `LONG_INT_TRAILER` branch of `read_int_bare`.
+pub(crate) fn write_big_int(buf: &mut WriteBuffer, big: &BigInt) -> Result<(), WireError> {
+    write_long_int_bytes(buf, &big.wire_magnitude(), big.neg)
 }
 
 /// `write_literal_value`: bare literal value, tag chosen by variant.

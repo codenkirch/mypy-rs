@@ -54955,3 +54955,285 @@ class NativeAstdiffSymbolSnapshotSuite(Suite):
         assert _type_kernel.rust_snapshot_symbol_table("mod", table) is None
         with self.assertRaises(AssertionError):
             self._snapshot("mod", table, True)
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeCacheMetaWriterSuite(Suite):
+    """Issue #1503 (B1/B3 slice 1): native fixed-format cache meta writer.
+
+    Byte parity Rust vs Python `CacheMeta.write` / `CacheMetaEx.write` over
+    a fixture battery (all fields, empty collections, nested options JSON,
+    plugin_data dict/tuple, error tuples with None path/code, i64 and
+    arbitrary-precision ints, multiple `imports_ignored` entries), a
+    round-trip through the existing native readers, the gate-off vs gate-on
+    shim differential, and the defer contract for unsupported
+    `plugin_data`.
+    """
+
+    def setUp(self) -> None:
+        from mypy import cache
+
+        self.cache = cache
+        self._prev_active = cache._native_cache_active
+        cache._set_native_cache_active(True)
+
+    def tearDown(self) -> None:
+        self.cache._set_native_cache_active(self._prev_active)
+
+    def _ref(self, meta: Any, *, ex: bool = False) -> bytes:
+        buf = _WriteBuffer()
+        meta.write(buf)
+        return buf.getvalue()
+
+    def _rust(self, meta: Any, *, ex: bool = False) -> bytes | None:
+        if ex:
+            return _type_kernel.rust_write_cache_meta_ex(meta)
+        return _type_kernel.rust_write_cache_meta(meta)
+
+    def _assert_parity(self, meta: Any, *, ex: bool = False) -> bytes:
+        ref = self._ref(meta, ex=ex)
+        rust = self._rust(meta, ex=ex)
+        assert rust is not None, "Rust writer must engage for the fixture"
+        assert_equal(rust, ref, "Rust cache meta bytes differ from Python")
+        # The cache.py shim must return the same bytes with the gate on and
+        # None with it off (so build.py runs the pure-Python writer).
+        if ex:
+            assert self.cache._try_native_write_cache_meta_ex(meta) == ref
+        else:
+            assert self.cache._try_native_write_cache_meta(meta) == ref
+        self.cache._set_native_cache_active(False)
+        try:
+            if ex:
+                assert self.cache._try_native_write_cache_meta_ex(meta) is None
+            else:
+                assert self.cache._try_native_write_cache_meta(meta) is None
+        finally:
+            self.cache._set_native_cache_active(True)
+        return rust
+
+    def _meta(self, **overrides: Any) -> Any:
+        from mypy.cache import CacheMeta
+
+        fields: dict[str, Any] = dict(
+            id="mod",
+            path="/tmp/mod.py",
+            mtime=1234567890,
+            size=42,
+            hash="deadbeef",
+            dependencies=["a", "b"],
+            data_mtime=1234567891,
+            data_file="mod.data.ff",
+            suppressed=["c"],
+            imports_ignored={1: ["ignore"], 10: ["misc"]},
+            options={"platform": "linux", "other_options": "hash"},
+            suppressed_deps_opts=b"\x01\x02",
+            dep_prios=[0, 1, 2],
+            dep_lines=[1, 2, 3],
+            dep_hashes=[b"\xaa" * 8, b"\xbb" * 16],
+            interface_hash=b"\xcc" * 16,
+            trans_dep_hash=b"\xdd" * 24,
+            version_id="1.2.3",
+            ignore_all=False,
+            plugin_data={"mypyc": True},
+        )
+        fields.update(overrides)
+        return CacheMeta(**fields)
+
+    def _meta_ex(self, **overrides: Any) -> Any:
+        from mypy.cache import CacheMetaEx
+
+        fields: dict[str, Any] = dict(
+            dependencies=["a", "b"],
+            suppressed=["c"],
+            dep_hashes=[b"\x01", b"\x02\x03"],
+            error_lines=[
+                ("/tmp/mod.py", 1, 2, 3, 4, "error", "msg", "code"),
+                (None, 10, 0, 10, 5, "note", "no path/code", None),
+            ],
+        )
+        fields.update(overrides)
+        return CacheMetaEx(**fields)
+
+    def test_meta_full_fixture_parity_and_roundtrip(self) -> None:
+        meta = self._meta(
+            ignore_all=True,
+            plugin_data={"mypyc": True, "n": 5, "f": 1.5, "none": None},
+        )
+        rust = self._assert_parity(meta)
+        decoded = _type_kernel.rust_read_cache_meta(rust)
+        assert decoded is not None, "native reader must decode the native bytes"
+        assert_equal(decoded["id"], meta.id)
+        assert_equal(decoded["path"], meta.path)
+        assert_equal(decoded["mtime"], meta.mtime)
+        assert_equal(decoded["hash"], meta.hash)
+        assert_equal(decoded["dependencies"], meta.dependencies)
+        assert_equal(decoded["suppressed"], meta.suppressed)
+        assert_equal(decoded["imports_ignored"], meta.imports_ignored)
+        assert_equal(decoded["options"], meta.options)
+        assert_equal(decoded["suppressed_deps_opts"], meta.suppressed_deps_opts)
+        assert_equal(decoded["dep_prios"], meta.dep_prios)
+        assert_equal(decoded["dep_lines"], meta.dep_lines)
+        assert_equal(decoded["dep_hashes"], meta.dep_hashes)
+        assert_equal(decoded["interface_hash"], meta.interface_hash)
+        assert_equal(decoded["trans_dep_hash"], meta.trans_dep_hash)
+        assert_equal(decoded["version_id"], meta.version_id)
+        assert_equal(decoded["ignore_all"], meta.ignore_all)
+        assert_equal(decoded["plugin_data"], meta.plugin_data)
+
+    def test_meta_empty_collections(self) -> None:
+        meta = self._meta(
+            dependencies=[],
+            suppressed=[],
+            imports_ignored={},
+            dep_prios=[],
+            dep_lines=[],
+            dep_hashes=[],
+            plugin_data=None,
+        )
+        rust = self._assert_parity(meta)
+        decoded = _type_kernel.rust_read_cache_meta(rust)
+        assert decoded is not None
+        assert_equal(decoded["dependencies"], [])
+        assert_equal(decoded["suppressed"], [])
+        assert_equal(decoded["imports_ignored"], {})
+        assert_equal(decoded["dep_hashes"], [])
+        assert_equal(decoded["plugin_data"], None)
+
+    def test_meta_options_nested_json(self) -> None:
+        options: dict[str, Any] = {
+            "platform": "darwin",
+            "other_options": "h",
+            "flag": True,
+            "off": False,
+            "nothing": None,
+            "ratio": 0.5,
+            "level": 3,
+            "names": ["x", "y"],
+            "pair": (1, "two"),
+            "nested": {"z": None, "deep": [3, (4, False), {"k": 1.5}]},
+        }
+        meta = self._meta(options=options)
+        rust = self._assert_parity(meta)
+        decoded = _type_kernel.rust_read_cache_meta(rust)
+        assert decoded is not None
+        assert_equal(decoded["options"], options)
+
+    def test_meta_plugin_data_dict_and_tuple(self) -> None:
+        for plugin_data in (
+            {"a": 1, "b": [1, 2], "c": (3, None)},
+            (1, ("nested", True), None),
+            "plain",
+            7,
+            2.5,
+            True,
+            None,
+        ):
+            meta = self._meta(plugin_data=plugin_data)
+            rust = self._assert_parity(meta)
+            decoded = _type_kernel.rust_read_cache_meta(rust)
+            assert decoded is not None
+            assert_equal(decoded["plugin_data"], plugin_data)
+
+    def test_meta_large_ints(self) -> None:
+        meta = self._meta(
+            mtime=2**62,
+            size=2**63 - 1,
+            data_mtime=-(2**62),
+            imports_ignored={2**40: ["big"]},
+            dep_lines=[2**40, 1],
+        )
+        rust = self._assert_parity(meta)
+        decoded = _type_kernel.rust_read_cache_meta(rust)
+        assert decoded is not None
+        assert_equal(decoded["mtime"], 2**62)
+        assert_equal(decoded["size"], 2**63 - 1)
+        assert_equal(decoded["data_mtime"], -(2**62))
+        assert_equal(decoded["dep_lines"], [2**40, 1])
+
+    def test_meta_arbitrary_precision_ints(self) -> None:
+        # Beyond i64: writer byte parity only. The native reader is
+        # i64-bounded by design, so the read seam defers to Python here.
+        meta = self._meta(mtime=2**70, size=-(2**80), data_mtime=2**200)
+        self._assert_parity(meta)
+
+    def test_meta_multiple_imports_ignored_entries(self) -> None:
+        imports_ignored = {5: ["b"], 1: ["a"], 100: ["c", "d"], 3: []}
+        meta = self._meta(imports_ignored=imports_ignored)
+        rust = self._assert_parity(meta)
+        decoded = _type_kernel.rust_read_cache_meta(rust)
+        assert decoded is not None
+        assert_equal(decoded["imports_ignored"], imports_ignored)
+        assert_equal(list(decoded["imports_ignored"]), list(imports_ignored))
+
+    def test_meta_ex_error_tuples_and_roundtrip(self) -> None:
+        meta_ex = self._meta_ex(
+            error_lines=[
+                (None, 1, 2, 3, 4, "error", "msg", None),
+                ("/tmp/x.py", 2**40, 0, 2**40, 8, "note", "m2", "code"),
+            ],
+        )
+        rust = self._assert_parity(meta_ex, ex=True)
+        decoded = _type_kernel.rust_read_cache_meta_ex(rust)
+        assert decoded is not None
+        assert_equal(decoded["dependencies"], meta_ex.dependencies)
+        assert_equal(decoded["suppressed"], meta_ex.suppressed)
+        assert_equal(decoded["dep_hashes"], meta_ex.dep_hashes)
+        assert_equal(decoded["error_lines"], meta_ex.error_lines)
+
+    def test_meta_ex_empty_collections(self) -> None:
+        meta_ex = self._meta_ex(dependencies=[], suppressed=[], dep_hashes=[], error_lines=[])
+        rust = self._assert_parity(meta_ex, ex=True)
+        decoded = _type_kernel.rust_read_cache_meta_ex(rust)
+        assert decoded is not None
+        assert_equal(decoded["error_lines"], [])
+
+    def test_unsupported_plugin_data_defers(self) -> None:
+        meta = self._meta(plugin_data={1, 2})
+        assert _type_kernel.rust_write_cache_meta(meta) is None
+        assert self.cache._try_native_write_cache_meta(meta) is None
+        with self.assertRaises(AssertionError):
+            self._ref(meta)
+
+    def test_build_shim_prefix_and_metastore(self) -> None:
+        from librt.internal import cache_version
+
+        from mypy import build
+        from mypy.cache import CACHE_VERSION
+
+        class _MetaStore:
+            def __init__(self) -> None:
+                self.writes: list[tuple[str, bytes]] = []
+
+            def write(self, path: str, data: bytes) -> bool:
+                self.writes.append((path, data))
+                return True
+
+        manager = cast(
+            Any,
+            SimpleNamespace(
+                options=SimpleNamespace(fixed_format_cache=True, debug_cache=False),
+                metastore=_MetaStore(),
+                log=lambda msg: None,
+            ),
+        )
+        meta = self._meta()
+        meta_ex = self._meta_ex()
+        prefix = bytes([cache_version(), CACHE_VERSION])
+
+        self.cache._set_native_cache_active(False)
+        try:
+            build.write_cache_meta(meta, manager, "/tmp/mod.meta.ff")
+            build.write_cache_meta_ex("/tmp/mod.meta.ff", meta_ex, manager)
+        finally:
+            self.cache._set_native_cache_active(True)
+        python_writes = list(manager.metastore.writes)
+
+        manager.metastore.writes.clear()
+        build.write_cache_meta(meta, manager, "/tmp/mod.meta.ff")
+        build.write_cache_meta_ex("/tmp/mod.meta.ff", meta_ex, manager)
+        rust_writes = list(manager.metastore.writes)
+        assert len(rust_writes) == 2
+        assert rust_writes[0][1] == prefix + self._ref(meta)
+        assert rust_writes[1][1] == self._ref(meta_ex, ex=True)
+        # Gate off vs gate on produce identical files.
+        assert_equal([(p, d) for p, d in rust_writes], [(p, d) for p, d in python_writes])
