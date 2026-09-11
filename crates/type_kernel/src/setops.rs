@@ -4243,61 +4243,6 @@ fn flatten_alias_union_items(
     true
 }
 
-/// handle_recursive=False flatten (`tuple_fallback`'s union,
-/// typeops.py:392): Python's get_proper_type expands NON-recursive
-/// alias items and keeps recursive alias nodes folded (types.py:5109).
-/// Mirror that split exactly: expand non-recursive aliases to their raw
-/// chain-resolved targets, push a recursive alias node unchanged.
-/// Returns `false` to defer on a missing snapshot, an alias cycle, or
-/// an unsubstitutable shape (arg-bearing / tvar-carrying alias).
-fn flatten_alias_union_items_keep_recursive(
-    items: &[Type],
-    aliases: &dyn crate::aliases::AliasLookup,
-    out: &mut Vec<Type>,
-    active: &mut Vec<String>,
-) -> bool {
-    for t in items {
-        match t {
-            Type::TypeAliasType {
-                type_ref,
-                is_recursive,
-                ..
-            } => {
-                if *is_recursive {
-                    // Wave-33 guardrail: never unfold a recursive alias.
-                    out.push(t.clone());
-                    continue;
-                }
-                if active.contains(type_ref) {
-                    return false;
-                }
-                let Some(target) = crate::checkexpr_functions::expand_alias_target_raw(t, aliases)
-                else {
-                    return false;
-                };
-                active.push(type_ref.clone());
-                let ok = if let Type::UnionType { items: inner, .. } = &target {
-                    flatten_alias_union_items_keep_recursive(inner, aliases, out, active)
-                } else {
-                    out.push(target);
-                    true
-                };
-                active.pop();
-                if !ok {
-                    return false;
-                }
-            }
-            Type::UnionType { items: inner, .. } => {
-                if !flatten_alias_union_items_keep_recursive(inner, aliases, out, active) {
-                    return false;
-                }
-            }
-            _ => out.push(t.clone()),
-        }
-    }
-    true
-}
-
 /// `make_simplified_union` (typeops.py:605-692), Rust subset.
 ///
 /// Steps ported: flatten nested unions (step 1), single-item fast
@@ -4334,9 +4279,9 @@ pub(crate) fn make_simplified_union_expanded(
     keep_erased: bool,
     expand_aliases: bool,
 ) -> Option<Type> {
-    // Step 1: flatten nested unions. expand_aliases=false (the
-    // `tuple_fallback` union) still expands NON-recursive aliases and
-    // keeps recursive nodes folded (types.py:5109).
+    // Step 1: flatten nested unions. A top-level alias item expands to
+    // its raw target; union targets recurse, missing snapshot or cycle
+    // defers; under expand_aliases=false the fallback must not engage.
     let flat = match flatten_nested_unions(items) {
         Some(f) => f,
         None if expand_aliases => {
@@ -4349,13 +4294,10 @@ pub(crate) fn make_simplified_union_expanded(
             flat
         }
         None => {
-            let aliases = resolver.aliases()?;
-            let mut flat: Vec<Type> = Vec::with_capacity(items.len());
-            let mut active: std::vec::Vec<String> = Vec::new();
-            if !flatten_alias_union_items_keep_recursive(items, &aliases, &mut flat, &mut active) {
-                return None;
-            }
-            flat
+            // Wave-33 guardrail: `tuple_fallback`'s union must defer on
+            // alias-bearing items, never unfold them (msu/is_subtype/
+            // tuple_fallback cross-entry recursion, crash class).
+            return None;
         }
     };
     // Step 2: single-item fast path.
@@ -11513,18 +11455,19 @@ mod tests {
         }
 
         #[test]
-        fn msu_expand_aliases_false_expands_nonrecursive_alias_item() {
-            // handle_recursive=False still expands a NON-recursive alias
-            // item (types.py:5109 keeps only `is_recursive` aliases
-            // folded); the kernel substitutes the target and simplifies.
+        fn msu_expand_aliases_false_defers_on_alias_item() {
+            // The tuple_fallback shape (handle_recursive=False): the
+            // kernel must defer alias-bearing lists here (wave-33 crash
+            // guardrail, msu/is_subtype/tuple_fallback cross-entry loop).
             let r = join_resolver(vec![alias_snap(
                 "testmod.A",
                 &instance("builtins.int", vec![]),
             )]);
             let items = vec![alias_type("testmod.A", vec![]), int_inst()];
-            let got = make_simplified_union_expanded(&items, &ctx(true), &r, false, false, false)
-                .unwrap();
-            assert_eq!(got, int_inst());
+            assert_eq!(
+                make_simplified_union_expanded(&items, &ctx(true), &r, false, false, false),
+                None
+            );
         }
 
         #[test]
@@ -11567,8 +11510,9 @@ mod tests {
                 implicit: false,
             };
             assert_eq!(crate::typeops::tuple_fallback(&tup, &r), None);
-            // Non-recursive alias items expand under hr=false (Python's
-            // get_proper_type substitutes them); the union simplifies.
+            // Alias-bearing items defer under hr=false regardless of
+            // recursion: the Python substitution sits in the same
+            // cross-entry loop, so keep the wave-33 defer here.
             let r3 = join_resolver(vec![alias_snap(
                 "testmod.A",
                 &instance("builtins.int", vec![]),
@@ -11578,16 +11522,7 @@ mod tests {
                 items: vec![alias_type("testmod.A", vec![]), int_inst()],
                 implicit: false,
             };
-            let got3 = crate::typeops::tuple_fallback(&tup3, &r3).unwrap();
-            assert_eq!(
-                got3,
-                Type::Instance {
-                    type_ref: "builtins.tuple".to_string(),
-                    args: vec![int_inst()],
-                    last_known_value: None,
-                    extra_attrs: None,
-                }
-            );
+            assert_eq!(crate::typeops::tuple_fallback(&tup3, &r3), None);
             // Plain-item tuples still join natively and answer the
             // union fallback.
             let r2 = join_resolver(vec![]);
