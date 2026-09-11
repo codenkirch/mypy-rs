@@ -545,7 +545,10 @@ def _resync_definitions_inner(original: Type, decoded: Type) -> Type | None:
         return d.copy_modified(args=new_args)
     if type(o) is UnionType and type(d) is UnionType:
         if len(o.items) != len(d.items):
-            return None
+            # Alias-union flattening can change the item count; the re-stamp
+            # is positional, so defer only when the original subtree still
+            # carries definitions (otherwise the decoded tree is faithful).
+            return d if not _needs_definitions(o) else None
         new_items = []
         for po, pd in zip(o.items, d.items):
             pi = _resync_definitions_inner(po, pd)
@@ -579,6 +582,19 @@ def _resync_definitions_inner(original: Type, decoded: Type) -> Type | None:
         if pb is None:
             return None
         return d.copy_modified(upper_bound=pb)
+    if type(o) is TypeAliasType and type(d) is TypeAliasType:
+        # Alias nodes carry no definition, but their args can nest callables
+        # (e.g. Alias[Callable[..., int]]); pair the args positionally. An
+        # arg-count divergence means expansion spliced an Unpack: defer.
+        if len(o.args) != len(d.args):
+            return None
+        new_args = []
+        for po, pd in zip(o.args, d.args):
+            pa = _resync_definitions_inner(po, pd)
+            if pa is None:
+                return None
+            new_args.append(pa)
+        return d.copy_modified(args=new_args)
     # Divergent node kinds (leaf types): nothing to re-stamp. The top-level
     # check proved no unpaired definitions sit below a pairing node, and a
     # leaf-level kind mismatch means no callable is involved at all.
@@ -819,9 +835,9 @@ def freshen_all_functions_type_vars(t: T) -> T:
     if not t.accept(has_generic_callable):
         return t  # Fast path to avoid expensive freshening
     else:
-        # Stage 3c type-kernel seam: try the Rust freshen path first. Rust
-        # returns None for unsupported cases (Overloaded, ParamSpec vars,
-        # TypeAliasType), then we fall through to the pure-Python visitor.
+        # Stage 3c seam: try Rust first, else the pure-Python visitor. The
+        # resolver feeds the alias snapshot the union flatten needs (#1203);
+        # decoded alias nodes re-link through the same map (#1224 contract).
         if (
             _HAS_TYPE_KERNEL
             and _native_expand_type_active
@@ -830,16 +846,25 @@ def freshen_all_functions_type_vars(t: T) -> T:
         ):
             try:
                 call = _type_kernel.rust_freshen_all_functions_type_vars(
-                    TypeVarId.next_raw_id, _serialize_type(t), state.strict_optional
+                    TypeVarId.next_raw_id,
+                    _serialize_type(t),
+                    state.strict_optional,
+                    _native_expand_type_resolver,
                 )
                 if call is not None:
                     next_raw_id, changed, serialized = call
                     if changed:
                         TypeVarId.next_raw_id = next_raw_id
-                        decoded = read_type(_ReadBuffer(bytes(serialized)))
                         from mypy.wirefixup import fixup_wire_type
 
+                        decoded = read_type(_ReadBuffer(bytes(serialized)))
                         fixed = fixup_wire_type(decoded)
+                        if fixed is None:
+                            # Alias-bearing signatures keep alias nodes; a
+                            # plain decode cannot re-link them. Retry with
+                            # the per-build map (uncached: fresh vars leak).
+                            decoded = read_type(_ReadBuffer(bytes(serialized)))
+                            fixed = fixup_wire_type(decoded, resolve_aliases=True)
                         # The wire format has no line/column; decoded types
                         # default to -1. Preserve the input type's location so
                         # derived contexts report errors at the call site.

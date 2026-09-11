@@ -4944,7 +4944,7 @@ def _native_union_length(t: Type) -> int | None:
         return None
 
 
-def _deserialize_type_from_visitor(b: bytes) -> Type | None:
+def _deserialize_type_from_visitor(b: bytes, *, resolve_aliases: bool = False) -> Type | None:
     """Decode a visitor-seam blob into a live Type, fixed up (#1412).
 
     Runs `fixup_wire_type` so decoded Instances/TypeAliasTypes are
@@ -4952,12 +4952,16 @@ def _deserialize_type_from_visitor(b: bytes) -> Type | None:
     (defer to the pure-Python caller) when the fixup cannot be performed
     (no typeinfo map, unresolved type_ref) — an unfixed decode
     (alias=None / FakeInfo instance) must never reach live state.
+
+    `resolve_aliases=True` re-links decoded alias nodes through the
+    per-build alias map (the #1224/#1309 contract); the default keeps the
+    defer-on-alias behavior every other visitor seam relies on.
     """
     buf = _ReadBuffer(b)
     decoded = _visitor_read_type(buf)
     from mypy.wirefixup import fixup_wire_type
 
-    fixed = fixup_wire_type(decoded)
+    fixed = fixup_wire_type(decoded, resolve_aliases=resolve_aliases)
     # Mirrors the expandtype seam hygiene: read_type lazily fills
     # process-global instance_cache with Instance(NOT_READY, []) singletons
     # for str/int/bool/etc.; those must not leak into later builds.
@@ -4971,14 +4975,16 @@ def _deserialize_type_from_visitor(b: bytes) -> Type | None:
     return fixed
 
 
-def _deserialize_type_list_from_visitor(bs: list[bytes]) -> list[Type] | None:
+def _deserialize_type_list_from_visitor(
+    bs: list[bytes], *, resolve_aliases: bool = False
+) -> list[Type] | None:
     """All-or-nothing list variant of `_deserialize_type_from_visitor`."""
     # Rust Vec<Vec<u8>> arrives as list[list[int]] over PyO3, so each row is
     # widened to bytes here (mirrors the single-blob bytes(result) call in
     # the copy_modified seam); a plain bytes row passes through unchanged.
     out: list[Type] = []
     for b in bs:
-        t = _deserialize_type_from_visitor(bytes(b))
+        t = _deserialize_type_from_visitor(bytes(b), resolve_aliases=resolve_aliases)
         if t is None:
             return None
         out.append(t)
@@ -5776,6 +5782,83 @@ def _restore_dedup_identity(
     return src
 
 
+def _eq_children(t: Type) -> Iterable[Type]:
+    """Child positions `py_type_eq` / `Type.__eq__` recurse into."""
+    if isinstance(t, Instance):  # type: ignore[misc]
+        yield from t.args
+        if t.last_known_value is not None:
+            yield t.last_known_value
+        if t.extra_attrs is not None:
+            yield from t.extra_attrs.attrs.values()
+    elif isinstance(t, TypeVarType):
+        yield from t.values
+        yield t.upper_bound
+        yield t.default
+    elif isinstance(t, ParamSpecType):
+        yield t.default
+        yield from t.prefix.arg_types
+    elif isinstance(t, TypeVarTupleType):
+        yield t.default
+    elif isinstance(t, UnboundType):
+        yield from t.args
+    elif isinstance(t, UnpackType):
+        yield t.type
+    elif isinstance(t, CallableType):  # type: ignore[misc]
+        yield from t.arg_types
+        yield t.ret_type
+        yield t.fallback
+        if t.type_guard is not None:
+            yield t.type_guard
+        if t.type_is is not None:
+            yield t.type_is
+    elif isinstance(t, Overloaded):  # type: ignore[misc]
+        yield from t.items
+    elif isinstance(t, TupleType):  # type: ignore[misc]
+        yield from t.items
+        yield t.partial_fallback
+    elif isinstance(t, TypedDictType):  # type: ignore[misc]
+        yield from t.items.values()
+        yield t.fallback
+    elif isinstance(t, LiteralType):  # type: ignore[misc]
+        yield t.fallback
+    elif isinstance(t, TypeType):  # type: ignore[misc]
+        yield t.item
+    elif isinstance(t, TypeAliasType):
+        yield from t.args
+    elif isinstance(t, UnionType):  # type: ignore[misc]
+        yield from t.items
+
+
+def _dedup_alias_identity_sound(types: Sequence[Type]) -> bool:
+    """True when structural alias equality matches Python's alias identity.
+
+    The native `remove_dups` path compares `TypeAliasType` nodes by
+    `(fullname, args)` (the wire carries no alias object), while Python's
+    `__eq__` compares the alias *object* plus args (types.py:545). If every
+    fullname reachable in the list maps to one live alias object, the
+    structural key is injective and the semantics coincide. Otherwise the
+    caller falls back to the pure-Python body. Nested alias args are walked
+    (they participate in `==`); alias targets are not (Python never
+    descends them for equality).
+    """
+    seen: dict[str, int] = {}
+    visited: set[int] = set()
+    stack: list[Type] = list(types)
+    while stack:
+        t = stack.pop()
+        if id(t) in visited:
+            continue
+        visited.add(id(t))
+        if isinstance(t, TypeAliasType):
+            if t.alias is None:
+                return False
+            prior = seen.setdefault(t.alias.fullname, id(t.alias))
+            if prior != id(t.alias):
+                return False
+        stack.extend(_eq_children(t))
+    return True
+
+
 def _restore_tvars_as_args_identity(
     type_vars: Sequence[TypeVarLikeType], type_bytes_list: list[bytes], args: list[Type]
 ) -> tuple[Type, ...] | None:
@@ -6082,20 +6165,28 @@ def callable_with_ellipsis(any_type: AnyType, ret_type: Type, fallback: Instance
 
 
 def remove_dups(types: list[T]) -> list[T]:
-    # The native path serializes each element as a Type, but remove_dups is
-    # generic (e.g. semanal passes (TypeVarLikeType, ...) tuples); only take
-    # it when every element is a real Type instance (#1412 sweep).
+    # Native path (Type elements only; #1412 sweep). The alias-identity
+    # precondition keeps the structural key equivalent to Python's
+    # object-identity `TypeAliasType.__eq__`.
     if (
         _VISITOR_HAS_TYPE_KERNEL
         and _native_visitor_types_active
         and len(types) > 1
         and all(isinstance(t, Type) for t in types)
+        and _dedup_alias_identity_sound(types)  # type: ignore[arg-type]
     ):
         try:
             type_bytes_list = _serialize_type_list_for_visitor(types)  # type: ignore[arg-type]
             result = _rust_remove_dups(type_bytes_list)
             if result is not None:
                 deduped = _deserialize_type_list_from_visitor(result)
+                if deduped is None:
+                    # Alias-bearing rows only decode through the per-build
+                    # alias map (#1224/#1309 contract); retry once before
+                    # falling back to the pure-Python body.
+                    deduped = _deserialize_type_list_from_visitor(
+                        result, resolve_aliases=True
+                    )
                 if deduped is not None:
                     live = _restore_dedup_identity(types, type_bytes_list, deduped)  # type: ignore[arg-type]
                     if live is not None:

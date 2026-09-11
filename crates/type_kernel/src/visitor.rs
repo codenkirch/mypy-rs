@@ -620,25 +620,36 @@ fn decode_types_for_list_return(blobs: &[Vec<u8>]) -> Option<Vec<Type>> {
 // ---------------------------------------------------------------------------
 
 /// `mypy.types.remove_dups` — remove duplicates from a list, preserving
-/// order of first appearance. Type has `PartialEq` (no `Hash`), so this
-/// is O(n*m) where n = items, m = unique items seen.
+/// order of first appearance, with Python `__eq__` semantics per element
+/// (`crate::wire::py_type_eq`). The shim only engages this seam when every
+/// `TypeAliasType` fullname in the list maps to a single live alias object
+/// (structural alias equality then reproduces `TypeAliasType.__eq__`'s
+/// object-identity half). Alias-bearing elements are decodable: the wire
+/// carries `type_ref` + args, and the shim re-links decoded rows.
 ///
 /// Returns the deduped list as wire-format type bytes. The shim decodes
 /// back to Python list.
 #[pyfunction]
 pub(crate) fn rust_remove_dups(type_bytes_list: Vec<Vec<u8>>) -> PyResult<Option<Vec<Vec<u8>>>> {
-    let types = match decode_types_for_list_return(&type_bytes_list) {
-        Some(t) => t,
-        None => return Ok(None),
-    };
-    let deduped = remove_dups_inner(&types);
+    let mut types = Vec::with_capacity(type_bytes_list.len());
+    for b in &type_bytes_list {
+        match decode_type(b) {
+            Some(t) => types.push(t),
+            None => return Ok(None),
+        }
+    }
+    let deduped = remove_dups_py_eq_inner(&types);
     Ok(encode_type_list(&deduped))
 }
 
-pub(crate) fn remove_dups_inner(types: &[Type]) -> Vec<Type> {
+/// Python-`__eq__` dedup (`t not in all_types` with `Type.__eq__`
+/// semantics). The in-engine callers of `mypy.types.remove_dups`
+/// (`try_expanding_sum_type_to_union`, `expand_for_target`) use this so
+/// their dedup matches Python's set-based semantics.
+pub(crate) fn remove_dups_py_eq_inner(types: &[Type]) -> Vec<Type> {
     let mut seen: Vec<Type> = Vec::new();
     for t in types {
-        if !seen.contains(t) {
+        if !seen.iter().any(|s| crate::wire::py_type_eq(s, t)) {
             seen.push(t.clone());
         }
     }
@@ -1524,12 +1535,12 @@ mod tests {
     }
 
     #[test]
-    fn test_remove_dups_preserves_order() {
+    fn test_remove_dups_py_eq_preserves_order() {
         let a = make_instance("A", vec![]);
         let b = make_instance("B", vec![]);
         let c = make_instance("C", vec![]);
         let input = vec![a.clone(), b.clone(), a.clone(), c.clone(), b.clone()];
-        let result = remove_dups_inner(&input);
+        let result = remove_dups_py_eq_inner(&input);
         assert_eq!(result.len(), 3);
         assert_eq!(result[0], a);
         assert_eq!(result[1], b);
@@ -1537,16 +1548,104 @@ mod tests {
     }
 
     #[test]
-    fn test_remove_dups_single() {
+    fn test_remove_dups_py_eq_single() {
         let a = make_instance("A", vec![]);
-        let result = remove_dups_inner(std::slice::from_ref(&a));
+        let result = remove_dups_py_eq_inner(std::slice::from_ref(&a));
         assert_eq!(result.len(), 1);
     }
 
     #[test]
-    fn test_remove_dups_empty() {
-        let result = remove_dups_inner(&[]);
+    fn test_remove_dups_py_eq_empty() {
+        let result = remove_dups_py_eq_inner(&[]);
         assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_remove_dups_py_eq_any_kinds_collapse() {
+        // AnyType.__eq__ is isinstance-only (types.py:1534): two AnyTypes
+        // with different type_of_any ARE equal, unlike derived PartialEq.
+        let a1 = make_unannotated_any();
+        let a2 = make_explicit_any();
+        let result = remove_dups_py_eq_inner(&[a1, a2]);
+        assert_eq!(result.len(), 1);
+    }
+
+    #[test]
+    fn test_remove_dups_py_eq_union_order_insensitive() {
+        // UnionType.__eq__ is frozenset(items) (types.py:3871): a
+        // different item order is still equal, unlike derived PartialEq.
+        let a = make_instance("A", vec![]);
+        let b = make_instance("B", vec![]);
+        let u1 = Type::UnionType {
+            items: vec![a.clone(), b.clone()],
+            uses_pep604_syntax: false,
+            can_be_true: true,
+            can_be_false: true,
+            is_evaluated: true,
+            original_str_expr: None,
+            original_str_fallback: None,
+        };
+        let u2 = Type::UnionType {
+            items: vec![b, a],
+            uses_pep604_syntax: true,
+            can_be_true: false,
+            can_be_false: false,
+            is_evaluated: false,
+            original_str_expr: None,
+            original_str_fallback: None,
+        };
+        let result = remove_dups_py_eq_inner(&[u1, u2]);
+        assert_eq!(result.len(), 1);
+    }
+
+    #[test]
+    fn test_remove_dups_py_eq_alias_structural() {
+        // TypeAliasType equality on the wire key: (type_ref, args).
+        let alias = |type_ref: &str, args: Vec<Type>| Type::TypeAliasType {
+            args,
+            type_ref: type_ref.to_string(),
+            is_recursive: false,
+        };
+        let a1 = alias("mod.A", vec![]);
+        let a2 = alias("mod.A", vec![]);
+        let b = alias("mod.B", vec![]);
+        let a3 = alias("mod.A", vec![make_instance("builtins.int", vec![])]);
+        let result = remove_dups_py_eq_inner(&[a1, a2, b, a3.clone()]);
+        // a2 collapses onto a1; b and the arg-bearing a3 stay distinct.
+        assert_eq!(result.len(), 3);
+        assert_eq!(result[0], alias("mod.A", vec![]));
+        assert_eq!(result[1], alias("mod.B", vec![]));
+        assert_eq!(result[2], a3);
+    }
+
+    #[test]
+    fn test_remove_dups_py_eq_callable_ignores_flags() {
+        // CallableType.__eq__ (types.py:2949) excludes `variables`,
+        // `is_bound`, `implicit` and `instance_type`.
+        fn callable(is_bound: bool) -> Type {
+            Type::CallableType {
+                fallback: Box::new(make_instance("builtins.function", vec![])),
+                instance_type: None,
+                is_ellipsis_args: false,
+                implicit: false,
+                is_bound,
+                from_concatenate: false,
+                imprecise_arg_kinds: false,
+                unpack_kwargs: false,
+                from_type_type: false,
+                arg_types: vec![make_instance("builtins.int", vec![])],
+                arg_kinds: vec![0],
+                arg_names: vec![None],
+                ret_type: Box::new(make_instance("builtins.int", vec![])),
+                name: Some("f".to_string()),
+                variables: Vec::new(),
+                type_guard: None,
+                type_is: None,
+                special_sig: None,
+            }
+        }
+        let result = remove_dups_py_eq_inner(&[callable(false), callable(true)]);
+        assert_eq!(result.len(), 1);
     }
 
     #[test]

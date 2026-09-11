@@ -934,7 +934,7 @@ pub(crate) fn try_expanding_sum_type_to_union_inner(
                 &mut Vec::new(),
                 None,
             )?;
-            let deduped = crate::visitor::remove_dups_inner(&flat);
+            let deduped = crate::visitor::remove_dups_py_eq_inner(&flat);
             let mut out = Vec::with_capacity(deduped.len());
             for item in &deduped {
                 out.push(try_expanding_sum_type_to_union_inner(
@@ -2358,6 +2358,10 @@ pub(crate) fn rust_type_object_type_from_function(
     resolver: &mut NativeTypeResolver,
 ) -> Option<Vec<u8>> {
     let _infer_unions_guard = crate::unify::InferUnionsGuard::install(infer_unions);
+    // Alias map for the internal expand arms (union flatten, #1203) and for
+    // alias survivors: Python's bind/map path keeps live TypeAliasType nodes
+    // and the shim re-links them via the #1496 alias decode.
+    let _flat_alias_guard = crate::expandtype::FlatAliasGuard::install(resolver);
     let signature = decode_type(signature_bytes)?;
     let fallback = decode_type(fallback_bytes)?;
     // 1. orig_self_types
@@ -2460,11 +2464,31 @@ fn typevar_key(t: &Type) -> Option<TvarKey> {
 
 /// Collect the keys of all TypeVar-like nodes a `TypeQuery(get_all_type_vars)`
 /// walk with `include_all=True` would visit (TypeQuery positions,
-/// type_visitor.py:415-466). Returns `None` on a `TypeAliasType`: Python
-/// expands those with `get_proper_type`, which needs live alias nodes.
-fn collect_query_tvars(t: &Type, out: &mut Vec<TvarKey>) -> Option<()> {
+/// type_visitor.py:415-466). Alias nodes expand through the resolver
+/// snapshot like `TypeQuery.visit_type_alias_type` (`get_proper_type`
+/// chain); the `seen` list mirrors Python's `seen_aliases` recursion guard
+/// (keyed by alias fullname + args, the wire stand-in for the live alias
+/// object identity). Returns `None` when the resolver cannot expand an
+/// alias (missing snapshot / cycle), deferring to Python.
+fn collect_query_tvars(
+    t: &Type,
+    out: &mut Vec<TvarKey>,
+    resolver: &NativeTypeResolver,
+    seen: &mut Vec<(String, Vec<Type>)>,
+) -> Option<()> {
     match t {
-        Type::TypeAliasType { .. } => None,
+        Type::TypeAliasType { type_ref, args, .. } => {
+            if seen
+                .iter()
+                .any(|(r, a)| r == type_ref && same_type_list(a, args))
+            {
+                return Some(());
+            }
+            seen.push((type_ref.clone(), args.clone()));
+            let target =
+                crate::types_impl::chain_resolve_alias_target(t, resolver.alias_resolver())?;
+            collect_query_tvars(&target, out, resolver, seen)
+        }
         Type::TypeVarType {
             upper_bound,
             default,
@@ -2481,14 +2505,14 @@ fn collect_query_tvars(t: &Type, out: &mut Vec<TvarKey>) -> Option<()> {
             ..
         } => {
             out.push(typevar_key(t)?);
-            collect_query_tvars(upper_bound, out)?;
-            collect_query_tvars(default, out)?;
+            collect_query_tvars(upper_bound, out, resolver, seen)?;
+            collect_query_tvars(default, out, resolver, seen)?;
             for v in values_for_tvar(t) {
-                collect_query_tvars(v, out)?;
+                collect_query_tvars(v, out, resolver, seen)?;
             }
             if let Type::ParamSpecType { prefix, .. } = t {
                 for a in &prefix.arg_types {
-                    collect_query_tvars(a, out)?;
+                    collect_query_tvars(a, out, resolver, seen)?;
                 }
             }
             Some(())
@@ -2500,20 +2524,20 @@ fn collect_query_tvars(t: &Type, out: &mut Vec<TvarKey>) -> Option<()> {
             ..
         } => {
             for a in arg_types {
-                collect_query_tvars(a, out)?;
+                collect_query_tvars(a, out, resolver, seen)?;
             }
-            collect_query_tvars(ret_type, out)?;
+            collect_query_tvars(ret_type, out, resolver, seen)?;
             if let Some(it) = instance_type {
                 // The query only descends when instance_type != ret_type.
                 if **it != **ret_type {
-                    collect_query_tvars(it, out)?;
+                    collect_query_tvars(it, out, resolver, seen)?;
                 }
             }
             Some(())
         }
         Type::Overloaded { items } => {
             for it in items {
-                collect_query_tvars(it, out)?;
+                collect_query_tvars(it, out, resolver, seen)?;
             }
             Some(())
         }
@@ -2521,7 +2545,7 @@ fn collect_query_tvars(t: &Type, out: &mut Vec<TvarKey>) -> Option<()> {
         | Type::UnboundType { args, .. }
         | Type::UnionType { items: args, .. } => {
             for a in args {
-                collect_query_tvars(a, out)?;
+                collect_query_tvars(a, out, resolver, seen)?;
             }
             Some(())
         }
@@ -2530,23 +2554,23 @@ fn collect_query_tvars(t: &Type, out: &mut Vec<TvarKey>) -> Option<()> {
             items,
             ..
         } => {
-            collect_query_tvars(partial_fallback, out)?;
+            collect_query_tvars(partial_fallback, out, resolver, seen)?;
             for a in items {
-                collect_query_tvars(a, out)?;
+                collect_query_tvars(a, out, resolver, seen)?;
             }
             Some(())
         }
         Type::TypedDictType { items, .. } => {
             for (_, v) in items {
-                collect_query_tvars(v, out)?;
+                collect_query_tvars(v, out, resolver, seen)?;
             }
             Some(())
         }
-        Type::TypeType { item, .. } => collect_query_tvars(item, out),
-        Type::UnpackType { typ, .. } => collect_query_tvars(typ, out),
+        Type::TypeType { item, .. } => collect_query_tvars(item, out, resolver, seen),
+        Type::UnpackType { typ, .. } => collect_query_tvars(typ, out, resolver, seen),
         Type::Parameters(p) => {
             for a in &p.arg_types {
-                collect_query_tvars(a, out)?;
+                collect_query_tvars(a, out, resolver, seen)?;
             }
             Some(())
         }
@@ -2554,6 +2578,14 @@ fn collect_query_tvars(t: &Type, out: &mut Vec<TvarKey>) -> Option<()> {
         // Deleted carry no tvars at the query positions.
         _ => Some(()),
     }
+}
+
+/// Element-wise `py_type_eq` list comparison (Python list `==`).
+fn same_type_list(a: &[Type], b: &[Type]) -> bool {
+    a.len() == b.len()
+        && a.iter()
+            .zip(b.iter())
+            .all(|(x, y)| crate::wire::py_type_eq(x, y))
 }
 
 fn values_for_tvar(t: &Type) -> &[Type] {
@@ -2684,7 +2716,8 @@ fn generic_bind_self_item(
     }
     // Solve for the method's variables that appear in the self type.
     let mut tv_keys: Vec<TvarKey> = Vec::new();
-    collect_query_tvars(self_param, &mut tv_keys)?;
+    let mut seen_aliases: Vec<(String, Vec<Type>)> = Vec::new();
+    collect_query_tvars(self_param, &mut tv_keys, resolver, &mut seen_aliases)?;
     let self_ids: HashSet<TvarKey> = tv_keys.into_iter().collect();
     let mut self_vars: Vec<Type> = Vec::with_capacity(variables.len());
     for tv in variables {
@@ -2744,7 +2777,10 @@ fn generic_bind_self_item(
         &env,
         strict_optional,
         true,
-        false,
+        // alias_ok: Python's bind_self expand (ExpandTypeVisitor) keeps live
+        // TypeAliasType nodes; the composite's Python tail re-links them via
+        // `_deserialize_type_with_aliases` (#1496), so survivors may ride.
+        true,
         false,
     )?;
     let Type::CallableType {

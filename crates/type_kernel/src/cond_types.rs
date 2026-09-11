@@ -19,7 +19,7 @@ use crate::meet::overlap;
 use crate::setops::{make_simplified_union, union_make_union};
 use crate::subtypes::{is_subtype, SubtypeContext};
 use crate::typeinfo::{read_bool_attr, read_str_list_attr, NativeTypeResolver, TypeResolver};
-use crate::visitor::{flatten_nested_unions_inner, remove_dups_inner};
+use crate::visitor::flatten_nested_unions_inner;
 use crate::wire::{self, LiteralValue, ReadBuffer, Type, WriteBuffer};
 
 // ---------------------------------------------------------------------------
@@ -120,7 +120,9 @@ pub(crate) fn expand_for_target<'py>(
             // recursive=True): a recursive alias inside yields None (defer).
             let flat =
                 flatten_nested_unions_inner(&relevant, true, true, None, &mut Vec::new(), None)?;
-            let deduped = remove_dups_inner(&flat);
+            // Python calls `remove_dups` here; use the Python-`__eq__`
+            // variant so the dedup matches its set-based semantics.
+            let deduped = crate::visitor::remove_dups_py_eq_inner(&flat);
             let mut out = Vec::with_capacity(deduped.len());
             for item in &deduped {
                 out.push(expand_for_target(
