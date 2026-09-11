@@ -4268,9 +4268,11 @@ fn add_class_tvars_inner(
                 }
             };
 
-            // expand_type_by_instance(bound, isuper) if isuper is Some.
+            // expand_type_by_instance(bound, isuper): Python never defers
+            // on the method's own leftover tvars (freeze_all_type_vars
+            // reifies them), so use the free variant like the IAMA tail.
             let expanded = if let Some(isup) = isuper {
-                match crate::expandtype::expand_type_by_instance_core_alias(
+                match crate::expandtype::expand_type_by_instance_free(
                     &bound,
                     isup,
                     resolver,

@@ -41,14 +41,11 @@ fn encode_type(t: &Type) -> Option<Vec<u8>> {
     Some(buf.into_bytes())
 }
 
-/// `get_proper_type` — a `TypeAliasType` has no proper form in the wire
-/// representation (its target is unresolved), so defer. Otherwise the wire
-/// type is already proper.
-fn get_proper_type(t: &Type) -> Option<Type> {
-    if let Type::TypeAliasType { .. } = t {
-        return None;
-    }
-    Some(t.clone())
+/// `get_proper_type` — expand a top-level `TypeAliasType` through the
+/// resolver's alias snapshot (mirroring the live chain); a missing snapshot
+/// defers. Otherwise the wire type is already proper.
+fn get_proper_type(t: &Type, resolver: &TypeResolver) -> Option<Type> {
+    crate::checkexpr_functions::proper_or_expand_resolver(t, resolver)
 }
 
 // ---------------------------------------------------------------------------
@@ -94,11 +91,14 @@ fn neg_op(op: &str) -> Option<&'static str> {
 /// to defer when a `custom_special_method` or `has_base` check needs a
 /// snapshot that is missing from the resolver.
 pub(crate) fn can_be_narrowed_with_len(typ: &Type, resolver: &TypeResolver) -> Option<bool> {
+    // Python's `custom_special_method` expands aliases at its head
+    // (`get_proper_type`), so expand once here and run the check on the
+    // proper type; the later `get_proper_type(typ)` is then a no-op.
+    let p_typ = get_proper_type(typ, resolver)?;
     // If user overrides builtin behavior, we can't do anything.
-    if custom_special_method_inner(typ, "__len__", false, resolver)? {
+    if custom_special_method_inner(&p_typ, "__len__", false, resolver)? {
         return Some(false);
     }
-    let p_typ = get_proper_type(typ)?;
     match p_typ {
         Type::TupleType {
             items,
@@ -148,7 +148,7 @@ fn refine_tuple_type_with_len(
     typ: &Type,
     op: &str,
     size: i64,
-    _resolver: &TypeResolver,
+    resolver: &TypeResolver,
 ) -> Option<(Type, Type)> {
     let Type::TupleType {
         items,
@@ -183,7 +183,7 @@ fn refine_tuple_type_with_len(
     else {
         return None;
     };
-    let unpacked = get_proper_type(&unpack_type)?;
+    let unpacked = get_proper_type(&unpack_type, resolver)?;
 
     if let Type::TypeVarTupleType {
         tuple_fallback,
@@ -239,7 +239,7 @@ fn refine_tuple_type_with_len(
         } else {
             // op in (">", ">="): delegate to neg_op and swap.
             let neg = neg_op(op)?;
-            let (yes_type, no_type) = refine_tuple_type_with_len(typ, neg, size, _resolver)?;
+            let (yes_type, no_type) = refine_tuple_type_with_len(typ, neg, size, resolver)?;
             return Some((no_type, yes_type));
         }
     }
@@ -315,7 +315,7 @@ fn refine_tuple_type_with_len(
     } else {
         // op in (">", ">="): delegate to neg_op and swap.
         let neg = neg_op(op)?;
-        let (yes_type, no_type) = refine_tuple_type_with_len(typ, neg, size, _resolver)?;
+        let (yes_type, no_type) = refine_tuple_type_with_len(typ, neg, size, resolver)?;
         Some((no_type, yes_type))
     }
 }
@@ -440,7 +440,7 @@ pub(crate) fn rust_narrow_with_len(
         Some(t) => t,
         None => return Ok(None),
     };
-    let p_typ = match get_proper_type(&typ) {
+    let p_typ = match get_proper_type(&typ, resolver.resolver()) {
         Some(t) => t,
         None => return Ok(None),
     };
@@ -489,7 +489,10 @@ fn narrow_with_len_inner(
                     }
                     None => return None,
                 }
-                let (yt, nt) = narrow_with_len_inner(t, op, size, precise_tuple, resolver)?;
+                // Python's `narrow_with_len(t)` expands the item at its
+                // head (`get_proper_type`) before the dispatch.
+                let t_proper = get_proper_type(t, resolver)?;
+                let (yt, nt) = narrow_with_len_inner(&t_proper, op, size, precise_tuple, resolver)?;
                 yes_types.push(yt);
                 no_types.push(nt);
             }

@@ -252,10 +252,17 @@ pub(crate) fn custom_special_method_inner(
                 }
             }
         }
-        Type::TupleType { .. } => {
-            let fallback = crate::typeops::tuple_fallback(proper, resolver)?;
-            custom_special_method_inner(&fallback, name, check_all, resolver)
-        }
+        Type::TupleType {
+            partial_fallback, ..
+        } => match partial_fallback.as_ref() {
+            // Python's tuple fallback keeps a non-builtins fallback as-is
+            // and wraps joined items for builtins.tuple; the definer check
+            // reads only the TypeInfo, so read it without the union.
+            Type::Instance { type_ref, .. } => {
+                instance_custom_special_method(type_ref, name, resolver)
+            }
+            _ => None,
+        },
         Type::CallableType {
             fallback,
             ret_type,
