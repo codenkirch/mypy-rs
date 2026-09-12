@@ -305,6 +305,7 @@ from mypy.types import (
     UnionType,
     UnpackType,
     _encode_no_arg_instance,
+    _mirror_touch,
     flatten_nested_tuples,
     get_proper_type,
     get_proper_types,
@@ -2328,6 +2329,7 @@ class SemanticAnalyzer(
                     num_extra_anys = len(fdef.arguments) - len(sig.arg_types)
                     extra_anys = [AnyType(TypeOfAny.from_error)] * num_extra_anys
                     sig.arg_types.extend(extra_anys)
+                    _mirror_touch(sig)
                     return
                 if tag == _NATIVE_FUNC_SIG_TOO_MANY:
                     self.fail("Type signature has too many arguments", fdef, blocker=True)
@@ -2338,6 +2340,7 @@ class SemanticAnalyzer(
             num_extra_anys = len(fdef.arguments) - len(sig.arg_types)
             extra_anys = [AnyType(TypeOfAny.from_error)] * num_extra_anys
             sig.arg_types.extend(extra_anys)
+            _mirror_touch(sig)
         elif len(sig.arg_types) > len(fdef.arguments):
             self.fail("Type signature has too many arguments", fdef, blocker=True)
 

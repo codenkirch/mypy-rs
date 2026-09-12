@@ -221,12 +221,12 @@ jobs:
           TEST_NATIVE_TYPE_MIRROR: "1"
           TEST_NATIVE_TYPE_MIRROR_READ: "1"
           MYPY_NATIVE_TYPE_KERNEL_REQUIRED: "1"
-        # Pre-existing F2 read-flip stale-blob bug (#1530): capture-only is
-        # green, so the stale-blob cases (macOS testVariadicStarArgsCall,
-        # linux testRevealBoundParamSpecArgs) are deselected until it lands.
+        # The two #1530 stale-blob cases (testVariadicStarArgsCallNoCrash and
+        # testRevealBoundParamSpecArgs) are re-enabled: raw-list mutators call
+        # types_mirror.touch and the read flip re-verifies on the moved epoch.
         run: |
           uv run python -m pytest mypy/test/testcheck.py -q -n4 \
-            -k "not slow and not testVariadicStarArgsCallNoCrash and not testRevealBoundParamSpecArgs" \
+            -k "not slow" \
             --timeout=30 --timeout-method=thread
 
       - name: Mirror capture+read fine-grained

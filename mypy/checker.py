@@ -295,6 +295,7 @@ from mypy.types import (
     UnionType,
     UnpackType,
     _encode_no_arg_instance,
+    _mirror_touch,
     _read_mirror_blob,
     _serialize_stats,
     _serialize_stats_on,
@@ -1722,6 +1723,7 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
                     if getter_type is not None:
                         getter_type.definition = defn.items[0]
                         defn.type.items[0] = getter_type
+                        _mirror_touch(defn.type)
         for i, fdef in enumerate(defn.items):
             assert isinstance(fdef, Decorator)
             if defn.is_property:

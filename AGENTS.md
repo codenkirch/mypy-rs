@@ -3623,6 +3623,39 @@ including:
   3,385/6 both gate states, testcheck 8,198/15/7 exact both states,
   fine-grained 747/27 + daemon 37 mirror-on (capture+read).
 
+- wave 64A F2 stale-blob fix (#1530): the F2 read flip served
+  pre-mutation blobs after raw in-place writes (list/dict item stores
+  and extend/append) because raw writes never fire the family
+  `__setattr__` capture and never bumped `_UNPROT_EPOCH`. Fix per
+  ADR-0004 Decision 3, opt-in path only (no default flip):
+  `types_mirror.touch(t)` re-serializes/cascades a registered family
+  blob and bumps the unprotected epoch; `read_fresh_bytes` now gates on
+  `rust_mirror_write_skip(h, _UNPROT_EPOCH)` and re-serializes before
+  serving when the epoch moved (covers shared-list siblings and
+  nested-mutation carriers). The site hook is
+  `mypy.types._mirror_touch` (installed by `types_mirror.activate`,
+  one None-check when the mirror is off). Mutator registry, all
+  touched: CallableType `arg_kinds[-1] =` via the aliased list
+  (typeanal.py:2069, the report's site), CallableType `arg_types[i] =`
+  in `normalize_trivial_unpack` (types.py, both repros' mutation),
+  CallableType `arg_types.extend` (semanal.py:2330/2340), TupleType
+  `items` rebind + item write (semanal_typeargs.py:114/117,
+  change-guarded), Overloaded `items[0] =` (checker.py:1724),
+  TypeAliasType `args` rebind (semanal_typeargs.py:99). Family-class
+  rebinds (Instance.args, CallableType.variables, ...) stay on the
+  patched setattr capture, no touch. Instrumentation stripped; the two
+  CI-deselected cases re-enabled in `parity-mirror` (the `-k`
+  deselection is gone). Repro before -> after: both
+  `testVariadicStarArgsCallNoCrash` and `testRevealBoundParamSpecArgs`
+  fail (spurious diagnostics) under capture+read -> green. Pins:
+  `NativeMirrorReadSuite` +4 (raw-escape served stale until touch,
+  epoch gate refreshes an untouched drifted handle,
+  `normalize_trivial_unpack` touch + gate-off parity). Gates: cold
+  self-check clean 347 (mirror off); testcheck 8,198/15/7/0 both
+  mirror states; testtypes 3,389/6 both states (+4); fine-grained
+  747/27 + daemon 37 with capture+read; ruff/black clean on the
+  changed files (2 pre-existing C408s in testtypes untouched).
+
 ## Pull Requests
 
 The default branch on this fork is `main` (not `master`). Always target

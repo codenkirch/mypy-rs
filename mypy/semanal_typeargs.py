@@ -34,6 +34,8 @@ from mypy.types import (
     TypeVarType,
     UnboundType,
     UnpackType,
+    _mirror_touch,
+    _mirror_touch_enabled,
     flatten_nested_tuples,
     get_proper_type,
     get_proper_types,
@@ -97,6 +99,7 @@ class TypeArgumentAnalyzer(MixedTraverserVisitor):
             # then it is safer to erase the arguments completely, to avoid crashes later.
             # TODO: can we move this logic to typeanal.py?
             t.args = erased_vars(t.alias.alias_tvars, TypeOfAny.from_error)
+            _mirror_touch(t)
         if not is_error:
             # If there was already an error for the alias itself, there is no point in checking
             # the expansion, most likely it will result in the same kind of error.
@@ -111,10 +114,19 @@ class TypeArgumentAnalyzer(MixedTraverserVisitor):
         # Unfortunately, universal normalization of tuples is not possible in presence of
         # recursive aliases, see testNoCrashOnNonNormalRecursiveTuple for an example.
         # TODO: update the places where we handle tuples to always expect non-normal ones.
-        t.items = flatten_nested_tuples(t.items, handle_recursive=False)
+        old_items = t.items
+        t.items = flatten_nested_tuples(old_items, handle_recursive=False)
+        if _mirror_touch_enabled() and (
+            len(t.items) != len(old_items)
+            or any(new is not old for new, old in zip(t.items, old_items))
+        ):
+            # TupleType is not a mirror family class: the raw rebind/rewrite
+            # only matters through a registered container that embeds it.
+            _mirror_touch(t)
         for i, it in enumerate(t.items):
             if self.check_non_paramspec(it, "tuple", t):
                 t.items[i] = AnyType(TypeOfAny.from_error)
+                _mirror_touch(t)
 
         # We could also normalize Tuple[*tuple[X, ...]] -> tuple[X, ...] like in
         # expand_type() but we can't do this here since it is not a translator visitor,
