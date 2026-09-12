@@ -39,15 +39,17 @@ use crate::astwire::{
 /// `mypy.traverser.has_return_statement` — find if a function has a
 /// non-trivial return statement.
 ///
-/// Mirrors `ReturnSeeker` (traverser.py:946-963). "Non-trivial" means the
-/// return has an expression (plain `return` and `return None` don't count).
-/// Since the wire format drops scalar values, we can't distinguish
-/// `return None` from `return <expr>` — but we CAN distinguish `return`
-/// (expr field is None/ChildField::None) from `return <expr>` (expr field
-/// is a Node). This matches the Python seeker which checks
-/// `stmt.expr is not None`.
+/// Mirrors `ReturnSeeker` (traverser.py:1039-1056). "Non-trivial" means a
+/// return whose expression is neither absent nor the `None` name (plain
+/// `return` and `return None` don't count). The wire format drops the
+/// `NameExpr.name` scalar, so a return whose expression is a `NameExpr` is
+/// ambiguous: `return None` is trivial, `return <name>` is not. Those
+/// trees defer (`None`) and the Python `ReturnSeeker` decides. Any other
+/// expression node kind is decidable, so a single `return 1` anywhere makes
+/// the whole answer `Some(true)` even if a `NameExpr` return is also
+/// present.
 ///
-/// Returns `None` (defer) when the root does not decode: the Python
+/// Returns `None` (defer) for an undecodable root too: the Python
 /// serializer emits a bare LITERAL_NONE for a node kind it has no wire
 /// tag for (e.g. a bare `FuncItem`, whose `body` therefore never reaches
 /// us), and answering `false` there would diverge from the pure-Python
@@ -58,23 +60,36 @@ pub(crate) fn rust_has_return_statement(node_bytes: &[u8]) -> PyResult<Option<bo
         Some(n) => n,
         None => return Ok(None),
     };
-    Ok(Some(has_return_statement_inner(&node)))
+    Ok(has_return_statement_inner(&node))
 }
 
-fn has_return_statement_inner(node: &AstNode) -> bool {
+fn has_return_statement_inner(node: &AstNode) -> Option<bool> {
+    let mut ambiguous = false;
+    if has_decidable_return(node, &mut ambiguous) {
+        Some(true)
+    } else if ambiguous {
+        // `return None` and `return <name>` look identical on the wire
+        // (NameExpr.name is a dropped scalar): defer to Python.
+        None
+    } else {
+        Some(false)
+    }
+}
+
+/// True when a non-`NameExpr` return expression (or no return at all) is
+/// found. A `NameExpr` expression sets `ambiguous` because the wire cannot
+/// tell `return None` from `return <name>`.
+fn has_decidable_return(node: &AstNode, ambiguous: &mut bool) -> bool {
     if is_return_stmt(node.tag) {
-        // Non-trivial if the expr child is a Node (not None).
-        if node
-            .children
-            .first()
-            .is_some_and(|f| matches!(f, ChildField::Node(_)))
-        {
-            return true;
+        match node.children.first() {
+            Some(ChildField::Node(expr)) if is_name_expr(expr.tag) => *ambiguous = true,
+            Some(ChildField::Node(_)) => return true,
+            _ => {} // bare `return`: trivial
         }
     }
     node.child_nodes()
         .iter()
-        .any(|c| has_return_statement_inner(c))
+        .any(|c| has_decidable_return(c, ambiguous))
 }
 
 // ---------------------------------------------------------------------------
@@ -810,7 +825,7 @@ mod tests {
     #[test]
     fn test_has_return_statement_with_expr() {
         let block = make_block(vec![make_return(Some(make_int()))]);
-        assert!(has_return_statement_inner(&block));
+        assert_eq!(has_return_statement_inner(&block), Some(true));
     }
 
     #[test]
@@ -824,20 +839,40 @@ mod tests {
     #[test]
     fn test_has_return_statement_bare_return() {
         let block = make_block(vec![make_return(None)]);
-        assert!(!has_return_statement_inner(&block));
+        assert_eq!(has_return_statement_inner(&block), Some(false));
     }
 
     #[test]
     fn test_has_return_statement_nested() {
         let inner = make_block(vec![make_return(Some(make_int()))]);
         let outer = make_block(vec![inner]);
-        assert!(has_return_statement_inner(&outer));
+        assert_eq!(has_return_statement_inner(&outer), Some(true));
     }
 
     #[test]
     fn test_has_return_statement_none() {
         let block = make_block(vec![make_int()]);
-        assert!(!has_return_statement_inner(&block));
+        assert_eq!(has_return_statement_inner(&block), Some(false));
+    }
+
+    #[test]
+    fn test_has_return_statement_name_expr_defers() {
+        // `return None` and `return x` are indistinguishable on the wire
+        // (NameExpr.name is a dropped scalar), so the seeker must defer
+        // (issue #1547).
+        let block = make_block(vec![make_return(Some(make_name()))]);
+        assert_eq!(has_return_statement_inner(&block), None);
+    }
+
+    #[test]
+    fn test_has_return_statement_decidable_beats_ambiguous() {
+        // An `IntExpr` return proves the answer is true regardless of the
+        // ambiguous `NameExpr` return alongside it.
+        let block = make_block(vec![
+            make_return(Some(make_name())),
+            make_return(Some(make_int())),
+        ]);
+        assert_eq!(has_return_statement_inner(&block), Some(true));
     }
 
     #[test]

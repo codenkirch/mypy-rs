@@ -3881,6 +3881,33 @@ including:
   ast_serialize 3 (the 7 scaffold tests deleted), fmt + clippy clean
   both crates, AST parity 876 passed/75 skipped/3 xfailed, testparse
   fastparse 250/74, testcheck 8,198/15/7 exact, cold self-check 347.
+- wave 67C stubgen yield-trio root cause + fix (issue #1547): the three
+  pre-existing stubgen failures (`testFunctionYields`,
+  `testGeneratorYieldFrom`, `testGeneratorYieldAndYieldFrom`) were not
+  parser-mode dependent. The trigger is the native traverser seam
+  `rust_has_return_statement` (`crates/type_kernel/src/traverser.rs`):
+  astwire drops the `NameExpr.name` scalar, so the Rust seeker could not
+  tell `return None` (trivial for `ReturnSeeker`) from `return <name>`
+  (non-trivial) and answered `true` for both. Stubgen's generator
+  inference (`mypy/stubgen.py:711`) then added the third
+  `Generator[..., Incomplete]` parameter for `return None`. Fix: the
+  seeker is now tri-state (`Option<bool>`) - `Some(true)` when any
+  non-`NameExpr` return expression exists (a decidable non-trivial
+  return short-circuits), `None` (defer to Python's `ReturnSeeker`) when
+  only `NameExpr` returns are present, `Some(false)` when no
+  expression-carrying return exists. No wire-format change: the
+  `#1030` defer pattern applies. `mypy/test/teststubgen.py`'s #1547
+  xfail block is removed; `NativeTraverserSuite` gains fastparse +
+  eager-native-parse parity pins and a direct seam tri-state test
+  (`return None`/`return x` defer, `return 1` true, bare return false).
+  The CI `parity-ast` job never built `type_kernel`, so its teststubgen
+  run was already on the Python fallback; the bug only showed under the
+  shared wave-65 extensions. Gates: trio green with the xfail removed;
+  full teststubgen 373 passed/1 skipped/2 xfailed (the two remaining
+  xfails pre-date #1547: `test_infer_sig_from_docstring_args_kwargs_errors`
+  and the data-driven `testNestedClassInNamedTuple_semanal-xfail`);
+  testtypes 3,409/7; testcheck 8,198/15/7 exact; cold self-check clean
+  347; cargo type_kernel 2,775/11; fmt + clippy clean.
 
 - wave 67A expression enum + writer byte parity (G0.3, issue #1556):
   `crates/ast_serialize/src/ast_node.rs` adds the `ExprNode` enum (one
