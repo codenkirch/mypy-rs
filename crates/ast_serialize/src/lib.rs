@@ -460,7 +460,6 @@ impl ImportCollector {
     include_docstrings = false,
     custom_typing_module = None
 ))]
-#[allow(clippy::too_many_arguments)]
 fn parse(
     py: Python<'_>,
     fnam: &str,
