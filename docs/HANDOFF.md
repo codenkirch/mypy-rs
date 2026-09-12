@@ -1,6 +1,6 @@
 # Handoff: strangler-fig Rust migration loop (seam-deferral reduction)
 
-*Written 2026-08-28, refreshed 2026-09-11 (post-wave65: waves 52-65
+*Written 2026-08-28, refreshed 2026-09-11 (post-wave66: waves 52-66
 landed the st find_member/unpack/apply-report ports (#1492, embedded
 112 -> 61), the icf SUBTYPE_OF protocol-actual arm (#1487), the
 plugin-synthesized TypeInfo registrar (#1489), the ctor-blob gate
@@ -28,20 +28,27 @@ five icf protocol-member sub-buckets, raw-FFI fallbacks 149 -> 56
 docs/plans/2026-09-11-phase-g0-next-steps.md with scoped follow-ups
 #1545 (AST wire v5: docstring/custom-typing-module/version-pin bugs),
 #1546 (dead scaffolding + AST CI), #1547 (teststubgen pre-existing
-failures)). Two
+failures)), and wave 66 (A #1552 fixed the three native-parser parity bugs
+via AST wire v5 - docstrings, --custom-typing-module, reader-side
+pos_only; B #1550 deleted 2,040 dead AST-scaffolding lines and added the
+`parity-ast` CI gate (#1547's yield trio xfailed there); C #1549 produced
+the ADR-0004 proxy brief at docs/plans/2026-09-11-adr0004-proxy-brief.md
+with P1/P2 filed as #1553/#1554; #1551 filed for the multi-alias import
+split). Two
 docs-only negative closes also landed (B6 render bundle #1481; maptype
 timing-gap #1494 - the #1493 audit that followed disproved its own
 hypothesis and landed the alias-decode fix #1496 instead). Goal:
 "migrate all python code to rust, really all", pursued as the established measure -> file -> dispatch-agents -> process-PRs ->
 gate loop. This file is the resume point.*
 
-## Where main stands (2026-09-11, post-wave65)
+## Where main stands (2026-09-11, post-wave66)
 
-- `main` = `aa11047e1` (icf protocol arms, `#1542`) on top of
-  `ddd4ff44a` (`#1544`, #1539), `7a2b2f850` (`#1538`), `beeab0fef`
-  (`#1534`, #1526), `92f27e06d` (`#1536`, #1532), `c08025b32`
-  (`#1535`, #1530), `57ccaa38b` (`#1533`), `490a06c3e` (`#1531`,
-  #1527), `82e75bb21` (`#1529`),
+- `main` = `85fadf488` (AST CI gate, `#1550`) on top of `37633b024`
+  (`#1552`, #1545), `bf019a1f1` (`#1548`, #1540), `aa11047e1` (`#1542`,
+  #1541), `ddd4ff44a` (`#1544`, #1539), `7a2b2f850` (`#1538`),
+  `beeab0fef` (`#1534`, #1526), `92f27e06d` (`#1536`, #1532),
+  `c08025b32` (`#1535`, #1530), `57ccaa38b` (`#1533`), `490a06c3e`
+  (`#1531`, #1527), `82e75bb21` (`#1529`),
   `3d9b3b8fb` (`#1525`, #1520), `13e9e9f7b`
   (`#1524`, #1516), `19d68949c` (`#1523`, #1517), `81a8149dd` (`#1522`,
   #1518), `0bb6827cb` (`#1521`, #1519), `66e709794` (`#1515`),
@@ -56,12 +63,11 @@ gate loop. This file is the resume point.*
   correct on the identified raw-list mutators (#1530 closed) and the
   wire-cache splice is exercisable (#1526 closed). #1528 (daemon-stable
   handles) is re-scoped to the strong-pin protocol.
-- Gates on the merged head `aa11047e1`: cargo 2,773/11 ignored;
-  testtypes 3,405/7 (PyPI librt; 3,399+/3 with scratch librt);
-  testcheck 8,198/15/7 exact (kernel, capture-only, capture+read);
-  cold self-check clean (347 files); fine-grained 747/27, daemon 37;
-  pr-gate + parity + parity-mirror + parity-typeops green on
-  #1542/#1544.
+- Gates on the merged head `85fadf488`: cargo type_kernel 2,773/11,
+  ast_serialize 9/0; testtypes 3,405/7; AST suites 881 passed / 75
+  skipped / 5 xfailed (native + fastparse differential); testcheck
+  8,198/15/7 exact; cold self-check clean (347 files); fine-grained
+  747/27, daemon 37; CI green including the new `parity-ast` job.
 - Shared `.so` rebuilt 2026-09-11 at the merged head content (wave-63
   Rust, codesigned); `/private/tmp/mypy-rs-local-typekernel`.
 - Wave-56: the alias-aware typeobj decode retry
@@ -199,6 +205,27 @@ gate loop. This file is the resume point.*
   149 -> 56 (-62%). Residual 51 `ffi-extra-tvars` (#1171/#1427
   multi-wave channel) + 5 small defers. Line-loss path deferred and
   tracked as #1543.
+- Wave-66A (#1545/#1552): AST wire v5 - FuncDef/ClassDef docstrings
+  (byte-exact vs ast.get_docstring(clean=False), surrogate-safe),
+  `--custom-typing-module` translation with implicit asname,
+  reader-side `pos_only_special_methods`, `AST_WIRE_VERSION = 5`
+  enforced at the parse entry, `transform_source` routed on the native
+  branch. Writer-side `argument_elide_name` is unconditional in
+  fastparse too, so gating it would diverge - documented deviation.
+  testIncludeDocstrings green; #1551 filed (multi-alias import split).
+- Wave-66B (#1546/#1550): deleted 2,040 dead AST-scaffolding lines
+  (nodes_full/nodes_codec/full_ast_codec/visitor_engine); added
+  ast_serialize cargo test/fmt/clippy and a `parity-ast` CI job
+  (test_nativeparse + testparse + teststubgen, paths trigger extended);
+  moved the astwire-only tags out of the 150-152 cache range to 230-232
+  (traverser-local, no stored format change); #1547's yield trio
+  reproduces on main and is xfailed with the issue link.
+- Wave-66C (#1549): ADR-0004 proxy graduation brief persisted
+  (`docs/plans/2026-09-11-adr0004-proxy-brief.md`): ADR staleness
+  corrections, the blob-backed shadow first slice, purge points,
+  coherence/plugin/cache/daemon risks, and the P1-P4 sequence (P1/P2
+  filed as #1553/#1554). #1528's weakref claim corrected (all eight
+  Type classes fail weakref).
 - Runner note unchanged: the repo runner cannot re-register (403,
   admin-blocked; #1249 open); GH `ocr-review` jobs stay `queued`
   forever. The operative review gate is the local
@@ -277,6 +304,9 @@ gate loop. This file is the resume point.*
 | #1534 | #1526 | wave64C: in-repo librt build (write_raw_bytes), CI wiring + `mypyc/lib-rt/**` trigger; cache-depth leak and write-funnel test-coupling fixes | splice suite 3/3 skipped -> 7/0; testtypes 3,397/3 with scratch librt; testcheck 8,198/15/7 exact; self-check clean |
 | #1544 | #1539 | wave65A: mirror capture cuts (cached walk ctx, registration fusion, guards, import hoisting); revised 10% decision in the audit doc | capture 217.4s -> 171.3s (-21.2%), overhead -37.3%; cargo 2,773/11; testcheck exact in all three modes; fine-grained 747/27 + daemon 37 capture+read |
 | #1542 | #1541 | wave65C: icf protocol-member actual-shape arms (both-protocol SUP, callback/typeobj callable, Overloaded + `__call__`, tuple-protocol tail) | raw-FFI fallbacks 149 -> 56 (-62%); cargo 2,773/11; testtypes 3,403/7; testcheck 8,198/15/7 exact; fine-grained 747/27 + daemon 37; #1543 filed |
+| #1552 | #1545 | wave66A: AST wire v5 - docstrings, `--custom-typing-module`, reader-side pos-only, version pin, `transform_source` routing | AST suites 881/75/5 xfail; testcheck 8,198/15/7 exact; self-check clean; #1551 filed |
+| #1550 | #1546 | wave66B: 2,040 dead scaffolding lines deleted; ast_serialize cargo gates + `parity-ast` CI job; astwire tag move to 230-232; #1547 xfailed with link | ast_serialize 9/0; type_kernel 2,773/11; AST parity 876/75/3 xfail; testcheck exact; self-check clean |
+| (docs) | #1549 | wave66C: ADR-0004 proxy graduation brief persisted; #1553/#1554 filed | docs-only |
 | (docs) | #1540 | wave65B: Phase G0 scoping brief persisted + follow-ups #1545/#1546/#1547 | docs-only |
 
 Closed alongside: #1412, #1393 (F2 complete), #1397 (F3 partial,
@@ -306,18 +336,20 @@ in #1501, closed by hand), #1503 (#1504 auto-closed it), #1506
 (#1508 auto-closed it), #1507 (#1509 + manual close), #1511 (#1514
 merged; closed by hand), #1512 (#1513 merged; closed by hand), #1516,
 #1517, #1518 (closed by hand after the wave-62 merges), #1519 (#1521
-auto-closed it), #1520 (#1525 auto-closed it), #1527 (#1531 merged; closed by hand); #1528 deferred with evidence), #1530 (#1535 auto-closed it), #1532 (closed by hand after #1536), #1526 (closed by hand after #1534), #1539 (#1544 auto-closed it), #1541 (#1542 auto-closed it), #1540 (closed by the G0-brief docs PR).
+auto-closed it), #1520 (#1525 auto-closed it), #1527 (#1531 merged; closed by hand); #1528 deferred with evidence), #1530 (#1535 auto-closed it), #1532 (closed by hand after #1536), #1526 (closed by hand after #1534), #1539 (#1544 auto-closed it), #1541 (#1542 auto-closed it), #1540 (closed by the G0-brief docs PR), #1545 (#1552 auto-closed it), #1546 (#1550 auto-closed it); #1547 stays open (xfail target); #1549 closed by the proxy-brief docs PR.
 
 ## Open backlog (next waves; dispatch max ~2 port agents)
 
-1. **#1545 (G0.1)**: AST wire v5 - fix the three confirmed parser parity
-   bugs (docstrings, `--custom-typing-module`, `pos_only_special_methods`)
-   plus the wire-version pin and `transform_source` routing. Concrete,
-   high-value, independent of F.
-2. **#1546 (G0.2)**: delete the 2,040 dead AST-scaffolding lines and put
-   the AST path (`cargo test -p mypy-ast-serialize`, test_nativeparse,
-   testparse, teststubgen) into CI; #1547 tracks the pre-existing
-   teststubgen yield failures to fix/xfail in the same pass.
+1. **G0.3** (next): expression enum + writer byte parity over the
+   250-case corpus + golden blobs (per the G0 brief's sequence); then
+   G0.4 statements and G0.5 symbol nodes.
+2. **Proxy P1/P2 (#1553/#1554)**: store scaffold, then the lazy
+   Instance read shadow with the drop-if-no-win measurement.
+3. **#1551**: multi-alias `import a, b` splits into one Import node per
+   alias in `tree.imports` (needs an import-metadata name-list + wire
+   bump); noticed by wave 66A.
+4. **#1547**: stubgen yield-trio xfail removal once fixed (both parser
+   modes).
 3. **F2/F4 graduation**: capture cuts are exhausted (wave 65A revised
    decision); the next step is the ADR-0004 proxy or the P4 default-on
    decision, and #1528 needs the strong-pin protocol first.
