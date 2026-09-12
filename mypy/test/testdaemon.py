@@ -20,6 +20,13 @@ from mypy.test.config import PREFIX, test_temp_dir
 from mypy.test.data import DataDrivenTestCase, DataSuite
 from mypy.test.helpers import assert_string_arrays_equal, normalize_error_messages
 
+try:
+    import type_kernel  # noqa: F401
+
+    _HAS_TYPE_KERNEL = True
+except ImportError:
+    _HAS_TYPE_KERNEL = False
+
 # Files containing test cases descriptions.
 daemon_files = ["daemon.test"]
 
@@ -135,3 +142,94 @@ class DaemonUtilitySuite(unittest.TestCase):
         if not path.endswith("/"):
             with open(fullpath, "w") as f:
                 f.write("# test file")
+
+
+@unittest.skipUnless(_HAS_TYPE_KERNEL, "requires the type_kernel extension")
+class NativeDaemonStableHandleSuite(unittest.TestCase):
+    """Daemon-stable identity handles (issue #1528).
+
+    A dmypy fine-grained recheck calls `_clear_native_resolvers`, which now
+    takes the preserving reset: blob storage and raw ids drop while the
+    strong-pin stable layer keeps the handle of every live object, so an
+    astmerge-preserved Type re-registers under the handle it already had.
+    An object the recheck drops loses its pin at the next preserving reset,
+    once nothing else owns it (the pin was the only remaining owner).
+    """
+
+    def tearDown(self) -> None:
+        if _HAS_TYPE_KERNEL:
+            from mypy import types_mirror
+
+            types_mirror.reset(clear_counts=True)
+
+    def test_handle_survives_fine_grained_recheck(self) -> None:
+        from mypy import types_mirror
+        from mypy.dmypy_server import Server
+        from mypy.modulefinder import BuildSource
+        from mypy.nodes import Var
+        from mypy.options import Options
+        from mypy.types import Instance, get_proper_type
+
+        with tempfile.TemporaryDirectory() as td:
+            other_path = os.path.join(td, "other.py")
+            main_path = os.path.join(td, "main.py")
+            with open(other_path, "w", encoding="utf8") as f:
+                f.write("a = [1]\n")
+            with open(main_path, "w", encoding="utf8") as f:
+                f.write("import other\nkeep = [3]\n")
+
+            options = Options()
+            options.use_builtins_fixtures = True
+            options.native_type_mirror = True
+            server = Server(options, os.path.join(td, "status.json"))
+            sources = [
+                BuildSource(main_path, "main", None),
+                BuildSource(other_path, "other", None),
+            ]
+
+            def check() -> None:
+                res = server.check(
+                    sources, export_types=False, is_tty=False, terminal_width=-1
+                )
+                assert res["status"] == 0, res
+
+            check()
+            fg = server.fine_grained_manager
+            assert fg is not None
+            a_node = fg.manager.modules["other"].names["a"].node
+            assert isinstance(a_node, Var)
+            a_type = a_node.type
+            assert a_type is not None
+            a_handle = types_mirror._register_tree(a_type)
+            assert a_handle is not None
+            # A scratch family object nothing else owns: the recheck's
+            # preserving sweep must retire its pin-only entry.
+            proper = get_proper_type(a_type)
+            assert isinstance(proper, Instance)
+            scratch = proper.copy_modified()
+            scratch_handle = types_mirror._register_tree(scratch)
+            assert scratch_handle is not None and scratch_handle != a_handle
+            del scratch
+            assert types_mirror._kernel_mod.rust_mirror_stable_alive(scratch_handle)
+
+            # Recheck: only `main` changes, so astmerge preserves `other`'s
+            # objects. The same reset sweeps the pin-only scratch entry.
+            with open(main_path, "w", encoding="utf8") as f:
+                f.write("import other\nvalue = other.a\n")
+            check()
+            fg = server.fine_grained_manager
+            assert fg is not None
+            a_after = fg.manager.modules["other"].names["a"].node
+            assert isinstance(a_after, Var)
+            assert a_after.type is a_type
+            # Preserved object: the stable layer kept its handle, blob
+            # storage was dropped, and re-registration rebuilds it under
+            # the same handle.
+            assert types_mirror._kernel_mod.rust_mirror_handle_of(a_type) == a_handle
+            assert types_mirror._kernel_mod.rust_mirror_stable_alive(a_handle)
+            assert types_mirror._register_tree(a_type) == a_handle
+            assert types_mirror._handle_of(a_type) == a_handle
+            blob = types_mirror._kernel_mod.rust_mirror_bytes(a_handle)
+            assert blob is not None and bytes(blob)
+            # Dropped object: the pin-only entry was retired.
+            assert not types_mirror._kernel_mod.rust_mirror_stable_alive(scratch_handle)

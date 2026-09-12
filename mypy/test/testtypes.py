@@ -53926,6 +53926,80 @@ class NativeMirrorAdoptionFastPathSuite(Suite):
 
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeMirrorStableIdentitySuite(Suite):
+    """Daemon-stable identity handles (issue #1528).
+
+    The stable layer pins a live object with a strong `Py<PyAny>` (no
+    weakrefs: every probed Type class refuses one), so the handle survives a
+    preserving reset, the daemon recheck boundary. Blob storage and raw ids
+    drop, entries whose stable pin is their only owner are released, and a
+    non-preserving reset drops the layer outright.
+    """
+
+    def setUp(self) -> None:
+        from mypy import types_mirror
+
+        types_mirror.activate(audit=True)
+        types_mirror.reset(clear_counts=True)
+        self._m = types_mirror
+        self.fx = TypeFixture()
+
+    def tearDown(self) -> None:
+        self._m.reset(clear_counts=True)
+
+    def _callable(self) -> CallableType:
+        return CallableType(
+            [self.fx.o], [ARG_POS], [None], self.fx.o, self.fx.function, name="f"
+        )
+
+    def test_preserving_reset_keeps_stable_identity(self) -> None:
+        c = self._callable()
+        h = self._m._register_tree(c)
+        assert h is not None
+        stored = bytes(self._m._kernel_mod.rust_mirror_bytes(h))
+        assert stored
+        # `c` is referenced by this frame, so the sweep keeps its pin.
+        self._m.reset(preserve_stable=True)
+        assert self._m._kernel_mod.rust_mirror_stable_alive(h)
+        assert self._m._kernel_mod.rust_mirror_handle_of(c) == h
+        # Per-build blob storage dropped; the Python map is per-build too.
+        assert self._m._kernel_mod.rust_mirror_bytes(h) is None
+        assert self._m._handle_of(c) is None
+        # Re-registration restores identity and rebuilds the blob.
+        assert self._m._register_tree(c) == h
+        assert self._m._handle_of(c) == h
+        assert bytes(self._m._kernel_mod.rust_mirror_bytes(h)) == stored
+
+    def test_full_reset_drops_stable_identity(self) -> None:
+        c = self._callable()
+        h = self._m._register_tree(c)
+        assert h is not None
+        self._m.reset()
+        assert not self._m._kernel_mod.rust_mirror_stable_alive(h)
+        assert self._m._kernel_mod.rust_mirror_handle_of(c) is None
+        h2 = self._m._register_tree(c)
+        assert h2 is not None and h2 != h
+
+    def test_preserving_reset_releases_unreferenced_entries(self) -> None:
+        c = self._callable()
+        h = self._m._register_tree(c)
+        assert h is not None
+        del c
+        # The mirror was the only non-stable owner; reset clears its pins
+        # first, so the kernel sweep releases the pin-only entry.
+        self._m.reset(preserve_stable=True)
+        assert not self._m._kernel_mod.rust_mirror_stable_alive(h)
+
+    def test_preserving_reset_keeps_referenced_entries(self) -> None:
+        c = self._callable()
+        h = self._m._register_tree(c)
+        assert h is not None
+        self._m.reset(preserve_stable=True)
+        assert self._m._kernel_mod.rust_mirror_stable_alive(h)
+        assert self._m._kernel_mod.rust_mirror_handle_of(c) == h
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeVisitorBindSuite(Suite):
     """Regression for #1412: the visitor-kernel gate actually engages.
 

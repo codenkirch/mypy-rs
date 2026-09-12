@@ -1820,20 +1820,20 @@ class BuildManager:
         build starts from an empty snapshot instead of accumulating into a
         stale one.
         """
-        if self.options.native_type_mirror:
-            # Mirror state pins live objects and caches wire bytes; a
-            # stale graph must never survive a build boundary even when
-            # the type-kernel gate is off (mirror runs standalone).
-            from mypy import types_mirror
-
-            types_mirror.reset()
         if self.options.native_type_proxy:
             # Proxy entries pin live objects and cache wire bytes too; a
-            # stale graph must never survive a build boundary. `reset`
-            # leaves `identity` alone (mirror owns that reset).
+            # stale graph must never survive. Runs first (it leaves
+            # `identity` alone), so the mirror sweep sees its pins gone.
             from mypy import type_proxy
 
             type_proxy.reset()
+        if self.options.native_type_mirror:
+            # Preserving reset (#1528): blobs + raw ids drop, strong-pin
+            # stable handles survive so astmerge-preserved objects keep
+            # their handle across the recheck (pin-only entries are swept).
+            from mypy import types_mirror
+
+            types_mirror.reset(preserve_stable=True)
         if not self.options.native_type_kernel:
             return
         self._native_resolver = None

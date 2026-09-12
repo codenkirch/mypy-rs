@@ -1631,10 +1631,19 @@ def report() -> dict[str, int]:
     return dict(_audit)
 
 
-def reset(*, clear_counts: bool = False) -> None:
-    """Drop mirror storage and reset the handle registry (per-build boundary)."""
-    if _kernel_mod is not None:
-        _kernel_mod.rust_mirror_reset()
+def reset(*, clear_counts: bool = False, preserve_stable: bool = False) -> None:
+    """Drop mirror storage and reset the raw identity layer (per-build boundary).
+
+    `preserve_stable=True` (the daemon recheck boundary, issue #1528) keeps
+    the strong-pin identity handle of every still-referenced object: an
+    astmerge-preserved object re-registers under the handle it already had.
+    The kernel sweeps entries whose stable pin is their only owner at that
+    boundary, and a later non-preserving reset releases the rest (no
+    cross-build leak). The default drops the stable layer too, matching the
+    full-reset semantics the mirror unit suites rely on. The Python pins drop
+    before the kernel reset so their contributions to refcounts are already
+    gone when the sweep runs.
+    """
     _BY_HANDLE.clear()
     _HANDLE_BY_ID.clear()
     _ADOPT_STRIKE.clear()
@@ -1644,6 +1653,8 @@ def reset(*, clear_counts: bool = False) -> None:
     _ALIAS_REVERSE.clear()
     _HIDDEN_EMBED.clear()
     _SLOT_NAMES.clear()
+    if _kernel_mod is not None:
+        _kernel_mod.rust_mirror_reset(preserve_stable)
     if clear_counts:
         for key, n in _audit.items():
             _audit_total[key] = _audit_total.get(key, 0) + n

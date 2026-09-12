@@ -7,11 +7,14 @@
 //! Python's serialized graph is what a Rust owner would have had. No
 //! consumer reads this storage in F1.
 //!
-//! Keys come from `identity::handle_for` (raw `id()` layer, thread-local).
-//! Python pins every mirrored object strongly until the per-build reset,
-//! so a recycled `id()` cannot adopt a stale entry before `reset`.
-//! Byte storage is unbounded by design: blobs are small (a few KB), and
-//! run length is bounded by the gate harness; memory is watched there.
+//! Keys come from `identity::handle_for_stable` (strong-pin stable layer,
+//! #1528), with the raw `id()` layer as fallback. Every mirrored object is
+//! pinned both by Python (`_BY_HANDLE`) and by the stable layer, so a
+//! recycled `id()` cannot adopt a stale entry; a preserving reset drops the
+//! Python pins and the blob storage but keeps live-object stable handles
+//! across a daemon recheck. Byte storage is unbounded by design: blobs are
+//! small (a few KB), and run length is bounded by the gate harness; memory
+//! is watched there.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -108,7 +111,11 @@ pub(crate) fn register(
     bytes: Vec<u8>,
     child_handles: Vec<u64>,
 ) -> PyResult<u64> {
-    let handle = identity::handle_for(obj)
+    // Stable-first (issue #1528): a stable handle outlives a preserving
+    // reset, so a daemon recheck re-registers an astmerge-preserved
+    // object under the handle it already had. Raw stays the fallback.
+    let handle = identity::handle_for_stable(obj)
+        .or_else(|| identity::handle_for(obj))
         .ok_or_else(|| PyValueError::new_err("mirror: object has no identity handle"))?;
     with_mirror(|m| {
         // Unlink the previous child list (kept in children_of) before
@@ -205,13 +212,21 @@ pub(crate) fn stamp_sync(handle: u64, stamp_epoch: u64) -> bool {
     })
 }
 
-/// Clear all mirror state and reset the identity registry.
-pub(crate) fn reset() -> u64 {
+/// Drop all mirror blob/parent state and the walk caches.
+fn reset_storage() {
     with_mirror(|m| {
         *m = Mirror::new();
     });
     clear_walk_caches();
-    identity::reset()
+}
+
+/// Clear all mirror state and both identity layers (a full, non-preserving
+/// reset: mirror unit tests rely on this for isolation).
+#[cfg(test)]
+pub(crate) fn reset() -> u64 {
+    reset_storage();
+    identity::reset_stable();
+    identity::reset_raw()
 }
 
 /// Number of live mirror entries.
@@ -281,10 +296,16 @@ pub(crate) fn rust_mirror_stamp_sync(handle: u64, stamp_epoch: u64) -> bool {
     stamp_sync(handle, stamp_epoch)
 }
 
-/// Drop all mirror state; returns the new identity generation.
+/// Drop all mirror state; returns the new identity generation. The raw
+/// layer always clears; `preserve_stable` keeps the strong-pin handle of
+/// every still-referenced object (the daemon recheck boundary, #1528) and
+/// sweeps entries whose pin is their only owner, while the default drops
+/// the stable layer too (no cross-build leak).
 #[pyfunction]
-pub(crate) fn rust_mirror_reset() -> u64 {
-    reset()
+#[pyo3(signature = (preserve_stable = false))]
+pub(crate) fn rust_mirror_reset(py: Python<'_>, preserve_stable: bool) -> u64 {
+    reset_storage();
+    identity::reset(preserve_stable, py)
 }
 
 /// Live entry count (audit + tests).
@@ -293,10 +314,20 @@ pub(crate) fn rust_mirror_entry_count() -> usize {
     entry_count()
 }
 
+/// Whether `handle` still owns a stable identity pin. A stable handle
+/// outlives its mirror blob across a preserving reset; audit + tests use
+/// this to observe retirement.
+#[pyfunction]
+pub(crate) fn rust_mirror_stable_alive(handle: u64) -> bool {
+    identity::stable_alive(handle)
+}
+
 /// Non-minting handle lookup: None when the object was never registered.
+/// Stable-first so a preserved handle is found after its blob storage was
+/// reset; falls back to the raw layer for raw-minted (e.g. proxy) ids.
 #[pyfunction]
 pub(crate) fn rust_mirror_handle_of(obj: &PyAny) -> Option<u64> {
-    identity::handle_of(obj)
+    identity::handle_of_stable(obj).or_else(|| identity::handle_of(obj))
 }
 
 /// Splice `Instance.args` into the stored blob (F3 slice 1, #1397): decode
@@ -1300,6 +1331,56 @@ mod mirror_tests {
             let h2 = register(obj, "instance", b"abz".to_vec(), vec![]).unwrap();
             assert_eq!(h1, h2);
             assert_eq!(entry_bytes(h1), Some(b"abz".to_vec()));
+        });
+    }
+
+    #[test]
+    fn test_register_reuses_stable_handle_across_preserving_reset() {
+        with_py(|py| {
+            reset();
+            let obj = fresh(py);
+            let h1 = register(obj, "instance", b"abc".to_vec(), vec![]).unwrap();
+            // The preserving reset drops blobs and the raw layer; the
+            // strong stable pin keeps the object's identity.
+            rust_mirror_reset(py, true);
+            assert_eq!(entry_bytes(h1), None);
+            assert!(identity::stable_alive(h1));
+            assert_eq!(rust_mirror_handle_of(obj), Some(h1));
+            // Re-registration installs the new blob under the same handle.
+            let h2 = register(obj, "instance", b"xyz".to_vec(), vec![]).unwrap();
+            assert_eq!(h2, h1);
+            assert_eq!(entry_bytes(h2), Some(b"xyz".to_vec()));
+        });
+    }
+
+    #[test]
+    fn test_register_full_reset_mints_fresh_handle() {
+        with_py(|py| {
+            reset();
+            let obj = fresh(py);
+            let h1 = register(obj, "instance", b"abc".to_vec(), vec![]).unwrap();
+            rust_mirror_reset(py, false);
+            assert!(!identity::stable_alive(h1));
+            assert_eq!(rust_mirror_handle_of(obj), None);
+            let h2 = register(obj, "callable", b"def".to_vec(), vec![]).unwrap();
+            assert_ne!(h2, h1);
+        });
+    }
+
+    #[test]
+    fn test_preserving_reset_releases_pin_owned_entries() {
+        let h = with_py(|py| {
+            reset();
+            let obj = fresh(py);
+            register(obj, "instance", b"a".to_vec(), vec![]).unwrap()
+        });
+        // The Python frame is gone, so only the stable pin owned the
+        // object; the next preserving reset releases it.
+        assert!(identity::stable_alive(h));
+        with_py(|py| {
+            rust_mirror_reset(py, true);
+            assert!(!identity::stable_alive(h));
+            assert_eq!(entry_bytes(h), None);
         });
     }
 

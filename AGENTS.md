@@ -3954,6 +3954,41 @@ including:
   8,144/69/7/0 local (the documented wave-65C local baseline; CI's
   8,198/15/7 differs by 54 environment-skips), fine-grained 747/27, daemon
   37. P2 (#1554) not attempted in this commit series.
+- wave 68C strong-pin stable handles (issue #1528): the wave-63D weakref
+  route is dead (every probed Type class refuses `weakref.ref`; no
+  `Type.__slots__` change), so `identity.rs` reworks the stable layer to a
+  strong `Py<PyAny>` pin per stable handle. Raw and stable now share one
+  handle per object (each layer adopts the other's: `handle_for` /
+  `handle_of` answer stable-first, `handle_for_stable` migrates a raw entry
+  under the pin), so the proxy and the mirror never mint two identities
+  (the P1 `NativeProxyStoreSuite` equality pin and the wave-67 stub comment
+  encode this). New `retire_stable` / `reset_stable` / `stable_alive` and
+  `reset(preserve_stable)`: a preserving reset keeps live-object handles
+  and sweeps entries whose pin is their only owner (refcount 1); a
+  non-preserving reset drops the layer. Mirror side: `rust_mirror_reset`
+  takes `preserve_stable=False`, `rust_mirror_handle_of` is stable-first
+  with a raw fallback, new `rust_mirror_stable_alive`, and `register`
+  prefers the stable handle (raw fallback) behind the existing gate.
+  Python side: `types_mirror.reset(preserve_stable=False)` drops its pins
+  first (clears `_BY_HANDLE` / `_HANDLE_BY_ID` / carrier maps) then calls
+  the kernel; `_clear_native_resolvers` runs `type_proxy.reset()` first and
+  then the preserving mirror reset, so a daemon recheck keeps an
+  astmerge-preserved object's handle while blob storage rebuilds under it.
+  Residual (documented in `identity.rs`): a dropped graph that stays in a
+  mypy-side reference cycle keeps its pin, because a weakref-free pin
+  cannot distinguish a cycle root from a live object; a non-preserving
+  reset or explicit `retire_stable` releases it. Tests: 15 identity units
+  (shared namespace, adoption, retire/reset, mismatch re-check, sweep,
+  preserve), 3 mirror units (preserving reuse, full-reset fresh mint,
+  pin-only release), `NativeMirrorStableIdentitySuite` (4) and
+  `NativeDaemonStableHandleSuite` (1: preserved handle survives a
+  fine-grained recheck; a pin-only scratch entry is retired). No Type
+  layout, cache format, proxy.py or plugin-visible change. Gates: cargo
+  type_kernel 2,791/11, fmt + clippy `-D warnings` clean, cold self-check
+  clean 348, testtypes 3,424/7 (3,420/7 + 4), testcheck 8,198/15/7 exact,
+  fine-grained 747/27, daemon 38 (37 + 1); the mirror capture / capture+read
+  modes re-run exact (testtypes 3,424/7, fine-grained 747/27, testcheck
+  8,198/15/7).
 
 - wave 68A statement/pattern enum + writer byte parity (G0.4, issue
   #1560): `crates/ast_serialize/src/ast_node.rs` gains `StmtNode` (one
