@@ -18415,7 +18415,10 @@ class NativeTraverserSuite(Suite):
 
     def test_has_return_statement_return_none_native_parser(self) -> None:
         # Both parser modes produce NameExpr("None") and must agree (#1547).
-        import ast_serialize
+        try:
+            import ast_serialize
+        except ImportError:
+            self.skipTest("ast_serialize extension not built")
 
         if not hasattr(ast_serialize, "parse"):
             self.skipTest("ast_serialize extension not built")
