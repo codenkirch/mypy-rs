@@ -57597,3 +57597,154 @@ class NativeJoinMeetWave62Suite(Suite):
         off = self._with_gate(False, lambda: join_type_list([r, self.fx.a]))
         on = self._with_gate(True, lambda: join_type_list([r, self.fx.a]))
         assert_equal(on, off)
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeProxyStoreSuite(Suite):
+    """Unit tests for the ADR-0004 proxy P1 store scaffold (#1553).
+
+    P1 ships the Rust blob store plus the `mypy/type_proxy.py` gate and
+    deliberately wires no funnel: every assertion here drives the store
+    directly. The pinnings are the store contract P2 consumes: epoch
+    mismatch misses, drop/reset release entries and pins, and handles
+    share the `identity` namespace the mirror already uses.
+    """
+
+    def setUp(self) -> None:
+        import type_kernel as kernel
+
+        from mypy import type_proxy
+
+        type_proxy.activate(audit=True)
+        type_proxy.reset(clear_counts=True)
+        self._k = kernel
+        self._p = type_proxy
+        self.fx = TypeFixture()
+
+    def tearDown(self) -> None:
+        self._p.reset(clear_counts=True)
+
+    def _blob(self, t: Type) -> bytes:
+        blob = self._p._fresh_bytes(t)
+        assert blob is not None
+        return blob
+
+    def _delta(self, before: dict[str, int]) -> dict[str, int]:
+        after = self._p.report()
+        return {k: v - before.get(k, 0) for k, v in after.items() if v != before.get(k, 0)}
+
+    def test_put_read_roundtrip_and_entry_count(self) -> None:
+        inst = self.fx.a
+        blob = self._blob(inst)
+        handle = self._k.rust_proxy_put(inst, blob, 1)
+        assert self._k.rust_proxy_entry_count() == 1
+        assert self._k.rust_proxy_read(handle, 1) == blob
+        # A re-put overwrites blob and stamp for the same handle.
+        newer = self._blob(self.fx.b)
+        assert self._k.rust_proxy_put(inst, newer, 2) == handle
+        assert self._k.rust_proxy_entry_count() == 1
+        assert self._k.rust_proxy_read(handle, 1) is None
+        assert self._k.rust_proxy_read(handle, 2) == newer
+
+    def test_epoch_mismatch_returns_none(self) -> None:
+        inst = self.fx.a
+        blob = self._blob(inst)
+        handle = self._k.rust_proxy_put(inst, blob, 5)
+        assert self._k.rust_proxy_read(handle, 6) is None
+        assert self._k.rust_proxy_read(handle, 5) == blob
+
+    def test_drop_removes_entry(self) -> None:
+        inst = self.fx.a
+        handle = self._k.rust_proxy_put(inst, self._blob(inst), 1)
+        assert self._k.rust_proxy_drop(handle) is True
+        assert self._k.rust_proxy_read(handle, 1) is None
+        assert self._k.rust_proxy_entry_count() == 0
+        assert self._k.rust_proxy_drop(handle) is False
+
+    def test_reset_empties_store_and_pins(self) -> None:
+        inst = self.fx.a
+        blob = self._p.read_scope_bytes(inst)
+        assert blob is not None
+        assert id(inst) in self._p._PROXY_HANDLES
+        assert id(inst) in self._p._PROXY_PINS
+        assert self._k.rust_proxy_entry_count() == 1
+        before = dict(self._p.report())
+        self._p.reset()
+        delta = self._delta(before)
+        assert delta.get("reset") == 1
+        assert self._p._PROXY_HANDLES == {}
+        assert self._p._PROXY_PINS == {}
+        assert self._k.rust_proxy_entry_count() == 0
+
+    def test_handle_equality_with_identity(self) -> None:
+        inst = self.fx.a
+        handle = self._k.rust_proxy_put(inst, self._blob(inst), 1)
+        # The proxy handle is the shared identity-service handle, so the
+        # mirror's lookup answers with the same value.
+        assert self._k.rust_proxy_handle_of(inst) == handle
+        assert self._k.rust_mirror_handle_of(inst) == handle
+
+    def test_read_scope_bytes_miss_then_hit(self) -> None:
+        inst = self.fx.a
+        before = dict(self._p.report())
+        first = self._p.read_scope_bytes(inst)
+        assert first is not None
+        assert first == self._blob(inst)
+        delta = self._delta(before)
+        assert delta.get("miss") == 1, delta
+        assert delta.get("put") == 1, delta
+        before = dict(self._p.report())
+        second = self._p.read_scope_bytes(inst)
+        assert second == first
+        delta = self._delta(before)
+        assert delta.get("hit") == 1, delta
+
+    def test_read_scope_bytes_non_instance_defers(self) -> None:
+        ct = CallableType([self.fx.o], [ARG_POS], [None], self.fx.o, self.fx.function, name="f")
+        before = dict(self._p.report())
+        assert self._p.read_scope_bytes(ct) is None
+        delta = self._delta(before)
+        assert delta.get("scope_defer.not_instance") == 1, delta
+        assert self._k.rust_proxy_entry_count() == 0
+
+    def test_read_scope_bytes_serialize_failure_defers(self) -> None:
+        inst = self.fx.a
+        inst.type = None  # type: ignore[assignment]  # partial object: write raises
+        before = dict(self._p.report())
+        assert self._p.read_scope_bytes(inst) is None
+        delta = self._delta(before)
+        assert delta.get("serialize_fail") == 1, delta
+        assert delta.get("put") is None, delta
+        assert id(inst) not in self._p._PROXY_HANDLES
+        assert self._k.rust_proxy_entry_count() == 0
+
+    def test_touch_drops_entry_and_bumps_epoch(self) -> None:
+        inst = self.fx.a
+        first = self._p.read_scope_bytes(inst)
+        assert first is not None
+        before = dict(self._p.report())
+        self._p.touch(inst)
+        delta = self._delta(before)
+        assert delta.get("touch") == 1, delta
+        assert delta.get("touch_drop") == 1, delta
+        assert id(inst) not in self._p._PROXY_HANDLES
+        assert id(inst) not in self._p._PROXY_PINS
+        assert self._k.rust_proxy_entry_count() == 0
+        # The next read re-serializes the same bytes at the new epoch.
+        again = self._p.read_scope_bytes(inst)
+        assert again == first
+
+    def test_gate_off_defers(self) -> None:
+        inst = self.fx.a
+        self._p._active = False
+        try:
+            before = dict(self._p.report())
+            assert self._p.read_scope_bytes(inst) is None
+            delta = self._delta(before)
+            assert delta.get("scope_defer.inactive") == 1, delta
+        finally:
+            self._p._active = True
+
+    def test_option_default_off_and_not_cache_affecting(self) -> None:
+        from mypy.options import OPTIONS_AFFECTING_CACHE, Options
+
+        assert Options().native_type_proxy is False
+        assert "native_type_proxy" not in OPTIONS_AFFECTING_CACHE

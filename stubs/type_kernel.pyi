@@ -457,6 +457,13 @@ __all__ = [
     "rust_check_unpacks_in_list",
     "rust_find_matching_overload_items",
     "rust_infer_operator_assignment_method",
+    "rust_proxy_read",
+    "rust_proxy_put",
+    "rust_proxy_drop",
+    "rust_proxy_reset",
+    "rust_proxy_entry_count",
+    "rust_proxy_handle_of",
+    "rust_mirror_handle_of",
     "IdMapper",
 ]
 
@@ -2617,3 +2624,17 @@ def rust_lookup_definer(typ: Instance, attr_name: str) -> str | None: ...
 def rust_infer_operator_assignment_method(
     typ: Any, method: str, in_ops: bool
 ) -> tuple[bool, str] | None: ...
+
+# ADR-0004 proxy P1 (#1553): blob-backed read-shadow store. Handles are
+# minted by rust_proxy_put through the shared identity service; a read
+# serves bytes only while its stamp still matches the caller's epoch.
+def rust_proxy_read(handle: int, stamp: int) -> bytes | None: ...
+def rust_proxy_put(obj: Any, bytes: bytes, stamp: int) -> int: ...
+def rust_proxy_drop(handle: int) -> bool: ...
+def rust_proxy_reset() -> int: ...
+def rust_proxy_entry_count() -> int: ...
+def rust_proxy_handle_of(obj: Any) -> int | None: ...
+
+# The proxy suite pins the shared identity namespace by comparing the
+# proxy handle with the mirror's non-minting lookup.
+def rust_mirror_handle_of(obj: Any) -> int | None: ...

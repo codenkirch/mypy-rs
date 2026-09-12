@@ -476,6 +476,8 @@ def parse_options(
     # Phase F3 (#1397) write flip is a differential mirror gate: splices
     # only engage when the capture mirror is on.
     options.native_type_instance_write = _env_gate("TEST_NATIVE_TYPE_INSTANCE_WRITE")
+    # ADR-0004 proxy (#1553) is a read-shadow gate; P1 is scaffold-only.
+    options.native_type_proxy = _env_gate("TEST_NATIVE_TYPE_PROXY")
     _ensure_native_modules_available()
 
     # Allow custom python version to override testfile_pyversion.

@@ -3928,6 +3928,32 @@ including:
   + clippy clean (`--lib` and `--all-targets`), AST suites 881/75/5
   xfail exactly, testcheck 8,198/15/7/0 exact, cold self-check clean
   347, fine-grained 747/27, daemon 37.
+- wave 67B proxy P1 store scaffold + gate (issue #1553): new
+  `crates/type_kernel/src/proxy.rs` - thread-local blob store keyed by
+  `identity::handle_for`, `ProxyEntry { bytes, stamp }` plus strong
+  `Py<PyAny>` pins; core `read/put/drop/reset/entry_count` and the six
+  `rust_proxy_*` pyfunctions registered in `lib.rs`; `reset` deliberately
+  does not call `identity::reset` (owned by `rust_mirror_reset`), so other
+  seams' handles survive; `rust_proxy_read` returns real `bytes` (a
+  `Vec<u8>` return would materialize a list[int] on the P2 hot path).
+  New `mypy/type_proxy.py`: activation flag, FFI-free `_PROXY_HANDLES`/
+  `_PROXY_PINS` id-keyed maps (wave-65A pattern), epoch counter, audit
+  counters, `read_scope_bytes` (Instance-only scope, wire cache off +
+  `_REC_CACHE_SUPPRESSED`, serialization failure returns None so callers
+  raise identically), `touch`/`reset`/`report`. `Options.native_type_proxy`
+  default off, deliberately not in `OPTIONS_AFFECTING_CACHE`;
+  `TEST_NATIVE_TYPE_PROXY` env gate in test helpers; `_clear_native_resolvers`
+  reset branch next to the mirror reset. No funnel wiring: zero behavior
+  change (proxy env leaves testcheck exact). `NativeProxyStoreSuite` (11
+  Python tests) + 8 Rust units; successor-ADR draft
+  `docs/adrs/0005-proxy-shadow-store-successor.md` records the blob-shadow
+  supersession of ADR-0004 Decision 1's single-PyObject identity map and
+  of the plan text's "views replacing storage". Gates: cargo type_kernel
+  2,781/11 (+8), fmt + clippy clean, cold self-check clean 348 files (347
+  + type_proxy.py), testtypes 3,416/7 (= 3,405/7 + 11 new), testcheck
+  8,144/69/7/0 local (the documented wave-65C local baseline; CI's
+  8,198/15/7 differs by 54 environment-skips), fine-grained 747/27, daemon
+  37. P2 (#1554) not attempted in this commit series.
 
 ## Pull Requests
 
