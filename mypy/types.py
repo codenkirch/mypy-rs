@@ -6436,10 +6436,15 @@ def _write_type_cached(t: Type, data: WriteBuffer) -> None:
     _type_wire_cache_session_depth += 1
     _type_wire_cache_saw_tvar = 0
     tmp = WriteBuffer()
-    t.write(tmp)
+    try:
+        t.write(tmp)
+    finally:
+        # A raise mid-session must not leak the depth counter: an unbalanced
+        # depth sends every later call down the nested path, making the cache
+        # inert.
+        _type_wire_cache_session_depth -= 1
     blob = tmp.getvalue()
     saw_tvar = _type_wire_cache_saw_tvar
-    _type_wire_cache_session_depth -= 1
     if not saw_tvar and (not isinstance(t, Instance) or t.type_ref is None):  # type: ignore[misc]
         _type_wire_cache[key] = (t, blob)
     write_raw_bytes(data, blob)
@@ -6457,11 +6462,13 @@ def _serialize_with_taint_check(t: Type, buf: WriteBuffer) -> tuple[bytes, bool]
     global _type_wire_cache_saw_tvar, _type_wire_cache_session_depth
     _type_wire_cache_session_depth += 1
     _type_wire_cache_saw_tvar = 0
-    t.write(buf)
+    try:
+        t.write(buf)
+    finally:
+        _type_wire_cache_session_depth -= 1
     saw_tvar = _type_wire_cache_saw_tvar > 0 or isinstance(
         t, (TypeVarType, ParamSpecType, TypeVarTupleType)
     )
-    _type_wire_cache_session_depth -= 1
     return buf.getvalue(), saw_tvar
 
 

@@ -51129,15 +51129,19 @@ class NativeMirrorSpliceSuite(Suite):
 
         from mypy.types import _write_type_cached
 
-        # Without a bump the funnel trusts the stamp; splice funnels keep
-        # their full re-serialization, so the cachedsplice path below is
-        # what still guards in-place drift when the wire cache is active.
+        # Without a bump the write funnel trusts its stamp; an active wire
+        # cache (librt fork) routes the hit into _check_splice, which
+        # full-verifies and reports the drift in strict mode.
         c = self._callable()
         _write_type_cached(c, WriteBuffer())  # cache fill
         c.arg_types[0] = self.fx.std_tuple  # in-place mutation escapes capture
         self._m._strict = True
         try:
-            _write_type_cached(c, WriteBuffer())  # stamped: funnel skips
+            if _SPLICE_ACTIVE:
+                with self.assertRaises(AssertionError):
+                    _write_type_cached(c, WriteBuffer())
+            else:
+                _write_type_cached(c, WriteBuffer())  # stamped: funnel skips
         finally:
             self._m._strict = False
 
@@ -51185,6 +51189,38 @@ class NativeMirrorSpliceSuite(Suite):
             assert not _type_wire_cache, _type_wire_cache
         finally:
             types_mod.__dict__["write_raw_bytes"] = saved
+
+    @skipUnless(_SPLICE_ACTIVE, "wire-cache session needs librt write_raw_bytes")
+    def test_session_depth_restored_on_write_error(self) -> None:
+        # A raise inside the isolated session must not leak the depth
+        # counter: an unbalanced depth sends every later write down the
+        # nested path, so the cache never fills again (xdist flake).
+        from unittest import mock
+
+        from librt.internal import WriteBuffer
+
+        import mypy.types as types_mod
+        from mypy.types import (
+            _serialize_with_taint_check,
+            _type_wire_cache,
+            _write_type_cached,
+        )
+
+        c = self._callable()
+
+        def boom(self: CallableType, data: object) -> None:
+            raise RuntimeError("boom")
+
+        with mock.patch.object(CallableType, "write", boom):
+            with self.assertRaises(RuntimeError):
+                _write_type_cached(c, WriteBuffer())
+            assert types_mod._type_wire_cache_session_depth == 0
+            with self.assertRaises(RuntimeError):
+                _serialize_with_taint_check(c, WriteBuffer())
+            assert types_mod._type_wire_cache_session_depth == 0
+        _write_type_cached(c, WriteBuffer())
+        assert id(c) in _type_wire_cache
+        assert types_mod._type_wire_cache_session_depth == 0
 
 
 class NativeMirrorTypeVarIdSuite(Suite):
@@ -51777,14 +51813,29 @@ class NativeWriteFunnelSkipSuite(Suite):
 
     def setUp(self) -> None:
         from mypy import types_mirror
+        from mypy.types import (
+            _clear_type_wire_cache,
+            _set_type_wire_cache_enabled,
+            _wire_cache_enabled,
+        )
 
         types_mirror.activate(audit=True)
         types_mirror.reset(clear_counts=True)
+        # Pin the pre-librt write path: with an active wire cache
+        # (`write_raw_bytes` present) nested cached children splice and add
+        # `*.cachedsplice` keys the structural deltas below do not expect.
+        self._wire_cache_prev = _wire_cache_enabled()
+        _set_type_wire_cache_enabled(False)
+        _clear_type_wire_cache()
         self._m = types_mirror
         self.fx = TypeFixture()
 
     def tearDown(self) -> None:
+        from mypy.types import _clear_type_wire_cache, _set_type_wire_cache_enabled
+
         self._m._strict = False
+        _set_type_wire_cache_enabled(self._wire_cache_prev)
+        _clear_type_wire_cache()
         self._m.reset(clear_counts=True)
 
     def _delta(self, before: dict[str, int]) -> dict[str, int]:
