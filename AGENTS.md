@@ -3822,6 +3822,9 @@ including:
   and counts as the pre-change baseline `.so`; the merged-head
   `8,198/15/7` differs only by 54 environment-skips), fine-grained
   747/27 + daemon 37, survey numbers reproduced from the issue.
+  Noticed, not fixed: #1543 (a wire-decoded native type used as an
+  error context can lose its source line; the shipped code defers the
+  member-miss path that exposed it).
 
 ## Pull Requests
 
