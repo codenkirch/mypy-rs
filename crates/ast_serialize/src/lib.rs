@@ -1,12 +1,3 @@
-// Dead scaffolding, deleted in #1546; the allow keeps the crate's
-// `cargo clippy -D warnings` gate green until then.
-#[allow(clippy::new_without_default)]
-pub mod full_ast_codec;
-pub mod nodes_codec;
-pub mod nodes_full;
-#[allow(clippy::new_without_default)]
-pub mod visitor_engine;
-
 use pyo3::exceptions::{PyNotImplementedError, PyRuntimeError, PyUnicodeDecodeError};
 use pyo3::prelude::*;
 use ruff_python_ast::{self as ast, token::TokenKind, AnyParameterRef, ArgOrKeyword, PySourceType};
@@ -455,6 +446,7 @@ impl ImportCollector {
     }
 }
 
+#[allow(clippy::too_many_arguments)] // Signature mirrors the Python `parse` entry point.
 #[pyfunction]
 #[pyo3(signature = (
     fnam,
