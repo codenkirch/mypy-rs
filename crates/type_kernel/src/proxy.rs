@@ -80,11 +80,19 @@ pub(crate) fn put(obj: &PyAny, bytes: Vec<u8>, stamp: u64) -> PyResult<u64> {
 }
 
 /// Drop one entry and its pin. Returns whether an entry was present.
-pub(crate) fn drop(handle: u64) -> bool {
-    with_store(|store| {
-        store.pins.remove(&handle);
-        store.by_handle.remove(&handle).is_some()
-    })
+///
+/// The pin is moved out of the map under the borrow and dropped only
+/// after the `RefCell` guard is released: releasing the last reference
+/// can run a Python deallocator, and a callback re-entering the store
+/// would panic on the active mutable borrow.
+pub(crate) fn retire(handle: u64) -> bool {
+    let (present, pin) = with_store(|store| {
+        let present = store.by_handle.remove(&handle).is_some();
+        let pin = store.pins.remove(&handle);
+        (present, pin)
+    });
+    drop(pin);
+    present
 }
 
 /// Clear every entry and pin; returns how many entries were dropped.
@@ -92,12 +100,15 @@ pub(crate) fn drop(handle: u64) -> bool {
 /// is owned by `rust_mirror_reset`, and proxy state must not invalidate
 /// handles other seams still hold.
 pub(crate) fn reset() -> usize {
-    with_store(|store| {
+    let (entries, pins) = with_store(|store| {
         let entries = store.by_handle.len();
+        let pins: Vec<Py<PyAny>> = store.pins.drain().map(|(_, pin)| pin).collect();
         store.by_handle.clear();
-        store.pins.clear();
-        entries
-    })
+        (entries, pins)
+    });
+    // Drop the pins only after the guard is released (see `retire`).
+    drop(pins);
+    entries
 }
 
 /// Number of live entries.
@@ -124,7 +135,7 @@ pub(crate) fn rust_proxy_put(obj: &PyAny, bytes: &[u8], stamp: u64) -> PyResult<
 /// Drop the entry (and pin) for `handle`; returns whether one existed.
 #[pyfunction]
 pub(crate) fn rust_proxy_drop(handle: u64) -> bool {
-    drop(handle)
+    retire(handle)
 }
 
 /// Clear all proxy entries and pins; returns the dropped entry count.
@@ -203,10 +214,10 @@ mod proxy_tests {
             reset();
             let obj = fresh_object(py);
             let h = put(obj, b"blob".to_vec(), 1).unwrap();
-            assert!(drop(h));
+            assert!(retire(h));
             assert_eq!(read(h, 1), None);
             assert_eq!(entry_count(), 0);
-            assert!(!drop(h));
+            assert!(!retire(h));
         });
     }
 
@@ -216,7 +227,7 @@ mod proxy_tests {
             reset();
             let obj = fresh_object(py);
             let h = put(obj, b"blob".to_vec(), 1).unwrap();
-            assert!(drop(h));
+            assert!(retire(h));
             // Identity is untouched by a proxy drop; only the entry is gone.
             assert_eq!(identity::handle_of(obj), Some(h));
         });
