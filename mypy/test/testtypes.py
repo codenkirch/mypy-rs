@@ -51813,14 +51813,29 @@ class NativeWriteFunnelSkipSuite(Suite):
 
     def setUp(self) -> None:
         from mypy import types_mirror
+        from mypy.types import (
+            _clear_type_wire_cache,
+            _set_type_wire_cache_enabled,
+            _wire_cache_enabled,
+        )
 
         types_mirror.activate(audit=True)
         types_mirror.reset(clear_counts=True)
+        # Pin the pre-librt write path: with an active wire cache
+        # (`write_raw_bytes` present) nested cached children splice and add
+        # `*.cachedsplice` keys the structural deltas below do not expect.
+        self._wire_cache_prev = _wire_cache_enabled()
+        _set_type_wire_cache_enabled(False)
+        _clear_type_wire_cache()
         self._m = types_mirror
         self.fx = TypeFixture()
 
     def tearDown(self) -> None:
+        from mypy.types import _clear_type_wire_cache, _set_type_wire_cache_enabled
+
         self._m._strict = False
+        _set_type_wire_cache_enabled(self._wire_cache_prev)
+        _clear_type_wire_cache()
         self._m.reset(clear_counts=True)
 
     def _delta(self, before: dict[str, int]) -> dict[str, int]:
