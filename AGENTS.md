@@ -3874,11 +3874,10 @@ including:
   (`mypy/astwire.py` + `crates/type_kernel/src/astwire.rs`; astwire
   bytes are traverser-local and never cache-persisted). teststubgen is
   green; `testIncludeDocstrings` runs for real once #1552 (G0.1) lands
-  in the same wave, so the interim xfail was removed here. #1547's yield trio
-  passes at bf019a1f1 and is not reproducible: stubgen builds its own
-  Options and always parses natively (the TEST_NATIVE_PARSER gate is
-  inert there), verified with the in-repo extension, the shared Sep-10
-  `.so`, and forced fastparse. Gates: cargo type_kernel 2,773/11,
+  in the same wave, so the interim xfail was removed here. #1547's yield
+  trio reproduces on main (3/3 with the shared wave-65 extensions) in
+  both parser modes and is xfailed in teststubgen for the new AST CI
+  gate; remove with the #1547 fix. Gates: cargo type_kernel 2,773/11,
   ast_serialize 3 (the 7 scaffold tests deleted), fmt + clippy clean
   both crates, AST parity 876 passed/75 skipped/3 xfailed, testparse
   fastparse 250/74, testcheck 8,198/15/7 exact, cold self-check 347.
