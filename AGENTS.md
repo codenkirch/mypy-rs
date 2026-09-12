@@ -3655,6 +3655,35 @@ including:
   mirror states; testtypes 3,389/6 both states (+4); fine-grained
   747/27 + daemon 37 with capture+read; ruff/black clean on the
   changed files (2 pre-existing C408s in testtypes untouched).
+- wave 64B recursive-alias pretty-walk loop hardening (#1532): the
+  wave-63B `__weakref__` hang of `testNoCrashOnRecursiveTupleFallback`
+  is NOT in `flatten_nested_unions`. An instrumented cold self-check
+  (env-gated, stripped) pinned the loop driver at
+  `messages._pretty_wire_safe` / `_unsafe_pretty_callables`: every
+  `get_proper_type` alias expansion mints a fresh proper tree, so the
+  id-keyed `seen` set never cuts a recursive alias and the walk stops
+  only when the allocator recycles a freed address ("allocation luck").
+  Fix: `_repeat_alias_expansion` in `mypy/messages.py` cuts on the alias
+  node plus args before expanding, in BOTH walkers (the #1528 WIP
+  blanket alias-defer only moved the loop into `_unsafe_pretty_callables`);
+  `_pretty_wire_safe` still walks the first unrolling, so recursive
+  trees keep the native formatting path. `flatten_nested_unions`
+  no-resolver branch: every recursive alias row now appends `None`
+  (whole-call defer) regardless of `handle_recursive`; non-recursive
+  rows keep the live `get_proper_type` row expansion. Audit: a directly
+  self-referential union alias (`X = Union[int, X]`) is rejected by
+  semanal ("Invalid recursive alias"), so the row callback only ever
+  sees container-nested aliases whose one-step expansion is finite; the
+  guard is defense in depth, not a behavior change. Regression pins
+  (testtypes): `test_recursive_alias_pretty_walk_terminates` (pins every
+  expansion result to block id reuse; bounded call count),
+  `test_recursive_alias_format_parity`,
+  `test_flatten_recursive_alias_no_resolver_defers_row` and
+  `test_flatten_nonrecursive_alias_no_resolver_callback_engages`; the
+  perturbed-layout hang (20s+, 62k sequential `flatten_nested_unions`
+  calls) now passes in 0.07s. Gates: cargo 2,772/11 ignored, fmt +
+  clippy clean, cold self-check clean 347, testtypes 3,389/6 (+4),
+  testcheck 8,198/15/7 exact, fine-grained 747/27 + daemon 37.
 
 ## Pull Requests
 

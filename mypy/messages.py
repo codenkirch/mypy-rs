@@ -3296,8 +3296,11 @@ def _pretty_wire_safe(typ: Type) -> bool:
     dropped `definition` (see `_callable_pretty_wire_safe`)."""
     stack: list[Type] = [typ]
     seen: set[int] = set()
+    seen_aliases: set[TypeAliasType] = set()
     while stack:
         t = stack.pop()
+        if _repeat_alias_expansion(t, seen_aliases):
+            continue
         proper = get_proper_type(t)
         if id(proper) in seen:
             continue
@@ -3416,6 +3419,26 @@ def _pretty_hint(c: CallableType) -> tuple[str | None, str | None] | None:
         return None
 
 
+def _repeat_alias_expansion(t: Type, seen_aliases: set[TypeAliasType]) -> bool:
+    """True when this walk already expanded this type alias (issue #1532).
+
+    `get_proper_type` mints a fresh proper-type tree on every expansion, so
+    the id-keyed `seen` set cannot cut a recursive alias: each unrolling
+    carries new ids and the walk loops until the allocator happens to
+    recycle an address ("allocation luck"). Mirror
+    `TypeQuery.visit_type_alias_type` and key the cut on the alias node plus
+    its arguments, before the expansion happens. Unfixed aliases
+    (`alias is None`) keep the previous behavior (expand and let
+    `get_proper_type` raise).
+    """
+    if not isinstance(t, TypeAliasType) or t.alias is None:
+        return False
+    if t in seen_aliases:
+        return True
+    seen_aliases.add(t)
+    return False
+
+
 def _unsafe_pretty_callables(typ: Type) -> list[CallableType]:
     """Every callable in `typ` whose pretty render needs `definition`.
 
@@ -3425,8 +3448,11 @@ def _unsafe_pretty_callables(typ: Type) -> list[CallableType]:
     out: list[CallableType] = []
     stack: list[Type] = [typ]
     seen: set[int] = set()
+    seen_aliases: set[TypeAliasType] = set()
     while stack:
         t = stack.pop()
+        if _repeat_alias_expansion(t, seen_aliases):
+            continue
         proper = get_proper_type(t)
         if id(proper) in seen:
             continue

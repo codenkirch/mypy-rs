@@ -5978,17 +5978,15 @@ def flatten_nested_unions(
             type_bytes_list = _serialize_type_list_for_visitor(types)
             row_expansions: list[bytes | None] = []
             if _native_visitor_resolver is None:
-                # No alias snapshot yet (startup): alias rows expand via
-                # the live get_proper_type (one chain step); recursive
-                # aliases keep the pass-through row (Rust skip arm).
+                # No alias snapshot yet: alias rows expand via the live
+                # get_proper_type. Recursive rows defer to the pure-Python
+                # body (issue #1532); `None` means whole-call deferral.
                 for t in types:
                     if handle_type_alias_type and isinstance(t, TypeAliasType):
-                        if not handle_recursive and t.is_recursive:
+                        if t.is_recursive:
                             row_expansions.append(None)
                         else:
-                            row_expansions.append(
-                                _serialize_type_for_visitor(get_proper_type(t))
-                            )
+                            row_expansions.append(_serialize_type_for_visitor(get_proper_type(t)))
                     else:
                         row_expansions.append(None)
             result = _rust_flatten_nested_unions(
