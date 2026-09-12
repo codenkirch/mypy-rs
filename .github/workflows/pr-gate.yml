@@ -93,15 +93,27 @@ jobs:
             cp "target/release/lib${NAME}.so" "$SCRATCH/${NAME}${EXT_SUFFIX}" 2>/dev/null || cp "target/release/lib${NAME}.dylib" "$SCRATCH/${NAME}${EXT_SUFFIX}"
           done
 
+      - name: Build in-repo librt (F3 wire cache)
+        # PyPI librt (>=0.12.0) omits write_raw_bytes, so the F3 wire-cache
+        # splice stays inert. Build the in-repo lib-rt and prepend it; the
+        # PyPI wheel remains the fallback. See AGENTS.md "librt build order".
+        run: |
+          LIBSO=/tmp/librt-ext
+          mkdir -p "$LIBSO"
+          (cd mypyc/lib-rt && uv run python setup.py build_ext \
+            --build-lib "$LIBSO" --build-temp /tmp/librt-build)
+          PYTHONPATH="$LIBSO" uv run python -c "from librt.internal import write_raw_bytes; print('in-repo librt: write_raw_bytes OK')"
+          echo "LIBRT_SCRATCH=$LIBSO" >> "$GITHUB_ENV"
+
       - name: Self-check (mypy_self_check.ini)
         env:
-          PYTHONPATH: ${{ env.SCRATCH }}
+          PYTHONPATH: ${{ env.LIBRT_SCRATCH }}:${{ env.SCRATCH }}
           TEST_NATIVE_TYPE_KERNEL: "1"
         run: uv run python -m mypy --config-file mypy_self_check.ini -p mypy -p mypyc
 
       - name: Python parity (NativeTypeWire + Resolver suites)
         env:
-          PYTHONPATH: ${{ env.SCRATCH }}
+          PYTHONPATH: ${{ env.LIBRT_SCRATCH }}:${{ env.SCRATCH }}
           TEST_NATIVE_TYPE_KERNEL: "1"
         run: uv run python -m pytest mypy/test/testtypes.py -q
 
@@ -110,7 +122,7 @@ jobs:
 
       - name: Python check_call argmap parity (native-on)
         env:
-          PYTHONPATH: ${{ env.SCRATCH }}
+          PYTHONPATH: ${{ env.LIBRT_SCRATCH }}:${{ env.SCRATCH }}
           TEST_NATIVE_TYPE_KERNEL: "1"
         run: uv run python -m pytest mypy/test/testinfer.py -q
 

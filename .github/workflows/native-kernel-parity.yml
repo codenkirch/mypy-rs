@@ -106,9 +106,21 @@ jobs:
           EXT_SUFFIX=$(uv run python -c "import sysconfig; print(sysconfig.get_config_var('EXT_SUFFIX'))")
           cp target/release/libmodule_resolver.so "${{ env.SCRATCH }}/module_resolver${EXT_SUFFIX}" 2>/dev/null || cp target/release/libmodule_resolver.dylib "${{ env.SCRATCH }}/module_resolver${EXT_SUFFIX}"
 
+      - name: Build in-repo librt (F3 wire cache)
+        # PyPI librt (>=0.12.0) omits write_raw_bytes, so the F3 wire-cache
+        # splice stays inert and NativeMirrorSpliceSuite self-skips. Build
+        # the in-repo lib-rt; the PyPI wheel remains the fallback.
+        run: |
+          LIBSO=/tmp/librt-ext
+          mkdir -p "$LIBSO"
+          (cd mypyc/lib-rt && uv run python setup.py build_ext \
+            --build-lib "$LIBSO" --build-temp /tmp/librt-build)
+          PYTHONPATH="$LIBSO" uv run python -c "from librt.internal import write_raw_bytes; print('in-repo librt: write_raw_bytes OK')"
+          echo "LIBRT_SCRATCH=$LIBSO" >> "$GITHUB_ENV"
+
       - name: Parity testcheck (resolvers installed)
         env:
-          PYTHONPATH: ${{ env.SCRATCH }}
+          PYTHONPATH: ${{ env.LIBRT_SCRATCH }}:${{ env.SCRATCH }}
           TEST_NATIVE_TYPE_KERNEL: "1"
           TEST_NATIVE_PARSER: "1"
           TEST_NATIVE_RESOLVER: "1"
@@ -122,7 +134,7 @@ jobs:
 
       - name: Parity solve_one (testinfer)
         env:
-          PYTHONPATH: ${{ env.SCRATCH }}
+          PYTHONPATH: ${{ env.LIBRT_SCRATCH }}:${{ env.SCRATCH }}
           TEST_NATIVE_TYPE_KERNEL: "1"
           MYPY_NATIVE_PARITY_INSTALL_RESOLVERS: "1"
           MYPY_NATIVE_TYPE_KERNEL_REQUIRED: "1"
@@ -133,7 +145,7 @@ jobs:
       # as ~17-25 failures; the conftest hook restores the snapshot per test.
       - name: Parity reversed-order isolation (testcheck+testtypes, #336)
         env:
-          PYTHONPATH: ${{ env.SCRATCH }}
+          PYTHONPATH: ${{ env.LIBRT_SCRATCH }}:${{ env.SCRATCH }}
           TEST_NATIVE_TYPE_KERNEL: "1"
           TEST_NATIVE_PARSER: "1"
           TEST_NATIVE_RESOLVER: "1"
@@ -206,9 +218,21 @@ jobs:
           EXT_SUFFIX=$(uv run python -c "import sysconfig; print(sysconfig.get_config_var('EXT_SUFFIX'))")
           cp target/release/libmodule_resolver.so "${{ env.SCRATCH }}/module_resolver${EXT_SUFFIX}" 2>/dev/null || cp target/release/libmodule_resolver.dylib "${{ env.SCRATCH }}/module_resolver${EXT_SUFFIX}"
 
+      - name: Build in-repo librt (F3 wire cache)
+        # Same as the parity job: the PyPI wheel omits write_raw_bytes and
+        # the splice suite self-skips. Prepend the in-repo build so the
+        # capture/read mirror runs exercise the wire cache for real.
+        run: |
+          LIBSO=/tmp/librt-ext
+          mkdir -p "$LIBSO"
+          (cd mypyc/lib-rt && uv run python setup.py build_ext \
+            --build-lib "$LIBSO" --build-temp /tmp/librt-build)
+          PYTHONPATH="$LIBSO" uv run python -c "from librt.internal import write_raw_bytes; print('in-repo librt: write_raw_bytes OK')"
+          echo "LIBRT_SCRATCH=$LIBSO" >> "$GITHUB_ENV"
+
       - name: Mirror capture testtypes
         env:
-          PYTHONPATH: ${{ env.SCRATCH }}
+          PYTHONPATH: ${{ env.LIBRT_SCRATCH }}:${{ env.SCRATCH }}
           TEST_NATIVE_TYPE_KERNEL: "1"
           TEST_NATIVE_TYPE_MIRROR: "1"
           MYPY_NATIVE_TYPE_KERNEL_REQUIRED: "1"
@@ -216,7 +240,7 @@ jobs:
 
       - name: Mirror capture+read testcheck
         env:
-          PYTHONPATH: ${{ env.SCRATCH }}
+          PYTHONPATH: ${{ env.LIBRT_SCRATCH }}:${{ env.SCRATCH }}
           TEST_NATIVE_TYPE_KERNEL: "1"
           TEST_NATIVE_TYPE_MIRROR: "1"
           TEST_NATIVE_TYPE_MIRROR_READ: "1"
@@ -231,7 +255,7 @@ jobs:
 
       - name: Mirror capture+read fine-grained
         env:
-          PYTHONPATH: ${{ env.SCRATCH }}
+          PYTHONPATH: ${{ env.LIBRT_SCRATCH }}:${{ env.SCRATCH }}
           TEST_NATIVE_TYPE_KERNEL: "1"
           TEST_NATIVE_TYPE_MIRROR: "1"
           TEST_NATIVE_TYPE_MIRROR_READ: "1"

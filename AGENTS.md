@@ -235,6 +235,36 @@ self-check (0 errors). Three parity fixes were applied:
    and decode errors surface as `CompileError("Cannot decode file: ...")`
    — matching the Python path in `build.py:get_source()`.
 
+### librt build order (F3 wire-cache splice)
+
+The F3 wire cache (`_write_type_cached`, `mypy/types.py`) splices cached
+wire bytes through `librt.internal.write_raw_bytes`. The PyPI `librt`
+wheel (>=0.12.0) does **not** export that symbol even though the in-repo
+`mypyc/lib-rt/internal/librt_internal.c` implements it, so the import in
+`mypy/types.py:29-34` degrades to `None`, `_write_type_cached` falls back
+to plain `t.write`, and the `NativeMirrorSpliceSuite` splice tests
+self-skip. Build the in-repo lib-rt into a private scratch prefix and
+prepend it to `PYTHONPATH` to exercise the splice. Never install or
+upgrade `librt` in the shared `.venv`: every worktree symlinks it, and a
+mutation breaks parallel agents mid-run.
+
+```bash
+# from the repo root (the C sources are relative to mypyc/lib-rt)
+(cd mypyc/lib-rt && ../../.venv/bin/python setup.py build_ext \
+  --build-lib /private/tmp/mypy-rs-<issue>-librt \
+  --build-temp /private/tmp/mypy-rs-<issue>-librt-build)
+PYTHONPATH=/private/tmp/mypy-rs-<issue>-librt .venv/bin/python \
+  -c "from librt.internal import write_raw_bytes; print('splice active')"
+```
+
+The build covers all six in-repo modules (`internal`, `strings`,
+`base64`, `vecs`, `time`, `random`). `librt` stays a namespace package,
+so any module not shadowed resolves from the PyPI wheel (the fallback);
+a scratch prefix containing only `librt/internal*.so` also works. CI
+builds the same prefix in the `native-kernel-parity` `parity` and
+`parity-mirror` jobs and prepends `LIBRT_SCRATCH` to `PYTHONPATH`, so
+the splice suite runs instead of skipping.
+
 ### Type kernel build order
 
 The type kernel (`Options.native_type_kernel`, default-on since #58) is
@@ -3684,6 +3714,27 @@ including:
   calls) now passes in 0.07s. Gates: cargo 2,772/11 ignored, fmt +
   clippy clean, cold self-check clean 347, testtypes 3,389/6 (+4),
   testcheck 8,198/15/7 exact, fine-grained 747/27 + daemon 37.
+- wave 64C librt `write_raw_bytes` scratch build (#1526): the PyPI
+  `librt>=0.12.0` wheel omits `librt.internal.write_raw_bytes` even
+  though `mypyc/lib-rt/internal/librt_internal.c` exports it, so
+  `mypy/types.py` degraded the F3 wire-cache splice to `None` and
+  `NativeMirrorSpliceSuite` self-skipped 3 tests. The in-repo lib-rt now
+  builds into a scratch prefix that is prepended on `PYTHONPATH` (all six
+  modules; PyPI stays the namespace fallback; the shared `.venv` is never
+  mutated): suite 3 passed/3 skipped -> 7 passed/0 skipped (new
+  session-depth regression test; `test_strict_mode_skips_until_unprotected_bump`
+  now branches on `_SPLICE_ACTIVE` because the epoch skip is a
+  write-funnel behavior unreachable once the splice serves the hit).
+  Enabling it exposed a latent cache-inerting bug: a raise inside the
+  `_write_type_cached` / `_serialize_with_taint_check` session leaked
+  `_type_wire_cache_session_depth`, making the cache inert process-wide
+  (a 20% xdist flake in testtypes); both sessions restore the depth in
+  `finally`. CI: `pr-gate` + `native-kernel-parity` (`parity`,
+  `parity-mirror`) build `mypyc/lib-rt` and prepend `LIBRT_SCRATCH`;
+  build order documented under "librt build order". Gates with the
+  scratch librt: cold self-check clean 347, testcheck 8,198/15/7 exact,
+  testtypes 3,389/3, testinfer 106, F2 mirror capture+read testcheck
+  8,196/15/7 (2 deselected, #1530), splice suite 10/10 stress runs green.
 
 ## Pull Requests
 
