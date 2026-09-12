@@ -159,6 +159,9 @@ class CacheDataWriterSuite(unittest.TestCase):
         options.incremental = True
         options.cache_dir = self.cache_dir
         options.native_type_kernel = True
+        # The write-cache dispatch activates from this opt-in option; a
+        # build would otherwise reset the module gate set in setUp.
+        options.native_cache_data = True
         options.allow_empty_bodies = True
         return options
 

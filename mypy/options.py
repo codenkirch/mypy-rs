@@ -426,6 +426,10 @@ class Options:
         # (the gate is inert; P2 wires the lazy Instance read shadow). Not
         # in OPTIONS_AFFECTING_CACHE: no proxy state may enter the cache.
         self.native_type_proxy = False
+        # G0.5 (#1566): opt-in Rust fixed-format cache-data writer; the
+        # hybrid write phase measured ~1.5x the Python writer per round, so
+        # the bridge ships default-off until the type payloads move too.
+        self.native_cache_data = False
         # Some behaviors are changed when using Bazel (https://bazel.build).
         self.bazel = False
         # If True, export inferred types for all expressions as BuildResult.types

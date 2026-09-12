@@ -4140,9 +4140,12 @@ including:
   `PyAttributeError` / `PyAssertionError` / `PyNotImplementedError`
   map to the same defer, other PyErrs propagate (#1466 pattern).
   Production wiring: `mypy/cache_data.py` shim + `build.py`
-  `write_cache` dispatch, activated with the meta writer from
-  `Options.native_type_kernel`; `stubs/ast_serialize.pyi` declares the
-  seam. Cache-format decision: output is byte-identical, so
+  `write_cache` dispatch, activated from the new default-off
+  `Options.native_cache_data` (opt-in; `TEST_NATIVE_CACHE_DATA` in test
+  helpers): the hybrid write phase measured ~1.5x the Python writer per
+  round (36.3ms vs 55.1ms per 57-tree round) with no format change, so
+  the bridge stays off until the type payloads move; `stubs/ast_serialize.pyi`
+  declares the seam. Cache-format decision: output is byte-identical, so
   `CACHE_VERSION` stays 13, the JSON path is untouched and
   `FileRawData` / the AST wire (`AST_WIRE_VERSION` 5) are unchanged;
   fine-grained never writes cache files (`State.write_cache` guard),

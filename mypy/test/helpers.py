@@ -478,6 +478,7 @@ def parse_options(
     options.native_type_instance_write = _env_gate("TEST_NATIVE_TYPE_INSTANCE_WRITE")
     # ADR-0004 proxy (#1553) is a read-shadow gate; P1 is scaffold-only.
     options.native_type_proxy = _env_gate("TEST_NATIVE_TYPE_PROXY")
+    options.native_cache_data = _env_gate("TEST_NATIVE_CACHE_DATA")
     _ensure_native_modules_available()
 
     # Allow custom python version to override testfile_pyversion.

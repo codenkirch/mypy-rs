@@ -1236,7 +1236,9 @@ class BuildManager:
         # on any shape it does not implement, so the format is unchanged.
         from mypy.cache_data import _set_native_cache_data_active
 
-        _set_native_cache_data_active(self.options.native_type_kernel)
+        _set_native_cache_data_active(
+            self.options.native_cache_data and self.options.native_type_kernel
+        )
         # Stage 4: clear stale plugin-hook snapshot, then build the
         # registry. Plugins are config-static, so build once here.
         from mypy.checkexpr import _set_native_plugin_hook_registry
