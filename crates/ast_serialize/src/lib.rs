@@ -1,6 +1,6 @@
 use pyo3::exceptions::{PyNotImplementedError, PyRuntimeError, PyUnicodeDecodeError};
 use pyo3::prelude::*;
-use ruff_python_ast::{self as ast, token::TokenKind, AnyParameterRef, ArgOrKeyword, PySourceType};
+use ruff_python_ast::{self as ast, token::TokenKind, AnyParameterRef, PySourceType};
 #[cfg(test)]
 use ruff_python_parser::parse_module;
 use ruff_python_parser::{parse_expression, parse_unchecked_source};
@@ -8,6 +8,11 @@ use ruff_text_size::Ranged;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::fs;
+
+mod ast_node;
+mod ast_writer;
+#[cfg(test)]
+mod expr_legacy;
 
 /// Wire format version for the serialized AST returned by `parse`.
 /// Bump when a record layout changes; `parse` rejects any other value so a
@@ -145,6 +150,11 @@ impl Writer {
         self.bytes.push(tag);
     }
 
+    /// Append a pre-built sub-record verbatim (lambda parameter payloads).
+    fn raw_bytes(&mut self, bytes: &[u8]) {
+        self.bytes.extend_from_slice(bytes);
+    }
+
     fn bare_int(&mut self, value: i64) {
         const MIN_ONE_BYTE_INT: i64 = -10;
         const MAX_ONE_BYTE_INT: i64 = 117;
@@ -253,6 +263,10 @@ struct Serializer<'a> {
     lambda_depth: usize,
     include_docstrings: bool,
     custom_typing_module: Option<String>,
+    /// Test-only A/B switch: route expression records through the frozen
+    /// pre-enum writer so both paths can be byte-compared on one corpus.
+    #[cfg(test)]
+    legacy_exprs: bool,
 }
 
 impl<'a> Serializer<'a> {
@@ -287,6 +301,8 @@ impl<'a> Serializer<'a> {
             uses_template_strings: false,
             include_docstrings,
             custom_typing_module,
+            #[cfg(test)]
+            legacy_exprs: false,
         }
     }
 
@@ -710,7 +726,7 @@ fn serialize_suite(
     include_docstrings: bool,
     custom_typing_module: Option<String>,
 ) -> PyResult<SerializeSuiteResult> {
-    let mut serializer = Serializer::new(
+    let serializer = Serializer::new(
         source,
         python_version,
         platform,
@@ -721,6 +737,13 @@ fn serialize_suite(
         include_docstrings,
         custom_typing_module,
     );
+    serialize_suite_with_serializer(serializer, suite)
+}
+
+fn serialize_suite_with_serializer(
+    mut serializer: Serializer<'_>,
+    suite: &ast::Suite,
+) -> PyResult<SerializeSuiteResult> {
     serializer.writer.int(suite.len() as i64);
     let mut rest_unreachable = false;
     for statement in suite {
@@ -1102,512 +1125,22 @@ fn serialize_import_from(
 }
 
 fn serialize_expr(serializer: &mut Serializer<'_>, expression: &ast::Expr) -> PyResult<()> {
-    match expression {
-        ast::Expr::Call(call) => {
-            let loc = serializer.loc(expression);
-            serializer.writer.tag(CALL_EXPR);
-            serialize_expr(serializer, &call.func)?;
-
-            let arg_count = call.arguments.args.len() + call.arguments.keywords.len();
-            serializer.writer.tag(LIST_GEN);
-            serializer.writer.bare_int(arg_count as i64);
-            for arg in &call.arguments.args {
-                serialize_call_arg_value(serializer, &ArgOrKeyword::Arg(arg))?;
-            }
-            for keyword in &call.arguments.keywords {
-                serialize_call_arg_value(serializer, &ArgOrKeyword::Keyword(keyword))?;
-            }
-
-            let mut arg_kinds = Vec::with_capacity(arg_count);
-            let mut arg_names = Vec::with_capacity(arg_count);
-            for arg in &call.arguments.args {
-                arg_kinds.push(if matches!(arg, ast::Expr::Starred(_)) {
-                    ARG_STAR
-                } else {
-                    ARG_POS
-                });
-                arg_names.push(None);
-            }
-            for keyword in &call.arguments.keywords {
-                if let Some(name) = &keyword.arg {
-                    arg_kinds.push(ARG_NAMED);
-                    arg_names.push(Some(name.as_str().to_owned()));
-                } else {
-                    arg_kinds.push(ARG_STAR2);
-                    arg_names.push(None);
-                }
-            }
-            serializer.writer.int_list(&arg_kinds);
-            serializer.writer.opt_str_list(&arg_names);
-            serializer.writer.loc(&loc);
-            serializer.writer.tag(END_TAG);
-            Ok(())
-        }
-        ast::Expr::Name(name) => {
-            let loc = serializer.loc(expression);
-            serialize_name_expr(&mut serializer.writer, name.id.as_str(), &loc);
-            Ok(())
-        }
-        ast::Expr::NoneLiteral(_) => {
-            let loc = serializer.loc(expression);
-            serialize_name_expr(&mut serializer.writer, "None", &loc);
-            Ok(())
-        }
-        ast::Expr::BooleanLiteral(boolean) => {
-            let loc = serializer.loc(expression);
-            serialize_name_expr(
-                &mut serializer.writer,
-                if boolean.value { "True" } else { "False" },
-                &loc,
-            );
-            Ok(())
-        }
-        ast::Expr::EllipsisLiteral(_) => {
-            let loc = serializer.loc(expression);
-            serializer.writer.tag(ELLIPSIS_EXPR);
-            serializer.writer.loc(&loc);
-            serializer.writer.tag(END_TAG);
-            Ok(())
-        }
-        ast::Expr::Compare(compare) => {
-            let loc = serializer.loc(expression);
-            serializer.writer.tag(COMPARISON_EXPR);
-            serialize_expr(serializer, &compare.left)?;
-            serializer.writer.int_list(
-                &compare
-                    .ops
-                    .iter()
-                    .map(|op| comparison_index(*op))
-                    .collect::<Vec<_>>(),
-            );
-            serializer.writer.expr_list(compare.comparators.len());
-            for comparator in &compare.comparators {
-                serialize_expr(serializer, comparator)?;
-            }
-            serializer.writer.loc(&loc);
-            serializer.writer.tag(END_TAG);
-            Ok(())
-        }
-        ast::Expr::BoolOp(bool_op) => {
-            let loc = serializer.loc(expression);
-            serializer.writer.tag(BOOL_OP_EXPR);
-            serializer.writer.int(bool_op_index(bool_op.op));
-            serializer.writer.expr_list(bool_op.values.len());
-            for value in &bool_op.values {
-                serialize_expr(serializer, value)?;
-            }
-            serializer.writer.loc(&loc);
-            serializer.writer.tag(END_TAG);
-            Ok(())
-        }
-        ast::Expr::UnaryOp(unary_op) => {
-            let loc = serializer.loc(expression);
-            serializer.writer.tag(UNARY_EXPR);
-            serializer.writer.int(unary_op_index(unary_op.op));
-            serialize_expr(serializer, &unary_op.operand)?;
-            serializer.writer.loc(&loc);
-            serializer.writer.tag(END_TAG);
-            Ok(())
-        }
-        ast::Expr::Await(await_expr) => {
-            let loc = serializer.loc(expression);
-            serializer.writer.tag(AWAIT_EXPR);
-            serialize_expr(serializer, &await_expr.value)?;
-            serializer.writer.loc(&loc);
-            serializer.writer.tag(END_TAG);
-            Ok(())
-        }
-        ast::Expr::Yield(yield_expr) => {
-            let loc = serializer.loc(expression);
-            serializer.writer.tag(YIELD_EXPR);
-            serializer.writer.bool(yield_expr.value.is_some());
-            if let Some(value) = &yield_expr.value {
-                serialize_expr(serializer, value)?;
-            }
-            serializer.writer.loc(&loc);
-            serializer.writer.tag(END_TAG);
-            Ok(())
-        }
-        ast::Expr::YieldFrom(yield_from) => {
-            let loc = serializer.loc(expression);
-            serializer.writer.tag(YIELD_FROM_EXPR);
-            serialize_expr(serializer, &yield_from.value)?;
-            serializer.writer.loc(&loc);
-            serializer.writer.tag(END_TAG);
-            Ok(())
-        }
-        ast::Expr::FString(f_string) => serialize_f_string_expr(serializer, f_string),
-        ast::Expr::TString(t_string) => serialize_t_string_expr(serializer, t_string),
-        ast::Expr::If(if_expr) => {
-            let loc = serializer.loc(expression);
-            serializer.writer.tag(CONDITIONAL_EXPR);
-            serialize_expr(serializer, &if_expr.body)?;
-            serialize_expr(serializer, &if_expr.test)?;
-            serialize_expr(serializer, &if_expr.orelse)?;
-            serializer.writer.loc(&loc);
-            serializer.writer.tag(END_TAG);
-            Ok(())
-        }
-        ast::Expr::Named(named) => {
-            let loc = serializer.loc(expression);
-            serializer.writer.tag(ASSIGNMENT_EXPR);
-            serialize_expr(serializer, &named.target)?;
-            serialize_expr(serializer, &named.value)?;
-            serializer.writer.loc(&loc);
-            serializer.writer.tag(END_TAG);
-            Ok(())
-        }
-        ast::Expr::Lambda(lambda) => serialize_lambda_expr(serializer, expression, lambda),
-        ast::Expr::Starred(starred) => {
-            let loc = serializer.loc(expression);
-            serializer.writer.tag(STAR_EXPR);
-            serialize_expr(serializer, &starred.value)?;
-            serializer.writer.loc(&loc);
-            serializer.writer.tag(END_TAG);
-            Ok(())
-        }
-        ast::Expr::Attribute(attribute) => {
-            let loc = serializer.loc(expression);
-            serializer.writer.tag(MEMBER_EXPR);
-            serialize_expr(serializer, &attribute.value)?;
-            serializer.writer.string(attribute.attr.as_str());
-            serializer.writer.loc(&loc);
-            serializer.writer.tag(END_TAG);
-            Ok(())
-        }
-        ast::Expr::BinOp(bin_op) => {
-            serializer.writer.tag(OP_EXPR);
-            serializer.writer.int(operator_index(bin_op.op)?);
-            serialize_expr(serializer, &bin_op.left)?;
-            serialize_expr(serializer, &bin_op.right)?;
-            serializer.writer.tag(END_TAG);
-            Ok(())
-        }
-        ast::Expr::NumberLiteral(number) => match &number.value {
-            ast::Number::Int(value) => {
-                let loc = serializer.loc(expression);
-                if let Some(value) = value.as_i64() {
-                    serializer.writer.tag(INT_EXPR);
-                    serializer.writer.int(value);
-                } else {
-                    serializer.writer.tag(BIG_INT_EXPR);
-                    serializer.writer.string(&value.to_string());
-                }
-                serializer.writer.loc(&loc);
-                serializer.writer.tag(END_TAG);
-                Ok(())
-            }
-            ast::Number::Float(value) => {
-                let loc = serializer.loc(expression);
-                serializer.writer.tag(FLOAT_EXPR);
-                serializer.writer.float(*value);
-                serializer.writer.loc(&loc);
-                serializer.writer.tag(END_TAG);
-                Ok(())
-            }
-            ast::Number::Complex { real, imag } => {
-                let loc = serializer.loc(expression);
-                serializer.writer.tag(COMPLEX_EXPR);
-                serializer.writer.float(*real);
-                serializer.writer.float(*imag);
-                serializer.writer.loc(&loc);
-                serializer.writer.tag(END_TAG);
-                Ok(())
-            }
-        },
-        ast::Expr::Tuple(tuple) => {
-            let loc = serializer.loc(expression);
-            serializer.writer.tag(TUPLE_EXPR);
-            serializer.writer.expr_list(tuple.elts.len());
-            for item in &tuple.elts {
-                serialize_expr(serializer, item)?;
-            }
-            serializer.writer.loc(&loc);
-            serializer.writer.tag(END_TAG);
-            Ok(())
-        }
-        ast::Expr::List(list) => {
-            let loc = serializer.loc(expression);
-            serializer.writer.tag(LIST_EXPR);
-            serializer.writer.expr_list(list.elts.len());
-            for item in &list.elts {
-                serialize_expr(serializer, item)?;
-            }
-            serializer.writer.loc(&loc);
-            serializer.writer.tag(END_TAG);
-            Ok(())
-        }
-        ast::Expr::ListComp(list_comp) => {
-            let loc = serializer.loc(expression);
-            serializer.writer.tag(LIST_COMPREHENSION);
-            serialize_generator_payload(serializer, &list_comp.elt, &list_comp.generators)?;
-            serializer.writer.loc(&loc);
-            serializer.writer.tag(END_TAG);
-            Ok(())
-        }
-        ast::Expr::Set(set) => {
-            let loc = serializer.loc(expression);
-            serializer.writer.tag(SET_EXPR);
-            serializer.writer.expr_list(set.elts.len());
-            for item in &set.elts {
-                serialize_expr(serializer, item)?;
-            }
-            serializer.writer.loc(&loc);
-            serializer.writer.tag(END_TAG);
-            Ok(())
-        }
-        ast::Expr::SetComp(set_comp) => {
-            let loc = serializer.loc(expression);
-            serializer.writer.tag(SET_COMPREHENSION);
-            serialize_generator_payload(serializer, &set_comp.elt, &set_comp.generators)?;
-            serializer.writer.loc(&loc);
-            serializer.writer.tag(END_TAG);
-            Ok(())
-        }
-        ast::Expr::Dict(dict) => {
-            let loc = serializer.loc(expression);
-            serializer.writer.tag(DICT_EXPR);
-            serializer.writer.expr_list(dict.items.len());
-            for item in &dict.items {
-                serializer.writer.bool(item.key.is_some());
-                if let Some(key) = &item.key {
-                    serialize_expr(serializer, key)?;
-                }
-            }
-            serializer.writer.expr_list(dict.items.len());
-            for item in &dict.items {
-                serialize_expr(serializer, &item.value)?;
-            }
-            serializer.writer.loc(&loc);
-            serializer.writer.tag(END_TAG);
-            Ok(())
-        }
-        ast::Expr::DictComp(dict_comp) => {
-            let loc = serializer.loc(expression);
-            let Some(key) = &dict_comp.key else {
-                return Err(PyNotImplementedError::new_err(
-                    "mypy in-tree Rust parser does not serialize dict unpack comprehensions yet",
-                ));
-            };
-            serializer.writer.tag(DICT_COMPREHENSION);
-            serialize_expr(serializer, key)?;
-            serialize_expr(serializer, &dict_comp.value)?;
-            serialize_comprehension_generators(serializer, &dict_comp.generators)?;
-            serializer.writer.loc(&loc);
-            serializer.writer.tag(END_TAG);
-            Ok(())
-        }
-        ast::Expr::Generator(generator) => {
-            let loc = serializer.loc(expression);
-            serializer.writer.tag(GENERATOR_EXPR);
-            serialize_generator_payload(serializer, &generator.elt, &generator.generators)?;
-            serializer.writer.loc(&loc);
-            serializer.writer.tag(END_TAG);
-            Ok(())
-        }
-        ast::Expr::StringLiteral(string) => {
-            let loc = serializer.loc(expression);
-            let (value, corrupted, raw) = string_literal_parts(serializer.source, string);
-            serializer.writer.tag(STR_EXPR);
-            serializer.writer.string(value);
-            serializer.writer.bool(corrupted);
-            if let Some(raw) = raw {
-                serializer.writer.string(&raw);
-            }
-            serializer.writer.loc(&loc);
-            serializer.writer.tag(END_TAG);
-            Ok(())
-        }
-        ast::Expr::BytesLiteral(bytes) => {
-            let loc = serializer.loc(expression);
-            let value = escaped_bytes(bytes.value.bytes());
-            serializer.writer.tag(BYTES_EXPR);
-            serializer.writer.string(&value);
-            serializer.writer.loc(&loc);
-            serializer.writer.tag(END_TAG);
-            Ok(())
-        }
-        ast::Expr::Subscript(subscript) => {
-            let loc = serializer.loc(expression);
-            serializer.writer.tag(INDEX_EXPR);
-            serialize_expr(serializer, &subscript.value)?;
-            serialize_expr(serializer, &subscript.slice)?;
-            serializer.writer.loc(&loc);
-            serializer.writer.tag(END_TAG);
-            Ok(())
-        }
-        ast::Expr::Slice(slice) => {
-            let loc = serializer.loc(expression);
-            serializer.writer.tag(SLICE_EXPR);
-            serializer.writer.bool(slice.lower.is_some());
-            if let Some(lower) = &slice.lower {
-                serialize_expr(serializer, lower)?;
-            }
-            serializer.writer.bool(slice.upper.is_some());
-            if let Some(upper) = &slice.upper {
-                serialize_expr(serializer, upper)?;
-            }
-            serializer.writer.bool(slice.step.is_some());
-            if let Some(step) = &slice.step {
-                serialize_expr(serializer, step)?;
-            }
-            serializer.writer.loc(&loc);
-            serializer.writer.tag(END_TAG);
-            Ok(())
-        }
-        _ => Err(PyNotImplementedError::new_err(format!(
-            "mypy in-tree Rust parser does not serialize this expression yet: {expression:?}"
-        ))),
+    #[cfg(test)]
+    if serializer.legacy_exprs {
+        return expr_legacy::serialize_expr(serializer, expression);
     }
-}
-
-fn serialize_lvalue(serializer: &mut Serializer<'_>, expression: &ast::Expr) -> PyResult<()> {
-    match expression {
-        ast::Expr::Tuple(tuple) => {
-            let loc = serializer.loc(expression);
-            serializer.writer.tag(TUPLE_EXPR);
-            serializer.writer.expr_list(tuple.elts.len());
-            for item in &tuple.elts {
-                serialize_lvalue(serializer, item)?;
-            }
-            serializer.writer.loc(&loc);
-            serializer.writer.tag(END_TAG);
-            Ok(())
-        }
-        ast::Expr::List(list) => {
-            let loc = serializer.loc(expression);
-            serializer.writer.tag(TUPLE_EXPR);
-            serializer.writer.expr_list(list.elts.len());
-            for item in &list.elts {
-                serialize_lvalue(serializer, item)?;
-            }
-            serializer.writer.loc(&loc);
-            serializer.writer.tag(END_TAG);
-            Ok(())
-        }
-        ast::Expr::Starred(starred) => {
-            let loc = serializer.loc(expression);
-            serializer.writer.tag(STAR_EXPR);
-            serialize_lvalue(serializer, &starred.value)?;
-            serializer.writer.loc(&loc);
-            serializer.writer.tag(END_TAG);
-            Ok(())
-        }
-        _ => serialize_expr(serializer, expression),
-    }
-}
-
-fn serialize_f_string_expr(
-    serializer: &mut Serializer<'_>,
-    f_string: &ast::ExprFString,
-) -> PyResult<()> {
-    let loc = serializer.loc(f_string);
-    serializer.writer.tag(FSTRING_EXPR);
-    serializer
-        .writer
-        .int(f_string.value.as_slice().len() as i64);
-    for part in f_string.value.as_slice() {
-        match part {
-            ast::FStringPart::Literal(literal) => {
-                // Same lone-surrogate repair as plain string literals: the
-                // value is lossy when the token has such an escape.
-                let range = literal.range;
-                let raw = &serializer.source[range.start().to_usize()..range.end().to_usize()];
-                let corrupted = !literal.flags.prefix().is_raw() && has_surrogate_escape(raw);
-                let loc = serializer.loc(literal);
-                serializer.writer.bool(false);
-                serializer.writer.string(literal.as_str());
-                serializer.writer.bool(corrupted);
-                if corrupted {
-                    serializer.writer.string(raw);
-                }
-                serializer.writer.loc(&loc);
-            }
-            ast::FStringPart::FString(part) => {
-                serializer.writer.bool(true);
-                serialize_f_string_items(serializer, &part.elements, part.flags.prefix().is_raw())?;
-            }
-        }
-    }
-    serializer.writer.loc(&loc);
-    serializer.writer.tag(END_TAG);
+    let node = ast_node::build_expr(serializer, expression)?;
+    ast_writer::write_expr(&mut serializer.writer, &node);
     Ok(())
 }
 
-/// Serialize a PEP 701 template string (`ExprTString`).
-///
-/// Wire format (read by `nativeparse.py:read_expression` TSTRING_EXPR):
-/// ```text
-/// TSTRING_EXPR; int nparts;
-/// for each part:
-///   bool is_interpolation
-///   if interpolation:
-///     expr; str (source); bool has_conv; [str conv]; bool has_format_spec;
-///     [fstring_items]
-///   else:
-///     str; bool corrupted; [str raw]
-/// loc; END_TAG
-/// ```
-/// Matches `fastparse.visit_TemplateStr`, which uses the same item shape as
-/// f-strings plus the raw interpolation source string (dropped by the
-/// checker, used only for debugging).
-fn serialize_t_string_expr(
-    serializer: &mut Serializer<'_>,
-    t_string: &ast::ExprTString,
-) -> PyResult<()> {
-    serializer.uses_template_strings = true;
-    let loc = serializer.loc(t_string);
-    serializer.writer.tag(TSTRING_EXPR);
-    // Wire format flattens all TString parts' elements into one list.
-    let nparts: usize = t_string
-        .value
-        .as_slice()
-        .iter()
-        .map(|t| t.elements.iter().count())
-        .sum();
-    serializer.writer.int(nparts as i64);
-    for tstring in t_string.value.as_slice() {
-        let is_raw = tstring.flags.prefix().is_raw();
-        for element in tstring.elements.iter() {
-            match element {
-                ast::InterpolatedStringElement::Interpolation(interpolation) => {
-                    serializer.writer.bool(true);
-                    serialize_expr(serializer, &interpolation.expression)?;
-                    // Raw interpolation source text (CPython's Interpolation.str).
-                    let source = &serializer.source[interpolation.range.start().to_usize()
-                        ..interpolation.range.end().to_usize()];
-                    serializer.writer.string(source);
-
-                    let conversion = interpolation.conversion.to_char();
-                    serializer.writer.bool(conversion.is_some());
-                    if let Some(conversion) = conversion {
-                        serializer.writer.string(&format!("!{conversion}"));
-                    }
-
-                    serializer.writer.bool(interpolation.format_spec.is_some());
-                    if let Some(format_spec) = &interpolation.format_spec {
-                        serialize_f_string_items(serializer, &format_spec.elements, is_raw)?;
-                        let loc = serializer.loc(&**format_spec);
-                        serializer.writer.loc(&loc);
-                    }
-                }
-                ast::InterpolatedStringElement::Literal(literal) => {
-                    let range = literal.range;
-                    let raw = &serializer.source[range.start().to_usize()..range.end().to_usize()];
-                    let corrupted = !is_raw && has_surrogate_escape(raw);
-                    serializer.writer.bool(false);
-                    serializer.writer.string(&literal.value);
-                    serializer.writer.bool(corrupted);
-                    if corrupted {
-                        serializer.writer.string(raw);
-                    }
-                    serializer.writer.loc(&serializer.loc(literal));
-                }
-            }
-        }
+fn serialize_lvalue(serializer: &mut Serializer<'_>, expression: &ast::Expr) -> PyResult<()> {
+    #[cfg(test)]
+    if serializer.legacy_exprs {
+        return expr_legacy::serialize_lvalue(serializer, expression);
     }
-    serializer.writer.loc(&loc);
-    serializer.writer.tag(END_TAG);
+    let node = ast_node::build_lvalue(serializer, expression)?;
+    ast_writer::write_expr(&mut serializer.writer, &node);
     Ok(())
 }
 
@@ -1646,87 +1179,6 @@ fn has_surrogate_escape(raw: &str) -> bool {
         i += 2;
     }
     false
-}
-
-fn serialize_f_string_items(
-    serializer: &mut Serializer<'_>,
-    elements: &ast::InterpolatedStringElements,
-    is_raw: bool,
-) -> PyResult<()> {
-    let extra_debug_literals = elements
-        .iter()
-        .filter(|element| {
-            matches!(
-                element,
-                ast::InterpolatedStringElement::Interpolation(interpolation)
-                    if interpolation.debug_text.is_some()
-            )
-        })
-        .count();
-    serializer
-        .writer
-        .int((elements.len() + extra_debug_literals) as i64);
-    for element in elements {
-        match element {
-            ast::InterpolatedStringElement::Literal(literal) => {
-                let range = literal.range;
-                let raw = &serializer.source[range.start().to_usize()..range.end().to_usize()];
-                let corrupted = !is_raw && has_surrogate_escape(raw);
-                let loc = serializer.loc(literal);
-                serializer.writer.string(&literal.value);
-                serializer.writer.bool(corrupted);
-                if corrupted {
-                    serializer.writer.string(raw);
-                }
-                serializer.writer.loc(&loc);
-            }
-            ast::InterpolatedStringElement::Interpolation(interpolation) => {
-                if let Some(debug_text) = &interpolation.debug_text {
-                    let loc = serializer.loc(interpolation);
-                    // Debug text is raw source spelling, never escape-decoded.
-                    serializer.writer.string(debug_text.as_str());
-                    serializer.writer.bool(false);
-                    serializer.writer.loc(&loc);
-                }
-                serialize_f_string_interpolation(serializer, interpolation, is_raw)?;
-            }
-        }
-    }
-    Ok(())
-}
-
-fn serialize_f_string_interpolation(
-    serializer: &mut Serializer<'_>,
-    interpolation: &ast::InterpolatedElement,
-    is_raw: bool,
-) -> PyResult<()> {
-    serializer.writer.tag(FSTRING_INTERPOLATION);
-    serialize_expr(serializer, &interpolation.expression)?;
-
-    // CPython defaults the !r conversion for the debug form only when no
-    // format spec is applied (with a spec it formats str(expr)).
-    let conversion = if interpolation.debug_text.is_some()
-        && interpolation.conversion == ast::ConversionFlag::None
-        && interpolation.format_spec.is_none()
-    {
-        Some('r')
-    } else {
-        interpolation.conversion.to_char()
-    };
-    serializer.writer.bool(conversion.is_some());
-    if let Some(conversion) = conversion {
-        serializer.writer.string(&format!("!{conversion}"));
-    }
-
-    serializer.writer.bool(interpolation.format_spec.is_some());
-    if let Some(format_spec) = &interpolation.format_spec {
-        serialize_f_string_items(serializer, &format_spec.elements, is_raw)?;
-        let loc = serializer.loc(&**format_spec);
-        serializer.writer.loc(&loc);
-    }
-
-    serializer.writer.tag(END_TAG);
-    Ok(())
 }
 
 fn serialize_class_def(
@@ -2210,29 +1662,6 @@ fn serialize_decorated_function_def(
     Ok(())
 }
 
-fn serialize_lambda_expr(
-    serializer: &mut Serializer<'_>,
-    expression: &ast::Expr,
-    lambda: &ast::ExprLambda,
-) -> PyResult<()> {
-    let loc = serializer.loc(expression);
-    serializer.writer.tag(LAMBDA_EXPR);
-    // CPython (type_comments=True) never attaches `# type:` comments to
-    // lambda parameters; a per-line statement comment must not leak into
-    // the lambda's argument annotations.
-    serializer.lambda_depth += 1;
-    if let Some(parameters) = &lambda.parameters {
-        serialize_parameters(serializer, parameters, None)?;
-    } else {
-        serialize_empty_parameters(serializer);
-    }
-    serializer.lambda_depth -= 1;
-    serialize_lambda_body(serializer, &lambda.body)?;
-    serializer.writer.loc(&loc);
-    serializer.writer.tag(END_TAG);
-    Ok(())
-}
-
 #[derive(Debug)]
 struct ParsedFunctionTypeComment {
     arg_types: Option<Vec<Option<String>>>,
@@ -2550,53 +1979,6 @@ fn serialize_parameters(
 fn serialize_empty_parameters(serializer: &mut Serializer<'_>) {
     serializer.writer.tag(LIST_GEN);
     serializer.writer.bare_int(0);
-}
-
-fn serialize_lambda_body(serializer: &mut Serializer<'_>, body: &ast::Expr) -> PyResult<()> {
-    let loc = serializer.loc(body);
-    serializer.writer.tag(BLOCK);
-    serializer.writer.tag(LIST_GEN);
-    serializer.writer.bare_int(1);
-    serializer.writer.bool(false);
-    serializer.writer.tag(RETURN_STMT);
-    serializer.writer.bool(true);
-    serialize_expr(serializer, body)?;
-    serializer.writer.loc(&loc);
-    serializer.writer.tag(END_TAG);
-    serializer.writer.tag(END_TAG);
-    Ok(())
-}
-
-fn serialize_generator_payload(
-    serializer: &mut Serializer<'_>,
-    elt: &ast::Expr,
-    generators: &[ast::Comprehension],
-) -> PyResult<()> {
-    serialize_expr(serializer, elt)?;
-    serialize_comprehension_generators(serializer, generators)
-}
-
-fn serialize_comprehension_generators(
-    serializer: &mut Serializer<'_>,
-    generators: &[ast::Comprehension],
-) -> PyResult<()> {
-    serializer.writer.int(generators.len() as i64);
-    for generator in generators {
-        serialize_lvalue(serializer, &generator.target)?;
-    }
-    for generator in generators {
-        serialize_expr(serializer, &generator.iter)?;
-    }
-    for generator in generators {
-        serializer.writer.expr_list(generator.ifs.len());
-        for condition in &generator.ifs {
-            serialize_expr(serializer, condition)?;
-        }
-    }
-    for generator in generators {
-        serializer.writer.bool(generator.is_async);
-    }
-    Ok(())
 }
 
 fn serialize_parameter_with_default(
@@ -2942,13 +2324,6 @@ fn type_param_constraint_values(bound: &ast::Expr) -> Option<&[ast::Expr]> {
         ast::Expr::Tuple(tuple) => Some(&tuple.elts),
         _ => None,
     }
-}
-
-fn serialize_name_expr(writer: &mut Writer, name: &str, loc: &SourceLocation) {
-    writer.tag(NAME_EXPR);
-    writer.string(name);
-    writer.loc(loc);
-    writer.tag(END_TAG);
 }
 
 fn write_optional_string(writer: &mut Writer, value: Option<&str>) {
@@ -3474,19 +2849,6 @@ fn flatten_union_items<'a>(items: &mut Vec<&'a ast::Expr>, expression: &'a ast::
     }
 }
 
-fn serialize_call_arg_value(
-    serializer: &mut Serializer<'_>,
-    arg: &ArgOrKeyword<'_>,
-) -> PyResult<()> {
-    match arg {
-        ArgOrKeyword::Arg(ast::Expr::Starred(starred)) => {
-            serialize_expr(serializer, &starred.value)
-        }
-        ArgOrKeyword::Arg(expr) => serialize_expr(serializer, expr),
-        ArgOrKeyword::Keyword(keyword) => serialize_expr(serializer, &keyword.value),
-    }
-}
-
 fn operator_string(operator: ast::Operator) -> &'static str {
     match operator {
         ast::Operator::Add => "+",
@@ -3969,6 +3331,101 @@ mod tests {
         )
         .unwrap();
         bytes
+    }
+
+    /// Serialize one source through the production enum path or the frozen
+    /// direct-writer reference, for byte-parity comparison.
+    fn serialize_source_bytes(source: &str, legacy_exprs: bool) -> Vec<u8> {
+        let suite = parse_module(source).unwrap().into_suite();
+        let mut serializer = Serializer::new(
+            source,
+            (3, 10),
+            String::new(),
+            HashSet::new(),
+            HashSet::new(),
+            false,
+            HashMap::new(),
+            true,
+            None,
+        );
+        serializer.legacy_exprs = legacy_exprs;
+        serialize_suite_with_serializer(serializer, &suite)
+            .unwrap()
+            .0
+    }
+
+    /// Every `[case ...]` source in the native-parser data files.
+    fn read_native_parser_cases() -> Vec<(String, String)> {
+        const FILES: &[&str] = &[
+            "native-parser.test",
+            "native-parser-python311.test",
+            "native-parser-python312.test",
+            "native-parser-imports.test",
+        ];
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let mut cases = Vec::new();
+        for file in FILES {
+            let path = root.join("test-data/unit").join(file);
+            let content = std::fs::read_to_string(&path)
+                .unwrap_or_else(|err| panic!("failed to read {}: {err}", path.display()));
+            let mut name: Option<String> = None;
+            let mut source: Vec<&str> = Vec::new();
+            for line in content.lines() {
+                if let Some(rest) = line.strip_prefix("[case ") {
+                    name = Some(rest.trim_end_matches(']').to_owned());
+                    source.clear();
+                } else if line == "[out]" {
+                    if let Some(case_name) = name.take() {
+                        cases.push((case_name, source.join("\n")));
+                    }
+                    source.clear();
+                } else if name.is_some() {
+                    source.push(line);
+                }
+            }
+            assert!(name.is_none(), "case without [out] in {file}");
+        }
+        cases
+    }
+
+    #[test]
+    fn expression_enum_matches_direct_writer_for_tstrings_and_debug_fstrings() {
+        let source = "value = t\"a{x!r:>{width}}b\"\ndebug = f\"{value=}\"\n";
+        assert!(
+            parse_module(source).is_ok(),
+            "corpus source must stay parsable"
+        );
+        assert_eq!(
+            serialize_source_bytes(source, false),
+            serialize_source_bytes(source, true)
+        );
+    }
+
+    #[test]
+    fn corpus_expression_enum_matches_direct_writer_bytes() {
+        let cases = read_native_parser_cases();
+        assert!(
+            cases.len() >= 250,
+            "native-parser corpus shrank: {} cases",
+            cases.len()
+        );
+        let mut checked = 0;
+        let mut skipped = 0;
+        for (name, source) in &cases {
+            if parse_module(source).is_err() {
+                skipped += 1;
+                continue;
+            }
+            let enum_bytes = serialize_source_bytes(source, false);
+            let legacy_bytes = serialize_source_bytes(source, true);
+            assert_eq!(
+                enum_bytes, legacy_bytes,
+                "expression enum/direct writer byte parity failed for case {name}"
+            );
+            checked += 1;
+        }
+        assert!(checked >= 230, "too few parsable corpus cases: {checked}");
+        assert!(skipped <= 20, "too many unparsable corpus cases: {skipped}");
     }
 
     #[test]

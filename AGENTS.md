@@ -3882,6 +3882,26 @@ including:
   both crates, AST parity 876 passed/75 skipped/3 xfailed, testparse
   fastparse 250/74, testcheck 8,198/15/7 exact, cold self-check 347.
 
+- wave 67A expression enum + writer byte parity (G0.3, issue #1556):
+  `crates/ast_serialize/src/ast_node.rs` adds the `ExprNode` enum (one
+  variant per `serialize_expr` wire tag with the exact current fields)
+  plus nested records (`FStringPartNode` / `FStringItemNode` /
+  `FStringFormatSpecNode` / `TStringItemNode` / `ComprehensionNode` /
+  `DictItemNode`); `ast_writer.rs` emits the records; the
+  `serialize_expr` / `serialize_lvalue` dispatchers now build-then-write,
+  so the enum is the single source of truth. Lambda parameter lists stay
+  a captured byte payload (def-family sub-record for G0.4); statements,
+  patterns and symbol nodes are untouched; wire format byte-identical,
+  no `AST_WIRE_VERSION` bump. Byte-parity proof: a test-only frozen copy
+  of the old direct writers (`expr_legacy.rs`, `#[cfg(test)]` only) plus
+  a Rust A/B over the full native-parser corpus (250 cases: 241 parsable
+  = 241 checked, 9 syntax-error skips) and a focused t-string /
+  debug-f-string case; the A/B caught a missing `STR_EXPR` END_TAG in the
+  first enum-writer draft (fixed before landing). Gates: cargo 11/0, fmt
+  + clippy clean (`--lib` and `--all-targets`), AST suites 881/75/5
+  xfail exactly, testcheck 8,198/15/7/0 exact, cold self-check clean
+  347, fine-grained 747/27, daemon 37.
+
 ## Pull Requests
 
 The default branch on this fork is `main` (not `master`). Always target
