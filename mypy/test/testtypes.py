@@ -18337,6 +18337,18 @@ class NativeTraverserSuite(Suite):
         tree = parse(source, fnam="<test>", module="<test>", errors=errors, options=options)
         return tree
 
+    def _parse_native(self, source: str) -> MypyFile:
+        """Parse eagerly through the native parser path (#1547 parity)."""
+        from mypy.errors import Errors
+        from mypy.options import Options
+        from mypy.parse import parse
+
+        options = Options()
+        options.python_version = (3, 12)
+        options.native_parser = True
+        errors = Errors(options)
+        return parse(source, fnam="<test>", module="<test>", errors=errors, options=options, eager=True)
+
     def _find_func(self, tree: MypyFile, name: str) -> FuncDef:
         for stmt in tree.defs:
             if isinstance(stmt, FuncDef) and stmt.name == name:
@@ -18386,6 +18398,52 @@ class NativeTraverserSuite(Suite):
         # kernel-off reference exactly, not silently return False.
         with pytest.raises(RuntimeError):
             has_return_statement(fi)
+
+    def test_has_return_statement_return_none(self) -> None:
+        # `return None` is trivial (ReturnSeeker excludes NameExpr("None")).
+        # The wire drops the name, so the Rust seam defers and the shim's
+        # Python fallback decides. Regression for #1547.
+        tree = self._parse("def f():\n    return None\n")
+        fdef = self._find_func(tree, "f")
+        assert has_return_statement(fdef) is False
+
+    def test_has_return_statement_return_name(self) -> None:
+        # `return x` is non-trivial; NameExpr returns defer to Python.
+        tree = self._parse("def f():\n    return x\n")
+        fdef = self._find_func(tree, "f")
+        assert has_return_statement(fdef) is True
+
+    def test_has_return_statement_return_none_native_parser(self) -> None:
+        # Both parser modes produce NameExpr("None") and must agree (#1547).
+        import ast_serialize
+
+        if not hasattr(ast_serialize, "parse"):
+            self.skipTest("ast_serialize extension not built")
+        tree = self._parse_native("def f():\n    return None\ndef g():\n    return x\n")
+        assert has_return_statement(self._find_func(tree, "f")) is False
+        assert has_return_statement(self._find_func(tree, "g")) is True
+
+    def test_has_return_statement_name_expr_defers(self) -> None:
+        # Direct seam: NameExpr return expressions are ambiguous on the wire
+        # (`return None` vs `return x`), so Rust defers; IntExpr returns are
+        # decidable and short-circuit the ambiguity (#1547).
+        from mypy.traverser import (  # type: ignore[attr-defined]
+            _rust_has_return_statement,
+            _serialize_ast_node,
+        )
+
+        tree = self._parse(
+            "def f():\n    return None\n"
+            "def g():\n    return x\n"
+            "def h():\n    return 1\n"
+            "def i():\n    return x\n    return 2\n"
+            "def j():\n    return\n"
+        )
+        assert _rust_has_return_statement(_serialize_ast_node(self._find_func(tree, "f"))) is None
+        assert _rust_has_return_statement(_serialize_ast_node(self._find_func(tree, "g"))) is None
+        assert _rust_has_return_statement(_serialize_ast_node(self._find_func(tree, "h"))) is True
+        assert _rust_has_return_statement(_serialize_ast_node(self._find_func(tree, "i"))) is True
+        assert _rust_has_return_statement(_serialize_ast_node(self._find_func(tree, "j"))) is False
 
     def test_has_str_expression_simple(self) -> None:
         tree = self._parse("x = 'hello'\n")
