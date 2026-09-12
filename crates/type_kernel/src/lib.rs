@@ -3404,6 +3404,13 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
     // Slice 7: Rust walk for types_mirror._walk_indices (reverse-index
     // collection); Python keeps the apply steps.
     module.add_function(wrap_pyfunction!(mirror::rust_mirror_walk_indices, module)?)?;
+    // Registration walk: the index lists plus the direct family children
+    // in `_child_types` order (one walk instead of a Python child scan +
+    // a Rust index walk per adopted object).
+    module.add_function(wrap_pyfunction!(
+        mirror::rust_mirror_walk_registration,
+        module
+    )?)?;
     // Slice 8: CallableType field-granular splice ops (same protocol as
     // the Instance ops: stored blob on noop, new blob on change, None defers).
     module.add_function(wrap_pyfunction!(

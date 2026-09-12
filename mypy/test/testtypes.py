@@ -52425,6 +52425,36 @@ class NativeMirrorWalkIndicesRustSuite(Suite):
         assert res is None
         self.assertRaises(AttributeError, self._m._walk_indices_py, w)
 
+    def test_registration_walk_matches_python(self) -> None:
+        """`_walk_registration` supplies the index lists plus the direct
+        family children in `_child_types` order; Python and Rust agree,
+        including a repeated child occurrence."""
+        graphs = self._graphs()
+        graphs["dup_child"] = TupleType([self.fx.o, self.fx.o], self.fx.std_tuple)
+        for key, t in graphs.items():
+            got = self._m._walk_registration(t)
+            py = self._m._walk_registration_py(t)
+            self._assert_equal(key, t, got[:3], py[:3])
+            assert [id(x) for x in got[3]] == [id(x) for x in py[3]], (key, "children")
+            assert all(type(x) in self._m.FAMILY_NAME for x in got[3]), key
+
+    def test_registration_walk_defer_falls_back(self) -> None:
+        """A deferring kernel seam routes `_walk_registration` to the
+        pure-Python body with identical children."""
+        import types as _types_mod
+
+        stub = _types_mod.SimpleNamespace(rust_mirror_walk_registration=lambda root: None)
+        saved = self._m._kernel_mod
+        try:
+            self._m._kernel_mod = stub
+            for key, t in self._graphs().items():
+                got = self._m._walk_registration(t)
+                py = self._m._walk_registration_py(t)
+                self._assert_equal(key, t, got[:3], py[:3])
+                assert [id(x) for x in got[3]] == [id(x) for x in py[3]], (key, "children")
+        finally:
+            self._m._kernel_mod = saved
+
 
 class NativeMirrorReadSuite(Suite):
     """Unit tests for the Phase F2 (#1393) mirror-read flip at checkexpr.

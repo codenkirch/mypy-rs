@@ -60,7 +60,18 @@ from collections import deque
 from collections.abc import Iterator, Sequence
 from typing import Any, Final, cast
 
-from mypy.types import CallableType, Instance, Type, TypeVarId, TypeVarType, UnionType
+from librt.internal import WriteBuffer
+
+import mypy.types as _types_mod
+from mypy.types import (
+    CallableType,
+    Instance,
+    Type,
+    TypeVarId,
+    TypeVarType,
+    UnionType,
+    write_type_list,
+)
 
 FAMILY_CLASSES: Final = (Instance, CallableType, TypeVarType, UnionType)
 FAMILY_NAME: Final[dict[type, str]] = {
@@ -463,9 +474,9 @@ def _note_mismatch(key: str, msg: str) -> None:
 
 
 def _wire_cache_enabled() -> bool:
-    from mypy.types import _type_wire_cache_enabled
-
-    return _type_wire_cache_enabled
+    # Hoisted module handle: this runs on every fresh serialization
+    # (~2.9M/self-check); a function-local import is not free.
+    return _types_mod._type_wire_cache_enabled
 
 
 # ---- child walking ----
@@ -617,6 +628,32 @@ def _walk_indices_py(root: Type) -> tuple[list[TypeVarId], list[Any], list[Type]
     return tvids, aliases, embeds
 
 
+def _walk_registration(
+    root: Type,
+) -> tuple[list[TypeVarId], list[Any], list[Type], list[Type]]:
+    """Index walk plus the direct family children, in `_child_types` order.
+
+    `_register_tree` needs both; the Rust walk collects them in one
+    descent, so adoption no longer scans the tree twice (a Python
+    child scan plus a Rust index walk). The children list matches
+    `[c for _site, c in _child_types(root) if type(c) in FAMILY_NAME]`.
+    """
+    if _kernel_mod is not None:
+        res = _kernel_mod.rust_mirror_walk_registration(root)
+        if res is not None:
+            return cast("tuple[list[TypeVarId], list[Any], list[Type], list[Type]]", res)
+    return _walk_registration_py(root)
+
+
+def _walk_registration_py(
+    root: Type,
+) -> tuple[list[TypeVarId], list[Any], list[Type], list[Type]]:
+    """Pure-Python `_walk_registration` body (deferral and differential)."""
+    tvids, aliases, embeds = _walk_indices_py(root)
+    children = [child for _site, child in _child_types(root) if type(child) in FAMILY_NAME]
+    return tvids, aliases, embeds, children
+
+
 def _apply_tvid_carriers(tvids: list[TypeVarId], handle: int) -> None:
     """Index every TypeVarId item under its carrier handle."""
     for tvid in tvids:
@@ -649,10 +686,12 @@ def _apply_hidden_embeds(embeds: list[Type], handle: int) -> None:
         entry = _HIDDEN_EMBED.get(key)
         if entry is None:
             _HIDDEN_EMBED[key] = (embed, {handle})
-            _flush_pending_embed(embed)
+            if _PENDING_CAPTURE:
+                _flush_pending_embed(embed)
         else:
             entry[1].add(handle)
-            _flush_pending_embed(embed)
+            if _PENDING_CAPTURE:
+                _flush_pending_embed(embed)
 
 
 # ---- fresh serialization ----
@@ -661,13 +700,9 @@ def _apply_hidden_embeds(embeds: list[Type], handle: int) -> None:
 def _fresh_bytes(t: Type) -> bytes:
     """Serialize `t` to fresh bytes with the wire cache disabled."""
     global _in_serialize
-    from librt.internal import WriteBuffer
-
-    import mypy.types as _types_mod
-    from mypy.types import _set_type_wire_cache_enabled as _set
 
     prev = _wire_cache_enabled()
-    _set(False)
+    _types_mod._set_type_wire_cache_enabled(False)
     prev_serialize = _in_serialize
     prev_cache = _types_mod._REC_CACHE_SUPPRESSED
     _in_serialize = True
@@ -682,7 +717,7 @@ def _fresh_bytes(t: Type) -> bytes:
     finally:
         _in_serialize = prev_serialize
         _types_mod._REC_CACHE_SUPPRESSED = prev_cache
-        _set(prev)
+        _types_mod._set_type_wire_cache_enabled(prev)
 
 
 def _args_list_bytes(args: Sequence[Type]) -> bytes | None:
@@ -694,13 +729,9 @@ def _args_list_bytes(args: Sequence[Type]) -> bytes | None:
     serialize yet; the splice then defers to the full fresh path.
     """
     global _in_serialize
-    from librt.internal import WriteBuffer
-
-    import mypy.types as _types_mod
-    from mypy.types import _set_type_wire_cache_enabled as _set, write_type_list
 
     prev = _wire_cache_enabled()
-    _set(False)
+    _types_mod._set_type_wire_cache_enabled(False)
     prev_serialize = _in_serialize
     prev_cache = _types_mod._REC_CACHE_SUPPRESSED
     _in_serialize = True
@@ -714,7 +745,7 @@ def _args_list_bytes(args: Sequence[Type]) -> bytes | None:
     finally:
         _in_serialize = prev_serialize
         _types_mod._REC_CACHE_SUPPRESSED = prev_cache
-        _set(prev)
+        _types_mod._set_type_wire_cache_enabled(prev)
 
 
 def _single_type_bytes(t: Type) -> bytes | None:
@@ -727,13 +758,9 @@ def _single_type_bytes(t: Type) -> bytes | None:
     fresh path.
     """
     global _in_serialize
-    from librt.internal import WriteBuffer
-
-    import mypy.types as _types_mod
-    from mypy.types import _set_type_wire_cache_enabled as _set
 
     prev = _wire_cache_enabled()
-    _set(False)
+    _types_mod._set_type_wire_cache_enabled(False)
     prev_serialize = _in_serialize
     prev_cache = _types_mod._REC_CACHE_SUPPRESSED
     _in_serialize = True
@@ -747,7 +774,7 @@ def _single_type_bytes(t: Type) -> bytes | None:
     finally:
         _in_serialize = prev_serialize
         _types_mod._REC_CACHE_SUPPRESSED = prev_cache
-        _set(prev)
+        _types_mod._set_type_wire_cache_enabled(prev)
 
 
 def _extra_attrs_bytes(value: Any) -> bytes | None:
@@ -758,13 +785,9 @@ def _extra_attrs_bytes(value: Any) -> bytes | None:
     mirror. Returns None when the value cannot serialize yet.
     """
     global _in_serialize
-    from librt.internal import WriteBuffer
-
-    import mypy.types as _types_mod
-    from mypy.types import _set_type_wire_cache_enabled as _set
 
     prev = _wire_cache_enabled()
-    _set(False)
+    _types_mod._set_type_wire_cache_enabled(False)
     prev_serialize = _in_serialize
     prev_cache = _types_mod._REC_CACHE_SUPPRESSED
     _in_serialize = True
@@ -778,7 +801,7 @@ def _extra_attrs_bytes(value: Any) -> bytes | None:
     finally:
         _in_serialize = prev_serialize
         _types_mod._REC_CACHE_SUPPRESSED = prev_cache
-        _set(prev)
+        _types_mod._set_type_wire_cache_enabled(prev)
 
 
 # ---- registration / adoption / cascade ----
@@ -876,16 +899,19 @@ def _register_tree(t: Type, fresh: bytes | None = None) -> int | None:
     h = _handle_of(t)
     if h is not None:
         return h
+    # One Rust descent supplies the reverse indexes and the direct family
+    # children the recursion below needs; `_child_types` no longer walks
+    # the tree a second time per adoption.
+    tvids, aliases, embeds, fam_children = _walk_registration(t)
     # Prior hidden-embed adopters: containers that already indexed `t` while
     # it was unregistered. Their stored blobs predate any in-place mutation
     # of `t` that happened between adoption and this registration.
     prior_adopters = _HIDDEN_EMBED.get(id(t)) is not None
     child_handles = []
-    for _site, child in _child_types(t):
-        if type(child) in FAMILY_NAME:
-            ch = _register_tree(child)
-            if ch is not None:
-                child_handles.append(ch)
+    for child in fam_children:
+        ch = _register_tree(child)
+        if ch is not None:
+            child_handles.append(ch)
     try:
         if fresh is None:
             fresh = _fresh_bytes(t)
@@ -898,9 +924,10 @@ def _register_tree(t: Type, fresh: bytes | None = None) -> int | None:
     _HANDLE_BY_ID[id(t)] = handle
     # A later successful adoption clears the failed one: the strike memo is
     # only about "cannot adopt yet", not "never capture writes again".
-    _note_successful_adoption(t)
+    # Guarded so the common empty-strike path skips the FIFO call.
+    if _ADOPT_STRIKE._members:
+        _note_successful_adoption(t)
     _kernel_mod.rust_mirror_stamp_sync(handle, _UNPROT_EPOCH)
-    tvids, aliases, embeds = _walk_indices(t)
     _apply_tvid_carriers(tvids, handle)
     _apply_alias_carriers(aliases, handle)
     _apply_hidden_embeds(embeds, handle)
@@ -1024,31 +1051,36 @@ def _assert_fresh(t: Type, site: str) -> None:
     """
     if _PENDING_CAPTURE:
         _drain_pending_captures()
-    fam = FAMILY_NAME[type(t)]
-    h = _handle_of(t)
+    # Inlined `_handle_of` (the funnel is the hot path: ~7.7M calls).
+    h = _HANDLE_BY_ID.get(id(t))
     if h is not None:
         if _kernel_mod.rust_mirror_write_skip(h, _UNPROT_EPOCH):
             # Nothing unprotected has drifted this object's subtree since its
             # blob last synced at the current epoch: the fresh walk would
             # re-derive identical bytes.
-            _count(f"assert_skip.{fam}.{site}")
+            if _audit_mode:
+                _count(f"assert_skip.{FAMILY_NAME[type(t)]}.{site}")
             return
     elif id(t) in _ADOPT_STRIKE:
         if _ADOPT_STRIKE.incr(id(t)) % _STRIKE_RETRY_INTERVAL:
             # Registration failed on an earlier visit (mid-semanal
             # PlaceholderType leaves): skip, and fall through to the
             # fresh adopt walk only when the counter rolls over.
-            _count(f"adopt_strike_skip.{fam}.{site}")
+            if _audit_mode:
+                _count(f"adopt_strike_skip.{FAMILY_NAME[type(t)]}.{site}")
             return
+    fam = FAMILY_NAME[type(t)]
     try:
         fresh = _fresh_bytes(t)
     except Exception:
         # A partial object the real write would also fail on; let the
         # unpatched serialization surface its own original error.
-        _count(f"unserializable.{fam}.funnel:{site}")
+        if _audit_mode:
+            _count(f"unserializable.{fam}.funnel:{site}")
         return
     if h is None:
-        _count(f"adopt.{fam}.{site}")
+        if _audit_mode:
+            _count(f"adopt.{fam}.{site}")
         if _register_tree(t, fresh) is None:
             # Memoize the failure so the per-funnel retry storm stops until
             # the object or one of its ancestors adopts successfully.
@@ -1056,11 +1088,13 @@ def _assert_fresh(t: Type, site: str) -> None:
         return
     if _mirror_expect_ok(h, fresh):
         _kernel_mod.rust_mirror_stamp_sync(h, _UNPROT_EPOCH)
-        _count(f"assert_ok.{fam}.{site}")
+        if _audit_mode:
+            _count(f"assert_ok.{fam}.{site}")
         _flush_pending_capture(t, h, fresh)
         return
-    key = f"mismatch.{fam}.{site}"
-    _count(key)
+    if _audit_mode:
+        key = f"mismatch.{fam}.{site}"
+        _count(key)
     if _strict:
         raise AssertionError(_drift_message(t, fam, site, h, fresh))
     if _audit_mode:
@@ -1325,7 +1359,8 @@ def _mirror_setattr(self: Type, name: str, value: Any) -> None:
         # first funnel snapshots the already-mutated state (lazy adoption).
         if id(self) not in _HIDDEN_EMBED:
             _ORIG_SETATTR(self, name, value)
-            _count("setattr_untracked." + FAMILY_NAME[type(self)])
+            if _audit_mode:
+                _count("setattr_untracked." + FAMILY_NAME[type(self)])
             return
         if id(self) in _ADOPT_STRIKE:
             # Still-unregistrable partial: bounded probe cadence (see
@@ -1347,8 +1382,8 @@ def _mirror_setattr(self: Type, name: str, value: Any) -> None:
                 # A partial object fresh serialization cannot handle yet
                 # (unfilled semanal fallback). Memo the failure; the bounded
                 # probe re-tests registrability every interval (see _assert_fresh).
-                fam = FAMILY_NAME[type(self)]
-                _count(f"setattr_gagged.{fam}")
+                if _audit_mode:
+                    _count(f"setattr_gagged.{FAMILY_NAME[type(self)]}")
                 _note_failed_adoption(self)
                 # Uncaptured write on a never-registered object: safe without
                 # an epoch bump (no stored blob derives through it until it
@@ -1391,8 +1426,8 @@ def _mirror_setattr(self: Type, name: str, value: Any) -> None:
         # Serialization can fail on a partially-built object; defer the
         # capture to the next successful funnel, which re-syncs the stale
         # parent blobs (tuple fallback args rewrite, issue #1385).
-        _count("unserializable." + fam + ".setattr:" + name)
         if _audit_mode:
+            _count("unserializable." + fam + ".setattr:" + name)
             _mismatch_examples.setdefault(f"unserializable.{fam}.setattr:{name}", _short_stack())
         _note_failed_capture(self)
         _bump_unprot("capt_fail")
