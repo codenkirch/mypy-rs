@@ -95,10 +95,11 @@ pub(crate) const CLASS_PATTERN: u8 = 224;
 pub(crate) const TYPE_ALIAS_STMT: u8 = 225;
 
 // Wire-format-only tags for expression types that have no Final[Tag]
-// in nodes.py. Range 150-159 is unused by the cache format.
-pub(crate) const ASTWIRE_CAST_EXPR: u8 = 150;
-pub(crate) const ASTWIRE_ASSERT_TYPE_EXPR: u8 = 151;
-pub(crate) const ASTWIRE_REVEAL_EXPR: u8 = 152;
+// in nodes.py. AST-only tags use 153-159 and 230-253; 150-152 are
+// cache tags (EXTRA_ATTRS, DT_SPEC, LOCATION).
+pub(crate) const ASTWIRE_CAST_EXPR: u8 = 230;
+pub(crate) const ASTWIRE_ASSERT_TYPE_EXPR: u8 = 231;
+pub(crate) const ASTWIRE_REVEAL_EXPR: u8 = 232;
 pub(crate) const ASTWIRE_SUPER_EXPR: u8 = 153;
 pub(crate) const ASTWIRE_TYPE_APPLICATION: u8 = 154;
 pub(crate) const ASTWIRE_TYPE_ALIAS_EXPR: u8 = 155;

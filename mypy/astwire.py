@@ -36,14 +36,12 @@ from mypy.cache import END_TAG, LIST_GEN, LITERAL_NONE, WriteBuffer, write_tag
 _NODE_TAGS: dict[type, int] = {}
 
 
-# Wire-format-only tags for expression types that have no Final[Tag]
-# in nodes.py. Range 150-159 is unused by the cache format (reserved:
-
-# 50-79 symbols, 80-149 types). These are local to the astwire
-# format and never written to/read from the mypy metadata cache.
-ASTWIRE_CAST_EXPR: int = 150
-ASTWIRE_ASSERT_TYPE_EXPR: int = 151
-ASTWIRE_REVEAL_EXPR: int = 152
+# Wire-format-only tags for expression types that have no Final[Tag] in
+# nodes.py. The astwire stream is local and never reaches the metadata
+# cache; AST-only tags use 153-159 and 230-253 (150-152 are cache tags).
+ASTWIRE_CAST_EXPR: int = 230
+ASTWIRE_ASSERT_TYPE_EXPR: int = 231
+ASTWIRE_REVEAL_EXPR: int = 232
 ASTWIRE_SUPER_EXPR: int = 153
 ASTWIRE_TYPE_APPLICATION: int = 154
 ASTWIRE_TYPE_ALIAS_EXPR: int = 155
