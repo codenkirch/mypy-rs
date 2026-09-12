@@ -22,9 +22,13 @@ Design notes (see crates/type_kernel/doc/f1_mirror.md):
   baseline and are invisible in F1, exactly like mutations of
   non-family objects.
 - Mirrored objects are pinned strongly until ``reset`` so a recycled
-  ``id()`` cannot adopt a stale handle; escaped mutations (raw list ops
-  on family fields) are detected at the next serialization funnel
-  instead of at ``__setattr__``. TypeVarId writes are captured through
+  ``id()`` cannot adopt a stale handle. Raw in-place mutations (list/
+  dict item stores and extend/append on family fields) never fire
+  ``__setattr__``; the mutating sites call ``types._mirror_touch``,
+  which re-syncs the object's blob and bumps the unprotected epoch so
+  every other handle re-verifies at its next funnel, and the F2 read
+  (`read_fresh_bytes`) re-serializes before serving when the epoch moved
+  (issue #1530). TypeVarId writes are captured through
   their own shim plus a reverse map from tvid to carrier handles, and
   family leaves behind a non-family Type (e.g. a tuple fallback
   Instance under a TypeVarType's TupleType upper_bound) are closed
@@ -787,6 +791,39 @@ def _handle_of(t: Any) -> int | None:
     return _HANDLE_BY_ID.get(id(t))
 
 
+def touch(t: Any) -> None:
+    """Capture a raw in-place mutation of a mirror-tracked Type (#1530).
+
+    List/dict item stores and mutating calls on family fields (`arg_types`,
+    `arg_kinds`, `items`, ...) never fire the patched ``__setattr__``, so a
+    mutating site calls this to (a) re-serialize and cascade the object's
+    stored blob and (b) bump the unprotected epoch, which forces every
+    other handle (siblings sharing the list, containers embedding the
+    mutated graph) to re-verify at its next funnel or F2 read before
+    trusting its blob. A no-op while the mirror is off.
+    """
+    if not _active or _in_serialize:
+        return
+    _bump_unprot("touch")
+    h = _handle_of(t)
+    if h is None:
+        # No stored blob of its own; the epoch bump above is what protects
+        # any registered container that embeds the mutated graph.
+        return
+    try:
+        fresh = _fresh_bytes(t)
+    except Exception:
+        # A partial object; its next funnel re-serializes (issue #1385
+        # pending-capture protocol) and the epoch bump keeps reads honest.
+        _note_failed_capture(t)
+        return
+    stored = _kernel_mod.rust_mirror_bytes(h)
+    if stored is not None and bytes(stored) == fresh:
+        _kernel_mod.rust_mirror_stamp_sync(h, _UNPROT_EPOCH)
+        return
+    _update_and_cascade(h, fresh, None)
+
+
 def read_fresh_bytes(t: Type) -> bytes | None:
     """Phase F2 (#1393): mirror-blob bytes for a registered family Type.
 
@@ -794,14 +831,29 @@ def read_fresh_bytes(t: Type) -> bytes | None:
     serialization for this read. Returns None (caller serializes as before)
     when read mode is off, the mirror is not active, or the object was never
     registered. The blob is kept fresh by the F1 capture invariant: strict
-    mode raises at the mutation funnel on any drift, so a live object leaf
-    other than a captured-mutation lag cannot be served here.
+    mode raises at the mutation funnel on any drift.
+
+    The epoch gate (issue #1530) is the second line of defense: when an
+    uncaptured mutation (`touch`) landed after this handle's blob was
+    stamped, re-serialize from the live object before serving instead of
+    handing out pre-mutation bytes.
     """
     if not _read_mode or not _active or _in_serialize:
         return None
     h = _handle_of(t)
     if h is None:
         return None
+    if not _kernel_mod.rust_mirror_write_skip(h, _UNPROT_EPOCH):
+        try:
+            fresh = _fresh_bytes(t)
+        except Exception:
+            return None
+        stored = _kernel_mod.rust_mirror_bytes(h)
+        if stored is not None and bytes(stored) == fresh:
+            _kernel_mod.rust_mirror_stamp_sync(h, _UNPROT_EPOCH)
+        else:
+            _update_and_cascade(h, fresh)
+        return fresh
     blob = _kernel_mod.rust_mirror_bytes(h)
     if blob is None:
         return None
@@ -1510,6 +1562,9 @@ def activate(
     import mypy.types as _types_mod
 
     _types_mod._type_mirror_splice_check = _check_splice
+    # Raw in-place mutations (list item stores, extend/append) never fire
+    # __setattr__; the mutating sites call `types._mirror_touch` (#1530).
+    _types_mod._set_native_mirror_touch(touch)
     if audit:
         atexit.register(_dump_audit)
 

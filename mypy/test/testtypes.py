@@ -52349,10 +52349,87 @@ class NativeMirrorReadSuite(Suite):
         self._m._read_mode = True
         _set_native_mirror_read(self._m.read_fresh_bytes)
         # A plain setattr goes through the patched __setattr__ (captured):
-        # the blob resyncs, so the read serves fresh bytes. Raw list splices
-        # like arg_types[0] = ... are F1 escapes; batteries guard those.
+        # the blob resyncs, so the read serves fresh bytes.
         ct.ret_type = self.fx.std_tuple  # captured setattr
         assert _serialize_type_for_checkexpr(ct) == self._m._fresh_bytes(ct)
+
+    def test_raw_list_mutation_served_stale_until_touch(self) -> None:
+        """Issue #1530 repro shape: a raw item store on a family list never
+        fires __setattr__, so the read serves the pre-mutation blob until
+        the mutating site calls `types_mirror.touch`."""
+        from librt.internal import WriteBuffer
+
+        from mypy.types import _mirror_touch
+
+        ct = self._generic_callable()
+        ct.write(WriteBuffer())  # adoption funnel registers the tree
+        self._m._read_mode = True
+        stale = self._m.read_fresh_bytes(ct)
+        assert stale is not None
+        ct.arg_types[0] = self.fx.a  # raw escape, no __setattr__
+        assert self._m.read_fresh_bytes(ct) == stale
+        _mirror_touch(ct)
+        fresh = self._m._fresh_bytes(ct)
+        assert fresh != stale
+        assert self._m.read_fresh_bytes(ct) == fresh
+
+    def test_touch_epoch_gate_refreshes_untouched_handle(self) -> None:
+        """`touch` bumps the global epoch: a handle whose own blob drifted
+        without a touch is re-serialized by the read gate anyway (the
+        shared-list / nested-mutation safety net)."""
+        from librt.internal import WriteBuffer
+
+        from mypy.types import _mirror_touch
+
+        ct = self._generic_callable()
+        other = self._generic_callable()
+        ct.write(WriteBuffer())
+        other.write(WriteBuffer())
+        self._m._read_mode = True
+        other_stale = self._m.read_fresh_bytes(other)
+        assert other_stale is not None
+        other.arg_types[0] = self.fx.a  # raw escape on `other`, never touched
+        assert self._m.read_fresh_bytes(other) == other_stale
+        _mirror_touch(ct)  # unrelated touch moves the epoch
+        assert self._m.read_fresh_bytes(other) == self._m._fresh_bytes(other)
+
+    def test_normalize_trivial_unpack_touches_blob(self) -> None:
+        """The two #1530 manifestations mutate `arg_types` through
+        `CallableType.normalize_trivial_unpack`; its touch keeps the F2
+        read fresh (gate-on side)."""
+        from librt.internal import WriteBuffer
+
+        ct = self._unpack_callable()
+        ct.write(WriteBuffer())
+        self._m._read_mode = True
+        stale = self._m.read_fresh_bytes(ct)
+        ct.normalize_trivial_unpack()
+        assert ct.arg_types == [self.fx.a]
+        fresh = self._m.read_fresh_bytes(ct)
+        assert fresh == self._m._fresh_bytes(ct)
+        assert fresh != stale
+
+    def test_normalize_trivial_unpack_gate_off_parity(self) -> None:
+        """Gate-off differential for the #1530 mutator: with the touch hook
+        uninstalled the same normalization happens with no mirror traffic."""
+        from mypy.types import _set_native_mirror_touch
+
+        ct = self._unpack_callable()
+        _set_native_mirror_touch(None)
+        try:
+            ct.normalize_trivial_unpack()
+        finally:
+            _set_native_mirror_touch(self._m.touch)
+        assert ct.arg_types == [self.fx.a]
+
+    def _unpack_callable(self) -> CallableType:
+        """`def (*args: Unpack[tuple[A]])`: the normalize_trivial_unpack input."""
+        from mypy.types import UnpackType
+
+        tuple_of_a = Instance(self.fx.std_tuplei, [self.fx.a])
+        return CallableType(
+            [UnpackType(tuple_of_a)], [ARG_STAR], [None], self.fx.o, self.fx.function, name="f"
+        )
 
     def test_read_mode_off_returns_none(self) -> None:
         from librt.internal import WriteBuffer

@@ -210,6 +210,30 @@ def _read_mirror_blob(t: Type) -> bytes | None:
     return fn(t)
 
 
+# Phase F2 (#1530): types_mirror.touch hook, installed by activate when
+# the mirror is on. Raw in-place writes (list/dict item stores,
+# extend/append) never fire the family __setattr__ capture.
+_mirror_touch_fn: Callable[[Type], None] | None = None
+
+
+def _set_native_mirror_touch(fn: Callable[[Type], None] | None) -> None:
+    """Install the F1/F2 raw-mutation touch hook (see types_mirror.touch)."""
+    global _mirror_touch_fn
+    _mirror_touch_fn = fn
+
+
+def _mirror_touch(t: Type) -> None:
+    """Notify the mirror that `t`'s fields were mutated in place (#1530)."""
+    fn = _mirror_touch_fn
+    if fn is not None:
+        fn(t)
+
+
+def _mirror_touch_enabled() -> bool:
+    """True when the mirror is active: guard costlier change probes."""
+    return _mirror_touch_fn is not None
+
+
 TUPLE_NAMES: Final = ("builtins.tuple", "typing.Tuple")
 TYPE_NAMES: Final = ("builtins.type", "typing.Type")
 
@@ -2844,6 +2868,9 @@ class CallableType(FunctionLike):
                 if isinstance(p_type, Instance):
                     assert p_type.type.fullname == "builtins.tuple"
                     self.arg_types[star_index] = p_type.args[0]
+                    # Raw item write never fires the mirror's setattr
+                    # capture; keep the F2 read blob honest (#1530).
+                    _mirror_touch(self)
 
     def with_unpacked_kwargs(self) -> NormalizedCallableType:
         if not self.unpack_kwargs:

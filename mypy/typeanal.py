@@ -113,6 +113,7 @@ from mypy.types import (
     UnionType,
     UnpackType,
     _encode_no_arg_instance,
+    _mirror_touch,
     callable_with_ellipsis,
     find_unpack_in_list,
     flatten_nested_tuples,
@@ -2069,6 +2070,9 @@ class TypeAnalyser(SyntheticTypeVisitor[Type], TypeAnalyzerPluginInterface):
                         arg_kinds[-1] = ARG_STAR2
                         arg_types[-1] = p_at
                         unpacked_kwargs = True
+                        # `arg_kinds` aliases `t.arg_kinds`; the raw item write
+                        # bypasses the mirror capture (#1530).
+                        _mirror_touch(t)
                 arg_types = self.check_unpacks_in_list(arg_types)
 
             if not param_spec_invalid and param_spec_with_args != param_spec_with_kwargs:
