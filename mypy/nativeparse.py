@@ -161,6 +161,11 @@ from mypy.util import unnamed_function
 
 TypeIgnores = list[tuple[int, list[str]]]
 
+# Wire format version written by the ast_serialize extension. Must match
+# AST_WIRE_VERSION in crates/ast_serialize/src/lib.rs; parse() rejects a
+# mismatch at the entry instead of failing mid-deserialization.
+AST_WIRE_VERSION: Final = 5
+
 # There is no way to create reasonable fallbacks at this stage,
 # they must be patched later.
 _dummy_fallback: Final = Instance(MISSING_FALLBACK, [], -1)
@@ -205,6 +210,29 @@ class State:
             )
 
 
+def read_source(filename: str) -> str:
+    """Read and decode a source file with PEP 263 encoding declarations.
+
+    A directory has no source text; return an empty string so the caller
+    produces the same empty module the parser used to return for packages
+    that only contain compiled files.
+    """
+    if os.path.isdir(filename):
+        return ""
+
+    from mypy.errors import CompileError
+    from mypy.util import DecodeError, decode_python_encoding
+
+    try:
+        with open(filename, "rb") as f:
+            return decode_python_encoding(f.read())
+    except (UnicodeDecodeError, DecodeError) as decodeerr:
+        raise CompileError(
+            [f"{filename}: error: Cannot decode file: {str(decodeerr)}"],
+            module_with_blocker=filename,
+        ) from decodeerr
+
+
 def native_parse(
     filename: str,
     options: Options,
@@ -232,21 +260,10 @@ def native_parse(
     # When source is None, the Rust extension would read the file directly via
     # fs::read_to_string (UTF-8), which ignores PEP 263 encoding declarations
     # (e.g. `# coding: ascii`). Read and decode here so decode errors surface
-
-    # the same way build.py's get_source() handles them — as a CompileError
+    # the same way build.py's get_source() handles them, as a CompileError
     # with "Cannot decode file: ..." (caught by the caller's wrap_context).
     if source is None:
-        from mypy.errors import CompileError
-        from mypy.util import DecodeError, decode_python_encoding
-
-        try:
-            with open(filename, "rb") as f:
-                source = decode_python_encoding(f.read())
-        except (UnicodeDecodeError, DecodeError) as decodeerr:
-            raise CompileError(
-                [f"{filename}: error: Cannot decode file: {str(decodeerr)}"],
-                module_with_blocker=filename,
-            ) from decodeerr
+        source = read_source(filename)
 
     (
         b,
@@ -279,6 +296,18 @@ def expect_end_tag(data: ReadBuffer) -> None:
 
 def expect_tag(data: ReadBuffer, tag: Tag) -> None:
     assert (actual := read_tag(data)) == tag, actual
+
+
+def read_docstring(data: ReadBuffer) -> str | None:
+    """Read a docstring field written by the serializer's write_docstring()."""
+    if not read_bool(data):
+        return None
+    value = read_str(data)
+    if read_bool(data):
+        # Broken surrogate escapes: re-evaluate the raw token(s) with CPython
+        # semantics, like the STR_EXPR arm.
+        value = literal_eval_str_token(read_str(data))
+    return value
 
 
 def read_statements(state: State, data: ReadBuffer, n: int) -> list[Statement]:
@@ -314,8 +343,11 @@ def parse_to_binary_ast(
         platform=options.platform,
         always_true=options.always_true,
         always_false=options.always_false,
-        cache_version=4,
+        cache_version=AST_WIRE_VERSION,
+        include_docstrings=options.include_docstrings,
+        custom_typing_module=options.custom_typing_module,
     )
+    assert ast_data["ast_wire_version"] == AST_WIRE_VERSION, ast_data["ast_wire_version"]
     return (
         ast_bytes,
         errors,
@@ -699,9 +731,10 @@ def read_func_def(state: State, data: ReadBuffer) -> FuncDef:
     state.num_funcs += 1
 
     name = read_str(data)
+    docstring = read_docstring(data)
     arguments, has_ann = read_parameters(state, data)
 
-    if special_function_elide_names(name):
+    if state.options.pos_only_special_methods and special_function_elide_names(name):
         for arg in arguments:
             arg.pos_only = True
 
@@ -737,6 +770,7 @@ def read_func_def(state: State, data: ReadBuffer) -> FuncDef:
         typ = None
 
     func_def = FuncDef(name, arguments, body, typ=typ, type_args=type_params)
+    func_def.docstring = docstring
     if is_async:
         func_def.is_coroutine = True
     read_loc(data, func_def)
@@ -757,6 +791,7 @@ def read_func_def(state: State, data: ReadBuffer) -> FuncDef:
 
 def read_class_def(state: State, data: ReadBuffer) -> ClassDef:
     name = read_str(data)
+    docstring = read_docstring(data)
     body = read_block(state, data)
     base_type_exprs = read_expression_list(state, data)
 
@@ -791,6 +826,7 @@ def read_class_def(state: State, data: ReadBuffer) -> ClassDef:
         type_args=type_params,
     )
     class_def.decorators = decorators
+    class_def.docstring = docstring
     read_loc(data, class_def)
     if type_params:
         state.check_min_version(

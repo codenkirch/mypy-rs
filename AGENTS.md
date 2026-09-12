@@ -3825,6 +3825,38 @@ including:
   Noticed, not fixed: #1543 (a wire-decoded native type used as an
   error context can lose its source line; the shipped code defers the
   member-miss path that exposed it).
+- AST wire v5 - native parser docstrings, custom typing module, version pin
+  (wave 66A, issue #1545). G0.1 of the Phase G0 brief. `AST_WIRE_VERSION = 5`
+  is returned in the parse data dict (`ast_wire_version`) and enforced at the
+  `ast_serialize.parse` entry with a RuntimeError on `cache_version` mismatch,
+  so a stale `.so` fails at the call instead of mid-deserialization
+  (`AssertionError: 255` class). `FUNC_DEF_STMT` / `CLASS_DEF` gain a
+  docstring field after the name (present flag, value, corrupted flag,
+  optional raw tokens for lone-surrogate repair); readers set
+  `FuncDef.docstring` / `ClassDef.docstring`, matching
+  `ast.get_docstring(node, clean=False)` including lone surrogates (probe:
+  `"\\ud800"` yields `'\ud800'`, not U+FFFD). `--custom-typing-module` is
+  threaded into the serializer: `import` / `from` translate the module to
+  `typing` with the implicit asname when translation occurs (star imports
+  stay untranslated, mirroring fastparse's `visit_ImportFrom`). The writer's
+  `argument_elide_name` stays unconditional: fastparse's `make_argument`
+  applies it regardless of `pos_only_special_methods` (`def f(__x)` is
+  pos-only under both option states), so the fix gates only the reader's
+  special-method re-elision; gating the writer would diverge. `mypy.parse`'s
+  native branch applies `options.transform_source` (the build path's
+  `source=None` reads the file via `nativeparse.read_source` first). New
+  in-tree `stubs/ast_serialize.pyi` declares the v5 surface (the pinned PyPI
+  wheel still declares v4, which broke the self-check). Tests:
+  `TestNativeParserOptionParity` (docstring / custom-typing-module / pos-only /
+  wire-version / transform differentials vs fastparse), v5 golden blobs, 8
+  Rust unit tests. Gates: cargo 16/0, fmt + clippy clean (crate clippy was 6
+  errors on main; the two dead-scaffolding `new_without_default` get module
+  allows until #1546 deletes the files, the two type-complexity tails are
+  fixed), test_nativeparse + testparse 510 passed/74 skipped, testcheck
+  8,144/69/7 exact, teststubgen 4 -> 3 failures (`testIncludeDocstrings`
+  green; residual are the #1547 yield failures), cold self-check clean 347.
+  Noticed, not fixed: #1551 (multi-alias `import a, b` splits into one
+  `Import` node per alias in `tree.imports`).
 
 ## Pull Requests
 

@@ -14,8 +14,9 @@ from collections.abc import Iterator
 
 from librt.internal import ReadBuffer
 
-from mypy import defaults, nodes
+from mypy import defaults, fastparse, nodes
 from mypy.cache import (
+    DICT_STR_GEN,
     END_TAG,
     LIST_GEN,
     LIST_INT,
@@ -26,9 +27,10 @@ from mypy.cache import (
     read_int,
 )
 from mypy.config_parser import parse_mypy_comments
-from mypy.errors import CompileError
+from mypy.errors import CompileError, Errors
 from mypy.nodes import MypyFile, ParseError
 from mypy.options import Options
+from mypy.parse import parse
 from mypy.test.data import DataDrivenTestCase, DataSuite
 from mypy.test.helpers import assert_string_arrays_equal
 from mypy.util import get_mypy_comments
@@ -38,6 +40,7 @@ from mypy.util import get_mypy_comments
 # Probe it with a full round-trip; skip the native suites on any mismatch.
 try:
     from mypy.nativeparse import (
+        AST_WIRE_VERSION,
         State,
         deserialize_imports,
         native_parse,
@@ -255,45 +258,46 @@ def format_reachable_imports(node: MypyFile) -> list[str]:
     return output
 
 
+def _int_enc(n: int) -> int:
+    return (n + 10) << 1
+
+
+def _locs(start_line: int, start_column: int, end_line: int, end_column: int) -> list[int]:
+    return [
+        LOCATION,
+        _int_enc(start_line),
+        _int_enc(start_column),
+        _int_enc(end_line - start_line),
+        _int_enc(end_column - start_column),
+    ]
+
+
 @unittest.skipUnless(has_nativeparse, "nativeparse not available")
 class TestNativeParserBinaryFormat(unittest.TestCase):
     def _assert_trivial_binary_data(self, b: bytes, /) -> None:
         # A quick sanity check to ensure the serialized data looks as expected. Only covers
         # a few AST nodes.
-
-        def int_enc(n: int) -> int:
-            return (n + 10) << 1
-
-        def locs(start_line: int, start_column: int, end_line: int, end_column: int) -> list[int]:
-            return [
-                LOCATION,
-                int_enc(start_line),
-                int_enc(start_column),
-                int_enc(end_line - start_line),
-                int_enc(end_column - start_column),
-            ]
-
         self.assertEqual(
             list(b),
             (
                 [LITERAL_INT, 22, nodes.EXPR_STMT, nodes.CALL_EXPR]
                 + [nodes.NAME_EXPR, LITERAL_STR]
-                + [int_enc(5)]
+                + [_int_enc(5)]
                 + list(b"print")
-                + locs(1, 0, 1, 5)
+                + _locs(1, 0, 1, 5)
                 + [END_TAG, LIST_GEN, 22, nodes.STR_EXPR]
-                + [LITERAL_STR, int_enc(5)]
+                + [LITERAL_STR, _int_enc(5)]
                 + list(b"hello")
                 + [0]  # corrupted flag (unescaped surrogate escapes present)
-                + locs(1, 6, 1, 13)
+                + _locs(1, 6, 1, 13)
                 + [END_TAG]
                 # arg_kinds: [ARG_POS]
-                + [LIST_INT, 22, int_enc(0)]
+                + [LIST_INT, 22, _int_enc(0)]
                 # arg_names: [None]
                 + [LIST_GEN, 22, LITERAL_NONE]
-                + locs(1, 0, 1, 14)
+                + _locs(1, 0, 1, 14)
                 + [END_TAG]
-                + locs(1, 0, 1, 14)
+                + _locs(1, 0, 1, 14)
                 + [END_TAG]
             ),
         )
@@ -314,6 +318,226 @@ class TestNativeParserBinaryFormat(unittest.TestCase):
     def test_invalid_bytes_raises(self) -> None:
         with self.assertRaises(UnicodeDecodeError):
             parse_to_binary_ast("", Options(), b"\xff")
+
+    def test_v5_golden_func_def_docstring(self) -> None:
+        # Pins the v5 FUNC_DEF_STMT record layout: the docstring field follows
+        # the name (present flag, value, corrupted flag) before the parameters.
+        options = Options()
+        options.include_docstrings = True
+        b, _, _, _, _, _, _, _ = parse_to_binary_ast("", options, 'def f():\n    "d"\n')
+        self.assertEqual(
+            list(b),
+            [LITERAL_INT, _int_enc(1), nodes.FUNC_DEF_STMT, LITERAL_STR, _int_enc(1)]
+            + list(b"f")
+            + [1, LITERAL_STR, _int_enc(1)]
+            + list(b"d")
+            + [0]
+            + [LIST_GEN, _int_enc(0)]  # parameters
+            + [nodes.BLOCK, LIST_GEN, _int_enc(1), 0]
+            + [nodes.EXPR_STMT, nodes.STR_EXPR, LITERAL_STR, _int_enc(1)]
+            + list(b"d")
+            + [0]
+            + _locs(2, 4, 2, 7)
+            + [END_TAG]
+            + _locs(2, 4, 2, 7)
+            + [END_TAG]
+            + [END_TAG]
+            + [0, 0, 0]  # is_async, has_type_params, has_return_type
+            + _locs(1, 0, 2, 7)
+            + [END_TAG],
+        )
+
+    def test_v5_golden_class_def_docstring(self) -> None:
+        options = Options()
+        options.include_docstrings = True
+        b, _, _, _, _, _, _, _ = parse_to_binary_ast("", options, 'class C:\n    "d"\n')
+        self.assertEqual(
+            list(b),
+            [LITERAL_INT, _int_enc(1), nodes.CLASS_DEF, LITERAL_STR, _int_enc(1)]
+            + list(b"C")
+            + [1, LITERAL_STR, _int_enc(1)]
+            + list(b"d")
+            + [0]
+            + [nodes.BLOCK, LIST_GEN, _int_enc(1), 0]
+            + [nodes.EXPR_STMT, nodes.STR_EXPR, LITERAL_STR, _int_enc(1)]
+            + list(b"d")
+            + [0]
+            + _locs(2, 4, 2, 7)
+            + [END_TAG]
+            + _locs(2, 4, 2, 7)
+            + [END_TAG]
+            + [END_TAG]
+            + [LIST_GEN, _int_enc(0)]  # base type expressions
+            + [LIST_GEN, _int_enc(0)]  # decorators
+            + [0]  # has_type_params
+            + [DICT_STR_GEN, _int_enc(0)]  # keywords
+            + _locs(1, 0, 2, 7)
+            + [END_TAG],
+        )
+
+
+def _collect_docstrings(tree: MypyFile) -> dict[tuple[int, str, str], str | None]:
+    docstrings: dict[tuple[int, str, str], str | None] = {}
+
+    def visit(stmts: list[nodes.Statement]) -> None:
+        for stmt in stmts:
+            if isinstance(stmt, nodes.FuncDef):
+                docstrings[(stmt.line, "func", stmt.name)] = stmt.docstring
+            elif isinstance(stmt, nodes.ClassDef):
+                docstrings[(stmt.line, "class", stmt.name)] = stmt.docstring
+                visit(stmt.defs.body)
+
+    visit(tree.defs)
+    return docstrings
+
+
+def _collect_imports(tree: MypyFile) -> list[tuple[object, ...]]:
+    shapes: list[tuple[object, ...]] = []
+    for imp in tree.imports:
+        if isinstance(imp, nodes.Import):
+            shapes.append(("Import", tuple(imp.ids)))
+        elif isinstance(imp, nodes.ImportFrom):
+            shapes.append(("ImportFrom", imp.id, imp.relative, tuple(imp.names)))
+        elif isinstance(imp, nodes.ImportAll):
+            shapes.append(("ImportAll", imp.id, imp.relative))
+    for stmt in tree.defs:
+        if isinstance(stmt, nodes.Import):
+            shapes.append(("stmt Import", tuple(stmt.ids)))
+        elif isinstance(stmt, nodes.ImportFrom):
+            shapes.append(("stmt ImportFrom", stmt.id, stmt.relative, tuple(stmt.names)))
+        elif isinstance(stmt, nodes.ImportAll):
+            shapes.append(("stmt ImportAll", stmt.id, stmt.relative))
+    return shapes
+
+
+def _collect_argument_positions(tree: MypyFile) -> dict[str, list[tuple[str, bool]]]:
+    positions: dict[str, list[tuple[str, bool]]] = {}
+
+    def visit(stmts: list[nodes.Statement]) -> None:
+        for stmt in stmts:
+            if isinstance(stmt, nodes.FuncDef):
+                positions[stmt.name] = [(a.variable.name, a.pos_only) for a in stmt.arguments]
+            elif isinstance(stmt, nodes.ClassDef):
+                visit(stmt.defs.body)
+
+    visit(tree.defs)
+    return positions
+
+
+@unittest.skipUnless(has_nativeparse, "nativeparse not available")
+class TestNativeParserOptionParity(unittest.TestCase):
+    """Differential checks against the CPython-based parser for wire-v5 options."""
+
+    def _parse_both(self, source: str, options: Options) -> tuple[MypyFile, MypyFile]:
+        errors = Errors(options)
+        fast = fastparse.parse(
+            bytes(source, "utf-8"), fnam="main", module="main", errors=errors, options=options
+        )
+        native, _errors, _ignores = native_parse("main", options, source)
+        load_tree(native, options)
+        return fast, native
+
+    def test_docstrings_match_fastparse(self) -> None:
+        cases = [
+            'def f():\n    """func doc"""\n    ...\n',
+            'class C:\n    """class doc"""\n    def m(self):\n        """method doc"""\n        ...\n',
+            'class C:\n    r"""raw \\" doc"""\n',
+            'class C:\n    "implicit" " concat"\n',
+            'class C:\n    b"bytes"\n',
+            'class C:\n    f"fstring"\n',
+            "class C:\n    1\n",
+            "class C:\n    '''triple\n    line'''\n",
+            'class C:\n    "esc \\n tab\\t unicode \\u263a"\n',
+            'class C:\n    "\\ud800"\n',
+        ]
+        for include in (True, False):
+            for source in cases:
+                options = Options()
+                options.python_version = (3, 13)
+                options.include_docstrings = include
+                fast, native = self._parse_both(source, options)
+                self.assertEqual(
+                    _collect_docstrings(fast), _collect_docstrings(native), (include, source)
+                )
+
+    def test_custom_typing_module_translation(self) -> None:
+        source = (
+            "import foo\n"
+            "import foo as bar\n"
+            "import foo.baz\n"
+            "from foo import T\n"
+            "from foo import T as U\n"
+            "from foo import *\n"
+            "from .foo import y\n"
+            "from typing import Any\n"
+        )
+        for custom in (None, "foo"):
+            options = Options()
+            options.python_version = (3, 13)
+            options.custom_typing_module = custom
+            fast, native = self._parse_both(source, options)
+            self.assertEqual(_collect_imports(fast), _collect_imports(native), custom)
+
+    def test_pos_only_special_methods_option(self) -> None:
+        source = (
+            "def f(__x, x): ...\n"
+            "class C:\n"
+            "    def __init__(self, x): ...\n"
+            "    def __getattr__(self, name): ...\n"
+            "    def __str__(obj): ...\n"
+            "def g(a, /, b, *, c): ...\n"
+        )
+        for enabled in (True, False):
+            options = Options()
+            options.python_version = (3, 13)
+            options.pos_only_special_methods = enabled
+            fast, native = self._parse_both(source, options)
+            self.assertEqual(
+                _collect_argument_positions(fast), _collect_argument_positions(native), enabled
+            )
+
+    def test_transform_source_applied_on_native_branch(self) -> None:
+        def transform(source: str | bytes) -> str | bytes:
+            text = source if isinstance(source, str) else source.decode()
+            return text.replace("1", "'transformed'")
+
+        options = Options()
+        options.native_parser = True
+        options.python_version = (3, 13)
+        options.transform_source = transform
+
+        tree = parse(
+            "x = 1\n",
+            fnam="main",
+            module="main",
+            errors=Errors(options),
+            options=options,
+            eager=True,
+        )
+        stmt = tree.defs[0]
+        assert isinstance(stmt, nodes.AssignmentStmt)
+        assert isinstance(stmt.rvalue, nodes.StrExpr)
+        assert stmt.rvalue.value == "transformed"
+
+        # The build path passes source=None; the native branch must read the
+        # file and still apply the transform (stubgen's semantic pass).
+        with temp_source("x = 1\n") as fnam:
+            tree = parse(
+                None, fnam=fnam, module="main", errors=Errors(options), options=options, eager=True
+            )
+        stmt = tree.defs[0]
+        assert isinstance(stmt, nodes.AssignmentStmt)
+        assert isinstance(stmt.rvalue, nodes.StrExpr)
+        assert stmt.rvalue.value == "transformed"
+
+    def test_wire_version_mismatch_rejected(self) -> None:
+        import ast_serialize
+
+        with self.assertRaises(RuntimeError) as ctx:
+            ast_serialize.parse("t.py", "x = 1\n", cache_version=AST_WIRE_VERSION - 1)
+        self.assertIn("wire version mismatch", str(ctx.exception))
+        result = ast_serialize.parse("t.py", "x = 1\n", cache_version=AST_WIRE_VERSION)
+        self.assertEqual(result[4]["ast_wire_version"], AST_WIRE_VERSION)
 
 
 @contextlib.contextmanager

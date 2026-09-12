@@ -1,9 +1,13 @@
+// Dead scaffolding, deleted in #1546; the allow keeps the crate's
+// `cargo clippy -D warnings` gate green until then.
+#[allow(clippy::new_without_default)]
 pub mod full_ast_codec;
 pub mod nodes_codec;
 pub mod nodes_full;
+#[allow(clippy::new_without_default)]
 pub mod visitor_engine;
 
-use pyo3::exceptions::{PyNotImplementedError, PyUnicodeDecodeError};
+use pyo3::exceptions::{PyNotImplementedError, PyRuntimeError, PyUnicodeDecodeError};
 use pyo3::prelude::*;
 use ruff_python_ast::{self as ast, token::TokenKind, AnyParameterRef, ArgOrKeyword, PySourceType};
 #[cfg(test)]
@@ -13,6 +17,11 @@ use ruff_text_size::Ranged;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::fs;
+
+/// Wire format version for the serialized AST returned by `parse`.
+/// Bump when a record layout changes; `parse` rejects any other value so a
+/// stale extension fails at the entry instead of mid-deserialization.
+const AST_WIRE_VERSION: i64 = 5;
 
 const LITERAL_NONE: u8 = 2;
 const LITERAL_INT: u8 = 3;
@@ -251,9 +260,12 @@ struct Serializer<'a> {
     uses_template_strings: bool,
     callable_arg_list_depth: usize,
     lambda_depth: usize,
+    include_docstrings: bool,
+    custom_typing_module: Option<String>,
 }
 
 impl<'a> Serializer<'a> {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         source: &'a str,
         python_version: (i64, i64),
@@ -262,6 +274,8 @@ impl<'a> Serializer<'a> {
         always_false: HashSet<String>,
         skip_function_bodies: bool,
         type_comments: HashMap<i64, String>,
+        include_docstrings: bool,
+        custom_typing_module: Option<String>,
     ) -> Self {
         Self {
             writer: Writer::default(),
@@ -280,6 +294,39 @@ impl<'a> Serializer<'a> {
             callable_arg_list_depth: 0,
             lambda_depth: 0,
             uses_template_strings: false,
+            include_docstrings,
+            custom_typing_module,
+        }
+    }
+
+    /// `ast.get_docstring(node, clean=False)` fields for a class/function body:
+    /// None when the first statement is not a string expression, else the
+    /// evaluated value plus the surrogate-corruption repair data.
+    fn docstring_fields(&self, body: &ast::Suite) -> Option<(String, bool, Option<String>)> {
+        if !self.include_docstrings {
+            return None;
+        }
+        let ast::Stmt::Expr(first) = body.first()? else {
+            return None;
+        };
+        let ast::Expr::StringLiteral(literal) = &*first.value else {
+            return None;
+        };
+        let (value, corrupted, raw) = string_literal_parts(self.source, literal);
+        Some((value.to_owned(), corrupted, raw))
+    }
+
+    fn write_docstring(&mut self, body: &ast::Suite) {
+        match self.docstring_fields(body) {
+            None => self.writer.bool(false),
+            Some((value, corrupted, raw)) => {
+                self.writer.bool(true);
+                self.writer.string(&value);
+                self.writer.bool(corrupted);
+                if let Some(raw) = raw {
+                    self.writer.string(&raw);
+                }
+            }
         }
     }
 
@@ -417,8 +464,11 @@ impl ImportCollector {
     platform = None,
     always_true = None,
     always_false = None,
-    cache_version = 0
+    cache_version = 0,
+    include_docstrings = false,
+    custom_typing_module = None
 ))]
+#[allow(clippy::too_many_arguments)]
 fn parse(
     py: Python<'_>,
     fnam: &str,
@@ -429,8 +479,15 @@ fn parse(
     always_true: Option<Vec<String>>,
     always_false: Option<Vec<String>>,
     cache_version: i64,
+    include_docstrings: bool,
+    custom_typing_module: Option<String>,
 ) -> PyResult<PyObject> {
-    let _ = cache_version;
+    if cache_version != AST_WIRE_VERSION {
+        return Err(PyRuntimeError::new_err(format!(
+            "ast_serialize extension wire version mismatch: caller expects AST wire v{cache_version}, \
+             this extension writes v{AST_WIRE_VERSION}; rebuild the ast_serialize extension"
+        )));
+    }
     let source = read_source(py, source, fnam)?;
     let parsed = parse_unchecked_source(&source, PySourceType::Python);
     let mut errors = parse_errors_to_py(py, &source, parsed.errors())?;
@@ -448,10 +505,13 @@ fn parse(
         always_false.unwrap_or_default(),
         skip_function_bodies,
         type_comments,
+        include_docstrings,
+        custom_typing_module,
     )?;
     errors.extend(native_parse_errors_to_py(py, native_errors)?);
     let import_bytes = serialize_import_metadata(&imports);
     let data = pyo3::types::PyDict::new(py);
+    data.set_item("ast_wire_version", AST_WIRE_VERSION)?;
     data.set_item("is_partial_package", is_partial_package)?;
     data.set_item("uses_template_strings", uses_template_strings)?;
     data.set_item("mypy_ignores", type_ignores.clone())?;
@@ -644,6 +704,9 @@ fn native_parse_errors_to_py(
     Ok(result)
 }
 
+type SerializeSuiteResult = (Vec<u8>, Vec<ImportMetadata>, Vec<NativeParseError>, bool);
+
+#[allow(clippy::too_many_arguments)]
 fn serialize_suite(
     suite: &ast::Suite,
     source: &str,
@@ -653,7 +716,9 @@ fn serialize_suite(
     always_false: Vec<String>,
     skip_function_bodies: bool,
     type_comments: HashMap<i64, String>,
-) -> PyResult<(Vec<u8>, Vec<ImportMetadata>, Vec<NativeParseError>, bool)> {
+    include_docstrings: bool,
+    custom_typing_module: Option<String>,
+) -> PyResult<SerializeSuiteResult> {
     let mut serializer = Serializer::new(
         source,
         python_version,
@@ -662,6 +727,8 @@ fn serialize_suite(
         always_false.into_iter().collect(),
         skip_function_bodies,
         type_comments,
+        include_docstrings,
+        custom_typing_module,
     );
     serializer.writer.int(suite.len() as i64);
     let mut rest_unreachable = false;
@@ -730,6 +797,33 @@ fn is_partial_stub_package(fnam: &str, suite: &ast::Suite) -> bool {
         ast::Stmt::FunctionDef(function) => function.name.as_str() == "__getattr__",
         _ => false,
     })
+}
+
+/// The evaluated value of a string literal, whether lone surrogate escapes
+/// were lost (Ruff decodes them to U+FFFD), and the raw source tokens to
+/// repair them. The Python reader re-evaluates the raw tokens with CPython
+/// semantics, matching `ast.get_docstring(node, clean=False)` exactly.
+fn string_literal_parts<'a>(
+    source: &'a str,
+    string: &'a ast::ExprStringLiteral,
+) -> (&'a str, bool, Option<String>) {
+    let raw_tokens: Vec<&str> = string
+        .value
+        .as_slice()
+        .iter()
+        .map(|part| {
+            let range = part.range;
+            &source[range.start().to_usize()..range.end().to_usize()]
+        })
+        .collect();
+    let corrupted = string
+        .value
+        .as_slice()
+        .iter()
+        .enumerate()
+        .any(|(i, part)| !part.flags.prefix().is_raw() && has_surrogate_escape(raw_tokens[i]));
+    let raw = corrupted.then(|| raw_tokens.join(" "));
+    (string.value.to_str(), corrupted, raw)
 }
 
 fn serialize_stmt(serializer: &mut Serializer<'_>, statement: &ast::Stmt) -> PyResult<()> {
@@ -906,24 +1000,22 @@ fn serialize_type_alias_stmt(
 fn serialize_import(serializer: &mut Serializer<'_>, import: &ast::StmtImport) -> PyResult<()> {
     let loc = serializer.loc(import);
     let flags = serializer.imports.flags();
+    let names = translated_import_names(&import.names, serializer.custom_typing_module.as_deref());
     serializer.writer.tag(IMPORT);
-    serializer.writer.int(import.names.len() as i64);
-    for alias in &import.names {
-        serializer.writer.string(alias.name.as_str());
-        write_optional_string(
-            &mut serializer.writer,
-            alias.asname.as_ref().map(|name| name.as_str()),
-        );
+    serializer.writer.int(names.len() as i64);
+    for (name, asname) in &names {
+        serializer.writer.string(name);
+        write_optional_string(&mut serializer.writer, asname.as_deref());
     }
     write_import_metadata_tail(&mut serializer.writer, &loc, flags);
     serializer.writer.tag(END_TAG);
 
-    for alias in &import.names {
+    for (name, asname) in names {
         serializer.imports.push(ImportMetadata {
             tag: IMPORT_METADATA,
-            module: alias.name.as_str().to_owned(),
+            module: name,
             relative: 0,
-            asname: alias.asname.as_ref().map(|name| name.as_str().to_owned()),
+            asname,
             names: Vec::new(),
             loc: loc.clone(),
             flags,
@@ -932,27 +1024,58 @@ fn serialize_import(serializer: &mut Serializer<'_>, import: &ast::StmtImport) -
     Ok(())
 }
 
+/// Mirror fastparse's `visit_Import`: a module named like the custom typing
+/// module becomes `typing`, with the original name as an implicit asname.
+fn translated_import_names(
+    aliases: &[ast::Alias],
+    custom_typing_module: Option<&str>,
+) -> Vec<(String, Option<String>)> {
+    aliases
+        .iter()
+        .map(|alias| {
+            let original = alias.name.as_str();
+            let translated = translate_module_name(original, custom_typing_module);
+            let asname = match &alias.asname {
+                Some(asname) => Some(asname.as_str().to_owned()),
+                None if translated != original => Some(original.to_owned()),
+                None => None,
+            };
+            (translated, asname)
+        })
+        .collect()
+}
+
+fn translate_module_name(name: &str, custom_typing_module: Option<&str>) -> String {
+    if custom_typing_module == Some(name) {
+        "typing".to_owned()
+    } else {
+        name.to_owned()
+    }
+}
+
 fn serialize_import_from(
     serializer: &mut Serializer<'_>,
     import: &ast::StmtImportFrom,
 ) -> PyResult<()> {
     let loc = serializer.loc(import);
     let flags = serializer.imports.flags();
-    let module = import
+    let raw_module = import
         .module
         .as_ref()
         .map_or_else(String::new, |module| module.as_str().to_owned());
     let relative = i64::from(import.level);
 
     if import.names.len() == 1 && import.names[0].name.as_str() == "*" {
+        // fastparse's `visit_ImportFrom` leaves the module untranslated for
+        // star imports; mirror that for parity.
         serializer.writer.tag(IMPORT_ALL);
-        serializer.writer.string(&module);
+        serializer.writer.string(&raw_module);
         serializer.writer.int(relative);
         write_import_metadata_tail(&mut serializer.writer, &loc, flags);
         serializer.writer.tag(END_TAG);
         serializer.imports.push(ImportMetadata {
             tag: IMPORTALL_METADATA,
-            module,
+            module: raw_module,
             relative,
             asname: None,
             names: Vec::new(),
@@ -962,6 +1085,7 @@ fn serialize_import_from(
         return Ok(());
     }
 
+    let module = translate_module_name(&raw_module, serializer.custom_typing_module.as_deref());
     let names = import_alias_names(&import.names);
     serializer.writer.tag(IMPORT_FROM);
     serializer.writer.int(relative);
@@ -1292,26 +1416,11 @@ fn serialize_expr(serializer: &mut Serializer<'_>, expression: &ast::Expr) -> Py
         }
         ast::Expr::StringLiteral(string) => {
             let loc = serializer.loc(expression);
-            // Ruff decodes lone surrogate escapes to U+FFFD, losing the exact
-            // value. When a part has one, also write the raw source tokens;
-            // the Python reader re-evaluates them with CPython semantics.
-            let raw_tokens: Vec<&str> = string
-                .value
-                .as_slice()
-                .iter()
-                .map(|part| {
-                    let range = part.range;
-                    &serializer.source[range.start().to_usize()..range.end().to_usize()]
-                })
-                .collect();
-            let corrupted = string.value.as_slice().iter().enumerate().any(|(i, part)| {
-                !part.flags.prefix().is_raw() && has_surrogate_escape(raw_tokens[i])
-            });
+            let (value, corrupted, raw) = string_literal_parts(serializer.source, string);
             serializer.writer.tag(STR_EXPR);
-            serializer.writer.string(string.value.to_str());
+            serializer.writer.string(value);
             serializer.writer.bool(corrupted);
-            if corrupted {
-                let raw = raw_tokens.join(" ");
+            if let Some(raw) = raw {
                 serializer.writer.string(&raw);
             }
             serializer.writer.loc(&loc);
@@ -1643,6 +1752,7 @@ fn serialize_class_def(
     };
     serializer.writer.tag(CLASS_DEF);
     serializer.writer.string(class_def.name.as_str());
+    serializer.write_docstring(&class_def.body);
     serializer.class_depth += 1;
     let body_result = serialize_block(serializer, &class_def.body, &loc);
     serializer.class_depth -= 1;
@@ -2047,6 +2157,7 @@ fn serialize_function_def(
     };
     serializer.writer.tag(FUNC_DEF_STMT);
     serializer.writer.string(function.name.as_str());
+    serializer.write_docstring(&function.body);
     let type_comment = function_type_comment(serializer, function, &loc);
     let comment_arg_types = type_comment
         .as_ref()
@@ -3712,10 +3823,12 @@ fn line_starts(source: &str) -> Vec<usize> {
     starts
 }
 
+type CommentDirectives = (Vec<(i64, Vec<String>)>, HashMap<i64, String>);
+
 fn collect_comment_directives(
     source: &str,
     tokens: &ruff_python_ast::token::Tokens,
-) -> (Vec<(i64, Vec<String>)>, HashMap<i64, String>) {
+) -> CommentDirectives {
     let line_starts = line_starts(source);
     let mut ignores = Vec::new();
     let mut type_comments = HashMap::new();
@@ -3845,6 +3958,105 @@ fn ast_serialize(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
 mod tests {
     use super::*;
 
+    fn serialize_test_source(
+        source: &str,
+        include_docstrings: bool,
+        custom_typing_module: Option<&str>,
+    ) -> Vec<u8> {
+        let suite = parse_module(source).unwrap().into_suite();
+        let (bytes, _, _, _) = serialize_suite(
+            &suite,
+            source,
+            (3, 10),
+            String::new(),
+            Vec::new(),
+            Vec::new(),
+            false,
+            HashMap::new(),
+            include_docstrings,
+            custom_typing_module.map(str::to_owned),
+        )
+        .unwrap();
+        bytes
+    }
+
+    #[test]
+    fn func_def_docstring_field_only_when_enabled() {
+        let source = "def f():\n    \"d\"\n";
+        let with_doc = serialize_test_source(source, true, None);
+        let without_doc = serialize_test_source(source, false, None);
+        // Layout: LITERAL_INT len, FUNC_DEF_STMT, LITERAL_STR len name.
+        let name_end = 6;
+        assert_eq!(with_doc[..name_end], without_doc[..name_end]);
+        // Present flag, value, corrupted flag.
+        assert_eq!(
+            with_doc[name_end..name_end + 5],
+            [1, LITERAL_STR, 22, b'd', 0]
+        );
+        // Without the option only the absent flag is written.
+        assert_eq!(without_doc[name_end], 0);
+        assert_eq!(with_doc[name_end + 5..], without_doc[name_end + 1..]);
+    }
+
+    #[test]
+    fn class_def_docstring_field_only_when_enabled() {
+        let source = "class C:\n    \"d\"\n";
+        let with_doc = serialize_test_source(source, true, None);
+        let without_doc = serialize_test_source(source, false, None);
+        let name_end = 6;
+        assert_eq!(with_doc[..name_end], without_doc[..name_end]);
+        assert_eq!(
+            with_doc[name_end..name_end + 5],
+            [1, LITERAL_STR, 22, b'd', 0]
+        );
+        assert_eq!(without_doc[name_end], 0);
+        assert_eq!(with_doc[name_end + 5..], without_doc[name_end + 1..]);
+    }
+
+    #[test]
+    fn docstring_surrogate_repair_data_written() {
+        let bytes = serialize_test_source("class C:\n    \"\\ud800\"\n", true, None);
+        // present flag, lossy U+FFFD value (len 3), corrupted flag, raw token.
+        let marker = [1, LITERAL_STR, 26, 0xEF, 0xBF, 0xBD, 1, LITERAL_STR];
+        assert!(bytes.windows(marker.len()).any(|window| window == marker));
+    }
+
+    #[test]
+    fn custom_typing_module_translates_import() {
+        let translated = serialize_test_source("import foo\n", false, Some("foo"));
+        // IMPORT, alias count, module "typing", implicit asname "foo".
+        let mut expected = vec![LITERAL_INT, 22, IMPORT, LITERAL_INT, 22, LITERAL_STR, 32];
+        expected.extend_from_slice(b"typing");
+        expected.extend_from_slice(&[1, LITERAL_STR, 26]);
+        expected.extend_from_slice(b"foo");
+        assert_eq!(&translated[..expected.len()], expected.as_slice());
+    }
+
+    #[test]
+    fn custom_typing_module_translates_import_from() {
+        let translated = serialize_test_source("from foo import X\n", false, Some("foo"));
+        let mut expected = vec![
+            LITERAL_INT,
+            22,
+            IMPORT_FROM,
+            LITERAL_INT,
+            20,
+            LITERAL_STR,
+            32,
+        ];
+        expected.extend_from_slice(b"typing");
+        expected.extend_from_slice(&[LITERAL_INT, 22, LITERAL_STR, 22]);
+        expected.extend_from_slice(b"X");
+        assert_eq!(&translated[..expected.len()], expected.as_slice());
+    }
+
+    #[test]
+    fn custom_typing_module_leaves_other_imports_alone() {
+        let raw = serialize_test_source("import foo.bar\n", false, Some("foo"));
+        let plain = serialize_test_source("import foo.bar\n", false, None);
+        assert_eq!(raw, plain);
+    }
+
     #[test]
     fn serializes_trivial_call_like_existing_binary_contract() {
         let suite = parse_module("print('hello')").unwrap().into_suite();
@@ -3857,6 +4069,8 @@ mod tests {
             Vec::new(),
             false,
             HashMap::new(),
+            false,
+            None,
         )
         .unwrap();
         assert!(imports.is_empty());
