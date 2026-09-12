@@ -830,6 +830,128 @@ fn handle_recursive_union_inner(
     Some(vec![])
 }
 
+/// Append `tail` after `head` (Python's shared `res` accumulator: the
+/// Callable-actual protocol arms run before the instance paths).
+fn merge_arm_res(head: Vec<Constraint>, tail: Vec<Constraint>) -> Vec<Constraint> {
+    if head.is_empty() {
+        return tail;
+    }
+    let mut out = head;
+    out.extend(tail);
+    out
+}
+
+/// `get_instance_type(force_fallback=True)` tail (types.py:2674-2699):
+/// unwrap the historic non-Instance fallbacks to their Instance carrier.
+fn force_fallback_instance(t: Type, aliases: &crate::aliases::TypeAliasResolver) -> Option<Type> {
+    match t {
+        Type::TypeVarType { upper_bound, .. } => get_proper_or_expand(&upper_bound, aliases),
+        Type::TupleType {
+            partial_fallback, ..
+        } => Some(*partial_fallback),
+        Type::TypedDictType { fallback, .. } => Some(*fallback),
+        Type::LiteralType { fallback, .. } => Some(*fallback),
+        _ => Some(t),
+    }
+}
+
+/// The Callable-actual protocol arms of `visit_instance`
+/// (constraints.py:1356-1385): the generic callback-protocol arm and the
+/// class-object arm. Extends `res` in Python's order; `None` defers the
+/// whole instance call to the pure-Python body.
+#[allow(clippy::too_many_arguments)]
+fn visit_instance_callable_protocol_arms(
+    py: Python<'_>,
+    template: &Type,
+    actual: &Type,
+    template_snap: &crate::typeinfo::TypeInfoSnapshot,
+    direction: i64,
+    resolver: &TypeResolver,
+    aliases: &crate::aliases::TypeAliasResolver,
+    strict_optional: bool,
+    res: &mut Vec<Constraint>,
+) -> Option<()> {
+    use crate::checker_helpers::{get_protocol_member_inner, GetProtocolMemberResult};
+
+    // Generic callback protocol (constraints.py:1356-1372).
+    if template_snap
+        .protocol_members
+        .iter()
+        .any(|m| m == "__call__")
+    {
+        let already = PROTOCOL_INFERRING.with(|s| s.borrow().contains(template));
+        if !already {
+            // Python appends before find_member and pops after the recursion.
+            let _guard = ProtocolInferringPush::new(template);
+            let call = match get_protocol_member_inner(
+                py, template, actual, "__call__", false, false, true, resolver,
+            ) {
+                Some(GetProtocolMemberResult::Found(t)) => t,
+                // Python asserts call is not None; out of contract.
+                _ => return None,
+            };
+            let erased_call =
+                erase_typevars_inner(&call, None, &crate::erase_typevars::make_any())?;
+            let ctx = SubtypeContext::new(false, false, false, false, false, strict_optional);
+            let check = if direction == SUPERTYPE_OF {
+                is_subtype(actual, &erased_call, &ctx, resolver)
+            } else {
+                is_subtype(&erased_call, actual, &ctx, resolver)
+            };
+            match check {
+                Some(true) => {
+                    let cs = infer_constraints_full_inner(
+                        &call,
+                        actual,
+                        direction,
+                        resolver,
+                        aliases,
+                        strict_optional,
+                        false,
+                        true,
+                    )?;
+                    res.extend(cs);
+                }
+                Some(false) => {}
+                None => return None,
+            }
+        }
+    }
+    // Class-object arm (constraints.py:1373-1385), SUPERTYPE_OF only.
+    if direction == SUPERTYPE_OF && crate::callable_compat::is_type_obj(actual, resolver)? {
+        let Type::CallableType {
+            instance_type,
+            ret_type,
+            ..
+        } = actual
+        else {
+            return None;
+        };
+        let raw = match instance_type {
+            Some(t) => (**t).clone(),
+            None => get_proper_or_expand(ret_type, aliases)?,
+        };
+        let it = force_fallback_instance(raw, aliases)?;
+        if matches!(it, Type::Instance { .. }) {
+            let cs = infer_constraints_from_protocol_members_native(
+                py,
+                &it,
+                template,
+                &it,
+                template,
+                true,
+                direction,
+                resolver,
+                aliases,
+                strict_optional,
+                None,
+            )?;
+            res.extend(cs);
+        }
+    }
+    Some(())
+}
+
 /// Port of `ConstraintBuilderVisitor.visit_instance` (constraints.py:917),
 /// keeping only the grabbable nominal-instance paths. Any branch that needs
 /// TypeInfo graph data Rust does not snapshot (protocol members, callable
@@ -849,11 +971,25 @@ fn visit_instance_native(
     };
     let template_snap = resolver.get(get_type_ref(template)?)?;
     let mut actual = original_actual;
-    // Callable actuals: only defer if the template is a protocol. The
-    // dominant non-protocol-vs-callable case uses the callable's fallback.
+    // Constraints from the Callable-actual protocol arms
+    // (constraints.py:1356-1385). The callable's fallback then continues
+    // into the instance logic below.
+    let mut arm_res: Vec<Constraint> = Vec::new();
     if matches!(actual, Type::CallableType { .. }) {
         if template_snap.is_protocol {
-            return None;
+            pyo3::Python::with_gil(|py| {
+                visit_instance_callable_protocol_arms(
+                    py,
+                    template,
+                    actual,
+                    template_snap,
+                    direction,
+                    resolver,
+                    aliases,
+                    strict_optional,
+                    &mut arm_res,
+                )
+            })?;
         }
         if let Type::CallableType { fallback, .. } = actual {
             actual = fallback;
@@ -879,7 +1015,7 @@ fn visit_instance_native(
         if template_snap.is_protocol {
             return None;
         }
-        return Some(vec![]);
+        return Some(arm_res);
     }
     if let Type::Instance { type_ref, args, .. } = actual {
         let a_snap = resolver.get(type_ref)?;
@@ -939,7 +1075,7 @@ fn visit_instance_native(
                     _ => {}
                 }
             }
-            return Some(res);
+            return Some(merge_arm_res(arm_res, res));
         }
         // SUPERTYPE_OF direction: actual is a base of template.
         if direction == SUPERTYPE_OF && a_snap.has_base(get_type_ref(template)?) {
@@ -1000,30 +1136,23 @@ fn visit_instance_native(
                     _ => {}
                 }
             }
-            return Some(res);
+            return Some(merge_arm_res(arm_res, res));
         }
         // Structural-protocol branch (constraints.py:1540-1582): the
-        // SUPERTYPE_OF arm (non-protocol instance) and the SUBTYPE_OF arm
-        // (protocol actual) decide in Rust; others defer to Python.
+        // SUPERTYPE_OF arm (any protocol template) and the SUBTYPE_OF arm
+        // (protocol actual) decide in Rust; the rest fall out with `res`.
         if template_snap.is_protocol || a_snap.is_protocol {
-            if template_snap.is_protocol && !a_snap.is_protocol {
-                if direction == SUPERTYPE_OF {
-                    return visit_instance_protocol_supertype_native(
-                        template,
-                        actual,
-                        original_actual,
-                        direction,
-                        resolver,
-                        aliases,
-                        strict_optional,
-                    );
-                }
-                if direction == SUBTYPE_OF {
-                    // Python: the SUBTYPE_OF structural arm requires the ACTUAL to be a
-                    // protocol; here it is not, so both structural arms miss
-                    // and the tail matches no Instance arm — `return []`.
-                    return Some(vec![]);
-                }
+            if template_snap.is_protocol && direction == SUPERTYPE_OF {
+                return visit_instance_protocol_supertype_native(
+                    template,
+                    actual,
+                    original_actual,
+                    direction,
+                    resolver,
+                    aliases,
+                    strict_optional,
+                )
+                .map(|cs| merge_arm_res(arm_res, cs));
             }
             if a_snap.is_protocol && direction == SUBTYPE_OF {
                 // constraints.py:1568-1582: actual is a protocol Instance,
@@ -1035,22 +1164,30 @@ fn visit_instance_native(
                     resolver,
                     aliases,
                     strict_optional,
-                );
+                )
+                .map(|cs| merge_arm_res(arm_res, cs));
             }
-            // Protocol-actual SUPERTYPE_OF pairs and both-protocol
-            // SUPERTYPE_OF pairs are Python-side (the structural tail).
-            return None;
+            // Python: both structural arms miss; `if res: return res` runs
+            // before the shape tail, whose Instance arm returns [].
+            return Some(arm_res);
         }
         // Fall through to the tail (actual is a non-protocol instance).
     }
-    visit_instance_tail_native(
+    // Python's `if res: return res` (constraints.py:1589) precedes the
+    // actual-shape tail: once the callable arms accumulated constraints and
+    // the fallback is not an Instance, the tail must not add more.
+    if !arm_res.is_empty() && !matches!(actual, Type::Instance { .. }) {
+        return Some(arm_res);
+    }
+    let tail = visit_instance_tail_native(
         template,
         actual,
         direction,
         resolver,
         aliases,
         strict_optional,
-    )
+    )?;
+    Some(merge_arm_res(arm_res, tail))
 }
 
 thread_local! {
@@ -1476,9 +1613,65 @@ fn visit_instance_tail_native(
         let tail_tref = get_type_ref(template)?;
         let tail_snap = (resolver.get(tail_tref))?;
         if tail_snap.is_protocol {
-            // Protocol special-case (constraints.py:1630-1643) needs
-            // protocol members; not ported this round.
-            return None;
+            // constraints.py:1619-1630: special-case protocols before using
+            // the fallback, for more precise constraints on custom tuple
+            // types like NamedTuples.
+            if !resolver.has_live_info_map() {
+                return None;
+            }
+            let already = PROTOCOL_INFERRING.with(|s| s.borrow().contains(template));
+            if already {
+                // Python's `and` chain fails; the final fallthrough infers
+                // against the fallback instance.
+                return push_inner(
+                    template.clone(),
+                    fallback,
+                    direction,
+                    resolver,
+                    aliases,
+                    strict_optional,
+                );
+            }
+            let skip = vec!["__call__".to_string()];
+            let ctx = SubtypeContext::default();
+            let verdict = pyo3::Python::with_gil(|py| {
+                crate::protocols::is_protocol_implementation_inner(
+                    py, &fallback, &fallback, &erased, &skip, &ctx, resolver,
+                )
+            });
+            match verdict {
+                Some(true) => {
+                    let _guard = ProtocolInferringPush::new(template);
+                    // Python: (instance, template, original_actual, template).
+                    let res = pyo3::Python::with_gil(|py| {
+                        infer_constraints_from_protocol_members_native(
+                            py,
+                            &fallback,
+                            template,
+                            actual,
+                            template,
+                            false,
+                            direction,
+                            resolver,
+                            aliases,
+                            strict_optional,
+                            None,
+                        )
+                    })?;
+                    return Some(res);
+                }
+                Some(false) => {
+                    return push_inner(
+                        template.clone(),
+                        fallback,
+                        direction,
+                        resolver,
+                        aliases,
+                        strict_optional,
+                    );
+                }
+                None => return None,
+            }
         }
         return push_inner(
             template.clone(),
@@ -2374,6 +2567,65 @@ fn visit_callable_native(
             skip_neg_op,
         );
     }
+    // Overloaded actual (constraints.py:1830-1831, 1861-1873):
+    // `infer_against_overloaded` picks the first callable-compatible item
+    // (ignore_return) and recurses with the normalized template.
+    if let Type::Overloaded { items } = actual {
+        let normalized = crate::checkcall::normalize_callable(template).ok()?;
+        let idx = crate::overload::find_matching_overload_index(
+            items,
+            &normalized,
+            strict_optional,
+            resolver,
+        )?;
+        let item = items.get(idx)?;
+        return infer_constraints_full_inner(
+            &normalized,
+            item,
+            direction,
+            resolver,
+            aliases,
+            strict_optional,
+            false,
+            true,
+        );
+    }
+    // Instance actual (constraints.py:1848-1857): an Instance with a
+    // `__call__` member is structural Callable; recurse against it, and
+    // a missing member infers nothing.
+    if matches!(actual, Type::Instance { .. }) {
+        use crate::checker_helpers::{get_protocol_member_inner, GetProtocolMemberResult};
+        let found = pyo3::Python::with_gil(|py| {
+            get_protocol_member_inner(py, actual, actual, "__call__", false, false, true, resolver)
+        });
+        return match found {
+            Some(GetProtocolMemberResult::Found(call)) => infer_constraints_full_inner(
+                template,
+                &call,
+                direction,
+                resolver,
+                aliases,
+                strict_optional,
+                false,
+                true,
+            ),
+            // Miss (`if call:` false). Python re-runs `find_member` here,
+            // whose member-access machinery has side effects the kernel
+            // does not replicate; defer so the pure-Python body answers.
+            Some(GetProtocolMemberResult::NoneVal) => None,
+            _ => None,
+        };
+    }
+    // TypeType actual needs `type_object_type` (constraints.py:1832-1847).
+    if matches!(actual, Type::TypeType { .. }) {
+        return None;
+    }
+    // constraints.py:1858-1859: every remaining actual shape (None, union,
+    // tuple, TypeVar, ...) falls to the `else: return []` arm; the
+    // template's shape is irrelevant there.
+    if !matches!(actual, Type::AnyType { .. }) {
+        return Some(vec![]);
+    }
     let callee = match template {
         Type::CallableType {
             arg_types,
@@ -2405,11 +2657,6 @@ fn visit_callable_native(
         _ => return None,
     };
     let (formal_types, formal_kinds, ret_type) = callee;
-    // Only the AnyType actual branch is portable; every other actual shape
-    // (callable, overloaded, typetype, instance) defers to Python.
-    if !matches!(actual, Type::AnyType { .. }) {
-        return None;
-    }
     // Build the derived Any: type_of_any=from_another_any, source_any=actual
     // (constraints.py:1480-1481). Mirrors AnyType(TypeOfAny.from_another_any,
     // source_any=self.actual).

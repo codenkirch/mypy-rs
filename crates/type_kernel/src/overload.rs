@@ -23,7 +23,7 @@ use crate::argmap;
 use crate::checkcall;
 use crate::checkexpr_functions;
 use crate::subtypes;
-use crate::typeinfo::NativeTypeResolver;
+use crate::typeinfo::{NativeTypeResolver, TypeResolver};
 use crate::wire::{read_type, write_type, ReadBuffer, Type, WriteBuffer};
 
 /// Whether a CallableType is a type object (i.e. its fallback is
@@ -758,26 +758,64 @@ pub fn rust_find_matching_overload_items(
     // variants defer through the engine's own `any_unpack_anywhere`.
     let mut matched: Vec<i64> = Vec::new();
     for (idx, blob) in items_wire.iter().enumerate() {
-        let item = match decode_type(blob) {
-            Some(t @ Type::CallableType { .. }) => t,
-            Some(_) | None => return None,
-        };
-        if has_variadic_arg(&item) {
-            return None;
-        }
-        let ctx = subtypes::SubtypeContext::new(false, false, false, false, false, strict_optional);
-        let res = resolver.resolver();
-        match crate::callable_compat::callables_compatible_with_ignore_return(
-            &item, &template, false, // ignore_pos_arg_names
-            false, // strict_concatenate
-            &ctx, res, true, // ignore_return: template return is indeterminate
-        ) {
+        let item = decode_type(blob)?;
+        match overload_item_matches(&item, &template, strict_optional, resolver.resolver()) {
             Some(true) => matched.push(idx as i64),
             Some(false) => {}
             None => return None, // uncertain -> defer the whole call
         }
     }
     Some(matched)
+}
+
+/// Per-pair decision inside `find_matching_overload_items`
+/// (constraints.py:2088-2096): plain-Callable gate, wire-identity gate,
+/// then `is_callable_compatible(item, template, is_compat=is_subtype,
+/// ignore_return=True)`. `None` defers the whole item list.
+pub(crate) fn overload_item_matches(
+    item: &Type,
+    template: &Type,
+    strict_optional: bool,
+    resolver: &TypeResolver,
+) -> Option<bool> {
+    let Type::CallableType { .. } = item else {
+        return None;
+    };
+    if has_variadic_arg(item) {
+        return None;
+    }
+    let ctx = subtypes::SubtypeContext::new(false, false, false, false, false, strict_optional);
+    crate::callable_compat::callables_compatible_with_ignore_return(
+        item, template, false, false, &ctx, resolver, true,
+    )
+}
+
+/// `find_matching_overload_item` (constraints.py:2067-2072): index of the
+/// first item callable-compatible with `template` (ignore_return), else 0
+/// (Python's `matches or items.copy()` fallback). `None` defers the whole
+/// call: an empty list, or any item the engine cannot decide.
+pub(crate) fn find_matching_overload_index(
+    items: &[Type],
+    template: &Type,
+    strict_optional: bool,
+    resolver: &TypeResolver,
+) -> Option<usize> {
+    if items.is_empty() {
+        return None;
+    }
+    let mut first_match: Option<usize> = None;
+    for (idx, item) in items.iter().enumerate() {
+        match overload_item_matches(item, template, strict_optional, resolver) {
+            Some(true) => {
+                if first_match.is_none() {
+                    first_match = Some(idx);
+                }
+            }
+            Some(false) => {}
+            None => return None,
+        }
+    }
+    Some(first_match.unwrap_or(0))
 }
 
 /// Walks a callable's argument/return types for a wire-unserializable
