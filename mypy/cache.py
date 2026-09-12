@@ -34,7 +34,8 @@ More precisely:
   readers must handle these.
 * reserved tag range for Instance type formats is 80 ... 99, for other types it is 100 ... 149.
 * tag 254 is reserved for if we would ever need to extend the tag range to indicated second tag
-  page. Tags 150 ... 253 are free for everything else (e.g. AST nodes etc).
+  page. Tags 153 ... 159 and 230 ... 253 are free for everything else (e.g. AST nodes etc);
+  tags 150 ... 152 are taken by EXTRA_ATTRS, DT_SPEC, and LOCATION.
 
 General convention is that custom classes implement write() and read() methods for FF
 serialization. The write method should write both class tag and end tag. The read method

@@ -3857,6 +3857,30 @@ including:
   green; residual are the #1547 yield failures), cold self-check clean 347.
   Noticed, not fixed: #1551 (multi-alias `import a, b` splits into one
   `Import` node per alias in `tree.imports`).
+- wave 66B AST CI + dead-scaffolding deletion (G0.2, issue #1546): the
+  four dead AST-scaffolding modules (`nodes_full.rs`, `nodes_codec.rs`,
+  `full_ast_codec.rs`, `visitor_engine.rs`, 2,040 lines, zero callers;
+  #138/#140 artifacts) deleted with their `lib.rs` declarations; `rg`
+  confirms no remaining references. ast_serialize now has cargo
+  test/fmt/clippy gates in pr-gate (the pre-existing too-many-arguments
+  and type-complexity lints are silenced with repo-convention allows),
+  and a new `parity-ast` job in native-kernel-parity runs
+  test_nativeparse + testparse + teststubgen (native) plus the testparse
+  fastparse differential; the paths trigger gains
+  nativeparse/fastparse/parse and the three test modules. AST-only tag
+  ranges corrected to 153-159 and 230-253 (150-152 are
+  EXTRA_ATTRS/DT_SPEC/LOCATION); the three astwire-only expression tags
+  that collided with 150-152 moved to 230-232 in both mirrors
+  (`mypy/astwire.py` + `crates/type_kernel/src/astwire.rs`; astwire
+  bytes are traverser-local and never cache-persisted). teststubgen is
+  green; `testIncludeDocstrings` runs for real once #1552 (G0.1) lands
+  in the same wave, so the interim xfail was removed here. #1547's yield
+  trio reproduces on main (3/3 with the shared wave-65 extensions) in
+  both parser modes and is xfailed in teststubgen for the new AST CI
+  gate; remove with the #1547 fix. Gates: cargo type_kernel 2,773/11,
+  ast_serialize 3 (the 7 scaffold tests deleted), fmt + clippy clean
+  both crates, AST parity 876 passed/75 skipped/3 xfailed, testparse
+  fastparse 250/74, testcheck 8,198/15/7 exact, cold self-check 347.
 
 ## Pull Requests
 
