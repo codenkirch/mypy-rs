@@ -4108,7 +4108,7 @@ including:
   - the "wire cache off => serialization dominates" premise is
     disproven for Instance roots: corpus B OFF is not slower than
     corpus A OFF, the funnel wire-cache hit rate is 22% on the smoke
-    corpus, and 92% of engaged puts serialize to <=64B.
+    corpus, and 91% of engaged puts serialize to <=64B.
   All P2b wiring is reverted; the P1 scaffold (`proxy.rs`,
   `mypy/type_proxy.py`, `Options.native_type_proxy`,
   `TEST_NATIVE_TYPE_PROXY`, `_clear_native_resolvers` reset branch) is
