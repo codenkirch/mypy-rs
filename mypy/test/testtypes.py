@@ -25608,6 +25608,252 @@ class NativeConstraintsDeferralSuite(Suite):
 
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeInstanceConstraintArmsSuite(Suite):
+    """Gate-off/on parity for the wave-65C `visit_instance` actual-shape arms.
+
+    Pins the arms that previously deferred the whole `rust_infer_constraints_full`
+    call (issue #1541):
+
+    * both-protocol Instance SUPERTYPE_OF (constraints.py:1550-1572),
+    * Callable actual vs protocol template (callback-protocol + class-object
+      arms, constraints.py:1356-1385, then the fallback continuation),
+    * Tuple actual vs protocol template (constraints.py:1619-1630),
+    * Overloaded actual (`infer_against_overloaded`, constraints.py:1830/1861),
+    * Instance actual (`__call__` member recursion, constraints.py:1848-1857),
+    * the `else: return []` tail for the remaining actual shapes.
+
+    Each test runs `infer_constraints` gate-off vs gate-on and asserts equal
+    constraint lists, plus a direct `rust_infer_constraints_full` call proving
+    native engagement (returns blobs, not None).
+    """
+
+    def setUp(self) -> None:
+        from mypy.constraints import _set_native_constraints_active
+
+        self.fx = TypeFixture()
+        self._live_info: dict[str, TypeInfo] = {}
+        self._set_active = _set_native_constraints_active
+        # Safe default so a mismatched gate never crosses suites.
+        self._set_active(False)
+
+    def tearDown(self) -> None:
+        from mypy.constraints import _set_native_constraints_resolver
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        self._set_active(False)
+        _set_native_constraints_resolver(None)
+        set_wire_typeinfo_map(None)
+
+    # --- synthetic protocol / impl fixtures (protocol-suite shape) ---
+
+    def _method_callable(self, ret: Type | None = None, self_type: Type | None = None) -> CallableType:
+        self_arg = self_type if self_type is not None else self.fx.a
+        return CallableType(
+            [self_arg], [ARG_POS], [None], ret if ret is not None else self.fx.a, self.fx.function
+        )
+
+    def _add_method(self, info: TypeInfo, name: str, typ: ProperType) -> None:
+        node = FuncDef(name, [], None, None)
+        node.info = info
+        node.type = typ
+        node.line = 1
+        node.column = 1
+        info.names[name] = SymbolTableNode(MDEF, node)
+
+    def _synth_info(self, fullname: str, is_protocol: bool) -> TypeInfo:
+        info = self.fx.make_type_info(fullname)
+        info.mro = [info, self.fx.oi]
+        info.is_protocol = is_protocol
+        self._live_info[fullname] = info
+        return info
+
+    def _protocol(self, fullname: str, members: list[str]) -> TypeInfo:
+        info = self._synth_info(fullname, True)
+        inst = Instance(info, [])
+        for name in members:
+            self._add_method(info, name, self._method_callable(self.fx.a, inst))
+        return info
+
+    def _impl(self, fullname: str, members: list[str]) -> TypeInfo:
+        info = self._synth_info(fullname, False)
+        inst = Instance(info, [])
+        for name in members:
+            self._add_method(info, name, self._method_callable(self.fx.a, inst))
+        return info
+
+    def _build_resolver(self) -> None:
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        type_infos = [
+            getattr(self.fx, name)
+            for name in dir(self.fx)
+            if name.endswith("i") and _is_type_info(getattr(self.fx, name))
+        ]
+        type_infos.extend(self._live_info.values())
+        self.resolver = _type_kernel.build_native_resolver(type_infos, [])
+        self.resolver.set_live_typeinfo_map(dict(self._live_info))
+        set_wire_typeinfo_map(dict(self._live_info))
+
+    def _constraints(
+        self, template: Type, actual: Type, direction: int, native: bool
+    ) -> list[Any]:
+        from mypy.constraints import _set_native_constraints_resolver, infer_constraints
+
+        self._set_active(native)
+        if native:
+            self._build_resolver()
+            _set_native_constraints_resolver(self.resolver)
+        else:
+            _set_native_constraints_resolver(None)
+        return infer_constraints(template, actual, direction)
+
+    def _assert_par(self, template: Type, actual: Type, direction: int = SUBTYPE_OF) -> None:
+        native = self._constraints(template, actual, direction, native=True)
+        python = self._constraints(template, actual, direction, native=False)
+        assert_equal(native, python, f"native={native!r} python={python!r}")
+
+    def _assert_engages(
+        self, template: Type, actual: Type, direction: int = SUBTYPE_OF
+    ) -> None:
+        self._build_resolver()
+        tbuf = _WriteBuffer()
+        template.write(tbuf)
+        abuf = _WriteBuffer()
+        actual.write(abuf)
+        raw = _type_kernel.rust_infer_constraints_full(
+            self.resolver,
+            tbuf.getvalue(),
+            abuf.getvalue(),
+            direction,
+            False,
+            False,
+            strict_optional_flag(),
+            True,
+        )
+        assert (
+            raw is not None
+        ), f"Rust seam must engage for template={template!r} actual={actual!r}"
+
+    def _assert_defers(
+        self, template: Type, actual: Type, direction: int = SUBTYPE_OF
+    ) -> None:
+        self._build_resolver()
+        tbuf = _WriteBuffer()
+        template.write(tbuf)
+        abuf = _WriteBuffer()
+        actual.write(abuf)
+        raw = _type_kernel.rust_infer_constraints_full(
+            self.resolver,
+            tbuf.getvalue(),
+            abuf.getvalue(),
+            direction,
+            False,
+            False,
+            strict_optional_flag(),
+            True,
+        )
+        assert raw is None, f"Rust seam must defer for template={template!r} actual={actual!r}"
+
+    def _plain_callable(self, ret: Type) -> CallableType:
+        return CallableType([], [], [], ret, self.fx.function)
+
+    def _plain_callable_with_fallback(self, ret: Type, fallback: Instance) -> CallableType:
+        return CallableType([], [], [], ret, fallback)
+
+    # --- arms ---
+
+    def test_both_protocol_supertype_engages(self) -> None:
+        # constraints.py:1550-1572 fires for a protocol TEMPLATE regardless
+        # of whether the actual is also a protocol; the previous
+        # `!a_snap.is_protocol` gate deferred every such pair.
+        target = Instance(self._protocol("mod.PTarget", ["m"]), [])
+        other = Instance(self._protocol("mod.POther", ["m"]), [])
+        self._assert_par(target, other, SUPERTYPE_OF)
+        self._assert_engages(target, other, SUPERTYPE_OF)
+
+    def test_protocol_actual_supertype_returns_empty(self) -> None:
+        # constraints.py:1550's template arm does not fire for a
+        # non-protocol template, and the SUBTYPE_OF arm needs the opposite
+        # direction; the shape tail then returns [] (line 1589-1641).
+        template = self.fx.a
+        other = Instance(self._protocol("mod.POther2", ["m"]), [])
+        self._assert_par(template, other, SUPERTYPE_OF)
+        self._assert_engages(template, other, SUPERTYPE_OF)
+
+    def test_callable_actual_protocol_template_engages(self) -> None:
+        # A protocol template without `__call__` and a non-type-object
+        # callable actual: the callback arm is skipped and the callable
+        # unwraps to a synthetic non-implementer fallback -> [].
+        target = Instance(self._protocol("mod.PTargetC", ["m"]), [])
+        fallback = Instance(self._impl("mod.NoImplC", ["z"]), [])
+        actual = self._plain_callable_with_fallback(self.fx.a, fallback)
+        self._assert_par(target, actual, SUPERTYPE_OF)
+        self._assert_engages(target, actual, SUPERTYPE_OF)
+
+    def test_callback_protocol_member_engages(self) -> None:
+        # constraints.py:1356-1372: the generic callback-protocol arm runs
+        # `find_member("__call__")` on the template and recurses; the
+        # fallback is a synthetic non-implementer so the arm decides.
+        target = Instance(self._protocol("mod.PCall", ["__call__"]), [])
+        fallback = Instance(self._impl("mod.NoImplCall", ["z"]), [])
+        actual = self._plain_callable_with_fallback(self.fx.a, fallback)
+        self._assert_par(target, actual, SUPERTYPE_OF)
+        self._assert_engages(target, actual, SUPERTYPE_OF)
+
+    def test_type_object_member_arm_parity(self) -> None:
+        # constraints.py:1373-1385: a type-object callable actual runs the
+        # class-object member loop, whose `class_obj=True` fetch stays a
+        # documented defer floor, so the seam defers and parity holds.
+        target = Instance(self._protocol("mod.PLen", ["__len__"]), [])
+        actual = CallableType([], [], [], self.fx.lsta, self.fx.type_type)
+        self._assert_par(target, actual, SUPERTYPE_OF)
+        self._assert_defers(target, actual, SUPERTYPE_OF)
+
+    def test_tuple_actual_protocol_template_engages(self) -> None:
+        # constraints.py:1619-1630: the tuple-fallback protocol special
+        # case; a synthetic non-implementer partial fallback lets the
+        # engine answer False, then the final fallback recursion decides.
+        target = Instance(self._protocol("mod.PTuple", ["__len__"]), [])
+        fallback = Instance(self._impl("mod.NoLen", ["z"]), [])
+        actual = TupleType([self.fx.a], fallback)
+        self._assert_par(target, actual, SUPERTYPE_OF)
+        self._assert_engages(target, actual, SUPERTYPE_OF)
+
+    def test_overloaded_actual_engages(self) -> None:
+        # constraints.py:1830/1861: `infer_against_overloaded` matches the
+        # first callable-compatible item (ignore_return) and recurses on it.
+        template = self._plain_callable(self.fx.a)
+        actual = Overloaded([self._plain_callable(self.fx.a), self._plain_callable(self.fx.b)])
+        self._assert_par(template, actual, SUPERTYPE_OF)
+        self._assert_engages(template, actual, SUPERTYPE_OF)
+
+    def test_instance_call_member_engages(self) -> None:
+        # constraints.py:1848-1857: an Instance actual recurses against its
+        # `__call__` member (bound by `find_member`).
+        info = self._impl("mod.Callable0", ["__call__"])
+        template = self._plain_callable(self.fx.a)
+        actual = Instance(info, [])
+        self._assert_par(template, actual, SUPERTYPE_OF)
+        self._assert_engages(template, actual, SUPERTYPE_OF)
+
+    def test_instance_no_call_member_defers(self) -> None:
+        # Same arm with no `__call__` member: Python's `find_member` miss
+        # path owns position/side-effect bookkeeping the kernel does not
+        # replicate, so the seam defers and Python answers [].
+        info = self._impl("mod.Plain0", ["m"])
+        template = self._plain_callable(self.fx.a)
+        actual = Instance(info, [])
+        self._assert_par(template, actual, SUPERTYPE_OF)
+        self._assert_defers(template, actual, SUPERTYPE_OF)
+
+    def test_callable_actual_else_returns_empty(self) -> None:
+        # constraints.py:1858-1859: every remaining actual shape returns [].
+        template = self._plain_callable(self.fx.a)
+        self._assert_par(template, NoneType(), SUPERTYPE_OF)
+        self._assert_engages(template, NoneType(), SUPERTYPE_OF)
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeConstraintsPolyGateSuite(Suite):
     """Parity suite for the skip_neg_op / infer_polymorphic gate (issue #1226).
 
@@ -55165,13 +55411,15 @@ class NativeIcfProtocolSubtypeArmSuite(Suite):
         self._assert_par(template, actual, SUBTYPE_OF)
         self._assert_engages(template, actual, SUBTYPE_OF)
 
-    def test_direction_supertype_of_still_defers(self) -> None:
-        # The port did not widen the opposite direction: protocol-actual
-        # SUPERTYPE_OF pairs stay a whole-call deferral to Python.
+    def test_direction_supertype_of_returns_empty(self) -> None:
+        # Wave-65C widened the dispatch: a protocol-actual SUPERTYPE_OF pair
+        # misses both structural arms and Python's shape tail returns [],
+        # now decided natively instead of a whole-call defer.
         self._build_resolver(self.iter_info, self.p_info, self.other_info)
         template = Instance(self.iter_info, [self.iter_t])
         actual = Instance(self.p_info, [self.fx.a])
-        self._assert_defers(template, actual, SUPERTYPE_OF)
+        self._assert_par(template, actual, SUPERTYPE_OF)
+        self._assert_engages(template, actual, SUPERTYPE_OF)
 
     def test_non_implementing_template_falls_to_tail(self) -> None:
         # `mod.Other[T]` declares no `f`, so is_protocol_implementation(erased,

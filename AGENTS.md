@@ -3767,6 +3767,61 @@ including:
   fine-grained 747/27 + daemon 37 capture+read, cold self-check 347
   (off and capture), cargo 2,773/11, fmt + clippy clean. Table in
   `docs/plans/2026-09-11-mirror-capture-audit.md` section 8.
+- icf protocol-member actual-shape arms (wave 65C, issue #1541): the
+  largest residual seam `rust_infer_constraints_full` (21,888 calls,
+  149 raw-FFI fallbacks measured on the wave-65 head; the issue's
+  "~219" was the rounded-1% estimate) was audit-first ported. The
+  env-gated defer-reason probe (`MYPY_TK_W65C_AUDIT`, stripped before
+  landing) ranked the leaves: `vi-proto-both-sup` 40 /
+  `vi-callable-proto` 37 / `call-actual-not-any` 36 (Overloaded actual
+  27 + Instance actual 9) / `ffi-extra-tvars` 27 /
+  `tail-protocol-tuple` 6 / `vi-proto-actual-sup` 3.
+  Ported:
+  * both-protocol Instance SUPERTYPE_OF: the `template.is_protocol`
+    SUP arm is no longer gated on `!actual.is_protocol`
+    (constraints.py:1550-1572 fires for any protocol template);
+    protocol-actual SUPERTYPE_OF pairs now take the shape tail's []
+    (dispatch rework + `merge_arm_res` accumulator mirroring Python's
+    shared `res`, including the `if res: return res` precedence before
+    the shape tail).
+  * Callable actual vs protocol template
+    (`visit_instance_callable_protocol_arms`): the generic
+    callback-protocol arm (`find_member("__call__", ...)` via
+    `get_protocol_member_inner` find_member semantics, erased-member
+    subtype gate, recursion) and the class-object arm (`is_type_obj` +
+    `get_instance_type(force_fallback=True)` via
+    `force_fallback_instance` + the member loop with `class_obj=true`;
+    the class-object member fetch remains a documented defer floor),
+    then the callable's fallback continues through the instance logic.
+  * Tuple actual vs protocol template (`visit_instance_tail_native`):
+    the tuple-fallback structural-protocol special case
+    (constraints.py:1619-1630) reusing the parity-tested
+    `is_protocol_implementation_inner` + member loop.
+  * Callable-template actual arms (`visit_callable_native`):
+    Overloaded actual via `overload::find_matching_overload_index`
+    (new `pub(crate)` core factored out of the unchanged
+    `rust_find_matching_overload_items` pyfunction) + normalized-template
+    recursion; Instance actual recurses against a found `__call__`
+    member (the member-miss case defers: Python's `find_member` owns
+    position/side-effect bookkeeping); the remaining shapes take the
+    `else: return []` tail.
+  Result (clean build, proxy survey): 21,888 -> 21,735 calls,
+  149 -> 56 raw-FFI fallbacks (-62%). Residual taxonomy: 51
+  `ffi-extra-tvars` (the polymorphic reverse frame attaches
+  `extra_tvars`; the 3-field wire has no channel, the #1171/#1427
+  floor), 1 protocol-member fetch defer, 4 Instance-actual miss
+  defers (the `NoneVal` defer above). The 24 Overloaded-actual calls
+  now solve natively but surface extras and defer at the FFI boundary;
+  they retire wholesale when the extras channel lands. Pins:
+  `NativeInstanceConstraintArmsSuite` (10 gate-off/on parity +
+  direct-seam tests; class-object and member-miss defers documented
+  and asserted), `NativeIcfProtocolSubtypeArmSuite` supertype-direction
+  pin reworked to `..._returns_empty`. Gates: cargo 2,772/11, fmt +
+  clippy clean, cold self-check clean 347, testtypes 3,403/7
+  (3,393 baseline + 10 new), testcheck 8,144/69/7 exact (same command
+  and counts as the pre-change baseline `.so`; the merged-head
+  `8,198/15/7` differs only by 54 environment-skips), fine-grained
+  747/27 + daemon 37, survey numbers reproduced from the issue.
 
 ## Pull Requests
 
