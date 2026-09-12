@@ -66,6 +66,17 @@ jobs:
           PYO3_PYTHON=$(uv run python -c "import sys; print(sys.executable)") \
           PYTHONPATH="$GITHUB_WORKSPACE:$SITE" cargo test -p mypy-type-kernel
 
+      - name: cargo fmt --check (ast_serialize)
+        run: cargo fmt -p mypy-ast-serialize -- --check
+
+      - name: cargo clippy (ast_serialize lib)
+        run: cargo clippy -p mypy-ast-serialize --lib -- -D warnings
+
+      - name: cargo test (ast_serialize suites)
+        run: |
+          PYO3_PYTHON=$(uv run python -c "import sys; print(sys.executable)") \
+          cargo test -p mypy-ast-serialize
+
       - name: Build type_kernel extension
         run: |
           SCRATCH=/tmp/type-kernel-ext

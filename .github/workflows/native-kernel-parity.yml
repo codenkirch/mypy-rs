@@ -38,6 +38,12 @@ on:
       - mypy/test/testtypes.py
       - mypy/test/testfinegrained.py
       - mypy/test/testinfer.py
+      - mypy/nativeparse.py
+      - mypy/fastparse.py
+      - mypy/parse.py
+      - mypy/test/test_nativeparse.py
+      - mypy/test/testparse.py
+      - mypy/test/teststubgen.py
       - .github/workflows/native-kernel-parity.yml
   workflow_dispatch:
 
@@ -333,3 +339,62 @@ jobs:
           MYPY_NATIVE_PARITY_INSTALL_TYPEOPS_RESOLVERS: "1"
           MYPY_NATIVE_TYPE_KERNEL_REQUIRED: "1"
         run: uv run python -m pytest mypy/test/testcheck.py -q -k "not slow" --timeout=30 --timeout-method=thread
+
+  parity-ast:
+    # G0.2 (#1546): the AST path (test_nativeparse / testparse /
+    # teststubgen) ran in no workflow. teststubgen always parses natively:
+    # stubgen builds its own Options and ignores TEST_NATIVE_PARSER.
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Python 3.13
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          version: "0.11.14"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-parity-${{ runner.os }}-${{ hashFiles('**/Cargo.toml') }}
+          restore-keys: cargo-parity-${{ runner.os }}-
+
+      - name: Sync Python deps (uv)
+        run: uv sync --group test
+
+      - name: Build ast_serialize extension
+        run: |
+          SCRATCH=/tmp/ast-serialize-ext
+          mkdir -p "$SCRATCH"
+          cargo rustc -p mypy-ast-serialize --features extension-module \
+            --lib --crate-type cdylib --release
+          EXT_SUFFIX=$(uv run python -c "import sysconfig; print(sysconfig.get_config_var('EXT_SUFFIX'))")
+          cp target/release/libast_serialize.so "$SCRATCH/ast_serialize${EXT_SUFFIX}" 2>/dev/null || cp target/release/libast_serialize.dylib "$SCRATCH/ast_serialize${EXT_SUFFIX}"
+          echo "SCRATCH=$SCRATCH" >> "$GITHUB_ENV"
+
+      - name: AST parity (native parser)
+        env:
+          PYTHONPATH: ${{ env.SCRATCH }}
+          TEST_NATIVE_PARSER: "1"
+        run: uv run python -m pytest mypy/test/test_nativeparse.py mypy/test/testparse.py mypy/test/teststubgen.py -q -n4 --timeout=30 --timeout-method=thread
+
+      - name: AST fastparse differential (Python parser)
+        env:
+          PYTHONPATH: ${{ env.SCRATCH }}
+          TEST_NATIVE_PARSER: "0"
+        run: uv run python -m pytest mypy/test/testparse.py -q -n4 --timeout=30 --timeout-method=thread
