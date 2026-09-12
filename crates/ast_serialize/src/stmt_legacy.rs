@@ -201,12 +201,11 @@ fn serialize_import(serializer: &mut Serializer<'_>, import: &ast::StmtImport) -
     write_import_metadata_tail(&mut serializer.writer, &loc, flags);
     serializer.writer.tag(END_TAG);
 
-    for (name, asname) in names {
+    for (name, _) in names {
         serializer.imports.push(ImportMetadata {
             tag: IMPORT_METADATA,
             module: name,
             relative: 0,
-            asname,
             names: Vec::new(),
             loc: loc.clone(),
             flags,
@@ -239,7 +238,6 @@ fn serialize_import_from(
             tag: IMPORTALL_METADATA,
             module: raw_module,
             relative,
-            asname: None,
             names: Vec::new(),
             loc,
             flags,
@@ -264,7 +262,6 @@ fn serialize_import_from(
         tag: IMPORTFROM_METADATA,
         module,
         relative,
-        asname: None,
         names,
         loc,
         flags,

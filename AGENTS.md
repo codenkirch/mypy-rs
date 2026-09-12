@@ -4172,6 +4172,30 @@ including:
   / `mypy/test/testcachedata.py` / `stubs/ast_serialize.pyi` path
   triggers. Built in the private `mypy-rs-local-ast-1566` scratch dir;
   shared dirs untouched.
+- wave 69B multi-alias import grouping, AST wire v6 (issue #1551):
+  `import a, b` split into one `Import` node per alias in
+  `tree.imports` because `serialize_import` pushed one
+  `IMPORT_METADATA` record per alias (statement nodes were already
+  correct; deps unaffected). The record now carries the statement's
+  whole alias list (LIST_GEN + count + name/asname pairs, mirroring
+  `IMPORTFROM_METADATA`), the writer pushes one record per statement,
+  and `nativeparse.deserialize_imports` rebuilds a single
+  `Import(names)`. `AST_WIRE_VERSION` 5 -> 6 with the caller constant
+  (`mypy/nativeparse.py`) and `stubs/ast_serialize.pyi` updated; the
+  dead `asname` field dropped from `ImportMetadata`; the frozen
+  `stmt_legacy.rs` reference only loses the field. Single-alias
+  imports use the same grouped shape (no dual record layout; the
+  version bump covers the bytes). Tests: 5 data-driven
+  `native-parser-imports.test` cases (multi-alias, asnames, mixed,
+  unreachable, in-function; `format_reachable_imports` now renders one
+  line per statement so a split is visible), fastparse differentials
+  for tree.imports + statements (`test_multi_alias_import_grouping`)
+  and dependency-discovery flags, a v6 golden blob
+  (`test_v6_golden_multi_alias_import_metadata`), and 4 Rust record
+  unit tests. Gates: cargo ast_serialize 19/0, fmt + clippy clean;
+  AST suites 892/75/2 xfailed; testparse fastparse 250/74; testcheck
+  8,144/69/7/0 exact local baseline (CI's 8,198/15/7); cold
+  self-check clean 348; fine-grained 747/27 + daemon 38.
 
 ## Pull Requests
 

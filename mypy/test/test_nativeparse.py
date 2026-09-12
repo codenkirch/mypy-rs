@@ -213,12 +213,16 @@ def format_reachable_imports(node: MypyFile) -> list[str]:
         flags_str = " [" + ", ".join(flags) + "]" if flags else ""
 
         if isinstance(imp, Import):
-            # Format: line: import foo [as bar] [flags]
+            # Format: line: import foo [as bar], baz [flags]
+            # One line per statement so a multi-alias split into several
+            # Import nodes is visible in the expected output (#1551).
+            name_parts = []
             for module_id, as_id in imp.ids:
                 if as_id:
-                    output.append(f"{line_num}: import {module_id} as {as_id}{flags_str}")
+                    name_parts.append(f"{module_id} as {as_id}")
                 else:
-                    output.append(f"{line_num}: import {module_id}{flags_str}")
+                    name_parts.append(module_id)
+            output.append(f"{line_num}: import {', '.join(name_parts)}{flags_str}")
         elif isinstance(imp, ImportFrom):
             # Format: line: from foo import bar, baz [as b] [flags]
             # Handle relative imports
@@ -375,6 +379,24 @@ class TestNativeParserBinaryFormat(unittest.TestCase):
             + [END_TAG],
         )
 
+    def test_v6_golden_multi_alias_import_metadata(self) -> None:
+        # Pins the v6 IMPORT_METADATA record: one statement record carrying the
+        # whole alias list (list tag, count, name/asname pairs), then loc+flags.
+        import_bytes = parse_to_binary_ast("", Options(), "import a, b as c\n")[3]
+        self.assertEqual(
+            list(import_bytes),
+            [LIST_GEN, _int_enc(1), nodes.IMPORT_METADATA, LIST_GEN, _int_enc(2)]
+            + [LITERAL_STR, _int_enc(1)]
+            + list(b"a")
+            + [0]
+            + [LITERAL_STR, _int_enc(1)]
+            + list(b"b")
+            + [1, LITERAL_STR, _int_enc(1)]
+            + list(b"c")
+            + _locs(1, 0, 1, 16)
+            + [LITERAL_INT, _int_enc(1)],
+        )
+
 
 def _collect_docstrings(tree: MypyFile) -> dict[tuple[int, str, str], str | None]:
     docstrings: dict[tuple[int, str, str], str | None] = {}
@@ -477,6 +499,56 @@ class TestNativeParserOptionParity(unittest.TestCase):
             options.custom_typing_module = custom
             fast, native = self._parse_both(source, options)
             self.assertEqual(_collect_imports(fast), _collect_imports(native), custom)
+
+    def test_multi_alias_import_grouping(self) -> None:
+        # v6: `import a, b` is one Import node in both tree.imports and defs,
+        # and per-alias asnames survive. Covers the custom-typing translation
+        # path where a translated alias gains an implicit asname.
+        source = (
+            "import a, b\n"
+            "import c as x, d as y\n"
+            "import e, f as z\n"
+            "import g.h, i\n"
+            "import single\n"
+            "import foo, bar\n"
+            "if False:\n"
+            "    import unreachable, unreachable2\n"
+        )
+        for custom in (None, "foo"):
+            options = Options()
+            options.python_version = (3, 13)
+            options.custom_typing_module = custom
+            fast, native = self._parse_both(source, options)
+            self.assertEqual(_collect_imports(fast), _collect_imports(native), custom)
+
+    def test_multi_alias_import_dependency_flags(self) -> None:
+        # The dependency-discovery surface reads one Import per statement with
+        # the same ids, line, and unreachable flags as the fast parser.
+        source = "import a, b\nif PY2:\n    import c, d\n"
+        options = Options()
+        options.python_version = (3, 13)
+        errors = Errors(options)
+        fast = fastparse.parse(
+            bytes(source, "utf-8"), fnam="main", module="main", errors=errors, options=options
+        )
+        native, _errors, _ignores = native_parse("main", options, source)
+        assert native.raw_data is not None
+        native_imports = deserialize_imports(native.raw_data.imports, dependency_discovery=True)
+
+        dep_records = [
+            (tuple(imp.ids), imp.is_unreachable, imp.is_unreachable_dependency)
+            for imp in native_imports
+            if isinstance(imp, nodes.Import)
+        ]
+        self.assertEqual(
+            dep_records,
+            [
+                ((("a", None), ("b", None)), False, False),
+                ((("c", None), ("d", None)), True, True),
+            ],
+        )
+        fast_lines = [imp.line for imp in fast.imports if isinstance(imp, nodes.Import)]
+        self.assertEqual(fast_lines, [1, 3])
 
     def test_pos_only_special_methods_option(self) -> None:
         source = (

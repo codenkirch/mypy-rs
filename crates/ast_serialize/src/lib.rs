@@ -20,7 +20,7 @@ mod sym_node;
 /// Wire format version for the serialized AST returned by `parse`.
 /// Bump when a record layout changes; `parse` rejects any other value so a
 /// stale extension fails at the entry instead of mid-deserialization.
-const AST_WIRE_VERSION: i64 = 5;
+const AST_WIRE_VERSION: i64 = 6;
 
 const LITERAL_NONE: u8 = 2;
 const LITERAL_INT: u8 = 3;
@@ -422,7 +422,6 @@ struct ImportMetadata {
     tag: u8,
     module: String,
     relative: i64,
-    asname: Option<String>,
     names: Vec<(String, Option<String>)>,
     loc: SourceLocation,
     flags: i64,
@@ -833,10 +832,15 @@ fn serialize_import_metadata(imports: &[ImportMetadata]) -> Vec<u8> {
     for import in imports {
         writer.tag(import.tag);
         match import.tag {
+            // One record per `import a, b` statement, carrying the full alias
+            // list so the reader rebuilds a single `Import` node (v6 split fix).
             IMPORT_METADATA => {
-                writer.string(&import.module);
-                writer.int(import.relative);
-                write_optional_string(&mut writer, import.asname.as_deref());
+                writer.tag(LIST_GEN);
+                writer.bare_int(import.names.len() as i64);
+                for (name, asname) in &import.names {
+                    writer.string(name);
+                    write_optional_string(&mut writer, asname.as_deref());
+                }
             }
             IMPORTFROM_METADATA => {
                 writer.string(&import.module);
@@ -2972,6 +2976,144 @@ def f(x):
         let raw = serialize_test_source("import foo.bar\n", false, Some("foo"));
         let plain = serialize_test_source("import foo.bar\n", false, None);
         assert_eq!(raw, plain);
+    }
+
+    fn serialize_test_import_metadata(
+        source: &str,
+        custom_typing_module: Option<&str>,
+    ) -> (usize, Vec<u8>) {
+        let suite = parse_module(source).unwrap().into_suite();
+        let (_, imports, _, _) = serialize_suite(
+            &suite,
+            source,
+            (3, 10),
+            String::new(),
+            Vec::new(),
+            Vec::new(),
+            false,
+            HashMap::new(),
+            false,
+            custom_typing_module.map(str::to_owned),
+        )
+        .unwrap();
+        let count = imports.len();
+        (count, serialize_import_metadata(&imports))
+    }
+
+    #[test]
+    fn import_metadata_groups_statement_aliases() {
+        // v6: one record per `import a, b` statement, carrying the whole alias
+        // list; pins the record layout read by nativeparse.deserialize_imports.
+        let (count, bytes) = serialize_test_import_metadata("import a, b as c\n", None);
+        assert_eq!(count, 1);
+        assert_eq!(
+            bytes,
+            [
+                LIST_GEN,
+                22, // one statement record
+                IMPORT_METADATA,
+                LIST_GEN,
+                24, // two aliases
+                LITERAL_STR,
+                22,
+                b'a',
+                0, // no asname
+                LITERAL_STR,
+                22,
+                b'b',
+                1,
+                LITERAL_STR,
+                22,
+                b'c',
+                LOCATION,
+                22,
+                20,
+                20,
+                52, // "import a, b as c" spans columns 0..16
+                LITERAL_INT,
+                22, // top-level flag
+            ]
+        );
+    }
+
+    #[test]
+    fn import_metadata_single_alias_matches_group_shape() {
+        let (count, bytes) = serialize_test_import_metadata("import a\n", None);
+        assert_eq!(count, 1);
+        assert_eq!(
+            bytes,
+            [
+                LIST_GEN,
+                22,
+                IMPORT_METADATA,
+                LIST_GEN,
+                22,
+                LITERAL_STR,
+                22,
+                b'a',
+                0,
+                LOCATION,
+                22,
+                20,
+                20,
+                36,
+                LITERAL_INT,
+                22,
+            ]
+        );
+    }
+
+    #[test]
+    fn import_metadata_custom_typing_module_groups_translated_names() {
+        let (count, bytes) = serialize_test_import_metadata("import foo, bar\n", Some("foo"));
+        assert_eq!(count, 1);
+        // First alias translates to "typing" with implicit asname "foo",
+        // second stays "bar" without asname.
+        assert_eq!(
+            bytes,
+            [
+                LIST_GEN,
+                22,
+                IMPORT_METADATA,
+                LIST_GEN,
+                24,
+                LITERAL_STR,
+                32,
+                b't',
+                b'y',
+                b'p',
+                b'i',
+                b'n',
+                b'g',
+                1,
+                LITERAL_STR,
+                26,
+                b'f',
+                b'o',
+                b'o',
+                LITERAL_STR,
+                26,
+                b'b',
+                b'a',
+                b'r',
+                0,
+                LOCATION,
+                22,
+                20,
+                20,
+                50, // "import foo, bar" spans columns 0..15
+                LITERAL_INT,
+                22,
+            ]
+        );
+    }
+
+    #[test]
+    fn import_metadata_one_record_per_statement() {
+        let (count, bytes) = serialize_test_import_metadata("import a, b\nimport c\n", None);
+        assert_eq!(count, 2);
+        // Outer list header: tag + count.
+        assert_eq!(&bytes[..2], &[LIST_GEN, 24]);
     }
 
     #[test]

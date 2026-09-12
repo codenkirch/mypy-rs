@@ -1371,17 +1371,16 @@ pub(crate) fn build_stmt(
                 &import.names,
                 serializer.custom_typing_module.as_deref(),
             );
-            for (name, asname) in &names {
-                serializer.imports.push(crate::ImportMetadata {
-                    tag: crate::IMPORT_METADATA,
-                    module: name.clone(),
-                    relative: 0,
-                    asname: asname.clone(),
-                    names: Vec::new(),
-                    loc: loc.clone(),
-                    flags,
-                });
-            }
+            // One metadata record per statement: `import a, b` must rebuild a
+            // single `Import` node with both aliases, like fastparse (#1551).
+            serializer.imports.push(crate::ImportMetadata {
+                tag: crate::IMPORT_METADATA,
+                module: String::new(),
+                relative: 0,
+                names: names.clone(),
+                loc: loc.clone(),
+                flags,
+            });
             StmtNode::Import { names, loc, flags }
         }
         ast::Stmt::ImportFrom(import) => {
@@ -1397,7 +1396,6 @@ pub(crate) fn build_stmt(
                     tag: crate::IMPORTALL_METADATA,
                     module: raw_module.clone(),
                     relative,
-                    asname: None,
                     names: Vec::new(),
                     loc: loc.clone(),
                     flags,
@@ -1418,7 +1416,6 @@ pub(crate) fn build_stmt(
                     tag: crate::IMPORTFROM_METADATA,
                     module: module.clone(),
                     relative,
-                    asname: None,
                     names: names.clone(),
                     loc: loc.clone(),
                     flags,

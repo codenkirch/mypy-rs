@@ -27,6 +27,34 @@ import bar as b
 1: import foo as f
 2: import bar as b
 
+[case testMultiAliasImport]
+import foo, bar
+[out]
+1: import foo, bar
+
+[case testMultiAliasImportAs]
+import foo as f, bar as b
+[out]
+1: import foo as f, bar as b
+
+[case testMultiAliasMixedImport]
+import foo, bar as b, baz.qux
+[out]
+1: import foo, bar as b, baz.qux
+
+[case testMultiAliasUnreachableImport]
+if PY2:
+    import foo, bar
+import baz, qux
+[out]
+3: import baz, qux
+
+[case testMultiAliasImportInFunction]
+def f():
+    import foo, bar
+[out]
+2: import foo, bar [not top_level]
+
 [case testFromImport]
 from foo import bar
 [out]

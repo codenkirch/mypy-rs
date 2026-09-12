@@ -1,7 +1,7 @@
 """Inline stub for the in-tree Rust extension ``ast_serialize``.
 
-The extension is built from ``crates/ast_serialize`` and writes AST wire v5:
-the parse entry enforces ``cache_version == 5``, the data dict carries
+The extension is built from ``crates/ast_serialize`` and writes AST wire v6:
+the parse entry enforces ``cache_version == 6``, the data dict carries
 ``ast_wire_version``, and the docstring and custom-typing-module options are
 threaded through. The PyPI ``ast-serialize`` wheel pinned in pyproject still
 declares the older v4 surface, so mypy's self-check resolves the current

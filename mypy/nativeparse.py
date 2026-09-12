@@ -164,7 +164,9 @@ TypeIgnores = list[tuple[int, list[str]]]
 # Wire format version written by the ast_serialize extension. Must match
 # AST_WIRE_VERSION in crates/ast_serialize/src/lib.rs; parse() rejects a
 # mismatch at the entry instead of failing mid-deserialization.
-AST_WIRE_VERSION: Final = 5
+# v6: IMPORT_METADATA carries the statement's whole alias list so one
+# `import a, b` rebuilds a single Import node.
+AST_WIRE_VERSION: Final = 6
 
 # There is no way to create reasonable fallbacks at this stage,
 # they must be patched later.
@@ -2215,17 +2217,20 @@ def deserialize_imports(
         tag = read_tag(data)
 
         if tag == IMPORT_METADATA:
-            name = read_str(data)
-            relative = read_int(data)
+            expect_tag(data, LIST_GEN)
+            n_names = read_int_bare(data)
+            names: list[tuple[str, str | None]] = []
 
-            has_asname = read_bool(data)
-            if has_asname:
-                asname = read_str(data)
-            else:
-                asname = None
+            for _ in range(n_names):
+                name = read_str(data)
+                has_asname = read_bool(data)
+                if has_asname:
+                    asname = read_str(data)
+                else:
+                    asname = None
+                names.append((name, asname))
 
-            # Note: relative imports are handled via ImportFrom, so relative should be 0 here
-            stmt = Import([(name, asname)])
+            stmt = Import(names)
             _read_and_set_import_metadata(data, stmt, dependency_discovery=dependency_discovery)
             imports.append(stmt)
 
@@ -2235,7 +2240,7 @@ def deserialize_imports(
 
             expect_tag(data, LIST_GEN)
             n_names = read_int_bare(data)
-            names: list[tuple[str, str | None]] = []
+            names = []
 
             for _ in range(n_names):
                 name = read_str(data)
