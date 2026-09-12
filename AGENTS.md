@@ -4077,6 +4077,49 @@ including:
   182k le64 puts cannot pay for the store) or a corpus where the F2
   wire cache is off (semanal phases), and must re-run the same A/B on
   a quiet host first.
+- wave 69C proxy P2b thresholded read shadow, DROPPED on measurement
+  (issue #1567): the preserved P2 patch was re-applied plus an
+  engagement/size threshold - no-arg `Instance` roots defer to the
+  funnel's `_encode_no_arg_instance` fast path (`scope_defer.trivial`),
+  blobs below `_PROXY_MIN_BYTES` (env `MYPY_TK_PROXY_MIN_BYTES`, tuned
+  to 64) are served but not shadowed (with the wire cache on the read
+  defers so the funnel caches the object; with it off the fresh bytes
+  serve the read), and per-size hit counters (`serialize_bytes`,
+  `hit_size_*`, `skip_small.*`) plus inlined audit guards tune the cut.
+  Measured on two corpora, 4 interleaved pairs each at N=64
+  (`FORCE_NATIVE_TYPE_PROXY` 0/1, `MYPY_TK_PROXY_AUDIT=1`): corpus A =
+  normal cold self-check, corpus B = `MYPY_NO_WIRE_CACHE=1` (verified
+  off: smoke `serialize_hits` 34,420 -> 0).
+  - corpus A: wall median +8.97% (pairs +32.2/-21.0/+51.4/-14.3), user
+    CPU median +13.99% - the N=64 defer path double-serializes (162,746
+    `skip_small.defer` events: one `_fresh_bytes` plus the funnel's own).
+  - corpus B: wall median -11.02%, user CPU median -5.63% (pairs
+    -13.4/+57.7/-8.8/-2.5); per-pair user ratios span 0.87-1.58 and
+    identical OFF runs consumed 61-135s user CPU (load avg 13-67 from
+    sibling agents), so the medians cannot separate the expected
+    <=0.5% effect from host contention. An earlier block measured during
+    a load spike (load avg 60+) was discarded as non-stationary.
+  - threshold tuning (corpus B): N=0 stores 194.5k blobs / 12.9MB and
+    serves 383.6k hits (-0.8% wall / -2.4% user, 1 pair); N=64 stores
+    20.9k / 7.0MB, 26.9k hits, 530k below-N serves; N=256 stores 1.8k /
+    5.2MB and is effectively off (376 hits, +4.8% user). The shape gate
+    cuts 244k no-arg deferrals. The expected ceiling at N=0 is <=0.5% of
+    wall (383.6k hits x ~0.5-1us saved), below the noise floor.
+  - the "wire cache off => serialization dominates" premise is
+    disproven for Instance roots: corpus B OFF is not slower than
+    corpus A OFF, the funnel wire-cache hit rate is 22% on the smoke
+    corpus, and 92% of engaged puts serialize to <=64B.
+  All P2b wiring is reverted; the P1 scaffold (`proxy.rs`,
+  `mypy/type_proxy.py`, `Options.native_type_proxy`,
+  `TEST_NATIVE_TYPE_PROXY`, `_clear_native_resolvers` reset branch) is
+  unchanged and the tree is `770fe596c` + this bullet. The P2b
+  implementation is preserved as
+  `/private/tmp/mypy-rs-1567-p2b.patch` for a future slice targeting a
+  seam with real serialization volume (non-Instance roots or nested
+  writes), not root Instance funnels. Final-tree gates: cargo
+  type_kernel 2,791/11, fmt + clippy clean, testtypes 3,424/7,
+  testcheck 8,198/15/7/0, fine-grained 747/27, daemon 38, cold
+  self-check clean 348.
 
 ## Pull Requests
 
