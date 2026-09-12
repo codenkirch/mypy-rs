@@ -118,6 +118,8 @@ mod overload;
 mod overload_never;
 mod overload_override;
 mod protocols;
+// ADR-0004 proxy P1 (#1553): blob-backed read-shadow store scaffold.
+mod proxy;
 
 mod findmember;
 mod partially_defined;
@@ -3453,6 +3455,16 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         mirror::rust_mirror_patch_callable_flags,
         module
     )?)?;
+
+    // ADR-0004 proxy P1 (#1553): blob-backed read-shadow store keyed by
+    // identity handles. No funnel reads an entry in P1 (zero behavior
+    // change); P2 wires the lazy Instance read shadow.
+    module.add_function(wrap_pyfunction!(proxy::rust_proxy_read, module)?)?;
+    module.add_function(wrap_pyfunction!(proxy::rust_proxy_put, module)?)?;
+    module.add_function(wrap_pyfunction!(proxy::rust_proxy_drop, module)?)?;
+    module.add_function(wrap_pyfunction!(proxy::rust_proxy_reset, module)?)?;
+    module.add_function(wrap_pyfunction!(proxy::rust_proxy_entry_count, module)?)?;
+    module.add_function(wrap_pyfunction!(proxy::rust_proxy_handle_of, module)?)?;
 
     Ok(())
 }

@@ -1827,6 +1827,13 @@ class BuildManager:
             from mypy import types_mirror
 
             types_mirror.reset()
+        if self.options.native_type_proxy:
+            # Proxy entries pin live objects and cache wire bytes too; a
+            # stale graph must never survive a build boundary. `reset`
+            # leaves `identity` alone (mirror owns that reset).
+            from mypy import type_proxy
+
+            type_proxy.reset()
         if not self.options.native_type_kernel:
             return
         self._native_resolver = None
