@@ -1231,6 +1231,12 @@ class BuildManager:
         from mypy.cache import _set_native_cache_active
 
         _set_native_cache_active(self.options.native_type_kernel)
+        # G0.5 (#1566): gate the Rust fixed-format cache *data* writer.
+        # The writer lives in ast_serialize and defers to `MypyFile.write`
+        # on any shape it does not implement, so the format is unchanged.
+        from mypy.cache_data import _set_native_cache_data_active
+
+        _set_native_cache_data_active(self.options.native_type_kernel)
         # Stage 4: clear stale plugin-hook snapshot, then build the
         # registry. Plugins are config-static, so build once here.
         from mypy.checkexpr import _set_native_plugin_hook_registry
@@ -3424,9 +3430,13 @@ def write_cache(
 
     # Serialize data and analyze interface
     if manager.options.fixed_format_cache:
-        data_io = WriteBuffer()
-        tree.write(data_io)
-        data_bytes = data_io.getvalue()
+        from mypy.cache_data import _try_native_write_cache_data
+
+        data_bytes = _try_native_write_cache_data(tree)
+        if data_bytes is None:
+            data_io = WriteBuffer()
+            tree.write(data_io)
+            data_bytes = data_io.getvalue()
     else:
         data = tree.serialize()
         data_bytes = json_dumps(data, manager.options.debug_cache)

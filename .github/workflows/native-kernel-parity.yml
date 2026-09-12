@@ -41,9 +41,12 @@ on:
       - mypy/nativeparse.py
       - mypy/fastparse.py
       - mypy/parse.py
+      - mypy/cache_data.py
       - mypy/test/test_nativeparse.py
       - mypy/test/testparse.py
       - mypy/test/teststubgen.py
+      - mypy/test/testcachedata.py
+      - stubs/ast_serialize.pyi
       - .github/workflows/native-kernel-parity.yml
   workflow_dispatch:
 
@@ -392,6 +395,11 @@ jobs:
           PYTHONPATH: ${{ env.SCRATCH }}
           TEST_NATIVE_PARSER: "1"
         run: uv run python -m pytest mypy/test/test_nativeparse.py mypy/test/testparse.py mypy/test/teststubgen.py -q -n4 --timeout=30 --timeout-method=thread
+
+      - name: Cache data writer parity (G0.5)
+        env:
+          PYTHONPATH: ${{ env.SCRATCH }}
+        run: uv run python -m pytest mypy/test/testcachedata.py -q -n4 --timeout=120 --timeout-method=thread
 
       - name: AST fastparse differential (Python parser)
         env:

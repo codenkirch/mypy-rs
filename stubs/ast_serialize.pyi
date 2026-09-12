@@ -10,10 +10,11 @@ surface here via ``mypy_path`` (same pattern as ``module_resolver.pyi``).
 
 from __future__ import annotations
 
-from typing import TypeAlias, TypedDict, type_check_only
+from collections.abc import Callable
+from typing import Any, TypeAlias, TypedDict, type_check_only
 from typing_extensions import NotRequired
 
-__all__ = ["parse"]
+__all__ = ["parse", "write_cache_data"]
 
 _TypeIgnores: TypeAlias = list[tuple[int, list[str]]]
 
@@ -46,3 +47,11 @@ def parse(
     include_docstrings: bool = False,
     custom_typing_module: str | None = None,
 ) -> tuple[bytes, list[ParseError], _TypeIgnores, bytes, _ASTData]: ...
+
+def write_cache_data(
+    tree: Any,
+    capture_type_opt: Callable[[Any], bytes],
+    capture_type_list: Callable[[Any], bytes],
+    capture_literal: Callable[[Any], bytes],
+    capture_json: Callable[[Any], bytes],
+) -> bytes | None: ...

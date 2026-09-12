@@ -4120,6 +4120,55 @@ including:
   type_kernel 2,791/11, fmt + clippy clean, testtypes 3,424/7,
   testcheck 8,198/15/7/0, fine-grained 747/27, daemon 38, cold
   self-check clean 348.
+- wave 69A symbol-node enum + writer + cache payload contract (G0.5,
+  issue #1566): new `crates/ast_serialize/src/sym_node.rs` ports the
+  `mypy/nodes.py` fixed-format `write()` field sets - `MypyFile`,
+  `SymbolTable` / `SymbolTableNode` (sorted bare-key dict, skip
+  `__builtins__` / `no_serialize`, cross-ref prefix rule with the
+  `from_module_getattr` exception), `TypeInfo` (+ `ClassDef`), `Var`
+  (19 flags), `FuncDef` (14 flags; the issue's "FuncData" = the
+  FuncItem/FuncDef write fields), `Decorator`, `OverloadedFuncDef`,
+  `TypeVarExpr`, `ParamSpecExpr`, `TypeVarTupleExpr`, `TypeAlias` and
+  `DataclassTransformSpec`. `SymNode` records are built from live
+  PyO3 objects; the writer is pure Rust and mirrors the tag/field/flag
+  order byte-for-byte. Type-valued fields, `Var.final_value` and
+  `TypeInfo.metadata` stay opaque payloads captured through four
+  Python callbacks (the G0.3 `Lambda.parameters` pattern: type capture
+  rides `_write_type_cached`, so the F3 wire cache still serves).
+  Defer contract: an unknown shape (`PlaceholderNode`, non-MypyFile
+  root, unreadable fact) returns `None` and `MypyFile.write` runs;
+  `PyAttributeError` / `PyAssertionError` / `PyNotImplementedError`
+  map to the same defer, other PyErrs propagate (#1466 pattern).
+  Production wiring: `mypy/cache_data.py` shim + `build.py`
+  `write_cache` dispatch, activated with the meta writer from
+  `Options.native_type_kernel`; `stubs/ast_serialize.pyi` declares the
+  seam. Cache-format decision: output is byte-identical, so
+  `CACHE_VERSION` stays 13, the JSON path is untouched and
+  `FileRawData` / the AST wire (`AST_WIRE_VERSION` 5) are unchanged;
+  fine-grained never writes cache files (`State.write_cache` guard),
+  so it is untouched. Parity evidence: new
+  `mypy/test/testcachedata.py` (4 tests: live-tree parity over the
+  built package + real typeshed deps, production-path engagement via a
+  patched shim counter, cached-tree decode -> re-encode parity + astdiff
+  symbol-table structural equality excluding `__builtins__`, defer
+  contract) plus a temporary env-gated `MYPY_CACHE_DATA_AUDIT=1` audit
+  (stripped before landing) that A/B'd every production write on the
+  cold self-check: 811 module writes, 0 defers, 0 mismatches, re-run
+  with the in-repo librt scratch (F3 `write_raw_bytes` splice active)
+  likewise 811/0/0; warm re-run 811 `Metadata fresh`, 0 writes,
+  cache-consuming. Gates: cargo ast_serialize 22/0 (+7 unit tests,
+  was 15/0), fmt + clippy `--all-targets -D warnings` clean; AST
+  suites 888 passed/75 skipped/2 xfailed (884 baseline + 4 new);
+  testcheck 8,198/15/7/0 exact on the fastparse path and
+  8,144/69/7/0 exact with `TEST_NATIVE_PARSER=1
+  TEST_NATIVE_RESOLVER=1` (54 `_no_native_parse` skips); cold
+  self-check clean 350 (= 348 + `mypy/cache_data.py` +
+  `mypy/test/testcachedata.py`), warm clean and cache-consuming;
+  fine-grained 747/27 + daemon 38; testfinegrainedcache 549/229.
+  CI: `parity-ast` gains a cache-data step plus `mypy/cache_data.py`
+  / `mypy/test/testcachedata.py` / `stubs/ast_serialize.pyi` path
+  triggers. Built in the private `mypy-rs-local-ast-1566` scratch dir;
+  shared dirs untouched.
 
 ## Pull Requests
 

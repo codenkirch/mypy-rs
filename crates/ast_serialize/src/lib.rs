@@ -15,6 +15,7 @@ mod ast_writer;
 mod expr_legacy;
 #[cfg(test)]
 mod stmt_legacy;
+mod sym_node;
 
 /// Wire format version for the serialized AST returned by `parse`.
 /// Bump when a record layout changes; `parse` rejects any other value so a
@@ -27,6 +28,7 @@ const LITERAL_STR: u8 = 4;
 const LITERAL_FLOAT: u8 = 6;
 const LIST_GEN: u8 = 20;
 const LIST_INT: u8 = 21;
+const LIST_STR: u8 = 22;
 const DICT_STR_GEN: u8 = 30;
 const DECORATOR: u8 = 53;
 const CLASS_DEF: u8 = 60;
@@ -243,6 +245,51 @@ impl Writer {
     fn expr_list(&mut self, len: usize) {
         self.tag(LIST_GEN);
         self.bare_int(len as i64);
+    }
+
+    /// `write_str_bare`: bare length + UTF-8 body, no tag (G0.5 cache dicts).
+    fn str_bare(&mut self, value: &str) {
+        self.bare_int(value.len() as i64);
+        self.bytes.extend_from_slice(value.as_bytes());
+    }
+
+    /// `write_str_list`: `LIST_STR` + bare size + bare strings.
+    fn str_list(&mut self, values: &[String]) {
+        self.tag(LIST_STR);
+        self.bare_int(values.len() as i64);
+        for value in values {
+            self.str_bare(value);
+        }
+    }
+
+    /// `write_str_opt`: tagged str or `LITERAL_NONE`.
+    fn str_opt(&mut self, value: Option<&str>) {
+        match value {
+            Some(value) => {
+                self.tag(LITERAL_STR);
+                self.str_bare(value);
+            }
+            None => self.tag(LITERAL_NONE),
+        }
+    }
+
+    /// `write_int_opt`: tagged int or `LITERAL_NONE`.
+    fn int_opt(&mut self, value: Option<i64>) {
+        match value {
+            Some(value) => self.int(value),
+            None => self.tag(LITERAL_NONE),
+        }
+    }
+
+    /// `write_flags`: pack the bools into one tagged int, bit i for flag i.
+    fn flags(&mut self, values: &[bool]) {
+        let mut packed = 0i64;
+        for (i, value) in values.iter().enumerate() {
+            if *value {
+                packed |= 1 << i;
+            }
+        }
+        self.int(packed);
     }
 }
 
@@ -2524,6 +2571,7 @@ fn source_hash(source: &str) -> String {
 #[pymodule]
 fn ast_serialize(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(parse, module)?)?;
+    module.add_function(wrap_pyfunction!(sym_node::write_cache_data, module)?)?;
     Ok(())
 }
 
