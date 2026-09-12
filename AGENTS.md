@@ -4037,6 +4037,46 @@ including:
   Built in isolated scratch dirs (`mypy-rs-local-ast-1560` plus a
   private `typekernel-1560`) because the shared typekernel predates
   #1559; shared dirs untouched.
+- wave 68B proxy P2 lazy Instance read shadow, DROPPED on measurement
+  (issue #1554): the full P2 wiring was implemented, gated, and then
+  reverted per the ADR-0004 drop-if-no-win rule - `types.py` gained
+  `_proxy_read_fn` + `_set_native_proxy_read` with `_read_mirror_blob`
+  trying proxy -> mirror -> None; `build.py` activated the proxy and
+  installed `type_proxy.read_scope_bytes` only when `native_type_proxy`
+  was on and the mirror-read flip off; `type_proxy.activate` composed its
+  `touch` onto the `_set_native_mirror_touch` slot; and
+  `NativeInstanceProxyReadSuite` (13 tests) plus
+  `misc/wf4_proxy_selfcheck.py` pinned and measured the slice. All of it
+  is reverted here; the P1 scaffold (`proxy.rs`, `mypy/type_proxy.py`,
+  `Options.native_type_proxy`, `TEST_NATIVE_TYPE_PROXY`,
+  `_clear_native_resolvers` reset branch) is unchanged from #1553 and
+  the final tree is byte-identical to `b63f903e1` plus this bullet.
+  Measurement (cold self-check, `mypy_self_check.ini -n0
+  --no-incremental -p mypy -p mypyc`, `TEST_NATIVE_TYPE_KERNEL=1`,
+  `FORCE_NATIVE_TYPE_PROXY` 0/1, audit on, 5 interleaved pairs):
+  wall OFF {180.9, 174.7, 188.5, 149.4, 150.7}s vs ON {173.8, 154.3,
+  181.4, 114.2, 207.1}s - median delta -0.9s (-0.5%), mean -2.7s
+  (-1.6%); user CPU OFF {137.0, 133.3, 122.6, 121.5, 128.4}s vs ON
+  {136.0, 130.6, 135.6, 108.5, 136.7}s - median delta +7.2s (+5.6%,
+  mean +0.7%). The proxy engaged deterministically per run (~349.5k
+  hits, ~192.5k misses, ~198.8k puts = 12.6MB stored, 6.3k stale
+  re-puts, 47 touches, 3 serialize_fail, 206k non-Instance defers;
+  size buckets 182k le64 / 15k le256 / 1.5k le1k / 277 gt1k) yet the
+  wall win sits inside the load noise (host load avg 60-85 from sibling
+  agents; the lone quiet pair showed -23.6% wall / -10.7% CPU while the
+  fifth pair flipped +56.4s) and CPU time is a wash: the hit path
+  (Python dict + one FFI + pins) costs about what the avoided tiny
+  Instance serialization costs, so the slice does not move the
+  self-check wall-clock and is dropped rather than defended. Gates on
+  the P2 tree before the revert: testtypes 3,433/7 (13 new), proxy-on
+  cold self-check clean 348, ruff clean on the touched files. Gates on
+  the final tree: cargo type_kernel 2,783/11, fmt + clippy clean,
+  testtypes 3,420/7, testcheck 8,144/69/7/0 (exact local baseline; CI's
+  8,198/15/7 differs by 54 environment-skips), cold self-check clean
+  348. Any future P3/P4 attempt needs a size/engagement threshold (the
+  182k le64 puts cannot pay for the store) or a corpus where the F2
+  wire cache is off (semanal phases), and must re-run the same A/B on
+  a quiet host first.
 
 ## Pull Requests
 
