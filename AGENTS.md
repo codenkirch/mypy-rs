@@ -3955,6 +3955,54 @@ including:
   8,198/15/7 differs by 54 environment-skips), fine-grained 747/27, daemon
   37. P2 (#1554) not attempted in this commit series.
 
+- wave 68A statement/pattern enum + writer byte parity (G0.4, issue
+  #1560): `crates/ast_serialize/src/ast_node.rs` gains `StmtNode` (one
+  variant per statement wire tag with the exact current fields;
+  `Assignment` carries both the many-target `StmtAssign` shape and the
+  one-target `StmtAnnAssign` shape, split by `new_syntax`) plus
+  `PatternNode` / `BlockNode` / `IfClauseNode` / `WithItemNode` /
+  `ExceptHandlerNode` / `MatchCaseNode` / `DocstringNode` /
+  `SingletonNode`; `ast_writer.rs` gains `write_stmt` / `write_pattern`
+  and the two block writers. `serialize_stmt` / `serialize_suite` and
+  pattern emission now build-then-write, so the enums are the single
+  source of truth. Type annotations, type-param lists and parameter
+  records stay captured byte payloads via `capture_bytes` (G0.5 scope),
+  re-emitted verbatim; serializer side effects (imports metadata,
+  type-comment parse errors, branch modes, function/class depth,
+  skip-bodies) run in the build phase in the same order the direct
+  writer emitted them. `Block` semantics preserved: an empty block
+  writes its fallback loc, optional blocks (for/while else,
+  try-else/finally) write none, stripped blocks keep the
+  first-statement loc; elif flattening stays the same
+  `elif_else_clauses` fold. Wire bytes unchanged, no
+  `AST_WIRE_VERSION` bump.
+  Byte-parity proof: a frozen verbatim copy of the 21 pre-enum
+  statement/pattern emitters (`stmt_legacy.rs`, `#[cfg(test)]` only,
+  bodies diff-verified against HEAD) plus the `legacy_stmts` A/B: the
+  250-case native-parser corpus in both expression modes (241 parsable
+  = 241 checked per mode, 9 syntax-error skips), a parser-options
+  matrix (`skip_function_bodies` x `include_docstrings` x
+  `custom_typing_module` x expression mode), a language-surface case
+  (async def / decorators / with / for-else / try-else-finally / type
+  alias / all pattern kinds) and a frozen golden blob for
+  import/def/if-elif-else/try/match. Independent cross-binary check:
+  `(ast_bytes, errors, import_bytes, data)` hashes identical between
+  the pre-change shared `.so` and the new build for all 250 corpus
+  cases and all 343 `mypy/` + `mypyc/` sources.
+  Gates: cargo ast_serialize 15/0, fmt + clippy clean (`--lib` and
+  `--all-targets`); AST suites 884 passed/75 skipped/2 xfailed (the
+  brief's 881/75/5 is the pre-#1559 xfail state: #1559 removed the
+  stubgen yield-trio xfails, totals 886 either way; the stale shared
+  wave-65 typekernel `.so` reproduces the trio as 3 failures);
+  testcheck 8,198/15/7/0 exact on the fastparse path and
+  8,144/69/7/0 exact with `TEST_NATIVE_PARSER=1
+  TEST_NATIVE_RESOLVER=1` (54 `_no_native_parse` skips); cold
+  self-check clean 348 (= 347 + `mypy/type_proxy.py` from wave 67B);
+  testtypes 3,420/7; fine-grained 747/27; daemon 37; merge+diff 120/1.
+  Built in isolated scratch dirs (`mypy-rs-local-ast-1560` plus a
+  private `typekernel-1560`) because the shared typekernel predates
+  #1559; shared dirs untouched.
+
 ## Pull Requests
 
 The default branch on this fork is `main` (not `master`). Always target
