@@ -11397,6 +11397,80 @@ class NativeHasRecursiveTypesFlattenSuite(Suite):
             is not None
         )
 
+    def _spy_flatten(self) -> tuple[list[list[bytes | None]], Callable[[], None]]:
+        """Install a spy around the Rust flatten seam, returning its rows.
+
+        The spy records the `row_expansions` argument of every call and
+        then defers to the real seam.
+        """
+        import mypy.types as _types_mod
+
+        seen: list[list[bytes | None]] = []
+        real = _types_mod._rust_flatten_nested_unions  # type: ignore[attr-defined]
+
+        def spy(
+            blobs: list[bytes], hat: bool, hr: bool, resolver: Any, expansions: list[bytes | None]
+        ) -> Any:
+            seen.append(list(expansions))
+            return real(blobs, hat, hr, resolver, expansions)
+
+        _types_mod._rust_flatten_nested_unions = spy  # type: ignore[attr-defined, assignment]
+
+        def restore() -> None:
+            _types_mod._rust_flatten_nested_unions = real  # type: ignore[attr-defined]
+
+        return seen, restore
+
+    def test_flatten_recursive_alias_no_resolver_defers_row(self) -> None:
+        # Issue #1532: recursive alias rows defer (`[None]`) instead of
+        # expanding through the live callback; both `handle_recursive`
+        # values must match the pure-Python body.
+        from mypy.types import _set_native_visitor_resolver, flatten_nested_unions
+
+        A, _target = self.fx.def_alias_2(self.fx.a)
+        assert A.is_recursive
+        seen, restore = self._spy_flatten()
+        _set_native_visitor_resolver(None)
+        try:
+            self._set_gates(True, False)
+            off_true = [str(x) for x in flatten_nested_unions([A], handle_recursive=True)]
+            off_false = [str(x) for x in flatten_nested_unions([A], handle_recursive=False)]
+            self._set_gates(True, True)
+            on_true = [str(x) for x in flatten_nested_unions([A], handle_recursive=True)]
+            on_false = [str(x) for x in flatten_nested_unions([A], handle_recursive=False)]
+        finally:
+            restore()
+        assert on_true == off_true, f"no-resolver recursive parity hr=True: {on_true}"
+        assert on_false == off_false, f"no-resolver recursive parity hr=False: {on_false}"
+        # hr=True expands one union target step (base + tuple item);
+        # hr=False keeps the alias row.
+        assert len(on_true) == 2
+        assert on_false == [str(A)]
+        # No call ever asked the live callback to expand an alias row.
+        assert seen
+        assert all(x is None for rows in seen for x in rows), seen
+
+    def test_flatten_nonrecursive_alias_no_resolver_callback_engages(self) -> None:
+        # The #1532 guard is scoped to recursive rows: a non-recursive
+        # alias row still expands through the live callback and engages
+        # the Rust seam with the expanded blob.
+        from mypy.types import _set_native_visitor_resolver, flatten_nested_unions
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        _node, alias = self._def_union_alias("F", UnionType([self.fx.a, self.fx.str_type]))
+        seen, restore = self._spy_flatten()
+        _set_native_visitor_resolver(None)
+        set_wire_typeinfo_map({info.fullname: info for info in self.type_infos})
+        try:
+            self._set_gates(True, True)
+            on = flatten_nested_unions([alias])
+        finally:
+            restore()
+            set_wire_typeinfo_map(None)
+        expanded = [rows for rows in seen if rows and rows[0] is not None]
+        assert len(expanded) == 1, f"non-recursive row did not expand: {seen}"
+        assert [str(x) for x in on] == [str(self.fx.a), str(self.fx.str_type)]
+
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeInstantiateTypeAliasSuite(Suite):
@@ -19505,6 +19579,62 @@ class NativeMessagesDeferralSuite(Suite):
             [self._bytes_of(outer)], self.resolver, True, True, False, False, [None]
         )
         assert raw is None, "nested definition-dependent render must defer"
+
+    def test_recursive_alias_pretty_walk_terminates(self) -> None:
+        # Issue #1532: pin every expansion result (blocking id reuse) so
+        # the alias-identity cut must bound the walk; without it the
+        # walk terminates only by allocation luck.
+        import mypy.messages as messages_mod
+        from mypy.messages import _pretty_wire_safe, _unsafe_pretty_callables
+
+        A, _target = self.fx.def_alias_2(self.fx.a)
+        assert A.is_recursive
+        real = messages_mod.get_proper_type  # type: ignore[attr-defined]
+        retained: list[Type] = []
+        calls = 0
+
+        def pinned(t: Type) -> Type:
+            nonlocal calls
+            calls += 1
+            if calls > 64:
+                raise AssertionError("pretty walk re-expanded a recursive alias")
+            out = real(t)
+            retained.append(out)
+            return out
+
+        messages_mod.get_proper_type = pinned  # type: ignore[attr-defined, assignment]
+        try:
+            calls = 0
+            assert _pretty_wire_safe(A) is True
+            safe_calls = calls
+            calls = 0
+            assert _unsafe_pretty_callables(A) == []
+            unsafe_calls = calls
+        finally:
+            messages_mod.get_proper_type = real  # type: ignore[attr-defined]
+        assert safe_calls <= 8, f"safe walk expanded {safe_calls} times"
+        assert unsafe_calls <= 8, f"unsafe walk expanded {unsafe_calls} times"
+
+    def test_recursive_alias_format_parity(self) -> None:
+        # End-to-end pin: gate-on formatting of a recursive alias (alias
+        # registered in the resolver snapshot) terminates and matches the
+        # pure-Python formatter.
+        from mypy.messages import format_type
+        from mypy.wirefixup import set_wire_alias_map
+
+        A, _target = self.fx.def_alias_2(self.fx.a)
+        alias_node = A.alias
+        assert alias_node is not None
+        type_infos = [self.fx.oi, self.fx.ai, self.fx.bi, self.fx.ci, self.fx.functioni]
+        set_wire_alias_map({alias_node.fullname: alias_node})
+        self._set_resolver(_type_kernel.build_native_resolver(type_infos, [alias_node]))
+        try:
+            off = self._with_gate(False, lambda: format_type(A, self.options))
+            on = self._with_gate(True, lambda: format_type(A, self.options))
+        finally:
+            set_wire_alias_map(None)
+            self._set_resolver(self.resolver)
+        assert_equal(on, off, "recursive alias format parity")
 
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
