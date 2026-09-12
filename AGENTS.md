@@ -3765,7 +3765,7 @@ including:
   (3,395/7 PyPI; +2 registration-walk differential tests), testcheck
   8,198/15/7/0 exact in kernel, capture, and capture+read modes,
   fine-grained 747/27 + daemon 37 capture+read, cold self-check 347
-  (off and capture), cargo 2,774/11, fmt + clippy clean. Table in
+  (off and capture), cargo 2,773/11, fmt + clippy clean. Table in
   `docs/plans/2026-09-11-mirror-capture-audit.md` section 8.
 
 ## Pull Requests
