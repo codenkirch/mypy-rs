@@ -1,6 +1,6 @@
 # Handoff: strangler-fig Rust migration loop (seam-deferral reduction)
 
-*Written 2026-08-28, refreshed 2026-09-11 (post-wave64: waves 52-64
+*Written 2026-08-28, refreshed 2026-09-11 (post-wave65: waves 52-65
 landed the st find_member/unpack/apply-report ports (#1492, embedded
 112 -> 61), the icf SUBTYPE_OF protocol-actual arm (#1487), the
 plugin-synthesized TypeInfo registrar (#1489), the ctor-blob gate
@@ -20,18 +20,28 @@ bounded the recursive-alias pretty walks (#1532 closed; deterministic
 tests, layout-perturbation repro 20s -> 0.07s); C #1534 added the
 in-repo librt build enabling `write_raw_bytes` (#1526 closed; splice
 suite 3 passed/3 skipped -> 7/0; two latent bugs fixed) and the
-`mypyc/lib-rt/**` CI trigger). Two
+`mypyc/lib-rt/**` CI trigger), and wave 65 (A #1544 cut
+mirror capture overhead 37.3% (+125.5s -> +78.7s; 10% gate unreachable
+without the ADR-0004 proxy per the revised decision); C #1542 retired
+five icf protocol-member sub-buckets, raw-FFI fallbacks 149 -> 56
+(-62%); B #1540 produced the Phase G0 brief persisted at
+docs/plans/2026-09-11-phase-g0-next-steps.md with scoped follow-ups
+#1545 (AST wire v5: docstring/custom-typing-module/version-pin bugs),
+#1546 (dead scaffolding + AST CI), #1547 (teststubgen pre-existing
+failures)). Two
 docs-only negative closes also landed (B6 render bundle #1481; maptype
 timing-gap #1494 - the #1493 audit that followed disproved its own
 hypothesis and landed the alias-decode fix #1496 instead). Goal:
 "migrate all python code to rust, really all", pursued as the established measure -> file -> dispatch-agents -> process-PRs ->
 gate loop. This file is the resume point.*
 
-## Where main stands (2026-09-11, post-wave64)
+## Where main stands (2026-09-11, post-wave65)
 
-- `main` = `beeab0fef` (in-repo librt, `#1534`) on top of `92f27e06d`
-  (`#1536`, #1532), `c08025b32` (`#1535`, #1530), `57ccaa38b`
-  (`#1533`), `490a06c3e` (`#1531`, #1527), `82e75bb21` (`#1529`),
+- `main` = `aa11047e1` (icf protocol arms, `#1542`) on top of
+  `ddd4ff44a` (`#1544`, #1539), `7a2b2f850` (`#1538`), `beeab0fef`
+  (`#1534`, #1526), `92f27e06d` (`#1536`, #1532), `c08025b32`
+  (`#1535`, #1530), `57ccaa38b` (`#1533`), `490a06c3e` (`#1531`,
+  #1527), `82e75bb21` (`#1529`),
   `3d9b3b8fb` (`#1525`, #1520), `13e9e9f7b`
   (`#1524`, #1516), `19d68949c` (`#1523`, #1517), `81a8149dd` (`#1522`,
   #1518), `0bb6827cb` (`#1521`, #1519), `66e709794` (`#1515`),
@@ -46,12 +56,12 @@ gate loop. This file is the resume point.*
   correct on the identified raw-list mutators (#1530 closed) and the
   wire-cache splice is exercisable (#1526 closed). #1528 (daemon-stable
   handles) is re-scoped to the strong-pin protocol.
-- Gates on the merged head `beeab0fef`: cargo 2,772/11 ignored;
-  testtypes 3,393/7 with PyPI librt (3,397/3 with the in-repo scratch
-  librt); testcheck 8,198/15/7 exact (kernel, capture-only, and
-  capture+read); cold self-check clean (347 files); fine-grained 747/27,
-  daemon 37; pr-gate + parity + parity-mirror + parity-typeops green on
-  #1534/#1535/#1536.
+- Gates on the merged head `aa11047e1`: cargo 2,773/11 ignored;
+  testtypes 3,405/7 (PyPI librt; 3,399+/3 with scratch librt);
+  testcheck 8,198/15/7 exact (kernel, capture-only, capture+read);
+  cold self-check clean (347 files); fine-grained 747/27, daemon 37;
+  pr-gate + parity + parity-mirror + parity-typeops green on
+  #1542/#1544.
 - Shared `.so` rebuilt 2026-09-11 at the merged head content (wave-63
   Rust, codesigned); `/private/tmp/mypy-rs-local-typekernel`.
 - Wave-56: the alias-aware typeobj decode retry
@@ -170,6 +180,25 @@ gate loop. This file is the resume point.*
   cache (try/finally, 10/10 stress green) and the
   `NativeWriteFunnelSkipSuite` cache coupling. OCR high finding fixed:
   `mypyc/lib-rt/**` added to the parity paths trigger.
+- Wave-65A (#1539/#1544): mirror capture overhead cut 37.3% (capture
+  217.4s -> 171.3s median; +125.5s -> +78.7s over the 92.6s baseline;
+  ratio 2.37x -> 1.85x) via a cached walk context, registration fusion
+  (`rust_mirror_walk_registration`), clean-run guards, and import
+  hoisting. Audit counters unchanged. Revised decision: the 10% gate is
+  unreachable by hot-path tuning (residual is the F1 proof's fixed
+  per-object work); ADR-0004 proxy stays the graduation path.
+- Wave-65B (#1540): Phase G0 brief persisted
+  (`docs/plans/2026-09-11-phase-g0-next-steps.md`): no AST node enum in
+  production; three confirmed native-parser parity bugs (docstrings,
+  `--custom-typing-module`, `pos_only_special_methods`) plus a latent
+  `transform_source` gap; dead scaffolding; AST-path CI blindness; the
+  family order/risk ranking; and the G0.1-G0.5 PR sequence.
+- Wave-65C (#1541/#1542): icf protocol-member actual-shape arms -
+  both-protocol SUP widened, callback/typeobj callable arms, Overloaded
+  matcher + Instance `__call__`, tuple-protocol tail; raw-FFI fallbacks
+  149 -> 56 (-62%). Residual 51 `ffi-extra-tvars` (#1171/#1427
+  multi-wave channel) + 5 small defers. Line-loss path deferred and
+  tracked as #1543.
 - Runner note unchanged: the repo runner cannot re-register (403,
   admin-blocked; #1249 open); GH `ocr-review` jobs stay `queued`
   forever. The operative review gate is the local
@@ -246,6 +275,9 @@ gate loop. This file is the resume point.*
 | #1535 | #1530 | wave64A: F2 raw-list mutator touch/epoch registry (7 sites) + stale-gate in read_fresh_bytes; CI deselections re-enabled | repro 2 failed -> 2 passed; testcheck 8,198/15/7 exact in kernel/capture/read modes; testtypes 3,389/6; fine-grained 747/27 + daemon 37 with capture+read |
 | #1536 | #1532 | wave64B: pretty-walk alias-expansion cut in both walkers + no-resolver recursive-row defer; deterministic regression tests | testcheck 8,198/15/7 exact; testtypes 3,389/6 (+4); fine-grained 747/27 + daemon 37; layout repro 20s -> 0.07s |
 | #1534 | #1526 | wave64C: in-repo librt build (write_raw_bytes), CI wiring + `mypyc/lib-rt/**` trigger; cache-depth leak and write-funnel test-coupling fixes | splice suite 3/3 skipped -> 7/0; testtypes 3,397/3 with scratch librt; testcheck 8,198/15/7 exact; self-check clean |
+| #1544 | #1539 | wave65A: mirror capture cuts (cached walk ctx, registration fusion, guards, import hoisting); revised 10% decision in the audit doc | capture 217.4s -> 171.3s (-21.2%), overhead -37.3%; cargo 2,773/11; testcheck exact in all three modes; fine-grained 747/27 + daemon 37 capture+read |
+| #1542 | #1541 | wave65C: icf protocol-member actual-shape arms (both-protocol SUP, callback/typeobj callable, Overloaded + `__call__`, tuple-protocol tail) | raw-FFI fallbacks 149 -> 56 (-62%); cargo 2,773/11; testtypes 3,403/7; testcheck 8,198/15/7 exact; fine-grained 747/27 + daemon 37; #1543 filed |
+| (docs) | #1540 | wave65B: Phase G0 scoping brief persisted + follow-ups #1545/#1546/#1547 | docs-only |
 
 Closed alongside: #1412, #1393 (F2 complete), #1397 (F3 partial,
 Instance/CallableType only), #1300, #1418 (closed 2026-09-05 with the
@@ -274,21 +306,27 @@ in #1501, closed by hand), #1503 (#1504 auto-closed it), #1506
 (#1508 auto-closed it), #1507 (#1509 + manual close), #1511 (#1514
 merged; closed by hand), #1512 (#1513 merged; closed by hand), #1516,
 #1517, #1518 (closed by hand after the wave-62 merges), #1519 (#1521
-auto-closed it), #1520 (#1525 auto-closed it), #1527 (#1531 merged; closed by hand); #1528 deferred with evidence), #1530 (#1535 auto-closed it), #1532 (closed by hand after #1536), #1526 (closed by hand after #1534).
+auto-closed it), #1520 (#1525 auto-closed it), #1527 (#1531 merged; closed by hand); #1528 deferred with evidence), #1530 (#1535 auto-closed it), #1532 (closed by hand after #1536), #1526 (closed by hand after #1534), #1539 (#1544 auto-closed it), #1541 (#1542 auto-closed it), #1540 (closed by the G0-brief docs PR).
 
 ## Open backlog (next waves; dispatch max ~2 port agents)
 
-1. **F2 graduation (read flip)**: #1530 is closed and the splice path
-   works; next is the P3 capture-overhead cut toward the 10% gate and
-   then the default-on decision (see the mirror audit doc). #1528
-   (daemon-stable handles) needs the strong-pin protocol first.
-2. **#1537**: 2 pre-existing ruff C408 in testtypes (noticed by wave
-   64B) - trivial cleanup when touching the file.
-3. **#624 (seam work)**: residual seam fallbacks are the documented
-   engine floors (st extra_tvars channel, icf protocol-member engine,
-   IAMA contract floor, sgc/roc/ifta); next seam wave needs a fresh
-   survey. B6 stays a documented negative; semanal stays opt-in.
-4. **#1249**: runner 403 - needs admin, skip until credentials change.
+1. **#1545 (G0.1)**: AST wire v5 - fix the three confirmed parser parity
+   bugs (docstrings, `--custom-typing-module`, `pos_only_special_methods`)
+   plus the wire-version pin and `transform_source` routing. Concrete,
+   high-value, independent of F.
+2. **#1546 (G0.2)**: delete the 2,040 dead AST-scaffolding lines and put
+   the AST path (`cargo test -p mypy-ast-serialize`, test_nativeparse,
+   testparse, teststubgen) into CI; #1547 tracks the pre-existing
+   teststubgen yield failures to fix/xfail in the same pass.
+3. **F2/F4 graduation**: capture cuts are exhausted (wave 65A revised
+   decision); the next step is the ADR-0004 proxy or the P4 default-on
+   decision, and #1528 needs the strong-pin protocol first.
+4. **#1537**: 2 pre-existing ruff C408 in testtypes - trivial cleanup
+   when touching the file.
+5. **#624 (seam work)**: residual fallbacks are the documented engine
+   floors (st extra_tvars channel, icf residual 51, IAMA contract floor,
+   sgc/roc/ifta); a fresh survey is needed before any new seam wave.
+6. **#1249**: runner 403 - needs admin, skip until credentials change.
 
 Standing audited floors (do NOT re-audit blind; the mechanism that
 would unlock each is noted): st 61 embedded (19 serfail + 42 kernel:
