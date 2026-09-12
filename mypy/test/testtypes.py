@@ -56669,43 +56669,43 @@ class NativeCacheMetaWriterSuite(Suite):
     def _meta(self, **overrides: Any) -> Any:
         from mypy.cache import CacheMeta
 
-        fields: dict[str, Any] = dict(
-            id="mod",
-            path="/tmp/mod.py",
-            mtime=1234567890,
-            size=42,
-            hash="deadbeef",
-            dependencies=["a", "b"],
-            data_mtime=1234567891,
-            data_file="mod.data.ff",
-            suppressed=["c"],
-            imports_ignored={1: ["ignore"], 10: ["misc"]},
-            options={"platform": "linux", "other_options": "hash"},
-            suppressed_deps_opts=b"\x01\x02",
-            dep_prios=[0, 1, 2],
-            dep_lines=[1, 2, 3],
-            dep_hashes=[b"\xaa" * 8, b"\xbb" * 16],
-            interface_hash=b"\xcc" * 16,
-            trans_dep_hash=b"\xdd" * 24,
-            version_id="1.2.3",
-            ignore_all=False,
-            plugin_data={"mypyc": True},
-        )
+        fields: dict[str, Any] = {
+            "id": "mod",
+            "path": "/tmp/mod.py",
+            "mtime": 1234567890,
+            "size": 42,
+            "hash": "deadbeef",
+            "dependencies": ["a", "b"],
+            "data_mtime": 1234567891,
+            "data_file": "mod.data.ff",
+            "suppressed": ["c"],
+            "imports_ignored": {1: ["ignore"], 10: ["misc"]},
+            "options": {"platform": "linux", "other_options": "hash"},
+            "suppressed_deps_opts": b"\x01\x02",
+            "dep_prios": [0, 1, 2],
+            "dep_lines": [1, 2, 3],
+            "dep_hashes": [b"\xaa" * 8, b"\xbb" * 16],
+            "interface_hash": b"\xcc" * 16,
+            "trans_dep_hash": b"\xdd" * 24,
+            "version_id": "1.2.3",
+            "ignore_all": False,
+            "plugin_data": {"mypyc": True},
+        }
         fields.update(overrides)
         return CacheMeta(**fields)
 
     def _meta_ex(self, **overrides: Any) -> Any:
         from mypy.cache import CacheMetaEx
 
-        fields: dict[str, Any] = dict(
-            dependencies=["a", "b"],
-            suppressed=["c"],
-            dep_hashes=[b"\x01", b"\x02\x03"],
-            error_lines=[
+        fields: dict[str, Any] = {
+            "dependencies": ["a", "b"],
+            "suppressed": ["c"],
+            "dep_hashes": [b"\x01", b"\x02\x03"],
+            "error_lines": [
                 ("/tmp/mod.py", 1, 2, 3, 4, "error", "msg", "code"),
                 (None, 10, 0, 10, 5, "note", "no path/code", None),
             ],
-        )
+        }
         fields.update(overrides)
         return CacheMetaEx(**fields)
 
