@@ -52,6 +52,11 @@ def parse(
     if options.native_parser:
         import mypy.nativeparse
 
+        if options.transform_source is not None:
+            if source is None:
+                source = mypy.nativeparse.read_source(fnam)
+            source = options.transform_source(source)
+
         ignore_errors = options.ignore_errors or fnam in errors.ignored_files
         # If errors are ignored, we can drop many function bodies to speed up type checking.
         strip_function_bodies = ignore_errors and not options.preserve_asts
