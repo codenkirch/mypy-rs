@@ -3873,8 +3873,8 @@ including:
   that collided with 150-152 moved to 230-232 in both mirrors
   (`mypy/astwire.py` + `crates/type_kernel/src/astwire.rs`; astwire
   bytes are traverser-local and never cache-persisted). teststubgen is
-  green with `testIncludeDocstrings` xfailed against #1545 (class
-  docstrings dropped by the native parser, G0.1). #1547's yield trio
+  green; `testIncludeDocstrings` runs for real once #1552 (G0.1) lands
+  in the same wave, so the interim xfail was removed here. #1547's yield trio
   passes at bf019a1f1 and is not reproducible: stubgen builds its own
   Options and always parses natively (the TEST_NATIVE_PARSER gate is
   inert there), verified with the in-repo extension, the shared Sep-10

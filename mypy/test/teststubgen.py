@@ -856,11 +856,6 @@ class StubgenPythonSuite(DataSuite):
             self.run_case_inner(testcase)
 
     def run_case_inner(self, testcase: DataDrivenTestCase) -> None:
-        if testcase.name == "testIncludeDocstrings":
-            # The native parser does not serialize ClassDef.docstring yet
-            # (#1545, G0.1 AST wire v5); stubgen builds its own MypyOptions
-            # with native_parser default-on. Remove with the #1545 fix.
-            pytest.xfail("class docstrings dropped by the native parser (#1545)")
         extra = []  # Extra command-line args
         mods = []  # Module names to process
         source = "\n".join(testcase.input)
