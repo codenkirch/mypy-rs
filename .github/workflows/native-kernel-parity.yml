@@ -18,6 +18,7 @@ on:
       - crates/type_kernel/**
       - crates/ast_serialize/**
       - crates/module_resolver/**
+      - mypyc/lib-rt/**
       - mypy/subtypes.py
       - mypy/join.py
       - mypy/argmap.py
