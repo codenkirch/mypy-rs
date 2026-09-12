@@ -3735,6 +3735,38 @@ including:
   scratch librt: cold self-check clean 347, testcheck 8,198/15/7 exact,
   testtypes 3,389/3, testinfer 106, F2 mirror capture+read testcheck
   8,196/15/7 (2 deselected, #1530), splice suite 10/10 stress runs green.
+- wave 65A capture-overhead cuts (#1539), the F4.2 slice off the wave-63A
+  audit. cProfile on the capture cold self-check ranked
+  `rust_mirror_walk_indices` first (39.9s tottime / 2.75M calls), then
+  `_mirror_setattr` (26.8s / 100.5M) and the Python `_child_types` scan
+  (23.2s cum / 4.94M), all inside `_register_tree` (105.7s cum) and
+  `_assert_fresh` (141.9s cum) over the `Type.write` funnel (166.8s cum).
+  Cuts, opt-in path only: (a) the walk's `mypy.types` class context and
+  per-class slot names are cached thread-locally (strong type pin;
+  `rust_mirror_reset` clears both), slot reads borrow instead of incref,
+  and container dispatch runs before the tvid/Type/name probes (walk
+  micro: AnyType 2.38 -> 0.38us, Callable 13.3 -> 5.4us); (b)
+  `rust_mirror_walk_registration` returns the direct family children with
+  the index lists so `_register_tree` does one Rust descent instead of a
+  Python child scan plus a Rust walk (`_walk_registration_py` keeps the
+  deferral/differential body); (c) clean-run hot-path guards: `_audit_mode`
+  f-string gates on the funnel counters, inlined `_handle_of` in
+  `_assert_fresh`, empty-strike/empty-pending call skips; (d) the
+  per-serialization `librt`/`mypy.types` function-local imports hoisted.
+  Same-harness cold self-check A/B (audit off): off median 92.6s
+  (82.9-97.1), capture median 171.3s (158.2-174.4) vs the wave-63A 217.4s
+  clean, so the capture overhead fell +125.5s -> +78.7s (-37%; capture
+  wall -21%), ratio 2.37x -> 1.85x. Audit-on counter parity pre/post is
+  exact within run-to-run volume drift (zero mismatches, `unprot_bump` 80
+  both). The within-10% gate stays unreachable (~101s capture needed,
+  ~69s residual gap: 2.3M registrations + 2.9M fresh serializations, both
+  semantics-bound); the ADR-0004 proxy stays the graduation path and
+  capture/read stay opt-in. Gates: testtypes 3,399/3 scratch librt
+  (3,395/7 PyPI; +2 registration-walk differential tests), testcheck
+  8,198/15/7/0 exact in kernel, capture, and capture+read modes,
+  fine-grained 747/27 + daemon 37 capture+read, cold self-check 347
+  (off and capture), cargo 2,774/11, fmt + clippy clean. Table in
+  `docs/plans/2026-09-11-mirror-capture-audit.md` section 8.
 
 ## Pull Requests
 

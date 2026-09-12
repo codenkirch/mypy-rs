@@ -155,3 +155,70 @@ cases deselected: `testVariadicStarArgsCallNoCrash` on macOS,
 `mypy/types_mirror.py` and `mypy/types.py` join the path filters. This is
 the first CI the mirror env has ever had; it immediately caught #1530,
 which was invisible on main.
+
+## 8. Wave 65A: capture overhead cuts (issue #1539)
+
+Re-run of section 3's method at `7a2b2f850` (post-wave64), then four
+opt-in-path cuts, all pinned by the mirror suites.
+
+### 8.1 Profile ranking (before cuts; cProfile, audit-on capture, 428.3s)
+
+| function | tottime | cumtime | calls |
+|---|---|---|---|
+| `rust_mirror_walk_indices` | 39.9s | 39.9s | 2.75M |
+| `_mirror_setattr` | 26.8s | 32.5s | 100.5M |
+| `_child_types` (+`_child_types_in_value`) | 11.1s (6.4s) | 23.2s (9.0s) | 4.94M (24.5M) |
+| `_register_tree` | 9.2s | 105.7s | 3.5M |
+| `_assert_fresh` | 6.2s | 141.9s | 7.7M |
+| write wrapper (`types_mirror.py:1154`) | 5.6s | 166.8s | 18.0M |
+| `_fresh_bytes` | 4.9s | 36.3s | 2.9M |
+| `rust_mirror_register` | n/a | 3.4s | 2.29M |
+
+The shape is unchanged from section 3: adoption (`_register_tree`: one
+Rust index walk plus one Python `_child_types` scan per adopted object)
+and the funnel (`_assert_fresh` per `Type.write`) dominate; the setattr
+wrapper is the third block.
+
+### 8.2 Cuts landed
+
+1. **Walk fixed cost.** `mypy.types` class context and per-class
+   `__slots__` names are cached thread-locally in Rust (strong type pin;
+   `rust_mirror_reset` clears both), slot reads borrow instead of
+   increfing, and container dispatch runs before the tvid/Type/name
+   probes. Micro: AnyType 2.38 -> 0.38us, 2-arg Instance 4.63 -> 3.75us,
+   Callable 13.3 -> 5.4us per walk.
+2. **Registration walk fusion.** New `rust_mirror_walk_registration`
+   returns the direct family children (in `_child_types` order) with the
+   index lists, so `_register_tree` does one Rust descent instead of a
+   Python child scan plus a Rust index walk. The pure-Python
+   `_walk_registration_py` body keeps the deferral/differential contract.
+3. **Hot-path guards (clean runs).** `_audit_mode` gates the funnel
+   f-string counters (`assert_skip`/`adopt`/`untracked`), `_handle_of` is
+   inlined in `_assert_fresh`, and the empty-strike / empty-pending calls
+   are skipped. Audit-mode counters are unchanged (delta < 0.03% pre/post,
+   all run-to-run volume drift; zero mismatches).
+4. **Import hoisting.** `WriteBuffer`, `write_type_list`, and the
+   `mypy.types` module handle moved out of the four per-serialization
+   helpers (2.9M calls).
+
+### 8.3 Wall clock A/B (cold self-check, `-n0 --no-incremental`, 347 files)
+
+Interleaved same-harness runs; audit off.
+
+| config | runs (s) | median | vs off |
+|---|---|---|---|
+| mirror off | 97.1 / 92.6 / 82.9 | 92.6 | baseline |
+| capture (wave 63A, section 2) | 217.4 | 217.4 | +125.5 |
+| capture (wave 65A) | 174.4 / 158.2 / 172.6 / 170.0 | 171.3 | +78.7 |
+| capture audit-on (wave 63A) | 226.0 | 226.0 | +134.1 |
+| capture audit-on (wave 65A, under load) | 198.0 | 198.0 | +105.4 |
+
+Capture overhead fell +125.5s -> +78.7s (-37%), capture wall -21%
+(217.4 -> 171.3), ratio 2.37x -> 1.85x. The within-10% cold-path gate
+(`docs/remaining-migration-plan.md:707`) would need capture <= ~102s; the
+~69s residual is fixed per-object adoption/serialization cost (2.3M
+registrations and 2.9M fresh serializations per self-check, both
+semantics-bound by the F1 proof), not seam overhead. The section 5
+decision stands: capture/read stay opt-in until an ADR-0004 proxy slice
+(or a measured phase-scoped capture) removes the per-object work; no
+further hot-path micro-optimization is queued.

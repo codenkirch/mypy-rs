@@ -210,6 +210,7 @@ pub(crate) fn reset() -> u64 {
     with_mirror(|m| {
         *m = Mirror::new();
     });
+    clear_walk_caches();
     identity::reset()
 }
 
@@ -965,8 +966,51 @@ struct WalkCtx {
     tvid_cls: Py<PyAny>,
     /// The four family class objects (`type(value) in FAMILY_NAME`).
     family: Vec<Py<PyAny>>,
-    /// Per-class usable slot names (`_SLOT_NAMES` minus skipped names).
-    slot_cache: HashMap<usize, Rc<Vec<String>>>,
+}
+
+/// Per-class walked slot names, keyed by type pointer and pinned by a
+/// strong ref so a collected class cannot be replaced at the same address.
+type SlotCache = HashMap<usize, (Py<PyAny>, Rc<Vec<String>>)>;
+
+thread_local! {
+    /// `WalkCtx` classes. `mypy.types` import and its six class lookups were
+    /// paid on every walk (2.7M calls/self-check); the classes are stable for
+    /// the process lifetime (Python's own `FAMILY_NAME` makes the same
+    /// assumption). `reset` clears the slot so a test boundary starts clean.
+    static WALK_CLASSES: RefCell<Option<WalkCtx>> = const { RefCell::new(None) };
+
+    /// Per-class walked slot names. Replaces the per-call `slot_cache`, which
+    /// re-collected the MRO `__slots__` of every class encountered per walk.
+    static WALK_SLOTS: RefCell<SlotCache> = RefCell::new(HashMap::new());
+}
+
+fn clear_walk_caches() {
+    WALK_CLASSES.with(|c| *c.borrow_mut() = None);
+    WALK_SLOTS.with(|c| c.borrow_mut().clear());
+}
+
+fn walk_classes(py: Python) -> Option<WalkCtx> {
+    WALK_CLASSES.with(|cell| {
+        let mut cache = cell.borrow_mut();
+        if cache.is_none() {
+            let types_mod = py.import("mypy.types").ok()?;
+            let cls = |name: &str| types_mod.getattr(name).ok().map(|o| o.to_object(py));
+            *cache = Some(WalkCtx {
+                type_cls: cls("Type")?,
+                tvid_cls: cls("TypeVarId")?,
+                family: FAMILY_ORDER
+                    .iter()
+                    .map(|name| cls(name))
+                    .collect::<Option<Vec<_>>>()?,
+            });
+        }
+        let ctx = cache.as_ref()?;
+        Some(WalkCtx {
+            type_cls: ctx.type_cls.clone_ref(py),
+            tvid_cls: ctx.tvid_cls.clone_ref(py),
+            family: ctx.family.iter().map(|c| c.clone_ref(py)).collect(),
+        })
+    })
 }
 
 /// Read one slot; `Ok(None)` is an unset slot descriptor (the AttributeError
@@ -975,9 +1019,9 @@ struct WalkCtx {
 /// `_walk_slots` uses `object.__getattribute__` (no `__getattr__`
 /// fallback). Parity holds because the mypy family/alias/ExtraAttrs
 /// classes define no attribute hooks; revisit if one ever does.
-fn read_slot(obj: &PyAny, name: &str, py: Python) -> Result<Option<PyObject>, WalkErr> {
+fn read_slot<'a>(obj: &'a PyAny, name: &str, py: Python) -> Result<Option<&'a PyAny>, WalkErr> {
     match obj.getattr(name) {
-        Ok(v) => Ok(Some(v.to_object(py))),
+        Ok(v) => Ok(Some(v)),
         Err(e) if e.is_instance_of::<PyAttributeError>(py) => Ok(None),
         Err(_) => Err(WalkErr::Defer),
     }
@@ -1027,41 +1071,48 @@ fn collect_slot_names(ty: &PyType, py: Python) -> Result<Vec<String>, WalkErr> {
     Ok(out)
 }
 
-fn slot_names_for(ctx: &mut WalkCtx, py: Python, t: &PyAny) -> Result<Rc<Vec<String>>, WalkErr> {
+fn slot_names_for(py: Python, t: &PyAny) -> Result<Rc<Vec<String>>, WalkErr> {
     let ty = t.get_type();
     let key = ty.as_ptr() as usize;
-    if let Some(v) = ctx.slot_cache.get(&key) {
-        return Ok(v.clone());
+    if let Some(names) = WALK_SLOTS.with(|c| c.borrow().get(&key).map(|entry| entry.1.clone())) {
+        return Ok(names);
     }
     let names = Rc::new(collect_slot_names(ty, py)?);
-    ctx.slot_cache.insert(key, names.clone());
+    WALK_SLOTS.with(|c| {
+        c.borrow_mut()
+            .insert(key, (ty.to_object(py), names.clone()));
+    });
     Ok(names)
 }
 
-/// The three walk output lists, grouped so walk_slots/walk_value stay
-/// under the clippy argument limit.
+/// The walk output lists, grouped so walk_slots/walk_value stay under the
+/// clippy argument limit. `children` are the direct family Types in
+/// `_child_types` order (the registration recursion input); they are
+/// collected only when `direct` is true.
 struct WalkOut {
     tvids: Vec<Py<PyAny>>,
     aliases: Vec<Py<PyAny>>,
     embeds: Vec<Py<PyAny>>,
+    children: Vec<Py<PyAny>>,
 }
 
 fn walk_slots(
-    ctx: &mut WalkCtx,
+    ctx: &WalkCtx,
     py: Python,
     t: &PyAny,
     seen: &mut HashSet<usize>,
     depth: usize,
+    direct: bool,
     out: &mut WalkOut,
 ) -> Result<(), WalkErr> {
-    let names = slot_names_for(ctx, py, t)?;
+    let names = slot_names_for(py, t)?;
     for name in names.iter() {
         let depth = depth + 1;
         if depth > WALK_DEPTH_CAP {
             return Err(WalkErr::Depth);
         }
         if let Some(value) = read_slot(t, name, py)? {
-            walk_value(ctx, py, value.as_ref(py), seen, depth, out)?;
+            walk_value(ctx, py, value, seen, depth, direct, out)?;
         }
     }
     Ok(())
@@ -1087,17 +1138,22 @@ fn py_type_name(value: &PyAny) -> Result<String, WalkErr> {
     Ok(s.to_str().map_err(WalkErr::from)?.to_string())
 }
 
-/// Dispatch order mirrors `_walk_value` exactly. The cap gate here plus the
-/// `depth + 1` passed into every direct recursion bounds all descent edges,
-/// so a pure-container cycle defers at the cap instead of overflowing the
-/// native stack (Python's fallback then hits its own RecursionError, as
-/// before the port).
+/// Dispatch order mirrors `_walk_value`'s *result*: scalars are skipped,
+/// containers are descended in item order, and remaining objects are
+/// classified by type name. Container checks run before the tvid/Type
+/// probes because a list/tuple/dict can never be one (the probe order in
+/// Python is unobservable: its lists fall through the same isinstance
+/// ladder). The cap gate here plus the `depth + 1` passed into every
+/// direct recursion bounds all descent edges, so a pure-container cycle
+/// defers at the cap instead of overflowing the native stack (Python's
+/// fallback then hits its own RecursionError, as before the port).
 fn walk_value(
-    ctx: &mut WalkCtx,
+    ctx: &WalkCtx,
     py: Python,
     value: &PyAny,
     seen: &mut HashSet<usize>,
     depth: usize,
+    direct: bool,
     out: &mut WalkOut,
 ) -> Result<(), WalkErr> {
     if depth > WALK_DEPTH_CAP {
@@ -1107,6 +1163,23 @@ fn walk_value(
         return Ok(());
     }
     let vptr = value.as_ptr() as usize;
+    if value.is_instance_of::<PyList>() || value.is_instance_of::<PyTuple>() {
+        seen.insert(vptr);
+        for item in value.iter().map_err(WalkErr::from)? {
+            let item = item.map_err(WalkErr::from)?;
+            walk_value(ctx, py, item, seen, depth + 1, direct, out)?;
+        }
+        return Ok(());
+    }
+    if value.is_instance_of::<PyDict>() {
+        seen.insert(vptr);
+        let values = value.call_method0("values").map_err(WalkErr::from)?;
+        for item in values.iter().map_err(WalkErr::from)? {
+            let item = item.map_err(WalkErr::from)?;
+            walk_value(ctx, py, item, seen, depth + 1, direct, out)?;
+        }
+        return Ok(());
+    }
     if value
         .is_instance(ctx.tvid_cls.as_ref(py))
         .map_err(WalkErr::from)?
@@ -1119,17 +1192,22 @@ fn walk_value(
         .is_instance(ctx.type_cls.as_ref(py))
         .map_err(WalkErr::from)?
     {
+        let ty_obj = value.get_type();
+        let is_family = ctx
+            .family
+            .iter()
+            .any(|f| f.as_ref(py).as_ptr() == ty_obj.as_ptr());
+        // `_child_types` yields every occurrence of a direct Type child,
+        // even one the seen-set prunes from further descent.
+        if direct && is_family {
+            out.children.push(value.to_object(py));
+        }
         if !seen.contains(&vptr) {
             seen.insert(vptr);
-            let ty_obj = value.get_type();
-            if ctx
-                .family
-                .iter()
-                .any(|f| f.as_ref(py).as_ptr() == ty_obj.as_ptr())
-            {
+            if is_family {
                 out.embeds.push(value.to_object(py));
             }
-            walk_slots(ctx, py, value, seen, depth, out)?;
+            walk_slots(ctx, py, value, seen, depth, false, out)?;
         }
         return Ok(());
     }
@@ -1139,25 +1217,8 @@ fn walk_value(
             seen.insert(vptr);
             out.aliases.push(value.to_object(py));
             if let Some(target) = read_slot(value, "target", py)? {
-                walk_value(ctx, py, target.as_ref(py), seen, depth + 1, out)?;
+                walk_value(ctx, py, target, seen, depth + 1, false, out)?;
             }
-        }
-        return Ok(());
-    }
-    if value.is_instance_of::<PyList>() || value.is_instance_of::<PyTuple>() {
-        seen.insert(vptr);
-        for item in value.iter().map_err(WalkErr::from)? {
-            let item = item.map_err(WalkErr::from)?;
-            walk_value(ctx, py, item, seen, depth + 1, out)?;
-        }
-        return Ok(());
-    }
-    if value.is_instance_of::<PyDict>() {
-        seen.insert(vptr);
-        let values = value.call_method0("values").map_err(WalkErr::from)?;
-        for item in values.iter().map_err(WalkErr::from)? {
-            let item = item.map_err(WalkErr::from)?;
-            walk_value(ctx, py, item, seen, depth + 1, out)?;
         }
         return Ok(());
     }
@@ -1166,7 +1227,7 @@ fn walk_value(
         // here (unlike the slot scan and the alias target); an unreadable
         // read defers, so the fallback re-raises identically.
         match value.getattr("attrs") {
-            Ok(attrs) => walk_value(ctx, py, attrs, seen, depth + 1, out)?,
+            Ok(attrs) => walk_value(ctx, py, attrs, seen, depth + 1, direct, out)?,
             Err(_) => return Err(WalkErr::Defer),
         }
     }
@@ -1179,34 +1240,41 @@ const FAMILY_ORDER: [&str; 4] = ["Instance", "CallableType", "TypeVarType", "Uni
 /// The three index lists; alias keeps the pyfunction signature out of the
 /// clippy type-complexity limit.
 type WalkLists = (Vec<Py<PyAny>>, Vec<Py<PyAny>>, Vec<Py<PyAny>>);
+/// `WalkLists` plus the direct family children (registration walk).
+type WalkLists4 = (
+    Vec<Py<PyAny>>,
+    Vec<Py<PyAny>>,
+    Vec<Py<PyAny>>,
+    Vec<Py<PyAny>>,
+);
 
-#[pyfunction]
-pub(crate) fn rust_mirror_walk_indices(py: Python, root: &PyAny) -> Option<WalkLists> {
-    let types_mod = py.import("mypy.types").ok()?;
-    let cls = |name: &str| types_mod.getattr(name).ok().map(|o| o.to_object(py));
-    let mut ctx = WalkCtx {
-        type_cls: cls("Type")?,
-        tvid_cls: cls("TypeVarId")?,
-        family: FAMILY_ORDER
-            .iter()
-            .map(|name| cls(name))
-            .collect::<Option<Vec<_>>>()?,
-        slot_cache: HashMap::new(),
-    };
+fn walk_root(py: Python, root: &PyAny) -> Option<WalkOut> {
+    let ctx = walk_classes(py)?;
     let mut seen = HashSet::new();
     seen.insert(root.as_ptr() as usize);
     let mut out = WalkOut {
         tvids: Vec::new(),
         aliases: Vec::new(),
         embeds: Vec::new(),
+        children: Vec::new(),
     };
-    walk_slots(&mut ctx, py, root, &mut seen, 0, &mut out).ok()?;
-    let WalkOut {
-        tvids,
-        aliases,
-        embeds,
-    } = out;
-    Some((tvids, aliases, embeds))
+    walk_slots(&ctx, py, root, &mut seen, 0, true, &mut out).ok()?;
+    Some(out)
+}
+
+#[pyfunction]
+pub(crate) fn rust_mirror_walk_indices(py: Python, root: &PyAny) -> Option<WalkLists> {
+    let out = walk_root(py, root)?;
+    Some((out.tvids, out.aliases, out.embeds))
+}
+
+/// Registration walk: the index lists plus the direct family children in
+/// `_child_types` order, so `_register_tree` does not re-walk the tree in
+/// Python after registering the children.
+#[pyfunction]
+pub(crate) fn rust_mirror_walk_registration(py: Python, root: &PyAny) -> Option<WalkLists4> {
+    let out = walk_root(py, root)?;
+    Some((out.tvids, out.aliases, out.embeds, out.children))
 }
 
 #[cfg(test)]
@@ -1699,6 +1767,20 @@ mod mirror_tests {
             let fake = py.eval("type('ExtraAttrs', (), {})", None, None).unwrap();
             root.setattr("args", fake.call0().unwrap()).unwrap();
             assert!(rust_mirror_walk_indices(py, root).is_none());
+        });
+    }
+
+    /// The slot-name cache is filled on first use and `clear_walk_caches`
+    /// (the `reset` hook) empties it again.
+    #[test]
+    fn test_slot_cache_clears() {
+        with_py(|py| {
+            clear_walk_caches();
+            let root = slots_root(py);
+            assert!(slot_names_for(py, root).is_ok());
+            assert!(!WALK_SLOTS.with(|c| c.borrow().is_empty()));
+            clear_walk_caches();
+            assert!(WALK_SLOTS.with(|c| c.borrow().is_empty()));
         });
     }
 
