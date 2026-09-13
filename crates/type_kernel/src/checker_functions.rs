@@ -1394,6 +1394,42 @@ pub(crate) fn rust_is_writable_attribute(py: Python<'_>, node: &PyAny) -> PyResu
     Ok(Some(is_writable_attribute_inner(false, false, false, None)))
 }
 
+/// `TypeChecker.is_defined_in_base_class` (checker.py:10168-10173):
+/// a pure bool predicate. Returns `False` when `var.info` is falsy,
+/// `True` when `var.info.fallback_to_any`, else walks `info.mro[1:]`
+/// and returns `True` if any base's `names.get(var.name)` is not None.
+/// Mirrors `rust_is_final_enum_value` (live-object, no wire decode).
+/// Defers (`None`) only on an unreadable attribute.
+#[pyfunction]
+pub(crate) fn rust_is_defined_in_base_class(
+    _py: Python<'_>,
+    var: &PyAny,
+) -> PyResult<Option<bool>> {
+    let info = var.getattr("info")?;
+    if !info.is_true()? {
+        return Ok(Some(false));
+    }
+    let fallback_to_any: bool = info.getattr("fallback_to_any")?.extract()?;
+    if fallback_to_any {
+        return Ok(Some(true));
+    }
+    let name: String = var.getattr("name")?.extract()?;
+    let mro = info.getattr("mro")?;
+    let mro_len = mro.len()?;
+    if mro_len <= 1 {
+        return Ok(Some(false));
+    }
+    for i in 1..mro_len {
+        let base = mro.get_item(i)?;
+        let names = base.getattr("names")?;
+        let result = names.call_method("get", (name.clone(),), None)?;
+        if !result.is_none() {
+            return Ok(Some(true));
+        }
+    }
+    Ok(Some(false))
+}
+
 /// Test-only decision fold of `check_for_untyped_decorator`
 /// (checker.py:6955-6964). The seam inlines the same short-circuit
 /// order; kept for the pure decision-table tests below.

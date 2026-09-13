@@ -4517,6 +4517,21 @@ including:
   skipped, testcheck 8144 passed/69 skipped/7 xfailed, cold self-check
   clean.
 
+- `rust_is_defined_in_base_class` (issue #1601, mypy.checker) — mirrors
+  `TypeChecker.is_defined_in_base_class` (checker.py:10168-10173): a pure
+  bool predicate over a live `Var`. Returns `False` when `var.info` is
+  falsy, `True` when `var.info.fallback_to_any`, else walks `info.mro[1:]`
+  and returns `True` if any base's `names.get(var.name)` is not None. Rust
+  reads the live Var via PyO3 (`info` truthiness via `is_true`,
+  `fallback_to_any` bool, `name` string, `mro` list, per-base `names.get`)
+  and returns `Option<bool>`, mirroring `rust_is_writable_attribute`
+  (live-object, no wire decode). Defers (`None`) only on an unreadable
+  attribute so the pure-Python body re-runs unchanged. Gated by
+  `_native_checker_active` (existing wiring, no build.py change) and
+  covered by `NativeIsDefinedInBaseClassSuite` in
+  `mypy/test/testtypes.py` (direct seam calls for all branches plus
+  gate-off vs gate-on parity differentials).
+
 ## Pull Requests
 
 The default branch on this fork is `main` (not `master`). Always target

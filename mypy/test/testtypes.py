@@ -47302,6 +47302,139 @@ class NativeIsWritableAttributeSuite(Suite):
 
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeIsDefinedInBaseClassSuite(Suite):
+    """Parity for the Rust `is_defined_in_base_class` pure-predicate port (#1601).
+
+    `TypeChecker.is_defined_in_base_class` (checker.py:10168) is a pure bool
+    over a live `Var`: returns `False` when `var.info` is falsy, `True` when
+    `var.info.fallback_to_any`, else walks `info.mro[1:]` and returns `True`
+    if any base's `names.get(var.name)` is not None. The Rust port reads the
+    live Var via PyO3 and returns the bool directly, mirroring
+    `rust_is_final_enum_value`. Direct seam calls assert the exact bool;
+    the gate-off vs gate-on differential drives the real TypeChecker method.
+    """
+
+    def setUp(self) -> None:
+        from mypy.checker import _set_native_checker_active
+
+        self._set_active = _set_native_checker_active
+        self._set_active(True)
+        self.fx = TypeFixture()
+
+    def tearDown(self) -> None:
+        self._set_active(False)
+
+    def _with_gate(self, active: bool, fn: Callable[[], T]) -> T:
+        self._set_active(active)
+        try:
+            return fn()
+        finally:
+            self._set_active(True)
+
+    def _make_typeinfo(self, name: str = "mod.X") -> TypeInfo:
+        from mypy.nodes import Block, ClassDef
+
+        defn = ClassDef(name, Block([]))
+        info = TypeInfo(SymbolTable(), defn, name)
+        defn.info = info
+        info.mro = [info]
+        return info
+
+    def _make_var(self, name: str, info: TypeInfo | None = None) -> Var:
+        v = Var(name)
+        if info is not None:
+            v.info = info
+        return v
+
+    def _add_base(self, info: TypeInfo, base: TypeInfo, member_name: str | None = None) -> None:
+        """Add base to info.mro and optionally register a member in base.names."""
+        info.mro.insert(1, base)
+        if member_name is not None:
+            st = SymbolTableNode(GDEF, Var(member_name))
+            base.names[member_name] = st
+
+    def _seam(self, var: Var) -> Any:
+        return _type_kernel.rust_is_defined_in_base_class(var)
+
+    def _run(self, var: Var) -> tuple[bool, bool]:
+        from mypy.checker import TypeChecker
+
+        def check_one() -> bool:
+            chk = TypeChecker.__new__(TypeChecker)
+            return chk.is_defined_in_base_class(var)
+
+        off = self._with_gate(False, check_one)
+        on = self._with_gate(True, check_one)
+        return off, on
+
+    def _assert_par(self, var: Var) -> None:
+        off, on = self._run(var)
+        assert_equal(on, off, f"is_defined_in_base_class parity for var={var!r}")
+
+    def test_seam_no_info(self) -> None:
+        v = self._make_var("attr")
+        assert self._seam(v) is False
+
+    def test_seam_fallback_to_any(self) -> None:
+        info = self._make_typeinfo()
+        info.fallback_to_any = True
+        v = self._make_var("attr", info)
+        assert self._seam(v) is True
+
+    def test_seam_empty_mro(self) -> None:
+        info = self._make_typeinfo()
+        v = self._make_var("attr", info)
+        assert self._seam(v) is False
+
+    def test_seam_name_in_base(self) -> None:
+        info = self._make_typeinfo()
+        base = self._make_typeinfo("mod.Base")
+        self._add_base(info, base, member_name="attr")
+        v = self._make_var("attr", info)
+        assert self._seam(v) is True
+
+    def test_seam_name_not_in_base(self) -> None:
+        info = self._make_typeinfo()
+        base = self._make_typeinfo("mod.Base")
+        self._add_base(info, base, member_name="other")
+        v = self._make_var("attr", info)
+        assert self._seam(v) is False
+
+    def test_seam_name_in_second_base(self) -> None:
+        info = self._make_typeinfo()
+        base1 = self._make_typeinfo("mod.B1")
+        base2 = self._make_typeinfo("mod.B2")
+        self._add_base(info, base1, member_name="other")
+        self._add_base(info, base2, member_name="attr")
+        v = self._make_var("attr", info)
+        assert self._seam(v) is True
+
+    def test_parity_no_info(self) -> None:
+        self._assert_par(self._make_var("attr"))
+
+    def test_parity_fallback_to_any(self) -> None:
+        info = self._make_typeinfo()
+        info.fallback_to_any = True
+        self._assert_par(self._make_var("attr", info))
+
+    def test_parity_empty_mro(self) -> None:
+        info = self._make_typeinfo()
+        self._assert_par(self._make_var("attr", info))
+
+    def test_parity_name_in_base(self) -> None:
+        info = self._make_typeinfo()
+        base = self._make_typeinfo("mod.Base")
+        self._add_base(info, base, member_name="attr")
+        self._assert_par(self._make_var("attr", info))
+
+    def test_parity_name_not_in_base(self) -> None:
+        info = self._make_typeinfo()
+        base = self._make_typeinfo("mod.Base")
+        self._add_base(info, base, member_name="other")
+        self._assert_par(self._make_var("attr", info))
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeCheckExitReturnTypeSuite(Suite):
     """Parity for `rust_check_exit_return_type` (issue #1597).
 
