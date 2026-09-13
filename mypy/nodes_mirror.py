@@ -336,7 +336,18 @@ _G2_FUNC_FLAGS: Final[frozenset[str]] = frozenset(
 )
 
 _G2_FUNC_DEF: Final[frozenset[str]] = (
-    frozenset({"abstract_status", "deprecated"})
+    frozenset(
+        {
+            "type",
+            "unanalyzed_type",
+            "_fullname",
+            "abstract_status",
+            "deprecated",
+            "original_def",
+            "dataclass_transform_spec",
+            "docstring",
+        }
+    )
     | _G2_FUNC_BASE
     | _G2_FUNC_FLAGS
 )

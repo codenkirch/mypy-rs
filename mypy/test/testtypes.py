@@ -58389,6 +58389,10 @@ class NativeStmtDefMirrorSuite(Suite):
         func.unanalyzed_type = self.fx.callable(AnyType(TypeOfAny.special_form))
         func.abstract_status = 1
         func.info = self._typeinfo("mod.f")
+        func.deprecated = "use g instead"
+        func.original_def = nodes_mod.FuncDef("g")
+        func.dataclass_transform_spec = nodes_mod.DataclassTransformSpec()
+        func.docstring = "doc"
         flags = sorted(self._m._G2_FUNC_FLAGS)
         for name in flags:
             setattr(func, name, True)
@@ -58399,6 +58403,10 @@ class NativeStmtDefMirrorSuite(Suite):
         assert record["unanalyzed_type"] == ("obj", "CallableType", None, None)
         assert record["abstract_status"] == ("int", None, 1, None)
         assert record["info"] == ("obj", "TypeInfo:mod.f", None, None)
+        assert record["deprecated"] == ("str", "use g instead", None, None)
+        assert record["original_def"] == ("obj", "FuncDef", None, None)
+        assert record["dataclass_transform_spec"] == ("obj", "DataclassTransformSpec", None, None)
+        assert record["docstring"] == ("str", "doc", None, None)
         for name in flags:
             assert record[name] == ("bool", None, 1, None), name
 
@@ -58700,6 +58708,7 @@ class NativeStmtDefMirrorSuite(Suite):
             "analyzed",
             "has_incompatible_baseclass",
             "metaclass",
+            "removed_statements",
         }
         assert record["has_incompatible_baseclass"] == ("bool", None, 1, None)
         assert record["metaclass"] == ("obj", "NameExpr", None, None)
