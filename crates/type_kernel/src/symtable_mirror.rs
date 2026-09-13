@@ -500,11 +500,7 @@ pub(crate) fn meta_put(
 /// Record one extended G3.0c field on an existing MetaEntry (or create
 /// a minimal entry if none exists yet). The value is a string encoding
 /// (bool as "true"/"false", int as its string form, fullname string).
-pub(crate) fn meta_put_field(
-    info: &PyAny,
-    field: &str,
-    value: &str,
-) -> PyResult<()> {
+pub(crate) fn meta_put_field(info: &PyAny, field: &str, value: &str) -> PyResult<()> {
     let info_handle = handle_or_error(info)?;
     with_store(|store| {
         store.next_seq += 1;
