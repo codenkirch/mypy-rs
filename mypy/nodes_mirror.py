@@ -320,7 +320,9 @@ _G2_FUNC_FLAGS: Final[frozenset[str]] = frozenset(
 )
 
 _G2_FUNC_DEF: Final[frozenset[str]] = (
-    frozenset({"type", "unanalyzed_type", "_fullname", "abstract_status", "deprecated"})
+    frozenset(
+        {"type", "unanalyzed_type", "_fullname", "abstract_status", "deprecated", "info"}
+    )
     | _G2_FUNC_FLAGS
 )
 
@@ -384,13 +386,25 @@ _G2_TRACKED: Final[dict[type, frozenset[str]]] = {
     WithStmt: frozenset({"analyzed_types"}),
     IfStmt: frozenset({"unreachable_else"}),
     MatchStmt: frozenset({"subject_dummy"}),
-    TypeAliasStmt: frozenset({"alias_node"}),
+    TypeAliasStmt: frozenset({"alias_node", "invalid_recursive_alias"}),
     FuncDef: _G2_FUNC_DEF,
     OverloadedFuncDef: frozenset(
         {"items", "unanalyzed_items", "impl", "deprecated", "setter_index"}
     ),
-    Decorator: frozenset({"func", "var", "is_overload", "decorators"}),
-    ClassDef: frozenset({"info", "analyzed", "has_incompatible_baseclass", "metaclass"}),
+    Decorator: frozenset(
+        {"func", "var", "is_overload", "decorators", "original_decorators"}
+    ),
+    ClassDef: frozenset(
+        {
+            "info",
+            "analyzed",
+            "has_incompatible_baseclass",
+            "metaclass",
+            "_fullname",
+            "removed_base_type_exprs",
+            "type_vars",
+        }
+    ),
     Var: _G2_VAR,
 }
 

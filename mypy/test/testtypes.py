@@ -58388,6 +58388,7 @@ class NativeStmtDefMirrorSuite(Suite):
         func.type = self.fx.callable(AnyType(TypeOfAny.special_form))
         func.unanalyzed_type = self.fx.callable(AnyType(TypeOfAny.special_form))
         func.abstract_status = 1
+        func.info = self._typeinfo("mod.f")
         flags = sorted(self._m._G2_FUNC_FLAGS)
         for name in flags:
             setattr(func, name, True)
@@ -58397,6 +58398,7 @@ class NativeStmtDefMirrorSuite(Suite):
         assert record["type"] == ("obj", "CallableType", None, None)
         assert record["unanalyzed_type"] == ("obj", "CallableType", None, None)
         assert record["abstract_status"] == ("int", None, 1, None)
+        assert record["info"] == ("obj", "TypeInfo:mod.f", None, None)
         for name in flags:
             assert record[name] == ("bool", None, 1, None), name
 
@@ -58424,11 +58426,14 @@ class NativeStmtDefMirrorSuite(Suite):
         # `func` and `var` are non-baseline, adopting the node; the
         # baseline `decorators=[]` and `is_overload=False` are captured
         # because the node is already adopted.
-        assert set(record) == {"func", "var", "is_overload", "decorators"}
+        assert set(record) == {
+            "func", "var", "is_overload", "decorators", "original_decorators",
+        }
         assert record["func"] == ("obj", "FuncDef", None, None)
         assert record["var"] == ("obj", "Var", None, None)
         assert record["is_overload"] == ("bool", None, 0, None)
         assert record["decorators"] == ("list", None, None, [])
+        assert record["original_decorators"] == ("list", None, None, [])
 
     def test_class_def_info_and_analyzed(self) -> None:
         from mypy import nodes as nodes_mod
@@ -58638,7 +58643,9 @@ class NativeStmtDefMirrorSuite(Suite):
         dec.is_overload = True
         dec.decorators = [nodes_mod.NameExpr("decorator1")]
         record = self._meta(dec)
-        assert set(record) == {"func", "var", "is_overload", "decorators"}
+        assert set(record) == {
+            "func", "var", "is_overload", "decorators", "original_decorators",
+        }
         assert record["is_overload"] == ("bool", None, 1, None)
         assert record["decorators"] == ("list", None, None, ["NameExpr"])
 
@@ -58650,7 +58657,10 @@ class NativeStmtDefMirrorSuite(Suite):
         cls.metaclass = nodes_mod.NameExpr("ABCMeta")
         record = self._meta(cls)
         assert set(record) == {
-            "info", "analyzed", "has_incompatible_baseclass", "metaclass",
+            "info",
+            "analyzed",
+            "has_incompatible_baseclass",
+            "metaclass",
         }
         assert record["has_incompatible_baseclass"] == ("bool", None, 1, None)
         assert record["metaclass"] == ("obj", "NameExpr", None, None)
@@ -58665,6 +58675,67 @@ class NativeStmtDefMirrorSuite(Suite):
         assert record["deprecated"] == ("str", "use mod.g", None, None)
         func.deprecated = None
         assert self._meta(func)["deprecated"] == ("none", None, None, None)
+
+    def test_class_def_fullname_and_type_vars(self) -> None:
+        from mypy import nodes as nodes_mod
+
+        cls = nodes_mod.ClassDef("C", nodes_mod.Block([]))
+        cls._fullname = "mod.C"
+        cls.type_vars = [
+            TypeVarType(
+                "T", "mod.T", TypeVarId(1), [],
+                AnyType(TypeOfAny.special_form), AnyType(TypeOfAny.special_form),
+            )
+        ]
+        record = self._meta(cls)
+        assert record["_fullname"] == ("str", "mod.C", None, None)
+        assert record["type_vars"] == ("list", None, None, ["TypeVarType:mod.T"])
+
+    def test_class_def_removed_base_type_exprs(self) -> None:
+        from mypy import nodes as nodes_mod
+
+        cls = nodes_mod.ClassDef("C", nodes_mod.Block([]))
+        cls.removed_base_type_exprs = [nodes_mod.NameExpr("Generic")]
+        record = self._meta(cls)
+        assert record["removed_base_type_exprs"] == (
+            "list", None, None, ["NameExpr"],
+        )
+        cls.removed_base_type_exprs = []
+        assert self._meta(cls)["removed_base_type_exprs"] == (
+            "list", None, None, [],
+        )
+
+    def test_func_def_info(self) -> None:
+        from mypy import nodes as nodes_mod
+
+        func = nodes_mod.FuncDef("f")
+        func._fullname = "mod.f"
+        func.info = self._typeinfo("mod.A")
+        record = self._meta(func)
+        assert record["info"] == ("obj", "TypeInfo:mod.A", None, None)
+
+    def test_type_alias_stmt_invalid_recursive_alias(self) -> None:
+        from mypy import nodes as nodes_mod
+
+        stmt = nodes_mod.TypeAliasStmt(
+            nodes_mod.NameExpr("A"), [], nodes_mod.LambdaExpr([], nodes_mod.Block([]))
+        )
+        stmt.invalid_recursive_alias = True
+        record = self._meta(stmt)
+        assert record["invalid_recursive_alias"] == ("bool", None, 1, None)
+        stmt.invalid_recursive_alias = False
+        assert self._meta(stmt)["invalid_recursive_alias"] == ("bool", None, 0, None)
+
+    def test_decorator_original_decorators(self) -> None:
+        from mypy import nodes as nodes_mod
+
+        func = nodes_mod.FuncDef("f")
+        var = nodes_mod.Var("f")
+        dec = nodes_mod.Decorator(func, [nodes_mod.NameExpr("dec1")], var)
+        record = self._meta(dec)
+        assert record["original_decorators"] == ("list", None, None, ["NameExpr"])
+        dec.original_decorators = []
+        assert self._meta(dec)["original_decorators"] == ("list", None, None, [])
 
     def test_handle_shares_identity_namespace(self) -> None:
         from mypy import nodes as nodes_mod
