@@ -148,6 +148,8 @@ mod stubgen;
 mod subtypes;
 mod suggestions;
 mod supported_self_type;
+// Phase G3.0a (#1581): namespace dual-write capture shadow store.
+mod symtable_mirror;
 mod traverser;
 mod treetransform;
 mod type_range;
@@ -3561,6 +3563,50 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
     )?)?;
     module.add_function(wrap_pyfunction!(
         node_mirror::rust_node_mirror_meta_entry_count,
+        module
+    )?)?;
+
+    // Phase G3.0a (#1581): namespace dual-write capture shadow. One
+    // record per (owner table handle, name) with generation + seq;
+    // capture-only, same identity base as the proxy/mirror stores.
+    module.add_function(wrap_pyfunction!(
+        symtable_mirror::rust_symtable_mirror_put,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        symtable_mirror::rust_symtable_mirror_delete,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        symtable_mirror::rust_symtable_mirror_refresh_flags,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        symtable_mirror::rust_symtable_mirror_lookup,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        symtable_mirror::rust_symtable_mirror_entry_count,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        symtable_mirror::rust_symtable_mirror_total_entry_count,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        symtable_mirror::rust_symtable_mirror_names,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        symtable_mirror::rust_symtable_mirror_generation,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        symtable_mirror::rust_symtable_mirror_reset,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        symtable_mirror::rust_symtable_mirror_handle_of,
         module
     )?)?;
 

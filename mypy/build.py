@@ -1306,6 +1306,17 @@ class BuildManager:
             nodes_mirror.activate(
                 audit=_os_ast_mirror.environ.get("MYPY_TK_AST_MIRROR_AUDIT") == "1"
             )
+        # Phase G3.0a (#1581): activate the namespace dual-write capture
+        # shadow (capture-only; no consumer reads it). Independent of the
+        # type-kernel gate: it wraps live SymbolTable classes.
+        if self.options.native_symtable_mirror:
+            import os as _os_symtable_mirror
+
+            from mypy import symtables_mirror
+
+            symtables_mirror.activate(
+                audit=_os_symtable_mirror.environ.get("MYPY_TK_SYMTABLE_AUDIT") == "1"
+            )
         # Stage 3c/4 production wiring (M8bb): the resolver is built per
         # SCC in `process_stale_scc` (after semantic analysis populates
         # the TypeInfo graph). See `_build_native_resolvers` for status.
@@ -1853,6 +1864,13 @@ class BuildManager:
             from mypy import nodes_mirror
 
             nodes_mirror.reset()
+        if self.options.native_symtable_mirror:
+            # Phase G3.0a (#1581): namespace-shadow entries pin symbol
+            # tables and nodes; reset before the preserving type-mirror
+            # reset (it also leaves `identity` alone).
+            from mypy import symtables_mirror
+
+            symtables_mirror.reset()
         if self.options.native_type_mirror:
             # Preserving reset (#1528): blobs + raw ids drop, strong-pin
             # stable handles survive so astmerge-preserved objects keep

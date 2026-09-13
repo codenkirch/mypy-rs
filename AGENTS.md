@@ -4314,6 +4314,39 @@ including:
   combined); cold self-check clean 351 in kernel and kernel+shadow
   modes.
 
+- wave 72A namespace entry funnel + dual-write capture scaffold (G3.0a, issue #1581):
+  first G3 slice per docs/plans/2026-09-11-g3-symbol-table-brief.md. New
+  `crates/type_kernel/src/symtable_mirror.rs` keyed by (owner table handle,
+  name) with table generation + monotonic capture seq, strong Py<PyAny> pins,
+  and the by-node reverse index for flag refresh; ten
+  `rust_symtable_mirror_*` pyfunctions + lib.rs registrations + stub
+  declarations; reset drops entries/pins only and never touches
+  `identity::reset`. New `mypy/symtable_access.py` (`put_names_entry` ->
+  PutResult mirroring the committed branch of
+  `add_symbol_table_node`) and `mypy/symtables_mirror.py` (class patches
+  on `SymbolTable.__setitem__/__delitem__/pop` and
+  `SymbolTableNode.__setattr__`, G1.0a pattern; routed writes use raw
+  `dict.__setitem__` so every patched `__setitem__` counts as
+  `bypass.put`). Gate `Options.native_symtable_mirror` default off, out
+  of OPTIONS_AFFECTING_CACHE, plus `TEST_NATIVE_SYMTABLE_MIRROR` in test
+  helpers and the per-build/per-recheck reset branch in
+  `_clear_native_resolvers` (before the preserving type-mirror reset).
+  Routed the semanal adding funnel through the accessor
+  (`prepare_file`/__builtins__, builtins core classes + special vars,
+  the implicit-attr put, `add_global_symbol`,
+  `add_symbol_table_node` committed put, `add_redefinition`); refusals
+  never call it so they leave no shadow trace by construction. Tests:
+  `NativeSymtableMirrorSuite` (12: routed put, placeholder replace,
+  two refusal pins, unknown-shape defer, generations, ref-flag refresh,
+  cross/plugin flags, deletes, shared identity, failure-safety, gate-off)
+  plus the documented known-bypass pin for
+  `rust_remove_imported_names_from_symtable` (semanal_visitor.rs:458
+  `PyDict::del_item`, G3.0b reroute). No read flip, no cache-format
+  change, no plugin-visible change. Gates: cargo type_kernel 2,818/11,
+  fmt + clippy clean; testtypes 3,483/7 both gate states (3,471 baseline
+  + 12); testcheck 8,198/15/7 exact both gate states; fine-grained 747/27
+  + daemon 38 + merge 41/1 + diff 79 shadow-on; cold self-check clean 353.
+
 ## Pull Requests
 
 The default branch on this fork is `main` (not `master`). Always target

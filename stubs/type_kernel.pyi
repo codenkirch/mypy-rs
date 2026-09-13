@@ -485,6 +485,16 @@ __all__ = [
     "rust_node_mirror_meta_drop",
     "rust_node_mirror_meta_reset",
     "rust_node_mirror_meta_entry_count",
+    "rust_symtable_mirror_put",
+    "rust_symtable_mirror_delete",
+    "rust_symtable_mirror_refresh_flags",
+    "rust_symtable_mirror_lookup",
+    "rust_symtable_mirror_entry_count",
+    "rust_symtable_mirror_total_entry_count",
+    "rust_symtable_mirror_names",
+    "rust_symtable_mirror_generation",
+    "rust_symtable_mirror_reset",
+    "rust_symtable_mirror_handle_of",
     "rust_mirror_handle_of",
     "IdMapper",
 ]
@@ -2709,6 +2719,42 @@ def rust_node_mirror_meta_captures(handle: int) -> int | None: ...
 def rust_node_mirror_meta_drop(handle: int) -> bool: ...
 def rust_node_mirror_meta_reset() -> int: ...
 def rust_node_mirror_meta_entry_count() -> int: ...
+
+# Phase G3.0a (#1581): namespace dual-write capture shadow. One record
+# per (owner table handle, name) with generation + seq; `refresh_flags`
+# updates every record referencing an adopted node.
+def rust_symtable_mirror_put(
+    owner: Any,
+    name: str,
+    symbol: Any,
+    kind: int,
+    node_fullname: str | None,
+    module_public: bool,
+    module_hidden: bool,
+    implicit: bool,
+    plugin_generated: bool,
+    no_serialize: bool,
+    cross_ref: str | None,
+) -> tuple[int, int, int, int]: ...
+def rust_symtable_mirror_delete(owner: Any, name: str) -> bool: ...
+def rust_symtable_mirror_refresh_flags(
+    node: Any,
+    kind: int,
+    node_fullname: str | None,
+    module_public: bool,
+    module_hidden: bool,
+    implicit: bool,
+    plugin_generated: bool,
+    no_serialize: bool,
+    cross_ref: str | None,
+) -> bool: ...
+def rust_symtable_mirror_lookup(owner: Any, name: str) -> dict[str, Any] | None: ...
+def rust_symtable_mirror_entry_count(owner: Any) -> int: ...
+def rust_symtable_mirror_total_entry_count() -> int: ...
+def rust_symtable_mirror_names(owner: Any) -> list[str]: ...
+def rust_symtable_mirror_generation(owner: Any) -> int | None: ...
+def rust_symtable_mirror_reset() -> int: ...
+def rust_symtable_mirror_handle_of(obj: Any) -> int | None: ...
 
 # The proxy suite pins the shared identity namespace by comparing the
 # proxy handle with the mirror's non-minting lookup.

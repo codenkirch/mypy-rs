@@ -430,6 +430,10 @@ class Options:
         # AST family (RefExpr bindings + analyzed); capture-only and not in
         # OPTIONS_AFFECTING_CACHE: no shadow state may enter the cache.
         self.native_ast_mirror = False
+        # Phase G3.0a (#1581): opt-in dual-write namespace capture shadow
+        # for symbol tables (semanal adding funnel via put_names_entry).
+        # Capture-only, not in OPTIONS_AFFECTING_CACHE.
+        self.native_symtable_mirror = False
         # G0.5 (#1566): opt-in Rust fixed-format cache-data writer; the
         # hybrid write phase measured ~1.5x the Python writer per round, so
         # the bridge ships default-off until the type payloads move too.

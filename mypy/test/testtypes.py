@@ -58571,3 +58571,294 @@ class NativeStmtDefMirrorSuite(Suite):
         assert self._k.rust_node_mirror_handle_of(var) == handle
         assert self._k.rust_proxy_handle_of(var) == handle
         assert self._k.rust_mirror_handle_of(var) == handle
+
+
+class NativeSymtableMirrorSuite(Suite):
+    """Unit tests for the G3.0a namespace entry funnel + capture scaffold (#1581).
+
+    The store is capture-only: every assertion drives the
+    `mypy.symtable_access.put_names_entry` funnel or the patched
+    `SymbolTable` hooks and reads the Rust record back through the
+    `rust_symtable_mirror_*` pyfunctions. The pinnings are the G3.0a
+    contract: committed puts record exactly once, refusals leave no
+    trace, namespace rebinds mint a fresh generation, ref-flag writes
+    refresh adopted records, deletes drop records, identity shares the
+    proxy/mirror namespace, capture failures never break the write, the
+    gate-off path leaves the table untouched, and the Rust
+    `remove_imported_names` deleter is a documented known bypass until
+    the G3.0b reroute.
+    """
+
+    def setUp(self) -> None:
+        import type_kernel as kernel
+
+        from mypy import symtables_mirror
+
+        symtables_mirror.activate(audit=True)
+        symtables_mirror.reset(clear_counts=True)
+        self._k = kernel
+        self._m = symtables_mirror
+
+    def tearDown(self) -> None:
+        self._m.reset(clear_counts=True)
+
+    def _var(self, name: str, fullname: str) -> Any:
+        var = Var(name)
+        var._fullname = fullname
+        return var
+
+    def _delta(self, before: dict[str, int]) -> dict[str, int]:
+        after = self._m.report()
+        return {k: v - before.get(k, 0) for k, v in after.items() if v != before.get(k, 0)}
+
+    def test_routed_put_records_entry(self) -> None:
+        from mypy.symtable_access import put_names_entry
+
+        table: SymbolTable = SymbolTable()
+        before = self._m.report()
+        result = put_names_entry(table, "x", SymbolTableNode(GDEF, self._var("x", "mod.x")))
+        assert result.committed is True
+        assert result.generation > 0
+        assert result.seq > 0
+        assert table["x"].node is not None
+        assert self._m.entry_count(table) == 1
+        assert self._k.rust_symtable_mirror_entry_count(table) == 1
+        record = self._m.lookup(table, "x")
+        assert record is not None
+        assert record["kind"] == GDEF
+        assert record["node_fullname"] == "mod.x"
+        assert record["generation"] == result.generation
+        assert record["seq"] == result.seq
+        delta = self._delta(before)
+        assert delta.get("routed.put", 0) == 1
+        assert delta.get("bypass.put", 0) == 0
+
+    def test_placeholder_put_then_replacement_relinks(self) -> None:
+        from mypy.symtable_access import put_names_entry
+
+        table: SymbolTable = SymbolTable()
+        placeholder = PlaceholderNode("mod.x", Var("dummy"), 1)
+        first_sym = SymbolTableNode(GDEF, placeholder)
+        put_names_entry(table, "x", first_sym)
+        first = self._m.lookup(table, "x")
+        assert first is not None
+        assert first["node_fullname"] == "mod.x"
+        replacement = self._var("x", "mod.x")
+        replacement_sym = SymbolTableNode(GDEF, replacement)
+        put_names_entry(table, "x", replacement_sym)
+        second = self._m.lookup(table, "x")
+        assert second is not None
+        assert second["seq"] > first["seq"]
+        assert second["generation"] == first["generation"]
+        # The replaced placeholder node is unlinked: refreshing it no
+        # longer touches the record, the new node does.
+        assert (
+            self._k.rust_symtable_mirror_refresh_flags(
+                first_sym, GDEF, "mod.x", True, False, False, False, False, None
+            )
+            is False
+        )
+        assert (
+            self._k.rust_symtable_mirror_refresh_flags(
+                replacement_sym, GDEF, "mod.x", True, False, False, False, False, None
+            )
+            is True
+        )
+        assert self._m.entry_count(table) == 1
+
+    def test_refused_placeholder_new_leaves_no_trace(self) -> None:
+        from mypy.semanal import is_valid_replacement
+        from mypy.symtable_access import put_names_entry
+
+        table: SymbolTable = SymbolTable()
+        existing = SymbolTableNode(GDEF, self._var("x", "mod.x"))
+        put_names_entry(table, "x", existing)
+        before_count = self._m.entry_count(table)
+        before_record = self._m.lookup(table, "x")
+        # A placeholder arriving over a real definition is not a valid
+        # replacement: add_symbol_table_node returns False without
+        # putting, so the shadow must keep the old record untouched.
+        refused = SymbolTableNode(GDEF, PlaceholderNode("mod.x", Var("dummy"), 1))
+        assert is_valid_replacement(existing, refused) is False
+        assert self._m.entry_count(table) == before_count
+        assert self._m.lookup(table, "x") == before_record
+        assert self._m.lookup(table, "y") is None
+
+    def test_construction_without_put_leaves_no_trace(self) -> None:
+        table: SymbolTable = SymbolTable()
+        # Merely constructing a node (the refusal path builds one but
+        # never puts it) must not adopt anything.
+        SymbolTableNode(GDEF, self._var("y", "mod.y"))
+        assert self._m.entry_count(table) == 0
+        assert self._m.lookup(table, "y") is None
+        assert self._k.rust_symtable_mirror_total_entry_count() == 0
+        # Unknown shapes defer safely: a non-SymbolTableNode value still
+        # writes through the raw dict but records nothing.
+        from mypy.symtable_access import put_names_entry
+
+        result = put_names_entry(table, "junk", object())
+        assert result.committed is True
+        assert result.generation == 0
+        assert "junk" in table
+        assert self._m.lookup(table, "junk") is None
+        assert self._m.entry_count(table) == 0
+
+    def test_namespace_rebind_mints_fresh_generation(self) -> None:
+        from mypy.symtable_access import put_names_entry
+
+        old: SymbolTable = SymbolTable()
+        first = put_names_entry(old, "x", SymbolTableNode(GDEF, self._var("x", "mod.x")))
+        new: SymbolTable = SymbolTable()
+        second = put_names_entry(new, "x", SymbolTableNode(GDEF, self._var("x", "mod.x")))
+        assert second.generation != first.generation
+        assert self._m.generation(old) == first.generation
+        assert self._m.generation(new) == second.generation
+        # Per-name records never merge across generations.
+        assert self._m.entry_count(old) == 1
+        assert self._m.entry_count(new) == 1
+        assert self._k.rust_symtable_mirror_total_entry_count() == 2
+
+    def test_ref_flags_refresh_on_setattr(self) -> None:
+        from mypy.symtable_access import put_names_entry
+
+        table: SymbolTable = SymbolTable()
+        sym = SymbolTableNode(GDEF, self._var("x", "mod.x"))
+        put_names_entry(table, "x", sym)
+        # Constructor-default writes on a never-adopted node stay out of
+        # the store; the first put adopts with the post-write snapshot.
+        fresh = SymbolTableNode(GDEF, self._var("u", "mod.u"))
+        fresh.implicit = True
+        assert self._k.rust_symtable_mirror_total_entry_count() == 1
+        sym.implicit = True
+        sym.module_public = False
+        sym.no_serialize = True
+        record = self._m.lookup(table, "x")
+        assert record is not None
+        assert record["implicit"] is True
+        assert record["module_public"] is False
+        assert record["no_serialize"] is True
+        sym.kind = MDEF
+        refreshed = self._m.lookup(table, "x")
+        assert refreshed is not None
+        assert refreshed["kind"] == MDEF
+
+    def test_cross_ref_plugin_and_hidden_flags_captured(self) -> None:
+        from mypy.symtable_access import put_names_entry
+
+        table: SymbolTable = SymbolTable()
+        sym = SymbolTableNode(
+            GDEF, self._var("x", "other.x"), plugin_generated=True, no_serialize=True
+        )
+        sym.module_hidden = True
+        sym.cross_ref = "other.x"
+        put_names_entry(table, "x", sym)
+        record = self._m.lookup(table, "x")
+        assert record is not None
+        assert record["plugin_generated"] is True
+        assert record["no_serialize"] is True
+        assert record["module_hidden"] is True
+        assert record["cross_ref"] == "other.x"
+        assert record["node_fullname"] == "other.x"
+
+    def test_delete_via_delitem_and_pop(self) -> None:
+        from mypy.symtable_access import put_names_entry
+
+        table: SymbolTable = SymbolTable()
+        put_names_entry(table, "a", SymbolTableNode(GDEF, self._var("a", "mod.a")))
+        put_names_entry(table, "b", SymbolTableNode(GDEF, self._var("b", "mod.b")))
+        assert self._m.entry_count(table) == 2
+        del table["a"]
+        assert "a" not in table
+        assert self._m.lookup(table, "a") is None
+        assert self._m.entry_count(table) == 1
+        table.pop("b")
+        assert "b" not in table
+        assert self._m.lookup(table, "b") is None
+        assert self._m.entry_count(table) == 0
+
+    def test_identity_shares_namespace(self) -> None:
+        from mypy.symtable_access import put_names_entry
+
+        table: SymbolTable = SymbolTable()
+        sym = SymbolTableNode(GDEF, self._var("x", "mod.x"))
+        put_names_entry(table, "x", sym)
+        handle = self._m.handle_of(table)
+        assert handle is not None
+        # One identity namespace: the symtable store, the proxy and the
+        # mirror all answer the same handle for the same object.
+        assert self._k.rust_symtable_mirror_handle_of(table) == handle
+        assert self._k.rust_mirror_handle_of(table) == handle
+        assert self._k.rust_proxy_handle_of(table) == handle
+        node_handle = self._m._NODE_HANDLES.get(id(sym))
+        assert node_handle is not None
+        assert self._k.rust_symtable_mirror_handle_of(sym) == node_handle
+
+    def test_failure_safety_write_survives_kernel_failure(self) -> None:
+        import type_kernel as kernel
+
+        from mypy.symtable_access import put_names_entry
+
+        table: SymbolTable = SymbolTable()
+        original = kernel.rust_symtable_mirror_put
+
+        def boom(*args: Any, **kwargs: Any) -> Any:
+            raise RuntimeError("kernel down")
+
+        kernel.rust_symtable_mirror_put = boom
+        try:
+            before = self._m.report()
+            sym = SymbolTableNode(GDEF, self._var("x", "mod.x"))
+            result = put_names_entry(table, "x", sym)
+            # The dict write is normative and never fails with the
+            # capture; the receipt degrades to the plain one.
+            assert table["x"] is sym
+            assert result.generation == 0
+            assert self._m.lookup(table, "x") is None
+            assert self._delta(before).get("capture_fail.put", 0) >= 1
+        finally:
+            kernel.rust_symtable_mirror_put = original
+
+    def test_gate_off_leaves_table_untouched(self) -> None:
+        from mypy.symtable_access import put_names_entry
+
+        self._m._active = False
+        try:
+            table: SymbolTable = SymbolTable()
+            sym = SymbolTableNode(GDEF, self._var("x", "mod.x"))
+            result = put_names_entry(table, "x", sym)
+            assert table["x"] is sym
+            assert result.generation == 0
+            assert id(sym) not in self._m._NODE_HANDLES
+            assert self._k.rust_symtable_mirror_total_entry_count() == 0
+        finally:
+            self._m._active = True
+
+    def test_direct_write_counts_bypass_and_rust_remove_is_known_bypass(self) -> None:
+        # A direct `table[name] = ...` write bypasses put_names_entry: the
+        # class patch still captures it (the shadow stays complete) but
+        # counts it as `bypass.put`, so funnel coverage stays falsifiable.
+        table: SymbolTable = SymbolTable()
+        before = self._m.report()
+        table["direct"] = SymbolTableNode(GDEF, self._var("direct", "mod.direct"))
+        assert self._m.lookup(table, "direct") is not None
+        delta = self._delta(before)
+        assert delta.get("bypass.put", 0) >= 1
+        # Documented known bypass (G3.0b follow-up):
+        # rust_remove_imported_names_from_symtable deletes via
+        # PyDict::del_item (semanal_visitor.rs:458), bypassing the patch.
+        import type_kernel as kernel
+
+        from mypy.symtable_access import put_names_entry
+
+        table2: SymbolTable = SymbolTable()
+        put_names_entry(table2, "local", SymbolTableNode(GDEF, self._var("local", "mod.local")))
+        put_names_entry(
+            table2, "imported", SymbolTableNode(GDEF, self._var("imported", "other.imported"))
+        )
+        assert self._m.entry_count(table2) == 2
+        kernel.rust_remove_imported_names_from_symtable(table2, "mod")
+        assert "imported" not in table2
+        assert "local" in table2
+        # The shadow still holds the removed name: stale until G3.0b.
+        assert self._m.lookup(table2, "imported") is not None
+        assert self._m.entry_count(table2) == 2
