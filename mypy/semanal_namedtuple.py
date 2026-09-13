@@ -47,6 +47,7 @@ from mypy.nodes import (
     Var,
     is_StrExpr_list,
 )
+from mypy.nodes_mirror import touch as _touch_node_meta
 from mypy.options import Options
 from mypy.semanal_shared import (
     PRIORITY_FALLBACKS,
@@ -181,11 +182,13 @@ class NamedTupleAnalyzer:
                     continue
                 statements.pop()
                 defn.removed_statements.append(stmt)
+                _touch_node_meta(defn, "removed_statements")
                 self.fail(NAMEDTUP_CLASS_ERROR, stmt)
             elif len(stmt.lvalues) > 1 or not isinstance(stmt.lvalues[0], NameExpr):
                 # An assignment, but an invalid one.
                 statements.pop()
                 defn.removed_statements.append(stmt)
+                _touch_node_meta(defn, "removed_statements")
                 self.fail(NAMEDTUP_CLASS_ERROR, stmt)
             else:
                 # Append name and type in this case...

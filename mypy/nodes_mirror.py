@@ -419,6 +419,8 @@ _G2_TRACKED: Final[dict[type, frozenset[str]]] = {
             "_fullname",
             "removed_base_type_exprs",
             "type_vars",
+            "base_type_exprs",
+            "removed_statements",
         }
     ),
     Var: _G2_VAR,

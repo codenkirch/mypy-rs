@@ -36,6 +36,7 @@ from mypy.nodes import (
     TypeInfo,
     inline_base,
 )
+from mypy.nodes_mirror import touch as _touch_node_meta
 from mypy.options import Options
 from mypy.semanal_shared import (
     SemanticAnalyzerInterface,
@@ -537,10 +538,12 @@ class TypedDictAnalyzer:
                     statements.append(stmt)
                 else:
                     defn.removed_statements.append(stmt)
+                    _touch_node_meta(defn, "removed_statements")
                     self.fail(TPDICT_CLASS_ERROR, stmt)
             elif len(stmt.lvalues) > 1 or not isinstance(stmt.lvalues[0], NameExpr):
                 # An assignment, but an invalid one.
                 defn.removed_statements.append(stmt)
+                _touch_node_meta(defn, "removed_statements")
                 self.fail(TPDICT_CLASS_ERROR, stmt)
             else:
                 name = stmt.lvalues[0].name

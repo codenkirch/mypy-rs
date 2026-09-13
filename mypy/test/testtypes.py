@@ -58456,6 +58456,32 @@ class NativeStmtDefMirrorSuite(Suite):
         cls.analyzed = None
         assert self._meta(cls)["analyzed"] == ("none", None, None, None)
 
+    def test_class_def_extended_fields(self) -> None:
+        from mypy import nodes as nodes_mod
+
+        cls = nodes_mod.ClassDef("C", nodes_mod.Block([]))
+        # Node is adopted via the non-baseline `info` constructor write.
+        # The new fields start as constructor baselines and are not yet
+        # in the record until a non-baseline write or explicit touch.
+        record = self._meta(cls)
+        assert "info" in record
+        assert "analyzed" in record
+        # Direct attribute assignment (visible to __setattr__).
+        cls.metaclass = nodes_mod.NameExpr("Meta")
+        assert self._meta(cls)["metaclass"] == ("obj", "NameExpr", None, None)
+        cls.base_type_exprs = [nodes_mod.NameExpr("Base")]
+        assert self._meta(cls)["base_type_exprs"] == ("list", None, None, ["NameExpr"])
+        # In-place list mutations (invisible to __setattr__) need touch.
+        cls.removed_statements.append(nodes_mod.PassStmt())
+        self._m.touch(cls, "removed_statements")
+        assert self._meta(cls)["removed_statements"] == ("list", None, None, ["PassStmt"])
+        cls.removed_base_type_exprs.append(nodes_mod.NameExpr("Generic"))
+        self._m.touch(cls, "removed_base_type_exprs")
+        assert self._meta(cls)["removed_base_type_exprs"] == ("list", None, None, ["NameExpr"])
+        # Reset via assignment (visible to __setattr__).
+        cls.removed_statements = []
+        assert self._meta(cls)["removed_statements"] == ("list", None, None, [])
+
     def test_var_field_set(self) -> None:
         from mypy import nodes as nodes_mod
 

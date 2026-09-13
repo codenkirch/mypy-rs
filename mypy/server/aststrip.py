@@ -62,6 +62,7 @@ from mypy.nodes import (
     TupleExpr,
     TypeInfo,
 )
+from mypy.nodes_mirror import touch as _touch_node_meta
 from mypy.symtable_access import delete_names_entry as _delete_names_entry
 from mypy.traverser import TraverserVisitor
 from mypy.types import CallableType
@@ -112,6 +113,7 @@ class NodeStripVisitor(TraverserVisitor, SplittingVisitor):
         to_delete = {v.node for v in node.info.names.values() if v.plugin_generated}
         node.type_vars = []
         node.base_type_exprs.extend(node.removed_base_type_exprs)
+        _touch_node_meta(node, "base_type_exprs")
         node.removed_base_type_exprs = []
         node.defs.body = [
             s

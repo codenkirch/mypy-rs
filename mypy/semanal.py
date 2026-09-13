@@ -2717,6 +2717,8 @@ class SemanticAnalyzer(
         # removed).
         defn.base_type_exprs.extend(defn.removed_base_type_exprs)
         defn.removed_base_type_exprs.clear()
+        _touch_node_meta(defn, "base_type_exprs")
+        _touch_node_meta(defn, "removed_base_type_exprs")
 
         self.infer_metaclass_and_bases_from_compat_helpers(defn)
 
@@ -3232,7 +3234,9 @@ class SemanticAnalyzer(
             # mostly because otherwise they will create spurious dependencies in fine
             # grained incremental mode.
             defn.removed_base_type_exprs.append(defn.base_type_exprs[i])
+            _touch_node_meta(defn, "removed_base_type_exprs")
             del base_type_exprs[i]
+        _touch_node_meta(defn, "base_type_exprs")
         tvar_defs = self.tvar_defs_from_tvars(declared_tvars, context)
         return base_type_exprs, tvar_defs, is_protocol, declared_tvars
 
