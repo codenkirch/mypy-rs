@@ -4499,6 +4499,23 @@ including:
   parity differentials), plus pure decision unit tests in
   `checker_functions.rs`. Gates: cargo type_kernel clean, fmt + clippy
   clean, testtypes 3557 passed/7 skipped, cold self-check clean.
+- wave 75 H1d native check_final_deletable (issue #1599): the Rust
+  seam in `checker_functions.rs` mirrors
+  `TypeChecker.check_final_deletable` (checker.py:4053-4059) as a
+  live-PyO3-object port (zero wire bytes). Rust walks
+  `typ.deletable_attributes` (list of strings), looks up each attr in
+  `typ.names` (SymbolTable dict), checks `isinstance(node.node, Var)`
+  and `node.node.is_final` via PyO3, and returns the list of offending
+  attr names. Returns `Option<Vec<String>>`: `Some(names)` = emit fail
+  for each, `None` = defer. The `self.fail(message_registry.CANNOT_MAKE_DELETABLE_FINAL, ...)`
+  emission stays Python-side. Gated by `_native_checker_active`
+  (existing wiring, no build.py change) and covered by
+  `NativeCheckFinalDeletableSuite` in `mypy/test/testtypes.py` (6 direct
+  seam calls + 6 gate-off vs gate-on parity differentials), plus pure
+  decision unit tests in `checker_functions.rs`. Gates: cargo
+  type_kernel clean, fmt + clippy clean, testtypes 3555 passed/7
+  skipped, testcheck 8144 passed/69 skipped/7 xfailed, cold self-check
+  clean.
 
 ## Pull Requests
 

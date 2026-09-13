@@ -3217,6 +3217,12 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         module
     )?)?;
 
+    // Issue H1d: check_final_deletable pure fold over deletable_attributes.
+    module.add_function(wrap_pyfunction!(
+        checker_functions::rust_check_final_deletable,
+        module
+    )?)?;
+
     // Issue #1079: infer_operator_assignment_method decision. Rust reads
     // the live proper type via PyO3 and returns the (is_inplace, method)
     // pair; get_proper_type and the ops_with_inplace_method membership

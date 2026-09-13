@@ -335,6 +335,7 @@ try:
         rust_can_be_narrowed_with_len as _rust_can_be_narrowed_with_len,
         rust_check_exit_return_type as _rust_check_exit_return_type,
         rust_check_explicit_override_decorator as _rust_check_explicit_override_decorator,
+        rust_check_final_deletable as _rust_check_final_deletable,
         rust_check_for_untyped_decorator as _rust_check_for_untyped_decorator,
         rust_check_match_args as _rust_check_match_args,
         rust_check_overlapping_overloads as _rust_check_overlapping_overloads,
@@ -461,6 +462,7 @@ except ImportError:
     _rust_classify_enum = None  # type: ignore[assignment]
     _rust_check_explicit_override_decorator = None  # type: ignore[assignment]
     _rust_check_exit_return_type = None  # type: ignore[assignment]
+    _rust_check_final_deletable = None  # type: ignore[assignment]
     _rust_conditional_types = None  # type: ignore[assignment]
     _rust_detach_callable = None  # type: ignore[assignment]
     _rust_is_string_literal = None  # type: ignore[assignment]
@@ -4064,6 +4066,14 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
     def check_final_deletable(self, typ: TypeInfo) -> None:
         # These checks are only for mypyc. Only perform some checks that are easier
         # to implement here than in mypyc.
+        if _CHECKER_HAS_TYPE_KERNEL and _native_checker_active and _rust_check_final_deletable is not None:
+            result = _rust_check_final_deletable(typ)
+            if result is not None:
+                for name in result:
+                    node = typ.names.get(name)
+                    if node and node.node:
+                        self.fail(message_registry.CANNOT_MAKE_DELETABLE_FINAL, node.node)
+                return
         for attr in typ.deletable_attributes:
             node = typ.names.get(attr)
             if node and isinstance(node.node, Var) and node.node.is_final:

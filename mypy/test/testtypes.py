@@ -47462,6 +47462,155 @@ class NativeCheckExitReturnTypeSuite(Suite):
 
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeCheckFinalDeletableSuite(Suite):
+    """Parity for the Rust `check_final_deletable` port (H1d).
+
+    `TypeChecker.check_final_deletable` (checker.py:4053-4059) iterates
+    `typ.deletable_attributes`, looks up each in `typ.names`, and emits
+    `CANNOT_MAKE_DELETABLE_FINAL` for any whose `node` is a final `Var`.
+    The Rust port (`checker_functions.rs`) reads the live `TypeInfo` via
+    PyO3 and returns the list of offending attr names. Direct seam calls
+    assert the exact list; gate-off vs gate-on parity drives the real
+    TypeChecker method through a mock `fail` recorder.
+    """
+
+    def setUp(self) -> None:
+        from mypy.nodes import Block, ClassDef, SymbolTable, TypeInfo
+
+        from mypy.checker import _set_native_checker_active
+
+        self._set_active = _set_native_checker_active
+        self._set_active(True)
+
+    def tearDown(self) -> None:
+        self._set_active(False)
+
+    def _with_gate(self, active: bool, fn: Callable[[], T]) -> T:
+        self._set_active(active)
+        try:
+            return fn()
+        finally:
+            self._set_active(True)
+
+    def _make_info(
+        self,
+        deletable: list[str],
+        names: dict[str, SymbolTableNode] | None = None,
+    ) -> TypeInfo:
+        from mypy.nodes import Block, ClassDef, SymbolTable, TypeInfo
+
+        table = SymbolTable()
+        info = TypeInfo(table, ClassDef("X", Block([])), "mod.X")
+        info.deletable_attributes = list(deletable)
+        if names:
+            for key, val in names.items():
+                table[key] = val
+        return info
+
+    def _var_node(self, name: str, is_final: bool = False) -> SymbolTableNode:
+        v = Var(name)
+        v.is_final = is_final
+        return SymbolTableNode(GDEF, v)
+
+    def _funcdef_node(self, name: str) -> SymbolTableNode:
+        return SymbolTableNode(GDEF, FuncDef(name))
+
+    def _seam(self, typ: TypeInfo) -> Any:
+        return _type_kernel.rust_check_final_deletable(typ)
+
+    def _run(self, typ: TypeInfo) -> tuple[list[Any], list[Any]]:
+
+        from mypy.checker import TypeChecker
+
+        fails: list[Any] = []
+
+        class _StubChecker(TypeChecker):
+            def fail(
+                self, msg: Any, context: Any, *, code: Any = None
+            ) -> Any:
+                fails.append((str(msg), context))
+
+        def check_one() -> list[Any]:
+            nonlocal fails
+            fails = []
+            chk = _StubChecker.__new__(_StubChecker)
+            chk.check_final_deletable(typ)
+            return list(fails)
+
+        off = self._with_gate(False, check_one)
+        on = self._with_gate(True, check_one)
+        return off, on
+
+    def _assert_par(self, typ: TypeInfo) -> None:
+        off, on = self._run(typ)
+        assert_equal(on, off, f"check_final_deletable parity for typ={typ!r}")
+
+    # --- direct seam tests ---
+
+    def test_seam_empty_deletable(self) -> None:
+        info = self._make_info([])
+        assert self._seam(info) == []
+
+    def test_seam_var_final(self) -> None:
+        info = self._make_info(["attr"], {"attr": self._var_node("attr", is_final=True)})
+        assert self._seam(info) == ["attr"]
+
+    def test_seam_var_not_final(self) -> None:
+        info = self._make_info(["attr"], {"attr": self._var_node("attr", is_final=False)})
+        assert self._seam(info) == []
+
+    def test_seam_missing_name(self) -> None:
+        info = self._make_info(["attr"])
+        assert self._seam(info) == []
+
+    def test_seam_non_var_node(self) -> None:
+        info = self._make_info(["attr"], {"attr": self._funcdef_node("attr")})
+        assert self._seam(info) == []
+
+    def test_seam_multiple_attrs(self) -> None:
+        info = self._make_info(
+            ["a", "b", "c"],
+            {
+                "a": self._var_node("a", is_final=False),
+                "b": self._var_node("b", is_final=True),
+                "c": self._var_node("c", is_final=True),
+            },
+        )
+        assert self._seam(info) == ["b", "c"]
+
+    # --- gate-off vs gate-on parity ---
+
+    def test_parity_empty(self) -> None:
+        self._assert_par(self._make_info([]))
+
+    def test_parity_var_final(self) -> None:
+        info = self._make_info(["attr"], {"attr": self._var_node("attr", is_final=True)})
+        self._assert_par(info)
+
+    def test_parity_var_not_final(self) -> None:
+        info = self._make_info(["attr"], {"attr": self._var_node("attr", is_final=False)})
+        self._assert_par(info)
+
+    def test_parity_missing_name(self) -> None:
+        self._assert_par(self._make_info(["attr"]))
+
+    def test_parity_non_var(self) -> None:
+        info = self._make_info(["attr"], {"attr": self._funcdef_node("attr")})
+        self._assert_par(info)
+
+    def test_parity_multiple(self) -> None:
+        info = self._make_info(
+            ["a", "b", "c"],
+            {
+                "a": self._var_node("a", is_final=False),
+                "b": self._var_node("b", is_final=True),
+                "c": self._var_node("c", is_final=True),
+            },
+        )
+        self._assert_par(info)
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeAlwaysReturnsNoneSuite(Suite):
     """Parity for `rust_always_returns_none` (issue #1070).
 

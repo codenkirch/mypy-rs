@@ -5690,6 +5690,70 @@ pub(crate) fn rust_classify_find_isinstance_head(
     }
 }
 
+/// `TypeChecker.check_final_deletable` (checker.py:4053-4059): a pure
+/// fold over `typ.deletable_attributes` returning the names whose
+/// `SymbolTableNode.node` is a final `Var`. Rust reads the live
+/// `TypeInfo` via PyO3 (zero wire bytes), mirroring `rust_is_writable_attribute`.
+/// Returns `Some(Vec<String>)` with the offending attr names (possibly
+/// empty); `None` defers to the pure-Python body on an unreadable
+/// attribute.
+#[pyfunction]
+pub(crate) fn rust_check_final_deletable(
+    py: Python<'_>,
+    typ: &PyAny,
+) -> PyResult<Option<Vec<String>>> {
+    let var_cls = nodes_class(py, "Var")?;
+    let deletable = match typ.getattr("deletable_attributes") {
+        Ok(d) => d,
+        Err(_) => return Ok(None),
+    };
+    let names = match typ.getattr("names") {
+        Ok(n) => n,
+        Err(_) => return Ok(None),
+    };
+    let names_dict: &PyDict = match names.downcast() {
+        Ok(d) => d,
+        Err(_) => return Ok(None),
+    };
+    let len = match deletable.len() {
+        Ok(l) => l,
+        Err(_) => return Ok(None),
+    };
+    let mut result = Vec::new();
+    for i in 0..len {
+        let attr = match deletable.get_item(i) {
+            Ok(a) => a,
+            Err(_) => return Ok(None),
+        };
+        let attr_str: String = match attr.extract() {
+            Ok(s) => s,
+            Err(_) => return Ok(None),
+        };
+        let sym = match names_dict.get_item(&attr_str) {
+            Ok(Some(s)) => s,
+            _ => continue,
+        };
+        let node = match sym.getattr("node") {
+            Ok(n) => n,
+            Err(_) => return Ok(None),
+        };
+        if node.is_none() {
+            continue;
+        }
+        if !node.is_instance(var_cls)? {
+            continue;
+        }
+        let is_final: bool = match node.getattr("is_final") {
+            Ok(f) => f.extract()?,
+            Err(_) => return Ok(None),
+        };
+        if is_final {
+            result.push(attr_str);
+        }
+    }
+    Ok(Some(result))
+}
+
 #[cfg(test)]
 mod isinstance_head_tests {
     use super::*;
