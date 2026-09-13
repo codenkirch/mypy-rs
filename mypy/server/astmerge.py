@@ -395,6 +395,12 @@ class NodeReplaceVisitor(TraverserVisitor):
             info.mro[i] = self.fixup(info.mro[i])
         for i, base in enumerate(info.bases):
             self.fixup_type(info.bases[i])
+        # G3.0d: in-place mro/bases mutations bypass the TypeInfo.__setattr__
+        # patch (list item assignment, not attribute write). Re-capture so the
+        # shadow stays in sync with the post-fixup state.
+        from mypy import symtables_mirror
+        if symtables_mirror._active:
+            symtables_mirror._capture_meta(info, "astmerge_fixup")
 
     def process_synthetic_type_info(self, info: TypeInfo) -> None:
         # Synthetic types (types not created using a class statement) don't

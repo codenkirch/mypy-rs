@@ -58984,3 +58984,26 @@ class NativeSymtableMirrorSuite(Suite):
             assert self._k.rust_symtable_mirror_meta_entry_count() == 0
         finally:
             self._m._active = True
+
+    def test_astmerge_inplace_mro_mutation_recaptured(self) -> None:
+        # G3.0d: info.mro[i] = ... is a list item assignment that bypasses
+        # the TypeInfo.__setattr__ patch. The astmerge process_type_info
+        # path re-captures via _capture_meta after the in-place mutations.
+        from mypy.nodes import TypeInfo, ClassDef
+
+        info = self._make_info("mod.Cls")
+        base = self._make_info("mod.Base")
+        info.mro = [info, base]
+        record_before = self._k.rust_symtable_mirror_meta_lookup(info)
+        assert record_before is not None
+        assert record_before["mro_count"] == 2
+        # Simulate astmerge in-place mro mutation (replace one entry)
+        replacement = self._make_info("mod.Base2")
+        info.mro[1] = replacement
+        # The shadow is stale until _capture_meta re-runs
+        from mypy import symtables_mirror
+        symtables_mirror._capture_meta(info, "astmerge_fixup")
+        record_after = self._k.rust_symtable_mirror_meta_lookup(info)
+        assert record_after is not None
+        assert record_after["mro_count"] == 2
+        assert record_after["seq"] > record_before["seq"]
