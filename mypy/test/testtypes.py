@@ -58010,17 +58010,6 @@ class NativeAstMirrorFieldSuite(Suite):
     for the append-only `method_types`), plus one direct seam call per
     capture wrapper. The store stays capture-only: Python remains
     authoritative and no test reads a field back through the node.
-class NativeStmtDefMirrorSuite(Suite):
-    """Unit tests for the G2.0 statement/def metadata shadow (#1577).
-
-    The store is capture-only: every assertion drives the
-    `mypy.nodes_mirror` hook and reads the Rust record back through the
-    `rust_node_mirror_meta*` pyfunctions. The pinnings are the G2
-    contract: constructor-default writes on a never-adopted node stay
-    out of the store, the first non-default write adopts it, each tagged
-    field keeps its last value, object values are class/fullname markers
-    only, and astmerge's `replace_object_state` re-registers the
-    surviving identity through the same hook.
     """
 
     def setUp(self) -> None:
@@ -58033,12 +58022,6 @@ class NativeStmtDefMirrorSuite(Suite):
         self._k = kernel
         self._m = nodes_mirror
         self.fx = TypeFixture()
-        # TypeFixture builds real Vars/TypeInfos, so it must come before
-        # the reset that zeroes the store for each test.
-        self.fx = TypeFixture()
-        nodes_mirror.reset(clear_counts=True)
-        self._k = kernel
-        self._m = nodes_mirror
 
     def tearDown(self) -> None:
         self._m.reset(clear_counts=True)
@@ -58202,6 +58185,49 @@ class NativeStmtDefMirrorSuite(Suite):
     def test_capture_failure_does_not_break_field_write(self) -> None:
         expr = StrExpr("x")
         original = self._k.rust_node_mirror_capture_field_kind
+
+        def boom(*args: Any, **kwargs: Any) -> None:
+            raise RuntimeError("kernel down")
+
+        self._k.rust_node_mirror_capture_field_kind = boom  # type: ignore[assignment]
+        try:
+            expr.as_type = self.fx.a
+            assert expr.as_type is self.fx.a
+            assert self._m.report().get("capture_fail.as_type", 0) >= 1
+        finally:
+            self._k.rust_node_mirror_capture_field_kind = original
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeStmtDefMirrorSuite(Suite):
+    """Unit tests for the G2.0 statement/def metadata shadow (#1577).
+
+    The store is capture-only: every assertion drives the
+    `mypy.nodes_mirror` hook and reads the Rust record back through the
+    `rust_node_mirror_meta*` pyfunctions. The pinnings are the G2
+    contract: constructor-default writes on a never-adopted node stay
+    out of the store, the first non-default write adopts it, each tagged
+    field keeps its last value, object values are class/fullname markers
+    only, and astmerge's `replace_object_state` re-registers the
+    surviving identity through the same hook.
+    """
+
+    def setUp(self) -> None:
+        import type_kernel as kernel
+
+        from mypy import nodes_mirror
+
+        nodes_mirror.activate(audit=True)
+        # TypeFixture builds real Vars/TypeInfos, so it must come before
+        # the reset that zeroes the store for each test.
+        self.fx = TypeFixture()
+        nodes_mirror.reset(clear_counts=True)
+        self._k = kernel
+        self._m = nodes_mirror
+
+    def tearDown(self) -> None:
+        self._m.reset(clear_counts=True)
+
     def _meta(self, node: Any) -> dict[str, tuple[Any, ...]]:
         handle = self._m._META_HANDLES.get(id(node))
         assert handle is not None, "node was not adopted by the metadata shadow"
@@ -58526,13 +58552,6 @@ class NativeStmtDefMirrorSuite(Suite):
         def boom(*args: Any, **kwargs: Any) -> None:
             raise RuntimeError("kernel down")
 
-        self._k.rust_node_mirror_capture_field_kind = boom  # type: ignore[assignment]
-        try:
-            expr.as_type = self.fx.a
-            assert expr.as_type is self.fx.a
-            assert self._m.report().get("capture_fail.as_type", 0) >= 1
-        finally:
-            self._k.rust_node_mirror_capture_field_kind = original
         kernel.rust_node_mirror_capture_meta = boom  # type: ignore[assignment]
         try:
             stmt.is_final_def = True

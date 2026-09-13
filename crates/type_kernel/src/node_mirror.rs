@@ -279,6 +279,11 @@ fn capture_field_value(obj: &PyAny, field: String, value: FieldValue) -> PyResul
         let entry = store.by_handle.entry(handle).or_default();
         entry.fields.insert(field, value);
         entry.field_captures += 1;
+        store.pins.insert(handle, Py::from(obj));
+    });
+    Ok(handle)
+}
+
 // ===========================================================================
 // G2.0 statement/def metadata shadow (issue #1577)
 // ===========================================================================

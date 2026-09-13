@@ -464,12 +464,20 @@ def _meta_setattr(self: Any, name: str, value: Any) -> None:
 
 
 def touch(node: Any, field: str) -> None:
-    """Capture one field after an in-place mutation (list append etc.).
+    """Capture one in-place field mutation (G1.0b list fields, G2 metadata).
 
-    Public because `mypy/semanal.py` calls it at the
-    `ImportBase.assignments.append` site; a no-op unless the gate is on.
+    `__setattr__` cannot observe list mutations, so mutating sites call
+    this after the write; G2's `ImportBase.assignments.append` and
+    G1.0b's `ComparisonExpr.method_types` are the current callers.
+    Off-gate calls return immediately; unknown fields are ignored.
     """
     if not _active or _in_capture:
+        return
+    if field in _FIELD_NAMES:
+        if _is_field_baseline(field, getattr(node, field)):
+            return
+        _capture_field(node, field)
+        _count("touch." + field)
         return
     _capture_meta(node, field)
 
@@ -536,21 +544,6 @@ def activate(*, audit: bool = False) -> None:
     _activate_meta()
 
 
-def touch(node: Any, field: str) -> None:
-    """Record an in-place mutation of a shadowed field (G1.0b).
-
-    `__setattr__` cannot observe list mutations, so a mutating site
-    calls this after the write; `ComparisonExpr.method_types` is the
-    only such field. Off-gate calls return immediately, so callers need
-    no guard. Unknown fields and values that are still the constructor
-    default (an empty list) are ignored, keeping lazy adoption intact.
-    """
-    if not _active or field not in _FIELD_NAMES:
-        return
-    if _is_field_baseline(field, getattr(node, field)):
-        return
-    _capture_field(node, field)
-    _count("touch." + field)
 
 
 def reset(*, clear_counts: bool = False) -> None:
