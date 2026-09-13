@@ -1,6 +1,6 @@
 # Handoff: strangler-fig Rust migration loop (seam-deferral reduction)
 
-*Written 2026-08-28, refreshed 2026-09-11 (post-wave68: waves 52-68
+*Written 2026-08-28, refreshed 2026-09-11 (post-wave69: waves 52-69
 landed the st find_member/unpack/apply-report ports (#1492, embedded
 112 -> 61), the icf SUBTYPE_OF protocol-actual arm (#1487), the
 plugin-synthesized TypeInfo registrar (#1489), the ctor-blob gate
@@ -37,16 +37,20 @@ with P1/P2 filed as #1553/#1554; #1551 filed for the multi-alias import
 split), waves 67-68 (G0.3/G0.4 expression + statement enums with
 byte-parity A/B; the #1547 stubgen trio root-caused to a traverser
 tri-state bug; proxy P1 scaffold; proxy P2 measured and DROPPED; strong
-pins landed). Two
+pins landed), and wave 69 (G0.5 symbol-node writer + cache payload,
+default-off; multi-alias import grouping with AST wire v6; proxy P2b
+second negative). Two
 docs-only negative closes also landed (B6 render bundle #1481; maptype
 timing-gap #1494 - the #1493 audit that followed disproved its own
 hypothesis and landed the alias-decode fix #1496 instead). Goal:
 "migrate all python code to rust, really all", pursued as the established measure -> file -> dispatch-agents -> process-PRs ->
 gate loop. This file is the resume point.*
 
-## Where main stands (2026-09-11, post-wave68)
+## Where main stands (2026-09-11, post-wave69)
 
-- `main` = `8fd1ee5b5` (P2 negative close, `#1563`) on top of
+- `main` = `7a3410dda` (import grouping, `#1568`) on top of
+  `be99e1664` (`#1569`, #1566), `f001381c4` (`#1570`, #1567),
+  `770fe596c` (`#1565`, #1537), `8fd1ee5b5` (`#1563`, #1554),
   `04f725791` (`#1562`, #1528), `93aa18ed4` (`#1561`, #1560),
   `b63f903e1` (`#1558`, #1553), `95546e537` (`#1559`, #1547),
   `85fadf488` (`#1550`, #1546), `37633b024` (`#1552`, #1545),
@@ -69,11 +73,11 @@ gate loop. This file is the resume point.*
   correct on the identified raw-list mutators (#1530 closed) and the
   wire-cache splice is exercisable (#1526 closed). #1528 (daemon-stable
   handles) is re-scoped to the strong-pin protocol.
-- Gates on the merged head `8fd1ee5b5`: cargo type_kernel 2,791/11,
-  ast_serialize 15/0; testtypes 3,424/7; AST suites 884/75/2 xfailed;
-  testcheck 8,198/15/7 exact; cold self-check clean (348 files);
-  fine-grained 747/27, daemon 38; CI green (pr-gate, parity,
-  parity-ast, parity-mirror, parity-typeops).
+- Gates on the merged head `7a3410dda`: cargo type_kernel 2,791/11,
+  ast_serialize 26/0; testtypes 3,424/7; AST suites 896/75/2 xfailed
+  (incl. cache-data); testcheck 8,198/15/7 exact; cold self-check clean
+  (350 files); fine-grained 747/27, daemon 38; CI green (pr-gate,
+  parity, parity-ast, parity-mirror, parity-typeops).
 - Shared `.so` rebuilt 2026-09-11 at the merged head content (wave-63
   Rust, codesigned); `/private/tmp/mypy-rs-local-typekernel`.
 - Wave-56: the alias-aware typeobj decode retry
@@ -269,6 +273,27 @@ gate loop. This file is the resume point.*
   first then the preserving mirror reset; dmypy recheck identity test
   (daemon 38). Residual: a dropped graph inside a mypy-side reference
   cycle keeps its pin (documented, conservative).
+- Wave-69A (#1566/#1569): G0.5 symbol-node writer - `sym_node.rs`
+  ports the nodes.py fixed-format write field sets (MypyFile, symbol
+  tables, TypeInfo, Var/FuncDef/Decorator/OverloadedFuncDef, the three
+  TypeVar-like exprs, TypeAlias, DataclassTransformSpec) with opaque
+  captured type/JSON payloads; `mypy/cache_data.py` + build dispatch;
+  byte-identical output (CACHE_VERSION stays 13); 811 production writes
+  audited 0 defer / 0 mismatch; testcachedata suite. The hybrid write
+  phase measured ~1.5x the Python writer (36.3ms vs 55.1ms per 57-tree
+  round), so the bridge ships behind a new default-off
+  `Options.native_cache_data` (`TEST_NATIVE_CACHE_DATA`).
+- Wave-69B (#1551/#1568): multi-alias import grouping - `import a, b`
+  now yields one `Import` node; `IMPORT_METADATA` carries the statement
+  alias list; AST wire v5 -> v6 with the caller/version pin + golden
+  blob; parser differential + 5 data cases; deps/stubgen unaffected.
+  #1551 had been auto-closed by #1552 in error and was reopened first.
+- Wave-69C (#1567/#1570): proxy P2b (thresholded shadow) second
+  negative - corpus A +8.97% wall / +13.99% CPU (threshold defers);
+  corpus B (wire cache off) -11.02% wall but inside noise (ceiling
+  <=0.5%, 22% wire-cache hit rate, 91% of puts <=64B); DROPPED; patch
+  at /private/tmp/mypy-rs-1567-p2b.patch. The F program stays
+  kernel-opt-in.
 - Runner note unchanged: the repo runner cannot re-register (403,
   admin-blocked; #1249 open); GH `ocr-review` jobs stay `queued`
   forever. The operative review gate is the local
@@ -355,6 +380,9 @@ gate loop. This file is the resume point.*
 | #1561 | #1560 | wave68A: G0.4 statement/pattern enums + writer; cross-binary sha256 parity | cargo 15/0; AST suites 884/75/2; testcheck exact; fine-grained 747/27 + daemon 37 |
 | #1562 | #1528 | wave68C: strong-pin stable handles (identity.rs, mirror prefer-stable, preserving reset, daemon recheck test) | cargo 2,791/11; testtypes 3,424/7; daemon 38; testcheck exact; self-check 348 |
 | #1563 | #1554 | wave68B: proxy P2 lazy read shadow DROPPED after A/B (-0.5% wall, +5.6% CPU median); docs-only negative close | implementation preserved at /private/tmp/mypy-rs-1554-p2.patch |
+| #1569 | #1566 | wave69A: G0.5 symbol-node writer + cache-data bridge (default-off `native_cache_data`); byte-identical format | cargo ast 22/0; 811 writes 0 defer/0 mismatch; AST suites 888/75/2; testcheck exact; self-check 350 |
+| #1568 | #1551 | wave69B: multi-alias import grouping; AST wire v5 -> v6 + caller pin, golden blob, differential tests | AST suites 896/75/2; testcheck 8,198/15/7 exact; self-check 350; fine-grained 747/27 + daemon 38 |
+| #1570 | #1567 | wave69C: proxy P2b thresholded shadow measured on two corpora, DROPPED (second negative) | docs-only; patch preserved at /private/tmp/mypy-rs-1567-p2b.patch |
 | (docs) | #1549 | wave66C: ADR-0004 proxy graduation brief persisted; #1553/#1554 filed | docs-only |
 | (docs) | #1540 | wave65B: Phase G0 scoping brief persisted + follow-ups #1545/#1546/#1547 | docs-only |
 
@@ -385,23 +413,22 @@ in #1501, closed by hand), #1503 (#1504 auto-closed it), #1506
 (#1508 auto-closed it), #1507 (#1509 + manual close), #1511 (#1514
 merged; closed by hand), #1512 (#1513 merged; closed by hand), #1516,
 #1517, #1518 (closed by hand after the wave-62 merges), #1519 (#1521
-auto-closed it), #1520 (#1525 auto-closed it), #1527 (#1531 merged; closed by hand); #1528 deferred with evidence), #1530 (#1535 auto-closed it), #1532 (closed by hand after #1536), #1526 (closed by hand after #1534), #1539 (#1544 auto-closed it), #1541 (#1542 auto-closed it), #1540 (closed by the G0-brief docs PR), #1545 (#1552 auto-closed it), #1546 (#1550 auto-closed it); #1549 closed by the proxy-brief docs PR; #1547 fixed by #1559 (closed by hand), #1553 (#1558 auto-closed it), #1556 (#1557 auto-closed it), #1554 (negative close after #1563).
+auto-closed it), #1520 (#1525 auto-closed it), #1527 (#1531 merged; closed by hand); #1528 deferred with evidence), #1530 (#1535 auto-closed it), #1532 (closed by hand after #1536), #1526 (closed by hand after #1534), #1539 (#1544 auto-closed it), #1541 (#1542 auto-closed it), #1540 (closed by the G0-brief docs PR), #1545 (#1552 auto-closed it), #1546 (#1550 auto-closed it); #1549 closed by the proxy-brief docs PR; #1547 fixed by #1559 (closed by hand), #1553 (#1558 auto-closed it), #1556 (#1557 auto-closed it), #1554 (negative close after #1563), #1566 (#1569 auto-closed it), #1551 (reopened after a wrong auto-close, fixed by #1568), #1567 (second negative after #1570).
 
 ## Open backlog (next waves; dispatch max ~2 port agents)
 
-1. **G0.5** (next): symbol-node enum + writer + cache payload contract
-   (per the G0 brief's sequence; G0.3/G0.4 are merged).
-2. **F2/F4 graduation**: proxy P2 was dropped on measurement (see
-   #1554); the kernel stays opt-in. Possible next levers: a
-   size/engagement-threshold proxy on a wire-cache-off corpus, or
-   declare the F program kernel-complete and move to Phase G.
-3. **Strong-pin residuals (#1528)**: the refcount-1 sweep keeps pins
-   for objects trapped in mypy-side cycles; document or add an explicit
+1. **G1.0** (next): expression dual-write shadow + accessors (the G0
+   brief's sixth step; G0.1-G0.5 are all merged). No read flip in that
+   PR; parity via testcheck + fine-grained with shadow on/off.
+2. **F program decision**: both proxy slices measured negative (P2
+   #1554, P2b #1567); the kernel stays opt-in. Options: declare the F
+   program kernel-complete and put the remaining effort into Phase G,
+   or revisit only with a new mechanism (the audit doc's thresholds).
+3. **Strong-pin residuals (#1528)**: refcount-1 sweep keeps pins for
+   objects trapped in mypy-side cycles; document or add an explicit
    retire hook when the mirror moves to stable-handle reuse.
-4. **#1551**: multi-alias `import a, b` splits into one Import node per
-   alias in `tree.imports` (needs an import-metadata name-list + wire
-   bump); noticed by wave 66A.
-5. **#1537**: 2 pre-existing ruff C408 in testtypes.
+4. **G0.5 follow-up**: the cache-data bridge is default-off; revisit
+   default-on only after the type payloads move to Rust (G1+).
 3. **F2/F4 graduation**: capture cuts are exhausted (wave 65A revised
    decision); the next step is the ADR-0004 proxy or the P4 default-on
    decision, and #1528 needs the strong-pin protocol first.
