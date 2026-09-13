@@ -4379,6 +4379,32 @@ including:
   import and parse; comment-block check clean; ``git diff --check``
   clean.
 
+- wave 72C G3.0c extended TypeInfo meta fields (issue #1592):
+  extends the symtable shadow's TypeInfo meta tracking from 5 core
+  fields to 21 by adding 16 post-construction fields (bool flags:
+  ``is_final``, ``is_protocol``, ``is_enum``, ``is_disjoint_base``,
+  ``is_type_check_only``, ``is_intersection``, ``fallback_to_any``,
+  ``meta_fallback_to_any``, ``runtime_protocol``, ``bad_mro``; scalars:
+  ``type_vars`` count, ``declared_metaclass``/``self_type``/
+  ``dataclass_transform_spec`` fullnames, ``deprecated`` string,
+  ``default_depends`` fullname). A new
+  ``rust_symtable_mirror_meta_put_field(info, field, value)`` FFI
+  stores string-encoded values in an ``extra: HashMap<String, String>``
+  on ``MetaEntry``; core fields keep the existing ``meta_put`` path.
+  ``meta_put`` clones the existing ``extra`` before overwriting so
+  extended fields survive a core-field refresh; ``meta_lookup`` now
+  returns the ``extra`` dict. Python side: ``_META_FIELDS`` split into
+  ``_META_CORE`` (5) + ``_META_EXTRA`` (16), ``_encode_extra()``
+  serializes bool/int/str/fullname, ``_META_ADOPTED`` set tracks
+  TypeInfo adoption for lazy-skip of baseline writes, and ``reset()``
+  clears it. A core-field write also refreshes all non-baseline extras.
+  Tests: ``NativeSymtableMetaExtraSuite`` (11 tests). Gate is
+  ``Options.native_ast_mirror`` (default off, not in
+  ``OPTIONS_AFFECTING_CACHE``). No wire/cache format change. Gates:
+  cargo type_kernel build + clippy + fmt clean; symtable mirror tests
+  35 passed; full testtypes 3519 passed/7 skipped/1 pre-existing
+  failure; cold self-check pending.
+
 ## Pull Requests
 
 The default branch on this fork is `main` (not `master`). Always target

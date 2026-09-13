@@ -60,6 +60,9 @@ _TABLE_HANDLES: dict[int, int] = {}
 # id(node) -> node handle; presence marks adoption by a recorded put. The
 # Rust store pins the node, so the id() keys cannot be recycled.
 _NODE_HANDLES: dict[int, int] = {}
+# id(TypeInfo) -> presence marker; records that the TypeInfo has a meta
+# entry so the extended-field lazy adoption can skip constructor defaults.
+_META_ADOPTED: set[int] = set()
 _audit: dict[str, int] = {}
 # Audit-mode per-callsite counters: "<prefix>@<file>:<line>" -> count.
 _site_counts: dict[str, int] = {}
@@ -81,11 +84,44 @@ _FLAG_FIELDS: Final[frozenset[str]] = frozenset(
 )
 
 # G3.0c: TypeInfo meta fields captured by `TypeInfo.__setattr__`.
-# `names` is a namespace rebind; others carry list length or fullname.
-# All other fields pass through untouched.
+# Core fields use meta_put (bases/mro count, metaclass fullname,
+# _fullname, names handle); extended fields use meta_put_field.
+# Extended values are string-encoded (bool -> "true"/"false", etc.).
 _META_FIELDS: Final[frozenset[str]] = frozenset(
+    {
+        "bases",
+        "mro",
+        "metaclass_type",
+        "_fullname",
+        "names",
+        # G3.0c extended: bool flags and scalar fields mutated by semanal.
+        "bad_mro",
+        "is_final",
+        "is_disjoint_base",
+        "is_enum",
+        "is_protocol",
+        "is_type_check_only",
+        "is_intersection",
+        "fallback_to_any",
+        "meta_fallback_to_any",
+        "runtime_protocol",
+        "declared_metaclass",
+        "type_vars",
+        "self_type",
+        "dataclass_transform_spec",
+        "deprecated",
+        "default_depends",
+    }
+)
+
+# Fields that go through the core `meta_put` (list lengths + fullnames).
+_META_CORE: Final[frozenset[str]] = frozenset(
     {"bases", "mro", "metaclass_type", "_fullname", "names"}
 )
+
+# Fields that go through `meta_put_field` as string-encoded values.
+# Bool -> "true"/"false"; int -> str; fullname -> str; None -> "".
+_META_EXTRA: Final[frozenset[str]] = _META_FIELDS - _META_CORE
 
 
 def _count(key: str, n: int = 1) -> None:
@@ -262,6 +298,35 @@ def _instance_fullname(typ: Any) -> str | None:
         return None
 
 
+def _meta_extra_is_baseline(field: str, value: Any) -> bool:
+    """True for a constructor-default value on a never-adopted TypeInfo."""
+    if value is None or value is False:
+        return True
+    if field == "type_vars" and isinstance(value, (list, tuple)):
+        return len(value) == 0
+    if isinstance(value, str):
+        return value == ""
+    return False
+
+
+def _encode_extra(value: Any) -> str:
+    """Encode a G3.0c extended field value for the Rust store."""
+    if value is True or value is False:
+        return "true" if value else "false"
+    if value is None:
+        return ""
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, str):
+        return value
+    # Type objects (Instance, TypeVarType, etc.): record the fullname.
+    try:
+        fullname = value.fullname
+    except Exception:
+        return type(value).__name__
+    return fullname if isinstance(fullname, str) else type(value).__name__
+
+
 def _capture_meta(info: Any, field: str) -> None:
     """Record the post-write meta fields of one TypeInfo."""
     global _in_capture
@@ -289,9 +354,38 @@ def _capture_meta(info: Any, field: str) -> None:
                 fullname if isinstance(fullname, str) else None,
                 names_table,
             )
+            _META_ADOPTED.add(id(info))
             _count("meta.put." + field)
         except Exception:
             _count("capture_fail.meta_put")
+            return
+        # G3.0c extended fields: capture the written field plus all
+        # previously-written extras (a single field write refreshes the
+        # full snapshot, matching the core `meta_put` semantics).
+        if field in _META_EXTRA:
+            try:
+                _kernel_mod.rust_symtable_mirror_meta_put_field(
+                    info, field, _encode_extra(getattr(info, field))
+                )
+                _count("meta.extra." + field)
+            except Exception:
+                _count("capture_fail.meta_extra")
+        else:
+            # A core field write also refreshes the extended snapshot.
+            for extra_field in _META_EXTRA:
+                try:
+                    val = getattr(info, extra_field)
+                except Exception:
+                    continue
+                if _meta_extra_is_baseline(extra_field, val):
+                    continue
+                try:
+                    _kernel_mod.rust_symtable_mirror_meta_put_field(
+                        info, extra_field, _encode_extra(val)
+                    )
+                    _count("meta.extra." + extra_field)
+                except Exception:
+                    _count("capture_fail.meta_extra_refresh")
     finally:
         _in_capture = False
 
@@ -302,6 +396,11 @@ def _typeinfo_setattr(self: Any, name: str, value: Any) -> None:
         return
     if name not in _META_FIELDS:
         return
+    # Lazy adoption: skip baseline writes on never-adopted TypeInfos.
+    if name in _META_EXTRA:
+        if _meta_extra_is_baseline(name, value) and id(self) not in _META_ADOPTED:
+            _count("meta_baseline_skip." + name)
+            return
     _capture_meta(self, name)
 
 
@@ -354,6 +453,7 @@ def reset(*, clear_counts: bool = False) -> None:
         _kernel_mod.rust_symtable_mirror_reset()
     _TABLE_HANDLES.clear()
     _NODE_HANDLES.clear()
+    _META_ADOPTED.clear()
     _count("reset")
     if clear_counts:
         _audit.clear()

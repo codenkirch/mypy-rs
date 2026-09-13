@@ -496,6 +496,7 @@ __all__ = [
     "rust_symtable_mirror_reset",
     "rust_symtable_mirror_handle_of",
     "rust_symtable_mirror_meta_put",
+    "rust_symtable_mirror_meta_put_field",
     "rust_symtable_mirror_meta_lookup",
     "rust_symtable_mirror_meta_delete",
     "rust_symtable_mirror_meta_entry_count",
@@ -2766,6 +2767,11 @@ def rust_symtable_mirror_meta_put(
     metaclass_fullname: str | None,
     fullname: str | None,
     names_table: Any,
+) -> int: ...
+def rust_symtable_mirror_meta_put_field(
+    info: Any,
+    field: str,
+    value: str,
 ) -> int: ...
 def rust_symtable_mirror_meta_lookup(info: Any) -> dict[str, Any] | None: ...
 def rust_symtable_mirror_meta_delete(info: Any) -> bool: ...

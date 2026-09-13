@@ -64,6 +64,9 @@ pub(crate) struct SymFlags {
 /// fullname of the metaclass_type Instance or None; `fullname` is the
 /// TypeInfo's `_fullname`; `names_handle` is the handle of the bound
 /// `SymbolTable` (changes on a namespace rebind). `seq` is monotonic.
+/// `extra` holds the extended G3.0c fields (bool flags, type-var
+/// count, self_type/metaclass fullnames, deprecated string) keyed by
+/// field name.
 pub(crate) struct MetaEntry {
     pub(crate) seq: u64,
     pub(crate) bases_count: usize,
@@ -71,6 +74,7 @@ pub(crate) struct MetaEntry {
     pub(crate) metaclass_fullname: Option<String>,
     pub(crate) fullname: Option<String>,
     pub(crate) names_handle: u64,
+    pub(crate) extra: HashMap<String, String>,
 }
 
 struct SymStore {
@@ -470,6 +474,11 @@ pub(crate) fn meta_put(
     Ok(with_store(|store| {
         store.next_seq += 1;
         let seq = store.next_seq;
+        let extra = store
+            .meta
+            .get(&info_handle)
+            .map(|e| e.extra.clone())
+            .unwrap_or_default();
         store.meta.insert(
             info_handle,
             MetaEntry {
@@ -479,12 +488,40 @@ pub(crate) fn meta_put(
                 metaclass_fullname,
                 fullname,
                 names_handle,
+                extra,
             },
         );
         store.pins.insert(info_handle, Py::from(info));
         store.pins.insert(names_handle, Py::from(names_table));
         seq
     }))
+}
+
+/// Record one extended G3.0c field on an existing MetaEntry (or create
+/// a minimal entry if none exists yet). The value is a string encoding
+/// (bool as "true"/"false", int as its string form, fullname string).
+pub(crate) fn meta_put_field(
+    info: &PyAny,
+    field: &str,
+    value: &str,
+) -> PyResult<()> {
+    let info_handle = handle_or_error(info)?;
+    with_store(|store| {
+        store.next_seq += 1;
+        let seq = store.next_seq;
+        let entry = store.meta.entry(info_handle).or_insert(MetaEntry {
+            seq,
+            bases_count: 0,
+            mro_count: 0,
+            metaclass_fullname: None,
+            fullname: None,
+            names_handle: 0,
+            extra: HashMap::new(),
+        });
+        entry.seq = seq;
+        entry.extra.insert(field.to_string(), value.to_string());
+    });
+    Ok(())
 }
 
 /// Read the meta record for one TypeInfo; None when never recorded.
@@ -502,10 +539,12 @@ pub(crate) fn meta_lookup<'a>(py: Python<'a>, info: &'a PyAny) -> PyResult<Optio
                 e.metaclass_fullname.clone(),
                 e.fullname.clone(),
                 e.names_handle,
+                e.extra.clone(),
             )
         })
     });
-    let Some((seq, bases_count, mro_count, mc_fullname, fullname, names_handle)) = record else {
+    let Some((seq, bases_count, mro_count, mc_fullname, fullname, names_handle, extra)) = record
+    else {
         return Ok(None);
     };
     let dict = PyDict::new(py);
@@ -515,6 +554,11 @@ pub(crate) fn meta_lookup<'a>(py: Python<'a>, info: &'a PyAny) -> PyResult<Optio
     dict.set_item("metaclass_fullname", mc_fullname)?;
     dict.set_item("fullname", fullname)?;
     dict.set_item("names_handle", names_handle)?;
+    let extra_dict = PyDict::new(py);
+    for (k, v) in &extra {
+        extra_dict.set_item(k, v)?;
+    }
+    dict.set_item("extra", extra_dict)?;
     Ok(Some(dict))
 }
 
@@ -550,6 +594,15 @@ pub(crate) fn rust_symtable_mirror_meta_put(
         fullname,
         names_table,
     )
+}
+
+#[pyfunction]
+pub(crate) fn rust_symtable_mirror_meta_put_field(
+    info: &PyAny,
+    field: &str,
+    value: &str,
+) -> PyResult<()> {
+    meta_put_field(info, field, value)
 }
 
 #[pyfunction]

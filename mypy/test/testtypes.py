@@ -59249,3 +59249,124 @@ class NativeSymtableMirrorSuite(Suite):
         assert record_after is not None
         assert record_after["mro_count"] == 2
         assert record_after["seq"] > record_before["seq"]
+
+
+class NativeSymtableMetaExtraSuite(Suite):
+    """G3.0c: extended TypeInfo meta fields (bool flags, type_vars
+    count, self_type/declared_metaclass fullnames) captured through
+    the ``meta_put_field`` FFI."""
+
+    def setUp(self) -> None:
+        import type_kernel as kernel
+
+        from mypy import symtables_mirror
+
+        symtables_mirror.activate(audit=True)
+        symtables_mirror.reset(clear_counts=True)
+        self._k = kernel
+        self._m = symtables_mirror
+
+    def tearDown(self) -> None:
+        self._m.reset(clear_counts=True)
+
+    def _make_info(self, fullname: str = "mod.Cls") -> Any:
+        from mypy.nodes import TypeInfo, ClassDef, Block
+
+        info = TypeInfo(SymbolTable(), ClassDef(fullname, Block([])), "")
+        info._fullname = fullname
+        return info
+
+    def test_is_final_captured(self) -> None:
+        info = self._make_info()
+        info.is_final = True
+        record = self._k.rust_symtable_mirror_meta_lookup(info)
+        assert record is not None
+        assert record["extra"].get("is_final") == "true"
+        info.is_final = False
+        record = self._k.rust_symtable_mirror_meta_lookup(info)
+        assert record is not None
+        assert record["extra"].get("is_final") == "false"
+
+    def test_is_protocol_captured(self) -> None:
+        info = self._make_info()
+        info.is_protocol = True
+        record = self._k.rust_symtable_mirror_meta_lookup(info)
+        assert record is not None
+        assert record["extra"].get("is_protocol") == "true"
+
+    def test_is_enum_captured(self) -> None:
+        info = self._make_info()
+        info.is_enum = True
+        record = self._k.rust_symtable_mirror_meta_lookup(info)
+        assert record is not None
+        assert record["extra"].get("is_enum") == "true"
+
+    def test_type_vars_count_captured(self) -> None:
+        info = self._make_info()
+        info.type_vars = 3
+        record = self._k.rust_symtable_mirror_meta_lookup(info)
+        assert record is not None
+        assert record["extra"].get("type_vars") == "3"
+
+    def test_fallback_to_any_captured(self) -> None:
+        info = self._make_info()
+        info.fallback_to_any = True
+        record = self._k.rust_symtable_mirror_meta_lookup(info)
+        assert record is not None
+        assert record["extra"].get("fallback_to_any") == "true"
+
+    def test_core_write_refreshes_extras(self) -> None:
+        info = self._make_info()
+        info.is_final = True
+        # A core field write should also refresh the extended snapshot.
+        info.bases = []
+        record = self._k.rust_symtable_mirror_meta_lookup(info)
+        assert record is not None
+        assert record["extra"].get("is_final") == "true"
+
+    def test_baseline_write_on_adopted_does_not_skip(self) -> None:
+        # TypeInfo.__init__ writes _fullname and names (core meta fields),
+        # so the TypeInfo is adopted at construction. A baseline-value
+        # write to an extra field refreshes rather than being skipped.
+        info = self._make_info()
+        before = self._m.report()
+        info.is_final = False
+        delta = self._delta(before)
+        # Should NOT be skipped — the TypeInfo is already adopted.
+        assert delta.get("meta_baseline_skip.is_final", 0) == 0
+        record = self._k.rust_symtable_mirror_meta_lookup(info)
+        assert record is not None
+        assert record["extra"].get("is_final") == "false"
+
+    def _delta(self, before: dict[str, int]) -> dict[str, int]:
+        after = self._m.report()
+        return {k: v - before.get(k, 0) for k, v in after.items() if v != before.get(k, 0)}
+
+    def test_reset_clears_meta_adopted(self) -> None:
+        info = self._make_info()
+        info.is_final = True
+        assert id(info) in self._m._META_ADOPTED
+        self._m.reset()
+        assert id(info) not in self._m._META_ADOPTED
+
+    def test_multiple_extras_captured(self) -> None:
+        info = self._make_info()
+        info.is_final = True
+        info.is_protocol = True
+        info.is_enum = True
+        record = self._k.rust_symtable_mirror_meta_lookup(info)
+        assert record is not None
+        extra = record["extra"]
+        assert extra.get("is_final") == "true"
+        assert extra.get("is_protocol") == "true"
+        assert extra.get("is_enum") == "true"
+
+    def test_gate_off_no_extra_captured(self) -> None:
+        self._m._active = False
+        try:
+            info = self._make_info()
+            before = self._k.rust_symtable_mirror_meta_entry_count()
+            info.is_final = True
+            assert self._k.rust_symtable_mirror_meta_entry_count() == before
+        finally:
+            self._m._active = True

@@ -3615,6 +3615,10 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         module
     )?)?;
     module.add_function(wrap_pyfunction!(
+        symtable_mirror::rust_symtable_mirror_meta_put_field,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
         symtable_mirror::rust_symtable_mirror_meta_lookup,
         module
     )?)?;
