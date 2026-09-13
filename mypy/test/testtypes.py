@@ -58866,9 +58866,9 @@ class NativeSymtableMirrorSuite(Suite):
     # ---- G3.0c: TypeInfo meta-field capture ----
 
     def _make_info(self, fullname: str = "mod.Cls") -> Any:
-        from mypy.nodes import TypeInfo, ClassDef
+        from mypy.nodes import TypeInfo, ClassDef, Block
 
-        info = TypeInfo(SymbolTable(), ClassDef(fullname, None), "")
+        info = TypeInfo(SymbolTable(), ClassDef(fullname, Block([])), "")
         info._fullname = fullname
         return info
 

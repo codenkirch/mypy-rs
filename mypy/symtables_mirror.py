@@ -256,7 +256,8 @@ def _symtable_node_setattr(self: Any, name: str, value: Any) -> None:
 def _instance_fullname(typ: Any) -> str | None:
     """Fullname of a metaclass_type Instance or None."""
     try:
-        return typ.type.fullname
+        fullname: str | None = typ.type.fullname
+        return fullname
     except Exception:
         return None
 
