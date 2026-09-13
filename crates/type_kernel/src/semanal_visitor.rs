@@ -455,6 +455,9 @@ pub(crate) fn rust_remove_imported_names_from_symtable(
     }
 
     for key in &to_remove {
+        let key_ref = key.as_ref(py);
+        let key_str = key_ref.downcast::<PyString>()?.to_str()?;
+        let _ = crate::symtable_mirror::delete(names, key_str);
         names_dict.del_item(key)?;
     }
     Ok(())

@@ -241,7 +241,11 @@ from mypy.semanal_shared import (
     set_callable_name as set_callable_name,
 )
 from mypy.semanal_typeddict import TypedDictAnalyzer
-from mypy.symtable_access import put_names_entry as _put_names_entry
+from mypy.symtable_access import (
+    delete_names_entry as _delete_names_entry,
+    delete_names_entry_safe as _delete_names_entry_safe,
+    put_names_entry as _put_names_entry,
+)
 from mypy.tvar_scope import TypeVarLikeScope
 from mypy.typeanal import (
     SELF_TYPE_NAMES,
@@ -1323,7 +1327,7 @@ class SemanticAnalyzer(
                 continue  # Do not reset TypeAliases on the second pass.
 
             # We need to remove any node that is there at the moment. It is invalid.
-            tree.names.pop(name, None)
+            _delete_names_entry_safe(tree.names, name)
 
             # Now, create a new alias.
             self.create_alias(tree, target_name, alias, name)
@@ -1360,7 +1364,7 @@ class SemanticAnalyzer(
             # Kill the placeholder if there is one.
             if name in tree.names:
                 assert isinstance(tree.names[name].node, PlaceholderNode)
-                del tree.names[name]
+                _delete_names_entry(tree.names, name)
 
     def adjust_public_exports(self) -> None:
         """Adjust the module visibility of globals due to __all__."""

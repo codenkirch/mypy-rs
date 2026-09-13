@@ -159,6 +159,7 @@ from mypy.server.aststrip import strip_target
 from mypy.server.deps import get_dependencies_of_target, merge_dependencies
 from mypy.server.target import trigger_to_target
 from mypy.server.trigger import WILDCARD_TAG, make_trigger
+from mypy.symtable_access import delete_names_entry as _delete_names_entry
 from mypy.typestate import type_state
 from mypy.util import is_stdlib_file, module_prefix, split_target
 
@@ -797,7 +798,7 @@ def delete_module(module_id: str, path: str, graph: Graph, manager: BuildManager
         if parent_id in manager.modules:
             parent = manager.modules[parent_id]
             if components[-1] in parent.names:
-                del parent.names[components[-1]]
+                _delete_names_entry(parent.names, components[-1])
     # If the module is removed from the build but still exists, then
     # we mark it as missing so that it will get picked up by import from still.
     if manager.fscache.isfile(path):

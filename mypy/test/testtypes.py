@@ -58843,9 +58843,9 @@ class NativeSymtableMirrorSuite(Suite):
         assert self._m.lookup(table, "direct") is not None
         delta = self._delta(before)
         assert delta.get("bypass.put", 0) >= 1
-        # Documented known bypass (G3.0b follow-up):
-        # rust_remove_imported_names_from_symtable deletes via
-        # PyDict::del_item (semanal_visitor.rs:458), bypassing the patch.
+        # G3.0b: the Rust remove-imported path now calls
+        # symtable_mirror::delete before PyDict::del_item, so the
+        # shadow record is cleaned up alongside the dict entry.
         import type_kernel as kernel
 
         from mypy.symtable_access import put_names_entry
@@ -58859,6 +58859,6 @@ class NativeSymtableMirrorSuite(Suite):
         kernel.rust_remove_imported_names_from_symtable(table2, "mod")
         assert "imported" not in table2
         assert "local" in table2
-        # The shadow still holds the removed name: stale until G3.0b.
-        assert self._m.lookup(table2, "imported") is not None
-        assert self._m.entry_count(table2) == 2
+        # G3.0b: shadow record is now cleaned up by the Rust delete.
+        assert self._m.lookup(table2, "imported") is None
+        assert self._m.entry_count(table2) == 1

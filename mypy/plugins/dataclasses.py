@@ -54,6 +54,10 @@ from mypy.plugins.common import (
 from mypy.semanal_shared import find_dataclass_transform_spec, require_bool_literal_argument
 from mypy.server.trigger import make_wildcard_trigger
 from mypy.state import state
+from mypy.symtable_access import (
+    delete_names_entry as _delete_names_entry,
+    put_names_entry as _put_names_entry,
+)
 from mypy.typeops import map_type_from_supertype, try_getting_literals_from_type
 from mypy.types import (
     AnyType,
@@ -548,7 +552,7 @@ class DataclassTransformer:
                 obj_type,
                 AnyType(TypeOfAny.from_omitted_generics),
             )
-            info.names[SELF_TVAR_NAME] = SymbolTableNode(MDEF, self_tvar_expr)
+            _put_names_entry(info.names, SELF_TVAR_NAME, SymbolTableNode(MDEF, self_tvar_expr))
 
         # Add <, >, <=, >=, but only if the class has an eq method.
         if decorator_arguments["order"]:
@@ -727,7 +731,7 @@ class DataclassTransformer:
         for attr in attributes:
             if attr.is_init_var:
                 if attr.name in info.names:
-                    del info.names[attr.name]
+                    _delete_names_entry(info.names, attr.name)
                 else:
                     # Nodes of superclass InitVars not used in __init__ cannot be reached.
                     assert attr.is_init_var
@@ -1010,7 +1014,7 @@ class DataclassTransformer:
                 var.info = info
                 var.is_property = True
                 var._fullname = info.fullname + "." + var.name
-                info.names[var.name] = SymbolTableNode(MDEF, var)
+                _put_names_entry(info.names, var.name, SymbolTableNode(MDEF, var))
 
     def _propertize_callables(
         self, attributes: list[DataclassAttribute], settable: bool = True
@@ -1030,7 +1034,7 @@ class DataclassTransformer:
                 var.is_property = True
                 var.is_settable_property = settable
                 var._fullname = info.fullname + "." + var.name
-                info.names[var.name] = SymbolTableNode(MDEF, var)
+                _put_names_entry(info.names, var.name, SymbolTableNode(MDEF, var))
 
     def _is_kw_only_type(self, node: Type | None) -> bool:
         """Checks if the type of the node is the KW_ONLY sentinel value."""
@@ -1062,8 +1066,10 @@ class DataclassTransformer:
         var.info = self._cls.info
         var._fullname = self._cls.info.fullname + "." + attr_name
         var.is_classvar = True
-        self._cls.info.names[attr_name] = SymbolTableNode(
-            kind=MDEF, node=var, plugin_generated=True
+        _put_names_entry(
+            self._cls.info.names,
+            attr_name,
+            SymbolTableNode(kind=MDEF, node=var, plugin_generated=True),
         )
 
     def _collect_field_args(self, expr: Expression) -> tuple[bool, dict[str, Expression]]:

@@ -31,6 +31,7 @@ from mypy.nodes import (
 )
 from mypy.options import Options
 from mypy.semanal_shared import SemanticAnalyzerInterface
+from mypy.symtable_access import put_names_entry as _put_names_entry
 from mypy.types import LiteralType, get_proper_type
 
 # Note: 'enum.EnumMeta' is deliberately excluded from this list. Classes that directly
@@ -145,7 +146,7 @@ class EnumCallAnalyzer:
             # either way, each item should be treated as if it has an explicit value.
             var.has_explicit_value = True
             var._fullname = f"{info.fullname}.{item}"
-            info.names[item] = SymbolTableNode(MDEF, var)
+            _put_names_entry(info.names, item, SymbolTableNode(MDEF, var))
         return info
 
     def parse_enum_call_args(

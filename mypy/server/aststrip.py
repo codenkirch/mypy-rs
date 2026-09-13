@@ -62,6 +62,7 @@ from mypy.nodes import (
     TupleExpr,
     TypeInfo,
 )
+from mypy.symtable_access import delete_names_entry as _delete_names_entry
 from mypy.traverser import TraverserVisitor
 from mypy.types import CallableType
 from mypy.typestate import type_state
@@ -97,7 +98,7 @@ class NodeStripVisitor(TraverserVisitor, SplittingVisitor):
             # TODO: this is a hot fix, we should delete all names,
             # see https://github.com/python/mypy/issues/6422.
             if "@" not in name:
-                del file_node.names[name]
+                _delete_names_entry(file_node.names, name)
 
     def visit_block(self, b: Block) -> None:
         if b.is_unreachable:
@@ -228,7 +229,7 @@ class NodeStripVisitor(TraverserVisitor, SplittingVisitor):
                 # self, since only those can define new attributes.
                 assert self.type is not None
                 if lvalue.name in self.type.names:
-                    del self.type.names[lvalue.name]
+                    _delete_names_entry(self.type.names, lvalue.name)
         elif isinstance(lvalue, (TupleExpr, ListExpr)):
             for item in lvalue.items:
                 self.process_lvalue_in_method(item)

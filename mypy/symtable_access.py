@@ -20,6 +20,11 @@ Callers (the G3.0a routing):
 Direct ``SymbolTable.__setitem__`` writes outside this seam (plugins,
 synthetic tables, checker fake infos) are captured by the same class
 patch and counted as ``bypass.put``; the G3.0b sweep reroutes them.
+
+``delete_names_entry`` / ``delete_names_entry_safe`` are the normative
+delete paths: they remove the dict entry via ``dict.__delitem__`` /
+``dict.pop`` (bypassing the patched ``SymbolTable.__delitem__`` / ``pop``)
+and clean up the shadow record when the mirror is active.
 """
 
 from __future__ import annotations
@@ -63,3 +68,17 @@ def put_names_entry(table: Any, name: str, symbol: Any) -> PutResult:
         return _PLAIN
     _owner_handle, _node_handle, seq, generation = receipt
     return PutResult(committed=True, generation=generation, seq=seq)
+
+
+def delete_names_entry(table: Any, name: str) -> None:
+    """Delete ``name`` from ``table`` and clean up the shadow record."""
+    dict.__delitem__(table, name)
+    if symtables_mirror._active:
+        symtables_mirror._delete(table, name)
+
+
+def delete_names_entry_safe(table: Any, name: str) -> None:
+    """Delete ``name`` from ``table`` without raising on a missing key."""
+    dict.pop(table, name, None)
+    if symtables_mirror._active:
+        symtables_mirror._delete(table, name)

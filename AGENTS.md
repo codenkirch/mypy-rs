@@ -4347,6 +4347,38 @@ including:
   + 12); testcheck 8,198/15/7 exact both gate states; fine-grained 747/27
   + daemon 38 + merge 41/1 + diff 79 shadow-on; cold self-check clean 353.
 
+- wave 72B G3.0b direct-write and delete sweep (issue #1581): reroutes
+  remaining direct ``SymbolTable`` writes through ``put_names_entry`` and
+  all ``del table.names[...]`` / ``table.names.pop(...)`` deletes through
+  two new accessor functions in ``mypy/symtable_access``:
+  ``delete_names_entry(table, name)`` (hard delete via
+  ``dict.__delitem__``) and ``delete_names_entry_safe(table, name)``
+  (soft delete via ``dict.pop(..., None)``). Both bypass the patched
+  ``SymbolTable.__delitem__`` / ``pop`` (matching ``put_names_entry``'s
+  ``dict.__setitem__`` pattern) and clean up the shadow record via
+  ``symtables_mirror._delete`` only when the mirror is active. Routed
+  puts (9 sites): ``checker.intersect_instances`` /
+  ``intersect_instance_callable`` (3), ``plugins.common`` (5: 2 method
+  adds, 2 redefinition renames, 1 attribute add), ``plugins.attrs`` (5:
+  __hash__ copy, Self tvar, property var, descriptor attr, magic attr),
+  ``plugins.dataclasses`` (4: Self tvar, 2 property vars, classvar),
+  ``semanal_namedtuple`` (5: field var, method, Self tvar, 2 redef
+  renames), ``semanal_newtype`` (1: __init__), ``semanal_enum`` (1: enum
+  member). Routed deletes (6 sites): ``semanal.add_typing_extension_aliases``
+  (``pop`` -> ``delete_names_entry_safe``), ``semanal.create_alias``
+  (``del`` -> ``delete_names_entry``), ``plugins.dataclasses.reset_init_only_vars``
+  (``del``), ``server.aststrip`` (2: file names clear, attribute remove),
+  ``server.update`` (1: module symbol remove). The Rust bypass in
+  ``rust_remove_imported_names_from_symtable`` (semanal_visitor.rs) now
+  calls ``crate::symtable_mirror::delete(names, key_str)`` before
+  ``PyDict::del_item`` for each removed key, retiring the G3.0a
+  known-bypass pin. Gate is ``Options.native_symtable_mirror`` (default
+  off); all changes are no-ops when the gate is off. No test files
+  touched, no wire/cache/``OPTIONS_AFFECTING_CACHE`` change. Gates: cargo
+  type_kernel build + clippy + fmt clean; all 12 edited Python files
+  import and parse; comment-block check clean; ``git diff --check``
+  clean.
+
 ## Pull Requests
 
 The default branch on this fork is `main` (not `master`). Always target

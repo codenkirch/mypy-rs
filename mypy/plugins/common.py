@@ -61,6 +61,7 @@ from mypy.semanal_shared import (
     require_bool_literal_argument,
     set_callable_name,
 )
+from mypy.symtable_access import put_names_entry as _put_names_entry
 from mypy.typeops import try_getting_str_literals as try_getting_str_literals
 from mypy.types import (
     AnyType,
@@ -283,7 +284,7 @@ def add_method_to_class(
         is_classmethod=is_classmethod,
         is_staticmethod=is_staticmethod,
     )
-    cls.info.names[name] = sym
+    _put_names_entry(cls.info.names, name, sym)
     cls.info.defn.defs.body.append(func)
     return func
 
@@ -332,7 +333,7 @@ def add_overloaded_method_to_class(
     sym = SymbolTableNode(MDEF, overload_def)
     sym.plugin_generated = True
 
-    cls.info.names[name] = sym
+    _put_names_entry(cls.info.names, name, sym)
     cls.info.defn.defs.body.append(overload_def)
     return overload_def
 
@@ -353,7 +354,8 @@ def _prepare_class_namespace(cls: ClassDef, name: str) -> None:
     if name in info.names:
         # Get a nice unique name instead.
         r_name = get_unique_redefinition_name(name, info.names)
-        info.names[r_name] = info.names[name]
+        _existing = info.names[name]
+        _put_names_entry(info.names, r_name, _existing)
 
 
 def _add_method_by_spec(
@@ -446,7 +448,8 @@ def add_attribute_to_class(
     if name in info.names and not overwrite_existing:
         # Get a nice unique name instead.
         r_name = get_unique_redefinition_name(name, info.names)
-        info.names[r_name] = info.names[name]
+        _existing = info.names[name]
+        _put_names_entry(info.names, r_name, _existing)
 
     node = Var(name, typ)
     node.info = info
@@ -462,8 +465,8 @@ def add_attribute_to_class(
     else:
         node._fullname = info.fullname + "." + name
 
-    info.names[name] = SymbolTableNode(
-        MDEF, node, plugin_generated=True, no_serialize=no_serialize
+    _put_names_entry(
+        info.names, name, SymbolTableNode(MDEF, node, plugin_generated=True, no_serialize=no_serialize)
     )
     return node
 

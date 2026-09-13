@@ -29,6 +29,7 @@ from mypy.nodes import (
 )
 from mypy.options import Options
 from mypy.semanal_shared import SemanticAnalyzerInterface, has_placeholder
+from mypy.symtable_access import put_names_entry as _put_names_entry
 from mypy.typeanal import check_for_explicit_any, has_any_from_unimported_type
 from mypy.types import (
     AnyType,
@@ -257,7 +258,7 @@ class NewTypeAnalyzer:
             updated = old_type != previous_sym.arguments[1].variable.type
         sym = SymbolTableNode(MDEF, init_func)
         sym.plugin_generated = True
-        info.names["__init__"] = sym
+        _put_names_entry(info.names, "__init__", sym)
 
         if has_placeholder(old_type):
             self.api.process_placeholder(None, "NewType base", info, force_progress=updated)

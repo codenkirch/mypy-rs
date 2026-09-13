@@ -235,6 +235,7 @@ from mypy.subtypes import (
     restrict_subtype_away,
     unify_generic_callable,
 )
+from mypy.symtable_access import put_names_entry as _put_names_entry
 from mypy.traverser import TraverserVisitor, all_return_statements, has_return_statement
 from mypy.treetransform import TransformVisitor
 from mypy.typeanal import check_for_explicit_any, has_any_from_unimported_type, make_optional_type
@@ -8151,7 +8152,7 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
             errors.append((pretty_names_list, "would have incompatible method signatures"))
             return None
 
-        curr_module.names[full_name] = SymbolTableNode(GDEF, info, False, module_hidden=True)
+        _put_names_entry(curr_module.names, full_name, SymbolTableNode(GDEF, info, False, module_hidden=True))
         return Instance(info, [], extra_attrs=instances[0].extra_attrs or instances[1].extra_attrs)
 
     def intersect_instance_callable(self, typ: Instance, callable_type: CallableType) -> Instance:
@@ -8178,9 +8179,9 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
         func_def.info = info
         sym = SymbolTableNode(MDEF, func_def)
         sym.plugin_generated = True
-        info.names["__call__"] = sym
+        _put_names_entry(info.names, "__call__", sym)
 
-        cur_module.names[gen_name] = SymbolTableNode(GDEF, info)
+        _put_names_entry(cur_module.names, gen_name, SymbolTableNode(GDEF, info))
 
         return Instance(info, [], extra_attrs=typ.extra_attrs)
 

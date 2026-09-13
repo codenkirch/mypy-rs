@@ -55,6 +55,7 @@ from mypy.semanal_shared import (
     has_placeholder,
     set_callable_name,
 )
+from mypy.symtable_access import put_names_entry as _put_names_entry
 from mypy.types import (
     TYPED_NAMEDTUPLE_NAMES,
     AnyType,
@@ -516,7 +517,7 @@ class NamedTupleAnalyzer:
             var.is_initialized_in_class = is_initialized_in_class
             var.is_property = is_property
             var._fullname = f"{info.fullname}.{var.name}"
-            info.names[var.name] = SymbolTableNode(MDEF, var)
+            _put_names_entry(info.names, var.name, SymbolTableNode(MDEF, var))
 
         fields = [Var(item, typ) for item, typ in zip(items, types)]
         for var in fields:
@@ -591,7 +592,7 @@ class NamedTupleAnalyzer:
             else:
                 sym = SymbolTableNode(MDEF, func)
             sym.plugin_generated = True
-            info.names[funcname] = sym
+            _put_names_entry(info.names, funcname, sym)
 
         add_method(
             "_replace",
@@ -626,7 +627,7 @@ class NamedTupleAnalyzer:
             info.tuple_type,
             AnyType(TypeOfAny.from_omitted_generics),
         )
-        info.names[SELF_TVAR_NAME] = SymbolTableNode(MDEF, self_tvar_expr)
+        _put_names_entry(info.names, SELF_TVAR_NAME, SymbolTableNode(MDEF, self_tvar_expr))
         return info
 
     @contextmanager
@@ -670,8 +671,8 @@ class NamedTupleAnalyzer:
                     # Keep existing (user-provided) definitions under mangled names, so they
                     # get semantically analyzed.
                     r_key = get_unique_redefinition_name(key, named_tuple_info.names)
-                    named_tuple_info.names[r_key] = sym
-            named_tuple_info.names[key] = value
+                    _put_names_entry(named_tuple_info.names, r_key, sym)
+            _put_names_entry(named_tuple_info.names, key, value)
 
     # Helpers
 

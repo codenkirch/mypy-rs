@@ -56,6 +56,7 @@ from mypy.plugins.common import (
 )
 from mypy.server.trigger import make_wildcard_trigger
 from mypy.state import state
+from mypy.symtable_access import put_names_entry as _put_names_entry
 from mypy.typeops import (
     get_type_vars,
     make_simplified_union,
@@ -688,7 +689,8 @@ def attr_class_maker_callback_impl(
         pass  # Do nothing.
     elif hashable:
         # We copy the `__hash__` signature from `object` to make them hashable.
-        ctx.cls.info.names["__hash__"] = ctx.cls.info.mro[-1].names["__hash__"]
+        _hash_sym = ctx.cls.info.mro[-1].names["__hash__"]
+        _put_names_entry(ctx.cls.info.names, "__hash__", _hash_sym)
     else:
         _remove_hashability(ctx)
 
@@ -1133,7 +1135,7 @@ def _add_order(ctx: mypy.plugin.ClassDefContext, adder: MethodAdder) -> None:
     self_tvar_expr = TypeVarExpr(
         SELF_TVAR_NAME, fullname, [], object_type, AnyType(TypeOfAny.from_omitted_generics)
     )
-    ctx.cls.info.names[SELF_TVAR_NAME] = SymbolTableNode(MDEF, self_tvar_expr)
+    _put_names_entry(ctx.cls.info.names, SELF_TVAR_NAME, SymbolTableNode(MDEF, self_tvar_expr))
 
     for method in ["__lt__", "__le__", "__gt__", "__ge__"]:
         namespace = f"{ctx.cls.info.fullname}.{method}"
@@ -1160,7 +1162,7 @@ def _make_frozen(ctx: mypy.plugin.ClassDefContext, attributes: list[Attribute]) 
             var = Var(attribute.name, attribute.init_type)
             var.info = ctx.cls.info
             var._fullname = f"{ctx.cls.info.fullname}.{var.name}"
-            ctx.cls.info.names[var.name] = SymbolTableNode(MDEF, var)
+            _put_names_entry(ctx.cls.info.names, var.name, SymbolTableNode(MDEF, var))
             var.is_property = True
 
 
@@ -1222,12 +1224,12 @@ def _add_attrs_magic_attribute(
         proper_type = get_proper_type(attr_type)
         if isinstance(proper_type, Instance):
             var.info = proper_type.type
-        ti.names[name] = SymbolTableNode(MDEF, var, plugin_generated=True)
+        _put_names_entry(ti.names, name, SymbolTableNode(MDEF, var, plugin_generated=True))
     attributes_type = Instance(ti, [])
 
     # We need to stash the type of the magic attribute so it can be
     # loaded on cached runs.
-    ctx.cls.info.names[attr_name] = SymbolTableNode(MDEF, ti, plugin_generated=True)
+    _put_names_entry(ctx.cls.info.names, attr_name, SymbolTableNode(MDEF, ti, plugin_generated=True))
 
     add_attribute_to_class(
         ctx.api,
