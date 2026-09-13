@@ -1,6 +1,6 @@
 # Handoff: strangler-fig Rust migration loop (seam-deferral reduction)
 
-*Written 2026-08-28, refreshed 2026-09-11 (post-wave70: waves 52-70
+*Written 2026-08-28, refreshed 2026-09-11 (post-wave71: waves 52-71
 landed the st find_member/unpack/apply-report ports (#1492, embedded
 112 -> 61), the icf SUBTYPE_OF protocol-actual arm (#1487), the
 plugin-synthesized TypeInfo registrar (#1489), the ctor-blob gate
@@ -40,7 +40,9 @@ tri-state bug; proxy P1 scaffold; proxy P2 measured and DROPPED; strong
 pins landed), and wave 69 (G0.5 symbol-node writer + cache payload,
 default-off; multi-alias import grouping with AST wire v6; proxy P2b
 second negative), and wave 70 (G1.0a node dual-write shadow scaffold;
-the F-program close-out: F kernel-complete, F4 rung retired unclaimed).
+the F-program close-out: F kernel-complete, F4 rung retired unclaimed), and wave 71 (G1.0b
+expression fields, G2.0 statement/def metadata shadow, the G3
+symbol-table brief + G3.0a filed).
 Two
 docs-only negative closes also landed (B6 render bundle #1481; maptype
 timing-gap #1494 - the #1493 audit that followed disproved its own
@@ -48,10 +50,12 @@ hypothesis and landed the alias-decode fix #1496 instead). Goal:
 "migrate all python code to rust, really all", pursued as the established measure -> file -> dispatch-agents -> process-PRs ->
 gate loop. This file is the resume point.*
 
-## Where main stands (2026-09-11, post-wave70)
+## Where main stands (2026-09-11, post-wave71)
 
-- `main` = `efb524ee7` (node shadow scaffold, `#1574`, #1572) on top of
-  `db7f32450` (`#1571`), `7a3410dda` (`#1568`, #1551),
+- `main` = `2a3d36427` (G2 shadow, `#1580`, #1577) on top of
+  `239037192` (`#1582`, #1578), `6f0b4ef9d` (`#1579`, #1576),
+  `efb524ee7` (`#1574`, #1572), `db7f32450` (`#1571`),
+  `7a3410dda` (`#1568`, #1551),
   `be99e1664` (`#1569`, #1566), `f001381c4` (`#1570`, #1567),
   `770fe596c` (`#1565`, #1537), `8fd1ee5b5` (`#1563`, #1554),
   `04f725791` (`#1562`, #1528), `93aa18ed4` (`#1561`, #1560),
@@ -76,10 +80,10 @@ gate loop. This file is the resume point.*
   correct on the identified raw-list mutators (#1530 closed) and the
   wire-cache splice is exercisable (#1526 closed). #1528 (daemon-stable
   handles) is re-scoped to the strong-pin protocol.
-- Gates on the merged head `efb524ee7`: cargo type_kernel 2,798/11,
-  ast_serialize 26/0; testtypes 3,436/7; AST suites 896/75/2 xfailed;
-  testcheck 8,198/15/7 exact (kernel and node-shadow-on identical);
-  cold self-check clean (351 files); fine-grained 747/27, daemon 38.
+- Gates on the merged head `2a3d36427`: cargo type_kernel 2,811/11,
+  ast_serialize 26/0; testtypes 3,471/7; testcheck 8,198/15/7 exact in
+  kernel, node-shadow-on, and G2-shadow-on modes; fine-grained family
+  905/28 (fg+daemon+merge+diff); cold self-check clean (351 files).
 - F program CLOSED (#1573, `docs/plans/2026-09-11-f-program-close-out.md`):
   F0-F3 landed opt-in; F4 retired unclaimed; the claim-ladder rung is
   removed in `docs/remaining-migration-plan.md` and reopening requires a
@@ -320,6 +324,30 @@ gate loop. This file is the resume point.*
   bar, and the three load-bearing facts. Claim ladder updated in
   `docs/remaining-migration-plan.md` (F4 rung removed; G4 text now
   "the AST executes in Rust").
+- Wave-71A (#1576/#1579): G1.0b remaining expression fields - the node
+  shadow gains a per-field record (kind/flag/name/kinds) for
+  method_type(s), as_type, right_always/right_unreachable, def_var, and
+  the RefExpr special flags; `nodes_mirror.touch` covers the append-only
+  `method_types` list. 15-test suite; engagement method_type 5 sites,
+  touch.method_types 715, as_type 1363.
+- Wave-71B (#1577/#1580): G2.0 statement/def metadata shadow - tagged
+  field-map store (interned names, strong pins), `_meta_setattr` on 12
+  classes, all claimed fields captured (AssignmentStmt/For/With/If/
+  Match/TypeAliasStmt/ImportBase, FuncDef+flags, OverloadedFuncDef,
+  Decorator, ClassDef.info+analyzed, Var). 20-test suite; astmerge
+  re-registration pinned via `replace_object_state`.
+- Wave-71C (#1578/#1582): G3 symbol-table brief persisted
+  (`docs/plans/2026-09-11-g3-symbol-table-brief.md`) with three G0-brief
+  corrections, the accessor surface, the two C-API bypass facts, the
+  astmerge contract, and the G3.0a-d sequence; G3.0a filed as #1581.
+- Wave-71 merge lesson: the two shadow agents edited the same files and
+  independently defined `nodes_mirror.touch` and same-named test
+  helpers. Concatenating conflict sides is NOT sufficient: the repair
+  rebuilt testtypes.py as A's file + B's inserted suite, unified `touch`
+  (G1 list fields vs G2 metadata), and fixed a truncated Rust function
+  and a cut lib.rs registration macro. Always compile plus run the
+  Python suites AND the self-check after a same-file rebase; `cargo test`
+  alone missed the Python-side damage.
 - Runner note unchanged: the repo runner cannot re-register (403,
   admin-blocked; #1249 open); GH `ocr-review` jobs stay `queued`
   forever. The operative review gate is the local
@@ -411,6 +439,9 @@ gate loop. This file is the resume point.*
 | #1570 | #1567 | wave69C: proxy P2b thresholded shadow measured on two corpora, DROPPED (second negative) | docs-only; patch preserved at /private/tmp/mypy-rs-1567-p2b.patch |
 | #1574 | #1572 | wave70A: G1.0a expression node dual-write shadow scaffold (node_mirror.rs + nodes_mirror.py, RefExpr bindings, gated default-off) | cargo 2,798/11; testtypes 3,436/7 (+12); testcheck 8,198/15/7 identical shadow-on; fine-grained 747/27 + daemon 38; self-check 351 |
 | (docs) | #1573 | wave70B: F-program close-out brief + claim-ladder update (F4 retired unclaimed, reopening bar recorded) | docs-only |
+| #1579 | #1576 | wave71A: G1.0b remaining expression shadow fields (per-field records + touch) | cargo 2,806/11; testtypes 3,451/7; testcheck 8,198/15/7 exact; fine-grained 747/27 + daemon 38 |
+| #1580 | #1577 | wave71B: G2.0 statement/def metadata shadow (tagged field map, 12 patched classes) + rebase repair (touch union, suite split) | cargo 2,811/11; testtypes 3,471/7; testcheck exact off/on; fine-grained family 905/28; self-check 351 |
+| (docs) | #1578 | wave71C: G3 symbol-table accessor brief persisted; G3.0a filed as #1581 | docs-only |
 | (docs) | #1549 | wave66C: ADR-0004 proxy graduation brief persisted; #1553/#1554 filed | docs-only |
 | (docs) | #1540 | wave65B: Phase G0 scoping brief persisted + follow-ups #1545/#1546/#1547 | docs-only |
 
@@ -441,23 +472,20 @@ in #1501, closed by hand), #1503 (#1504 auto-closed it), #1506
 (#1508 auto-closed it), #1507 (#1509 + manual close), #1511 (#1514
 merged; closed by hand), #1512 (#1513 merged; closed by hand), #1516,
 #1517, #1518 (closed by hand after the wave-62 merges), #1519 (#1521
-auto-closed it), #1520 (#1525 auto-closed it), #1527 (#1531 merged; closed by hand); #1528 deferred with evidence), #1530 (#1535 auto-closed it), #1532 (closed by hand after #1536), #1526 (closed by hand after #1534), #1539 (#1544 auto-closed it), #1541 (#1542 auto-closed it), #1540 (closed by the G0-brief docs PR), #1545 (#1552 auto-closed it), #1546 (#1550 auto-closed it); #1549 closed by the proxy-brief docs PR; #1547 fixed by #1559 (closed by hand), #1553 (#1558 auto-closed it), #1556 (#1557 auto-closed it), #1554 (negative close after #1563), #1566 (#1569 auto-closed it), #1551 (reopened after a wrong auto-close, fixed by #1568), #1567 (second negative after #1570), #1572 (#1574 auto-closed it), #1573 (close-out docs PR).
+auto-closed it), #1520 (#1525 auto-closed it), #1527 (#1531 merged; closed by hand); #1528 deferred with evidence), #1530 (#1535 auto-closed it), #1532 (closed by hand after #1536), #1526 (closed by hand after #1534), #1539 (#1544 auto-closed it), #1541 (#1542 auto-closed it), #1540 (closed by the G0-brief docs PR), #1545 (#1552 auto-closed it), #1546 (#1550 auto-closed it); #1549 closed by the proxy-brief docs PR; #1547 fixed by #1559 (closed by hand), #1553 (#1558 auto-closed it), #1556 (#1557 auto-closed it), #1554 (negative close after #1563), #1566 (#1569 auto-closed it), #1551 (reopened after a wrong auto-close, fixed by #1568), #1567 (second negative after #1570), #1572 (#1574 auto-closed it), #1573 (close-out docs PR), #1576 (#1579 auto-closed it), #1577 (closed by hand after the #1580 repair), #1578 (docs PR #1582).
 
 ## Open backlog (next waves; dispatch max ~2 port agents)
 
-1. **G1.0b** (next): finish the expression shadow (method_type(s),
-   as_type, analyzed replacements for Comparison/Unary/StrExpr, the
-   remaining G1 sites) and add the G1.1 read-flip channel design; no
-   read flip without a measured consumer.
-2. **G2.0**: statement/def metadata shadow (AssignmentStmt type fields,
-   FuncDef/ClassDef/OverloadedFuncDef metadata, aststrip sites) behind
-   the same gate; ClassDef.analyzed is explicitly G2.
-3. **G3.0**: symbol-table accessors (the highest-risk family; semanal
-   placeholder lifecycle + astmerge identity) - scoping first.
+1. **#1581 (G3.0a)** (next): namespace entry funnel + dual-write
+   capture scaffold per the G3 brief (semanal adding funnel routed
+   through `put_names_entry`, symtable_mirror.rs, 11-pin suite).
+2. **G1.1/G2.1 read-channel design**: only with a measured consumer;
+   G1.0b/G2.0 are record-only by design.
+3. **G3.0b-d**: direct-write/delete sweep, TypeInfoAccess meta fields,
+   astmerge re-registration (all after G3.0a).
 4. **F reopen bar**: only a one-family replacement-view prototype
    clearing >=10% relative total work share with full parity green (see
-   the close-out doc); proxy scaffold is inert and should be wired or
-   deleted.
+   the close-out doc); the proxy scaffold is inert (wire or delete).
 3. **F2/F4 graduation**: capture cuts are exhausted (wave 65A revised
    decision); the next step is the ADR-0004 proxy or the P4 default-on
    decision, and #1528 needs the strong-pin protocol first.
