@@ -58408,7 +58408,11 @@ class NativeStmtDefMirrorSuite(Suite):
         item = nodes_mod.FuncDef("f")
         item._fullname = "mod.f"
         over = nodes_mod.OverloadedFuncDef([item])
-        assert self._meta(over)["items"] == ("list", None, None, ["FuncDef:mod.f"])
+        record = self._meta(over)
+        # FuncBase.__init__ adopts via `self.info = FUNC_NO_INFO` (non-baseline),
+        # so all tracked FuncBase fields are captured from that point on.
+        assert "items" in record
+        assert record["items"] == ("list", None, None, ["FuncDef:mod.f"])
         impl = nodes_mod.FuncDef("f")
         over.impl = impl
         assert self._meta(over)["impl"] == ("obj", "FuncDef", None, None)
@@ -58627,12 +58631,21 @@ class NativeStmtDefMirrorSuite(Suite):
         over.deprecated = "use mod.g instead"
         over.setter_index = 2
         record = self._meta(over)
-        assert set(record) == {
-            "items", "unanalyzed_items", "impl", "deprecated", "setter_index",
-        }
+        # FuncBase fields are captured from construction (info=FUNC_NO_INFO
+        # adopts the node in FuncBase.__init__, before OverloadedFuncDef's
+        # own writes).
+        assert "unanalyzed_items" in record
         assert record["unanalyzed_items"] == ("list", None, None, ["FuncDef:mod.f"])
         assert record["deprecated"] == ("str", "use mod.g instead", None, None)
         assert record["setter_index"] == ("int", None, 2, None)
+        # Post-construction FuncBase writes are captured.
+        over.is_property = True
+        over._fullname = "mod.f"
+        over.is_static = True
+        record = self._meta(over)
+        assert record["is_property"] == ("bool", None, 1, None)
+        assert record["_fullname"] == ("str", "mod.f", None, None)
+        assert record["is_static"] == ("bool", None, 1, None)
 
     def test_decorator_is_overload_and_decorators(self) -> None:
         from mypy import nodes as nodes_mod
@@ -58736,6 +58749,32 @@ class NativeStmtDefMirrorSuite(Suite):
         assert record["original_decorators"] == ("list", None, None, ["NameExpr"])
         dec.original_decorators = []
         assert self._meta(dec)["original_decorators"] == ("list", None, None, [])
+
+    def test_overloaded_func_def_func_base_fields(self) -> None:
+        from mypy import nodes as nodes_mod
+
+        item = nodes_mod.FuncDef("f")
+        over = nodes_mod.OverloadedFuncDef([item])
+        record = self._meta(over)
+        # FuncBase.__init__ sets info=FUNC_NO_INFO (non-baseline), adopting
+        # the node. All tracked FuncBase fields from that point are captured
+        # with their constructor-default values.
+        assert record["info"] == ("obj", "FakeInfo", None, None)
+        assert record["is_property"] == ("bool", None, 0, None)
+        assert record["is_class"] == ("bool", None, 0, None)
+        assert record["is_static"] == ("bool", None, 0, None)
+        assert record["is_final"] == ("bool", None, 0, None)
+        assert record["is_explicit_override"] == ("bool", None, 0, None)
+        assert record["is_type_check_only"] == ("bool", None, 0, None)
+        assert record["def_or_infer_vars"] == ("bool", None, 0, None)
+        assert record["_fullname"] == ("str", "", None, None)
+        assert record["_is_trivial_self"] == ("none", None, None, None)
+        # Post-construction mutations are captured.
+        over.is_final = True
+        over._is_trivial_self = True
+        record = self._meta(over)
+        assert record["is_final"] == ("bool", None, 1, None)
+        assert record["_is_trivial_self"] == ("bool", None, 1, None)
 
     def test_handle_shares_identity_namespace(self) -> None:
         from mypy import nodes as nodes_mod
