@@ -333,6 +333,7 @@ try:
         rust_are_argument_counts_overlapping as _rust_are_argument_counts_overlapping,
         rust_builtin_item_type as _rust_builtin_item_type,
         rust_can_be_narrowed_with_len as _rust_can_be_narrowed_with_len,
+        rust_check_exit_return_type as _rust_check_exit_return_type,
         rust_check_explicit_override_decorator as _rust_check_explicit_override_decorator,
         rust_check_for_untyped_decorator as _rust_check_for_untyped_decorator,
         rust_check_match_args as _rust_check_match_args,
@@ -459,6 +460,7 @@ except ImportError:
     _rust_classify_enum_bases = None  # type: ignore[assignment]
     _rust_classify_enum = None  # type: ignore[assignment]
     _rust_check_explicit_override_decorator = None  # type: ignore[assignment]
+    _rust_check_exit_return_type = None  # type: ignore[assignment]
     _rust_conditional_types = None  # type: ignore[assignment]
     _rust_detach_callable = None  # type: ignore[assignment]
     _rust_is_string_literal = None  # type: ignore[assignment]
@@ -3954,6 +3956,15 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
         exceptions even though this is not the case, resulting in
         invalid reachability inference.
         """
+        if _CHECKER_HAS_TYPE_KERNEL and _native_checker_active and _rust_check_exit_return_type is not None:
+            try:
+                result = _rust_check_exit_return_type(defn)
+                if result is True:
+                    self.msg.incorrect__exit__return(defn)
+                return
+            except (AssertionError, NotImplementedError):
+                pass
+
         if not defn.type or not isinstance(defn.type, CallableType):
             return
 

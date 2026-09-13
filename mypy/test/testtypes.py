@@ -71,6 +71,7 @@ from mypy.nodes import (
     SetExpr,
     SliceExpr,
     StarExpr,
+    Statement,
     StrExpr,
     SymbolNode,
     SymbolTable,
@@ -47301,6 +47302,166 @@ class NativeIsWritableAttributeSuite(Suite):
 
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeCheckExitReturnTypeSuite(Suite):
+    """Parity for `rust_check_exit_return_type` (issue #1597).
+
+    `TypeChecker.check__exit__return_type` (checker.py:3949-3972) emits
+    `incorrect__exit__return` when an `__exit__` method always returns
+    `False` but its declared return type contains `bool`. The Rust seam
+    is a live-PyO3-object port: it reads `defn.type` (CallableType check),
+    calls Python's `get_proper_type` + `has_bool_item` (both already
+    native), calls `all_return_statements` (already native), and checks
+    each return's `expr` is a `NameExpr` with `fullname ==
+    "builtins.False"`. Direct seam calls assert the expected bool;
+    gate-off vs gate-on differentials drive the real TypeChecker method
+    through a stub message recorder and must agree.
+    """
+
+    def setUp(self) -> None:
+        from mypy.checker import _set_native_checker_active
+
+        self.fx = TypeFixture()
+        self._set_active = _set_native_checker_active
+        self._set_active(True)
+
+    def tearDown(self) -> None:
+        self._set_active(False)
+
+    def _with_gate(self, active: bool, fn: Callable[[], T]) -> T:
+        self._set_active(active)
+        try:
+            return fn()
+        finally:
+            self._set_active(True)
+
+    def _false_name(self) -> Any:
+        from mypy.nodes import NameExpr
+
+        n = NameExpr("False")
+        n.fullname = "builtins.False"
+        return n
+
+    def _true_name(self) -> Any:
+        from mypy.nodes import NameExpr
+
+        n = NameExpr("True")
+        n.fullname = "builtins.True"
+        return n
+
+    def _func(
+        self, ret_type: Type, returns: list[Any]
+    ) -> Any:
+        from mypy.nodes import Block, FuncDef, ReturnStmt
+
+        stmts: list[Statement] = [ReturnStmt(expr) for expr in returns]
+        fd = FuncDef("__exit__", [], Block(stmts))
+        ct = self.fx.callable_type(ret_type)
+        fd.type = ct
+        return fd
+
+    def _seam(self, defn: Any) -> Any:
+        return _type_kernel.rust_check_exit_return_type(defn)
+
+    def _run(self, defn: Any) -> list[tuple[str, str]]:
+        from mypy.checker import TypeChecker
+
+        def check_one() -> list[tuple[str, str]]:
+            chk = TypeChecker.__new__(TypeChecker)
+            chk.options = Options()
+            msgs: list[tuple[str, str]] = []
+            chk.msg = SimpleNamespace(  # type: ignore[assignment]
+                fail=lambda msg, ctx, **kw: msgs.append(("fail", str(msg))),
+                incorrect__exit__return=lambda ctx: msgs.append(
+                    ("fail", '"bool" is invalid as return type for "__exit__" that always returns False')
+                ),
+            )
+            chk.check__exit__return_type(defn)
+            return msgs
+
+        off = self._with_gate(False, check_one)
+        on = self._with_gate(True, check_one)
+        assert_equal(on, off, f"check__exit__return_type parity for {defn!r}")
+        return on
+
+    def test_seam_all_false_returns(self) -> None:
+        fd = self._func(self.fx.bool_type, [self._false_name(), self._false_name()])
+        assert self._seam(fd) is True
+
+    def test_seam_mixed_returns(self) -> None:
+        fd = self._func(self.fx.bool_type, [self._false_name(), self._true_name()])
+        assert self._seam(fd) is False
+
+    def test_seam_true_returns(self) -> None:
+        fd = self._func(self.fx.bool_type, [self._true_name()])
+        assert self._seam(fd) is False
+
+    def test_seam_no_returns(self) -> None:
+        fd = self._func(self.fx.bool_type, [])
+        assert self._seam(fd) is False
+
+    def test_seam_no_bool_item(self) -> None:
+        fd = self._func(self.fx.str_type, [self._false_name()])
+        assert self._seam(fd) is False
+
+    def test_seam_none_type(self) -> None:
+        from mypy.nodes import Block, FuncDef
+
+        fd = FuncDef("__exit__", [], Block([]))
+        fd.type = None
+        assert self._seam(fd) is False
+
+    def test_seam_non_callable_type(self) -> None:
+        from mypy.nodes import Block, FuncDef
+
+        fd = FuncDef("__exit__", [], Block([]))
+        fd.type = self.fx.bool_type  # not a CallableType
+        assert self._seam(fd) is False
+
+    def test_seam_union_with_bool(self) -> None:
+        from mypy.types import UnionType
+
+        ret = UnionType([self.fx.bool_type, self.fx.nonet])
+        fd = self._func(ret, [self._false_name()])
+        assert self._seam(fd) is True
+
+    def test_parity_all_false(self) -> None:
+        fd = self._func(self.fx.bool_type, [self._false_name()])
+        msgs = self._run(fd)
+        assert msgs == [("fail", '"bool" is invalid as return type for "__exit__" that always returns False')]
+
+    def test_parity_mixed(self) -> None:
+        fd = self._func(self.fx.bool_type, [self._false_name(), self._true_name()])
+        msgs = self._run(fd)
+        assert msgs == []
+
+    def test_parity_no_returns(self) -> None:
+        fd = self._func(self.fx.bool_type, [])
+        msgs = self._run(fd)
+        assert msgs == []
+
+    def test_parity_no_bool_item(self) -> None:
+        fd = self._func(self.fx.str_type, [self._false_name()])
+        msgs = self._run(fd)
+        assert msgs == []
+
+    def test_parity_none_type(self) -> None:
+        from mypy.nodes import Block, FuncDef
+
+        fd = FuncDef("__exit__", [], Block([]))
+        fd.type = None
+        msgs = self._run(fd)
+        assert msgs == []
+
+    def test_parity_non_callable_type(self) -> None:
+        from mypy.nodes import Block, FuncDef
+
+        fd = FuncDef("__exit__", [], Block([]))
+        fd.type = self.fx.bool_type
+        msgs = self._run(fd)
+        assert msgs == []
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeAlwaysReturnsNoneSuite(Suite):
     """Parity for `rust_always_returns_none` (issue #1070).
 
@@ -59268,7 +59429,7 @@ class NativeSymtableMirrorSuite(Suite):
     # ---- G3.0c: TypeInfo meta-field capture ----
 
     def _make_info(self, fullname: str = "mod.Cls") -> Any:
-        from mypy.nodes import TypeInfo, ClassDef, Block
+        from mypy.nodes import Block, ClassDef, TypeInfo
 
         info = TypeInfo(SymbolTable(), ClassDef(fullname, Block([])), "")
         info._fullname = fullname
@@ -59391,7 +59552,6 @@ class NativeSymtableMirrorSuite(Suite):
         # G3.0d: info.mro[i] = ... is a list item assignment that bypasses
         # the TypeInfo.__setattr__ patch. The astmerge process_type_info
         # path re-captures via _capture_meta after the in-place mutations.
-        from mypy.nodes import TypeInfo, ClassDef
 
         info = self._make_info("mod.Cls")
         base = self._make_info("mod.Base")
@@ -59414,7 +59574,7 @@ class NativeSymtableMirrorSuite(Suite):
         # G3.0d: replace_object_state(new, old) copies state via setattr,
         # which triggers _typeinfo_setattr -> _capture_meta on the surviving
         # `new` identity. The shadow record must appear on `new`, not `old`.
-        from mypy.nodes import TypeInfo, ClassDef, Block
+        from mypy.nodes import Block, ClassDef, TypeInfo
         from mypy.util import replace_object_state
 
         old = self._make_info("mod.Old")
@@ -59438,7 +59598,7 @@ class NativeSymtableMirrorSuite(Suite):
         # G3.0d: node._node = new in replace_nodes_in_symbol_table writes to
         # a _FLAG_FIELDS slot, triggering _symtable_node_setattr ->
         # _refresh_flags on the SymbolTableNode.
-        from mypy.nodes import Var, SymbolTableNode, SymbolTable, GDEF
+        from mypy.nodes import GDEF, SymbolTable, SymbolTableNode, Var
 
         table = SymbolTable()
         old_node = Var("x")
@@ -59476,7 +59636,7 @@ class NativeSymtableMetaExtraSuite(Suite):
         self._m.reset(clear_counts=True)
 
     def _make_info(self, fullname: str = "mod.Cls") -> Any:
-        from mypy.nodes import TypeInfo, ClassDef, Block
+        from mypy.nodes import Block, ClassDef, TypeInfo
 
         info = TypeInfo(SymbolTable(), ClassDef(fullname, Block([])), "")
         info._fullname = fullname

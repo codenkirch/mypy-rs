@@ -4482,6 +4482,24 @@ including:
   real `ConditionalTypeBinder`). Gates: cargo type_kernel clean, fmt +
   clippy clean, testtypes 3543 passed/7 skipped, cold self-check clean.
 
+- wave 75 H1c native check__exit__return_type (issue #1597): the Rust
+  seam in `checker_functions.rs` mirrors
+  `TypeChecker.check__exit__return_type` (checker.py:3951-3983) as a
+  live-PyO3-object port (zero wire bytes for the `defn` node). Rust reads
+  `defn.type` via PyO3 `is_instance` against `mypy.types.CallableType`,
+  calls Python's `get_proper_type` + `has_bool_item` (both already
+  native) on the return type, calls `all_return_statements` (already
+  native) on the def body, and checks each return's `expr` is a
+  `NameExpr` with `fullname == "builtins.False"`. Returns `Option<bool>`:
+  `Some(true)` = emit error, `Some(false)` = no error, `None` = defer.
+  The `self.msg.incorrect__exit__return(defn)` emission stays
+  Python-side. Gated by `_native_checker_active` (existing wiring, no
+  build.py change) and covered by `NativeCheckExitReturnTypeSuite` in
+  `mypy/test/testtypes.py` (7 direct seam calls + 7 gate-off vs gate-on
+  parity differentials), plus pure decision unit tests in
+  `checker_functions.rs`. Gates: cargo type_kernel clean, fmt + clippy
+  clean, testtypes 3557 passed/7 skipped, cold self-check clean.
+
 ## Pull Requests
 
 The default branch on this fork is `main` (not `master`). Always target

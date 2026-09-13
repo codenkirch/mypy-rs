@@ -5774,4 +5774,104 @@ mod isinstance_head_tests {
             ISINSTANCE_HEAD_TYPEGUARD
         );
     }
+
+    #[test]
+    fn test_exit_return_type_all_false() {
+        assert_eq!(check_exit_return_type_inner(true, true, true), Some(true));
+    }
+
+    #[test]
+    fn test_exit_return_type_mixed() {
+        assert_eq!(check_exit_return_type_inner(true, true, false), Some(false));
+    }
+
+    #[test]
+    fn test_exit_return_type_no_bool_item() {
+        assert_eq!(check_exit_return_type_inner(false, true, true), Some(false));
+    }
+
+    #[test]
+    fn test_exit_return_type_no_returns() {
+        assert_eq!(check_exit_return_type_inner(true, false, true), Some(false));
+    }
+
+    /// Pure decision fold of `check__exit__return_type` for unit tests.
+    fn check_exit_return_type_inner(
+        has_bool_item: bool,
+        has_returns: bool,
+        all_false: bool,
+    ) -> Option<bool> {
+        if !has_bool_item {
+            return Some(false);
+        }
+        if !has_returns {
+            return Some(false);
+        }
+        Some(all_false)
+    }
+}
+
+/// `TypeChecker.check__exit__return_type` (checker.py:3949-3972):
+/// live-PyO3 seam. Returns `Some(true)` when every return statement
+/// is `builtins.False` (emit error), `Some(false)` when not, `None` on
+/// deferral. The `self.msg.incorrect__exit__return` emission stays
+/// Python-side.
+#[pyfunction]
+pub(crate) fn rust_check_exit_return_type(py: Python<'_>, defn: &PyAny) -> PyResult<Option<bool>> {
+    let types_mod = py.import("mypy.types")?;
+    let callable_cls: &PyType = types_mod.getattr("CallableType")?.downcast()?;
+    let name_expr_cls = nodes_class(py, "NameExpr")?;
+
+    // `if not defn.type or not isinstance(defn.type, CallableType): return`
+    let defn_type = defn.getattr("type")?;
+    if defn_type.is_none() {
+        return Ok(Some(false));
+    }
+    if !defn_type.is_instance(callable_cls)? {
+        return Ok(Some(false));
+    }
+
+    // `ret_type = get_proper_type(defn.type.ret_type)`
+    let raw_ret = defn_type.getattr("ret_type")?;
+    let gpt = py.import("mypy.types")?.getattr("get_proper_type")?;
+    let ret_type = gpt.call1((raw_ret,))?;
+
+    // `if not has_bool_item(ret_type): return`
+    let hbi = py.import("mypy.checker")?.getattr("has_bool_item")?;
+    let has_bool: bool = hbi.call1((ret_type,))?.extract()?;
+    if !has_bool {
+        return Ok(Some(false));
+    }
+
+    // `returns = all_return_statements(defn)`
+    let ars = py
+        .import("mypy.traverser")?
+        .getattr("all_return_statements")?;
+    let returns = ars.call1((defn,))?;
+    let returns_list = returns.downcast::<PyList>()?;
+    if returns_list.is_empty() {
+        return Ok(Some(false));
+    }
+
+    // `if all(isinstance(ret.expr, NameExpr) and
+    //          ret.expr.fullname == "builtins.False" for ret in returns)`
+    for item in returns_list.iter() {
+        let expr = item.getattr("expr")?;
+        if expr.is_none() {
+            return Ok(Some(false));
+        }
+        if !expr.is_instance(name_expr_cls)? {
+            return Ok(Some(false));
+        }
+        let fullname = expr.getattr("fullname")?;
+        if fullname.is_none() {
+            return Ok(Some(false));
+        }
+        let s: &str = fullname.downcast::<pyo3::types::PyString>()?.to_str()?;
+        if s != "builtins.False" {
+            return Ok(Some(false));
+        }
+    }
+
+    Ok(Some(true))
 }

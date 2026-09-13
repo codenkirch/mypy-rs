@@ -3209,6 +3209,14 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         module
     )?)?;
 
+    // Issue #1597: check__exit__return_type decision. Rust reads the
+    // live FuncItem via PyO3 and returns Some(true) when all returns are
+    // builtins.False; the message emission stays Python-side.
+    module.add_function(wrap_pyfunction!(
+        checker_functions::rust_check_exit_return_type,
+        module
+    )?)?;
+
     // Issue #1079: infer_operator_assignment_method decision. Rust reads
     // the live proper type via PyO3 and returns the (is_inplace, method)
     // pair; get_proper_type and the ops_with_inplace_method membership
