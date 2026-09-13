@@ -655,9 +655,19 @@ observed; no work is scheduled.
 
 ## Phase F: Rust-owned type graph
 
-Goal: `mypy.types.Type` instances become views over Rust-owned storage. The
-checking semantics, the plugin API surface, and the test suites stay
-unchanged as a contract.
+**CLOSED 2026-09-11 (#1573): F0-F3 landed opt-in, F4 retired unclaimed.**
+Every measured F slice was <= noise or a loss (capture +78.7s; proxy P2
+-0.5% wall / +5.6% CPU; P2b corpus A +8.97% wall, corpus B inside noise;
+cache-data bridge ~1.5x slower), and the only architecture that removes
+per-object Python work (replacement views) was declined by ADR-0004
+Decision 1. The mirror stays as opt-in byte-identity audit tooling.
+Reopening requires a one-family replacement-view prototype clearing a
+>=10% relative total work-share win on the cold self-check with full
+parity green (see `docs/plans/2026-09-11-f-program-close-out.md`).
+
+Original goal: `mypy.types.Type` instances become views over Rust-owned
+storage. The checking semantics, the plugin API surface, and the test
+suites stay unchanged as a contract.
 
 ### Why this is now in scope
 
@@ -765,9 +775,11 @@ if the bridge costs outweigh the standalone benefit.
 - Today (after wave 28-32): "Rust kernel, Python host": native parser,
   native resolver, ~97%+ native type kernel with every undecidable case
   documented.
-- After F4: "the type graph executes in Rust; Python is the host and plugin
-  bridge."
-- After G4: "the AST and type graph execute in Rust."
+- F close-out (2026-09-11, #1573): the F0-F3 shadow storage is
+  kernel-complete and opt-in. The F4 rung ("the type graph executes in
+  Rust; Python is the host and plugin bridge") is retired unclaimed; a
+  phase closed without graduating contributes no rung.
+- After G4: "the AST executes in Rust."
 - After H: "the type-checking pipeline executes in Rust."
 - After J: "full Rust port", with the Python plugin bridge optional.
 
@@ -811,7 +823,7 @@ Phase F (after wave32 or in parallel by capacity, DUAL-WRITE FIRST):
   F1: dual-write shadow (Instance, CallableType, TypeVarType, UnionType)
   F2: read flip per family
   F3: write flip per family (Instance first)
-  F4: graduation (cache, daemon, plugin bridge)
+  F4: graduation - RETIRED UNCLAIMED (#1573); see the Phase F section
 
 Phase G (after F4):
   G0-G4: nodes ownership transfer, families as listed in Phase G
