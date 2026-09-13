@@ -4404,6 +4404,33 @@ including:
   cargo type_kernel build + clippy + fmt clean; symtable mirror tests
   35 passed; full testtypes 3519 passed/7 skipped/1 pre-existing
   failure; cold self-check pending.
+- wave 73A expression node wire read channel for type-valued fields
+  (G1.1, issue #1576): extends the G1.0b expression node shadow to
+  store F2 wire bytes for the four type-valued expression fields
+  (`method_type`, `as_type`, `type_guard`, `type_is`) so Rust can
+  serve reads without crossing back to Python. New `Wire` variant on
+  `FieldValue` (`{ kind: Option<String>, bytes: Vec<u8> }`) in
+  `node_mirror.rs` with two pyfunctions:
+  `rust_node_mirror_capture_field_wire(obj, field, kind, wire)` for
+  capture and `rust_node_mirror_field_wire(obj, field)` returning
+  `Option<(Option<String>, PyBytes)>` for reads. Python side
+  (`mypy/nodes_mirror.py`): `_capture_field` now routes Type-valued
+  writes through `rust_node_mirror_capture_field_wire` when
+  `isinstance(value, MypyType)`, serializing via
+  `types_mirror._fresh_bytes`; non-Type values keep the G1.0b
+  `rust_node_mirror_capture_field_kind` path. `read_field_type(handle,
+  field)` deserializes wire bytes through `ReadBuffer` + `read_type`
+  so a consumer gets a live `Type` object back. Gate is the existing
+  `Options.native_ast_mirror` (default off, not in
+  ``OPTIONS_AFFECTING_CACHE``). No read flip, no cache-format change, no
+  plugin-visible change. Tests: updated 6 `NativeAstMirrorFieldSuite`
+  tests to expect `("wire", kind, ...)` for type-valued fields; new
+  `NativeAstMirrorWireSuite` (11 tests: wire round-trip for Instance
+  and AnyType, cleared-type routing to kind variant, `read_field_type`
+  helper, wire overwrites, NotParsed baseline, setattr engagement).
+  Gates: cargo type_kernel 2,806/11, fmt + clippy clean; testtypes
+  3,521/7 (gate off and on); testcheck 8,144/69/7 exact; fine-grained
+  747/27; cold self-check clean.
 
 ## Pull Requests
 

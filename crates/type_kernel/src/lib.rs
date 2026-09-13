@@ -3539,6 +3539,17 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         module
     )?)?;
 
+    // Phase G1.1 (#1576 follow-up): wire bytes for type-valued fields so
+    // Rust can serve reads without crossing back to Python.
+    module.add_function(wrap_pyfunction!(
+        node_mirror::rust_node_mirror_capture_field_wire,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        node_mirror::rust_node_mirror_field_wire,
+        module
+    )?)?;
+
     // Phase G2.0 (#1577): statement/def metadata shadow store. Record-only
     // like G1.0a: no consumer reads an entry, same gate and identity base.
     module.add_function(wrap_pyfunction!(

@@ -25,6 +25,7 @@ use std::collections::HashMap;
 
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
+use pyo3::types::PyBytes;
 
 use crate::identity;
 
@@ -271,6 +272,12 @@ pub(crate) enum FieldValue {
     Name(Option<String>),
     /// Type list (`ComparisonExpr.method_types`): class per item.
     Kinds(Vec<Option<String>>),
+    /// G1.1: wire bytes for a type-valued field, plus the class name
+    /// for parity-checking. None when the type was cleared.
+    Wire {
+        kind: Option<String>,
+        bytes: Vec<u8>,
+    },
 }
 
 fn capture_field_value(obj: &PyAny, field: String, value: FieldValue) -> PyResult<u64> {
@@ -406,6 +413,28 @@ pub(crate) fn rust_node_mirror_capture_field_kind(
     capture_field_value(obj, field, FieldValue::Kind(kind))
 }
 
+/// G1.1: Capture a type-valued field with its wire bytes. The kind is the
+/// class name (None when cleared); the bytes are the serialized Type form
+/// so Rust can serve reads without crossing back to Python. When `kind`
+/// is None the bytes are ignored (a cleared field has no wire form).
+#[pyfunction]
+#[pyo3(signature = (obj, field, kind, wire))]
+pub(crate) fn rust_node_mirror_capture_field_wire(
+    obj: &PyAny,
+    field: String,
+    kind: Option<String>,
+    wire: Vec<u8>,
+) -> PyResult<u64> {
+    let value = match &kind {
+        None => FieldValue::Wire {
+            kind: None,
+            bytes: vec![],
+        },
+        Some(_) => FieldValue::Wire { kind, bytes: wire },
+    };
+    capture_field_value(obj, field, value)
+}
+
 /// Capture a bool field (`right_always`, `right_unreachable`,
 /// `is_special_form`, `is_alias_rvalue`).
 #[pyfunction]
@@ -443,7 +472,29 @@ fn field_value_object(py: Python<'_>, value: &FieldValue) -> PyObject {
         FieldValue::Flag(flag) => ("flag", *flag).into_py(py),
         FieldValue::Name(name) => ("name", name.clone()).into_py(py),
         FieldValue::Kinds(kinds) => ("kinds", kinds.clone()).into_py(py),
+        FieldValue::Wire { kind, bytes } => ("wire", kind.clone(), bytes.clone()).into_py(py),
     }
+}
+
+/// G1.1: Read the wire bytes for a type-valued field; returns
+/// `(kind, bytes)` or None when the object/field has no entry or the
+/// field is not wire-captured.
+#[pyfunction]
+pub(crate) fn rust_node_mirror_field_wire(
+    py: Python<'_>,
+    handle: u64,
+    field: &str,
+) -> Option<(Option<String>, Py<PyBytes>)> {
+    with_store(|store| {
+        store.by_handle.get(&handle).and_then(|entry| {
+            entry.fields.get(field).and_then(|value| match value {
+                FieldValue::Wire { kind, bytes } => {
+                    Some((kind.clone(), PyBytes::new(py, bytes).into()))
+                }
+                _ => None,
+            })
+        })
+    })
 }
 
 /// Read one field record as a tagged tuple; None when the object or the

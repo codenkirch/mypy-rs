@@ -108,6 +108,7 @@ from mypy.nodes import (
     Var,
     WithStmt,
 )
+from mypy.types import Type as MypyType
 
 # The five RefExpr binding scalars. `fullname` is a property writing
 # `_fullname`, so the slot name is the tracked key.
@@ -147,6 +148,45 @@ def _count(key: str, n: int = 1) -> None:
     if not _audit_mode:
         return
     _audit[key] = _audit.get(key, 0) + n
+
+
+def _serialize_type_wire(t: MypyType) -> bytes:
+    """Serialize a Type to wire bytes for the node mirror store.
+
+    Uses the mirror's fresh-bytes path so the wire cache does not
+    interfere.  On failure returns empty bytes (the capture site treats
+    an empty blob as a cleared field).
+    """
+    try:
+        from mypy.types_mirror import _fresh_bytes
+        return _fresh_bytes(t)
+    except Exception:
+        _count("wire_serialize_fail")
+        return b""
+
+
+def read_field_type(handle: int, field: str) -> MypyType | None:
+    """Read a type-valued field from the shadow store and deserialize it.
+
+    Returns the Type, or None when the field is absent, was cleared, or
+    cannot be deserialized.
+    """
+    if _kernel_mod is None:
+        return None
+    result = _kernel_mod.rust_node_mirror_field_wire(handle, field)
+    if result is None:
+        return None
+    kind, wire = result
+    if kind is None or not wire:
+        return None
+    try:
+        from mypy.cache import ReadBuffer
+        from mypy.types import read_type
+        data = ReadBuffer(wire)
+        return read_type(data)
+    except Exception:
+        _count("wire_deserialize_fail")
+        return None
 
 
 def _is_baseline(name: str, value: Any) -> bool:
@@ -227,7 +267,15 @@ def _capture_field(node: Any, name: str) -> None:
         handle: int
         if name in _KIND_FIELDS:
             kind = None if value is None else type(value).__name__
-            handle = _kernel_mod.rust_node_mirror_capture_field_kind(node, name, kind)
+            if isinstance(value, MypyType):
+                wire = _serialize_type_wire(value)
+                handle = _kernel_mod.rust_node_mirror_capture_field_wire(
+                    node, name, kind, wire
+                )
+            else:
+                handle = _kernel_mod.rust_node_mirror_capture_field_kind(
+                    node, name, kind
+                )
         elif name in _FLAG_FIELDS:
             handle = _kernel_mod.rust_node_mirror_capture_flag(node, name, bool(value))
         elif name in _NAME_FIELDS:

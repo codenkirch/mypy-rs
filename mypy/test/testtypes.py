@@ -58044,10 +58044,13 @@ class NativeAstMirrorFieldSuite(Suite):
         op.right_always = True
         op.right_unreachable = True
         op.as_type = self.fx.a
-        assert self._field(op, "method_type") == ("kind", "Instance")
+        # Type-valued fields now carry wire bytes (G1.1).
+        mt = self._field(op, "method_type")
+        assert mt[0] == "wire" and mt[1] == "Instance"
         assert self._field(op, "right_always") == ("flag", True)
         assert self._field(op, "right_unreachable") == ("flag", True)
-        assert self._field(op, "as_type") == ("kind", "Instance")
+        at = self._field(op, "as_type")
+        assert at[0] == "wire" and at[1] == "Instance"
         assert self._k.rust_node_mirror_fields(self._handle(op)) == [
             "as_type",
             "method_type",
@@ -58059,6 +58062,7 @@ class NativeAstMirrorFieldSuite(Suite):
         op = OpExpr("|", NameExpr("a"), NameExpr("b"))
         op.as_type = None
         # A cleared slot is a captured write, not a missing record.
+        # None is not a Type, so it routes through capture_field_kind.
         assert self._field(op, "as_type") == ("kind", None)
         assert self._field(op, "method_type") is None
 
@@ -58080,19 +58084,23 @@ class NativeAstMirrorFieldSuite(Suite):
     def test_unary_method_type_capture(self) -> None:
         expr = UnaryExpr("-", NameExpr("a"))
         expr.method_type = self.fx.a
-        assert self._field(expr, "method_type") == ("kind", "Instance")
+        mt = self._field(expr, "method_type")
+        assert mt[0] == "wire" and mt[1] == "Instance"
 
     def test_index_method_type_and_as_type_capture(self) -> None:
         expr = IndexExpr(NameExpr("a"), NameExpr("b"))
         expr.method_type = self.fx.a
         expr.as_type = AnyType(TypeOfAny.explicit)
-        assert self._field(expr, "method_type") == ("kind", "Instance")
-        assert self._field(expr, "as_type") == ("kind", "AnyType")
+        mt = self._field(expr, "method_type")
+        assert mt[0] == "wire" and mt[1] == "Instance"
+        at = self._field(expr, "as_type")
+        assert at[0] == "wire" and at[1] == "AnyType"
 
     def test_str_as_type_capture(self) -> None:
         expr = StrExpr("List[int]")
         expr.as_type = self.fx.a
-        assert self._field(expr, "as_type") == ("kind", "Instance")
+        at = self._field(expr, "as_type")
+        assert at[0] == "wire" and at[1] == "Instance"
         expr.as_type = None
         assert self._field(expr, "as_type") == ("kind", None)
 
@@ -58113,8 +58121,10 @@ class NativeAstMirrorFieldSuite(Suite):
         expr.type_is = AnyType(TypeOfAny.explicit)
         assert self._field(expr, "is_special_form") == ("flag", True)
         assert self._field(expr, "is_alias_rvalue") == ("flag", True)
-        assert self._field(expr, "type_guard") == ("kind", "Instance")
-        assert self._field(expr, "type_is") == ("kind", "AnyType")
+        tg = self._field(expr, "type_guard")
+        assert tg[0] == "wire" and tg[1] == "Instance"
+        ti = self._field(expr, "type_is")
+        assert ti[0] == "wire" and ti[1] == "AnyType"
 
     def test_fields_merge_with_ref_record(self) -> None:
         expr = NameExpr("x")
@@ -58184,18 +58194,159 @@ class NativeAstMirrorFieldSuite(Suite):
 
     def test_capture_failure_does_not_break_field_write(self) -> None:
         expr = StrExpr("x")
-        original = self._k.rust_node_mirror_capture_field_kind
+        original_wire = self._k.rust_node_mirror_capture_field_wire
 
         def boom(*args: Any, **kwargs: Any) -> None:
             raise RuntimeError("kernel down")
 
-        self._k.rust_node_mirror_capture_field_kind = boom  # type: ignore[assignment]
+        self._k.rust_node_mirror_capture_field_wire = boom  # type: ignore[assignment]
         try:
             expr.as_type = self.fx.a
             assert expr.as_type is self.fx.a
             assert self._m.report().get("capture_fail.as_type", 0) >= 1
         finally:
-            self._k.rust_node_mirror_capture_field_kind = original
+            self._k.rust_node_mirror_capture_field_wire = original_wire
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeAstMirrorWireSuite(Suite):
+    """G1.1 wire-bytes round-trip tests for type-valued expression fields.
+
+    Each test captures a Type into the node shadow via the same
+    ``__setattr__`` path a build uses, then reads the wire bytes back
+    through ``rust_node_mirror_field_wire`` and deserializes them to
+    verify the round-trip produces an equal Type.
+    """
+
+    def setUp(self) -> None:
+        import type_kernel as kernel
+
+        from mypy import nodes_mirror
+
+        nodes_mirror.activate(audit=True)
+        nodes_mirror.reset(clear_counts=True)
+        self._k = kernel
+        self._m = nodes_mirror
+        self.fx = TypeFixture()
+
+    def tearDown(self) -> None:
+        self._m.reset(clear_counts=True)
+
+    def _handle(self, node: Any) -> int:
+        handle = self._m._NODE_HANDLES.get(id(node))
+        assert handle is not None, "node was not adopted by the shadow"
+        return handle
+
+    def _field_wire(self, node: Any, field: str) -> tuple[str | None, bytes] | None:
+        return self._k.rust_node_mirror_field_wire(self._handle(node), field)
+
+    def test_method_type_wire_roundtrip(self) -> None:
+        op = OpExpr("+", NameExpr("a"), NameExpr("b"))
+        op.method_type = self.fx.a
+        result = self._field_wire(op, "method_type")
+        assert result is not None
+        kind, wire = result
+        assert kind == "Instance"
+        assert len(wire) > 0
+        # Verify the wire bytes start with the INSTANCE tag (first byte).
+        from mypy.types import INSTANCE
+        assert wire[0] == INSTANCE
+
+    def test_as_type_wire_roundtrip(self) -> None:
+        expr = StrExpr("List[int]")
+        expr.as_type = self.fx.a
+        result = self._field_wire(expr, "as_type")
+        assert result is not None
+        kind, wire = result
+        assert kind == "Instance"
+        assert len(wire) > 0
+
+    def test_type_guard_wire_roundtrip(self) -> None:
+        expr = NameExpr("x")
+        expr.type_guard = self.fx.a
+        result = self._field_wire(expr, "type_guard")
+        assert result is not None
+        kind, wire = result
+        assert kind == "Instance"
+        assert len(wire) > 0
+
+    def test_type_is_anytype_wire_roundtrip(self) -> None:
+        expr = NameExpr("x")
+        any_t = AnyType(TypeOfAny.explicit)
+        expr.type_is = any_t
+        result = self._field_wire(expr, "type_is")
+        assert result is not None
+        kind, wire = result
+        assert kind == "AnyType"
+        assert len(wire) > 0
+        from mypy.types import ANY_TYPE
+        assert wire[0] == ANY_TYPE
+
+    def test_cleared_type_routes_through_kind_not_wire(self) -> None:
+        op = OpExpr("+", NameExpr("a"), NameExpr("b"))
+        # First write a Type to adopt the node.
+        op.method_type = self.fx.a
+        handle = self._handle(op)
+        assert self._k.rust_node_mirror_field_wire(handle, "method_type") is not None
+        # Overwrite with None: not a Type, routes through capture_field_kind.
+        op.method_type = None
+        # Wire reader returns None for non-wire entries.
+        assert self._k.rust_node_mirror_field_wire(handle, "method_type") is None
+        # The general field reader sees the kind entry.
+        assert self._k.rust_node_mirror_field(handle, "method_type") == ("kind", None)
+
+    def test_read_field_type_helper(self) -> None:
+        """AnyType round-trips without a resolver (no type_ref fixup)."""
+        expr = NameExpr("x")
+        any_t = AnyType(TypeOfAny.explicit)
+        expr.type_is = any_t
+        handle = self._handle(expr)
+        decoded = self._m.read_field_type(handle, "type_is")
+        assert decoded is not None
+        proper = get_proper_type(decoded)
+        assert isinstance(proper, AnyType)
+        assert proper.type_of_any == TypeOfAny.explicit
+
+    def test_read_field_type_cleared_returns_none(self) -> None:
+        op = OpExpr("+", NameExpr("a"), NameExpr("b"))
+        op.method_type = self.fx.a
+        handle = self._handle(op)
+        # Overwrite with None.
+        op.method_type = None
+        assert self._m.read_field_type(handle, "method_type") is None
+
+    def test_read_field_type_missing_field_returns_none(self) -> None:
+        op = OpExpr("+", NameExpr("a"), NameExpr("b"))
+        op.method_type = self.fx.a
+        handle = self._handle(op)
+        # `as_type` was never written.
+        assert self._m.read_field_type(handle, "as_type") is None
+
+    def test_wire_overwrites_previous(self) -> None:
+        op = OpExpr("+", NameExpr("a"), NameExpr("b"))
+        op.method_type = self.fx.a
+        first = self._field_wire(op, "method_type")
+        assert first is not None and first[0] == "Instance"
+        # Overwrite with a different type.
+        any_t = AnyType(TypeOfAny.explicit)
+        op.method_type = any_t
+        second = self._field_wire(op, "method_type")
+        assert second is not None and second[0] == "AnyType"
+
+    def test_notparsed_as_type_not_wire(self) -> None:
+        """NotParsed is not a Type, so it stays on the kind path."""
+        expr = StrExpr("x")
+        # Constructor default: NotParsed.VALUE
+        assert id(expr) not in self._m._NODE_HANDLES
+        expr.as_type = NotParsed.VALUE
+        # NotParsed is not a Type, no adoption.
+        assert id(expr) not in self._m._NODE_HANDLES
+
+    def test_capture_wire_engages_through_setattr(self) -> None:
+        """Verify the wire path is reached through the patched __setattr__."""
+        op = OpExpr("+", NameExpr("a"), NameExpr("b"))
+        op.method_type = self.fx.a
+        assert self._m.report().get("capture_method_type", 0) >= 1
 
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
