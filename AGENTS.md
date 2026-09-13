@@ -4196,6 +4196,40 @@ including:
   AST suites 892/75/2 xfailed; testparse fastparse 250/74; testcheck
   8,144/69/7/0 exact local baseline (CI's 8,198/15/7); cold
   self-check clean 348; fine-grained 747/27 + daemon 38.
+- wave 70A expression dual-write node shadow scaffold (G1.0a, issue
+  #1572): new `crates/type_kernel/src/node_mirror.rs` - a thread-local
+  per-node store keyed by `identity::handle_for` with strong pins, one
+  merged record per object holding the `RefExpr` binding scalars
+  (`kind`, target `node` fullname, `_fullname`, `is_new_def`,
+  `is_inferred_def`) plus the last `analyzed` replacement class name
+  (record-only) and monotonic capture counters; `reset` drops entries
+  and pins but never touches `identity` (`rust_mirror_reset` stays the
+  single owner). Nine `rust_node_mirror_*` pyfunctions + lib.rs
+  registrations + `stubs/type_kernel.pyi` declarations. New
+  `mypy/nodes_mirror.py` activation hook behind default-off
+  `Options.native_ast_mirror` (`TEST_NATIVE_AST_MIRROR`, probe in
+  helpers): patches `__setattr__` on `RefExpr` / `CallExpr` /
+  `IndexExpr` / `OpExpr` (all use `__slots__` but define no
+  `__setattr__`, so the patch composes; `ClassDef.analyzed` is G2 and
+  out of scope). Lazy adoption: constructor-default writes stay out of
+  the store, the first non-default binding write adopts with the full
+  post-write record; capture failures increment an audit counter and
+  never break the write. Build wiring: activate in
+  `BuildManager.__init__` next to the type mirror; reset in
+  `_clear_native_resolvers` after the proxy reset and before the
+  preserving mirror reset. Site list (all captured by the patch, no
+  explicit touch calls needed) is documented in the module docstring:
+  semanal.py 4347-4351 / 4572-4573 / 4789 / 4994 / 5501 / 5773-5776 /
+  5964-5965 / 6020 / 7247-7249, checker.py 2372 / 2416 / 2525 / 4088 /
+  6726 / 10716-10717, server/astmerge.py 308-311. No read flip, no
+  cache/plugin/astmerge-identity change. Gates: cargo type_kernel
+  2,798/11 (+7 units), fmt + clippy `-D warnings` clean; testtypes
+  3,436/7 (+12 `NativeAstMirrorSuite` from 3,424/7) both gate states;
+  testcheck 8,198/15/7/0 exact in kernel and kernel+shadow modes
+  (shadow-on ~7% slower: 214-234s vs 219-294s load-dependent);
+  fine-grained 747/27 + daemon 38 with the shadow on; testgraph 12,
+  merge 41/1, diff 79 with the shadow on; cold self-check clean 351
+  (350 + `mypy/nodes_mirror.py`).
 
 ## Pull Requests
 

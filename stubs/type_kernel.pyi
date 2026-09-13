@@ -463,6 +463,15 @@ __all__ = [
     "rust_proxy_reset",
     "rust_proxy_entry_count",
     "rust_proxy_handle_of",
+    "rust_node_mirror_capture_ref",
+    "rust_node_mirror_capture_analyzed",
+    "rust_node_mirror_ref",
+    "rust_node_mirror_analyzed",
+    "rust_node_mirror_captures",
+    "rust_node_mirror_drop",
+    "rust_node_mirror_reset",
+    "rust_node_mirror_entry_count",
+    "rust_node_mirror_handle_of",
     "rust_mirror_handle_of",
     "IdMapper",
 ]
@@ -2634,6 +2643,28 @@ def rust_proxy_drop(handle: int) -> bool: ...
 def rust_proxy_reset() -> int: ...
 def rust_proxy_entry_count() -> int: ...
 def rust_proxy_handle_of(obj: Any) -> int | None: ...
+
+# Phase G1.0a (#1572): expression dual-write node shadow. `capture_*`
+# mint (or reuse) the shared identity handle and return it; reads return
+# None for an object with no record.
+def rust_node_mirror_capture_ref(
+    obj: Any,
+    kind: int | None,
+    node_fullname: str | None,
+    fullname: str,
+    is_new_def: bool,
+    is_inferred_def: bool,
+) -> int: ...
+def rust_node_mirror_capture_analyzed(obj: Any, analyzed_kind: str | None) -> int: ...
+def rust_node_mirror_ref(
+    handle: int,
+) -> tuple[int | None, str | None, str, bool, bool] | None: ...
+def rust_node_mirror_analyzed(handle: int) -> tuple[bool, str | None] | None: ...
+def rust_node_mirror_captures(handle: int) -> tuple[int, int] | None: ...
+def rust_node_mirror_drop(handle: int) -> bool: ...
+def rust_node_mirror_reset() -> int: ...
+def rust_node_mirror_entry_count() -> int: ...
+def rust_node_mirror_handle_of(obj: Any) -> int | None: ...
 
 # The proxy suite pins the shared identity namespace by comparing the
 # proxy handle with the mirror's non-minting lookup.

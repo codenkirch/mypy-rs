@@ -40,12 +40,14 @@ from mypy.nodes import (
     COVARIANT,
     GDEF,
     INVARIANT,
+    LDEF,
     MDEF,
     ArgKind,
     Argument,
     AssignmentStmt,
     BytesExpr,
     CallExpr,
+    CastExpr,
     Context,
     Decorator,
     DictExpr,
@@ -57822,3 +57824,176 @@ class NativeProxyStoreSuite(Suite):
 
         assert Options().native_type_proxy is False
         assert "native_type_proxy" not in OPTIONS_AFFECTING_CACHE
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeAstMirrorSuite(Suite):
+    """Unit tests for the G1.0a expression node shadow (#1572).
+
+    The store is capture-only: every assertion drives the `mypy.nodes_mirror`
+    hook and reads the Rust record back through the `rust_node_mirror_*`
+    pyfunctions. The pinnings are the G1 contract: construction never
+    adopts, the first non-default binding write adopts with the full
+    post-write record, tracked writes merge into one record, and the
+    shared identity handle behaves like the proxy/mirror ones.
+    """
+
+    def setUp(self) -> None:
+        import type_kernel as kernel
+
+        from mypy import nodes_mirror
+
+        nodes_mirror.activate(audit=True)
+        nodes_mirror.reset(clear_counts=True)
+        self._k = kernel
+        self._m = nodes_mirror
+
+    def tearDown(self) -> None:
+        self._m.reset(clear_counts=True)
+
+    def _handle(self, node: Any) -> int:
+        handle = self._m._NODE_HANDLES.get(id(node))
+        assert handle is not None, "node was not adopted by the shadow"
+        return handle
+
+    def _delta(self, before: dict[str, int]) -> dict[str, int]:
+        after = self._m.report()
+        return {k: v - before.get(k, 0) for k, v in after.items() if v != before.get(k, 0)}
+
+    def test_construction_does_not_adopt(self) -> None:
+        expr = NameExpr("x")
+        assert id(expr) not in self._m._NODE_HANDLES
+        assert self._k.rust_node_mirror_entry_count() == 0
+        # Explicit baseline writes on a fresh node stay out of the store.
+        expr.kind = None
+        expr.node = None
+        expr._fullname = ""
+        expr.is_new_def = False
+        expr.is_inferred_def = False
+        assert id(expr) not in self._m._NODE_HANDLES
+        assert self._k.rust_node_mirror_entry_count() == 0
+
+    def test_ref_capture_roundtrip(self) -> None:
+        expr = NameExpr("x")
+        target = Var("x")
+        target._fullname = "mod.x"
+        expr.kind = GDEF
+        expr.node = target
+        expr.fullname = "mod.x"
+        expr.is_new_def = True
+        expr.is_inferred_def = True
+        handle = self._handle(expr)
+        assert self._k.rust_node_mirror_ref(handle) == (GDEF, "mod.x", "mod.x", True, True)
+
+    def test_unbound_node_shadow_stays_distinguishable(self) -> None:
+        expr = NameExpr("x")
+        expr.kind = LDEF
+        handle = self._handle(expr)
+        # `kind` captured, target never set: the None fullname is a real
+        # shadow value, not a missing capture.
+        assert self._k.rust_node_mirror_ref(handle) == (LDEF, None, "", False, False)
+
+    def test_capture_counters_increment_per_write(self) -> None:
+        expr = NameExpr("x")
+        before = dict(self._m.report())
+        expr.kind = GDEF
+        expr.node = Var("x")
+        handle = self._handle(expr)
+        delta = self._delta(before)
+        assert delta.get("capture_ref") == 2, delta
+        assert self._k.rust_node_mirror_captures(handle) == (2, 0)
+        # Re-writing the same value is still a captured write.
+        expr.kind = GDEF
+        assert self._k.rust_node_mirror_captures(handle) == (3, 0)
+
+    def test_analyzed_capture_merges_into_one_record(self) -> None:
+        call = CallExpr(NameExpr("f"), [], [], [])
+        assert id(call) not in self._m._NODE_HANDLES
+        call.analyzed = CastExpr(NameExpr("y"), AnyType(TypeOfAny.special_form))
+        handle = self._k.rust_node_mirror_handle_of(call)
+        assert handle is not None
+        assert self._k.rust_node_mirror_analyzed(handle) == (True, "CastExpr")
+        # A cleared replacement is a tracked write, not a missing entry.
+        call.analyzed = None
+        assert self._k.rust_node_mirror_analyzed(handle) == (True, None)
+        assert self._k.rust_node_mirror_captures(handle) == (0, 2)
+        assert self._k.rust_node_mirror_entry_count() == 1
+
+    def test_analyzed_capture_on_index_and_op_expr(self) -> None:
+        index = IndexExpr(NameExpr("a"), NameExpr("b"))
+        index.analyzed = cast(Any, OpExpr("+", NameExpr("a"), NameExpr("b")))
+        index_handle = self._handle(index)
+        assert self._k.rust_node_mirror_analyzed(index_handle) == (True, "OpExpr")
+        op = OpExpr("+", NameExpr("a"), NameExpr("b"))
+        op.analyzed = cast(Any, CastExpr(NameExpr("y"), AnyType(TypeOfAny.special_form)))
+        op_handle = self._handle(op)
+        assert self._k.rust_node_mirror_analyzed(op_handle) == (True, "CastExpr")
+
+    def test_drop_and_reset(self) -> None:
+        expr = NameExpr("x")
+        expr.kind = GDEF
+        handle = self._handle(expr)
+        assert self._k.rust_node_mirror_drop(handle) is True
+        assert self._k.rust_node_mirror_ref(handle) is None
+        assert self._k.rust_node_mirror_entry_count() == 0
+        assert self._k.rust_node_mirror_drop(handle) is False
+
+    def test_handle_shares_identity_namespace(self) -> None:
+        expr = NameExpr("x")
+        expr.kind = GDEF
+        handle = self._handle(expr)
+        # One identity namespace: the non-minting lookups of the node
+        # store, the proxy and the mirror all answer the same handle.
+        assert self._k.rust_node_mirror_handle_of(expr) == handle
+        assert self._k.rust_proxy_handle_of(expr) == handle
+        assert self._k.rust_mirror_handle_of(expr) == handle
+
+    def test_reset_drops_entries_and_keeps_activation(self) -> None:
+        expr = NameExpr("x")
+        expr.kind = GDEF
+        assert self._k.rust_node_mirror_entry_count() == 1
+        self._m.reset()
+        assert self._k.rust_node_mirror_entry_count() == 0
+        assert self._m._NODE_HANDLES == {}
+        # The patched hook stays installed: a later binding write captures
+        # again under a fresh handle (activation is one-shot).
+        expr.kind = MDEF
+        assert self._k.rust_node_mirror_entry_count() == 1
+        handle = self._handle(expr)
+        assert self._k.rust_node_mirror_ref(handle) == (MDEF, None, "", False, False)
+
+    def test_gate_off_leaves_node_untouched(self) -> None:
+        expr = NameExpr("x")
+        self._m._active = False
+        try:
+            expr.kind = GDEF
+            expr.node = Var("x")
+            assert id(expr) not in self._m._NODE_HANDLES
+            assert self._k.rust_node_mirror_entry_count() == 0
+            assert expr.kind == GDEF
+            assert expr.node is not None
+        finally:
+            self._m._active = True
+
+    def test_capture_failure_does_not_break_the_write(self) -> None:
+        expr = NameExpr("x")
+        original = self._k.rust_node_mirror_capture_ref
+
+        def boom(*args: Any, **kwargs: Any) -> None:
+            raise RuntimeError("kernel down")
+
+        self._k.rust_node_mirror_capture_ref = boom  # type: ignore[assignment]
+        try:
+            expr.kind = GDEF
+            expr.node = Var("x")
+            assert expr.kind == GDEF
+            assert expr.node is not None
+            assert self._m.report().get("capture_fail.ref", 0) >= 1
+        finally:
+            self._k.rust_node_mirror_capture_ref = original
+
+    def test_option_default_off_and_not_cache_affecting(self) -> None:
+        from mypy.options import OPTIONS_AFFECTING_CACHE, Options
+
+        assert Options().native_ast_mirror is False
+        assert "native_ast_mirror" not in OPTIONS_AFFECTING_CACHE

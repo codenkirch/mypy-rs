@@ -388,6 +388,7 @@ _NATIVE_ENV_MODULE_PROBES = {
     "TEST_NATIVE_PARSER": ("ast_serialize", "parse"),
     "TEST_NATIVE_RESOLVER": ("module_resolver", "NativeResolver"),
     "TEST_NATIVE_TYPE_KERNEL": ("type_kernel", "erase_type"),
+    "TEST_NATIVE_AST_MIRROR": ("type_kernel", "rust_node_mirror_entry_count"),
 }
 
 
@@ -478,6 +479,9 @@ def parse_options(
     options.native_type_instance_write = _env_gate("TEST_NATIVE_TYPE_INSTANCE_WRITE")
     # ADR-0004 proxy (#1553) is a read-shadow gate; P1 is scaffold-only.
     options.native_type_proxy = _env_gate("TEST_NATIVE_TYPE_PROXY")
+    # Phase G1.0a (#1572) node shadow is capture-only; the option only
+    # installs the AST-mirror hooks, so a missing extension is a no-op.
+    options.native_ast_mirror = _env_gate("TEST_NATIVE_AST_MIRROR")
     options.native_cache_data = _env_gate("TEST_NATIVE_CACHE_DATA")
     _ensure_native_modules_available()
 

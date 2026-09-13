@@ -120,6 +120,8 @@ mod overload_override;
 mod protocols;
 // ADR-0004 proxy P1 (#1553): blob-backed read-shadow store scaffold.
 mod proxy;
+// Phase G1.0a (#1572): expression dual-write node shadow store.
+mod node_mirror;
 
 mod findmember;
 mod partially_defined;
@@ -3466,6 +3468,43 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(proxy::rust_proxy_reset, module)?)?;
     module.add_function(wrap_pyfunction!(proxy::rust_proxy_entry_count, module)?)?;
     module.add_function(wrap_pyfunction!(proxy::rust_proxy_handle_of, module)?)?;
+
+    // Phase G1.0a (#1572): expression dual-write node shadow. Capture-only
+    // in G1 (no consumer reads an entry), keyed by the shared identity
+    // handles like the proxy store.
+    module.add_function(wrap_pyfunction!(
+        node_mirror::rust_node_mirror_capture_ref,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        node_mirror::rust_node_mirror_capture_analyzed,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(node_mirror::rust_node_mirror_ref, module)?)?;
+    module.add_function(wrap_pyfunction!(
+        node_mirror::rust_node_mirror_analyzed,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        node_mirror::rust_node_mirror_captures,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        node_mirror::rust_node_mirror_drop,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        node_mirror::rust_node_mirror_reset,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        node_mirror::rust_node_mirror_entry_count,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        node_mirror::rust_node_mirror_handle_of,
+        module
+    )?)?;
 
     Ok(())
 }

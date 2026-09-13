@@ -1295,6 +1295,17 @@ class BuildManager:
                 read=self.options.native_type_mirror_read,
                 instance_write=self.options.native_type_instance_write,
             )
+        # Phase G1.0a (#1572): activate the expression dual-write node
+        # shadow (capture-only; no consumer reads it). Independent of the
+        # type-kernel gate: it wraps live node classes.
+        if self.options.native_ast_mirror:
+            import os as _os_ast_mirror
+
+            from mypy import nodes_mirror
+
+            nodes_mirror.activate(
+                audit=_os_ast_mirror.environ.get("MYPY_TK_AST_MIRROR_AUDIT") == "1"
+            )
         # Stage 3c/4 production wiring (M8bb): the resolver is built per
         # SCC in `process_stale_scc` (after semantic analysis populates
         # the TypeInfo graph). See `_build_native_resolvers` for status.
@@ -1835,6 +1846,13 @@ class BuildManager:
             from mypy import type_proxy
 
             type_proxy.reset()
+        if self.options.native_ast_mirror:
+            # Phase G1.0a (#1572): node-shadow entries pin AST nodes; a
+            # stale graph must never survive a recheck. Reset before the
+            # type mirror (it also leaves `identity` alone).
+            from mypy import nodes_mirror
+
+            nodes_mirror.reset()
         if self.options.native_type_mirror:
             # Preserving reset (#1528): blobs + raw ids drop, strong-pin
             # stable handles survive so astmerge-preserved objects keep

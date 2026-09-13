@@ -426,6 +426,10 @@ class Options:
         # (the gate is inert; P2 wires the lazy Instance read shadow). Not
         # in OPTIONS_AFFECTING_CACHE: no proxy state may enter the cache.
         self.native_type_proxy = False
+        # Phase G1.0a (#1572): opt-in dual-write node shadow of the first
+        # AST family (RefExpr bindings + analyzed); capture-only and not in
+        # OPTIONS_AFFECTING_CACHE: no shadow state may enter the cache.
+        self.native_ast_mirror = False
         # G0.5 (#1566): opt-in Rust fixed-format cache-data writer; the
         # hybrid write phase measured ~1.5x the Python writer per round, so
         # the bridge ships default-off until the type payloads move too.
