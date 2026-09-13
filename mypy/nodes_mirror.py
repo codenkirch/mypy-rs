@@ -87,6 +87,7 @@ from typing import Any, Final
 
 from mypy.nodes import (
     AssignmentStmt,
+    Block,
     CallExpr,
     ClassDef,
     ComparisonExpr,
@@ -278,11 +279,14 @@ def _node_setattr(self: Any, name: str, value: Any) -> None:
 
 # ===========================================================================
 # G2.0 statement/def metadata shadow (issue #1577)
+# G2.1 extension: ImportBase bool flags + Block.is_unreachable
 # ===========================================================================
 
 # Record-only metadata capture for the statement and def families, added
 # in its own section because the parallel G1.0b agent extends the G1
-# classes above.
+# classes above. G2.1 extends ImportBase tracking to four bool flags
+# (is_unreachable, is_unreachable_dependency, is_top_level, is_mypy_only)
+# set by semanal pass1 and reachability, and adds Block.is_unreachable.
 
 # Same gate (`Options.native_ast_mirror`) and identity base as G1.0a;
 # no consumer reads a record. The tracked field table is per patch
@@ -354,7 +358,16 @@ _G2_VAR: Final[frozenset[str]] = frozenset(
 # Class -> tracked slots. `ImportBase.assignments` is a list; the append
 # sites call `touch()` because the patched `__setattr__` cannot see it.
 _G2_TRACKED: Final[dict[type, frozenset[str]]] = {
-    ImportBase: frozenset({"assignments"}),
+    ImportBase: frozenset(
+        {
+            "assignments",
+            "is_unreachable",
+            "is_unreachable_dependency",
+            "is_top_level",
+            "is_mypy_only",
+        }
+    ),
+    Block: frozenset({"is_unreachable"}),
     AssignmentStmt: frozenset(
         {"type", "unanalyzed_type", "is_alias_def", "is_final_def", "invalid_recursive_alias"}
     ),

@@ -58560,6 +58560,53 @@ class NativeStmtDefMirrorSuite(Suite):
         finally:
             kernel.rust_node_mirror_capture_meta = original
 
+    def test_import_base_bool_flags(self) -> None:
+        from mypy import nodes as nodes_mod
+
+        imp = nodes_mod.Import([("m", None)])
+        assert self._k.rust_node_mirror_meta_entry_count() == 0
+        imp.is_top_level = True
+        imp.is_unreachable = True
+        imp.is_mypy_only = True
+        imp.is_unreachable_dependency = True
+        record = self._meta(imp)
+        assert set(record) == {
+            "is_top_level", "is_unreachable", "is_mypy_only",
+            "is_unreachable_dependency",
+        }
+        assert record["is_top_level"] == ("bool", None, 1, None)
+        assert record["is_unreachable"] == ("bool", None, 1, None)
+        assert record["is_mypy_only"] == ("bool", None, 1, None)
+        assert record["is_unreachable_dependency"] == ("bool", None, 1, None)
+        imp.is_top_level = False
+        assert self._meta(imp)["is_top_level"] == ("bool", None, 0, None)
+
+    def test_block_is_unreachable(self) -> None:
+        from mypy import nodes as nodes_mod
+
+        blk = nodes_mod.Block([])
+        assert self._k.rust_node_mirror_meta_entry_count() == 0
+        blk.is_unreachable = True
+        assert self._meta(blk) == {"is_unreachable": ("bool", None, 1, None)}
+        blk.is_unreachable = False
+        assert self._meta(blk) == {"is_unreachable": ("bool", None, 0, None)}
+
+    def test_import_assignments_and_flags_coexist(self) -> None:
+        from mypy import nodes as nodes_mod
+
+        imp = nodes_mod.ImportFrom("m", 0, [("x", None)])
+        imp.assignments.append(
+            nodes_mod.AssignmentStmt([nodes_mod.NameExpr("x")], nodes_mod.IntExpr(1))
+        )
+        self._m.touch(imp, "assignments")
+        imp.is_top_level = True
+        imp.is_unreachable = True
+        record = self._meta(imp)
+        assert set(record) == {"assignments", "is_top_level", "is_unreachable"}
+        assert record["assignments"] == ("list", None, None, ["AssignmentStmt"])
+        assert record["is_top_level"] == ("bool", None, 1, None)
+        assert record["is_unreachable"] == ("bool", None, 1, None)
+
     def test_handle_shares_identity_namespace(self) -> None:
         from mypy import nodes as nodes_mod
 
