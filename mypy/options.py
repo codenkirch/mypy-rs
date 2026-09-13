@@ -438,6 +438,10 @@ class Options:
         # hybrid write phase measured ~1.5x the Python writer per round, so
         # the bridge ships default-off until the type payloads move too.
         self.native_cache_data = False
+        # H1b (wave 74): opt-in native binder frame-stack metadata.
+        # Rust mirrors reachability flags for O(1) is_unreachable;
+        # type-merging stays Python. Not in OPTIONS_AFFECTING_CACHE.
+        self.native_binder = False
         # Some behaviors are changed when using Bazel (https://bazel.build).
         self.bazel = False
         # If True, export inferred types for all expressions as BuildResult.types

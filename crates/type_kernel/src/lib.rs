@@ -3028,6 +3028,32 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
 
     // Issue #527: binder.py pure helper (get_declaration).
     module.add_function(wrap_pyfunction!(binder::rust_get_declaration, module)?)?;
+    // H1b (wave 74): native binder frame-stack metadata store.
+    module.add_function(wrap_pyfunction!(binder::rust_binder_new, module)?)?;
+    module.add_function(wrap_pyfunction!(binder::rust_binder_reset, module)?)?;
+    module.add_function(wrap_pyfunction!(binder::rust_binder_push_frame, module)?)?;
+    module.add_function(wrap_pyfunction!(binder::rust_binder_pop_frame, module)?)?;
+    module.add_function(wrap_pyfunction!(
+        binder::rust_binder_is_unreachable,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        binder::rust_binder_is_unreachable_warning_suppressed,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        binder::rust_binder_set_unreachable,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        binder::rust_binder_set_top_unreachable,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        binder::rust_binder_suppress_unreachable_warnings,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(binder::rust_binder_frame_count, module)?)?;
     module.add_function(wrap_pyfunction!(
         classmethod_static::rust_is_classmethod_node,
         module

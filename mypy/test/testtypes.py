@@ -59576,3 +59576,146 @@ class NativeSymtableMetaExtraSuite(Suite):
             assert self._k.rust_symtable_mirror_meta_entry_count() == before
         finally:
             self._m._active = True
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeBinderFrameSuite(Suite):
+    """Parity tests for the H1b native binder frame-stack store.
+
+    The Rust thread-local store mirrors the unreachable / suppress
+    flags on the Python frame stack, with O(1) cached-count queries
+    replacing the Python ``any(f.unreachable for f in self.frames)``
+    scan. Direct seam tests drive the pyfunctions; the gate-off vs
+    gate-on differential proves the shim produces identical results
+    through the real ``ConditionalTypeBinder`` interface.
+    """
+
+    def setUp(self) -> None:
+        import type_kernel as kernel
+
+        self._k = kernel
+        self._k.rust_binder_reset()
+
+    def tearDown(self) -> None:
+        self._k.rust_binder_reset()
+
+    def test_option_default_off_and_not_cache_affecting(self) -> None:
+        from mypy.options import OPTIONS_AFFECTING_CACHE, Options
+
+        assert Options().native_binder is False
+        assert "native_binder" not in OPTIONS_AFFECTING_CACHE
+
+    def test_new_push_pop_frame_count(self) -> None:
+        self._k.rust_binder_new()
+        # new() starts with 1 frame (matching Python's __init__)
+        assert self._k.rust_binder_frame_count() == 1
+        self._k.rust_binder_push_frame()
+        assert self._k.rust_binder_frame_count() == 2
+        self._k.rust_binder_push_frame()
+        assert self._k.rust_binder_frame_count() == 3
+        self._k.rust_binder_pop_frame()
+        assert self._k.rust_binder_frame_count() == 2
+        self._k.rust_binder_pop_frame()
+        assert self._k.rust_binder_frame_count() == 1
+        # pop_frame on the last frame is a no-op (guards against empty)
+        self._k.rust_binder_pop_frame()
+        assert self._k.rust_binder_frame_count() == 1
+
+    def test_set_unreachable_and_query(self) -> None:
+        self._k.rust_binder_new()
+        self._k.rust_binder_push_frame()
+        assert self._k.rust_binder_is_unreachable() is False
+        self._k.rust_binder_set_unreachable()
+        assert self._k.rust_binder_is_unreachable() is True
+
+    def test_unreachable_persists_across_nested_frames(self) -> None:
+        self._k.rust_binder_new()
+        self._k.rust_binder_push_frame()
+        self._k.rust_binder_set_unreachable()
+        self._k.rust_binder_push_frame()
+        assert self._k.rust_binder_is_unreachable() is True
+        self._k.rust_binder_pop_frame()
+        assert self._k.rust_binder_is_unreachable() is True
+        self._k.rust_binder_pop_frame()
+        assert self._k.rust_binder_is_unreachable() is False
+
+    def test_suppress_unreachable_warnings(self) -> None:
+        self._k.rust_binder_new()
+        self._k.rust_binder_push_frame()
+        assert self._k.rust_binder_is_unreachable_warning_suppressed() is False
+        self._k.rust_binder_suppress_unreachable_warnings()
+        assert self._k.rust_binder_is_unreachable_warning_suppressed() is True
+
+    def test_set_top_unreachable_can_clear(self) -> None:
+        self._k.rust_binder_new()
+        self._k.rust_binder_push_frame()
+        self._k.rust_binder_set_unreachable()
+        assert self._k.rust_binder_is_unreachable() is True
+        self._k.rust_binder_set_top_unreachable(False)
+        assert self._k.rust_binder_is_unreachable() is False
+
+    def test_reset_clears_store(self) -> None:
+        self._k.rust_binder_new()
+        self._k.rust_binder_push_frame()
+        self._k.rust_binder_set_unreachable()
+        self._k.rust_binder_suppress_unreachable_warnings()
+        self._k.rust_binder_reset()
+        # reset drops the store; lazy init creates a fresh 1-frame store
+        assert self._k.rust_binder_frame_count() == 1
+        assert self._k.rust_binder_is_unreachable() is False
+        assert self._k.rust_binder_is_unreachable_warning_suppressed() is False
+
+    # --- gate-off vs gate-on differential through real binder ---
+
+    def _make_binder(self, native: bool) -> Any:
+        from mypy.options import Options
+
+        opts = Options()
+        opts.native_binder = native
+        from mypy.binder import ConditionalTypeBinder
+
+        return ConditionalTypeBinder(opts)
+
+    def test_gate_off_vs_on_is_unreachable(self) -> None:
+        off = self._make_binder(False)
+        on = self._make_binder(True)
+        for b in (off, on):
+            b.push_frame()
+            assert b.is_unreachable() is False
+            b.unreachable()
+            assert b.is_unreachable() is True
+            b.push_frame()
+            assert b.is_unreachable() is True
+            # pop_frame(False, 0) calls update_from_options([])
+            # which sets frames[-1].unreachable = not [] = True
+            b.pop_frame(False, 0)
+            assert b.is_unreachable() is True
+            # Pop the original unreachable frame; update_from_options([])
+            # sets the bottom frame unreachable too.
+            b.pop_frame(False, 0)
+            assert b.is_unreachable() is True
+
+    def test_gate_off_vs_on_suppress(self) -> None:
+        off = self._make_binder(False)
+        on = self._make_binder(True)
+        for b in (off, on):
+            b.push_frame()
+            assert b.is_unreachable_warning_suppressed() is False
+            b.suppress_unreachable_warnings()
+            assert b.is_unreachable_warning_suppressed() is True
+
+    def test_gate_off_vs_on_update_from_options(self) -> None:
+        off = self._make_binder(False)
+        on = self._make_binder(True)
+        for b in (off, on):
+            b.push_frame()
+            b.unreachable()
+            assert b.is_unreachable() is True
+            # update_from_options([]) sets frames[-1].unreachable = not [] = True
+            b.update_from_options([])
+            assert b.is_unreachable() is True
+            # update_from_options with a non-empty frames list clears it:
+            # frames[-1].unreachable = not frames = not [frame] = False
+            from mypy.binder import Frame
+            b.update_from_options([Frame(99)])
+            assert b.is_unreachable() is False

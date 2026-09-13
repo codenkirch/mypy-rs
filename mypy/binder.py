@@ -47,6 +47,33 @@ except ImportError:
     _rust_get_declaration = None  # type: ignore[assignment]
     _HAS_RUST_BINDER = False
 
+try:
+    from type_kernel import (
+        rust_binder_new as _rust_binder_new,
+        rust_binder_reset as _rust_binder_reset,
+        rust_binder_push_frame as _rust_binder_push_frame,
+        rust_binder_pop_frame as _rust_binder_pop_frame,
+        rust_binder_is_unreachable as _rust_binder_is_unreachable,
+        rust_binder_is_unreachable_warning_suppressed as _rust_binder_is_suppressed,
+        rust_binder_set_unreachable as _rust_binder_set_unreachable,
+        rust_binder_set_top_unreachable as _rust_binder_set_top_unreachable,
+        rust_binder_suppress_unreachable_warnings as _rust_binder_suppress,
+        rust_binder_frame_count as _rust_binder_frame_count,
+    )
+
+    _HAS_RUST_BINDER_STORE = True
+except ImportError:
+    _rust_binder_new = None  # type: ignore[assignment]
+    _rust_binder_reset = None  # type: ignore[assignment]
+    _rust_binder_push_frame = None  # type: ignore[assignment]
+    _rust_binder_pop_frame = None  # type: ignore[assignment]
+    _rust_binder_is_unreachable = None  # type: ignore[assignment]
+    _rust_binder_is_suppressed = None  # type: ignore[assignment]
+    _rust_binder_set_unreachable = None  # type: ignore[assignment]
+    _rust_binder_set_top_unreachable = None  # type: ignore[assignment]
+    _rust_binder_suppress = None  # type: ignore[assignment]
+    _rust_binder_frame_count = None  # type: ignore[assignment]
+    _HAS_RUST_BINDER_STORE = False
 BindableExpression: _TypeAlias = IndexExpr | MemberExpr | NameExpr
 
 
@@ -217,6 +244,14 @@ class ConditionalTypeBinder:
         # expression caches when needed.
         self.version = 0
 
+        # H1b (wave 74): native binder frame-stack metadata store.
+        self._native_binder_active = bool(options.native_binder)
+        if self._native_binder_active and _HAS_RUST_BINDER_STORE:
+            try:
+                _rust_binder_new()
+            except Exception:
+                self._native_binder_active = False
+
     def _get_id(self) -> int:
         self.next_id += 1
         return self.next_id
@@ -234,6 +269,11 @@ class ConditionalTypeBinder:
         f = Frame(self._get_id(), conditional_frame)
         self.frames.append(f)
         self.options_on_return.append([])
+        if self._native_binder_active:
+            try:
+                _rust_binder_push_frame()
+            except Exception:
+                pass
         return f
 
     def _put(self, key: Key, type: Type, from_assignment: bool, index: int = -1) -> None:
@@ -276,9 +316,19 @@ class ConditionalTypeBinder:
     def unreachable(self) -> None:
         self.version += 1
         self.frames[-1].unreachable = True
+        if self._native_binder_active:
+            try:
+                _rust_binder_set_unreachable()
+            except Exception:
+                pass
 
     def suppress_unreachable_warnings(self) -> None:
         self.frames[-1].suppress_unreachable_warnings = True
+        if self._native_binder_active:
+            try:
+                _rust_binder_suppress()
+            except Exception:
+                pass
 
     def get(self, expr: Expression) -> Type | None:
         key = literal_hash(expr)
@@ -291,9 +341,19 @@ class ConditionalTypeBinder:
     def is_unreachable(self) -> bool:
         # TODO: Copy the value of unreachable into new frames to avoid
         # this traversal on every statement?
+        if self._native_binder_active:
+            try:
+                return _rust_binder_is_unreachable()
+            except Exception:
+                pass
         return any(f.unreachable for f in self.frames)
 
     def is_unreachable_warning_suppressed(self) -> bool:
+        if self._native_binder_active:
+            try:
+                return _rust_binder_is_suppressed()
+            except Exception:
+                pass
         return any(f.suppress_unreachable_warnings for f in self.frames)
 
     def cleanse(self, expr: Expression) -> None:
@@ -437,6 +497,11 @@ class ConditionalTypeBinder:
                     )
 
         self.frames[-1].unreachable = not frames
+        if self._native_binder_active:
+            try:
+                _rust_binder_set_top_unreachable(not frames)
+            except Exception:
+                pass
 
         return changed
 
@@ -451,6 +516,11 @@ class ConditionalTypeBinder:
 
         result = self.frames.pop()
         options = self.options_on_return.pop()
+        if self._native_binder_active:
+            try:
+                _rust_binder_pop_frame()
+            except Exception:
+                pass
 
         if discard:
             self.last_pop_changed = False

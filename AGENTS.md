@@ -4452,6 +4452,36 @@ including:
   symtable mirror suite 27 passed; full testtypes 3522 passed/7
   skipped.
 
+- wave 74 H1b native ConditionalTypeBinder frame-stack store (issue
+  #1596): new `BinderStore` thread-local in
+  `crates/type_kernel/src/binder.rs` mirrors the unreachable and
+  `suppress_unreachable_warnings` flags on the Python binder's frame
+  stack, with O(1) cached-count queries replacing Python's
+  `any(f.unreachable for f in self.frames)` scan called on every
+  statement. Ten pyfunctions (`rust_binder_new` / `_reset` /
+  `_push_frame` / `_pop_frame` / `_is_unreachable` /
+  `_is_unreachable_warning_suppressed` / `_set_unreachable` /
+  `_set_top_unreachable` / `_suppress_unreachable_warnings` /
+  `_frame_count`) registered in `lib.rs`. The store starts with one
+  frame (matching Python's `__init__` which creates `self.frames =
+  [Frame(...)]`); `pop_frame` guards against emptying the stack.
+  `set_top_unreachable(v)` syncs after `update_from_options` sets
+  `self.frames[-1].unreachable = not frames` — can set OR clear the
+  flag. The type-merging core (`update_from_options`, `assign_type`,
+  `allow_jump`, `_put`/`_get`) stays in Python: `Frame.types` dicts
+  use Python tuple keys containing live `Var` objects which cannot be
+  hashed in Rust. Break/continue/try frame tracking also stays
+  Python-side (`allow_jump` doesn't modify `self.frames`). Gated by
+  `Options.native_binder` (default off, NOT in
+  `OPTIONS_AFFECTING_CACHE`); shim in `mypy/binder.py` delegates
+  `is_unreachable()` / `is_unreachable_warning_suppressed()` to the
+  Rust store and falls back to the Python `any()` scan on exception.
+  Covered by `NativeBinderFrameSuite` in `mypy/test/testtypes.py` (10
+  tests: direct seam push/pop/unreachable/suppress/reset/clear,
+  option-default-off, gate-off vs gate-on differential through the
+  real `ConditionalTypeBinder`). Gates: cargo type_kernel clean, fmt +
+  clippy clean, testtypes 3543 passed/7 skipped, cold self-check clean.
+
 ## Pull Requests
 
 The default branch on this fork is `main` (not `master`). Always target
