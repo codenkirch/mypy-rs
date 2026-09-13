@@ -58862,3 +58862,125 @@ class NativeSymtableMirrorSuite(Suite):
         # G3.0b: shadow record is now cleaned up by the Rust delete.
         assert self._m.lookup(table2, "imported") is None
         assert self._m.entry_count(table2) == 1
+
+    # ---- G3.0c: TypeInfo meta-field capture ----
+
+    def _make_info(self, fullname: str = "mod.Cls") -> Any:
+        from mypy.nodes import TypeInfo, ClassDef
+
+        info = TypeInfo(SymbolTable(), ClassDef(fullname, None), "")
+        info._fullname = fullname
+        return info
+
+    def test_meta_bases_write_captured(self) -> None:
+        info = self._make_info()
+        info.bases = []
+        record = self._k.rust_symtable_mirror_meta_lookup(info)
+        assert record is not None
+        assert record["bases_count"] == 0
+        info.bases = [info]  # self-referencing for the test
+        record = self._k.rust_symtable_mirror_meta_lookup(info)
+        assert record is not None
+        assert record["bases_count"] == 1
+
+    def test_meta_mro_write_captured(self) -> None:
+        info = self._make_info()
+        info.mro = [info]
+        record = self._k.rust_symtable_mirror_meta_lookup(info)
+        assert record is not None
+        assert record["mro_count"] == 1
+
+    def test_meta_metaclass_type_captured(self) -> None:
+        info = self._make_info()
+        # _make_info already wrote _fullname (a meta field), so a record
+        # exists; writing metaclass_type=None updates it with None.
+        info.metaclass_type = None
+        record = self._k.rust_symtable_mirror_meta_lookup(info)
+        assert record is not None
+        assert record["metaclass_fullname"] is None
+
+    def test_meta_fullname_captured(self) -> None:
+        info = self._make_info("mod.Old")
+        info._fullname = "mod.New"
+        record = self._k.rust_symtable_mirror_meta_lookup(info)
+        assert record is not None
+        assert record["fullname"] == "mod.New"
+
+    def test_meta_names_rebind_captures_fresh_handle(self) -> None:
+        info = self._make_info()
+        old_names = info.names
+        info.names = old_names  # same object, still captures
+        record1 = self._k.rust_symtable_mirror_meta_lookup(info)
+        assert record1 is not None
+        old_names_handle = record1["names_handle"]
+        new_names: SymbolTable = SymbolTable()
+        info.names = new_names
+        record2 = self._k.rust_symtable_mirror_meta_lookup(info)
+        assert record2 is not None
+        assert record2["names_handle"] != old_names_handle
+
+    def test_meta_non_meta_field_passes_through(self) -> None:
+        info = self._make_info()
+        before = self._k.rust_symtable_mirror_meta_entry_count()
+        info.is_abstract = True  # not in _META_FIELDS
+        assert self._k.rust_symtable_mirror_meta_entry_count() == before
+
+    def test_meta_accessor_set_bases_mro(self) -> None:
+        from mypy.symtable_access import set_bases_mro
+
+        info = self._make_info()
+        set_bases_mro(info, [info], [info, info])
+        assert info.bases == [info]
+        assert info.mro == [info, info]
+        record = self._k.rust_symtable_mirror_meta_lookup(info)
+        assert record is not None
+        assert record["bases_count"] == 1
+        assert record["mro_count"] == 2
+
+    def test_meta_accessor_set_meta(self) -> None:
+        from mypy.symtable_access import set_meta
+
+        info = self._make_info()
+        set_meta(info, None)
+        assert info.metaclass_type is None
+        record = self._k.rust_symtable_mirror_meta_lookup(info)
+        assert record is not None
+        assert record["metaclass_fullname"] is None
+
+    def test_meta_accessor_set_info_fullname(self) -> None:
+        from mypy.symtable_access import set_info_fullname
+
+        info = self._make_info("mod.Old")
+        set_info_fullname(info, "mod.New")
+        assert info._fullname == "mod.New"
+        record = self._k.rust_symtable_mirror_meta_lookup(info)
+        assert record is not None
+        assert record["fullname"] == "mod.New"
+
+    def test_meta_accessor_rebind_names_table(self) -> None:
+        from mypy.symtable_access import rebind_names_table
+
+        info = self._make_info()
+        new_names: SymbolTable = SymbolTable()
+        rebind_names_table(info, new_names)
+        assert info.names is new_names
+        record = self._k.rust_symtable_mirror_meta_lookup(info)
+        assert record is not None
+        assert record["names_handle"] == self._k.rust_symtable_mirror_handle_of(new_names)
+
+    def test_meta_delete_removes_record(self) -> None:
+        info = self._make_info()
+        info.bases = []
+        assert self._k.rust_symtable_mirror_meta_lookup(info) is not None
+        assert self._k.rust_symtable_mirror_meta_delete(info) is True
+        assert self._k.rust_symtable_mirror_meta_lookup(info) is None
+        assert self._k.rust_symtable_mirror_meta_delete(info) is False
+
+    def test_meta_gate_off_leaves_no_trace(self) -> None:
+        self._m._active = False
+        try:
+            info = self._make_info()
+            info.bases = []
+            assert self._k.rust_symtable_mirror_meta_entry_count() == 0
+        finally:
+            self._m._active = True

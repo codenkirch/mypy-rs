@@ -59,6 +59,20 @@ pub(crate) struct SymFlags {
     pub(crate) cross_ref: Option<String>,
 }
 
+/// One TypeInfo meta-field record (G3.0c). `bases_count` / `mro_count`
+/// are the list lengths at the last write; `metaclass_fullname` is the
+/// fullname of the metaclass_type Instance or None; `fullname` is the
+/// TypeInfo's `_fullname`; `names_handle` is the handle of the bound
+/// `SymbolTable` (changes on a namespace rebind). `seq` is monotonic.
+pub(crate) struct MetaEntry {
+    pub(crate) seq: u64,
+    pub(crate) bases_count: usize,
+    pub(crate) mro_count: usize,
+    pub(crate) metaclass_fullname: Option<String>,
+    pub(crate) fullname: Option<String>,
+    pub(crate) names_handle: u64,
+}
+
 struct SymStore {
     entries: HashMap<(u64, String), SymEntry>,
     /// Owner handle -> table generation. Minted per owner identity.
@@ -68,6 +82,8 @@ struct SymStore {
     /// Strong pins: handles key on raw `id()`s, so each stored object
     /// stays alive until its entry is dropped or the store resets.
     pins: HashMap<u64, Py<PyAny>>,
+    /// G3.0c: TypeInfo meta-field records keyed by the TypeInfo handle.
+    meta: HashMap<u64, MetaEntry>,
     next_generation: u64,
     next_seq: u64,
 }
@@ -79,6 +95,7 @@ impl SymStore {
             generations: HashMap::new(),
             by_node: HashMap::new(),
             pins: HashMap::new(),
+            meta: HashMap::new(),
             next_generation: 0,
             next_seq: 0,
         }
@@ -219,6 +236,7 @@ pub(crate) fn reset() -> usize {
         store.entries.clear();
         store.generations.clear();
         store.by_node.clear();
+        store.meta.clear();
         store.next_generation = 0;
         store.next_seq = 0;
         (entries, pins)
@@ -431,6 +449,125 @@ pub(crate) fn rust_symtable_mirror_reset() -> usize {
 #[pyfunction]
 pub(crate) fn rust_symtable_mirror_handle_of(obj: &PyAny) -> Option<u64> {
     identity::handle_of(obj)
+}
+
+// ---- G3.0c: TypeInfo meta-field capture ----
+
+/// Record (or replace) the meta fields for one TypeInfo. `info` is the
+/// live TypeInfo; `names_table` is the bound `SymbolTable` (may be a new
+/// object after a namespace rebind). `metaclass_fullname` is the fullname
+/// of the metaclass Instance or None. Returns the seq.
+pub(crate) fn meta_put(
+    info: &PyAny,
+    bases_count: usize,
+    mro_count: usize,
+    metaclass_fullname: Option<String>,
+    fullname: Option<String>,
+    names_table: &PyAny,
+) -> PyResult<u64> {
+    let info_handle = handle_or_error(info)?;
+    let names_handle = handle_or_error(names_table)?;
+    Ok(with_store(|store| {
+        store.next_seq += 1;
+        let seq = store.next_seq;
+        store.meta.insert(
+            info_handle,
+            MetaEntry {
+                seq,
+                bases_count,
+                mro_count,
+                metaclass_fullname,
+                fullname,
+                names_handle,
+            },
+        );
+        store.pins.insert(info_handle, Py::from(info));
+        store.pins.insert(names_handle, Py::from(names_table));
+        seq
+    }))
+}
+
+/// Read the meta record for one TypeInfo; None when never recorded.
+pub(crate) fn meta_lookup<'a>(py: Python<'a>, info: &'a PyAny) -> PyResult<Option<&'a PyDict>> {
+    let info_handle = match identity::handle_of(info) {
+        Some(handle) => handle,
+        None => return Ok(None),
+    };
+    let record = with_store(|store| {
+        store.meta.get(&info_handle).map(|e| {
+            (
+                e.seq,
+                e.bases_count,
+                e.mro_count,
+                e.metaclass_fullname.clone(),
+                e.fullname.clone(),
+                e.names_handle,
+            )
+        })
+    });
+    let Some((seq, bases_count, mro_count, mc_fullname, fullname, names_handle)) = record else {
+        return Ok(None);
+    };
+    let dict = PyDict::new(py);
+    dict.set_item("seq", seq)?;
+    dict.set_item("bases_count", bases_count)?;
+    dict.set_item("mro_count", mro_count)?;
+    dict.set_item("metaclass_fullname", mc_fullname)?;
+    dict.set_item("fullname", fullname)?;
+    dict.set_item("names_handle", names_handle)?;
+    Ok(Some(dict))
+}
+
+/// Remove the meta record for one TypeInfo; returns whether one existed.
+pub(crate) fn meta_delete(info: &PyAny) -> PyResult<bool> {
+    let info_handle = handle_or_error(info)?;
+    Ok(with_store(|store| {
+        store.meta.remove(&info_handle).is_some()
+    }))
+}
+
+/// Count of TypeInfo meta records (audit).
+pub(crate) fn meta_entry_count() -> usize {
+    with_store(|store| store.meta.len())
+}
+
+#[pyfunction]
+#[pyo3(signature = (info, bases_count, mro_count, metaclass_fullname, fullname, names_table))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn rust_symtable_mirror_meta_put(
+    info: &PyAny,
+    bases_count: usize,
+    mro_count: usize,
+    metaclass_fullname: Option<String>,
+    fullname: Option<String>,
+    names_table: &PyAny,
+) -> PyResult<u64> {
+    meta_put(
+        info,
+        bases_count,
+        mro_count,
+        metaclass_fullname,
+        fullname,
+        names_table,
+    )
+}
+
+#[pyfunction]
+pub(crate) fn rust_symtable_mirror_meta_lookup<'py>(
+    py: Python<'py>,
+    info: &'py PyAny,
+) -> PyResult<Option<&'py PyDict>> {
+    meta_lookup(py, info)
+}
+
+#[pyfunction]
+pub(crate) fn rust_symtable_mirror_meta_delete(info: &PyAny) -> PyResult<bool> {
+    meta_delete(info)
+}
+
+#[pyfunction]
+pub(crate) fn rust_symtable_mirror_meta_entry_count() -> usize {
+    meta_entry_count()
 }
 
 #[cfg(test)]

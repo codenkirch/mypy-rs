@@ -495,6 +495,10 @@ __all__ = [
     "rust_symtable_mirror_generation",
     "rust_symtable_mirror_reset",
     "rust_symtable_mirror_handle_of",
+    "rust_symtable_mirror_meta_put",
+    "rust_symtable_mirror_meta_lookup",
+    "rust_symtable_mirror_meta_delete",
+    "rust_symtable_mirror_meta_entry_count",
     "rust_mirror_handle_of",
     "IdMapper",
 ]
@@ -2755,6 +2759,17 @@ def rust_symtable_mirror_names(owner: Any) -> list[str]: ...
 def rust_symtable_mirror_generation(owner: Any) -> int | None: ...
 def rust_symtable_mirror_reset() -> int: ...
 def rust_symtable_mirror_handle_of(obj: Any) -> int | None: ...
+def rust_symtable_mirror_meta_put(
+    info: Any,
+    bases_count: int,
+    mro_count: int,
+    metaclass_fullname: str | None,
+    fullname: str | None,
+    names_table: Any,
+) -> int: ...
+def rust_symtable_mirror_meta_lookup(info: Any) -> dict[str, Any] | None: ...
+def rust_symtable_mirror_meta_delete(info: Any) -> bool: ...
+def rust_symtable_mirror_meta_entry_count() -> int: ...
 
 # The proxy suite pins the shared identity namespace by comparing the
 # proxy handle with the mirror's non-minting lookup.

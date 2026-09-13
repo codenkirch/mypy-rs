@@ -82,3 +82,43 @@ def delete_names_entry_safe(table: Any, name: str) -> None:
     dict.pop(table, name, None)
     if symtables_mirror._active:
         symtables_mirror._delete(table, name)
+
+
+# ---- G3.0c: TypeInfo meta-field accessors ----
+
+
+def set_bases_mro(info: Any, bases: Any, mro: Any) -> None:
+    """Write ``info.bases`` and ``info.mro``, then invalidate subtype caches.
+
+    Uses ``object.__setattr__`` so the class patch's re-entrant guard is
+    not tripped; the shadow capture runs via ``_capture_meta`` directly.
+    """
+    object.__setattr__(info, "bases", bases)
+    object.__setattr__(info, "mro", mro)
+    if symtables_mirror._active:
+        symtables_mirror._capture_meta(info, "bases_mro")
+    from mypy.typestate import type_state
+    type_state.reset_subtype_caches_for(info)
+
+
+def set_meta(info: Any, metaclass_type: Any) -> None:
+    """Write ``info.metaclass_type`` and invalidate subtype caches."""
+    object.__setattr__(info, "metaclass_type", metaclass_type)
+    if symtables_mirror._active:
+        symtables_mirror._capture_meta(info, "metaclass_type")
+    from mypy.typestate import type_state
+    type_state.reset_subtype_caches_for(info)
+
+
+def set_info_fullname(info: Any, fullname: str) -> None:
+    """Write ``info._fullname`` (no subtype-cache invalidation needed)."""
+    object.__setattr__(info, "_fullname", fullname)
+    if symtables_mirror._active:
+        symtables_mirror._capture_meta(info, "_fullname")
+
+
+def rebind_names_table(info: Any, names: Any) -> None:
+    """Replace ``info.names`` with a new ``SymbolTable`` identity."""
+    object.__setattr__(info, "names", names)
+    if symtables_mirror._active:
+        symtables_mirror._capture_meta(info, "names")

@@ -43,7 +43,7 @@ import os
 import sys
 from typing import Any, Final
 
-from mypy.nodes import SymbolTable, SymbolTableNode
+from mypy.nodes import SymbolTable, SymbolTableNode, TypeInfo
 
 _kernel_mod: Any = None
 _active = False
@@ -78,6 +78,13 @@ _FLAG_FIELDS: Final[frozenset[str]] = frozenset(
         "cross_ref",
         "_node",
     }
+)
+
+# G3.0c: TypeInfo meta fields captured by `TypeInfo.__setattr__`.
+# `names` is a namespace rebind; others carry list length or fullname.
+# All other fields pass through untouched.
+_META_FIELDS: Final[frozenset[str]] = frozenset(
+    {"bases", "mro", "metaclass_type", "_fullname", "names"}
 )
 
 
@@ -246,6 +253,57 @@ def _symtable_node_setattr(self: Any, name: str, value: Any) -> None:
     _refresh_flags(self, name)
 
 
+def _instance_fullname(typ: Any) -> str | None:
+    """Fullname of a metaclass_type Instance or None."""
+    try:
+        return typ.type.fullname
+    except Exception:
+        return None
+
+
+def _capture_meta(info: Any, field: str) -> None:
+    """Record the post-write meta fields of one TypeInfo."""
+    global _in_capture
+    _in_capture = True
+    try:
+        try:
+            bases_count = len(info.bases) if info.bases is not None else 0
+            mro_count = len(info.mro) if info.mro is not None else 0
+            mc = info.metaclass_type
+            mc_fullname = _instance_fullname(mc) if mc is not None else None
+            try:
+                fullname = info._fullname
+            except Exception:
+                fullname = None
+            names_table = info.names
+        except Exception:
+            _count("capture_fail.meta_read")
+            return
+        try:
+            _kernel_mod.rust_symtable_mirror_meta_put(
+                info,
+                bases_count,
+                mro_count,
+                mc_fullname,
+                fullname if isinstance(fullname, str) else None,
+                names_table,
+            )
+            _count("meta.put." + field)
+        except Exception:
+            _count("capture_fail.meta_put")
+    finally:
+        _in_capture = False
+
+
+def _typeinfo_setattr(self: Any, name: str, value: Any) -> None:
+    _ORIG_NODE_SETATTR(self, name, value)
+    if not _active or _in_capture:
+        return
+    if name not in _META_FIELDS:
+        return
+    _capture_meta(self, name)
+
+
 def activate(*, audit: bool = False) -> None:
     """Enable namespace-shadow capture; a missing extension leaves it off.
 
@@ -270,6 +328,7 @@ def activate(*, audit: bool = False) -> None:
         (SymbolTable, "__delitem__", _symtable_delitem),
         (SymbolTable, "pop", _symtable_pop),
         (SymbolTableNode, "__setattr__", _symtable_node_setattr),
+        (TypeInfo, "__setattr__", _typeinfo_setattr),
     )
     for cls, attr, hook in patches:
         try:
