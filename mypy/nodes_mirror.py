@@ -86,14 +86,26 @@ from __future__ import annotations
 from typing import Any, Final
 
 from mypy.nodes import (
+    AssignmentStmt,
     CallExpr,
+    ClassDef,
     ComparisonExpr,
+    Decorator,
+    ForStmt,
+    FuncDef,
+    IfStmt,
+    ImportBase,
     IndexExpr,
+    MatchStmt,
     NotParsed,
     OpExpr,
+    OverloadedFuncDef,
     RefExpr,
     StrExpr,
+    TypeAliasStmt,
     UnaryExpr,
+    Var,
+    WithStmt,
 )
 
 # The five RefExpr binding scalars. `fullname` is a property writing
@@ -264,6 +276,223 @@ def _node_setattr(self: Any, name: str, value: Any) -> None:
         _capture_field(self, name)
 
 
+# ===========================================================================
+# G2.0 statement/def metadata shadow (issue #1577)
+# ===========================================================================
+
+# Record-only metadata capture for the statement and def families, added
+# in its own section because the parallel G1.0b agent extends the G1
+# classes above.
+
+# Same gate (`Options.native_ast_mirror`) and identity base as G1.0a;
+# no consumer reads a record. The tracked field table is per patch
+# class: records store one tagged value per written field.
+
+# Scalar flags, strings, type objects and node collections share one
+# store; object values become class/fullname markers (`InstanceType`,
+# `NameExpr:mod.x`) and are never serialized.
+
+_G2_FUNC_FLAGS: Final[frozenset[str]] = frozenset(
+    {
+        "is_property",
+        "is_class",
+        "is_static",
+        "is_final",
+        "is_explicit_override",
+        "is_type_check_only",
+        "def_or_infer_vars",
+        "is_overload",
+        "is_generator",
+        "is_coroutine",
+        "is_async_generator",
+        "is_awaitable_coroutine",
+        "is_decorated",
+        "is_conditional",
+        "is_trivial_body",
+        "is_trivial_self",
+        "is_mypy_only",
+        "is_invalid_redefinition",
+    }
+)
+
+_G2_FUNC_DEF: Final[frozenset[str]] = (
+    frozenset({"type", "unanalyzed_type", "_fullname", "abstract_status"}) | _G2_FUNC_FLAGS
+)
+
+_G2_VAR: Final[frozenset[str]] = frozenset(
+    {
+        "_fullname",
+        "type",
+        "setter_type",
+        "info",
+        "final_value",
+        "is_self",
+        "is_cls",
+        "is_ready",
+        "is_inferred",
+        "is_initialized_in_class",
+        "is_staticmethod",
+        "is_classmethod",
+        "is_property",
+        "is_settable_property",
+        "is_classvar",
+        "is_abstract_var",
+        "is_final",
+        "is_index_var",
+        "final_unset_in_class",
+        "final_set_in_init",
+        "is_suppressed_import",
+        "explicit_self_type",
+        "from_module_getattr",
+        "has_explicit_value",
+        "allow_incompatible_override",
+        "invalid_partial_type",
+        "is_argument",
+    }
+)
+
+# Class -> tracked slots. `ImportBase.assignments` is a list; the append
+# sites call `touch()` because the patched `__setattr__` cannot see it.
+_G2_TRACKED: Final[dict[type, frozenset[str]]] = {
+    ImportBase: frozenset({"assignments"}),
+    AssignmentStmt: frozenset(
+        {"type", "unanalyzed_type", "is_alias_def", "is_final_def", "invalid_recursive_alias"}
+    ),
+    ForStmt: frozenset(
+        {
+            "index",
+            "index_type",
+            "unanalyzed_index_type",
+            "inferred_item_type",
+            "inferred_iterator_type",
+        }
+    ),
+    WithStmt: frozenset({"analyzed_types"}),
+    IfStmt: frozenset({"unreachable_else"}),
+    MatchStmt: frozenset({"subject_dummy"}),
+    TypeAliasStmt: frozenset({"alias_node"}),
+    FuncDef: _G2_FUNC_DEF,
+    OverloadedFuncDef: frozenset({"items", "impl"}),
+    Decorator: frozenset({"func", "var"}),
+    ClassDef: frozenset({"info", "analyzed"}),
+    Var: _G2_VAR,
+}
+
+_META_FIELDS: dict[type, frozenset[str]] = {}
+# id(node) -> native handle for every node the metadata store holds.
+_META_HANDLES: dict[int, int] = {}
+
+
+def _meta_tracked(cls: type) -> frozenset[str]:
+    """Tracked slots for a patched class or any of its subclasses."""
+    tracked = _META_FIELDS.get(cls)
+    if tracked is None:
+        tracked = frozenset()
+        for base in cls.__mro__:
+            found = _G2_TRACKED.get(base)
+            if found is not None:
+                tracked = found
+                break
+        _META_FIELDS[cls] = tracked
+    return tracked
+
+
+def _meta_marker(value: Any) -> str:
+    """Record-only marker for an object value: `Class` or `Class:fullname`."""
+    name = type(value).__name__
+    try:
+        fullname = value.fullname
+    except Exception:
+        return name
+    if isinstance(fullname, str) and fullname:
+        return f"{name}:{fullname}"
+    return name
+
+
+def _meta_encode(value: Any) -> tuple[str, str | None, int | None, list[str] | None]:
+    """Encode one field value for the Rust store (kind, text, num, items)."""
+    if value is None:
+        return "none", None, None, None
+    if value is True or value is False:
+        return "bool", None, 1 if value else 0, None
+    if isinstance(value, int):
+        return "int", None, value, None
+    if isinstance(value, str):
+        return "str", value, None, None
+    if isinstance(value, (list, tuple)):
+        return "list", None, None, [_meta_marker(item) for item in value]
+    return "obj", _meta_marker(value), None, None
+
+
+def _meta_is_baseline(value: Any) -> bool:
+    """True for a constructor-default value on a never-adopted node."""
+    if value is None or value is False:
+        return True
+    if isinstance(value, (list, tuple)):
+        return len(value) == 0
+    if isinstance(value, str):
+        return value == ""
+    return False
+
+
+def _capture_meta(node: Any, field: str) -> None:
+    global _in_capture
+    _in_capture = True
+    try:
+        kind, text, num, items = _meta_encode(getattr(node, field))
+        handle = _kernel_mod.rust_node_mirror_capture_meta(node, field, kind, text, num, items)
+        _META_HANDLES[id(node)] = handle
+        _count("meta_capture")
+    except Exception:
+        _count("meta_capture_fail")
+    finally:
+        _in_capture = False
+
+
+def _meta_setattr(self: Any, name: str, value: Any) -> None:
+    # Apply the write first; the store records the post-write state and
+    # an unknown-slot AttributeError propagates unchanged.
+    _ORIG_SETATTR(self, name, value)
+    if not _active or _in_capture:
+        return
+    if name not in _meta_tracked(type(self)):
+        return
+    if _meta_is_baseline(value) and id(self) not in _META_HANDLES:
+        _count("meta_baseline_skip")
+        return
+    _capture_meta(self, name)
+
+
+def touch(node: Any, field: str) -> None:
+    """Capture one field after an in-place mutation (list append etc.).
+
+    Public because `mypy/semanal.py` calls it at the
+    `ImportBase.assignments.append` site; a no-op unless the gate is on.
+    """
+    if not _active or _in_capture:
+        return
+    _capture_meta(node, field)
+
+
+def _activate_meta() -> None:
+    for cls in _G2_TRACKED:
+        try:
+            # `_G2_TRACKED` keys are plain `type`s, so the class-level
+            # assignment reports as an incompatible assignment (unlike the
+            # G1 tuple of concrete classes).
+            cls.__setattr__ = _meta_setattr  # type: ignore[assignment]
+        except Exception:
+            # A compiled (mypyc) class refuses class-level patching; a
+            # partial install only skips that class's capture.
+            _count("meta_activate_failed.patch")
+
+
+def _reset_meta() -> None:
+    if _kernel_mod is not None:
+        _kernel_mod.rust_node_mirror_meta_reset()
+    _META_HANDLES.clear()
+
+
 def activate(*, audit: bool = False) -> None:
     """Enable node-shadow capture; a missing extension leaves it off.
 
@@ -303,6 +532,8 @@ def activate(*, audit: bool = False) -> None:
             return
     _active = True
     _count("activate")
+    # G2.0 (#1577): patch the statement/def family (separate section).
+    _activate_meta()
 
 
 def touch(node: Any, field: str) -> None:
@@ -332,6 +563,8 @@ def reset(*, clear_counts: bool = False) -> None:
     if _kernel_mod is not None:
         _kernel_mod.rust_node_mirror_reset()
     _NODE_HANDLES.clear()
+    # G2.0 (#1577): drop the statement/def metadata store too.
+    _reset_meta()
     _count("reset")
     if clear_counts:
         _audit.clear()

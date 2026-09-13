@@ -197,6 +197,7 @@ from mypy.nodes import (
     type_aliases_source_versions,
     typing_extensions_aliases,
 )
+from mypy.nodes_mirror import touch as _touch_node_meta
 from mypy.options import Options
 from mypy.patterns import (
     AsPattern,
@@ -4357,6 +4358,9 @@ class SemanticAnalyzer(
             for node in assignment, lvalue, rvalue:
                 node.set_line(import_node)
             import_node.assignments.append(assignment)
+            # G2.0 (#1577): the append is invisible to the patched
+            # __setattr__, so the metadata shadow records it explicitly.
+            _touch_node_meta(import_node, "assignments")
             return True
         return False
 

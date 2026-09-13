@@ -3534,6 +3534,30 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
     )?)?;
     module.add_function(wrap_pyfunction!(
         node_mirror::rust_node_mirror_field_captures,
+    // Phase G2.0 (#1577): statement/def metadata shadow store. Record-only
+    // like G1.0a: no consumer reads an entry, same gate and identity base.
+    module.add_function(wrap_pyfunction!(
+        node_mirror::rust_node_mirror_capture_meta,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        node_mirror::rust_node_mirror_meta,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        node_mirror::rust_node_mirror_meta_captures,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        node_mirror::rust_node_mirror_meta_drop,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        node_mirror::rust_node_mirror_meta_reset,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        node_mirror::rust_node_mirror_meta_entry_count,
         module
     )?)?;
 

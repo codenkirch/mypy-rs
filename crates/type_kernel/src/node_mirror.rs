@@ -279,6 +279,112 @@ fn capture_field_value(obj: &PyAny, field: String, value: FieldValue) -> PyResul
         let entry = store.by_handle.entry(handle).or_default();
         entry.fields.insert(field, value);
         entry.field_captures += 1;
+// ===========================================================================
+// G2.0 statement/def metadata shadow (issue #1577)
+// ===========================================================================
+
+// Record-only metadata store for the second AST family: statement metadata
+// (`AssignmentStmt` type fields, `ForStmt` index/inferred fields, ...) and
+// def-family metadata (`FuncDef`, `OverloadedFuncDef`, `Decorator`, ...).
+
+// Same gate and identity base as G1.0a; Python stays authoritative, no
+// consumer reads a record, every op is a pure capture, and the store is
+// separate so the two scaffolds merge independently.
+
+// The record is a field-name keyed map of tagged scalar values, because
+// the shadowed fields are heterogeneous (bools, ints, strings, type
+// objects, node collections).
+
+// Object-valued fields are stored as class/fullname markers only, so no
+// live type or node graph is retained beyond the strong pin that keeps
+// the record key valid.
+
+// Guarantees mirror G1.0a: thread-local entries and pins, strong pins so
+// a recycled `id()` cannot adopt a stale entry, and one merged record per
+// object where a repeated field write replaces its value in place.
+
+// `reset` clears entries/pins but never touches `identity::reset`
+// (owned by `rust_mirror_reset`).
+
+// Astmerge identity is untouched: `replace_object_state` copies slots
+// through `setattr`, so a surviving identity re-registers through the
+// normal capture hook.
+
+/// Interned field names. Field names come from the finite Python-side
+/// `_META_PATCHED` table, leaked once, so records store `&'static str`
+/// keys without a per-capture key allocation.
+fn intern_meta_field(field: &str) -> &'static str {
+    static INTERNED: std::sync::OnceLock<std::sync::Mutex<HashMap<String, &'static str>>> =
+        std::sync::OnceLock::new();
+    let map = INTERNED.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+    let mut guard = map.lock().unwrap();
+    if let Some(existing) = guard.get(field) {
+        return existing;
+    }
+    let leaked: &'static str = Box::leak(field.to_string().into_boxed_str());
+    guard.insert(field.to_string(), leaked);
+    leaked
+}
+
+/// One tagged scalar value. `NoneVal` keeps a captured `None` distinct
+/// from "this field was never written"; `Obj`/`List` are record-only
+/// markers (`Class` or `Class:fullname`) for values the Python side
+/// refuses to serialize.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub(crate) enum MetaValue {
+    NoneVal,
+    Bool(bool),
+    Int(i64),
+    Text(String),
+    Obj(String),
+    List(Vec<String>),
+}
+
+/// One object's metadata shadow: insertion-ordered field values plus a
+/// monotonic capture counter.
+#[derive(Default)]
+pub(crate) struct MetaEntry {
+    fields: Vec<(&'static str, MetaValue)>,
+    pub(crate) captures: u64,
+}
+
+struct MetaStore {
+    by_handle: HashMap<u64, MetaEntry>,
+    /// Strong pins: handles key on raw `id()`s, so each stored object
+    /// stays alive until its entry is dropped or the store resets.
+    pins: HashMap<u64, Py<PyAny>>,
+}
+
+impl MetaStore {
+    fn new() -> Self {
+        MetaStore {
+            by_handle: HashMap::new(),
+            pins: HashMap::new(),
+        }
+    }
+}
+
+thread_local! {
+    static META_STORE: RefCell<MetaStore> = RefCell::new(MetaStore::new());
+}
+
+fn with_meta_store<T>(f: impl FnOnce(&mut MetaStore) -> T) -> T {
+    META_STORE.with(|cell| f(&mut cell.borrow_mut()))
+}
+
+/// Capture `(field, value)` for `obj`; returns the identity handle.
+/// A repeated field write replaces the tagged value in place.
+pub(crate) fn capture_meta(obj: &PyAny, field: &str, value: MetaValue) -> PyResult<u64> {
+    let handle = handle_or_error(obj)?;
+    let field = intern_meta_field(field);
+    with_meta_store(|store| {
+        let entry = store.by_handle.entry(handle).or_default();
+        if let Some(existing) = entry.fields.iter_mut().find(|(name, _)| *name == field) {
+            existing.1 = value;
+        } else {
+            entry.fields.push((field, value));
+        }
+        entry.captures += 1;
         store.pins.insert(handle, Py::from(obj));
     });
     Ok(handle)
@@ -373,6 +479,270 @@ pub(crate) fn rust_node_mirror_field_captures(handle: u64) -> Option<u64> {
             .get(&handle)
             .map(|entry| entry.field_captures)
     })
+}
+
+/// Drop one metadata entry and its pin. Returns whether one was present.
+///
+/// The pin is moved out of the map under the borrow and dropped only
+/// after the `RefCell` guard is released: releasing the last reference
+/// can run a Python deallocator, and a callback re-entering the store
+/// would panic on the active mutable borrow.
+pub(crate) fn retire_meta(handle: u64) -> bool {
+    let (present, pin) = with_meta_store(|store| {
+        let present = store.by_handle.remove(&handle).is_some();
+        let pin = store.pins.remove(&handle);
+        (present, pin)
+    });
+    drop(pin);
+    present
+}
+
+/// Clear every metadata entry and pin; returns how many entries dropped.
+/// Deliberately does NOT call `identity::reset`: the raw handle registry
+/// is owned by `rust_mirror_reset`, and node-shadow state must not
+/// invalidate handles other seams still hold.
+pub(crate) fn reset_meta() -> usize {
+    let (entries, pins) = with_meta_store(|store| {
+        let entries = store.by_handle.len();
+        let pins: Vec<Py<PyAny>> = store.pins.drain().map(|(_, pin)| pin).collect();
+        store.by_handle.clear();
+        (entries, pins)
+    });
+    // Drop the pins only after the guard is released (see `retire_meta`).
+    drop(pins);
+    entries
+}
+
+/// Number of live metadata entries.
+pub(crate) fn meta_entry_count() -> usize {
+    with_meta_store(|store| store.by_handle.len())
+}
+
+// ---- G2 pyfunction wrappers ----
+
+/// Capture one tagged field value; returns the identity handle.
+#[pyfunction]
+#[pyo3(signature = (obj, field, kind, text=None, num=None, items=None))]
+pub(crate) fn rust_node_mirror_capture_meta(
+    obj: &PyAny,
+    field: &str,
+    kind: &str,
+    text: Option<String>,
+    num: Option<i64>,
+    items: Option<Vec<String>>,
+) -> PyResult<u64> {
+    let value = match kind {
+        "none" => MetaValue::NoneVal,
+        "bool" => MetaValue::Bool(num.unwrap_or(0) != 0),
+        "int" => MetaValue::Int(num.unwrap_or(0)),
+        "str" => MetaValue::Text(text.unwrap_or_default()),
+        "obj" => MetaValue::Obj(text.unwrap_or_default()),
+        "list" => MetaValue::List(items.unwrap_or_default()),
+        other => {
+            return Err(PyValueError::new_err(format!(
+                "node_mirror: unknown meta kind {other:?}"
+            )))
+        }
+    };
+    capture_meta(obj, field, value)
+}
+
+/// Read the metadata record as `{field: (kind, text, num, items)}`; None
+/// when the object has no entry. Kind is one of `none`, `bool`, `int`,
+/// `str`, `obj`, `list`.
+#[pyfunction]
+pub(crate) fn rust_node_mirror_meta(py: Python<'_>, handle: u64) -> PyResult<Option<PyObject>> {
+    with_meta_store(|store| {
+        store
+            .by_handle
+            .get(&handle)
+            .map(|entry| {
+                let dict = pyo3::types::PyDict::new(py);
+                for (field, value) in &entry.fields {
+                    let item: (&str, Option<&str>, Option<i64>, Option<Vec<String>>) = match value {
+                        MetaValue::NoneVal => ("none", None, None, None),
+                        MetaValue::Bool(v) => ("bool", None, Some(i64::from(*v)), None),
+                        MetaValue::Int(v) => ("int", None, Some(*v), None),
+                        MetaValue::Text(v) => ("str", Some(v.as_str()), None, None),
+                        MetaValue::Obj(v) => ("obj", Some(v.as_str()), None, None),
+                        MetaValue::List(v) => ("list", None, None, Some(v.clone())),
+                    };
+                    dict.set_item(*field, item)?;
+                }
+                Ok(dict.into())
+            })
+            .transpose()
+    })
+}
+
+/// Capture counter for `handle`; None when the object has no entry.
+#[pyfunction]
+pub(crate) fn rust_node_mirror_meta_captures(handle: u64) -> Option<u64> {
+    with_meta_store(|store| store.by_handle.get(&handle).map(|entry| entry.captures))
+}
+
+/// Drop the metadata entry (and pin) for `handle`; whether one existed.
+#[pyfunction]
+pub(crate) fn rust_node_mirror_meta_drop(handle: u64) -> bool {
+    retire_meta(handle)
+}
+
+/// Clear all metadata entries and pins; returns the dropped count.
+#[pyfunction]
+pub(crate) fn rust_node_mirror_meta_reset() -> usize {
+    reset_meta()
+}
+
+/// Live metadata entry count (audit + tests).
+#[pyfunction]
+pub(crate) fn rust_node_mirror_meta_entry_count() -> usize {
+    meta_entry_count()
+}
+
+#[cfg(test)]
+mod g2_meta_tests {
+    use super::*;
+
+    /// Initialize the embedded interpreter, then run with the GIL.
+    fn with_py<T>(f: impl FnOnce(Python<'_>) -> T) -> T {
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(f)
+    }
+
+    fn fresh_object(py: Python<'_>) -> &PyAny {
+        py.eval("object()", None, None).unwrap()
+    }
+
+    fn field_value(handle: u64, field: &str) -> Option<MetaValue> {
+        with_meta_store(|store| {
+            store.by_handle.get(&handle).and_then(|entry| {
+                entry
+                    .fields
+                    .iter()
+                    .find(|(name, _)| *name == field)
+                    .map(|(_, value)| value.clone())
+            })
+        })
+    }
+
+    #[test]
+    fn test_capture_meta_roundtrip_all_kinds() {
+        with_py(|py| {
+            reset_meta();
+            let obj = fresh_object(py);
+            let h = capture_meta(obj, "type", MetaValue::NoneVal).unwrap();
+            assert_eq!(
+                capture_meta(obj, "is_alias_def", MetaValue::Bool(true)).unwrap(),
+                h
+            );
+            assert_eq!(
+                capture_meta(obj, "abstract_status", MetaValue::Int(2)).unwrap(),
+                h
+            );
+            assert_eq!(
+                capture_meta(obj, "_fullname", MetaValue::Text("mod.f".into())).unwrap(),
+                h
+            );
+            assert_eq!(
+                capture_meta(obj, "info", MetaValue::Obj("TypeInfo:mod.C".into())).unwrap(),
+                h
+            );
+            assert_eq!(
+                capture_meta(
+                    obj,
+                    "items",
+                    MetaValue::List(vec!["FuncDef".into(), "Decorator".into()])
+                )
+                .unwrap(),
+                h
+            );
+            assert_eq!(meta_entry_count(), 1);
+            assert_eq!(field_value(h, "type"), Some(MetaValue::NoneVal));
+            assert_eq!(field_value(h, "is_alias_def"), Some(MetaValue::Bool(true)));
+            assert_eq!(field_value(h, "abstract_status"), Some(MetaValue::Int(2)));
+            assert_eq!(
+                field_value(h, "_fullname"),
+                Some(MetaValue::Text("mod.f".into()))
+            );
+            assert_eq!(
+                field_value(h, "info"),
+                Some(MetaValue::Obj("TypeInfo:mod.C".into()))
+            );
+            assert_eq!(
+                field_value(h, "items"),
+                Some(MetaValue::List(vec!["FuncDef".into(), "Decorator".into()]))
+            );
+            assert_eq!(with_meta_store(|s| s.by_handle[&h].captures), 6);
+        });
+    }
+
+    #[test]
+    fn test_repeated_write_replaces_in_place() {
+        with_py(|py| {
+            reset_meta();
+            let obj = fresh_object(py);
+            let h = capture_meta(obj, "type", MetaValue::NoneVal).unwrap();
+            capture_meta(obj, "is_final_def", MetaValue::Bool(false)).unwrap();
+            capture_meta(obj, "type", MetaValue::Obj("InstanceType".into())).unwrap();
+            let order: Vec<&str> = with_meta_store(|s| {
+                s.by_handle[&h]
+                    .fields
+                    .iter()
+                    .map(|(name, _)| *name)
+                    .collect()
+            });
+            assert_eq!(order, vec!["type", "is_final_def"]);
+            assert_eq!(
+                field_value(h, "type"),
+                Some(MetaValue::Obj("InstanceType".into()))
+            );
+            assert_eq!(with_meta_store(|s| s.by_handle[&h].captures), 3);
+        });
+    }
+
+    #[test]
+    fn test_drop_and_reset() {
+        with_py(|py| {
+            reset_meta();
+            let a = fresh_object(py);
+            let b = fresh_object(py);
+            let ha = capture_meta(a, "type", MetaValue::NoneVal).unwrap();
+            capture_meta(b, "type", MetaValue::NoneVal).unwrap();
+            assert_eq!(meta_entry_count(), 2);
+            assert!(retire_meta(ha));
+            assert!(!retire_meta(ha));
+            assert_eq!(meta_entry_count(), 1);
+            assert_eq!(reset_meta(), 1);
+            assert_eq!(meta_entry_count(), 0);
+        });
+    }
+
+    #[test]
+    fn test_meta_reset_does_not_reset_identity() {
+        with_py(|py| {
+            reset_meta();
+            let obj = fresh_object(py);
+            let h = capture_meta(obj, "type", MetaValue::NoneVal).unwrap();
+            reset_meta();
+            // `rust_mirror_reset` alone owns `identity::reset`; the G2
+            // store reset must leave the raw handle registry alive.
+            assert_eq!(identity::handle_of(obj), Some(h));
+            assert_eq!(identity::handle_for(obj), Some(h));
+        });
+    }
+
+    #[test]
+    fn test_pyfunctions_answer_the_record() {
+        with_py(|py| {
+            reset_meta();
+            let obj = fresh_object(py);
+            let h = capture_meta(obj, "items", MetaValue::List(vec!["FuncDef".into()])).unwrap();
+            assert_eq!(rust_node_mirror_meta_captures(h), Some(1));
+            assert_eq!(rust_node_mirror_meta_captures(h + 1), None);
+            assert!(rust_node_mirror_meta_drop(h));
+            assert_eq!(rust_node_mirror_meta_entry_count(), 0);
+        });
+    }
 }
 
 #[cfg(test)]

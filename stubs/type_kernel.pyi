@@ -479,6 +479,12 @@ __all__ = [
     "rust_node_mirror_field",
     "rust_node_mirror_fields",
     "rust_node_mirror_field_captures",
+    "rust_node_mirror_capture_meta",
+    "rust_node_mirror_meta",
+    "rust_node_mirror_meta_captures",
+    "rust_node_mirror_meta_drop",
+    "rust_node_mirror_meta_reset",
+    "rust_node_mirror_meta_entry_count",
     "rust_mirror_handle_of",
     "IdMapper",
 ]
@@ -2685,6 +2691,24 @@ def rust_node_mirror_capture_field_kinds(
 def rust_node_mirror_field(handle: int, field: str) -> tuple[str, Any] | None: ...
 def rust_node_mirror_fields(handle: int) -> list[str] | None: ...
 def rust_node_mirror_field_captures(handle: int) -> int | None: ...
+# Phase G2.0 (#1577): statement/def metadata shadow. `capture_meta`
+# stores one tagged field value (kind in none/bool/int/str/obj/list);
+# `meta` reads the record as {field: (kind, text, num, items)}.
+def rust_node_mirror_capture_meta(
+    obj: Any,
+    field: str,
+    kind: str,
+    text: str | None = None,
+    num: int | None = None,
+    items: list[str] | None = None,
+) -> int: ...
+def rust_node_mirror_meta(
+    handle: int,
+) -> dict[str, tuple[str, str | None, int | None, list[str] | None]] | None: ...
+def rust_node_mirror_meta_captures(handle: int) -> int | None: ...
+def rust_node_mirror_meta_drop(handle: int) -> bool: ...
+def rust_node_mirror_meta_reset() -> int: ...
+def rust_node_mirror_meta_entry_count() -> int: ...
 
 # The proxy suite pins the shared identity namespace by comparing the
 # proxy handle with the mirror's non-minting lookup.

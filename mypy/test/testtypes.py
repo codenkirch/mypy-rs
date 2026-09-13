@@ -58010,6 +58010,17 @@ class NativeAstMirrorFieldSuite(Suite):
     for the append-only `method_types`), plus one direct seam call per
     capture wrapper. The store stays capture-only: Python remains
     authoritative and no test reads a field back through the node.
+class NativeStmtDefMirrorSuite(Suite):
+    """Unit tests for the G2.0 statement/def metadata shadow (#1577).
+
+    The store is capture-only: every assertion drives the
+    `mypy.nodes_mirror` hook and reads the Rust record back through the
+    `rust_node_mirror_meta*` pyfunctions. The pinnings are the G2
+    contract: constructor-default writes on a never-adopted node stay
+    out of the store, the first non-default write adopts it, each tagged
+    field keeps its last value, object values are class/fullname markers
+    only, and astmerge's `replace_object_state` re-registers the
+    surviving identity through the same hook.
     """
 
     def setUp(self) -> None:
@@ -58022,6 +58033,12 @@ class NativeAstMirrorFieldSuite(Suite):
         self._k = kernel
         self._m = nodes_mirror
         self.fx = TypeFixture()
+        # TypeFixture builds real Vars/TypeInfos, so it must come before
+        # the reset that zeroes the store for each test.
+        self.fx = TypeFixture()
+        nodes_mirror.reset(clear_counts=True)
+        self._k = kernel
+        self._m = nodes_mirror
 
     def tearDown(self) -> None:
         self._m.reset(clear_counts=True)
@@ -58185,6 +58202,326 @@ class NativeAstMirrorFieldSuite(Suite):
     def test_capture_failure_does_not_break_field_write(self) -> None:
         expr = StrExpr("x")
         original = self._k.rust_node_mirror_capture_field_kind
+    def _meta(self, node: Any) -> dict[str, tuple[Any, ...]]:
+        handle = self._m._META_HANDLES.get(id(node))
+        assert handle is not None, "node was not adopted by the metadata shadow"
+        record = self._k.rust_node_mirror_meta(handle)
+        assert record is not None
+        return record
+
+    def _handle(self, node: Any) -> int:
+        handle = self._m._META_HANDLES.get(id(node))
+        assert handle is not None, "node was not adopted by the metadata shadow"
+        return handle
+
+    def _typeinfo(self, fullname: str = "mod.A") -> Any:
+        from mypy import nodes as nodes_mod
+
+        defn = nodes_mod.ClassDef(fullname.rsplit(".", 1)[-1], nodes_mod.Block([]), None, [])
+        defn.fullname = fullname
+        info = nodes_mod.TypeInfo(nodes_mod.SymbolTable(), defn, "mod")
+        defn.info = info
+        info.mro = [info]
+        return info
+
+    def test_assignment_stmt_field_set(self) -> None:
+        from mypy import nodes as nodes_mod
+
+        stmt = nodes_mod.AssignmentStmt([nodes_mod.NameExpr("x")], nodes_mod.IntExpr(1))
+        assert self._k.rust_node_mirror_meta_entry_count() == 0
+        # A constructor-default tracked write on a fresh node never adopts.
+        stmt.is_final_def = False
+        assert self._k.rust_node_mirror_meta_entry_count() == 0
+        stmt.type = AnyType(TypeOfAny.special_form)
+        stmt.unanalyzed_type = AnyType(TypeOfAny.special_form)
+        stmt.is_alias_def = True
+        stmt.is_final_def = True
+        stmt.invalid_recursive_alias = True
+        record = self._meta(stmt)
+        assert set(record) == set(self._m._G2_TRACKED[nodes_mod.AssignmentStmt])
+        assert record["type"] == ("obj", "AnyType", None, None)
+        assert record["unanalyzed_type"] == ("obj", "AnyType", None, None)
+        assert record["is_alias_def"] == ("bool", None, 1, None)
+        assert record["is_final_def"] == ("bool", None, 1, None)
+        assert record["invalid_recursive_alias"] == ("bool", None, 1, None)
+
+    def test_for_stmt_field_set(self) -> None:
+        from mypy import nodes as nodes_mod
+
+        stmt = nodes_mod.ForStmt(
+            nodes_mod.NameExpr("i"), nodes_mod.ListExpr([]), nodes_mod.Block([]), None
+        )
+        # `index` is non-default, so construction adopts; the inferred
+        # fields start as `None` and refresh on the first late write.
+        assert self._k.rust_node_mirror_meta_entry_count() == 1
+        stmt.index_type = AnyType(TypeOfAny.special_form)
+        stmt.unanalyzed_index_type = AnyType(TypeOfAny.special_form)
+        stmt.inferred_item_type = AnyType(TypeOfAny.from_error)
+        stmt.inferred_iterator_type = AnyType(TypeOfAny.from_error)
+        record = self._meta(stmt)
+        assert set(record) == set(self._m._G2_TRACKED[nodes_mod.ForStmt])
+        assert record["index"] == ("obj", "NameExpr", None, None)
+        assert record["index_type"] == ("obj", "AnyType", None, None)
+        assert record["unanalyzed_index_type"] == ("obj", "AnyType", None, None)
+        assert record["inferred_item_type"] == ("obj", "AnyType", None, None)
+        assert record["inferred_iterator_type"] == ("obj", "AnyType", None, None)
+
+    def test_with_stmt_analyzed_types(self) -> None:
+        from mypy import nodes as nodes_mod
+
+        stmt = nodes_mod.WithStmt([nodes_mod.NameExpr("f")], [None], nodes_mod.Block([]))
+        assert self._k.rust_node_mirror_meta_entry_count() == 0
+        stmt.analyzed_types = [AnyType(TypeOfAny.special_form), AnyType(TypeOfAny.from_error)]
+        record = self._meta(stmt)
+        assert set(record) == {"analyzed_types"}
+        assert record["analyzed_types"] == ("list", None, None, ["AnyType", "AnyType"])
+
+    def test_if_stmt_unreachable_else(self) -> None:
+        from mypy import nodes as nodes_mod
+
+        stmt = nodes_mod.IfStmt([nodes_mod.NameExpr("c")], [nodes_mod.Block([])], None)
+        assert self._k.rust_node_mirror_meta_entry_count() == 0
+        stmt.unreachable_else = True
+        assert self._meta(stmt) == {"unreachable_else": ("bool", None, 1, None)}
+        stmt.unreachable_else = False
+        assert self._meta(stmt) == {"unreachable_else": ("bool", None, 0, None)}
+
+    def test_match_stmt_subject_dummy(self) -> None:
+        from mypy import nodes as nodes_mod
+
+        stmt = nodes_mod.MatchStmt(nodes_mod.NameExpr("x"), [], [], [])
+        assert self._k.rust_node_mirror_meta_entry_count() == 0
+        stmt.subject_dummy = nodes_mod.NameExpr("m")
+        assert self._meta(stmt) == {"subject_dummy": ("obj", "NameExpr", None, None)}
+        # A cleared replacement is a tracked write, not a missing entry.
+        stmt.subject_dummy = None
+        assert self._meta(stmt) == {"subject_dummy": ("none", None, None, None)}
+
+    def test_type_alias_stmt_alias_node(self) -> None:
+        from mypy import nodes as nodes_mod
+
+        stmt = nodes_mod.TypeAliasStmt(
+            nodes_mod.NameExpr("A"), [], nodes_mod.LambdaExpr([], nodes_mod.Block([]))
+        )
+        assert self._k.rust_node_mirror_meta_entry_count() == 0
+        stmt.alias_node = nodes_mod.TypeAlias(
+            AnyType(TypeOfAny.special_form), "mod.A", "mod", 1, 0
+        )
+        assert self._meta(stmt) == {"alias_node": ("obj", "TypeAlias:mod.A", None, None)}
+
+    def test_import_assignments_touch_and_aststrip_rebind(self) -> None:
+        from mypy import nodes as nodes_mod
+
+        imp = nodes_mod.Import([("mod", None)])
+        assert self._k.rust_node_mirror_meta_entry_count() == 0
+        imp.assignments.append(
+            nodes_mod.AssignmentStmt([nodes_mod.NameExpr("x")], nodes_mod.IntExpr(1))
+        )
+        self._m.touch(imp, "assignments")
+        assert self._meta(imp) == {"assignments": ("list", None, None, ["AssignmentStmt"])}
+        # aststrip's `node.assignments = []` is a setattr on an adopted
+        # node, so the cleared list refreshes the record in place.
+        imp.assignments = []
+        assert self._meta(imp) == {"assignments": ("list", None, None, [])}
+        # `touch` is a no-op while the gate is off.
+        self._m._active = False
+        try:
+            self._m.touch(imp, "assignments")
+        finally:
+            self._m._active = True
+
+    def test_aststrip_style_writes_capture(self) -> None:
+        from mypy import nodes as nodes_mod
+
+        stmt = nodes_mod.AssignmentStmt([nodes_mod.NameExpr("x")], nodes_mod.IntExpr(1))
+        stmt.unanalyzed_type = AnyType(TypeOfAny.special_form)
+        stmt.type = stmt.unanalyzed_type
+        assert self._meta(stmt)["type"] == ("obj", "AnyType", None, None)
+        stmt.type = None
+        assert self._meta(stmt)["type"] == ("none", None, None, None)
+        for_stmt = nodes_mod.ForStmt(
+            nodes_mod.NameExpr("i"), nodes_mod.ListExpr([]), nodes_mod.Block([]), None
+        )
+        for_stmt.index_type = AnyType(TypeOfAny.special_form)
+        for_stmt.index_type = for_stmt.unanalyzed_index_type
+        assert self._meta(for_stmt)["index_type"] == ("none", None, None, None)
+        items: list[Any] = [nodes_mod.FuncDef("f")]
+        over = nodes_mod.OverloadedFuncDef(items)
+        over.unanalyzed_items = list(items)
+        over.items = over.unanalyzed_items.copy()
+        over.impl = None
+        record = self._meta(over)
+        assert record["items"] == ("list", None, None, ["FuncDef"])
+        assert record["impl"] == ("none", None, None, None)
+
+    def test_func_def_field_set(self) -> None:
+        from mypy import nodes as nodes_mod
+
+        func = nodes_mod.FuncDef("f")
+        func._fullname = "mod.f"
+        func.type = self.fx.callable(AnyType(TypeOfAny.special_form))
+        func.unanalyzed_type = self.fx.callable(AnyType(TypeOfAny.special_form))
+        func.abstract_status = 1
+        flags = sorted(self._m._G2_FUNC_FLAGS)
+        for name in flags:
+            setattr(func, name, True)
+        record = self._meta(func)
+        assert set(record) == set(self._m._G2_TRACKED[nodes_mod.FuncDef])
+        assert record["_fullname"] == ("str", "mod.f", None, None)
+        assert record["type"] == ("obj", "CallableType", None, None)
+        assert record["unanalyzed_type"] == ("obj", "CallableType", None, None)
+        assert record["abstract_status"] == ("int", None, 1, None)
+        for name in flags:
+            assert record[name] == ("bool", None, 1, None), name
+
+    def test_overloaded_func_def_items_impl(self) -> None:
+        from mypy import nodes as nodes_mod
+
+        item = nodes_mod.FuncDef("f")
+        item._fullname = "mod.f"
+        over = nodes_mod.OverloadedFuncDef([item])
+        assert self._meta(over)["items"] == ("list", None, None, ["FuncDef:mod.f"])
+        impl = nodes_mod.FuncDef("f")
+        over.impl = impl
+        assert self._meta(over)["impl"] == ("obj", "FuncDef", None, None)
+        # aststrip clears the impl to None; a tracked write, not a miss.
+        over.impl = None
+        assert self._meta(over)["impl"] == ("none", None, None, None)
+
+    def test_decorator_func_var(self) -> None:
+        from mypy import nodes as nodes_mod
+
+        func = nodes_mod.FuncDef("f")
+        var = nodes_mod.Var("f")
+        dec = nodes_mod.Decorator(func, [], var)
+        record = self._meta(dec)
+        assert set(record) == {"func", "var"}
+        assert record["func"] == ("obj", "FuncDef", None, None)
+        assert record["var"] == ("obj", "Var", None, None)
+
+    def test_class_def_info_and_analyzed(self) -> None:
+        from mypy import nodes as nodes_mod
+
+        cls = nodes_mod.ClassDef("C", nodes_mod.Block([]))
+        # Construction adopts through the placeholder `info`; `analyzed`
+        # starts captured as a real None because the node is adopted.
+        record = self._meta(cls)
+        assert record["info"][0] == "obj"
+        assert record["analyzed"] == ("none", None, None, None)
+        cls.info = self._typeinfo("mod.C")
+        assert self._meta(cls)["info"] == ("obj", "TypeInfo:mod.C", None, None)
+        cls.analyzed = nodes_mod.NameExpr("C")
+        assert self._meta(cls)["analyzed"] == ("obj", "NameExpr", None, None)
+        # aststrip's `node.analyzed = None` refresh.
+        cls.analyzed = None
+        assert self._meta(cls)["analyzed"] == ("none", None, None, None)
+
+    def test_var_field_set(self) -> None:
+        from mypy import nodes as nodes_mod
+
+        var = nodes_mod.Var("x")
+        var._fullname = "mod.x"
+        var.type = AnyType(TypeOfAny.special_form)
+        var.setter_type = self.fx.callable(AnyType(TypeOfAny.special_form))
+        var.info = self._typeinfo()
+        var.final_value = 7
+        value_fields = {"_fullname", "type", "setter_type", "info", "final_value"}
+        bool_fields = sorted(self._m._G2_VAR - value_fields)
+        for name in bool_fields:
+            setattr(var, name, True)
+        record = self._meta(var)
+        assert set(record) == set(self._m._G2_VAR)
+        assert record["_fullname"] == ("str", "mod.x", None, None)
+        assert record["type"] == ("obj", "AnyType", None, None)
+        assert record["setter_type"] == ("obj", "CallableType", None, None)
+        assert record["info"] == ("obj", "TypeInfo:mod.A", None, None)
+        assert record["final_value"] == ("int", None, 7, None)
+        for name in bool_fields:
+            assert record[name] == ("bool", None, 1, None), name
+
+    def test_meta_read_shape_and_capture_counter(self) -> None:
+        import type_kernel as kernel
+
+        from mypy import nodes as nodes_mod
+
+        stmt = nodes_mod.AssignmentStmt([nodes_mod.NameExpr("x")], nodes_mod.IntExpr(1))
+        stmt.is_alias_def = True
+        stmt.type = AnyType(TypeOfAny.special_form)
+        handle = self._handle(stmt)
+        assert kernel.rust_node_mirror_meta_captures(handle) == 2
+        record = kernel.rust_node_mirror_meta(handle)
+        assert record is not None and set(record) == {"is_alias_def", "type"}
+        # A repeated write replaces the value without adding a field.
+        stmt.is_alias_def = False
+        assert kernel.rust_node_mirror_meta_captures(handle) == 3
+        record = kernel.rust_node_mirror_meta(handle)
+        assert record is not None
+        assert record["is_alias_def"] == ("bool", None, 0, None)
+
+    def test_replace_object_state_reregisters_surviving_identity(self) -> None:
+        from mypy import nodes as nodes_mod
+        from mypy.util import replace_object_state
+
+        old = nodes_mod.FuncDef("f")
+        old._fullname = "mod.f"
+        old.is_final = True
+        old.is_property = True
+        self._handle(old)
+        new = nodes_mod.FuncDef("f2")
+        # The astmerge pattern: state is copied onto the surviving
+        # identity through setattr, so the shadow re-registers it.
+        replace_object_state(new, old)
+        record = self._meta(new)
+        assert record["_fullname"] == ("str", "mod.f", None, None)
+        assert record["is_final"] == ("bool", None, 1, None)
+        assert record["is_property"] == ("bool", None, 1, None)
+
+    def test_drop_and_reset(self) -> None:
+        from mypy import nodes as nodes_mod
+
+        var = nodes_mod.Var("x")
+        var.is_final = True
+        handle = self._handle(var)
+        assert self._k.rust_node_mirror_meta_drop(handle) is True
+        assert self._k.rust_node_mirror_meta(handle) is None
+        assert self._k.rust_node_mirror_meta_entry_count() == 0
+        assert self._k.rust_node_mirror_meta_drop(handle) is False
+
+    def test_reset_drops_meta_store_and_keeps_activation(self) -> None:
+        from mypy import nodes as nodes_mod
+
+        var = nodes_mod.Var("x")
+        var.is_final = True
+        assert self._k.rust_node_mirror_meta_entry_count() >= 1
+        self._m.reset()
+        assert self._k.rust_node_mirror_meta_entry_count() == 0
+        assert self._m._META_HANDLES == {}
+        # Activation is one-shot and survives reset: the next
+        # non-default tracked write captures under a fresh handle.
+        var.has_explicit_value = True
+        assert self._k.rust_node_mirror_meta_entry_count() == 1
+
+    def test_gate_off_leaves_node_untouched(self) -> None:
+        from mypy import nodes as nodes_mod
+
+        self._m._active = False
+        try:
+            var = nodes_mod.Var("x")
+            var.is_final = True
+            var._fullname = "mod.x"
+            assert id(var) not in self._m._META_HANDLES
+            assert self._k.rust_node_mirror_meta_entry_count() == 0
+            assert var.is_final is True
+        finally:
+            self._m._active = True
+
+    def test_capture_failure_does_not_break_the_write(self) -> None:
+        import type_kernel as kernel
+
+        from mypy import nodes as nodes_mod
+
+        stmt = nodes_mod.AssignmentStmt([nodes_mod.NameExpr("x")], nodes_mod.IntExpr(1))
+        original = kernel.rust_node_mirror_capture_meta
 
         def boom(*args: Any, **kwargs: Any) -> None:
             raise RuntimeError("kernel down")
@@ -58196,3 +58533,22 @@ class NativeAstMirrorFieldSuite(Suite):
             assert self._m.report().get("capture_fail.as_type", 0) >= 1
         finally:
             self._k.rust_node_mirror_capture_field_kind = original
+        kernel.rust_node_mirror_capture_meta = boom  # type: ignore[assignment]
+        try:
+            stmt.is_final_def = True
+            assert stmt.is_final_def is True
+            assert self._m.report().get("meta_capture_fail", 0) >= 1
+        finally:
+            kernel.rust_node_mirror_capture_meta = original
+
+    def test_handle_shares_identity_namespace(self) -> None:
+        from mypy import nodes as nodes_mod
+
+        var = nodes_mod.Var("x")
+        var.is_final = True
+        handle = self._handle(var)
+        # One identity namespace: the metadata store, the expression
+        # store, the proxy and the mirror all answer the same handle.
+        assert self._k.rust_node_mirror_handle_of(var) == handle
+        assert self._k.rust_proxy_handle_of(var) == handle
+        assert self._k.rust_mirror_handle_of(var) == handle

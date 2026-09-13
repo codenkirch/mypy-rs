@@ -4264,6 +4264,55 @@ including:
   2,806/11, fmt + clippy `-D warnings` clean; testtypes 3,451/7;
   testcheck 8,198/15/7/0 exact shadow off and on; fine-grained 747/27 +
   daemon 38 shadow-on; cold self-check clean 351.
+- wave 71B statement/def metadata shadow scaffold (G2.0, issue #1577):
+  extends the G1.0a node shadow with a record-only metadata store for the
+  statement and def families, same gate (`Options.native_ast_mirror`,
+  default off) and identity base, kept in its own Rust store (G2 section
+  of `crates/type_kernel/src/node_mirror.rs`) so the parallel G1.0b
+  expression work merges independently. One record per object holds
+  tagged field values (`none`/`bool`/`int`/`str`/`obj`/`list`); object
+  values become class/fullname markers only (`InstanceType`,
+  `NameExpr:mod.x`) and are never serialized. Six new pyfunctions
+  (`rust_node_mirror_capture_meta` / `_meta` / `_meta_captures` /
+  `_meta_drop` / `_meta_reset` / `_meta_entry_count`) + lib.rs
+  registrations + stub declarations. Python side (G2 section of
+  `mypy/nodes_mirror.py`) patches `__setattr__` on `ImportBase`,
+  `AssignmentStmt`, `ForStmt`, `WithStmt`, `IfStmt`, `MatchStmt`,
+  `TypeAliasStmt`, `FuncDef`, `OverloadedFuncDef`, `Decorator`,
+  `ClassDef` and `Var`; lazy adoption skips constructor defaults on a
+  never-adopted node, then each field keeps its last captured value.
+  Tracked fields: AssignmentStmt `type`/`unanalyzed_type`/`is_alias_def`/
+  `is_final_def`/`invalid_recursive_alias`; ForStmt `index`/`index_type`/
+  `unanalyzed_index_type`/`inferred_item_type`/`inferred_iterator_type`;
+  WithStmt `analyzed_types`; IfStmt `unreachable_else`; MatchStmt
+  `subject_dummy`; TypeAliasStmt `alias_node`; ImportBase `assignments`;
+  FuncDef `type`/`unanalyzed_type`/`_fullname`/`abstract_status` plus
+  the 18 FuncBase/FuncItem/FuncDef bool flags; OverloadedFuncDef
+  `items`/`impl`; Decorator `func`/`var`; ClassDef `info`/`analyzed`
+  (`ClassDef.analyzed` was explicitly G2); Var `_fullname`/`type`/
+  `setter_type`/`info`/`final_value` plus its 22 metadata flags.
+  `ImportBase.assignments` is a list append the patched hook cannot see,
+  so `mypy/semanal.py:process_import_over_existing_name` calls
+  `nodes_mirror.touch(node, "assignments")` - the only explicit touch
+  site; every other G2 site routes through the patch (semanal.py
+  1488-1961 def/overload/class metadata, 4494-5660 AssignmentStmt /
+  type-alias fields, 6912 / 7021 / 7181 ForStmt / WithStmt /
+  TypeAliasStmt; checker.py 7092 / 7467-7468 / 7942; aststrip.py 112-220
+  reset sites). Astmerge identity is untouched: `replace_object_state`
+  copies slots through `setattr`, so a surviving identity re-registers
+  through the same hook (pinned by
+  `test_replace_object_state_reregisters_surviving_identity`). No read
+  flip, no cache / `OPTIONS_AFFECTING_CACHE` change. Tests:
+  `NativeStmtDefMirrorSuite` (20) covers every claimed field, lazy
+  adoption, last-value-wins, drop/reset, gate-off, capture-failure
+  resilience, the explicit touch, aststrip-style clear writes and the
+  shared identity namespace, plus 5 Rust `g2_meta_tests`. Gates: cargo
+  type_kernel 2,803/11 (+5 units), fmt + clippy `-D warnings` clean;
+  testtypes 3,456/7 (3,436/7 + 20) both gate states; testcheck
+  8,198/15/7/0 exact in kernel and kernel+shadow modes; fine-grained
+  747/27 + daemon 38 + merge 41/1 + diff 79 shadow-on (905/28
+  combined); cold self-check clean 351 in kernel and kernel+shadow
+  modes.
 
 ## Pull Requests
 
