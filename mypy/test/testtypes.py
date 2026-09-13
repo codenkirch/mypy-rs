@@ -47435,6 +47435,112 @@ class NativeIsDefinedInBaseClassSuite(Suite):
 
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeIsDefinitionSuite(Suite):
+    """Parity for the Rust `is_definition` pure-predicate port (#1603).
+
+    `TypeChecker.is_definition` (checker.py:6173-6188) is a pure bool
+    over a live `Lvalue`: a `NameExpr` is a definition when
+    `is_inferred_def` is set or its `node` is a `Var` with `type is None`;
+    a `MemberExpr` is a definition when `is_inferred_def` is set; else
+    `False`. The Rust port reads the live node via PyO3 and returns the
+    bool directly, mirroring `rust_is_writable_attribute`. Direct seam
+    calls assert the exact bool; the gate-off vs gate-on differential
+    drives the real TypeChecker method.
+    """
+
+    def setUp(self) -> None:
+        from mypy.checker import _set_native_checker_active
+
+        self._set_active = _set_native_checker_active
+        self._set_active(True)
+        self.fx = TypeFixture()
+
+    def tearDown(self) -> None:
+        self._set_active(False)
+
+    def _with_gate(self, active: bool, fn: Callable[[], T]) -> T:
+        self._set_active(active)
+        try:
+            return fn()
+        finally:
+            self._set_active(True)
+
+    def _name_expr(self, name: str, is_inferred_def: bool = False, node: Any = None) -> NameExpr:
+        ne = NameExpr(name)
+        ne.is_inferred_def = is_inferred_def
+        if node is not None:
+            ne.node = node
+        return ne
+
+    def _member_expr(self, name: str, is_inferred_def: bool = False) -> MemberExpr:
+        me = MemberExpr(NameExpr("obj"), name)
+        me.is_inferred_def = is_inferred_def
+        return me
+
+    def _seam(self, node: Any) -> Any:
+        return _type_kernel.rust_is_definition(node)
+
+    def _run(self, node: Any) -> tuple[bool, bool]:
+        from mypy.checker import TypeChecker
+
+        def check_one() -> bool:
+            chk = TypeChecker.__new__(TypeChecker)
+            return chk.is_definition(node)
+
+        off = self._with_gate(False, check_one)
+        on = self._with_gate(True, check_one)
+        return off, on
+
+    def _assert_par(self, node: Any) -> None:
+        off, on = self._run(node)
+        assert_equal(on, off, f"is_definition parity for node={node!r}")
+
+    def test_seam_name_expr_inferred_def(self) -> None:
+        assert self._seam(self._name_expr("x", is_inferred_def=True)) is True
+
+    def test_seam_name_expr_var_no_type(self) -> None:
+        v = Var("x")
+        v.type = None
+        assert self._seam(self._name_expr("x", node=v)) is True
+
+    def test_seam_name_expr_var_with_type(self) -> None:
+        v = Var("x")
+        v.type = self.fx.o
+        assert self._seam(self._name_expr("x", node=v)) is False
+
+    def test_seam_name_expr_no_node(self) -> None:
+        assert self._seam(self._name_expr("x")) is False
+
+    def test_seam_member_expr_inferred_def(self) -> None:
+        assert self._seam(self._member_expr("attr", is_inferred_def=True)) is True
+
+    def test_seam_member_expr_not_inferred(self) -> None:
+        assert self._seam(self._member_expr("attr")) is False
+
+    def test_seam_non_expr(self) -> None:
+        assert self._seam(self.fx.oi) is False
+
+    def test_parity_name_expr_inferred_def(self) -> None:
+        self._assert_par(self._name_expr("x", is_inferred_def=True))
+
+    def test_parity_name_expr_var_no_type(self) -> None:
+        v = Var("x")
+        v.type = None
+        self._assert_par(self._name_expr("x", node=v))
+
+    def test_parity_name_expr_var_with_type(self) -> None:
+        v = Var("x")
+        v.type = self.fx.o
+        self._assert_par(self._name_expr("x", node=v))
+
+    def test_parity_member_expr_inferred_def(self) -> None:
+        self._assert_par(self._member_expr("attr", is_inferred_def=True))
+
+    def test_parity_member_expr_not_inferred(self) -> None:
+        self._assert_par(self._member_expr("attr"))
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeCheckExitReturnTypeSuite(Suite):
     """Parity for `rust_check_exit_return_type` (issue #1597).
 

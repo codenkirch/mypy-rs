@@ -4532,6 +4532,23 @@ including:
   `mypy/test/testtypes.py` (direct seam calls for all branches plus
   gate-off vs gate-on parity differentials).
 
+- wave 75 H1f native is_definition (issue #1603): the Rust seam in
+  `checker_functions.rs` mirrors `TypeChecker.is_definition`
+  (checker.py:6173-6188) as a live-PyO3-object port (zero wire bytes).
+  Rust reads the live `Lvalue` via PyO3 `is_instance` against
+  `mypy.nodes.NameExpr` and `mypy.nodes.MemberExpr`: a `NameExpr` with
+  `is_inferred_def=True` returns `Some(true)`, a `NameExpr` whose `node`
+  is a `Var` with `type is None` returns `Some(true)`, a `MemberExpr`
+  with `is_inferred_def=True` returns `Some(true)`, all other shapes
+  return `Some(false)`. Defers (`None`) on an unreadable attribute so
+  the pure-Python body re-runs. Gated by `_native_checker_active`
+  (existing wiring, no build.py change) and covered by
+  `NativeIsDefinitionSuite` in `mypy/test/testtypes.py` (7 direct seam
+  calls + 5 gate-off vs gate-on parity differentials). Gates: cargo
+  type_kernel clean, fmt + clippy clean, testtypes 3581 passed/7
+  skipped, testcheck 8144 passed/69 skipped/7 xfailed, cold self-check
+  clean.
+
 ## Pull Requests
 
 The default branch on this fork is `main` (not `master`). Always target

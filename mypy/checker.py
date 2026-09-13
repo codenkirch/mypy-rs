@@ -404,6 +404,7 @@ try:
         rust_is_valid_inferred_type as _rust_is_valid_inferred_type,
         rust_is_writable_attribute as _rust_is_writable_attribute,
         rust_is_defined_in_base_class as _rust_is_defined_in_base_class,
+        rust_is_definition as _rust_is_definition,
         rust_narrow_type_by_identity_equality as _rust_narrow_type_by_identity_equality,
         rust_narrow_with_len as _rust_narrow_with_len,
         rust_or_conditional_maps as _rust_or_conditional_maps,
@@ -473,6 +474,7 @@ except ImportError:
     _rust_is_valid_inferred_type = None  # type: ignore[assignment]
     _rust_is_writable_attribute = None  # type: ignore[assignment]
     _rust_is_defined_in_base_class = None  # type: ignore[assignment]
+    _rust_is_definition = None  # type: ignore[assignment]
     _rust_is_more_general_arg_prefix = None  # type: ignore[assignment]
     _rust_overload_can_never_match = None  # type: ignore[assignment]
     _rust_is_equality_ambiguous_for_narrowing = None  # type: ignore[assignment]
@@ -6181,6 +6183,13 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
         return lvalue_type, index_lvalue, inferred
 
     def is_definition(self, s: Lvalue) -> bool:
+        if _CHECKER_HAS_TYPE_KERNEL and _native_checker_active and _rust_is_definition is not None:
+            try:
+                result = _rust_is_definition(s)
+                if result is not None:
+                    return result
+            except (AssertionError, NotImplementedError, ValueError, TypeError):
+                pass
         if isinstance(s, NameExpr):
             if s.is_inferred_def:
                 return True

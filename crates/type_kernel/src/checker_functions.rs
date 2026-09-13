@@ -1430,6 +1430,39 @@ pub(crate) fn rust_is_defined_in_base_class(
     Ok(Some(false))
 }
 
+/// `TypeChecker.is_definition` (checker.py:6173-6188): a pure bool
+/// predicate over a live `Lvalue`. A `NameExpr` is a definition when
+/// `is_inferred_def` is set or its `node` is a `Var` with `type is None`;
+/// a `MemberExpr` is a definition when `is_inferred_def` is set; else
+/// `False`. Mirrors `rust_is_writable_attribute` (live-object, no wire
+/// decode). Defers (`None`) only on an unreadable attribute.
+#[pyfunction]
+pub(crate) fn rust_is_definition(_py: Python<'_>, node: &PyAny) -> PyResult<Option<bool>> {
+    let name_expr_cls = nodes_class(_py, "NameExpr")?;
+    if node.is_instance(name_expr_cls)? {
+        let is_inferred_def: bool = node.getattr("is_inferred_def")?.extract()?;
+        if is_inferred_def {
+            return Ok(Some(true));
+        }
+        let inner_node = node.getattr("node")?;
+        if inner_node.is_none() {
+            return Ok(Some(false));
+        }
+        let var_cls = nodes_class(_py, "Var")?;
+        if inner_node.is_instance(var_cls)? {
+            let typ = inner_node.getattr("type")?;
+            return Ok(Some(typ.is_none()));
+        }
+        return Ok(Some(false));
+    }
+    let member_expr_cls = nodes_class(_py, "MemberExpr")?;
+    if node.is_instance(member_expr_cls)? {
+        let is_inferred_def: bool = node.getattr("is_inferred_def")?.extract()?;
+        return Ok(Some(is_inferred_def));
+    }
+    Ok(Some(false))
+}
+
 /// Test-only decision fold of `check_for_untyped_decorator`
 /// (checker.py:6955-6964). The seam inlines the same short-circuit
 /// order; kept for the pure decision-table tests below.
