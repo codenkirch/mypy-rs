@@ -59259,6 +59259,52 @@ class NativeSymtableMirrorSuite(Suite):
         assert record_after["mro_count"] == 2
         assert record_after["seq"] > record_before["seq"]
 
+    def test_astmerge_replace_object_state_typeinfo_recaptured(self) -> None:
+        # G3.0d: replace_object_state(new, old) copies state via setattr,
+        # which triggers _typeinfo_setattr -> _capture_meta on the surviving
+        # `new` identity. The shadow record must appear on `new`, not `old`.
+        from mypy.nodes import TypeInfo, ClassDef, Block
+        from mypy.util import replace_object_state
+
+        old = self._make_info("mod.Old")
+        old.bases = [old]
+        old.is_final = True
+        old_record = self._k.rust_symtable_mirror_meta_lookup(old)
+        assert old_record is not None
+        assert old_record["bases_count"] == 1
+        # Build a fresh TypeInfo with same class (required by
+        # replace_object_state).
+        new = TypeInfo(SymbolTable(), ClassDef("mod.New", Block([])), "")
+        # replace_object_state copies old's state onto new via setattr.
+        replace_object_state(new, old, skip_slots=("special_alias",))
+        new_record = self._k.rust_symtable_mirror_meta_lookup(new)
+        assert new_record is not None
+        assert new_record["bases_count"] == 1
+        assert new_record["fullname"] == "mod.Old"
+        assert new_record["seq"] > old_record["seq"]
+
+    def test_astmerge_replace_nodes_in_symbol_table_refreshes_flags(self) -> None:
+        # G3.0d: node._node = new in replace_nodes_in_symbol_table writes to
+        # a _FLAG_FIELDS slot, triggering _symtable_node_setattr ->
+        # _refresh_flags on the SymbolTableNode.
+        from mypy.nodes import Var, SymbolTableNode, SymbolTable, GDEF
+
+        table = SymbolTable()
+        old_node = Var("x")
+        old_node._fullname = "mod.x"
+        entry = SymbolTableNode(GDEF, old_node)
+        table["x"] = entry
+        record_before = self._m.lookup(table, "x")
+        assert record_before is not None
+        assert record_before["node_fullname"] == "mod.x"
+        # Simulate the astmerge replacement: swap the node identity.
+        new_node = Var("y")
+        new_node._fullname = "mod.y"
+        entry._node = new_node
+        record_after = self._m.lookup(table, "x")
+        assert record_after is not None
+        assert record_after["node_fullname"] == "mod.y"
+
 
 class NativeSymtableMetaExtraSuite(Suite):
     """G3.0c: extended TypeInfo meta fields (bool flags, type_vars

@@ -4405,6 +4405,26 @@ including:
   35 passed; full testtypes 3519 passed/7 skipped/1 pre-existing
   failure; cold self-check pending.
 
+- wave 73 G3.0d astmerge re-registration for symtable shadow (issue
+  #1581 follow-up): the in-place mro/bases mutation re-capture hook in
+  ``process_type_info`` (astmerge.py:398-403) is already in place from
+  G3.0c. This wave adds two test pins verifying the remaining astmerge
+  paths keep the shadow consistent: (a)
+  ``test_astmerge_replace_object_state_typeinfo_recaptured``: when
+  ``fixup()`` calls ``replace_object_state(new, old,
+  skip_slots=("special_alias",))``, the ``setattr`` calls on
+  ``_META_FIELDS`` trigger ``_typeinfo_setattr`` -> ``_capture_meta``
+  on the surviving ``new`` identity, so the meta record appears on
+  ``new`` with the old content and a higher seq; (b)
+  ``test_astmerge_replace_nodes_in_symbol_table_refreshes_flags``:
+  when ``replace_nodes_in_symbol_table`` writes ``node._node = new``
+  (a ``_FLAG_FIELDS`` slot), ``_symtable_node_setattr`` ->
+  ``_refresh_flags`` updates the ``node_fullname`` in the existing
+  record (seq is not bumped — ``refresh_flags`` updates content, not
+  identity). No Rust or production code change; test-only. Gates:
+  symtable mirror suite 27 passed; full testtypes 3522 passed/7
+  skipped.
+
 ## Pull Requests
 
 The default branch on this fork is `main` (not `master`). Always target
