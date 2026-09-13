@@ -58421,9 +58421,14 @@ class NativeStmtDefMirrorSuite(Suite):
         var = nodes_mod.Var("f")
         dec = nodes_mod.Decorator(func, [], var)
         record = self._meta(dec)
-        assert set(record) == {"func", "var"}
+        # `func` and `var` are non-baseline, adopting the node; the
+        # baseline `decorators=[]` and `is_overload=False` are captured
+        # because the node is already adopted.
+        assert set(record) == {"func", "var", "is_overload", "decorators"}
         assert record["func"] == ("obj", "FuncDef", None, None)
         assert record["var"] == ("obj", "Var", None, None)
+        assert record["is_overload"] == ("bool", None, 0, None)
+        assert record["decorators"] == ("list", None, None, [])
 
     def test_class_def_info_and_analyzed(self) -> None:
         from mypy import nodes as nodes_mod
@@ -58606,6 +58611,60 @@ class NativeStmtDefMirrorSuite(Suite):
         assert record["assignments"] == ("list", None, None, ["AssignmentStmt"])
         assert record["is_top_level"] == ("bool", None, 1, None)
         assert record["is_unreachable"] == ("bool", None, 1, None)
+
+    def test_overloaded_func_def_extended_fields(self) -> None:
+        from mypy import nodes as nodes_mod
+
+        item = nodes_mod.FuncDef("f")
+        item._fullname = "mod.f"
+        over = nodes_mod.OverloadedFuncDef([item])
+        over.unanalyzed_items = list(over.items)
+        over.deprecated = "use mod.g instead"
+        over.setter_index = 2
+        record = self._meta(over)
+        assert set(record) == {
+            "items", "unanalyzed_items", "impl", "deprecated", "setter_index",
+        }
+        assert record["unanalyzed_items"] == ("list", None, None, ["FuncDef:mod.f"])
+        assert record["deprecated"] == ("str", "use mod.g instead", None, None)
+        assert record["setter_index"] == ("int", None, 2, None)
+
+    def test_decorator_is_overload_and_decorators(self) -> None:
+        from mypy import nodes as nodes_mod
+
+        func = nodes_mod.FuncDef("f")
+        var = nodes_mod.Var("f")
+        dec = nodes_mod.Decorator(func, [], var)
+        dec.is_overload = True
+        dec.decorators = [nodes_mod.NameExpr("decorator1")]
+        record = self._meta(dec)
+        assert set(record) == {"func", "var", "is_overload", "decorators"}
+        assert record["is_overload"] == ("bool", None, 1, None)
+        assert record["decorators"] == ("list", None, None, ["NameExpr"])
+
+    def test_class_def_has_incompatible_baseclass_and_metaclass(self) -> None:
+        from mypy import nodes as nodes_mod
+
+        cls = nodes_mod.ClassDef("C", nodes_mod.Block([]))
+        cls.has_incompatible_baseclass = True
+        cls.metaclass = nodes_mod.NameExpr("ABCMeta")
+        record = self._meta(cls)
+        assert set(record) == {
+            "info", "analyzed", "has_incompatible_baseclass", "metaclass",
+        }
+        assert record["has_incompatible_baseclass"] == ("bool", None, 1, None)
+        assert record["metaclass"] == ("obj", "NameExpr", None, None)
+
+    def test_func_def_deprecated(self) -> None:
+        from mypy import nodes as nodes_mod
+
+        func = nodes_mod.FuncDef("f")
+        func.deprecated = "use mod.g"
+        record = self._meta(func)
+        assert "deprecated" in record
+        assert record["deprecated"] == ("str", "use mod.g", None, None)
+        func.deprecated = None
+        assert self._meta(func)["deprecated"] == ("none", None, None, None)
 
     def test_handle_shares_identity_namespace(self) -> None:
         from mypy import nodes as nodes_mod
