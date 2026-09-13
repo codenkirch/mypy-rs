@@ -1,13 +1,21 @@
-"""Phase G1.0a expression dual-write node shadow (issue #1572).
+"""Phase G1 expression dual-write node shadow (issues #1572, #1576).
 
 Python stays canonical. With the AST-mirror gate on, writes to the first
 shadowed node family are recorded into Rust storage behind the type
 kernel's `rust_node_mirror_*` pyfunctions: the `RefExpr` binding scalars
 (`kind`, target `node` fullname, `_fullname`, `is_new_def`,
 `is_inferred_def`) and the last `analyzed` replacement class name
-(record-only, CallExpr-like expression classes). No consumer reads the
-store in G1.0a; it exists to prove the capture path before any read flip,
-exactly like the F1 type mirror proved construction capture.
+(record-only, CallExpr-like expression classes). G1.0b (#1576) extends
+the store to the remaining G1 expression fields: `method_type`
+(OpExpr/IndexExpr/UnaryExpr), `method_types` (ComparisonExpr), `as_type`
+(OpExpr/IndexExpr/StrExpr), `right_always`/`right_unreachable` (OpExpr),
+`def_var` (MemberExpr) and the RefExpr/NameExpr `is_special_form`,
+`is_alias_rvalue`, `type_guard` and `type_is` flags. Each field keeps a
+presence marker plus a shape record (class name, bool, fullname, or
+kind list); the payload type graph is G1.1, which extends these records
+with wire bytes. No consumer reads the store in G1.0a/G1.0b; it exists
+to prove the capture path before any read flip, exactly like the F1
+type mirror proved construction capture.
 
 Design notes:
 - Capture is via class-level monkeypatching of ``__setattr__`` on
@@ -21,8 +29,8 @@ Design notes:
   ``NameExpr`` never pins anything. The first binding write (semanal's
   ``lvalue.kind = ...`` etc.) adopts the node and stores the full
   post-write record; later tracked writes refresh it. Writes to
-  non-shadowed fields (``name``, ``line``, ``is_alias_rvalue``, ...)
-  pass straight through.
+  non-shadowed fields (``name``, ``line``, ``value``, ...) pass
+  straight through.
 - Strong pins: the Rust store pins each captured node until reset, so
   the ``id()``-keyed ``_NODE_HANDLES`` map cannot go stale; no Python
   pin dict is needed. ``reset`` drops entries and pins but does NOT
@@ -51,13 +59,42 @@ patched ``__setattr__``; semanal.py anchors from the #1572 base):
 - checker.py:6726 redefinition binder binding,
 - checker.py:10716-10717 forward-reference binding,
 - server/astmerge.py:308-311 CallExpr ``analyzed`` fixup.
+
+G1.0b write sites (anchors from the #1574 base, all through the patched
+``__setattr__`` except the ``touch`` sites):
+- checkexpr.py:5620 OpExpr ``method_type`` (``visit_op_expr``),
+- checkexpr.py:6555 OpExpr ``method_type`` (``check_list_multiply``),
+- checkexpr.py:5714/5718/5747/5785 ComparisonExpr ``method_types``
+  appends (in place; covered by ``touch`` at the end of
+  ``visit_comparison_expr``),
+- checkexpr.py:6582 UnaryExpr ``method_type``,
+- checkexpr.py:6716/6788 IndexExpr ``method_type`` (``visit_index_with_type``
+  native and Python tails),
+- checkexpr.py:2721/2723 RefExpr ``type_guard``/``type_is`` (callee),
+- checker.py:6701 IndexExpr ``method_type`` (``check_indexed_assignment``),
+- semanal.py:4355/5501 RefExpr ``is_alias_rvalue``,
+- semanal.py:4789 NameExpr ``is_special_form``,
+- semanal.py:5972 MemberExpr ``def_var`` (``analyze_member_lvalue``),
+- semanal.py:7676/7681 OpExpr ``right_unreachable``/``right_always``,
+- semanal.py:9779-9893 ``as_type`` writes (StrExpr/IndexExpr/OpExpr),
+- server/astmerge.py:274-275 MemberExpr ``def_var`` fixup,
+- treetransform.py:485/493 ``is_special_form``/``def_var`` copies.
 """
 
 from __future__ import annotations
 
 from typing import Any, Final
 
-from mypy.nodes import CallExpr, IndexExpr, OpExpr, RefExpr
+from mypy.nodes import (
+    CallExpr,
+    ComparisonExpr,
+    IndexExpr,
+    NotParsed,
+    OpExpr,
+    RefExpr,
+    StrExpr,
+    UnaryExpr,
+)
 
 # The five RefExpr binding scalars. `fullname` is a property writing
 # `_fullname`, so the slot name is the tracked key.
@@ -66,6 +103,18 @@ _REF_FIELDS: Final[frozenset[str]] = frozenset(
 )
 # The expression classes that carry `analyzed`.
 _ANALYZED_CLASSES: Final[tuple[type, ...]] = (CallExpr, IndexExpr, OpExpr)
+# G1.0b (#1576) field sets: kind = class name (None when cleared),
+# flag = bool, name = `def_var` fullname, kinds = `method_types` list.
+# Only `method_types` is append-only and needs `touch`.
+_KIND_FIELDS: Final[frozenset[str]] = frozenset(
+    {"method_type", "as_type", "type_guard", "type_is"}
+)
+_FLAG_FIELDS: Final[frozenset[str]] = frozenset(
+    {"right_always", "right_unreachable", "is_special_form", "is_alias_rvalue"}
+)
+_NAME_FIELDS: Final[frozenset[str]] = frozenset({"def_var"})
+_KINDS_FIELDS: Final[frozenset[str]] = frozenset({"method_types"})
+_FIELD_NAMES: Final[frozenset[str]] = _KIND_FIELDS | _FLAG_FIELDS | _NAME_FIELDS | _KINDS_FIELDS
 
 _kernel_mod: Any = None
 _active = False
@@ -140,6 +189,56 @@ def _capture_analyzed(node: Any) -> None:
         _in_capture = False
 
 
+def _is_field_baseline(name: str, value: Any) -> bool:
+    """True for a constructor-default write of a G1.0b field.
+
+    `as_type` defaults to the `NotParsed.VALUE` sentinel while an
+    analysis write of None is meaningful; the other type-valued fields
+    default to None; the flags default to False and `method_types` to
+    an empty list.
+    """
+    if name == "as_type":
+        return isinstance(value, NotParsed)
+    if name in ("method_type", "type_guard", "type_is", "def_var"):
+        return value is None
+    if name == "method_types":
+        return not value
+    return value is False
+
+
+def _capture_field(node: Any, name: str) -> None:
+    global _in_capture
+    _in_capture = True
+    try:
+        value = getattr(node, name)
+        handle: int
+        if name in _KIND_FIELDS:
+            kind = None if value is None else type(value).__name__
+            handle = _kernel_mod.rust_node_mirror_capture_field_kind(node, name, kind)
+        elif name in _FLAG_FIELDS:
+            handle = _kernel_mod.rust_node_mirror_capture_flag(node, name, bool(value))
+        elif name in _NAME_FIELDS:
+            target = value
+            fullname: str | None = None
+            if target is not None:
+                try:
+                    raw = target.fullname
+                except Exception:
+                    raw = None
+                fullname = raw if isinstance(raw, str) else None
+            handle = _kernel_mod.rust_node_mirror_capture_field_name(node, name, fullname)
+        else:
+            # method_types is the only list-valued shadowed field.
+            kinds = [None if item is None else type(item).__name__ for item in value]
+            handle = _kernel_mod.rust_node_mirror_capture_field_kinds(node, name, kinds)
+        _NODE_HANDLES[id(node)] = handle
+        _count("capture_" + name)
+    except Exception:
+        _count("capture_fail." + name)
+    finally:
+        _in_capture = False
+
+
 def _node_setattr(self: Any, name: str, value: Any) -> None:
     # Apply the write first: the store records the post-write state, and
     # any AttributeError from an unknown slot propagates exactly as the
@@ -158,6 +257,11 @@ def _node_setattr(self: Any, name: str, value: Any) -> None:
         _count("baseline_skip.analyzed")
     elif name == "analyzed":
         _capture_analyzed(self)
+    elif name in _FIELD_NAMES:
+        if _NODE_HANDLES.get(id(self)) is None and _is_field_baseline(name, value):
+            _count("baseline_skip." + name)
+            return
+        _capture_field(self, name)
 
 
 def activate(*, audit: bool = False) -> None:
@@ -179,7 +283,17 @@ def activate(*, audit: bool = False) -> None:
         return
     _kernel_mod = _km
     _audit_mode = audit
-    for cls in (RefExpr, CallExpr, IndexExpr, OpExpr):
+    # G1.0b adds ComparisonExpr / StrExpr / UnaryExpr; NameExpr and
+    # MemberExpr already route through the RefExpr patch.
+    for cls in (
+        RefExpr,
+        CallExpr,
+        IndexExpr,
+        OpExpr,
+        ComparisonExpr,
+        StrExpr,
+        UnaryExpr,
+    ):
         try:
             cls.__setattr__ = _node_setattr  # type: ignore[method-assign]
         except Exception:
@@ -189,6 +303,23 @@ def activate(*, audit: bool = False) -> None:
             return
     _active = True
     _count("activate")
+
+
+def touch(node: Any, field: str) -> None:
+    """Record an in-place mutation of a shadowed field (G1.0b).
+
+    `__setattr__` cannot observe list mutations, so a mutating site
+    calls this after the write; `ComparisonExpr.method_types` is the
+    only such field. Off-gate calls return immediately, so callers need
+    no guard. Unknown fields and values that are still the constructor
+    default (an empty list) are ignored, keeping lazy adoption intact.
+    """
+    if not _active or field not in _FIELD_NAMES:
+        return
+    if _is_field_baseline(field, getattr(node, field)):
+        return
+    _capture_field(node, field)
+    _count("touch." + field)
 
 
 def reset(*, clear_counts: bool = False) -> None:

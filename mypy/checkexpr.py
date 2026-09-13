@@ -14,7 +14,16 @@ from typing_extensions import assert_never
 
 import mypy.checker
 import mypy.errorcodes as codes
-from mypy import applytype, erasetype, join, message_registry, nodes, operators, types
+from mypy import (
+    applytype,
+    erasetype,
+    join,
+    message_registry,
+    nodes,
+    nodes_mirror,
+    operators,
+    types,
+)
 from mypy.argmap import ArgTypeExpander, map_actuals_to_formals, map_formals_to_actuals
 from mypy.checker_shared import ExpressionCheckerSharedApi
 from mypy.checkmember import analyze_member_access, has_operator
@@ -5792,6 +5801,11 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
             else:
                 result = join.join_types(result, sub_result)
 
+        # G1.0b (#1576): the appends above mutate a list in place, which
+        # the shadow's patched __setattr__ cannot observe; record the
+        # final method_types once per visited comparison.
+        if e.method_types:
+            nodes_mirror.touch(e, "method_types")
         assert result is not None
         return result
 

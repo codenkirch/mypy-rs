@@ -48,6 +48,7 @@ from mypy.nodes import (
     BytesExpr,
     CallExpr,
     CastExpr,
+    ComparisonExpr,
     Context,
     Decorator,
     DictExpr,
@@ -62,6 +63,7 @@ from mypy.nodes import (
     MemberExpr,
     MypyFile,
     NameExpr,
+    NotParsed,
     OpExpr,
     OverloadedFuncDef,
     PlaceholderNode,
@@ -57997,3 +57999,200 @@ class NativeAstMirrorSuite(Suite):
 
         assert Options().native_ast_mirror is False
         assert "native_ast_mirror" not in OPTIONS_AFFECTING_CACHE
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeAstMirrorFieldSuite(Suite):
+    """Unit tests for the G1.0b remaining expression fields (#1576).
+
+    Every G1.0b field is exercised through the same capture path a build
+    uses (class-level `__setattr__` for assignments, `nodes_mirror.touch`
+    for the append-only `method_types`), plus one direct seam call per
+    capture wrapper. The store stays capture-only: Python remains
+    authoritative and no test reads a field back through the node.
+    """
+
+    def setUp(self) -> None:
+        import type_kernel as kernel
+
+        from mypy import nodes_mirror
+
+        nodes_mirror.activate(audit=True)
+        nodes_mirror.reset(clear_counts=True)
+        self._k = kernel
+        self._m = nodes_mirror
+        self.fx = TypeFixture()
+
+    def tearDown(self) -> None:
+        self._m.reset(clear_counts=True)
+
+    def _handle(self, node: Any) -> int:
+        handle = self._m._NODE_HANDLES.get(id(node))
+        assert handle is not None, "node was not adopted by the shadow"
+        return handle
+
+    def _field(self, node: Any, field: str) -> Any:
+        return self._k.rust_node_mirror_field(self._handle(node), field)
+
+    def _delta(self, before: dict[str, int]) -> dict[str, int]:
+        after = self._m.report()
+        return {k: v - before.get(k, 0) for k, v in after.items() if v != before.get(k, 0)}
+
+    def test_op_expr_fields_capture(self) -> None:
+        op = OpExpr("+", NameExpr("a"), NameExpr("b"))
+        op.method_type = self.fx.a
+        op.right_always = True
+        op.right_unreachable = True
+        op.as_type = self.fx.a
+        assert self._field(op, "method_type") == ("kind", "Instance")
+        assert self._field(op, "right_always") == ("flag", True)
+        assert self._field(op, "right_unreachable") == ("flag", True)
+        assert self._field(op, "as_type") == ("kind", "Instance")
+        assert self._k.rust_node_mirror_fields(self._handle(op)) == [
+            "as_type",
+            "method_type",
+            "right_always",
+            "right_unreachable",
+        ]
+
+    def test_op_expr_cleared_kind_stays_present(self) -> None:
+        op = OpExpr("|", NameExpr("a"), NameExpr("b"))
+        op.as_type = None
+        # A cleared slot is a captured write, not a missing record.
+        assert self._field(op, "as_type") == ("kind", None)
+        assert self._field(op, "method_type") is None
+
+    def test_comparison_method_types_touch(self) -> None:
+        cmp = ComparisonExpr(["<"], [NameExpr("a"), NameExpr("b")])
+        # The append alone is invisible to the shadow (list mutation).
+        cmp.method_types.append(self.fx.a)
+        assert id(cmp) not in self._m._NODE_HANDLES
+        cmp.method_types.append(None)
+        self._m.touch(cmp, "method_types")
+        assert self._field(cmp, "method_types") == ("kinds", ["Instance", None])
+        assert self._m.report().get("touch.method_types", 0) >= 1
+
+    def test_comparison_without_appends_stays_unadopted(self) -> None:
+        cmp = ComparisonExpr(["in"], [NameExpr("a"), NameExpr("b")])
+        self._m.touch(cmp, "method_types")
+        assert id(cmp) not in self._m._NODE_HANDLES
+
+    def test_unary_method_type_capture(self) -> None:
+        expr = UnaryExpr("-", NameExpr("a"))
+        expr.method_type = self.fx.a
+        assert self._field(expr, "method_type") == ("kind", "Instance")
+
+    def test_index_method_type_and_as_type_capture(self) -> None:
+        expr = IndexExpr(NameExpr("a"), NameExpr("b"))
+        expr.method_type = self.fx.a
+        expr.as_type = AnyType(TypeOfAny.explicit)
+        assert self._field(expr, "method_type") == ("kind", "Instance")
+        assert self._field(expr, "as_type") == ("kind", "AnyType")
+
+    def test_str_as_type_capture(self) -> None:
+        expr = StrExpr("List[int]")
+        expr.as_type = self.fx.a
+        assert self._field(expr, "as_type") == ("kind", "Instance")
+        expr.as_type = None
+        assert self._field(expr, "as_type") == ("kind", None)
+
+    def test_member_def_var_capture_and_clear(self) -> None:
+        target = Var("v")
+        target._fullname = "mod.v"
+        expr = MemberExpr(NameExpr("self"), "v")
+        expr.def_var = target
+        assert self._field(expr, "def_var") == ("name", "mod.v")
+        expr.def_var = None
+        assert self._field(expr, "def_var") == ("name", None)
+
+    def test_ref_expr_flags_capture(self) -> None:
+        expr = NameExpr("x")
+        expr.is_special_form = True
+        expr.is_alias_rvalue = True
+        expr.type_guard = self.fx.a
+        expr.type_is = AnyType(TypeOfAny.explicit)
+        assert self._field(expr, "is_special_form") == ("flag", True)
+        assert self._field(expr, "is_alias_rvalue") == ("flag", True)
+        assert self._field(expr, "type_guard") == ("kind", "Instance")
+        assert self._field(expr, "type_is") == ("kind", "AnyType")
+
+    def test_fields_merge_with_ref_record(self) -> None:
+        expr = NameExpr("x")
+        expr.kind = GDEF
+        expr.is_alias_rvalue = True
+        expr.type_guard = self.fx.a
+        handle = self._handle(expr)
+        assert self._k.rust_node_mirror_ref(handle) == (GDEF, None, "", False, False)
+        assert self._k.rust_node_mirror_fields(handle) == ["is_alias_rvalue", "type_guard"]
+        assert self._k.rust_node_mirror_captures(handle) == (1, 0)
+        assert self._k.rust_node_mirror_field_captures(handle) == 2
+        assert self._k.rust_node_mirror_entry_count() == 1
+
+    def test_baseline_field_writes_do_not_adopt(self) -> None:
+        op = OpExpr("+", NameExpr("a"), NameExpr("b"))
+        op.method_type = None
+        op.right_always = False
+        op.right_unreachable = False
+        op.as_type = NotParsed.VALUE
+        cmp = ComparisonExpr(["<"], [NameExpr("a"), NameExpr("b")])
+        cmp.method_types = []
+        member = MemberExpr(NameExpr("self"), "v")
+        member.def_var = None
+        expr = NameExpr("x")
+        expr.is_special_form = False
+        expr.is_alias_rvalue = False
+        expr.type_guard = None
+        expr.type_is = None
+        assert id(op) not in self._m._NODE_HANDLES
+        assert id(cmp) not in self._m._NODE_HANDLES
+        assert id(member) not in self._m._NODE_HANDLES
+        assert id(expr) not in self._m._NODE_HANDLES
+        assert self._k.rust_node_mirror_entry_count() == 0
+
+    def test_touch_unknown_field_is_a_noop(self) -> None:
+        expr = NameExpr("x")
+        self._m.touch(expr, "not_a_shadowed_field")
+        assert id(expr) not in self._m._NODE_HANDLES
+
+    def test_direct_capture_assertion(self) -> None:
+        expr = NameExpr("x")
+        handle = self._k.rust_node_mirror_capture_field_kind(expr, "method_type", "CallableType")
+        assert self._k.rust_node_mirror_field(handle, "method_type") == ("kind", "CallableType")
+        assert self._k.rust_node_mirror_fields(handle) == ["method_type"]
+        assert self._k.rust_node_mirror_field_captures(handle) == 1
+        assert self._k.rust_node_mirror_capture_flag(expr, "right_always", True) == handle
+        assert self._k.rust_node_mirror_capture_field_name(expr, "def_var", None) == handle
+        assert self._k.rust_node_mirror_capture_field_kinds(expr, "method_types", [None]) == handle
+        assert self._k.rust_node_mirror_field(handle, "def_var") == ("name", None)
+        assert self._k.rust_node_mirror_field(handle, "method_types") == ("kinds", [None])
+        assert self._k.rust_node_mirror_field_captures(handle) == 4
+        assert self._k.rust_node_mirror_field(handle, "unknown") is None
+        assert self._k.rust_node_mirror_field(handle + 1, "method_type") is None
+        assert self._k.rust_node_mirror_fields(handle + 1) is None
+        assert self._k.rust_node_mirror_field_captures(handle + 1) is None
+
+    def test_gate_off_leaves_new_fields_untouched(self) -> None:
+        expr = UnaryExpr("-", NameExpr("a"))
+        self._m._active = False
+        try:
+            expr.method_type = self.fx.a
+            assert id(expr) not in self._m._NODE_HANDLES
+            assert self._k.rust_node_mirror_entry_count() == 0
+            assert expr.method_type is self.fx.a
+        finally:
+            self._m._active = True
+
+    def test_capture_failure_does_not_break_field_write(self) -> None:
+        expr = StrExpr("x")
+        original = self._k.rust_node_mirror_capture_field_kind
+
+        def boom(*args: Any, **kwargs: Any) -> None:
+            raise RuntimeError("kernel down")
+
+        self._k.rust_node_mirror_capture_field_kind = boom  # type: ignore[assignment]
+        try:
+            expr.as_type = self.fx.a
+            assert expr.as_type is self.fx.a
+            assert self._m.report().get("capture_fail.as_type", 0) >= 1
+        finally:
+            self._k.rust_node_mirror_capture_field_kind = original

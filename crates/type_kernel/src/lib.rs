@@ -3506,5 +3506,36 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         module
     )?)?;
 
+    // Phase G1.0b (#1576): per-field records for the remaining G1
+    // expression analysis fields. Capture-only, same identity handles.
+    module.add_function(wrap_pyfunction!(
+        node_mirror::rust_node_mirror_capture_field_kind,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        node_mirror::rust_node_mirror_capture_flag,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        node_mirror::rust_node_mirror_capture_field_name,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        node_mirror::rust_node_mirror_capture_field_kinds,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        node_mirror::rust_node_mirror_field,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        node_mirror::rust_node_mirror_fields,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        node_mirror::rust_node_mirror_field_captures,
+        module
+    )?)?;
+
     Ok(())
 }

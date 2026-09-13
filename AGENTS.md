@@ -4230,6 +4230,40 @@ including:
   fine-grained 747/27 + daemon 38 with the shadow on; testgraph 12,
   merge 41/1, diff 79 with the shadow on; cold self-check clean 351
   (350 + `mypy/nodes_mirror.py`).
+- wave 71A remaining expression shadow fields + G1.1 read-channel design
+  (G1.0b, issue #1576): extends the #1572 node shadow, still record-only.
+  New per-field records on the same `NodeShadow` (`HashMap<String,
+  FieldValue>`: kind / flag / name / kinds variants) behind
+  `rust_node_mirror_capture_field_kind` / `_flag` / `_field_name` /
+  `_field_kinds` and the `rust_node_mirror_field` / `_fields` /
+  `_field_captures` readers. Captured: `method_type` (Op/Index/Unary),
+  `method_types` (Comparison), `as_type` (Op/Index/Str),
+  `right_always`/`right_unreachable` (Op), `def_var` (Member), the
+  RefExpr/NameExpr `is_special_form`/`is_alias_rvalue`/`type_guard`/
+  `type_is` flags; type-valued fields record the value class name, flags
+  the bool, `def_var` the target fullname, `method_types` the per-item
+  class list. `ComparisonExpr`/`StrExpr`/`UnaryExpr` join the patched
+  `__setattr__` class list (`NameExpr`/`MemberExpr` already route through
+  the `RefExpr` patch); the append-only `method_types` list is invisible
+  to `__setattr__`, so `visit_comparison_expr` records it once after the
+  loop via the new `nodes_mirror.touch` hook (empty-list no-op keeps
+  lazy adoption). Same strong pins, identity namespace and reset
+  contract as G1.0a; no read flip, option stays default-off and absent
+  from `OPTIONS_AFFECTING_CACHE`. PR body documents the G1.1 read
+  channel (first consumer reads `rust_node_mirror_field(handle, field)`;
+  G1.1 extends type-valued records with F2 wire bytes on the same
+  handle, Python stays authoritative). Engagement audit on a synthetic
+  cold build (env-gated `MYPY_TK_AST_MIRROR_AUDIT`, stripped):
+  `capture_method_type` 4 (incl. checker.py:6701), `touch.method_types`
+  715, `capture_as_type` 1363, `capture_def_var` 1,
+  `capture_is_alias_rvalue` 143, `capture_is_special_form` 1427,
+  `capture_right_always` 106, `capture_right_unreachable` 90,
+  `capture_type_guard` 1, `capture_type_is` 1, 0 capture failures.
+  Tests: `NativeAstMirrorFieldSuite` (+15 Python) and
+  `node_field_shadow_tests` (+8 Rust). Gates: cargo type_kernel
+  2,806/11, fmt + clippy `-D warnings` clean; testtypes 3,451/7;
+  testcheck 8,198/15/7/0 exact shadow off and on; fine-grained 747/27 +
+  daemon 38 shadow-on; cold self-check clean 351.
 
 ## Pull Requests
 
