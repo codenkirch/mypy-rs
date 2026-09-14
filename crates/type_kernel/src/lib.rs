@@ -3731,6 +3731,10 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         symtable_mirror::rust_symtable_mirror_meta_entry_count,
         module
     )?)?;
+    module.add_function(wrap_pyfunction!(
+        checker_functions::rust_classify_unbound_return_typevar,
+        module
+    )?)?;
 
     Ok(())
 }

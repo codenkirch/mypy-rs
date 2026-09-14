@@ -60919,3 +60919,176 @@ class NativeIsLiteralEnumSuite(Suite):
         off = self._with_gate(False, check)
         on = self._with_gate(True, check)
         assert_equal(on, off, "is_literal_enum parity: None types")
+
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeUnboundReturnTypevarSuite(Suite):
+    """Parity for the Rust `check_unbound_return_typevar` port (H1l).
+
+    `TypeChecker.check_unbound_return_typevar` (checker.py:2827) fails
+    when the return TypeVar is declared in `variables` but does not
+    appear in any argument type. The Rust seam
+    (`rust_classify_unbound_return_typevar`) decodes the wire
+    `CallableType`, checks whether `ret_type` is a `TypeVarType`
+    present in `variables`, and walks `arg_types` collecting all
+    `TypeVarType` ids (mirroring `CollectArgTypeVarTypes`). Returns
+    `Some(0)` = pass, `Some(1)` = fail + no note (upper bound is
+    `builtins.object`), `Some(2)` = fail + note, `None` = defer.
+    """
+
+    def setUp(self) -> None:
+        from mypy.checker import _set_native_checker_active
+
+        self._set_active = _set_native_checker_active
+        self._set_active(True)
+        self.fx = TypeFixture()
+
+    def tearDown(self) -> None:
+        self._set_active(False)
+
+    def _with_gate(self, active: bool, fn: Callable[[], T]) -> T:
+        self._set_active(active)
+        try:
+            return fn()
+        finally:
+            self._set_active(True)
+
+    def _wire(self, t: Type) -> bytes:
+        from mypy.checker import _serialize_type_for_checker
+
+        return _serialize_type_for_checker(t)
+
+    def _seam(self, typ: CallableType) -> int | None:
+        return _type_kernel.rust_classify_unbound_return_typevar(self._wire(typ))
+
+    def _run(self, typ: CallableType) -> tuple[list[str], list[str]]:
+        from mypy.checker import TypeChecker
+        from mypy.options import Options
+
+        def run_one() -> list[str]:
+            chk = TypeChecker.__new__(TypeChecker)
+            chk.options = Options()
+            records: list[str] = []
+
+            chk.fail = lambda msg, _ctx, **_kw: records.append(  # type: ignore[assignment]
+                str(msg)
+            )
+            chk.note = lambda msg, context, **_kw: records.append(  # type: ignore[method-assign]
+                str(msg)
+            )
+            chk.check_unbound_return_typevar(typ)
+            return records
+
+        off = self._with_gate(False, run_one)
+        on = self._with_gate(True, run_one)
+        return off, on
+
+    def _make_tvar(self, name: str = "T", uid: int = -1) -> TypeVarType:
+        return TypeVarType(
+            name, name, TypeVarId(uid), [], self.fx.o,
+            AnyType(TypeOfAny.from_omitted_generics),
+        )
+
+    def _make_callable(
+        self, ret: Type, args: list[Type], variables: list[TypeVarType]
+    ) -> CallableType:
+        return CallableType(
+            args,
+            [ARG_POS] * len(args),
+            [None] * len(args),
+            ret,
+            self.fx.function,
+            name=None,
+            variables=variables,
+        )
+
+    # -- direct seam tests --
+
+    def test_seam_pass_ret_not_tvar(self) -> None:
+        ct = self._make_callable(self.fx.a, [self.fx.a], [])
+        assert self._seam(ct) == 0
+
+    def test_seam_pass_tvar_not_in_variables(self) -> None:
+        t = self._make_tvar()
+        ct = self._make_callable(t, [self.fx.a], [])
+        assert self._seam(ct) == 0
+
+    def test_seam_pass_tvar_in_args(self) -> None:
+        t = self._make_tvar()
+        ct = self._make_callable(t, [t], [t])
+        assert self._seam(ct) == 0
+
+    def test_seam_pass_tvar_nested_in_args(self) -> None:
+        t = self._make_tvar()
+        ct = self._make_callable(
+            t, [Instance(self.fx.oi, [t])], [t]
+        )
+        assert self._seam(ct) == 0
+
+    def test_seam_fail_object_bound(self) -> None:
+        t = self._make_tvar()
+        ct = self._make_callable(t, [self.fx.a], [t])
+        assert self._seam(ct) == 1
+
+    def test_seam_fail_non_object_bound(self) -> None:
+        t = TypeVarType(
+            "T", "T", TypeVarId(-1), [], self.fx.str_type,
+            AnyType(TypeOfAny.from_omitted_generics),
+        )
+        ct = self._make_callable(t, [self.fx.a], [t])
+        assert self._seam(ct) == 2
+
+    def test_seam_defers_on_bad_wire(self) -> None:
+        assert _type_kernel.rust_classify_unbound_return_typevar(b"\xff\xff\xff") is None
+
+    # -- gate off/on parity --
+
+    def test_parity_pass_not_tvar(self) -> None:
+        ct = self._make_callable(self.fx.a, [self.fx.a], [])
+        off, on = self._run(ct)
+        assert_equal(on, off, "parity: non-tvar return")
+        assert off == []
+
+    def test_parity_pass_tvar_not_in_variables(self) -> None:
+        t = self._make_tvar()
+        ct = self._make_callable(t, [self.fx.a], [])
+        off, on = self._run(ct)
+        assert_equal(on, off, "parity: tvar not in variables")
+        assert off == []
+
+    def test_parity_pass_tvar_in_args(self) -> None:
+        t = self._make_tvar()
+        ct = self._make_callable(t, [t], [t])
+        off, on = self._run(ct)
+        assert_equal(on, off, "parity: tvar in args")
+        assert off == []
+
+    def test_parity_fail_object_bound(self) -> None:
+        t = self._make_tvar()
+        ct = self._make_callable(t, [self.fx.a], [t])
+        off, on = self._run(ct)
+        assert_equal(on, off, "parity: fail object bound")
+        assert len(off) == 1
+        assert "TypeVar should receive" in off[0]
+
+    def test_parity_fail_non_object_bound(self) -> None:
+        t = TypeVarType(
+            "T", "T", TypeVarId(-1), [], self.fx.str_type,
+            AnyType(TypeOfAny.from_omitted_generics),
+        )
+        ct = self._make_callable(t, [self.fx.a], [t])
+        off, on = self._run(ct)
+        assert_equal(on, off, "parity: fail non-object bound")
+        assert len(off) == 2
+        assert "TypeVar should receive" in off[0]
+        assert "upper bound" in off[1]
+
+    def test_parity_pass_tvar_nested_in_args(self) -> None:
+        t = self._make_tvar()
+        ct = self._make_callable(
+            t, [Instance(self.fx.oi, [t])], [t]
+        )
+        off, on = self._run(ct)
+        assert_equal(on, off, "parity: tvar nested in args")
+        assert off == []

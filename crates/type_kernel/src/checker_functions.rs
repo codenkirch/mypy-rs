@@ -6203,3 +6203,234 @@ pub(crate) fn rust_is_literal_enum(
         .is_true()?;
     Ok(Some(is_equal))
 }
+
+/// `TypeChecker.check_unbound_return_typevar` (checker.py:2821-2840):
+/// fails when the return typevar is not defined in arguments.
+///
+/// Wire input: the serialized `CallableType`. Rust extracts `ret_type`,
+/// `arg_types`, and `variables`. If `ret_type` is a `TypeVarType` whose
+/// id matches one in `variables`, Rust walks `arg_types` collecting all
+/// `TypeVarType` ids (recursive, mirroring `CollectArgTypeVarTypes`).
+/// If the ret_type id is NOT among them, the typevar is unbound.
+///
+/// Returns `Some(0)` = pass, `Some(1)` = fail (upper bound is
+/// `builtins.object`, no note), `Some(2)` = fail + note (upper bound
+/// is not object), `None` = defer (undecodable wire).
+#[pyfunction]
+pub(crate) fn rust_classify_unbound_return_typevar(type_bytes: &[u8]) -> PyResult<Option<i64>> {
+    let typ = match crate::checkmember::decode_type(type_bytes) {
+        Some(t) => t,
+        None => return Ok(None),
+    };
+    Ok(classify_unbound_return_typevar_inner(&typ))
+}
+
+fn classify_unbound_return_typevar_inner(typ: &Type) -> Option<i64> {
+    let callable = match typ {
+        Type::CallableType {
+            ret_type,
+            arg_types,
+            variables,
+            ..
+        } => (ret_type, arg_types, variables),
+        _ => return Some(0),
+    };
+    let (ret_type, arg_types, variables) = callable;
+
+    let ret_tvar = match &**ret_type {
+        Type::TypeVarType {
+            raw_id,
+            namespace,
+            meta_level,
+            ..
+        } => (*raw_id, *meta_level, namespace.as_str()),
+        _ => return Some(0),
+    };
+
+    let in_variables = variables.iter().any(|v| match v {
+        Type::TypeVarType {
+            raw_id,
+            namespace,
+            meta_level,
+            ..
+        } => *raw_id == ret_tvar.0 && *meta_level == ret_tvar.1 && namespace.as_str() == ret_tvar.2,
+        _ => false,
+    });
+    if !in_variables {
+        return Some(0);
+    }
+
+    let mut arg_tvar_ids: Vec<(i64, i64, &str)> = Vec::new();
+    for arg in arg_types.iter() {
+        collect_typevar_ids(arg, &mut arg_tvar_ids);
+    }
+
+    let in_args = arg_tvar_ids
+        .iter()
+        .any(|(r, m, ns)| *r == ret_tvar.0 && *m == ret_tvar.1 && *ns == ret_tvar.2);
+    if in_args {
+        return Some(0);
+    }
+
+    match &**ret_type {
+        Type::TypeVarType { upper_bound, .. } => {
+            let proper = crate::checker_helpers::get_proper_or_none(upper_bound);
+            match proper {
+                Some(Type::Instance { type_ref, .. }) => {
+                    if type_ref == "builtins.object" {
+                        Some(1)
+                    } else {
+                        Some(2)
+                    }
+                }
+                _ => Some(2),
+            }
+        }
+        _ => Some(1),
+    }
+}
+
+fn collect_typevar_ids<'a>(typ: &'a Type, ids: &mut Vec<(i64, i64, &'a str)>) {
+    if let Type::TypeVarType {
+        raw_id,
+        meta_level,
+        namespace,
+        ..
+    } = typ
+    {
+        ids.push((*raw_id, *meta_level, namespace.as_str()));
+    }
+    visit_children_for_tvar(typ, ids);
+}
+
+fn visit_children_for_tvar<'a>(typ: &'a Type, ids: &mut Vec<(i64, i64, &'a str)>) {
+    match typ {
+        Type::TypeVarType {
+            values,
+            upper_bound,
+            default,
+            ..
+        } => {
+            for v in values.iter() {
+                collect_typevar_ids(v, ids);
+            }
+            collect_typevar_ids(upper_bound, ids);
+            collect_typevar_ids(default, ids);
+        }
+        Type::Instance { args, .. }
+        | Type::TypeAliasType { args, .. }
+        | Type::UnboundType { args, .. } => {
+            for a in args.iter() {
+                collect_typevar_ids(a, ids);
+            }
+        }
+        Type::AnyType {
+            source_any: Some(src),
+            ..
+        } => {
+            collect_typevar_ids(src, ids);
+        }
+        Type::AnyType {
+            source_any: None, ..
+        } => {}
+        Type::CallableType {
+            fallback,
+            instance_type,
+            arg_types,
+            ret_type,
+            variables,
+            type_guard,
+            type_is,
+            ..
+        } => {
+            collect_typevar_ids(fallback, ids);
+            if let Some(it) = instance_type {
+                collect_typevar_ids(it, ids);
+            }
+            for a in arg_types.iter() {
+                collect_typevar_ids(a, ids);
+            }
+            collect_typevar_ids(ret_type, ids);
+            for v in variables.iter() {
+                collect_typevar_ids(v, ids);
+            }
+            if let Some(g) = type_guard {
+                collect_typevar_ids(g, ids);
+            }
+            if let Some(t) = type_is {
+                collect_typevar_ids(t, ids);
+            }
+        }
+        Type::Overloaded { items } => {
+            for i in items.iter() {
+                collect_typevar_ids(i, ids);
+            }
+        }
+        Type::TupleType {
+            items,
+            partial_fallback,
+            ..
+        } => {
+            for i in items.iter() {
+                collect_typevar_ids(i, ids);
+            }
+            collect_typevar_ids(partial_fallback, ids);
+        }
+        Type::TypedDictType {
+            items, fallback, ..
+        } => {
+            for (_, t) in items.iter() {
+                collect_typevar_ids(t, ids);
+            }
+            collect_typevar_ids(fallback, ids);
+        }
+        Type::UnionType { items, .. } => {
+            for i in items.iter() {
+                collect_typevar_ids(i, ids);
+            }
+        }
+        Type::TypeType { item, .. } => {
+            collect_typevar_ids(item, ids);
+        }
+        Type::LiteralType { fallback, .. } => {
+            collect_typevar_ids(fallback, ids);
+        }
+        Type::UnpackType { typ, .. } => {
+            collect_typevar_ids(typ, ids);
+        }
+        Type::ParamSpecType {
+            prefix,
+            upper_bound,
+            default,
+            ..
+        } => {
+            for a in prefix.arg_types.iter() {
+                collect_typevar_ids(a, ids);
+            }
+            for v in prefix.variables.iter() {
+                collect_typevar_ids(v, ids);
+            }
+            collect_typevar_ids(upper_bound, ids);
+            collect_typevar_ids(default, ids);
+        }
+        Type::TypeVarTupleType {
+            tuple_fallback,
+            upper_bound,
+            default,
+            ..
+        } => {
+            collect_typevar_ids(tuple_fallback, ids);
+            collect_typevar_ids(upper_bound, ids);
+            collect_typevar_ids(default, ids);
+        }
+        Type::Parameters(p) => {
+            for a in p.arg_types.iter() {
+                collect_typevar_ids(a, ids);
+            }
+            for v in p.variables.iter() {
+                collect_typevar_ids(v, ids);
+            }
+        }
+        _ => {}
+    }
+}

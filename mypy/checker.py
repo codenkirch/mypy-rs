@@ -410,6 +410,7 @@ try:
         rust_is_assignable_slot as _rust_is_assignable_slot,
         rust_is_noop_for_reachability as _rust_is_noop_for_reachability,
         rust_is_literal_enum as _rust_is_literal_enum,
+        rust_classify_unbound_return_typevar as _rust_classify_unbound_return_typevar,
         rust_narrow_type_by_identity_equality as _rust_narrow_type_by_identity_equality,
         rust_narrow_with_len as _rust_narrow_with_len,
         rust_or_conditional_maps as _rust_or_conditional_maps,
@@ -485,6 +486,7 @@ except ImportError:
     _rust_is_assignable_slot = None  # type: ignore[assignment]
     _rust_is_noop_for_reachability = None  # type: ignore[assignment]
     _rust_is_literal_enum = None  # type: ignore[assignment]
+    _rust_classify_unbound_return_typevar = None  # type: ignore[assignment]
     _rust_is_more_general_arg_prefix = None  # type: ignore[assignment]
     _rust_overload_can_never_match = None  # type: ignore[assignment]
     _rust_is_equality_ambiguous_for_narrowing = None  # type: ignore[assignment]
@@ -2828,6 +2830,30 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
 
     def check_unbound_return_typevar(self, typ: CallableType) -> None:
         """Fails when the return typevar is not defined in arguments."""
+        if (
+            _CHECKER_HAS_TYPE_KERNEL
+            and _native_checker_active
+            and _rust_classify_unbound_return_typevar is not None
+        ):
+            try:
+                tag = _rust_classify_unbound_return_typevar(
+                    _serialize_type_for_checker(typ)
+                )
+                if tag is not None:
+                    if tag == 0:
+                        return
+                    self.fail(message_registry.UNBOUND_TYPEVAR, typ.ret_type, code=TYPE_VAR)
+                    if tag == 2:
+                        assert isinstance(typ.ret_type, TypeVarType)
+                        self.note(
+                            "Consider using the upper bound "
+                            f"{format_type(typ.ret_type.upper_bound, self.options)} instead",
+                            context=typ.ret_type,
+                            code=TYPE_VAR,
+                        )
+                    return
+            except (AssertionError, NotImplementedError, ValueError, TypeError):
+                pass
         if isinstance(typ.ret_type, TypeVarType) and typ.ret_type in typ.variables:
             arg_type_visitor = CollectArgTypeVarTypes()
             for argtype in typ.arg_types:
