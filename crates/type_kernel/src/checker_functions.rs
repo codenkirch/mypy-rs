@@ -1584,6 +1584,53 @@ pub(crate) fn check_match_args_inner(typ: &Type) -> Option<bool> {
     None
 }
 
+/// `TypeChecker.is_valid_defaultdict_partial_value_type`
+/// (checker.py:6295-6318): a wire-type bool predicate. Rust decodes the
+/// proper type, returns `Some(false)` for non-Instance, `Some(true)` for
+/// 0-arg Instance, and for 1-arg Instance checks the arg proper type is
+/// `UninhabitedType` or `NoneType` (plus `TypeVarType` when
+/// `old_type_inference` is True), else `Some(false)`. `Some(false)` for
+/// 2+ args. Defers (`None`) on a `TypeAliasType` arg that cannot be
+/// resolved.
+#[pyfunction]
+pub(crate) fn rust_is_valid_defaultdict_partial_value_type(
+    type_bytes: &[u8],
+    old_type_inference: bool,
+) -> PyResult<Option<bool>> {
+    let typ = match crate::checkmember::decode_type(type_bytes) {
+        Some(t) => t,
+        None => return Ok(None),
+    };
+    Ok(is_valid_defaultdict_partial_value_type_inner(
+        &typ,
+        old_type_inference,
+    ))
+}
+
+fn is_valid_defaultdict_partial_value_type_inner(
+    typ: &Type,
+    old_type_inference: bool,
+) -> Option<bool> {
+    let proper = crate::checker_helpers::get_proper_or_none(typ)?;
+    let args = match proper {
+        Type::Instance { args, .. } => args,
+        _ => return Some(false),
+    };
+    if args.is_empty() {
+        return Some(true);
+    }
+    if args.len() == 1 {
+        let arg = crate::checker_helpers::get_proper_or_none(&args[0])?;
+        let allowed = match arg {
+            Type::UninhabitedType { .. } | Type::NoneType => true,
+            Type::TypeVarType { .. } => old_type_inference,
+            _ => false,
+        };
+        return Some(allowed);
+    }
+    Some(false)
+}
+
 #[cfg(test)]
 mod match_args_tests {
     use super::*;

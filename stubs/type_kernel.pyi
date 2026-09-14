@@ -235,6 +235,7 @@ __all__ = [
     "rust_check_for_untyped_decorator",
     "rust_check_explicit_override_decorator",
     "rust_check_match_args",
+    "rust_is_valid_defaultdict_partial_value_type",
     "rust_classify_comparison_operands",
     "rust_classify_type_check_raise",
     "rust_classify_type_range",
@@ -949,6 +950,9 @@ def rust_check_for_untyped_decorator(
 ) -> bool | None: ...
 def rust_check_explicit_override_decorator(defn: Any, found_method_base_classes: Any) -> bool: ...
 def rust_check_match_args(type_bytes: bytes) -> bool | None: ...
+def rust_is_valid_defaultdict_partial_value_type(
+    type_bytes: bytes, old_type_inference: bool
+) -> bool | None: ...
 def rust_classify_find_isinstance_head(
     callee: Any, args_len: int, literal_ok: bool
 ) -> int | None: ...

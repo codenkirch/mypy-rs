@@ -4517,6 +4517,21 @@ including:
   skipped, testcheck 8144 passed/69 skipped/7 xfailed, cold self-check
   clean.
 
+- wave 75 H1g native is_valid_defaultdict_partial_value_type (issue
+  #1606): the Rust seam in `checker_functions.rs` mirrors
+  `TypeChecker.is_valid_defaultdict_partial_value_type`
+  (checker.py:6295-6318) as a wire-type bool predicate. Rust decodes
+  the proper type, returns `Some(false)` for non-Instance, `Some(true)`
+  for 0-arg Instance, and for 1-arg Instance checks the arg proper type
+  is `UninhabitedType` or `NoneType` (plus `TypeVarType` when
+  `old_type_inference` is True), else `Some(false)`. `Some(false)` for
+  2+ args. Defers (`None`) on a `TypeAliasType` arg that cannot be
+  resolved. Gated by `_native_checker_active` (existing wiring, no
+  build.py change) and covered by
+  `NativeIsValidDefaultDictPartialValueTypeSuite` in
+  `mypy/test/testtypes.py` (9 direct seam calls + 8 gate-off vs gate-on
+  parity differentials).
+
 - `rust_is_defined_in_base_class` (issue #1601, mypy.checker) — mirrors
   `TypeChecker.is_defined_in_base_class` (checker.py:10168-10173): a pure
   bool predicate over a live `Var`. Returns `False` when `var.info` is

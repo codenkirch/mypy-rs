@@ -405,6 +405,7 @@ try:
         rust_is_writable_attribute as _rust_is_writable_attribute,
         rust_is_defined_in_base_class as _rust_is_defined_in_base_class,
         rust_is_definition as _rust_is_definition,
+        rust_is_valid_defaultdict_partial_value_type as _rust_is_valid_defaultdict_partial_value_type,
         rust_narrow_type_by_identity_equality as _rust_narrow_type_by_identity_equality,
         rust_narrow_with_len as _rust_narrow_with_len,
         rust_or_conditional_maps as _rust_or_conditional_maps,
@@ -475,6 +476,7 @@ except ImportError:
     _rust_is_writable_attribute = None  # type: ignore[assignment]
     _rust_is_defined_in_base_class = None  # type: ignore[assignment]
     _rust_is_definition = None  # type: ignore[assignment]
+    _rust_is_valid_defaultdict_partial_value_type = None  # type: ignore[assignment]
     _rust_is_more_general_arg_prefix = None  # type: ignore[assignment]
     _rust_overload_can_never_match = None  # type: ignore[assignment]
     _rust_is_equality_ambiguous_for_narrowing = None  # type: ignore[assignment]
@@ -6311,6 +6313,16 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
           * t is 'dict[...]' --> False (only generic types with a single type
             argument supported)
         """
+        if _rust_is_valid_defaultdict_partial_value_type is not None:
+            try:
+                result = _rust_is_valid_defaultdict_partial_value_type(
+                    _serialize_type_for_checker(t),
+                    self.options.old_type_inference,
+                )
+                if result is not None:
+                    return result
+            except Exception:
+                pass
         if not isinstance(t, Instance):
             return False
         if len(t.args) == 0:

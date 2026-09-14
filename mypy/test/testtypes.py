@@ -60267,3 +60267,134 @@ class NativeBinderFrameSuite(Suite):
             from mypy.binder import Frame
             b.update_from_options([Frame(99)])
             assert b.is_unreachable() is False
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeIsValidDefaultDictPartialValueTypeSuite(Suite):
+    """Parity for the Rust `is_valid_defaultdict_partial_value_type` port
+    (H1g).
+
+    `TypeChecker.is_valid_defaultdict_partial_value_type`
+    (checker.py:6295-6318) checks whether a proper type can be used as the
+    basis for a partial defaultdict value type. The Rust port
+    (`checker_functions.rs`) decodes the wire type and returns the bool;
+    the `old_type_inference` flag is passed from Python.
+
+    Direct seam calls assert the bool and the None deferrals; the
+    gate-off vs gate-on differential drives the real TypeChecker method
+    through a stub checker with mock options.
+    """
+
+    def setUp(self) -> None:
+        from mypy.checker import _set_native_checker_active
+
+        self._set_active = _set_native_checker_active
+        self._set_active(True)
+        self.fx = TypeFixture()
+
+    def tearDown(self) -> None:
+        self._set_active(False)
+
+    def _with_gate(self, active: bool, fn: Callable[[], T]) -> T:
+        self._set_active(active)
+        try:
+            return fn()
+        finally:
+            self._set_active(True)
+
+    def _seam(self, t: Type, old_type_inference: bool = False) -> Any:
+        from mypy.checker import _serialize_type_for_checker
+
+        return _type_kernel.rust_is_valid_defaultdict_partial_value_type(
+            _serialize_type_for_checker(t), old_type_inference
+        )
+
+    def _run(self, t: ProperType, old_type_inference: bool = False) -> tuple[bool, bool]:
+        from unittest.mock import Mock
+
+        from mypy.checker import TypeChecker
+
+        def check_one() -> bool:
+            chk = TypeChecker.__new__(TypeChecker)
+            chk.options = Mock()
+            chk.options.old_type_inference = old_type_inference
+            return chk.is_valid_defaultdict_partial_value_type(t)
+
+        off = self._with_gate(False, check_one)
+        on = self._with_gate(True, check_one)
+        return off, on
+
+    def _assert_par(self, t: ProperType, old_type_inference: bool = False) -> None:
+        off, on = self._run(t, old_type_inference)
+        assert_equal(on, off, f"parity for t={t!r} old={old_type_inference}")
+
+    # --- direct seam tests ---
+
+    def test_seam_no_args(self) -> None:
+        assert self._seam(self.fx.o) is True
+
+    def test_seam_one_arg_uninhabited(self) -> None:
+        t = Instance(self.fx.gi, [self.fx.uninhabited])
+        assert self._seam(t) is True
+
+    def test_seam_one_arg_none(self) -> None:
+        t = Instance(self.fx.gi, [self.fx.nonet])
+        assert self._seam(t) is True
+
+    def test_seam_one_arg_typevar_old(self) -> None:
+        t = Instance(self.fx.gi, [self.fx.t])
+        assert self._seam(t, old_type_inference=True) is True
+
+    def test_seam_one_arg_typevar_new(self) -> None:
+        t = Instance(self.fx.gi, [self.fx.t])
+        assert self._seam(t, old_type_inference=False) is False
+
+    def test_seam_one_arg_instance(self) -> None:
+        t = Instance(self.fx.gi, [self.fx.a])
+        assert self._seam(t) is False
+
+    def test_seam_two_args(self) -> None:
+        t = Instance(self.fx.hi, [self.fx.a, self.fx.a])
+        assert self._seam(t) is False
+
+    def test_seam_non_instance(self) -> None:
+        assert self._seam(self.fx.nonet) is False
+
+    def test_seam_type_alias_defers(self) -> None:
+        from mypy.nodes import TypeAlias
+
+        alias = TypeAlias(self.fx.str_type, "mod.A", "mod", -1, -1)
+        t = TypeAliasType(alias, [])
+        assert self._seam(t) is None
+
+    # --- gate-off vs gate-on parity ---
+
+    def test_parity_no_args(self) -> None:
+        self._assert_par(self.fx.o)
+
+    def test_parity_one_arg_uninhabited(self) -> None:
+        t = Instance(self.fx.gi, [self.fx.uninhabited])
+        self._assert_par(t)
+
+    def test_parity_one_arg_none(self) -> None:
+        t = Instance(self.fx.gi, [self.fx.nonet])
+        self._assert_par(t)
+
+    def test_parity_one_arg_typevar_old(self) -> None:
+        t = Instance(self.fx.gi, [self.fx.t])
+        self._assert_par(t, old_type_inference=True)
+
+    def test_parity_one_arg_typevar_new(self) -> None:
+        t = Instance(self.fx.gi, [self.fx.t])
+        self._assert_par(t, old_type_inference=False)
+
+    def test_parity_one_arg_instance(self) -> None:
+        t = Instance(self.fx.gi, [self.fx.a])
+        self._assert_par(t)
+
+    def test_parity_two_args(self) -> None:
+        t = Instance(self.fx.hi, [self.fx.a, self.fx.a])
+        self._assert_par(t)
+
+    def test_parity_non_instance(self) -> None:
+        self._assert_par(self.fx.nonet)
