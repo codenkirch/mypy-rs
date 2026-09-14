@@ -1,5 +1,133 @@
 # Handoff: strangler-fig Rust migration loop (seam-deferral reduction)
 
+## RESUME POINT — 2026-09-14 (mass-migration swarm, stopped mid-flight)
+
+Work was deliberately stopped on 2026-09-14. Five of six dispatched agents
+were cancelled with their worktrees intact, so the sections below are the
+authoritative resume state. Nothing was deleted; no branch was discarded.
+
+### Where `main` stands
+
+`main` = `98d844aee` (docs: backfill AGENTS.md ledger, PR `#1630`), on top of
+`fe173320e` (`#1631` design briefs), `ae0590ece` (`#1617` H1s), `656cddbe3`
+(`#1616` H1r), `f3d1b1dcb` (`#1615` H1q).
+
+Landed today:
+- `#1617` **H1s `rust_is_type_like`** merged (rebased over H1r, 4-file
+  conflict resolved; `IsTypeLike`/`IsSelfMemberRef`/`IsOverloadedItem` 31
+  passed locally; `pr-gate` + all four `parity*` jobs green; local `ocr` gate
+  0 blocking / 2 advisory, both recorded on the PR).
+- `#1597` **closed with evidence** (H1c `rust_check_exit_return_type` was
+  already in `main`; 14 tests re-verified on the current head).
+- `#1630` **ledger backfill merged**: `AGENTS.md` had no records for
+  `G1.1`, `G2.1`-`G2.6`, `H1c`-`H1s` (17 PRs); entries reconstructed from the
+  landed commits with re-verified `file:line` anchors, no invented metrics.
+- `#1631` **design briefs merged**: `docs/plans/2026-09-14-plugin-callback-brief.md`
+  and `docs/plans/2026-09-14-paramspec-variables-brief.md`. `#1622` closed
+  `NOT_PLANNED` with a cost-argued verdict; follow-ups filed: `#1626`
+  (enumerable plugin hook surface), `#1627` (pure `DefaultPlugin` hook
+  bodies, low priority), `#1628` / `#1629` (the two `#1621` slices).
+- `#1249` triaged: the runners API is still `403` for a collaborator token,
+  but PR gates now run **GitHub-hosted `ubuntu-latest`** and are green, so it
+  no longer blocks. Owner action required (re-register with an owner PAT, or
+  retire the self-hosted label in `code-review.yml`).
+- PR `#1638` **open, not merged**: `docs: rank Phase-2 mass-migration vertical
+  slices (#1625)` — the Phase-2 ranking document (454 lines). Its issues were
+  NOT yet filed; the survey was skipped on the resource rule (combined RSS
+  42.8-44.8 GB against the 40 GB cut) so it ranks on an `rg` seam inventory
+  plus cited wave numbers, and says so. Merge or re-run its step 0 first.
+
+### Stopped mid-flight — work preserved on disk
+
+| Workstream | Worktree | Branch | Uncommitted state | Next step |
+|---|---|---|---|---|
+| `#1618` wire `extra_tvars` (+`#1620`) | `worktrees/mypy-rs-1618` | `feature/mv-wire-extra-tvars` | `crates/type_kernel/src/constraints.rs`, `mypy/constraints.py` (+85/-16) | early: the wire record itself is untouched. Extend `wire.rs` + `mypy/types.py` `CallableType`, bump `CACHE_VERSION` in `mypy/cache.py`, then port `callable_with_vars_reachable` (`visitor.rs` ~320-345). |
+| `#1619` snapshot gap | `worktrees/mypy-rs-1619` | `feature/mv-snapshot-live-nominal` | `crates/type_kernel/src/subtypes.rs`, `mypy/build.py` (+374/-3) | substantive. Build, then verify the PEP 695 variance tests stay green (on-demand sealing regressed them before) plus `inst:left_snap_missing` (74) via an env-gated probe. |
+| `#1623` identity contracts | `mypy-rs-wave87-identity` | `feature/mv-identity-contracts` | `mypy/expandtype.py`, `mypy/wirefixup.py`, `mypy/test/testtypes.py` (+293/-60) | substantive. Finish, then run fine-grained + daemon suites (identity regressions live there). Part of the issue's premise is stale — audit before porting. |
+| `#1624` performance | `worktrees/mypy-rs-1624` | `perf/mv-wire-traffic` | no code; audit evidence in `/private/tmp/mypy-rs-1624-audit*.out` | finish the ranked table and post it on `#1624`. Build its own `/private/tmp/mypy-rs-tk-1624` from current source before trusting any kernel-on count. |
+| Phase-2 planning | (none; ran in the main checkout) | `docs/mv-phase2-slices` | committed + pushed; PR `#1638` open | merge `#1638`, then file the ranked slices as issues. |
+
+Cancelled agent transcripts are retained under
+`~/.qwen/projects/-Users-jonathangadeaharder-projects-coding-utils-mypy-rs/subagents/`
+and can be revived with `send_message` against their task ids if the original
+thread is still resident.
+
+**Measurement from the perf audit (load-insensitive counters, one cold
+self-check in the `#1624` worktree at `656cddbe3`):**
+- `mypy.checkexpr.plugin_call_hook_known_absent` 323,014 and
+  `_try_native_plugin_hook` 323,014, plus `plugin_hook_known_absent` 111,346 —
+  an inert hook-probe surface (see invariant 1 below).
+- `_collect_incremental`: 521 calls, 424,094 module visits, 53,563
+  `re_pushed_builtins`, `resolver_build_s = 1.864` — the per-SCC snapshot
+  upkeep cost the perf issue names as root cause (a).
+
+### Queue for the next wave
+
+1. Merge `#1638` (Phase-2 ranking), then file its unblocked slices as issues.
+2. Finish `#1618` first: it is the largest wall (268 defers) and it holds
+   `solve.rs`, which blocks `#1621`.
+3. `#1621` slices `#1628` (expandtype substitution arms) and `#1629`
+   (pass-1-only solve seam split; spike-gated) — both need `#1618` / `#1623`
+   to release their files. `#1621`'s premise was corrected: the wire already
+   carries `variables` (`wire.rs:639`) and `new_unification_variable` is
+   already ported for all three kinds (`freshen.rs:722-800`) — it is a
+   substitution-engine problem, not a wire-format one.
+4. `#1620` items beyond `extra_tvars`: `definition` slot (37
+   `format_type_distinctly` defers), `meta_level` on ParamSpec/TVT ids,
+   `PartialType`, `ErasedType`.
+5. Ledger: append the mass-migration wave entries once their PRs merge. The
+   backfill facts for the older series are staged at
+   `/private/tmp/wave-record-backfill-notes.md`.
+
+### Invariants and gotchas learned 2026-09-14
+
+1. **A user plugin makes every native hook seam inert.** `mypy/build.py:2095`
+   computes `has_user_plugins = len(plugins) > 1` and
+   `mypy/checkexpr.py:504-507` states the consequence: the registry is ignored
+   and all lookups defer to Python, because user plugins may match arbitrary
+   fullnames. `mypy_self_check.ini:22` loads `mypy.plugins.proper_plugin`, so
+   **the gate corpus is a user-plugin corpus**: measured 328,408 inert resolve
+   attempts with 0 usable results. Consequence for planning: hook-path defer
+   numbers measured on the cold self-check are best-case, not what a
+   plugin-using user sees. Tracked as `#1626`.
+2. **The kernel import is all-or-nothing.** `try: from type_kernel import
+   (...)` in `mypy/semanal.py` et al. — a stale `.so` missing one newly added
+   function makes the whole block raise `ImportError` and nulls that entire
+   battery of seams silently. Example: H1s added `rust_is_type_like` to
+   `mypy/semanal.py`'s import list, so any H1r-vintage `.so` now disables
+   every semanal seam. Always rebuild per checkout, into a per-issue scratch
+   dir, and never share one `.so` across worktrees at different commits.
+3. **`ocr-review` never completes** (`#1249`); the operative review gate is
+   `ocr review --from origin/main --to <branch> --audience agent` run from the
+   worktree, and it posts nothing to GitHub. Merge with
+   `gh pr merge --squash --admin` once `pr-gate` + `parity*` are green.
+4. **PR gates run on GitHub-hosted `ubuntu-latest`** now, not the self-hosted
+   label; docs-only diffs skip the `parity*` jobs via path filters and run
+   only `pr-gate`.
+5. **Memory**: with six agents live, combined uid-501 RSS sat at 38-44 GB
+   against the 51 GB cap. Cap `pytest` at `-n2` when more than two agents run
+   heavy suites, and never `-n auto`.
+6. **Worktree hygiene**: per-issue kernel scratch dirs live at
+   `/private/tmp/mypy-rs-local-tk-{1618,1619,1623,1624,h1s,h1r}`; the older
+   shared `local-ast` / `local-resolver` dirs are read-only inputs. Remove a
+   worktree only after its PR merges; `git worktree list` should be clean
+   before finishing.
+
+### Unmerged branches to harvest or discard
+
+```
+feature/mv-wire-extra-tvars      # #1618, uncommitted changes in the worktree
+feature/mv-snapshot-live-nominal # #1619, uncommitted changes in the worktree
+feature/mv-identity-contracts    # #1623, uncommitted changes in the worktree
+perf/mv-wire-traffic             # #1624, no commits (audit artifacts in /tmp)
+docs/mv-phase2-slices            # PR #1638 open
+```
+
+The three `#1618`/`#1619`/`#1623` worktrees hold real, uncommitted work; do not
+`worktree remove --force` them without reading the diff first.
+
+---
+
 *Written 2026-08-28, refreshed 2026-09-11 (post-wave71: waves 52-71
 landed the st find_member/unpack/apply-report ports (#1492, embedded
 112 -> 61), the icf SUBTYPE_OF protocol-actual arm (#1487), the
