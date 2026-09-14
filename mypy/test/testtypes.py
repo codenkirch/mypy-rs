@@ -61854,3 +61854,83 @@ class NativeIsSelfMemberRefSuite(Suite):
         ne.node = self.fx.oi
         me = self._make_member_expr(ne, "x")
         self._assert_par(me)
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeIsTypeLikeSuite(Suite):
+    """Parity for `rust_is_type_like` (H1s).
+
+    `SemanticAnalyzer.is_type_like` (semanal.py:8310) is a pure
+    isinstance check: True for TypeInfo, TypeAlias, or PlaceholderNode
+    with becomes_typeinfo=True.
+    """
+
+    def setUp(self) -> None:
+        from mypy.semanal import _set_native_semanal_active
+
+        self._set_active = _set_native_semanal_active
+        self._set_active(True)
+        self.fx = TypeFixture()
+
+    def tearDown(self) -> None:
+        self._set_active(False)
+
+    def _with_gate(self, active: bool, fn: Callable[[], T]) -> T:
+        self._set_active(active)
+        try:
+            return fn()
+        finally:
+            self._set_active(True)
+
+    def _seam(self, node: Any) -> bool | None:
+        return _type_kernel.rust_is_type_like(node)
+
+    def _run(self, node: Any) -> tuple[bool, bool]:
+        from mypy.semanal import SemanticAnalyzer
+
+        def check_one() -> bool:
+            sa = SemanticAnalyzer.__new__(SemanticAnalyzer)
+            return sa.is_type_like(node)
+
+        off = self._with_gate(False, check_one)
+        on = self._with_gate(True, check_one)
+        return off, on
+
+    def _assert_par(self, node: Any) -> None:
+        off, on = self._run(node)
+        assert_equal(on, off, "is_type_like parity")
+
+    def test_seam_typeinfo(self) -> None:
+        assert self._seam(self.fx.oi) is True
+
+    def test_seam_typealias(self) -> None:
+        alias = TypeAlias(self.fx.a, "mod.A", "mod", -1, -1)
+        assert self._seam(alias) is True
+
+    def test_seam_placeholder_becomes(self) -> None:
+        ph = PlaceholderNode("mod.C", Var("C"), 1, becomes_typeinfo=True)
+        assert self._seam(ph) is True
+
+    def test_seam_placeholder_not_becomes(self) -> None:
+        ph = PlaceholderNode("mod.C", Var("C"), 1, becomes_typeinfo=False)
+        assert self._seam(ph) is False
+
+    def test_seam_var(self) -> None:
+        assert self._seam(Var("x")) is False
+
+    def test_seam_none(self) -> None:
+        assert self._seam(None) is False
+
+    def test_parity_typeinfo(self) -> None:
+        self._assert_par(self.fx.oi)
+
+    def test_parity_typealias(self) -> None:
+        alias = TypeAlias(self.fx.a, "mod.A", "mod", -1, -1)
+        self._assert_par(alias)
+
+    def test_parity_placeholder_becomes(self) -> None:
+        ph = PlaceholderNode("mod.C", Var("C"), 1, becomes_typeinfo=True)
+        self._assert_par(ph)
+
+    def test_parity_var(self) -> None:
+        self._assert_par(Var("x"))

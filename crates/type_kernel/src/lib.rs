@@ -3774,5 +3774,11 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         module
     )?)?;
 
+    // H1s: is_type_like pure isinstance check.
+    module.add_function(wrap_pyfunction!(
+        checker_functions::rust_is_type_like,
+        module
+    )?)?;
+
     Ok(())
 }

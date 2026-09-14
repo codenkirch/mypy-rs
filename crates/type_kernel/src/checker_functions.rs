@@ -6764,3 +6764,55 @@ pub(crate) fn rust_is_self_member_ref(
     };
     Ok(Some(is_self))
 }
+
+/// H1s: is_type_like — mirrors SemanticAnalyzer.is_type_like
+/// (semanal.py:8310). Pure isinstance check on live objects.
+/// Returns Some(bool) or None on unreadable attributes (defers to Python).
+#[pyfunction]
+pub(crate) fn rust_is_type_like(py: Python<'_>, node: &PyAny) -> PyResult<Option<bool>> {
+    if node.is_none() {
+        return Ok(Some(false));
+    }
+    let nodes_mod = match py.import("mypy.nodes") {
+        Ok(m) => m,
+        Err(_) => return Ok(None),
+    };
+    let typeinfo_cls: &PyType = match nodes_mod.getattr("TypeInfo") {
+        Ok(c) => match c.downcast() {
+            Ok(t) => t,
+            Err(_) => return Ok(None),
+        },
+        Err(_) => return Ok(None),
+    };
+    let typealias_cls: &PyType = match nodes_mod.getattr("TypeAlias") {
+        Ok(c) => match c.downcast() {
+            Ok(t) => t,
+            Err(_) => return Ok(None),
+        },
+        Err(_) => return Ok(None),
+    };
+    let placeholder_cls: &PyType = match nodes_mod.getattr("PlaceholderNode") {
+        Ok(c) => match c.downcast() {
+            Ok(t) => t,
+            Err(_) => return Ok(None),
+        },
+        Err(_) => return Ok(None),
+    };
+    if node.is_instance(typeinfo_cls)? {
+        return Ok(Some(true));
+    }
+    if node.is_instance(typealias_cls)? {
+        return Ok(Some(true));
+    }
+    if node.is_instance(placeholder_cls)? {
+        let becomes: bool = match node.getattr("becomes_typeinfo") {
+            Ok(v) => match v.extract() {
+                Ok(b) => b,
+                Err(_) => return Ok(None),
+            },
+            Err(_) => return Ok(None),
+        };
+        return Ok(Some(becomes));
+    }
+    Ok(Some(false))
+}

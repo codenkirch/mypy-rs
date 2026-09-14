@@ -527,6 +527,7 @@ __all__ = [
     "rust_symtable_mirror_meta_delete",
     "rust_symtable_mirror_meta_entry_count",
     "rust_mirror_handle_of",
+    "rust_is_type_like",
     "IdMapper",
 ]
 
@@ -2850,3 +2851,4 @@ def rust_symtable_mirror_meta_entry_count() -> int: ...
 # The proxy suite pins the shared identity namespace by comparing the
 # proxy handle with the mirror's non-minting lookup.
 def rust_mirror_handle_of(obj: Any) -> int | None: ...
+def rust_is_type_like(node: Any) -> bool | None: ...

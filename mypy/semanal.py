@@ -393,6 +393,7 @@ try:
         rust_replace_implicit_first_type as _rust_replace_implicit_first_type,
         rust_is_overloaded_item as _rust_is_overloaded_item,
         rust_is_self_member_ref as _rust_is_self_member_ref,
+        rust_is_type_like as _rust_is_type_like,
     )
 
     from mypy.types import read_type as _semanal_read_type
@@ -405,6 +406,7 @@ except ImportError:
     _rust_replace_implicit_first_type = None  # type: ignore[assignment]
     _rust_is_overloaded_item = None  # type: ignore[assignment]
     _rust_is_self_member_ref = None  # type: ignore[assignment]
+    _rust_is_type_like = None  # type: ignore[assignment]
     _SemanalWriteBuffer = None  # type: ignore[assignment,misc]
     _SemanalReadBuffer = None  # type: ignore[assignment,misc]
     _semanal_read_type = None  # type: ignore[assignment]
@@ -8323,6 +8325,17 @@ class SemanticAnalyzer(
         return False
 
     def is_type_like(self, node: SymbolNode | None) -> bool:
+        if (
+            _SEMANAL_HAS_KERNEL
+            and _native_semanal_active
+            and _rust_is_type_like is not None
+        ):
+            try:
+                result = _rust_is_type_like(node)
+            except (AssertionError, NotImplementedError, ValueError, TypeError):
+                result = None
+            if result is not None:
+                return result
         return isinstance(node, (TypeInfo, TypeAlias)) or (
             isinstance(node, PlaceholderNode) and node.becomes_typeinfo
         )
