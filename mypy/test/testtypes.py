@@ -61396,3 +61396,129 @@ class NativeIncompatiblePropertyOverrideSuite(Suite):
         sub = self._make_info("Sub", mro=[base, self.fx.oi])
         e = self._decorator("prop", sub, is_settable=False)
         self._assert_par(e)
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeCanWidenInScopeSuite(Suite):
+    """Parity for `rust_can_widen_in_scope` (H1n).
+
+    `TypeChecker.can_widen_in_scope` (checker.py:6702-6716) is a pure bool:
+    returns False when `name.kind == GDEF`, the scope is inside a top-level
+    function, and `get_proper_type(orig_type)` is not NoneType; else True.
+    The Rust port reads live objects via PyO3 (zero wire bytes), mirroring
+    `rust_is_writable_attribute`. Direct seam calls assert the exact bool;
+    the gate-off vs gate-on differential drives the real TypeChecker method.
+    """
+
+    def setUp(self) -> None:
+        self.fx = TypeFixture()
+        self._set_active(True)
+
+    def _set_active(self, active: bool) -> None:
+        from mypy.checker import _set_native_checker_active
+
+        _set_native_checker_active(active)
+
+    def tearDown(self) -> None:
+        self._set_active(False)
+
+    def _with_gate(self, active: bool, fn: Any) -> Any:
+        self._set_active(active)
+        try:
+            return fn()
+        finally:
+            self._set_active(True)
+
+    def _name_expr(self, kind: int = 1) -> NameExpr:
+        ne = NameExpr("x")
+        ne.kind = kind
+        return ne
+
+    def _scope(self, in_function: bool = False) -> Any:
+        from mypy.checker_shared import CheckerScope
+        from mypy.nodes import Block
+
+        module = MypyFile([], [])
+        scope = CheckerScope(module)
+        if in_function:
+            fdef = FuncDef("f", [], Block([]))
+            scope.stack.append(fdef)
+        return scope
+
+    def _seam(self, name: Any, orig_type: Any, scope: Any) -> bool | None:
+        return _type_kernel.rust_can_widen_in_scope(name, orig_type, scope)
+
+    def _run(self, name: Any, orig_type: Any, scope: Any) -> tuple[bool, bool]:
+        from mypy.checker import TypeChecker
+
+        def check_one() -> bool:
+            chk = TypeChecker.__new__(TypeChecker)
+            chk.scope = scope
+            return chk.can_widen_in_scope(name, orig_type)
+
+        off = self._with_gate(False, check_one)
+        on = self._with_gate(True, check_one)
+        return off, on
+
+    def _assert_par(self, name: Any, orig_type: Any, scope: Any) -> None:
+        off, on = self._run(name, orig_type, scope)
+        assert_equal(on, off, f"can_widen_in_scope parity")
+
+    # --- Direct seam calls ---
+
+    def test_seam_gdef_in_function_non_none_type(self) -> None:
+        """GDEF name in a function with non-None orig_type -> False."""
+        name = self._name_expr(kind=1)
+        scope = self._scope(in_function=True)
+        assert self._seam(name, self.fx.anyt, scope) is False
+
+    def test_seam_gdef_in_function_none_type(self) -> None:
+        """GDEF name in a function with NoneType orig_type -> True."""
+        name = self._name_expr(kind=1)
+        scope = self._scope(in_function=True)
+        assert self._seam(name, self.fx.nonet, scope) is True
+
+    def test_seam_gdef_not_in_function(self) -> None:
+        """GDEF name not in a function -> True."""
+        name = self._name_expr(kind=1)
+        scope = self._scope(in_function=False)
+        assert self._seam(name, self.fx.anyt, scope) is True
+
+    def test_seam_ldef(self) -> None:
+        """LDEF name (not GDEF) -> True."""
+        name = self._name_expr(kind=2)
+        scope = self._scope(in_function=True)
+        assert self._seam(name, self.fx.anyt, scope) is True
+
+    def test_seam_mdef(self) -> None:
+        """MDEF name -> True."""
+        name = self._name_expr(kind=3)
+        scope = self._scope(in_function=True)
+        assert self._seam(name, self.fx.anyt, scope) is True
+
+    # --- Gate-off vs gate-on parity ---
+
+    def test_parity_gdef_in_function_non_none_type(self) -> None:
+        name = self._name_expr(kind=1)
+        scope = self._scope(in_function=True)
+        self._assert_par(name, self.fx.anyt, scope)
+
+    def test_parity_gdef_in_function_none_type(self) -> None:
+        name = self._name_expr(kind=1)
+        scope = self._scope(in_function=True)
+        self._assert_par(name, self.fx.nonet, scope)
+
+    def test_parity_gdef_not_in_function(self) -> None:
+        name = self._name_expr(kind=1)
+        scope = self._scope(in_function=False)
+        self._assert_par(name, self.fx.anyt, scope)
+
+    def test_parity_ldef(self) -> None:
+        name = self._name_expr(kind=2)
+        scope = self._scope(in_function=True)
+        self._assert_par(name, self.fx.anyt, scope)
+
+    def test_parity_mdef(self) -> None:
+        name = self._name_expr(kind=3)
+        scope = self._scope(in_function=True)
+        self._assert_par(name, self.fx.anyt, scope)

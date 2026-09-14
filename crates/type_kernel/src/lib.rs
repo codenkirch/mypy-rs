@@ -3747,5 +3747,13 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         module
     )?)?;
 
+    // H1n: can_widen_in_scope pure bool predicate. Rust reads the live
+    // NameExpr kind, calls scope.top_level_function(), and checks
+    // get_proper_type(orig_type) is NoneType via PyO3.
+    module.add_function(wrap_pyfunction!(
+        checker_functions::rust_can_widen_in_scope,
+        module
+    )?)?;
+
     Ok(())
 }

@@ -405,6 +405,7 @@ try:
         rust_is_writable_attribute as _rust_is_writable_attribute,
         rust_is_defined_in_base_class as _rust_is_defined_in_base_class,
         rust_is_definition as _rust_is_definition,
+        rust_can_widen_in_scope as _rust_can_widen_in_scope,
         rust_is_valid_defaultdict_partial_value_type as _rust_is_valid_defaultdict_partial_value_type,
         rust_is_len_of_tuple as _rust_is_len_of_tuple,
         rust_is_assignable_slot as _rust_is_assignable_slot,
@@ -483,6 +484,7 @@ except ImportError:
     _rust_is_writable_attribute = None  # type: ignore[assignment]
     _rust_is_defined_in_base_class = None  # type: ignore[assignment]
     _rust_is_definition = None  # type: ignore[assignment]
+    _rust_can_widen_in_scope = None  # type: ignore[assignment]
     _rust_is_valid_defaultdict_partial_value_type = None  # type: ignore[assignment]
     _rust_is_len_of_tuple = None  # type: ignore[assignment]
     _rust_is_assignable_slot = None  # type: ignore[assignment]
@@ -6737,6 +6739,18 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
 
         See test cases testNewRedefineGlobalVariableNoneInit[1-4], for example.
         """
+        # Native type_kernel seam: pure bool predicate in Rust.
+        if (
+            _CHECKER_HAS_TYPE_KERNEL
+            and _native_checker_active
+            and _rust_can_widen_in_scope is not None
+        ):
+            try:
+                result = _rust_can_widen_in_scope(name, orig_type, self.scope)
+                if result is not None:
+                    return result
+            except (AssertionError, NotImplementedError, ValueError, TypeError):
+                pass
         if (
             name.kind == GDEF
             and self.scope.top_level_function() is not None

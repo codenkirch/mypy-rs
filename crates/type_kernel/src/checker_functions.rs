@@ -6547,3 +6547,35 @@ pub(crate) fn rust_check_incompatible_property_override(
     }
     Ok(Some(false))
 }
+
+/// `TypeChecker.can_widen_in_scope` (checker.py:6702-6716): a pure bool
+/// predicate. Returns `False` when `name.kind == GDEF` and the scope is
+/// inside a top-level function and `get_proper_type(orig_type)` is not
+/// `NoneType`; else `True`. Mirrors `rust_is_writable_attribute`
+/// (live-object, no wire decode). Defers (`None`) only on an unreadable
+/// attribute or exception.
+#[pyfunction]
+pub(crate) fn rust_can_widen_in_scope(
+    py: Python<'_>,
+    name: &PyAny,
+    orig_type: &PyAny,
+    scope: &PyAny,
+) -> PyResult<Option<bool>> {
+    let kind: i64 = name.getattr("kind")?.extract()?;
+    if kind != 1 {
+        return Ok(Some(true));
+    }
+    let tlf = scope.getattr("top_level_function")?;
+    let tlf_result = tlf.call0()?;
+    if tlf_result.is_none() {
+        return Ok(Some(true));
+    }
+    let types_mod = py.import("mypy.types")?;
+    let get_proper = types_mod.getattr("get_proper_type")?;
+    let proper = get_proper.call1((orig_type,))?;
+    let none_type_cls: &PyType = types_mod.getattr("NoneType")?.downcast()?;
+    if proper.is_instance(none_type_cls)? {
+        return Ok(Some(true));
+    }
+    Ok(Some(false))
+}
