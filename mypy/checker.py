@@ -408,6 +408,7 @@ try:
         rust_is_valid_defaultdict_partial_value_type as _rust_is_valid_defaultdict_partial_value_type,
         rust_is_len_of_tuple as _rust_is_len_of_tuple,
         rust_is_assignable_slot as _rust_is_assignable_slot,
+        rust_is_noop_for_reachability as _rust_is_noop_for_reachability,
         rust_narrow_type_by_identity_equality as _rust_narrow_type_by_identity_equality,
         rust_narrow_with_len as _rust_narrow_with_len,
         rust_or_conditional_maps as _rust_or_conditional_maps,
@@ -481,6 +482,7 @@ except ImportError:
     _rust_is_valid_defaultdict_partial_value_type = None  # type: ignore[assignment]
     _rust_is_len_of_tuple = None  # type: ignore[assignment]
     _rust_is_assignable_slot = None  # type: ignore[assignment]
+    _rust_is_noop_for_reachability = None  # type: ignore[assignment]
     _rust_is_more_general_arg_prefix = None  # type: ignore[assignment]
     _rust_overload_can_never_match = None  # type: ignore[assignment]
     _rust_is_equality_ambiguous_for_narrowing = None  # type: ignore[assignment]
@@ -4668,6 +4670,13 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
         But if that statement is just something like a 'pass' or a just-in-case 'assert False',
         reporting an error would be annoying.
         """
+        if _rust_is_noop_for_reachability is not None:
+            try:
+                result = _rust_is_noop_for_reachability(s)
+                if result is not None:
+                    return result
+            except (AssertionError, NotImplementedError):
+                pass
         if isinstance(s, AssertStmt) and is_false_literal(s.expr):
             return True
         elif isinstance(s, ReturnStmt) and is_literal_not_implemented(s.expr):

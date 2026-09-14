@@ -44,6 +44,7 @@ from mypy.nodes import (
     MDEF,
     ArgKind,
     Argument,
+    AssertStmt,
     AssignmentStmt,
     BytesExpr,
     CallExpr,
@@ -54,6 +55,7 @@ from mypy.nodes import (
     DictExpr,
     EllipsisExpr,
     Expression,
+    ExpressionStmt,
     FuncBase,
     FuncDef,
     FuncItem,
@@ -66,8 +68,11 @@ from mypy.nodes import (
     NotParsed,
     OpExpr,
     OverloadedFuncDef,
+    PassStmt,
     PlaceholderNode,
+    RaiseStmt,
     RevealExpr,
+    ReturnStmt,
     SetExpr,
     SliceExpr,
     StarExpr,
@@ -60634,3 +60639,140 @@ class NativeIsAssignableSlotSuite(Suite):
     def test_parity_other(self) -> None:
         lv = self._make_lvalue()
         self._assert_par(lv, self.fx.nonet)
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeIsNoopForReachabilitySuite(Suite):
+    """Parity for the Rust `is_noop_for_reachability` port (H1j).
+
+    `TypeChecker.is_noop_for_reachability` (checker.py:4658-4684)
+    classifies a statement as a no-op for `--warn-unreachable`. The Rust
+    port decides the AssertStmt / ReturnStmt / RaiseStmt branches and
+    the non-CallExpr ExpressionStmt fallthrough natively; the
+    ExpressionStmt+CallExpr branch defers (None) because it needs
+    `self.expr_checker.accept()`.
+    """
+
+    def setUp(self) -> None:
+        from mypy.checker import _set_native_checker_active
+
+        self._set_active = _set_native_checker_active
+        self._set_active(True)
+
+    def tearDown(self) -> None:
+        self._set_active(False)
+
+    def _with_gate(self, active: bool, fn: Callable[[], T]) -> T:
+        self._set_active(active)
+        try:
+            return fn()
+        finally:
+            self._set_active(True)
+
+    def _seam(self, stmt: Any) -> Any:
+        return _type_kernel.rust_is_noop_for_reachability(stmt)
+
+    def _make_false_expr(self) -> NameExpr:
+        n = NameExpr("False")
+        n.fullname = "builtins.False"
+        return n
+
+    def _make_not_implemented_expr(self) -> NameExpr:
+        n = NameExpr("NotImplemented")
+        n.fullname = "builtins.NotImplemented"
+        return n
+
+    def test_seam_assert_false(self) -> None:
+        stmt = AssertStmt(self._make_false_expr())
+        assert self._seam(stmt) is True
+
+    def test_seam_assert_true(self) -> None:
+        n = NameExpr("True")
+        n.fullname = "builtins.True"
+        stmt = AssertStmt(n)
+        assert self._seam(stmt) is False
+
+    def test_seam_assert_int_zero(self) -> None:
+        stmt = AssertStmt(IntExpr(0))
+        assert self._seam(stmt) is True
+
+    def test_seam_return_not_implemented(self) -> None:
+        stmt = ReturnStmt(self._make_not_implemented_expr())
+        assert self._seam(stmt) is True
+
+    def test_seam_return_none(self) -> None:
+        stmt = ReturnStmt(None)
+        assert self._seam(stmt) is False
+
+    def test_seam_return_value(self) -> None:
+        stmt = ReturnStmt(IntExpr(42))
+        assert self._seam(stmt) is False
+
+    def test_seam_raise(self) -> None:
+        stmt = RaiseStmt(None, None)
+        assert self._seam(stmt) is True
+
+    def test_seam_expr_stmt_non_call(self) -> None:
+        stmt = ExpressionStmt(IntExpr(1))
+        assert self._seam(stmt) is False
+
+    def test_seam_expr_stmt_call_defers(self) -> None:
+        call = CallExpr(NameExpr("f"), [], [], [])
+        stmt = ExpressionStmt(call)
+        assert self._seam(stmt) is None
+
+    def test_seam_other_stmt(self) -> None:
+        stmt = PassStmt()
+        assert self._seam(stmt) is False
+
+    def test_parity_assert_false(self) -> None:
+        from mypy.checker import TypeChecker
+
+        stmt = AssertStmt(self._make_false_expr())
+
+        def check_one() -> bool:
+            chk = TypeChecker.__new__(TypeChecker)
+            return chk.is_noop_for_reachability(stmt)
+
+        off = self._with_gate(False, check_one)
+        on = self._with_gate(True, check_one)
+        assert_equal(on, off)
+
+    def test_parity_return_not_implemented(self) -> None:
+        from mypy.checker import TypeChecker
+
+        stmt = ReturnStmt(self._make_not_implemented_expr())
+
+        def check_one() -> bool:
+            chk = TypeChecker.__new__(TypeChecker)
+            return chk.is_noop_for_reachability(stmt)
+
+        off = self._with_gate(False, check_one)
+        on = self._with_gate(True, check_one)
+        assert_equal(on, off)
+
+    def test_parity_raise(self) -> None:
+        from mypy.checker import TypeChecker
+
+        stmt = RaiseStmt(None, None)
+
+        def check_one() -> bool:
+            chk = TypeChecker.__new__(TypeChecker)
+            return chk.is_noop_for_reachability(stmt)
+
+        off = self._with_gate(False, check_one)
+        on = self._with_gate(True, check_one)
+        assert_equal(on, off)
+
+    def test_parity_pass_stmt(self) -> None:
+        from mypy.checker import TypeChecker
+
+        stmt = PassStmt()
+
+        def check_one() -> bool:
+            chk = TypeChecker.__new__(TypeChecker)
+            return chk.is_noop_for_reachability(stmt)
+
+        off = self._with_gate(False, check_one)
+        on = self._with_gate(True, check_one)
+        assert_equal(on, off)

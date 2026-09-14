@@ -24,6 +24,8 @@ use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyDict, PyList, PyType};
 use std::collections::HashSet;
 
+use crate::checker_visitor::{rust_is_false_literal, rust_is_literal_not_implemented};
+
 use crate::typeinfo::{NativeTypeResolver, TypeResolver};
 use crate::wire::Type;
 
@@ -6124,4 +6126,40 @@ pub(crate) fn rust_check_exit_return_type(py: Python<'_>, defn: &PyAny) -> PyRes
     }
 
     Ok(Some(true))
+}
+
+/// `TypeChecker.is_noop_for_reachability` (checker.py:4658-4684): classifies
+/// a statement as a no-op for `--warn-unreachable` purposes. The first
+/// three branches are pure decisions on the live node: AssertStmt with a
+/// false literal, ReturnStmt with NotImplemented, RaiseStmt. The
+/// ExpressionStmt + CallExpr branch needs `self.expr_checker.accept()`
+/// (checker state) and defers (`None`).
+#[pyfunction]
+pub(crate) fn rust_is_noop_for_reachability(
+    py: Python<'_>,
+    stmt: &PyAny,
+) -> PyResult<Option<bool>> {
+    let assert_cls = nodes_class(py, "AssertStmt")?;
+    if stmt.is_instance(assert_cls)? {
+        let expr = stmt.getattr("expr")?;
+        return Ok(Some(rust_is_false_literal(py, expr)?));
+    }
+    let return_cls = nodes_class(py, "ReturnStmt")?;
+    if stmt.is_instance(return_cls)? {
+        let expr = stmt.getattr("expr")?;
+        return Ok(Some(rust_is_literal_not_implemented(py, expr)?));
+    }
+    let raise_cls = nodes_class(py, "RaiseStmt")?;
+    if stmt.is_instance(raise_cls)? {
+        return Ok(Some(true));
+    }
+    let expr_stmt_cls = nodes_class(py, "ExpressionStmt")?;
+    if stmt.is_instance(expr_stmt_cls)? {
+        let call_expr_cls = nodes_class(py, "CallExpr")?;
+        let inner = stmt.getattr("expr")?;
+        if inner.is_instance(call_expr_cls)? {
+            return Ok(None);
+        }
+    }
+    Ok(Some(false))
 }
