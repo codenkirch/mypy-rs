@@ -409,6 +409,7 @@ try:
         rust_is_len_of_tuple as _rust_is_len_of_tuple,
         rust_is_assignable_slot as _rust_is_assignable_slot,
         rust_is_noop_for_reachability as _rust_is_noop_for_reachability,
+        rust_is_literal_enum as _rust_is_literal_enum,
         rust_narrow_type_by_identity_equality as _rust_narrow_type_by_identity_equality,
         rust_narrow_with_len as _rust_narrow_with_len,
         rust_or_conditional_maps as _rust_or_conditional_maps,
@@ -483,6 +484,7 @@ except ImportError:
     _rust_is_len_of_tuple = None  # type: ignore[assignment]
     _rust_is_assignable_slot = None  # type: ignore[assignment]
     _rust_is_noop_for_reachability = None  # type: ignore[assignment]
+    _rust_is_literal_enum = None  # type: ignore[assignment]
     _rust_is_more_general_arg_prefix = None  # type: ignore[assignment]
     _rust_overload_can_never_match = None  # type: ignore[assignment]
     _rust_is_equality_ambiguous_for_narrowing = None  # type: ignore[assignment]
@@ -10629,6 +10631,14 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
 
         parent_type = get_proper_type(parent_type)
         member_type = get_proper_type(coerce_to_literal(member_type))
+        if _CHECKER_HAS_TYPE_KERNEL and _native_checker_active and _rust_is_literal_enum is not None:
+            try:
+                result = _rust_is_literal_enum(parent_type, member_type)
+                if result is not None:
+                    return result
+            except (AssertionError, NotImplementedError, ValueError, TypeError):
+                pass
+
         if not isinstance(parent_type, FunctionLike) or not isinstance(member_type, LiteralType):
             return False
 

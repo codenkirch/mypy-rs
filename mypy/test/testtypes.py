@@ -60529,6 +60529,7 @@ class NativeIsAssignableSlotSuite(Suite):
     gate-off vs gate-on differential drives the real TypeChecker method
     through a stub checker.
     """
+    """
 
     def setUp(self) -> None:
         from mypy.checker import _set_native_checker_active
@@ -60776,3 +60777,146 @@ class NativeIsNoopForReachabilitySuite(Suite):
         off = self._with_gate(False, check_one)
         on = self._with_gate(True, check_one)
         assert_equal(on, off)
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeIsLiteralEnumSuite(Suite):
+    """Parity for the Rust `is_literal_enum` port (checker.py:10586).
+
+    `TypeChecker.is_literal_enum` returns True when a `Foo.A` member
+    expression is an enum literal: the parent type is a type-object
+    callable, the member type is an enum LiteralType, and the
+    fallback TypeInfo matches `type_object()`. The Rust seam
+    (`rust_is_literal_enum`) reads the two resolved proper types via
+    PyO3. Direct seam calls assert the exact bool; the gate-off vs
+    gate-on differential drives the real TypeChecker method.
+    """
+
+    def setUp(self) -> None:
+        from mypy.checker import _set_native_checker_active
+
+        self._set_active = _set_native_checker_active
+        self.fx = TypeFixture()
+        self._set_active(True)
+
+    def tearDown(self) -> None:
+        self._set_active(False)
+
+    def _with_gate(self, active: bool, fn: Callable[[], T]) -> T:
+        self._set_active(active)
+        try:
+            return fn()
+        finally:
+            self._set_active(True)
+
+    def _make_enum_info(self, name: str = "mod.Foo") -> TypeInfo:
+        info = self.fx.make_type_info(name, mro=[self.fx.oi])
+        info.is_enum = True
+        return info
+
+    def _make_type_obj_callable(self, enum_info: TypeInfo) -> CallableType:
+        meta_info = self.fx.make_type_info("builtins.type")
+        meta_info.fallback_to_any = True
+        enum_inst = Instance(enum_info, [])
+        return CallableType(
+            [], [], [], enum_inst, Instance(meta_info, []),
+            instance_type=enum_inst,
+        )
+
+    def _seam(self, parent: Any, member: Any) -> Any:
+        return _type_kernel.rust_is_literal_enum(parent, member)
+
+    def _run(self, parent_type: Type, member_type: Type) -> tuple[bool, bool]:
+        from mypy.checker import TypeChecker
+
+        enum_info = self._make_enum_info()
+        parent_expr = NameExpr("Foo")
+        member_expr = MemberExpr(parent_expr, "A")
+        chk = TypeChecker.__new__(TypeChecker)
+        chk._type_maps = [{parent_expr: parent_type, member_expr: member_type}]
+
+        def check() -> bool:
+            chk2 = TypeChecker.__new__(TypeChecker)
+            chk2._type_maps = [{parent_expr: parent_type, member_expr: member_type}]
+            return chk2.is_literal_enum(member_expr)
+
+        off = self._with_gate(False, check)
+        on = self._with_gate(True, check)
+        return off, on
+
+    def test_seam_true(self) -> None:
+        enum_info = self._make_enum_info()
+        parent = self._make_type_obj_callable(enum_info)
+        member = LiteralType(1, Instance(enum_info, []))
+        assert self._seam(parent, member) is True
+
+    def test_seam_false_not_functionlike(self) -> None:
+        enum_info = self._make_enum_info()
+        member = LiteralType(1, Instance(enum_info, []))
+        assert self._seam(Instance(enum_info, []), member) is False
+
+    def test_seam_false_not_literaltype(self) -> None:
+        enum_info = self._make_enum_info()
+        parent = self._make_type_obj_callable(enum_info)
+        assert self._seam(parent, Instance(enum_info, [])) is False
+
+    def test_seam_false_not_type_obj(self) -> None:
+        enum_info = self._make_enum_info()
+        non_type_callable = CallableType(
+            [], [], [], Instance(enum_info, []), self.fx.function
+        )
+        member = LiteralType(1, Instance(enum_info, []))
+        assert self._seam(non_type_callable, member) is False
+
+    def test_seam_false_not_enum_literal(self) -> None:
+        enum_info = self._make_enum_info()
+        parent = self._make_type_obj_callable(enum_info)
+        member = LiteralType(1, Instance(self.fx.ai, []))
+        assert self._seam(parent, member) is False
+
+    def test_seam_false_wrong_fallback(self) -> None:
+        enum_info = self._make_enum_info()
+        other_info = self._make_enum_info("mod.Bar")
+        other_info.is_enum = True
+        parent = self._make_type_obj_callable(enum_info)
+        member = LiteralType(1, Instance(other_info, []))
+        assert self._seam(parent, member) is False
+
+    def test_parity_true(self) -> None:
+        enum_info = self._make_enum_info()
+        parent = self._make_type_obj_callable(enum_info)
+        member = LiteralType(1, Instance(enum_info, []))
+        off, on = self._run(parent, member)
+        assert_equal(on, off, "is_literal_enum parity: true case")
+        assert on is True
+
+    def test_parity_false_not_member_expr(self) -> None:
+        from mypy.checker import TypeChecker
+
+        expr = NameExpr("Foo")
+        chk = TypeChecker.__new__(TypeChecker)
+        chk._type_maps = [{}]
+
+        def check() -> bool:
+            chk2 = TypeChecker.__new__(TypeChecker)
+            chk2._type_maps = [{}]
+            return chk2.is_literal_enum(expr)
+
+        off = self._with_gate(False, check)
+        on = self._with_gate(True, check)
+        assert_equal(on, off, "is_literal_enum parity: not MemberExpr")
+
+    def test_parity_false_none_types(self) -> None:
+        parent_expr = NameExpr("Foo")
+        member_expr = MemberExpr(parent_expr, "A")
+
+        def check() -> bool:
+            from mypy.checker import TypeChecker
+
+            chk = TypeChecker.__new__(TypeChecker)
+            chk._type_maps = [{}]
+            return chk.is_literal_enum(member_expr)
+
+        off = self._with_gate(False, check)
+        on = self._with_gate(True, check)
+        assert_equal(on, off, "is_literal_enum parity: None types")

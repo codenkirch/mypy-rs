@@ -6163,3 +6163,44 @@ pub(crate) fn rust_is_noop_for_reachability(
     }
     Ok(Some(false))
 }
+
+/// `TypeChecker.is_literal_enum` (checker.py:10586-10622): a pure
+/// bool predicate. The shim precomputes `lookup_type_or_none`,
+/// `get_proper_type`, and `coerce_to_literal` and passes the two
+/// resolved proper types as live PyO3 objects. Rust checks
+/// isinstance against FunctionLike / LiteralType, calls
+/// `is_type_obj()`, `is_enum_literal()`, and compares
+/// `member_type.fallback.type == parent_type.type_object()`.
+/// Defers (`None`) on an unreadable attribute.
+#[pyfunction]
+pub(crate) fn rust_is_literal_enum(
+    py: Python<'_>,
+    parent_type: &PyAny,
+    member_type: &PyAny,
+) -> PyResult<Option<bool>> {
+    let types_mod = py.import("mypy.types")?;
+    let functionlike_cls: &PyType = types_mod.getattr("FunctionLike")?.downcast()?;
+    if !parent_type.is_instance(functionlike_cls)? {
+        return Ok(Some(false));
+    }
+    let literaltype_cls: &PyType = types_mod.getattr("LiteralType")?.downcast()?;
+    if !member_type.is_instance(literaltype_cls)? {
+        return Ok(Some(false));
+    }
+    let is_type_obj: bool = parent_type.call_method0("is_type_obj")?.extract()?;
+    if !is_type_obj {
+        return Ok(Some(false));
+    }
+    let is_enum_literal: bool = member_type.call_method0("is_enum_literal")?.extract()?;
+    if !is_enum_literal {
+        return Ok(Some(false));
+    }
+    let member_fallback = member_type.getattr("fallback")?;
+    let member_fallback_type = member_fallback.getattr("type")?;
+    let parent_type_obj = parent_type.call_method0("type_object")?;
+    let is_equal = member_fallback_type
+        .rich_compare(parent_type_obj, pyo3::pyclass::CompareOp::Eq)?
+        .is_true()?;
+    Ok(Some(is_equal))
+}
+}

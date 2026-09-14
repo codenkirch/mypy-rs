@@ -3703,6 +3703,13 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         symtable_mirror::rust_symtable_mirror_handle_of,
         module
     )?)?;
+    // H1k: is_literal_enum decision. Rust reads the two resolved proper
+    // types via PyO3 and returns the bool; the type lookups stay shim-side.
+    module.add_function(wrap_pyfunction!(
+        checker_functions::rust_is_literal_enum,
+        module
+    )?)?;
+
     // Phase G3.0c (#1581): TypeInfo meta-field capture.
     module.add_function(wrap_pyfunction!(
         symtable_mirror::rust_symtable_mirror_meta_put,
