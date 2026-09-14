@@ -411,6 +411,7 @@ try:
         rust_is_noop_for_reachability as _rust_is_noop_for_reachability,
         rust_is_literal_enum as _rust_is_literal_enum,
         rust_classify_unbound_return_typevar as _rust_classify_unbound_return_typevar,
+        rust_check_untyped_after_decorator as _rust_check_untyped_after_decorator,
         rust_narrow_type_by_identity_equality as _rust_narrow_type_by_identity_equality,
         rust_narrow_with_len as _rust_narrow_with_len,
         rust_or_conditional_maps as _rust_or_conditional_maps,
@@ -487,6 +488,7 @@ except ImportError:
     _rust_is_noop_for_reachability = None  # type: ignore[assignment]
     _rust_is_literal_enum = None  # type: ignore[assignment]
     _rust_classify_unbound_return_typevar = None  # type: ignore[assignment]
+    _rust_check_untyped_after_decorator = None  # type: ignore[assignment]
     _rust_is_more_general_arg_prefix = None  # type: ignore[assignment]
     _rust_overload_can_never_match = None  # type: ignore[assignment]
     _rust_is_equality_ambiguous_for_narrowing = None  # type: ignore[assignment]
@@ -7884,6 +7886,25 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
             self.accept(s.body)
 
     def check_untyped_after_decorator(self, typ: Type, func: FuncDef) -> None:
+        if (
+            _CHECKER_HAS_TYPE_KERNEL
+            and _native_checker_active
+            and _rust_check_untyped_after_decorator is not None
+        ):
+            try:
+                result = _rust_check_untyped_after_decorator(
+                    self.options.disallow_any_decorated,
+                    self.is_stub,
+                    self.current_node_deferred,
+                    _serialize_type_for_checker(typ),
+                    _native_checker_resolver,
+                )
+                if result is not None:
+                    if result:
+                        self.msg.untyped_decorated_function(typ, func)
+                    return
+            except (AssertionError, NotImplementedError, ValueError, TypeError):
+                pass
         if not self.options.disallow_any_decorated or self.is_stub or self.current_node_deferred:
             return
 

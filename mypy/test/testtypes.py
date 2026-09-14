@@ -61092,3 +61092,162 @@ class NativeUnboundReturnTypevarSuite(Suite):
         off, on = self._run(ct)
         assert_equal(on, off, "parity: tvar nested in args")
         assert off == []
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeCheckUntypedAfterDecoratorSuite(Suite):
+    """Parity for the Rust `check_untyped_after_decorator` port (H1o).
+
+    `TypeChecker.check_untyped_after_decorator` (checker.py) is a gate +
+    `has_any_type` check: if `disallow_any_decorated` is on, the file is not
+    a stub, and the node is not deferred, it emits
+    `untyped_decorated_function` when the decorated type contains Any.
+    The Rust port takes the 3 gate bools as scalars, decodes the wire type,
+    and runs `has_any_type_inner` (the same BoolTypeQuery the checkexpr
+    seam uses). Direct seam calls assert the bool; the gate-off vs gate-on
+    differential drives the real TypeChecker method through a stub checker
+    with a mock msg recorder.
+    """
+
+    def setUp(self) -> None:
+        from mypy.checker import _set_native_checker_active
+
+        self._set_active = _set_native_checker_active
+        self._set_active(True)
+        self.fx = TypeFixture()
+        self.resolver = _type_kernel.build_native_resolver([], [])
+
+    def tearDown(self) -> None:
+        self._set_active(False)
+
+    def _with_gate(self, active: bool, fn: Callable[[], T]) -> T:
+        self._set_active(active)
+        try:
+            return fn()
+        finally:
+            self._set_active(True)
+
+    def _seam(
+        self,
+        typ: Type,
+        disallow_any_decorated: bool = True,
+        is_stub: bool = False,
+        current_node_deferred: bool = False,
+    ) -> bool | None:
+        from mypy.checker import _serialize_type_for_checker
+
+        return _type_kernel.rust_check_untyped_after_decorator(
+            disallow_any_decorated,
+            is_stub,
+            current_node_deferred,
+            _serialize_type_for_checker(typ),
+            self.resolver,
+        )
+
+    def _run(
+        self,
+        typ: Type,
+        disallow_any_decorated: bool = True,
+        is_stub: bool = False,
+        current_node_deferred: bool = False,
+    ) -> tuple[list[Any], list[Any]]:
+        from types import SimpleNamespace
+
+        from mypy.checker import TypeChecker
+
+        def check_one() -> list[Any]:
+            chk = TypeChecker.__new__(TypeChecker)
+            fails: list[Any] = []
+            chk.options = SimpleNamespace(  # type: ignore[assignment]
+                disallow_any_decorated=disallow_any_decorated
+            )
+            chk.is_stub = is_stub
+            chk.current_node_deferred = current_node_deferred
+            chk.msg = SimpleNamespace(  # type: ignore[assignment]
+                untyped_decorated_function=lambda t, ctx: fails.append(t)
+            )
+            func = FuncDef("f")
+            chk.check_untyped_after_decorator(typ, func)
+            return list(fails)
+
+        off = self._with_gate(False, check_one)
+        on = self._with_gate(True, check_one)
+        return off, on
+
+    def _assert_par(
+        self,
+        typ: Type,
+        disallow_any_decorated: bool = True,
+        is_stub: bool = False,
+        current_node_deferred: bool = False,
+    ) -> None:
+        off, on = self._run(
+            typ, disallow_any_decorated, is_stub, current_node_deferred
+        )
+        assert_equal(
+            on,
+            off,
+            f"check_untyped_after_decorator parity for typ={typ!r}",
+        )
+
+    # --- direct seam tests ---
+
+    def test_seam_any_type_fires(self) -> None:
+        assert self._seam(AnyType(TypeOfAny.from_error)) is True
+
+    def test_seam_special_form_any_does_not_fire(self) -> None:
+        assert self._seam(AnyType(TypeOfAny.special_form)) is False
+
+    def test_seam_plain_instance_does_not_fire(self) -> None:
+        assert self._seam(self.fx.a) is False
+
+    def test_seam_gate_disallow_off(self) -> None:
+        assert self._seam(AnyType(TypeOfAny.from_error), disallow_any_decorated=False) is False
+
+    def test_seam_gate_is_stub(self) -> None:
+        assert self._seam(AnyType(TypeOfAny.from_error), is_stub=True) is False
+
+    def test_seam_gate_deferred(self) -> None:
+        assert self._seam(AnyType(TypeOfAny.from_error), current_node_deferred=True) is False
+
+    def test_seam_callable_with_any_fires(self) -> None:
+        any_unannotated = AnyType(TypeOfAny.unannotated)
+        ct = CallableType(
+            [any_unannotated], [ARG_POS], [None], any_unannotated, self.fx.function
+        )
+        assert self._seam(ct) is True
+
+    def test_seam_typed_callable_does_not_fire(self) -> None:
+        ct = CallableType([self.fx.a], [ARG_POS], [None], self.fx.a, self.fx.function)
+        assert self._seam(ct) is False
+
+    # --- gate-off vs gate-on parity ---
+
+    def test_parity_any_type(self) -> None:
+        self._assert_par(AnyType(TypeOfAny.from_error))
+
+    def test_parity_special_form_any(self) -> None:
+        self._assert_par(AnyType(TypeOfAny.special_form))
+
+    def test_parity_plain_instance(self) -> None:
+        self._assert_par(self.fx.a)
+
+    def test_parity_gate_disallow_off(self) -> None:
+        self._assert_par(AnyType(TypeOfAny.from_error), disallow_any_decorated=False)
+
+    def test_parity_gate_is_stub(self) -> None:
+        self._assert_par(AnyType(TypeOfAny.from_error), is_stub=True)
+
+    def test_parity_gate_deferred(self) -> None:
+        self._assert_par(AnyType(TypeOfAny.from_error), current_node_deferred=True)
+
+    def test_parity_typed_callable(self) -> None:
+        ct = CallableType([self.fx.a], [ARG_POS], [None], self.fx.a, self.fx.function)
+        self._assert_par(ct)
+
+    def test_parity_callable_with_any(self) -> None:
+        any_unannotated = AnyType(TypeOfAny.unannotated)
+        ct = CallableType(
+            [any_unannotated], [ARG_POS], [None], any_unannotated, self.fx.function
+        )
+        self._assert_par(ct)

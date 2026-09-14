@@ -3735,6 +3735,10 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         checker_functions::rust_classify_unbound_return_typevar,
         module
     )?)?;
+    module.add_function(wrap_pyfunction!(
+        checker_functions::rust_check_untyped_after_decorator,
+        module
+    )?)?;
 
     Ok(())
 }

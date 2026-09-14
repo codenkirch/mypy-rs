@@ -5942,6 +5942,29 @@ pub(crate) fn rust_check_final_deletable(
     Ok(Some(result))
 }
 
+#[pyfunction]
+#[allow(clippy::needless_pass_by_value)]
+pub(crate) fn rust_check_untyped_after_decorator(
+    disallow_any_decorated: bool,
+    is_stub: bool,
+    current_node_deferred: bool,
+    type_bytes: &[u8],
+    resolver: &NativeTypeResolver,
+) -> PyResult<Option<bool>> {
+    if !disallow_any_decorated || is_stub || current_node_deferred {
+        return Ok(Some(false));
+    }
+    let typ = match crate::checkmember::decode_type(type_bytes) {
+        Some(t) => t,
+        None => return Ok(None),
+    };
+    Ok(crate::checkexpr_functions::has_any_type_inner(
+        &typ,
+        false,
+        resolver.alias_resolver(),
+    ))
+}
+
 #[cfg(test)]
 mod isinstance_head_tests {
     use super::*;

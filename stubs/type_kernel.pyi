@@ -241,6 +241,7 @@ __all__ = [
     "rust_is_assignable_slot",
     "rust_is_noop_for_reachability",
     "rust_classify_unbound_return_typevar",
+    "rust_check_untyped_after_decorator",
     "rust_classify_comparison_operands",
     "rust_classify_type_check_raise",
     "rust_classify_type_range",
@@ -963,6 +964,13 @@ def rust_is_valid_defaultdict_partial_value_type(
 def rust_is_assignable_slot(lvalue: Any, typ: Any) -> bool | None: ...
 def rust_is_noop_for_reachability(stmt: Any) -> bool | None: ...
 def rust_classify_unbound_return_typevar(type_bytes: bytes) -> int | None: ...
+def rust_check_untyped_after_decorator(
+    disallow_any_decorated: bool,
+    is_stub: bool,
+    current_node_deferred: bool,
+    type_bytes: bytes,
+    resolver: Any,
+) -> bool | None: ...
 def rust_classify_find_isinstance_head(
     callee: Any, args_len: int, literal_ok: bool
 ) -> int | None: ...
