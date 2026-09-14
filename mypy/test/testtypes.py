@@ -33913,7 +33913,10 @@ class NativeRemoveTrivialFreshVarSuite(Suite):
     def test_fresh_var_nested_in_row_relinked(self) -> None:
         v = self._fresh()
         list_v = Instance(self.fx.std_listi, [v])
-        result = self._remove([list_v, self.fx.b])
+        patched, calls = self._spy()
+        with patched:
+            result = self._remove([list_v, self.fx.b])
+        assert_equal(len(calls), 1, "fresh-var list did not cross the Rust seam")
         first = get_proper_type(result[0])
         assert isinstance(first, Instance)
         assert first.args[0] is v
@@ -33921,7 +33924,10 @@ class NativeRemoveTrivialFreshVarSuite(Suite):
     def test_plain_typevar_relinked(self) -> None:
         # A non-meta var is no fresh id, but Python still returns the input
         # object; the old list canonicalizer left these decoded.
-        result = self._remove([self.fx.t, self.fx.b])
+        patched, calls = self._spy()
+        with patched:
+            result = self._remove([self.fx.t, self.fx.b])
+        assert_equal(len(calls), 1, "plain-var list did not cross the Rust seam")
         assert result[0] is self.fx.t
 
     def test_freeze_in_place_reaches_the_result(self) -> None:
@@ -33932,7 +33938,10 @@ class NativeRemoveTrivialFreshVarSuite(Suite):
 
         v = self._fresh()
         sig = self.fx.callable(self.fx.o, v).copy_modified(variables=[v])
-        result = self._remove([v, self.fx.b])
+        patched, calls = self._spy()
+        with patched:
+            result = self._remove([v, self.fx.b])
+        assert_equal(len(calls), 1, "fresh-var list did not cross the Rust seam")
         freeze_all_type_vars(sig)
         first = get_proper_type(result[0])
         assert isinstance(first, TypeVarType)
@@ -33995,6 +34004,79 @@ class NativeRemoveTrivialFreshVarSuite(Suite):
         assert isinstance(first, Instance)
         assert first.args[0] is v
         assert out[1] is v
+
+    def _relink_spy(self) -> tuple[Any, list[int]]:
+        """Patch the wirefixup relink so a test can prove it ran."""
+        from unittest import mock
+
+        import mypy.wirefixup as wirefixup
+
+        calls: list[int] = []
+        real = wirefixup.resync_var_identities_list
+
+        def wrapper(live: Any, decoded: Any) -> Any:
+            calls.append(1)
+            return real(live, decoded)
+
+        return mock.patch.object(wirefixup, "resync_var_identities_list", wrapper), calls
+
+    def _instance_type_call(self, v: TypeVarType) -> CallableType:
+        return self.fx.callable(self.fx.o, self.fx.o).copy_modified(
+            instance_type=Instance(self.fx.std_listi, [v])
+        )
+
+    def test_helper_relinks_instance_type_var(self) -> None:
+        # A var whose only occurrence is CallableType.instance_type: the
+        # contains_typevar_like walk used to miss it, so the relink never ran.
+        from mypy.wirefixup import resync_var_identities_list
+
+        v = self._fresh()
+        out = resync_var_identities_list(
+            [self._instance_type_call(v)], [self._instance_type_call(v.copy_modified())]
+        )
+        assert out is not None
+        first = get_proper_type(out[0])
+        assert isinstance(first, CallableType)
+        inst = first.instance_type
+        assert isinstance(inst, Instance)
+        assert inst.args[0] is v
+
+    def test_helper_relinks_type_guard_var(self) -> None:
+        from mypy.wirefixup import resync_var_identities_list
+
+        v = self._fresh()
+        live = self.fx.callable(self.fx.o, self.fx.b).copy_modified(type_guard=v)
+        decoded = self.fx.callable(self.fx.o, self.fx.b).copy_modified(
+            type_guard=v.copy_modified()
+        )
+        out = resync_var_identities_list([live], [decoded])
+        assert out is not None
+        first = get_proper_type(out[0])
+        assert isinstance(first, CallableType)
+        assert first.type_guard is v
+
+    def test_instance_type_var_stays_out_of_the_cache(self) -> None:
+        # Regression pin: contains_typevar_like missed instance_type, so a
+        # callable whose only var sat there was served through the cache.
+        import mypy.expandtype as expandtype
+
+        expandtype._expand_remove_trivial_cache.clear()
+        try:
+            v = self._fresh()
+            patched, relinks = self._relink_spy()
+            with patched:
+                result = self._remove([self._instance_type_call(v), self.fx.b])
+            assert_equal(len(relinks), 1, "instance_type-only var skipped the relink")
+            assert not expandtype._expand_remove_trivial_cache, (
+                "instance_type var went through the cache gate"
+            )
+            first = get_proper_type(result[0])
+            assert isinstance(first, CallableType)
+            inst = first.instance_type
+            assert isinstance(inst, Instance)
+            assert inst.args[0] is v
+        finally:
+            expandtype._expand_remove_trivial_cache.clear()
 
     def test_helper_passes_var_free_list_through(self) -> None:
         from mypy.wirefixup import resync_var_identities_list

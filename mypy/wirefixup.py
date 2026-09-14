@@ -385,6 +385,10 @@ def _collect_typevar_likes(t: Type, seed: dict[tuple[int, int, str], TypeVarLike
             stack.extend(cur.variables)
             if cur.instance_type is not None:
                 stack.append(cur.instance_type)
+            if cur.type_guard is not None:
+                stack.append(cur.type_guard)
+            if cur.type_is is not None:
+                stack.append(cur.type_is)
         elif isinstance(cur, Parameters):
             stack.extend(cur.arg_types)
             stack.extend(cur.variables)
@@ -509,9 +513,12 @@ class _VarIdentityCanonicalizer(TypeTranslator):
 def contains_typevar_like(typ: Type) -> bool:
     """Does the decoded tree contain any TypeVar-like node?
 
-    Mirrors the Rust `result_has_typevar` scan. Decoded var-bearing
-    results only appear on the identity-repair path, so callers use this
-    to cheaply skip the seed-walk repair for the common var-free case.
+    Walks the same fields as `_collect_typevar_likes` (a superset of the
+    Rust `result_has_typevar` scan: `instance_type`, `type_guard` and
+    `type_is` too), so a caller may use the negative answer to skip the
+    seed-walk repair. Decoded var-bearing results only appear on the
+    identity-repair path, so this is a cheap short-circuit for the common
+    var-free case.
     """
     stack: list[Type] = [typ]
     while stack:
@@ -523,6 +530,12 @@ def contains_typevar_like(typ: Type) -> bool:
             stack.append(cur.ret_type)
             stack.append(cur.fallback)
             stack.extend(cur.variables)
+            if cur.instance_type is not None:
+                stack.append(cur.instance_type)
+            if cur.type_guard is not None:
+                stack.append(cur.type_guard)
+            if cur.type_is is not None:
+                stack.append(cur.type_is)
         elif isinstance(cur, Overloaded):  # type: ignore[misc]
             stack.extend(cur.items)
         elif isinstance(cur, Parameters):
