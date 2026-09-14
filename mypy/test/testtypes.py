@@ -5073,11 +5073,12 @@ class NativeExpandTypeFreezeIdentitySuite(Suite):
     slot lists are the *same objects* as the occurrences in the tree. The
     wire decode creates fresh objects, so any seam that rebuilds a
     subtree through the wire must either re-canonicalize ids against a
-    seeded object or defer. `remove_trivial` is a partial-list seam: it
-    has no `variables` context and no live object to seed, so it keeps
-    the meta gate (`_needs_python(t, meta_gate=True)`); the other
-    relaxed callers (expand_type / expand_type_by_instance / freshen)
-    canonicalize or are seeded and stay relaxed.
+    seeded object or re-link them onto the live originals. `remove_trivial`
+    is a partial-list seam with no `variables` context, so it re-links
+    every decoded var onto the live object in its own input list
+    (`wirefixup.resync_var_identities_list`, #1623); the other relaxed
+    callers (expand_type / expand_type_by_instance / freshen) canonicalize
+    or are seeded.
 
     Locks the regression: a decorated generic signature whose return
     union is rebuilt through Python `expand_type` -> `visit_union_type`
@@ -5201,17 +5202,29 @@ class NativeExpandTypeFreezeIdentitySuite(Suite):
         for o in occs:
             assert o is g, "apply chain rebuilt a split copy of the fresh var"
 
-    def test_remove_trivial_defers_on_fresh_vars(self) -> None:
-        # A meta (fresh) var in the input list must take the pure-Python
-        # path: the decoded wire copy is a distinct object, so the native
-        # rebuild could never preserve freeze_all_type_vars's identity.
+    def test_remove_trivial_relinks_fresh_vars_natively(self) -> None:
+        # A meta (fresh) var with no default now decides natively: the
+        # decoded copy is re-linked onto the live input object, so
+        # freeze_all_type_vars's identity contract still holds (#1623).
+        from unittest import mock
+
+        import type_kernel
+
         from mypy.expandtype import remove_trivial
 
         fx = self.fx
-        v = TypeVarType("Fresh", "Test.Fresh", TypeVarId(500, meta_level=1), [], fx.o, fx.o)
-        result = remove_trivial([v, fx.b])
+        v = fx.t.copy_modified(id=TypeVarId(500, meta_level=1))
+        calls: list[bytes] = []
+        real = type_kernel.rust_remove_trivial
+
+        def wrapper(b: bytes, so: bool) -> object:
+            calls.append(b)
+            return real(b, so)
+
+        with mock.patch.object(type_kernel, "rust_remove_trivial", wrapper):
+            result = remove_trivial([v, fx.b])
+        assert_equal(len(calls), 1, "fresh-var list did not cross the Rust seam")
         assert result[0] is v
-        assert result[1] is fx.b
 
     def test_freeze_identity_gate_parity(self) -> None:
         # Gate on vs gate off must agree str-wise on the full
@@ -33805,6 +33818,189 @@ class NativeRemoveTrivialSuite(Suite):
 
         decoded = read_type_list(ReadBuffer(bytes(result)))
         assert_equal(len(decoded), 1)
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeRemoveTrivialFreshVarSuite(Suite):
+    """Live-object identity for `remove_trivial`'s partial-list seam (#1623).
+
+    `remove_trivial` (expandtype.py) is the one expand-family seam with no
+    enclosing `variables` slot to seed `canonicalize_fresh_vars` from, so
+    its decoded list used to gate every fresh (meta_level > 0) type var
+    back to the pure-Python body: a decoded copy is a doppelganger that
+    escapes both `freeze_all_type_vars`'s in-place `meta_level` mutation
+    and id-keyed substitution. The seam now re-links every decoded
+    TypeVar-like onto the live object reachable from its own input list
+    (`wirefixup.resync_var_identities_list`, strict), which is the
+    identity Python's `remove_trivial` preserves by returning the input
+    items unchanged. A decoded occurrence with no structurally-equal live
+    original still defers, so the strictness that used to be encoded in
+    the gate is now checked against the actual input list.
+    """
+
+    def setUp(self) -> None:
+        from mypy.expandtype import (
+            _set_native_expand_type_active,
+            _set_native_expand_type_resolver,
+            _set_native_expand_type_typeinfo_map,
+        )
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        self.fx = TypeFixture()
+        self._set_active = _set_native_expand_type_active
+        self._set_resolver = _set_native_expand_type_resolver
+        self._set_map = _set_native_expand_type_typeinfo_map
+        type_infos = []
+        for name in dir(self.fx):
+            if not name.endswith("i"):
+                continue
+            value = getattr(self.fx, name)
+            if _is_type_info(value):
+                type_infos.append(value)
+        self._resolver = _type_kernel.build_native_resolver(type_infos, [])
+        self._set_resolver(self._resolver)
+        self._set_map({info.fullname: info for info in type_infos})
+        set_wire_typeinfo_map({info.fullname: info for info in type_infos})
+        self._set_active(True)
+
+    def tearDown(self) -> None:
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        self._set_active(False)
+        self._set_resolver(None)
+        self._set_map(None)
+        set_wire_typeinfo_map(None)
+
+    def _with_gate(self, active: bool, fn: Callable[[], T]) -> T:
+        self._set_active(active)
+        try:
+            return fn()
+        finally:
+            self._set_active(True)
+
+    def _fresh(self, raw_id: int = 500) -> TypeVarType:
+        """A fresh (meta_level 1) tvar carrying the no-default sentinel."""
+        return self.fx.t.copy_modified(id=TypeVarId(raw_id, meta_level=1))
+
+    def _remove(self, types: Sequence[Type]) -> list[Type]:
+        from mypy.expandtype import remove_trivial
+
+        return remove_trivial(types)
+
+    def _spy(self) -> tuple[Any, list[bytes]]:
+        """Patch the Rust seam so a test can prove native engagement."""
+        from unittest import mock
+
+        import type_kernel
+
+        calls: list[bytes] = []
+        real = type_kernel.rust_remove_trivial
+
+        def wrapper(b: bytes, so: bool) -> object:
+            calls.append(b)
+            return real(b, so)
+
+        return mock.patch.object(type_kernel, "rust_remove_trivial", wrapper), calls
+
+    def test_fresh_var_relinked_to_live_object(self) -> None:
+        v = self._fresh()
+        patched, calls = self._spy()
+        with patched:
+            result = self._remove([v, self.fx.b])
+        assert_equal(len(calls), 1, "fresh-var list did not cross the Rust seam")
+        assert result[0] is v
+
+    def test_fresh_var_nested_in_row_relinked(self) -> None:
+        v = self._fresh()
+        list_v = Instance(self.fx.std_listi, [v])
+        result = self._remove([list_v, self.fx.b])
+        first = get_proper_type(result[0])
+        assert isinstance(first, Instance)
+        assert first.args[0] is v
+
+    def test_plain_typevar_relinked(self) -> None:
+        # A non-meta var is no fresh id, but Python still returns the input
+        # object; the old list canonicalizer left these decoded.
+        result = self._remove([self.fx.t, self.fx.b])
+        assert result[0] is self.fx.t
+
+    def test_freeze_in_place_reaches_the_result(self) -> None:
+        # freeze_all_type_vars mutates TypeVarId.meta_level in place on the
+        # vars a callable's `variables` slot lists, so the returned
+        # occurrence must be the very object the caller passed in.
+        from mypy.typeops import freeze_all_type_vars
+
+        v = self._fresh()
+        sig = self.fx.callable(self.fx.o, v).copy_modified(variables=[v])
+        result = self._remove([v, self.fx.b])
+        freeze_all_type_vars(sig)
+        first = get_proper_type(result[0])
+        assert isinstance(first, TypeVarType)
+        assert first is v
+        assert first.id.meta_level == 0
+
+    def test_gate_parity_fresh_and_plain(self) -> None:
+        v = self._fresh()
+        list_v = Instance(self.fx.std_listi, [v])
+        cases: list[list[Type]] = [[v, self.fx.b], [list_v, self.fx.b]]
+        for types in cases:
+            off = str(self._with_gate(False, lambda: self._remove(types)))
+            on = str(self._with_gate(True, lambda: self._remove(types)))
+            assert_equal(on, off, f"remove_trivial gate parity {types}")
+
+    def test_var_bearing_result_stays_out_of_the_cache(self) -> None:
+        import mypy.expandtype as expandtype
+
+        expandtype._expand_remove_trivial_cache.clear()
+        try:
+            self._remove([self._fresh(), self.fx.b])
+            assert not expandtype._expand_remove_trivial_cache, (
+                "var-bearing remove_trivial result was cached: a later caller "
+                "would receive the first caller's live objects"
+            )
+            self._remove([self.fx.a, self.fx.b])
+            assert len(expandtype._expand_remove_trivial_cache) == 1
+        finally:
+            expandtype._expand_remove_trivial_cache.clear()
+
+    def test_helper_defers_on_unmatched_var(self) -> None:
+        # Strictness: the live list holds no var, so the decoded one has no
+        # original to stand in for it.
+        from mypy.wirefixup import resync_var_identities_list
+
+        decoded = self._fresh().copy_modified()
+        assert resync_var_identities_list([self.fx.b], [decoded]) is None
+
+    def test_helper_defers_on_same_id_different_content(self) -> None:
+        # Same key, different structure: not a round-trip copy of the live
+        # original, so it must not pass as one.
+        from mypy.wirefixup import resync_var_identities_list
+
+        v = self._fresh()
+        drifted = v.copy_modified(upper_bound=self.fx.a)
+        assert resync_var_identities_list([v], [drifted]) is None
+
+    def test_helper_relinks_every_occurrence(self) -> None:
+        from mypy.wirefixup import resync_var_identities_list
+
+        v = self._fresh()
+        row = Instance(self.fx.std_listi, [v])
+        decoded_rows: list[Type] = [
+            Instance(self.fx.std_listi, [v.copy_modified()]),
+            v.copy_modified(),
+        ]
+        out = resync_var_identities_list([row], decoded_rows)
+        assert out is not None
+        first = get_proper_type(out[0])
+        assert isinstance(first, Instance)
+        assert first.args[0] is v
+        assert out[1] is v
+
+    def test_helper_passes_var_free_list_through(self) -> None:
+        from mypy.wirefixup import resync_var_identities_list
+
+        decoded: list[Type] = [self.fx.a, self.fx.b]
+        assert resync_var_identities_list([], decoded) is decoded
 
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")

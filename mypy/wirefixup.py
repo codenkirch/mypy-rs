@@ -348,22 +348,6 @@ def canonicalize_fresh_vars_reported(
     return result, bool(canonicalizer._var_by_id)
 
 
-def canonicalize_fresh_vars_reported_list(types: list[Type]) -> tuple[list[Type], bool]:
-    """Canonicalize a decoded list with one shared unifier, per identity.
-
-    A single canonicalizer instance unifies fresh ids across the items
-    (the same fresh var can appear in several items), and reports whether
-    any fresh var was seen: such trees must stay out of shared caches.
-    """
-    canonicalizer = _FreshVarCanonicalizer()
-    result: list[Type] = []
-    has_fresh = False
-    for t in types:
-        result.append(t.accept(canonicalizer))
-        has_fresh = has_fresh or bool(canonicalizer._var_by_id)
-    return result, has_fresh
-
-
 def canonicalize_fresh_vars(typ: Type, seed: Sequence[TypeVarLikeType] | None = None) -> Type:
     """Re-unify fresh meta-var occurrences by id (wire-path identity repair)."""
     result, _ = canonicalize_fresh_vars_reported(typ, seed)
@@ -447,29 +431,51 @@ class _VarIdentityCanonicalizer(TypeTranslator):
     Meta vars without a seed entry behave like `_FreshVarCanonicalizer`
     (share the first occurrence). A non-meta var absent from the seed is
     a collection gap: `missing_seed` is set and the caller defers.
+
+    `strict` drops the share-the-first-occurrence fallback: an unmatched
+    meta var also sets `missing_seed`, so a caller that must guarantee
+    live-object identity for *every* var occurrence (a partial-list seam
+    with no enclosing variables slot) defers instead of receiving a
+    doppelganger. `seed` injects a pre-collected map for callers whose
+    context is a list rather than one tree (`resync_var_identities_list`).
     """
 
-    def __init__(self, typ: Type, env_values: Sequence[Type]) -> None:
+    def __init__(
+        self,
+        typ: Type | None = None,
+        env_values: Sequence[Type] = (),
+        *,
+        seed: dict[tuple[int, int, str], TypeVarLikeType] | None = None,
+        strict: bool = False,
+    ) -> None:
         super().__init__()
         self._typ = typ
         self._env_values = env_values
-        self._seed: dict[tuple[int, int, str], TypeVarLikeType] | None = None
+        self._seed = seed
+        self._strict = strict
         self.missing_seed = False
 
     def _canon(self, t: TypeVarLikeType) -> Type:
         if self._seed is None:
             self._seed = {}
-            _collect_typevar_likes(self._typ, self._seed)
+            if self._typ is not None:
+                _collect_typevar_likes(self._typ, self._seed)
             for v in self._env_values:
                 _collect_typevar_likes(v, self._seed)
-        existing = self._seed.get((t.id.raw_id, t.id.meta_level, t.id.namespace))
+        key = (t.id.raw_id, t.id.meta_level, t.id.namespace)
+        existing = self._seed.get(key)
         if existing is None:
-            if not t.id.is_meta_var():
+            if self._strict or not t.id.is_meta_var():
                 self.missing_seed = True
-            self._seed[(t.id.raw_id, t.id.meta_level, t.id.namespace)] = t
+            self._seed[key] = t
             return t
         if existing == t:
             return existing
+        if self._strict:
+            # Same id, different content: not a round-trip copy of the live
+            # original, so it cannot stand in for it under a strict identity
+            # contract.
+            self.missing_seed = True
         return t
 
     def visit_type_var(self, t: TypeVarType, /) -> Type:
@@ -557,6 +563,37 @@ def resync_var_identities(typ: Type, decoded: Type, env_values: Sequence[Type]) 
         return decoded
     cand = _VarIdentityCanonicalizer(typ, env_values)
     result = decoded.accept(cand)
+    if cand.missing_seed:
+        return None
+    return result
+
+
+def resync_var_identities_list(live: Sequence[Type], decoded: list[Type]) -> list[Type] | None:
+    """Re-link a decoded list's TypeVar-like occurrences to live originals.
+
+    The list-shaped counterpart of `resync_var_identities`, for
+    partial-list seams whose input list *is* the whole context
+    (`remove_trivial`, expandtype.py). Python's `remove_trivial` returns
+    the input items unchanged, so a decoded occurrence of a live var
+    would be a doppelganger: `freeze_all_type_vars` mutates
+    `TypeVarId.meta_level` in place and id-keyed substitution compares by
+    object, so a split copy silently escapes both. Seeding from every
+    input item (nested positions included) makes each decoded occurrence
+    resolve to the very object the caller passed in.
+
+    Strict: an occurrence with no structurally-equal live original — a
+    fresh var the seed walk could not see, or a genuine expansion result
+    — returns None so the caller falls back to the pure-Python body.
+    Sharing a decoded copy instead is precisely the split this pass
+    exists to prevent.
+    """
+    if not any(contains_typevar_like(t) for t in decoded):
+        return decoded
+    seed: dict[tuple[int, int, str], TypeVarLikeType] = {}
+    for t in live:
+        _collect_typevar_likes(t, seed)
+    cand = _VarIdentityCanonicalizer(seed=seed, strict=True)
+    result = [d.accept(cand) for d in decoded]
     if cand.missing_seed:
         return None
     return result

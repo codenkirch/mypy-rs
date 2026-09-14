@@ -74,14 +74,7 @@ def _clear_expand_decode_cache() -> None:
     _expand_remove_trivial_cache.clear()
 
 
-def _canonicalize_fresh_type_list(types: list[Type]) -> tuple[list[Type], bool]:
-    """Wire-path identity repair for a decoded list; reports fresh-var presence."""
-    from mypy.wirefixup import canonicalize_fresh_vars_reported_list
-
-    return canonicalize_fresh_vars_reported_list(types)
-
-
-def _needs_python(typ: Type, *, definition_gate: bool = True, meta_gate: bool = False) -> bool:
+def _needs_python(typ: Type, *, definition_gate: bool = True) -> bool:
     """True if `typ` nests a node a kernel round-trip cannot carry.
 
     Callers that re-stamp dropped ``definition`` links after the round-trip
@@ -96,12 +89,11 @@ def _needs_python(typ: Type, *, definition_gate: bool = True, meta_gate: bool = 
     freshen_function_type_vars also keeps the gate (#1220): its decoded
     result re-enters error reporting as a plugin context, where nested
     wire-decoded types carry no locations.
-    Callers whose decoded result is a partial list that cannot be
-    re-unified with an enclosing variables slot (remove_trivial) pass
-    ``meta_gate=True``: a decoded fresh (meta) type var is a distinct
-    object, so in-place id mutation by ``freeze_all_type_vars`` would
-    miss it. Recursive TypeAliasType would loop while decoding and must
-    defer.
+    A fresh (meta) type var is *not* gated: every caller either seeds a
+    ``canonicalize_fresh_vars`` context or re-links decoded occurrences
+    onto the live objects (``remove_trivial`` via
+    ``resync_var_identities_list``, #1623). Recursive TypeAliasType would
+    loop while decoding and must defer.
     """
     stack: list[Type] = [typ]
     visited: set[int] = set()
@@ -125,10 +117,9 @@ def _needs_python(typ: Type, *, definition_gate: bool = True, meta_gate: bool = 
             # `Unpack[tuple[Never, ...]]` items, corrupting union results.
             return True
         elif isinstance(p, TypeVarType):
-            # Meta relax: whole-tree callers re-unify via canonicalize_fresh_vars
-            # and may take fresh (meta) vars across the wire. Partial-list
-            # callers pass meta_gate=True (decoded meta vars cannot re-unify).
-            if p.has_default() or (meta_gate and p.id.meta_level > 0):
+            # A var carrying a default keeps the gate: the collapse to the
+            # default is a Python-side decision with note side effects.
+            if p.has_default():
                 return True
         elif isinstance(p, UnpackType):
             # Walk through Unpack: `Unpack[tuple[Never, ...]]` nests a
@@ -1389,7 +1380,7 @@ def remove_trivial(types: Iterable[Type]) -> list[Type]:
     if (
         _HAS_TYPE_KERNEL
         and _native_expand_type_active
-        and not any(_needs_python(t, meta_gate=True) for t in types_list)
+        and not any(_needs_python(t) for t in types_list)
     ):
         try:
             from mypy.types import read_type_list, write_type_list
@@ -1402,7 +1393,11 @@ def remove_trivial(types: Iterable[Type]) -> list[Type]:
                 cached = _expand_remove_trivial_cache.get(raw)
                 if cached is not None:
                     return cached
-                from mypy.wirefixup import fixup_wire_type
+                from mypy.wirefixup import (
+                    contains_typevar_like,
+                    fixup_wire_type,
+                    resync_var_identities_list,
+                )
 
                 decoded = read_type_list(_ReadBuffer(raw))
                 # Clear the process-global primitive decode singletons
@@ -1422,12 +1417,15 @@ def remove_trivial(types: Iterable[Type]) -> list[Type]:
                         break
                     fixed_types.append(fixed)
                 else:
-                    # Same identity repair + cache policy as expand_type:
-                    # fresh-var trees stay out of the shared cache.
-                    fixed_types, has_fresh = _canonicalize_fresh_type_list(fixed_types)
-                    if not has_fresh:
-                        _expand_remove_trivial_cache[raw] = fixed_types
-                    return fixed_types
+                    # Partial-list seam: re-link each decoded TypeVar-like onto
+                    # the caller's live object; unmatched occurrences defer.
+                    live_types = resync_var_identities_list(types_list, fixed_types)
+                    if live_types is not None:
+                        # Var-bearing results hold per-caller live objects, so
+                        # only var-free results may enter the shared cache.
+                        if not any(contains_typevar_like(t) for t in live_types):
+                            _expand_remove_trivial_cache[raw] = live_types
+                        return live_types
         except (AssertionError, NotImplementedError, ValueError, AttributeError):
             # Defer to Python: semanal TypeInfo-not-fixed asserts,
             # unserializable variants, failed wire reads, FakeInfo
