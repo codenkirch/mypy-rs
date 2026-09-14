@@ -2412,6 +2412,35 @@ fn expand_type_by_instance(typ: &Type, left_ref: &str, left_args: &[Type]) -> Op
     }
 }
 
+/// `maptype.py:206-208` fast path over a live supertype `TypeInfo`:
+/// `if not superclass.type_vars: return Instance(superclass, [])`.
+///
+/// Used when the left class is absent from the snapshot (issue #1619):
+/// the supertype may be published to the live map while the snapshot has
+/// not seen it yet. Returns `None` when the live facts are unavailable or
+/// the supertype is generic (the derivation walk is needed then).
+fn map_supertype_live_non_generic(right_ref: &str, resolver: &TypeResolver) -> Option<Vec<Type>> {
+    if !resolver.has_live_info_map() {
+        return None;
+    }
+    let type_vars = Python::with_gil(|py| {
+        let info = live_typeinfo_obj(py, resolver, right_ref)?;
+        let n = info
+            .getattr("defn")
+            .ok()?
+            .getattr("type_vars")
+            .ok()?
+            .len()
+            .ok()?;
+        Some(n)
+    })?;
+    if type_vars == 0 {
+        Some(Vec::new())
+    } else {
+        None
+    }
+}
+
 /// `map_instance_to_supertype` (maptype.py:8-23), Rust subset.
 ///
 /// Walks `class_derivation_paths` (maptype.py:46-67) over the snapshot's
@@ -2429,9 +2458,15 @@ pub(crate) fn map_instance_to_supertype(
     right_ref: &str,
     resolver: &TypeResolver,
 ) -> Option<Vec<Type>> {
+    // Snapshot-missing left: Python's second fast path (maptype.py:19-21)
+    // answers without the MRO when the superclass has no type vars. A
+    // generic superclass still needs the snapshot derivation walk (#1619).
     let _left_snap = match resolver.get(left_ref) {
         Some(s) => s,
         None => {
+            if let Some(args) = map_supertype_live_non_generic(right_ref, resolver) {
+                return Some(args);
+            }
             return None;
         }
     };
@@ -2722,6 +2757,176 @@ fn callable_protocol_call_check(
     }
 }
 
+/// Live-`TypeInfo` nominal prelude facts for a snapshot-missing left
+/// class (issue #1619).
+///
+/// The Rust `TypeResolver` snapshot is fed per SCC *after* semanal, while
+/// the Python wire map publishes a module's TypeInfos at its top-level
+/// completion (`_install_semal_wirefixup`, issue #1115). A seam that runs
+/// during the remaining semanal of the SCC (e.g. the typeops union and
+/// maptype seams, whose resolvers are not cleared per SCC) therefore sees
+/// `in_map=True, in_snap=False` and defers. The live object is reachable
+/// through `TypeResolver::live_typeinfo`, so the nominal prelude reads
+/// its facts directly (the `rust_is_disjoint_base` live-object pattern).
+///
+/// Nothing is stored: every read happens at decision time, so the live
+/// variance / protocol / member facts can never be pinned pre-inference
+/// (the reason the on-demand-sealing direction was rejected, #1490).
+struct LiveNominal {
+    fallback_to_any: bool,
+    has_base: bool,
+    /// MRO entries carrying a non-empty `_promote` list (Python's
+    /// `base._promote and any(...)`); a hit defers.
+    promote_bases: usize,
+    /// `left.type.alt_promote.type is right.type`.
+    alt_promote_hit: bool,
+    /// `any(l.is_named_tuple for l in left.type.mro)`.
+    mro_has_named_tuple: bool,
+    right_is_protocol: bool,
+    /// `len(right.type.defn.type_vars)`.
+    right_type_vars: usize,
+    right_has_type_var_tuple_type: bool,
+}
+
+impl LiveNominal {
+    fn read(
+        py: Python<'_>,
+        resolver: &TypeResolver,
+        left_ref: &str,
+        right_ref: &str,
+    ) -> Option<LiveNominal> {
+        let left_info = live_typeinfo_obj(py, resolver, left_ref)?;
+        let right_info = live_typeinfo_obj(py, resolver, right_ref)?;
+        let fallback_to_any = left_info.getattr("fallback_to_any").ok()?.is_true().ok()?;
+        let has_base = left_info
+            .call_method1("has_base", (right_ref,))
+            .ok()?
+            .is_true()
+            .ok()?;
+        let mro = left_info.getattr("mro").ok()?;
+        let mut promote_bases = 0usize;
+        let mut mro_has_named_tuple = false;
+        for base in mro.iter().ok()? {
+            let base = base.ok()?;
+            let promote = base.getattr("_promote").ok()?;
+            if promote.len().ok()? > 0 {
+                promote_bases += 1;
+            }
+            if base.getattr("is_named_tuple").ok()?.is_true().ok()? {
+                mro_has_named_tuple = true;
+            }
+        }
+        // `left.type.alt_promote and left.type.alt_promote.type is
+        // right.type` (subtypes.py:546-547): identity comparison against
+        // the live right TypeInfo.
+        let alt_promote = left_info.getattr("alt_promote").ok()?;
+        let alt_promote_hit = if alt_promote.is_none() {
+            false
+        } else {
+            alt_promote.getattr("type").ok()?.is(right_info)
+        };
+        let right_is_protocol = right_info.getattr("is_protocol").ok()?.is_true().ok()?;
+        let right_type_vars = right_info
+            .getattr("defn")
+            .ok()?
+            .getattr("type_vars")
+            .ok()?
+            .len()
+            .ok()?;
+        let right_has_type_var_tuple_type = right_info
+            .getattr("has_type_var_tuple_type")
+            .ok()?
+            .is_true()
+            .ok()?;
+        Some(LiveNominal {
+            fallback_to_any,
+            has_base,
+            promote_bases,
+            alt_promote_hit,
+            mro_has_named_tuple,
+            right_is_protocol,
+            right_type_vars,
+            right_has_type_var_tuple_type,
+        })
+    }
+}
+
+/// Fetch a live `TypeInfo` from the installed live-info map, `None` when
+/// the map is absent, the fullname is missing, or the entry is a Python
+/// `None` placeholder.
+fn live_typeinfo_obj<'py>(
+    py: Python<'py>,
+    resolver: &'py TypeResolver,
+    fullname: &str,
+) -> Option<&'py PyAny> {
+    let info = resolver.live_typeinfo(py, fullname)?;
+    if info.is_none() {
+        return None;
+    }
+    Some(info)
+}
+
+/// `TYPED_NAMEDTUPLE_NAMES` (types.py:249).
+const TYPED_NAMEDTUPLE_NAMES: [&str; 2] = ["typing.NamedTuple", "typing_extensions.NamedTuple"];
+
+/// Nominal-instance decision for a snapshot-missing left class, driven by
+/// the live `TypeInfo` (issue #1619). Mirrors `SubtypeVisitor.visit_instance`'s
+/// `isinstance(right, Instance)` branch (subtypes.py:1100-1230) over live
+/// facts; every arm defers (`None`) rather than approximating, so a
+/// deferral keeps the pure-Python body's exact answer.
+fn visit_instance_nominal_live(
+    left_ref: &str,
+    right_ref: &str,
+    ctx: &SubtypeContext,
+    resolver: &TypeResolver,
+) -> Option<bool> {
+    if !resolver.has_live_info_map() {
+        return None;
+    }
+    // The left class must be a synthesized class absent from the snapshot;
+    // a live miss (an unknown fullname) keeps deferring.
+    let live = Python::with_gil(|py| LiveNominal::read(py, resolver, left_ref, right_ref))?;
+    // fallback_to_any short-circuit (subtypes.py:1102-1106). right is an
+    // Instance here, so `not isinstance(right, NoneType)` is True.
+    if live.fallback_to_any && !ctx.proper_subtype {
+        return Some(true);
+    }
+    // Promotion loop (subtypes.py:1125-1136): a base carrying `_promote`
+    // may promote left to right; deciding that needs the promote targets'
+    // expansion, so any such base defers rather than risk missing a True.
+    if !ctx.ignore_promotions && !live.right_is_protocol {
+        if live.promote_bases > 0 {
+            return None;
+        }
+        if live.alt_promote_hit {
+            return Some(true);
+        }
+    }
+    // Nominal gate (subtypes.py:1140-1150).
+    let is_named_tuple_right =
+        TYPED_NAMEDTUPLE_NAMES.contains(&right_ref) && live.mro_has_named_tuple;
+    let nominal_applies = (live.has_base || right_ref == "builtins.object" || is_named_tuple_right)
+        && !ctx.ignore_declared_variance;
+    if !nominal_applies {
+        // Protocol right: the implementation loop needs member data the
+        // snapshot would supply; defer to the Python visitor.
+        if live.right_is_protocol {
+            return None;
+        }
+        return Some(false);
+    }
+    // Nominal branch with a non-generic, non-variadic right: Python's
+    // `type_params` zip over `right.type.defn.type_vars` is empty, so
+    // `nominal` stays True (subtypes.py:1170-1205) for any mapped args.
+    if live.right_type_vars == 0 && !live.right_has_type_var_tuple_type {
+        return Some(true);
+    }
+    // Generic right: the mapped args and per-tvar variance checks need the
+    // full `map_instance_to_supertype` + `check_type_parameter` walk, which
+    // reads the left class's type vars through the snapshot (expandtype.rs).
+    None
+}
+
 #[allow(clippy::too_many_arguments)]
 fn visit_instance_nominal(
     left: &Type,
@@ -2753,13 +2958,14 @@ fn visit_instance_nominal(
     let left_snap = resolver.get(left_ref);
     let right_snap = resolver.get(right_ref);
 
-    // If left's TypeInfo is not in the resolver, it may be a synthesized
-    // type (e.g. ad-hoc intersection from isinstance narrowing) whose
-    // MRO and bases are only available on the live Python TypeInfo.
-
-    // Defer rather than returning a wrong Some(false).
+    // Left may be a synthesized type (ad-hoc intersection) or a class the
+    // snapshot has not seen yet; read the nominal prelude from the live
+    // TypeInfo (`visit_instance_nominal_live`) instead of deferring.
     #[allow(clippy::question_mark)]
     if left_snap.is_none() {
+        if let Some(verdict) = visit_instance_nominal_live(left_ref, right_ref, ctx, resolver) {
+            return Some(verdict);
+        }
         return None;
     }
 

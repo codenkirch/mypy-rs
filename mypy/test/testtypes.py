@@ -4392,6 +4392,248 @@ class NativeSubtypesDeferralSuite(Suite):
 
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeSnapshotGapLiveNominalSuite(Suite):
+    """Issue #1619: live-`TypeInfo` decisions for a snapshot-missing left.
+
+    The Rust `TypeResolver` snapshot is fed per SCC *after* semanal, while
+    the Python wire map publishes a module's TypeInfos at top-level
+    completion, so a seam inside a class's own SCC sees `in_map=True,
+    in_snap=False` and deferred. The nominal prelude now reads the live
+    `TypeInfo` at decision time instead (nothing is stored, so a
+    pre-inference variance can never be pinned, the #1490 sealing
+    regression), and the map seam reads the live supertype for the
+    `not superclass.type_vars` fast path. Every ambiguous arm still
+    defers (`None`), so the Python fallback keeps answering.
+    """
+
+    def setUp(self) -> None:
+        from mypy.subtypes import _set_native_subtype_active, _set_native_subtype_resolver
+
+        self.fx = TypeFixture(INVARIANT)
+        self.resolver = _type_kernel.build_native_resolver(self._type_infos(), [])
+        _set_native_subtype_resolver(self.resolver)
+        _set_native_subtype_active(True)
+
+    def tearDown(self) -> None:
+        from mypy.subtypes import _set_native_subtype_active, _set_native_subtype_resolver
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        _set_native_subtype_active(False)
+        _set_native_subtype_resolver(None)
+        set_wire_typeinfo_map(None)
+
+    def _type_infos(self) -> list[TypeInfo]:
+        infos = []
+        for name in dir(self.fx):
+            if not name.endswith("i"):
+                continue
+            value = getattr(self.fx, name)
+            if _is_type_info(value):
+                infos.append(value)
+        return infos
+
+    def _snapshot_gap_resolver(self, infos: list[TypeInfo]) -> Any:
+        """Snapshot with the `fx` classes only, live map with `infos` too."""
+        from mypy.subtypes import _set_native_subtype_resolver
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        live_infos = self._type_infos() + infos
+        live = {info.fullname: info for info in live_infos}
+        self.resolver = _type_kernel.build_native_resolver(self._type_infos(), [])
+        self.resolver.set_live_typeinfo_map(live)
+        set_wire_typeinfo_map(live)
+        _set_native_subtype_resolver(self.resolver)
+        return self.resolver
+
+    def _set_gate(self, active: bool) -> None:
+        from mypy.subtypes import _set_native_subtype_active
+
+        _set_native_subtype_active(active)
+
+    def _seam(self, left: Any, right: Any) -> Any:
+        from mypy.subtypes import _serialize_type
+
+        return _type_kernel.rust_is_subtype(
+            _serialize_type(left),
+            _serialize_type(right),
+            False,
+            False,
+            False,
+            False,
+            False,
+            True,
+            False,
+            False,
+            self.resolver,
+        )
+
+    def _parity(self, left: Any, right: Any) -> bool:
+        from mypy.subtypes import is_subtype
+
+        self._set_gate(False)
+        expected = is_subtype(left, right)
+        self._set_gate(True)
+        assert is_subtype(left, right) is expected
+        return expected
+
+    def _base_sub(self, suffix: str = "") -> tuple[TypeInfo, TypeInfo]:
+        from mypy.types import Instance
+
+        base = self.fx.make_type_info(f"mod.LiveBase{suffix}")
+        sub = self.fx.make_type_info(
+            f"mod.LiveSub{suffix}", mro=[base, self.fx.oi], bases=[Instance(base, [])]
+        )
+        return base, sub
+
+    def test_nominal_live_non_generic_decides(self) -> None:
+        # left missing from the snapshot but present live, has_base to a
+        # non-generic right: Python answers True via the nominal branch
+        # and the live prelude must decide the same without deferring.
+        from mypy.types import Instance
+
+        base, sub = self._base_sub()
+        self._snapshot_gap_resolver([base, sub])
+        left, right = Instance(sub, []), Instance(base, [])
+        assert self._parity(left, right) is True
+        assert self._seam(left, right) is True
+
+    def test_nominal_live_object_right_decides(self) -> None:
+        # builtins.object right hits the `rname == "builtins.object"`
+        # clause with no has_base read needed.
+        from mypy.types import Instance
+
+        base, sub = self._base_sub("Obj")
+        self._snapshot_gap_resolver([base, sub])
+        left, right = Instance(sub, []), Instance(self.fx.oi, [])
+        assert self._parity(left, right) is True
+        assert self._seam(left, right) is True
+
+    def test_nominal_live_no_base_decides_false(self) -> None:
+        # No has_base and no object/NamedTuple clause: Python skips the
+        # nominal branch and (right not a protocol) answers False.
+        from mypy.types import Instance
+
+        other = self.fx.make_type_info("mod.LiveOther")
+        _, sub = self._base_sub("False")
+        self._snapshot_gap_resolver([other, sub])
+        left, right = Instance(sub, []), Instance(other, [])
+        assert self._parity(left, right) is False
+        assert self._seam(left, right) is False
+
+    def test_nominal_live_generic_right_defers(self) -> None:
+        # Generic right: the per-arg variance walk needs the snapshot
+        # substitution, so the live prelude must defer (gate parity holds
+        # through the Python fallback).
+        from mypy.types import Instance
+
+        sub = self.fx.make_type_info(
+            "mod.LiveGSub",
+            mro=[self.fx.gi, self.fx.oi],
+            bases=[Instance(self.fx.gi, [self.fx.a])],
+        )
+        self._snapshot_gap_resolver([sub])
+        left, right = Instance(sub, []), Instance(self.fx.gi, [self.fx.a])
+        assert self._parity(left, right) is True
+        assert self._seam(left, right) is None
+
+    def test_nominal_live_protocol_right_defers(self) -> None:
+        # Protocol right: the member loop is not part of the live prelude.
+        from mypy.types import Instance
+
+        proto = self.fx.make_type_info("mod.LiveProto")
+        proto.is_protocol = True
+        _, sub = self._base_sub("Proto")
+        self._snapshot_gap_resolver([proto, sub])
+        left, right = Instance(sub, []), Instance(proto, [])
+        self._parity(left, right)
+        assert self._seam(left, right) is None
+
+    def test_nominal_live_promotion_defers(self) -> None:
+        # A base carrying `_promote` may promote left to right; deciding
+        # that needs the promote targets' expansion, so the live prelude
+        # defers and the Python promote loop answers True.
+        from mypy.types import Instance
+
+        base, sub = self._base_sub("Promote")
+        sub._promote = [Instance(base, [])]
+        self._snapshot_gap_resolver([base, sub])
+        left, right = Instance(sub, []), Instance(base, [])
+        assert self._parity(left, right) is True
+        assert self._seam(left, right) is None
+
+    def test_nominal_live_fallback_to_any_decides(self) -> None:
+        # `fallback_to_any` short-circuits True for a non-proper check.
+        from mypy.types import Instance
+
+        base, sub = self._base_sub("FbAny")
+        sub.fallback_to_any = True
+        self._snapshot_gap_resolver([base, sub])
+        left, right = Instance(sub, []), Instance(base, [])
+        assert self._parity(left, right) is True
+        assert self._seam(left, right) is True
+
+    def test_nominal_live_without_live_map_defers(self) -> None:
+        # No live map (pure-Rust / cleared resolver): the prelude must
+        # defer rather than guess from the empty snapshot.
+        from mypy.subtypes import _set_native_subtype_resolver, is_subtype
+        from mypy.types import Instance
+
+        base, sub = self._base_sub("NoLive")
+        left, right = Instance(sub, []), Instance(base, [])
+        self._set_gate(False)
+        expected = is_subtype(left, right)
+        bare = _type_kernel.build_native_resolver(self._type_infos(), [])
+        self.resolver = bare
+        _set_native_subtype_resolver(bare)
+        self._set_gate(True)
+        assert is_subtype(left, right) is expected
+        assert self._seam(left, right) is None
+
+    def test_map_live_non_generic_decides(self) -> None:
+        # Both classes absent from the snapshot but live: the FFI mapping
+        # fast path reads the live supertype's empty `type_vars`.
+        from librt.internal import ReadBuffer
+        from mypy.types import Instance, get_proper_type, read_type
+
+        base, sub = self._base_sub("Map")
+        resolver = self._snapshot_gap_resolver([base, sub])
+        inst = Instance(sub, [])
+        buf = _WriteBuffer()
+        inst.write(buf)
+        result = _type_kernel.rust_map_instance_to_supertype(
+            resolver, sub.fullname, buf.getvalue(), base.fullname
+        )
+        assert result is not None, "live non-generic supertype must map natively"
+        decoded = read_type(ReadBuffer(bytes(result)))
+        from mypy.wirefixup import fixup_wire_type
+
+        fixed = fixup_wire_type(decoded)
+        assert fixed is not None
+        proper = get_proper_type(fixed)
+        assert isinstance(proper, Instance)
+        assert proper.type is base
+        assert not proper.args
+
+    def test_map_live_generic_right_defers(self) -> None:
+        # Generic supertype: still needs the snapshot derivation walk.
+        from mypy.types import Instance
+
+        sub = self.fx.make_type_info(
+            "mod.LiveMapGSub",
+            mro=[self.fx.gi, self.fx.oi],
+            bases=[Instance(self.fx.gi, [self.fx.a])],
+        )
+        resolver = self._snapshot_gap_resolver([sub])
+        inst = Instance(sub, [])
+        buf = _WriteBuffer()
+        inst.write(buf)
+        result = _type_kernel.rust_map_instance_to_supertype(
+            resolver, sub.fullname, buf.getvalue(), self.fx.gi.fullname
+        )
+        assert result is None
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeInstanceCallSubtypeSuite(Suite):
     """Issue #1255: the two remaining is_subtype defer arms now decide.
 
