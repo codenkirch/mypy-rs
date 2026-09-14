@@ -62551,3 +62551,102 @@ class NativeIsTypeLikeSuite(Suite):
 
     def test_parity_var(self) -> None:
         self._assert_par(Var("x"))
+
+
+class NativeHotSeamsRetiredSuite(Suite):
+    """Pin the #1640 retirement of hot short-call seams in mypy/types.py.
+
+    The O(1) property reads (is_generic, is_var_arg, is_kw_arg,
+    min_args, max_possible, tuple/union length, can_be_true/false
+    defaults, has_recursive_types) serialized whole type trees so
+    Rust could read one scalar. They now run pure Python with zero
+    wire crossings; this suite fails if any native call returns.
+    """
+
+    _RETIRED_HELPERS = (
+        "_native_callable_is_generic",
+        "_native_callable_is_kw_arg",
+        "_native_callable_is_var_arg",
+        "_native_callable_max_possible_positional_args",
+        "_native_callable_min_args",
+        "_native_can_be_false_default",
+        "_native_can_be_true_default",
+        "_native_tuple_length",
+        "_native_union_length",
+    )
+
+    def setUp(self) -> None:
+        from mypy.types import _set_native_visitor_active
+
+        self.fx = TypeFixture()
+        import mypy.types as _tmod
+
+        self._tmod = _tmod
+        self._orig_gate = _tmod._native_visitor_active
+        _set_native_visitor_active(True)
+
+    def tearDown(self) -> None:
+        from mypy.types import _set_native_visitor_active
+
+        _set_native_visitor_active(self._orig_gate or False)
+
+    def test_helpers_removed(self) -> None:
+        for name in self._RETIRED_HELPERS:
+            assert not hasattr(self._tmod, name), f"{name} should be retired"
+
+    def test_hot_reads_serialize_nothing(self) -> None:
+        from mypy.types import TupleType, UnionType, has_recursive_types
+
+        calls: list[str] = []
+        orig = self._tmod._serialize_type_for_visitor
+
+        def spy(t: Any) -> bytes:
+            calls.append("serialize")
+            return orig(t)
+
+        self._tmod._serialize_type_for_visitor = spy
+        try:
+            c = self.fx.callable(self.fx.a, self.fx.b)
+            assert c.is_generic() is False
+            assert c.min_args == 1
+            assert c.is_var_arg is False
+            assert c.is_kw_arg is False
+            assert c.max_possible_positional_args() == 1
+            tt = TupleType([self.fx.a], self.fx.std_tuple)
+            assert tt.length() == 1
+            u = UnionType([self.fx.a, self.fx.b])
+            assert u.length() == 2
+            assert u.can_be_true is True
+            assert has_recursive_types(self.fx.a) is False
+        finally:
+            self._tmod._serialize_type_for_visitor = orig
+        assert calls == [], f"hot reads serialized: {len(calls)} calls"
+
+    def test_values_match_python(self) -> None:
+        from mypy.nodes import ARG_POS, ARG_STAR, ARG_STAR2
+        from mypy.types import CallableType, TupleType, UnionType
+
+        c = CallableType(
+            [self.fx.a, self.fx.b],
+            [ARG_POS, ARG_STAR],
+            [None, None],
+            self.fx.b,
+            self.fx.function,
+        )
+        assert c.min_args == 1
+        assert c.is_var_arg is True
+        assert c.is_kw_arg is False
+        assert c.max_possible_positional_args() == 2**63 - 1
+        assert c.is_generic() is False
+        t0 = TupleType([], self.fx.std_tuple)
+        assert t0.length() == 0
+        assert t0.can_be_true is False
+        assert t0.can_be_false is True
+        u = UnionType([self.fx.a, self.fx.nonet])
+        assert u.can_be_true is True
+        assert u.can_be_false is True
+        kw = CallableType(
+            [self.fx.a], [ARG_STAR2], [None], self.fx.b, self.fx.function
+        )
+        assert kw.is_kw_arg is True
+        assert kw.max_possible_positional_args() == 2**63 - 1

@@ -429,15 +429,11 @@ class Type(mypy.nodes.Context):
         self._can_be_false = v
 
     def can_be_true_default(self) -> bool:
-        result = _native_can_be_true_default(self)
-        if result is not None:
-            return result
+        # Native seam retired (#1640): base default is True.
         return True
 
     def can_be_false_default(self) -> bool:
-        result = _native_can_be_false_default(self)
-        if result is not None:
-            return result
+        # Native seam retired (#1640): base default is True.
         return True
 
     def accept(self, visitor: TypeVisitor[T]) -> T:
@@ -2645,25 +2641,19 @@ class CallableType(FunctionLike):
 
     @property
     def min_args(self) -> int:
-        result = _native_callable_min_args(self)
-        if result is not None:
-            return result
+        # Native seam retired (#1640): O(1) list count.
         return self.arg_kinds.count(ARG_POS)
 
     @property
     def is_var_arg(self) -> bool:
         """Does this callable have a *args argument?"""
-        result = _native_callable_is_var_arg(self)
-        if result is not None:
-            return result
+        # Native seam retired (#1640): O(n) membership test.
         return ARG_STAR in self.arg_kinds
 
     @property
     def is_kw_arg(self) -> bool:
         """Does this callable have a **kwargs argument?"""
-        result = _native_callable_is_kw_arg(self)
-        if result is not None:
-            return result
+        # Native seam retired (#1640): O(n) membership test.
         return ARG_STAR2 in self.arg_kinds
 
     def is_type_obj(self) -> bool:
@@ -2717,9 +2707,7 @@ class CallableType(FunctionLike):
         """Returns maximum number of positional arguments this method could possibly accept.
 
         This takes into account *arg and **kwargs but excludes keyword-only args."""
-        result = _native_callable_max_possible_positional_args(self)
-        if result is not None:
-            return result
+        # Native seam retired (#1640): O(n) scalar read.
         if self.is_var_arg or self.is_kw_arg:
             return sys.maxsize
         return sum(kind.is_positional() for kind in self.arg_kinds)
@@ -2828,9 +2816,7 @@ class CallableType(FunctionLike):
         return [self]
 
     def is_generic(self) -> bool:
-        result = _native_callable_is_generic(self)
-        if result is not None:
-            return result
+        # Native seam retired (#1640): list truthiness check.
         return bool(self.variables)
 
     def type_var_ids(self) -> list[TypeVarId]:
@@ -3265,9 +3251,7 @@ class TupleType(ProperType):
         )
 
     def length(self) -> int:
-        result = _native_tuple_length(self)
-        if result is not None:
-            return result
+        # Native seam retired (#1640): O(1) len read.
         return len(self.items)
 
     def accept(self, visitor: TypeVisitor[T]) -> T:
@@ -3881,15 +3865,11 @@ class UnionType(ProperType):
         self.original_str_fallback: str | None = None
 
     def can_be_true_default(self) -> bool:
-        result = _native_can_be_true_default(self)
-        if result is not None:
-            return result
+        # Native seam retired (#1640): any() over cached flags.
         return any(item.can_be_true for item in self.items)
 
     def can_be_false_default(self) -> bool:
-        result = _native_can_be_false_default(self)
-        if result is not None:
-            return result
+        # Native seam retired (#1640): any() over cached flags.
         return any(item.can_be_false for item in self.items)
 
     def __hash__(self) -> int:
@@ -3922,9 +3902,7 @@ class UnionType(ProperType):
             return UninhabitedType()
 
     def length(self) -> int:
-        result = _native_union_length(self)
-        if result is not None:
-            return result
+        # Native seam retired (#1640): O(1) len read.
         return len(self.items)
 
     def accept(self, visitor: TypeVisitor[T]) -> T:
@@ -4674,30 +4652,18 @@ try:
         rust_callable_argument_by_name as _rust_callable_argument_by_name,
         rust_callable_argument_by_position as _rust_callable_argument_by_position,
         rust_callable_formal_arguments as _rust_callable_formal_arguments,
-        rust_callable_is_generic as _rust_callable_is_generic,
-        rust_callable_is_kw_arg as _rust_callable_is_kw_arg,
-        rust_callable_is_var_arg as _rust_callable_is_var_arg,
-        rust_callable_max_possible_positional_args as _rust_callable_max_possible_positional_args,
-        rust_callable_min_args as _rust_callable_min_args,
         rust_callable_with_ellipsis as _rust_callable_with_ellipsis,
-        rust_can_be_false_default as _rust_can_be_false_default,
-        rust_can_be_false_default_live as _rust_can_be_false_default_live,
-        rust_can_be_true_default as _rust_can_be_true_default,
-        rust_can_be_true_default_live as _rust_can_be_true_default_live,
         rust_copy_modified as _rust_copy_modified,
         rust_copy_type as _rust_copy_type,
         rust_find_unpack_in_list as _rust_find_unpack_in_list,
         rust_flatten_nested_tuples as _rust_flatten_nested_tuples,
         rust_flatten_nested_unions as _rust_flatten_nested_unions,
-        rust_has_recursive_types as _rust_has_recursive_types,
         rust_has_type_vars as _rust_has_type_vars,
         rust_is_literal_type as _rust_is_literal_type,
         rust_is_unannotated_any as _rust_is_unannotated_any,
         rust_remove_dups as _rust_remove_dups,
         rust_split_with_prefix_and_suffix as _rust_split_with_prefix_and_suffix,
-        rust_tuple_length as _rust_tuple_length,
         rust_type_vars_as_args as _rust_type_vars_as_args,
-        rust_union_length as _rust_union_length,
     )
 
     # Phase gate #1412: read_type is defined later, so it cannot be bound
@@ -4706,7 +4672,6 @@ try:
     _VISITOR_HAS_TYPE_KERNEL = True
 except ImportError:
     _rust_has_type_vars = None  # type: ignore[assignment]
-    _rust_has_recursive_types = None  # type: ignore[assignment]
     _rust_is_literal_type = None  # type: ignore[assignment]
     _rust_is_unannotated_any = None  # type: ignore[assignment]
     _rust_copy_modified = None  # type: ignore[assignment]
@@ -4718,20 +4683,9 @@ except ImportError:
     _rust_flatten_nested_unions = None  # type: ignore[assignment]
     _rust_flatten_nested_tuples = None  # type: ignore[assignment]
     _rust_copy_type = None  # type: ignore[assignment]
-    _rust_can_be_true_default = None  # type: ignore[assignment]
-    _rust_can_be_true_default_live = None  # type: ignore[assignment]
-    _rust_can_be_false_default = None  # type: ignore[assignment]
-    _rust_can_be_false_default_live = None  # type: ignore[assignment]
-    _rust_callable_min_args = None  # type: ignore[assignment]
-    _rust_callable_is_var_arg = None  # type: ignore[assignment]
-    _rust_callable_is_kw_arg = None  # type: ignore[assignment]
-    _rust_callable_max_possible_positional_args = None  # type: ignore[assignment]
-    _rust_callable_is_generic = None  # type: ignore[assignment]
     _rust_callable_formal_arguments = None  # type: ignore[assignment]
     _rust_callable_argument_by_name = None  # type: ignore[assignment]
     _rust_callable_argument_by_position = None  # type: ignore[assignment]
-    _rust_tuple_length = None  # type: ignore[assignment]
-    _rust_union_length = None  # type: ignore[assignment]
     _VisitorWriteBuffer = None  # type: ignore[assignment,misc]
     _ReadBuffer = None  # type: ignore[assignment,misc]
     _visitor_read_type = None  # type: ignore[assignment]
@@ -4763,13 +4717,7 @@ def _set_native_visitor_resolver(resolver: Any) -> None:
 
 
 def _set_native_truthiness_resolver(resolver: Any) -> None:
-    """Install the resolver used by the live truthiness seams (parity-only).
-
-    The resolver carries the snapshot tables (TypeInfo/alias) and a live
-    TypeInfo map installed via `set_live_typeinfo_map`; the live seams use
-    it to decide `can_be_any_bool`, enum-literal truthiness, and alias
-    targets without reading those fields through the byte seam.
-    """
+    """Retired (#1640): kept as no-op for test compatibility."""
     global _native_truthiness_resolver
     _native_truthiness_resolver = resolver
 
@@ -4843,132 +4791,6 @@ def _encode_no_arg_instance(t: Type, buf_cls: type[WriteBuffer]) -> bytes | None
         write_tag(buf, INSTANCE_SIMPLE)
         write_str_bare(buf, fn)
     return buf.getvalue()
-
-
-def _native_can_be_true_default(t: Type) -> bool | None:
-    """Native fast path for Type.can_be_true_default (#456).
-
-    Returns the bool result, or None to defer to the Python default.
-    Guards against recursion: when called from within a serialization
-    (write) path, defers immediately so the native path does not
-    re-trigger write → property → default → native → write.
-    """
-    if not (_VISITOR_HAS_TYPE_KERNEL and _native_visitor_active):
-        return None
-    global _native_truthiness_in_flight
-    if _native_truthiness_in_flight:
-        return None
-    _native_truthiness_in_flight = True
-    try:
-        if _native_truthiness_resolver is not None:
-            return _rust_can_be_true_default_live(
-                _serialize_type_for_visitor(t), _native_truthiness_resolver
-            )
-        return _rust_can_be_true_default(_serialize_type_for_visitor(t))
-    except (AssertionError, NotImplementedError):
-        return None
-    finally:
-        _native_truthiness_in_flight = False
-
-
-def _native_can_be_false_default(t: Type) -> bool | None:
-    """Native fast path for Type.can_be_false_default (#456).
-
-    Returns the bool result, or None to defer to the Python default.
-    Guards against recursion: when called from within a serialization
-    (write) path, defers immediately so the native path does not
-    re-trigger write → property → default → native → write.
-    """
-    if not (_VISITOR_HAS_TYPE_KERNEL and _native_visitor_active):
-        return None
-    global _native_truthiness_in_flight
-    if _native_truthiness_in_flight:
-        return None
-    _native_truthiness_in_flight = True
-    try:
-        if _native_truthiness_resolver is not None:
-            return _rust_can_be_false_default_live(
-                _serialize_type_for_visitor(t), _native_truthiness_resolver
-            )
-        return _rust_can_be_false_default(_serialize_type_for_visitor(t))
-    except (AssertionError, NotImplementedError):
-        return None
-    finally:
-        _native_truthiness_in_flight = False
-
-
-def _native_callable_min_args(t: Type) -> int | None:
-    if not (_VISITOR_HAS_TYPE_KERNEL and _native_visitor_active):
-        return None
-    try:
-        return _rust_callable_min_args(_serialize_type_for_visitor(t))
-    except (AssertionError, NotImplementedError):
-        return None
-
-
-def _native_callable_is_var_arg(t: Type) -> bool | None:
-    if not (_VISITOR_HAS_TYPE_KERNEL and _native_visitor_active):
-        return None
-    try:
-        return _rust_callable_is_var_arg(_serialize_type_for_visitor(t))
-    except (AssertionError, NotImplementedError):
-        return None
-
-
-def _native_callable_is_kw_arg(t: Type) -> bool | None:
-    if not (_VISITOR_HAS_TYPE_KERNEL and _native_visitor_active):
-        return None
-    try:
-        return _rust_callable_is_kw_arg(_serialize_type_for_visitor(t))
-    except (AssertionError, NotImplementedError):
-        return None
-
-
-def _native_callable_max_possible_positional_args(t: Type) -> int | None:
-    if not (_VISITOR_HAS_TYPE_KERNEL and _native_visitor_active):
-        return None
-    try:
-        return _rust_callable_max_possible_positional_args(_serialize_type_for_visitor(t))
-    except (AssertionError, NotImplementedError):
-        return None
-
-
-def _native_callable_is_generic(t: Type) -> bool | None:
-    if not (_VISITOR_HAS_TYPE_KERNEL and _native_visitor_active):
-        return None
-    try:
-        return _rust_callable_is_generic(_serialize_type_for_visitor(t))
-    except (AssertionError, NotImplementedError):
-        return None
-
-
-def _native_tuple_length(t: Type) -> int | None:
-    if not (_VISITOR_HAS_TYPE_KERNEL and _native_visitor_active):
-        return None
-    # Re-entry guard: a length() evaluated from can_be_true during an
-    # in-flight serialization (write) would re-serialize a partially
-    # written cyclic alias graph and blow the stack (recursive-alias tests).
-
-    # Defer to the pure len(items) path, which never re-serializes and
-    # answers identically.
-    if _type_wire_cache_session_depth > 0:
-        return None
-    try:
-        return _rust_tuple_length(_serialize_type_for_visitor(t))
-    except (AssertionError, NotImplementedError):
-        return None
-
-
-def _native_union_length(t: Type) -> int | None:
-    if not (_VISITOR_HAS_TYPE_KERNEL and _native_visitor_active):
-        return None
-    # Same serialization re-entry guard as _native_tuple_length.
-    if _type_wire_cache_session_depth > 0:
-        return None
-    try:
-        return _rust_union_length(_serialize_type_for_visitor(t))
-    except (AssertionError, NotImplementedError):
-        return None
 
 
 def _deserialize_type_from_visitor(b: bytes, *, resolve_aliases: bool = False) -> Type | None:
@@ -5654,14 +5476,7 @@ _has_recursive_type: Final = HasRecursiveType()
 
 def has_recursive_types(typ: Type) -> bool:
     """Check if a type contains any recursive aliases (recursively)."""
-    if _VISITOR_HAS_TYPE_KERNEL and _native_visitor_active:
-        try:
-            type_bytes = _serialize_type_for_visitor(typ)
-            result = _rust_has_recursive_types(type_bytes)
-            if result is not None:
-                return result
-        except (AssertionError, NotImplementedError):
-            pass
+    # Native seam retired (#1640): serialize+walk cost exceeds walk.
     _has_recursive_type.reset()
     return typ.accept(_has_recursive_type)
 
