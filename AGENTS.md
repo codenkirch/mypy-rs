@@ -4649,6 +4649,76 @@ including:
   Follow-ups filed: #1640 (types.py short-call seams), #1641
   (dirty-driven per-SCC resolver update), #1642 (check_call cluster).
   #1624 stays open as the standing perf blocker.
+- Hot short-call seam retirement (issue #1640, PR #1648): fix shape
+  (d, delete) from the #1624 audit — the serialize-round-trip native
+  fast paths for `is_generic`, `has_recursive_types`,
+  `can_be_true/false_default`, `is_var_arg`, `is_kw_arg`, `min_args`,
+  `max_possible_positional_args`, `TupleType.length`, `UnionType.length`
+  in `mypy/types.py` cost more in wire traffic than the decision is
+  worth, so the 9 `_native_*` helpers + 12 `_rust_*` imports are
+  deleted (112+/198-) and the pure-Python bodies answer directly (the
+  Rust fns stay registered for direct-seam tests). Covered by
+  `NativeHotSeamsRetiredSuite` in `mypy/test/testtypes.py`. Measured
+  proxy saving ~6.97s across ~1.58M seam calls (-> 0 on every
+  retired seam). Residuals: `rust_is_literal_type_like` (0.32s,
+  typeops surface, out of scope) and the copy/flatten/expand floors,
+  which need a live-object return interface. Gates: cargo 2812/11,
+  testtypes 3774/7, testcheck 8144/69/7 exact, full parity green in
+  CI, cold self-check clean (353 files).
+- Dirty-driven per-SCC resolver upkeep (issue #1641, PR #1652):
+  Python-side content-signature diff over exactly the post-seal fields
+  (`_promote`, `alt_promote`, type-var variance) in `mypy/build.py`
+  (`_native_builtins_sig` / `_split_native_pending`, sig map on
+  `BuildManager`, reset in `_clear_native_resolvers`); unknown shapes
+  fail safe to re-push. The issue's mark-at-`add_type_promotion`
+  direction was tried and dropped: it passed single-process but failed
+  parallel self-check (155 errors) because the fixup
+  cache-load backwards-promotion hack (`mypy/fixup.py:124-130`,
+  mirrored in `fixup.rs:651-665`) grows `_promote` with no semanal
+  hook observing it. Process-local by construction, so no cross-worker
+  protocol. Measured: builtins re-pushes 53,563 -> 1 (`-n0`) / 4
+  (workers). Covered by `NativeResolverSigSuite` in
+  `mypy/test/testtypes.py` (8 tests). Gates: cargo 2812/11, testtypes
+  3779/7, testcheck 8144/69/7 exact, fine-grained 747/27,
+  finegrainedcache 549/229, daemon 38, cold + warm (cache-consuming)
+  self-check clean.
+- `rust_walk_dependency_visitor` (issue #1632, PR #1651): the full
+  `DependencyVisitor` walk (`mypy/server/deps.py`, ~52 `visit_*`
+  methods) over live PyO3 objects (zero wire bytes) in the new
+  `crates/type_kernel/src/depswalk.rs` (~2,100 lines), reusing the
+  ported `collect_triggers` / `attribute_triggers_walk` kernels; any
+  unreadable fact defers (`None`) so Python re-runs (incl. re-raising
+  asserts). The Python walk stays as the fallback (deletion would
+  remove the strangler safety net). Covered by
+  `NativeServerDepsWalkSuite` in `mypy/test/testtypes.py` (14 tests).
+  Measured: Python-body walk hits 12,410 -> 0 across the
+  fine-grained corpora. Gates: cargo 2812/11, testtypes 3833/7,
+  testdeps 230, fine-grained 747/27, finegrainedcache 549/229,
+  daemon+merge+diff 158/1, testcheck 8198/15/7 exact, cold self-check
+  clean.
+- Pattern-check driver heads (issue #1633, PR #1650): six classifiers
+  in `crates/type_kernel/src/checkpattern.rs` (seq head/result, map
+  rest, or-filter, class alias/kw) with shims in `mypy/checkpattern.py`
+  keeping verbatim-Python fallbacks; value/singleton bodies, or-union
+  building, and the keyword member-access loop stay Python by design.
+  Covered by `NativePatternCheckDriverSuite` in
+  `mypy/test/testtypes.py` (33 tests). Measured: 1,345 Python-body
+  hits -> 0 on the match corpus. Note: the cold self-check corpus
+  contains zero match statements, so self-check is a no-regression
+  gate only; engagement is measured on testcheck. Gates: cargo
+  2833/11, testtypes 3819/7, testcheck 8198/15/7 exact, cold
+  self-check clean.
+- Stubgen printer collectors (issue #1636, PR #1649): three seams in
+  the new `crates/type_kernel/src/stubgen.rs` behind the existing
+  `_HAS_NATIVE_STUBGEN` gate in `mypy/stubgen.py`; the port caught a
+  real semantics bug pre-merge (the unified unwrap loop ran both
+  math and `not` phases where Python runs exactly one). Covered by
+  `NativeStubgenPrinterSuite` in `mypy/test/testtypes.py` (12 tests).
+  Measured: 1,710 Python hits -> 0 (1,372 native whole-subtree
+  answers). `AnnotationPrinter`/`AliasPrinter` emission, the
+  `visit_*` walk, and `stubutil.py` stay Python (deliberate residual).
+  Gates: cargo 2815/11, teststubgen 373/1/2 text-exact, cold
+  self-check clean.
 
 ### Ledger backfill (2026-09-14)
 

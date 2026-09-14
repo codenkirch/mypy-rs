@@ -1,5 +1,75 @@
 # Handoff: strangler-fig Rust migration loop (seam-deferral reduction)
 
+## RESUME POINT — 2026-09-14, night (second parallel wave landed)
+
+Five parallel workers ran the top of the queue (perf #1640/#1641 +
+Phase-2 slices #1632/#1633/#1636). All five landed as merged PRs the
+same day; the two issues PR bodies failed to auto-close (#1640, #1636)
+were closed manually with landed evidence. `AGENTS.md` ledger entries
+for the five landings are in the same docs PR as this section.
+
+### Where `main` stands
+
+`main` = `c28d98f82` (feat native dependency walk, PR `#1651`), on top
+of `a41f4a94a` (`#1652` resolver upkeep), `82964b3c9` (`#1650` pattern
+driver), `bdacb0910` (`#1649` stubgen collectors), `ad8783e97` (`#1648`
+hot-seam retirement), `fb325d068` (`#1647` prior ledger+handoff).
+
+Landed this wave, in merge order:
+- `#1648` **retire hot short-call seams (#1640)**: deleted the
+  serialize-round-trip fast paths for `is_generic`,
+  `has_recursive_types`, `can_be_true/false_default`, `is_var_arg`,
+  `is_kw_arg`, `min_args`, `max_possible_positional_args`,
+  `TupleType.length`, `UnionType.length` (types.py 112+/198-). Proxy
+  saving ~6.97s across ~1.58M seam calls (-> 0). testtypes 3774/7,
+  testcheck exact, self-check clean.
+- `#1649` **stubgen printer collectors (#1636)**: three seams in new
+  `stubgen.rs` behind `_HAS_NATIVE_STUBGEN`; caught a real unwrap-loop
+  bug pre-merge (math vs `not` phases). 1,710 Python hits -> 0.
+  teststubgen 373/1/2 text-exact, self-check clean.
+- `#1650` **pattern-check driver heads (#1633)**: six classifiers in
+  `checkpattern.rs` with verbatim-Python fallbacks. 1,345 Python-body
+  hits -> 0 on the match corpus (self-check has zero match stmts, so
+  engagement is testcheck-measured). testcheck 8198/15/7 exact.
+- `#1652` **dirty-driven per-SCC resolver upkeep (#1641)**: content-sig
+  diff over post-seal fields in `build.py`; the issue's
+  mark-at-promotion direction failed parallel self-check (155 errors)
+  via the fixup backwards-promotion hack and was dropped. Builtins
+  re-pushes 53,563 -> 1 (-n0) / 4 (workers). fg 747/27, fgc 549/229,
+  daemon 38, warm self-check cache-consuming.
+- `#1651` **native dependency walk (#1632)**: full `DependencyVisitor`
+  over live PyO3 objects in new `depswalk.rs` (~2,100 lines), Python
+  walk kept as fallback. 12,410 Python-body hits -> 0. testdeps 230,
+  full fine-grained family green, testcheck exact.
+
+Closed: #1640, #1641, #1632, #1633, #1636. Still open: #1624 (standing
+perf blocker), #1620 (wire gaps), #1621 + slices #1628/#1629, #1626-#1629,
+#1634/#1635/#1637 (unclaimed Phase-2 slices), #1642 (check_call cluster).
+
+### Post-merge verification on `c28d98f82` (fresh kernel, this session)
+
+- Kernel rebuilt from the merged head into
+  `/private/tmp/mypy-rs-local-tk-final`.
+- Cold self-check `-n0 --no-incremental`: clean, 353 files.
+- Targeted suites for all five landings: 70 passed.
+- Shared `.venv` editable re-pointed at main (`uv sync`).
+
+### Queue for the next wave
+
+1. #1642 (check_call cluster) + #1637 (scalar-only seams) — last two
+   unowned perf slices.
+2. #1634 (complex-statement drivers) + #1635 (subexpr/aststrip) — last
+   two unclaimed Phase-2 module slices.
+3. #1621 slices #1628/#1629 (ParamSpec/TVT solve) — `solve.rs`
+   released by #1618; the 95-call origin-rebuild boundary is the wall.
+4. #1620 remaining (definition slot, ParamSpec/TVT meta_level,
+   PartialType, ErasedType).
+5. All five wave worktrees removed; branches deleted locally and on
+   origin; per-issue scratch `.so` dirs deleted. `git worktree list`
+   shows only the main checkout.
+
+---
+
 ## RESUME POINT — 2026-09-14, evening (stopped swarm finished, all work landed)
 
 The mid-flight swarm from the previous resume point was resumed with four
