@@ -2096,6 +2096,15 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         stubgen::rust_method_name_sort_key,
         module
     )?)?;
+    module.add_function(wrap_pyfunction!(
+        stubgen::rust_stubgen_get_qualified_name,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        stubgen::rust_stubgen_str_type_tag,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(stubgen::rust_stubgen_str_default, module)?)?;
     // Attrs plugin transform (Issue #357): seam function for class decoration.
     module.add_function(wrap_pyfunction!(attrs::rust_transform_attrs, module)?)?;
     module.add_function(wrap_pyfunction!(attrs::rust_serialize_fields, module)?)?;

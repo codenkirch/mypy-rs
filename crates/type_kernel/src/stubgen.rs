@@ -489,6 +489,345 @@ pub fn rust_method_name_sort_key(name: &str) -> (u8, String) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Issue #1636: stubgen printer/collector family (live AST nodes, no wire)
+// ---------------------------------------------------------------------------
+
+/// Mirror `mypy.stubgen.get_qualified_name` exactly.
+#[pyfunction]
+pub fn rust_stubgen_get_qualified_name(node: &PyAny) -> PyResult<String> {
+    qualified_inner(node)
+}
+
+fn qualified_inner(node: &PyAny) -> PyResult<String> {
+    let type_name: String = node.get_type().name()?.into();
+    match type_name.as_str() {
+        "NameExpr" => Ok(node.getattr("name")?.extract()?),
+        "MemberExpr" => {
+            let name: String = node.getattr("name")?.extract()?;
+            let inner = node.getattr("expr")?;
+            Ok(format!("{}.{}", qualified_inner(inner)?, name))
+        }
+        _ => Ok("<ERROR>".to_string()),
+    }
+}
+
+/// Unwrap nested unary exprs like `maybe_unwrap_unary_expr`.
+fn unwrap_for_str_type(node: &PyAny) -> PyResult<Option<&PyAny>> {
+    let head: String = node.get_type().name()?.into();
+    if head != "UnaryExpr" {
+        return Ok(Some(node));
+    }
+    let op0: String = match node.getattr("op") {
+        Ok(v) => match v.extract() {
+            Ok(s) => s,
+            Err(_) => return Ok(None),
+        },
+        Err(_) => return Ok(None),
+    };
+    if op0 == "+" || op0 == "-" {
+        let mut cur = node;
+        loop {
+            let ctn: String = cur.get_type().name()?.into();
+            if ctn != "UnaryExpr" {
+                break;
+            }
+            let cop: String = match cur.getattr("op") {
+                Ok(v) => match v.extract() {
+                    Ok(s) => s,
+                    Err(_) => return Ok(None),
+                },
+                Err(_) => return Ok(None),
+            };
+            if cop != "+" && cop != "-" {
+                break;
+            }
+            let inner = match cur.getattr("expr") {
+                Ok(v) => v,
+                Err(_) => return Ok(None),
+            };
+            let inm: String = inner.get_type().name()?.into();
+            match inm.as_str() {
+                "IntExpr" | "FloatExpr" | "ComplexExpr" | "UnaryExpr" => cur = inner,
+                _ => break,
+            }
+        }
+        return Ok(Some(cur));
+    }
+    if op0 == "not" {
+        let mut cur = node;
+        loop {
+            let ctn: String = cur.get_type().name()?.into();
+            if ctn != "UnaryExpr" {
+                break;
+            }
+            let cop: String = match cur.getattr("op") {
+                Ok(v) => match v.extract() {
+                    Ok(s) => s,
+                    Err(_) => return Ok(None),
+                },
+                Err(_) => return Ok(None),
+            };
+            if cop != "not" {
+                break;
+            }
+            let inner = match cur.getattr("expr") {
+                Ok(v) => v,
+                Err(_) => return Ok(None),
+            };
+            let inm: String = inner.get_type().name()?.into();
+            if inm == "UnaryExpr" {
+                cur = inner;
+            } else if inm == "NameExpr" {
+                let nm: String = match inner.getattr("name") {
+                    Ok(v) => match v.extract() {
+                        Ok(s) => s,
+                        Err(_) => return Ok(None),
+                    },
+                    Err(_) => return Ok(None),
+                };
+                if nm == "True" || nm == "False" {
+                    cur = inner;
+                } else {
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
+        return Ok(Some(cur));
+    }
+    Ok(Some(node))
+}
+
+/// Mirror `get_str_type_of_node` as a tag; Python applies `add_name`.
+#[pyfunction]
+pub fn rust_stubgen_str_type_tag(node: &PyAny, can_be_incomplete: bool) -> PyResult<Option<i64>> {
+    let unwrapped = match unwrap_for_str_type(node)? {
+        Some(n) => n,
+        None => return Ok(None),
+    };
+    let type_name: String = unwrapped.get_type().name()?.into();
+    match type_name.as_str() {
+        "IntExpr" => Ok(Some(0)),
+        "StrExpr" => Ok(Some(1)),
+        "BytesExpr" => Ok(Some(2)),
+        "FloatExpr" => Ok(Some(3)),
+        "ComplexExpr" => Ok(Some(4)),
+        "NameExpr" => {
+            let name: String = match unwrapped.getattr("name") {
+                Ok(v) => match v.extract() {
+                    Ok(s) => s,
+                    Err(_) => return Ok(None),
+                },
+                Err(_) => return Ok(None),
+            };
+            if name == "True" || name == "False" {
+                Ok(Some(5))
+            } else if can_be_incomplete {
+                Ok(Some(6))
+            } else {
+                Ok(Some(7))
+            }
+        }
+        "OpExpr" => {
+            let op: String = match unwrapped.getattr("op") {
+                Ok(v) => match v.extract() {
+                    Ok(s) => s,
+                    Err(_) => return Ok(None),
+                },
+                Err(_) => return Ok(None),
+            };
+            if op != "-" && op != "+" {
+                return Ok(Some(if can_be_incomplete { 6 } else { 7 }));
+            }
+            let left = match unwrapped.getattr("left") {
+                Ok(v) => v,
+                Err(_) => return Ok(None),
+            };
+            let right = match unwrapped.getattr("right") {
+                Ok(v) => v,
+                Err(_) => return Ok(None),
+            };
+            let lu = match unwrap_for_str_type(left)? {
+                Some(n) => n,
+                None => return Ok(None),
+            };
+            let ru = match unwrap_for_str_type(right)? {
+                Some(n) => n,
+                None => return Ok(None),
+            };
+            let ltn: String = lu.get_type().name()?.into();
+            let rtn: String = ru.get_type().name()?.into();
+            if ltn == "ComplexExpr" || rtn == "ComplexExpr" {
+                Ok(Some(4))
+            } else if can_be_incomplete {
+                Ok(Some(6))
+            } else {
+                Ok(Some(7))
+            }
+        }
+        _ => Ok(Some(if can_be_incomplete { 6 } else { 7 })),
+    }
+}
+
+/// Mirror `get_str_default_of_node`; `None` defers to Python.
+#[pyfunction]
+pub fn rust_stubgen_str_default(py: Python<'_>, node: &PyAny) -> PyResult<Option<(String, bool)>> {
+    let repr_fn = py.import("builtins")?.getattr("repr")?;
+    let str_fn = py.import("builtins")?.getattr("str")?;
+    default_inner(py, node, repr_fn, str_fn)
+}
+
+fn default_inner(
+    py: Python<'_>,
+    node: &PyAny,
+    repr_fn: &PyAny,
+    str_fn: &PyAny,
+) -> PyResult<Option<(String, bool)>> {
+    let _py = py;
+    let type_name: String = node.get_type().name()?.into();
+    match type_name.as_str() {
+        "NameExpr" => {
+            let name: String = match node.getattr("name") {
+                Ok(v) => match v.extract() {
+                    Ok(s) => s,
+                    Err(_) => return Ok(None),
+                },
+                Err(_) => return Ok(None),
+            };
+            if name == "None" || name == "True" || name == "False" {
+                Ok(Some((name, true)))
+            } else {
+                Ok(Some(("...".to_string(), false)))
+            }
+        }
+        "IntExpr" | "FloatExpr" => {
+            let value = match node.getattr("value") {
+                Ok(v) => v,
+                Err(_) => return Ok(None),
+            };
+            let s: String = str_fn.call1((value,))?.extract()?;
+            Ok(Some((s, true)))
+        }
+        "UnaryExpr" => {
+            let op: String = match node.getattr("op") {
+                Ok(v) => match v.extract() {
+                    Ok(s) => s,
+                    Err(_) => return Ok(None),
+                },
+                Err(_) => return Ok(None),
+            };
+            let inner = match node.getattr("expr") {
+                Ok(v) => v,
+                Err(_) => return Ok(None),
+            };
+            let inner_name: String = inner.get_type().name()?.into();
+            if inner_name == "IntExpr" || inner_name == "FloatExpr" {
+                let value = match inner.getattr("value") {
+                    Ok(v) => v,
+                    Err(_) => return Ok(None),
+                };
+                let s: String = str_fn.call1((value,))?.extract()?;
+                Ok(Some((format!("{}{}", op, s), true)))
+            } else {
+                Ok(Some(("...".to_string(), false)))
+            }
+        }
+        "StrExpr" => {
+            let value = match node.getattr("value") {
+                Ok(v) => v,
+                Err(_) => return Ok(None),
+            };
+            let s: String = repr_fn.call1((value,))?.extract()?;
+            Ok(Some((s, true)))
+        }
+        "BytesExpr" => {
+            let value = match node.getattr("value") {
+                Ok(v) => v,
+                Err(_) => return Ok(None),
+            };
+            let r: String = repr_fn.call1((value,))?.extract()?;
+            Ok(Some((format!("b{}", r.replace("\\\\", "\\")), true)))
+        }
+        "TupleExpr" | "ListExpr" | "SetExpr" => {
+            let items = match node.getattr("items") {
+                Ok(v) => v,
+                Err(_) => return Ok(None),
+            };
+            let list = match items.downcast::<PyList>() {
+                Ok(l) => l,
+                Err(_) => return Ok(None),
+            };
+            let mut parts = Vec::with_capacity(list.len());
+            for item in list.iter() {
+                match default_inner(py, item, repr_fn, str_fn)? {
+                    Some((s, true)) => parts.push(s),
+                    Some((_, false)) => return Ok(Some(("...".to_string(), false))),
+                    None => return Ok(None),
+                }
+            }
+            if type_name == "SetExpr" && parts.is_empty() {
+                return Ok(Some(("...".to_string(), false)));
+            }
+            if type_name == "TupleExpr" {
+                let closing = if parts.len() == 1 { ",)" } else { ")" };
+                Ok(Some((format!("({}{}", parts.join(", "), closing), true)))
+            } else if type_name == "ListExpr" {
+                Ok(Some((format!("[{}]", parts.join(", ")), true)))
+            } else {
+                Ok(Some((format!("{{{}}}", parts.join(", ")), true)))
+            }
+        }
+        "DictExpr" => {
+            let items = match node.getattr("items") {
+                Ok(v) => v,
+                Err(_) => return Ok(None),
+            };
+            let list = match items.downcast::<PyList>() {
+                Ok(l) => l,
+                Err(_) => return Ok(None),
+            };
+            let mut parts = Vec::with_capacity(list.len());
+            for item in list.iter() {
+                let tup = match item.downcast::<pyo3::types::PyTuple>() {
+                    Ok(t) => t,
+                    Err(_) => return Ok(None),
+                };
+                if tup.len() != 2 {
+                    return Ok(None);
+                }
+                let k = match tup.get_item(0) {
+                    Ok(v) => v,
+                    Err(_) => return Ok(None),
+                };
+                let v = match tup.get_item(1) {
+                    Ok(v) => v,
+                    Err(_) => return Ok(None),
+                };
+                if k.is_none() {
+                    return Ok(Some(("...".to_string(), false)));
+                }
+                let (ks, kv) = match default_inner(py, k, repr_fn, str_fn)? {
+                    Some((s, true)) => (s, true),
+                    Some((_, false)) => return Ok(Some(("...".to_string(), false))),
+                    None => return Ok(None),
+                };
+                let _ = kv;
+                let (vs, vv) = match default_inner(py, v, repr_fn, str_fn)? {
+                    Some((s, true)) => (s, true),
+                    Some((_, false)) => return Ok(Some(("...".to_string(), false))),
+                    None => return Ok(None),
+                };
+                let _ = vv;
+                parts.push(format!("{}: {}", ks, vs));
+            }
+            Ok(Some((format!("{{{}}}", parts.join(", ")), true)))
+        }
+        _ => Ok(Some(("...".to_string(), false))),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -586,5 +925,102 @@ plain = object()
         assert!(rust_is_pybind11_overloaded_function_docstring(doc, "foo").unwrap());
         assert!(!rust_is_pybind11_overloaded_function_docstring(doc, "bar").unwrap());
         assert!(!rust_is_pybind11_overloaded_function_docstring("plain docstring", "foo").unwrap());
+    }
+
+    #[test]
+    fn qualified_name_nests_and_errors() {
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|py| {
+            let locals = PyDict::new(py);
+            py.run(
+                r#"
+class NameExpr:
+    def __init__(self, name):
+        self.name = name
+class MemberExpr:
+    def __init__(self, expr, name):
+        self.expr = expr
+        self.name = name
+nested = MemberExpr(MemberExpr(NameExpr("a"), "b"), "c")
+plain = object()
+"#,
+                None,
+                Some(locals),
+            )
+            .unwrap();
+            let nested = locals.get_item("nested").unwrap().unwrap();
+            let plain = locals.get_item("plain").unwrap().unwrap();
+            assert_eq!(rust_stubgen_get_qualified_name(nested).unwrap(), "a.b.c");
+            assert_eq!(rust_stubgen_get_qualified_name(plain).unwrap(), "<ERROR>");
+        });
+    }
+
+    #[test]
+    fn str_type_tags_match_python() {
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|py| {
+            let locals = PyDict::new(py);
+            py.run(
+                r#"
+class IntExpr:
+    def __init__(self, v=1):
+        self.value = v
+class NameExpr:
+    def __init__(self, name):
+        self.name = name
+class UnaryExpr:
+    def __init__(self, op, expr):
+        self.op = op
+        self.expr = expr
+neg = UnaryExpr("-", IntExpr(5))
+tilde = UnaryExpr("~", IntExpr(5))
+"#,
+                None,
+                Some(locals),
+            )
+            .unwrap();
+            let neg = locals.get_item("neg").unwrap().unwrap();
+            let tilde = locals.get_item("tilde").unwrap().unwrap();
+            let int = locals.get_item("neg").unwrap().unwrap();
+            let _ = int;
+            assert_eq!(rust_stubgen_str_type_tag(neg, true).unwrap(), Some(0));
+            assert_eq!(rust_stubgen_str_type_tag(tilde, true).unwrap(), Some(6));
+        });
+    }
+
+    #[test]
+    fn str_default_tuple_and_set() {
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|py| {
+            let locals = PyDict::new(py);
+            py.run(
+                r#"
+class IntExpr:
+    def __init__(self, v):
+        self.value = v
+class TupleExpr:
+    def __init__(self, items):
+        self.items = items
+class SetExpr:
+    def __init__(self, items):
+        self.items = items
+one = TupleExpr([IntExpr(1)])
+empty_set = SetExpr([])
+"#,
+                None,
+                Some(locals),
+            )
+            .unwrap();
+            let one = locals.get_item("one").unwrap().unwrap();
+            let empty = locals.get_item("empty_set").unwrap().unwrap();
+            assert_eq!(
+                rust_stubgen_str_default(py, one).unwrap(),
+                Some(("(1,)".to_string(), true))
+            );
+            assert_eq!(
+                rust_stubgen_str_default(py, empty).unwrap(),
+                Some(("...".to_string(), false))
+            );
+        });
     }
 }

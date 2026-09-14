@@ -71,8 +71,8 @@ from mypy.nodes import (
     PassStmt,
     PlaceholderNode,
     RaiseStmt,
-    RevealExpr,
     ReturnStmt,
+    RevealExpr,
     SetExpr,
     SliceExpr,
     StarExpr,
@@ -4593,6 +4593,7 @@ class NativeSnapshotGapLiveNominalSuite(Suite):
         # Both classes absent from the snapshot but live: the FFI mapping
         # fast path reads the live supertype's empty `type_vars`.
         from librt.internal import ReadBuffer
+
         from mypy.types import Instance, get_proper_type, read_type
 
         base, sub = self._base_sub("Map")
@@ -48336,7 +48337,6 @@ class NativeCheckFinalDeletableSuite(Suite):
     """
 
     def setUp(self) -> None:
-        from mypy.nodes import Block, ClassDef, SymbolTable, TypeInfo
 
         from mypy.checker import _set_native_checker_active
 
@@ -62079,7 +62079,7 @@ class NativeCanWidenInScopeSuite(Suite):
 
     def _assert_par(self, name: Any, orig_type: Any, scope: Any) -> None:
         off, on = self._run(name, orig_type, scope)
-        assert_equal(on, off, f"can_widen_in_scope parity")
+        assert_equal(on, off, "can_widen_in_scope parity")
 
     # --- Direct seam calls ---
 
@@ -62650,3 +62650,199 @@ class NativeHotSeamsRetiredSuite(Suite):
         )
         assert kw.is_kw_arg is True
         assert kw.max_possible_positional_args() == 2**63 - 1
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeStubgenPrinterSuite(Suite):
+    """Parity for the stubgen printer/collector seams (#1636).
+
+    Covers `rust_stubgen_get_qualified_name`,
+    `rust_stubgen_str_type_tag` and `rust_stubgen_str_default`
+    with direct seam calls plus gate-off/on differentials
+    through the real `mypy.stubgen` entry points.
+    """
+
+    def setUp(self) -> None:
+        import type_kernel as _tk
+
+        import mypy.stubgen as _sg
+
+        self._tk = _tk
+        self._sg = _sg
+
+    def _with_gate(self, active: bool, fn: Callable[[], T]) -> T:
+        old = self._sg._HAS_NATIVE_STUBGEN
+        self._sg._HAS_NATIVE_STUBGEN = active
+        try:
+            return fn()
+        finally:
+            self._sg._HAS_NATIVE_STUBGEN = old
+
+    def _gen(self) -> Any:
+        from mypy.stubgen import ASTStubGenerator
+
+        return ASTStubGenerator()
+
+    # --- get_qualified_name ---
+    def test_qualified_name_direct(self) -> None:
+        assert_equal(self._tk.rust_stubgen_get_qualified_name(NameExpr("x")), "x")
+        nested = MemberExpr(MemberExpr(NameExpr("a"), "b"), "c")
+        assert_equal(self._tk.rust_stubgen_get_qualified_name(nested), "a.b.c")
+
+    def test_qualified_name_error_marker(self) -> None:
+        assert_equal(self._tk.rust_stubgen_get_qualified_name(IntExpr(1)), "<ERROR>")
+        callee = MemberExpr(CallExpr(NameExpr("f"), [], [], []), "attr")
+        assert_equal(self._tk.rust_stubgen_get_qualified_name(callee), "<ERROR>.attr")
+
+    def test_qualified_name_parity(self) -> None:
+        nodes: list[Expression] = [
+            NameExpr("x"),
+            MemberExpr(MemberExpr(NameExpr("a"), "b"), "c"),
+            IntExpr(1),
+        ]
+        for node in nodes:
+            off = self._with_gate(False, lambda: self._sg.get_qualified_name(node))
+            on = self._with_gate(True, lambda: self._sg.get_qualified_name(node))
+            assert_equal(on, off, "qualified_name parity")
+
+    # --- str_type_tag ---
+    def test_str_type_tags_direct(self) -> None:
+        from mypy.nodes import ComplexExpr, FloatExpr
+
+        tk = self._tk
+        assert_equal(tk.rust_stubgen_str_type_tag(IntExpr(1), True), 0)
+        assert_equal(tk.rust_stubgen_str_type_tag(StrExpr("x"), True), 1)
+        assert_equal(tk.rust_stubgen_str_type_tag(BytesExpr(b"x"), True), 2)  # type: ignore[arg-type]
+        assert_equal(tk.rust_stubgen_str_type_tag(FloatExpr(1.5), True), 3)
+        assert_equal(tk.rust_stubgen_str_type_tag(ComplexExpr(complex(0, 1)), True), 4)
+        assert_equal(tk.rust_stubgen_str_type_tag(NameExpr("True"), True), 5)
+        assert_equal(tk.rust_stubgen_str_type_tag(NameExpr("foo"), True), 6)
+        assert_equal(tk.rust_stubgen_str_type_tag(NameExpr("foo"), False), 7)
+
+    def test_str_type_unwrap_direct(self) -> None:
+        tk = self._tk
+        assert_equal(tk.rust_stubgen_str_type_tag(UnaryExpr("-", IntExpr(5)), True), 0)
+        nested = UnaryExpr("-", UnaryExpr("-", IntExpr(5)))
+        assert_equal(tk.rust_stubgen_str_type_tag(nested, True), 0)
+        assert_equal(tk.rust_stubgen_str_type_tag(UnaryExpr("~", IntExpr(5)), True), 6)
+        assert_equal(
+            tk.rust_stubgen_str_type_tag(UnaryExpr("not", NameExpr("True")), True), 5
+        )
+        assert_equal(
+            tk.rust_stubgen_str_type_tag(UnaryExpr("not", NameExpr("x")), True), 6
+        )
+        # Two-phase unwrap: `not` never falls into the math phase.
+        not_plus = UnaryExpr("not", UnaryExpr("+", IntExpr(1)))
+        assert_equal(tk.rust_stubgen_str_type_tag(not_plus, True), 6)
+        neg_not = UnaryExpr("-", UnaryExpr("not", NameExpr("False")))
+        assert_equal(tk.rust_stubgen_str_type_tag(neg_not, True), 6)
+
+    def test_str_type_op_complex_direct(self) -> None:
+        from mypy.nodes import ComplexExpr
+
+        tk = self._tk
+        op = OpExpr("+", IntExpr(1), ComplexExpr(complex(0, 1)))
+        assert_equal(tk.rust_stubgen_str_type_tag(op, True), 4)
+        plain = OpExpr("-", IntExpr(1), IntExpr(2))
+        assert_equal(tk.rust_stubgen_str_type_tag(plain, True), 6)
+        assert_equal(tk.rust_stubgen_str_type_tag(plain, False), 7)
+
+    def test_str_type_parity(self) -> None:
+        from mypy.nodes import ComplexExpr, FloatExpr
+
+        nodes: list[Expression] = [
+            IntExpr(1),
+            StrExpr("x"),
+            BytesExpr(b"x"),  # type: ignore[arg-type]
+            FloatExpr(1.5),
+            ComplexExpr(complex(0, 1)),
+            UnaryExpr("-", IntExpr(5)),
+            UnaryExpr("~", IntExpr(5)),
+            UnaryExpr("not", NameExpr("True")),
+            OpExpr("+", IntExpr(1), ComplexExpr(complex(0, 1))),
+            OpExpr("-", IntExpr(1), IntExpr(2)),
+            NameExpr("True"),
+            NameExpr("foo"),
+        ]
+        for node in nodes:
+            for inc in (True, False):
+                off = self._with_gate(
+                    False, lambda: self._gen().get_str_type_of_node(node, can_be_incomplete=inc)
+                )
+                on = self._with_gate(
+                    True, lambda: self._gen().get_str_type_of_node(node, can_be_incomplete=inc)
+                )
+                assert_equal(on, off, "str_type parity")
+
+    def test_str_type_incomplete_alias_parity(self) -> None:
+        from mypy.stubgen import ASTStubGenerator
+
+        for active in (False, True):
+            gen = ASTStubGenerator()
+            gen.set_defined_names({"Incomplete"})
+            old = self._sg._HAS_NATIVE_STUBGEN
+            self._sg._HAS_NATIVE_STUBGEN = active
+            try:
+                got = gen.get_str_type_of_node(NameExpr("foo"))
+            finally:
+                self._sg._HAS_NATIVE_STUBGEN = old
+            if active:
+                assert_equal(got, "_Incomplete")
+            else:
+                assert_equal(got, "_Incomplete")
+
+    # --- str_default ---
+    def test_str_default_direct(self) -> None:
+        tk = self._tk
+        assert_equal(tk.rust_stubgen_str_default(NameExpr("None")), ("None", True))
+        assert_equal(tk.rust_stubgen_str_default(IntExpr(5)), ("5", True))
+        assert_equal(tk.rust_stubgen_str_default(UnaryExpr("-", IntExpr(5))), ("-5", True))
+        assert_equal(tk.rust_stubgen_str_default(StrExpr("it's")), ('"it\'s"', True))
+        assert_equal(tk.rust_stubgen_str_default(TupleExpr([IntExpr(1)])), ("(1,)", True))
+        assert_equal(tk.rust_stubgen_str_default(ListExpr([IntExpr(1)])), ("[1]", True))
+        assert_equal(tk.rust_stubgen_str_default(SetExpr([])), ("...", False))
+        assert_equal(tk.rust_stubgen_str_default(NameExpr("x")), ("...", False))
+
+    def test_str_default_bytes_backslash(self) -> None:
+        tk = self._tk
+        node = BytesExpr(b"a\\b")  # type: ignore[arg-type]
+        off = self._with_gate(False, lambda: self._gen().get_str_default_of_node(node))
+        on_raw = tk.rust_stubgen_str_default(BytesExpr(b"a\\b"))  # type: ignore[arg-type]
+        assert on_raw is not None
+        assert_equal(tuple(on_raw), off, "bytes backslash parity")
+
+    def test_str_default_parity(self) -> None:
+        from mypy.nodes import FloatExpr
+
+        nodes: list[Expression] = [
+            NameExpr("None"),
+            NameExpr("x"),
+            IntExpr(5),
+            FloatExpr(1.5),
+            UnaryExpr("-", IntExpr(5)),
+            UnaryExpr("-", UnaryExpr("-", IntExpr(5))),
+            StrExpr("a\nb"),
+            BytesExpr(b"\x00\xff"),  # type: ignore[arg-type]
+            TupleExpr([]),
+            TupleExpr([IntExpr(1)]),
+            TupleExpr([IntExpr(1), StrExpr("x")]),
+            TupleExpr([NameExpr("x")]),
+            ListExpr([]),
+            ListExpr([IntExpr(1)]),
+            SetExpr([IntExpr(1)]),
+            SetExpr([]),
+            DictExpr([]),
+            DictExpr([(StrExpr("k"), IntExpr(1))]),
+            OpExpr("+", IntExpr(1), IntExpr(2)),
+        ]
+        for node in nodes:
+            off = self._with_gate(False, lambda: self._gen().get_str_default_of_node(node))
+            on = self._with_gate(True, lambda: self._gen().get_str_default_of_node(node))
+            assert_equal(on, off, "str_default parity")
+
+    def test_str_default_dict_none_key_parity(self) -> None:
+        node = DictExpr([(None, IntExpr(1))])
+        off = self._with_gate(False, lambda: self._gen().get_str_default_of_node(node))
+        on = self._with_gate(True, lambda: self._gen().get_str_default_of_node(node))
+        assert_equal(on, off, "dict none-key parity")
+        assert_equal(off, ("...", False))

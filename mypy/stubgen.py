@@ -172,12 +172,18 @@ try:
     from type_kernel import (
         rust_get_assigned_names as _rust_get_assigned_names,
         rust_is_none_expr as _rust_is_none_expr,
+        rust_stubgen_get_qualified_name as _rust_stubgen_get_qualified_name,
+        rust_stubgen_str_default as _rust_stubgen_str_default,
+        rust_stubgen_str_type_tag as _rust_stubgen_str_type_tag,
     )
 
     _HAS_NATIVE_STUBGEN = True
 except ImportError:
     _rust_get_assigned_names = None  # type: ignore[assignment]
     _rust_is_none_expr = None  # type: ignore[assignment]
+    _rust_stubgen_get_qualified_name = None  # type: ignore[assignment]
+    _rust_stubgen_str_default = None  # type: ignore[assignment]
+    _rust_stubgen_str_type_tag = None  # type: ignore[assignment]
     _HAS_NATIVE_STUBGEN = False
 
 # Common ways of naming package containing vendored modules.
@@ -1406,6 +1412,27 @@ class ASTStubGenerator(BaseStubGenerator, mypy.traverser.TraverserVisitor):
         return any(self.is_private_name(part) for part in parts)
 
     def get_str_type_of_node(self, rvalue: Expression, *, can_be_incomplete: bool = True) -> str:
+        if _HAS_NATIVE_STUBGEN:
+            try:
+                tag = _rust_stubgen_str_type_tag(rvalue, can_be_incomplete)
+            except Exception:
+                tag = None
+            if tag is not None:
+                if tag == 0:
+                    return "int"
+                if tag == 1:
+                    return "str"
+                if tag == 2:
+                    return "bytes"
+                if tag == 3:
+                    return "float"
+                if tag == 4:
+                    return "complex"
+                if tag == 5:
+                    return "bool"
+                if tag == 6:
+                    return self.add_name("_typeshed.Incomplete")
+                return ""
         rvalue = self.maybe_unwrap_unary_expr(rvalue)
 
         if isinstance(rvalue, IntExpr):
@@ -1469,6 +1496,13 @@ class ASTStubGenerator(BaseStubGenerator, mypy.traverser.TraverserVisitor):
 
         Returns a 2-tuple of the default and whether or not it is valid.
         """
+        if _HAS_NATIVE_STUBGEN:
+            try:
+                native = _rust_stubgen_str_default(rvalue)
+            except Exception:
+                native = None
+            if native is not None:
+                return native
         if isinstance(rvalue, NameExpr):
             if rvalue.name in ("None", "True", "False"):
                 return rvalue.name, True
@@ -1583,6 +1617,11 @@ def find_self_initializers(fdef: FuncBase) -> list[tuple[str, Expression, Type |
 
 
 def get_qualified_name(o: Expression) -> str:
+    if _HAS_NATIVE_STUBGEN:
+        try:
+            return _rust_stubgen_get_qualified_name(o)
+        except Exception:
+            pass
     if isinstance(o, NameExpr):
         return o.name
     elif isinstance(o, MemberExpr):
