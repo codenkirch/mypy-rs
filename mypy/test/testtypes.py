@@ -60508,3 +60508,129 @@ class NativeIsLenOfTupleSuite(Suite):
         off = self._with_gate(False, check)
         on = self._with_gate(True, check)
         assert_equal(on, off, "is_len_of_tuple parity: wrong arg count")
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeIsAssignableSlotSuite(Suite):
+    """Parity for the Rust `is_assignable_slot` port (H1i).
+
+    `TypeChecker.is_assignable_slot` (checker.py:5534-5552) checks whether
+    a lvalue is assignable as a slot (e.g. property). The Rust port
+    (`checker_functions.rs`) reads the live lvalue `node` attr and the
+    live proper type via PyO3, handling non-Union cases natively and
+    deferring (`None`) on UnionType (Python recurses).
+
+    Direct seam calls assert the bool and the None deferrals; the
+    gate-off vs gate-on differential drives the real TypeChecker method
+    through a stub checker.
+    """
+
+    def setUp(self) -> None:
+        from mypy.checker import _set_native_checker_active
+
+        self._set_active = _set_native_checker_active
+        self._set_active(True)
+        self.fx = TypeFixture()
+
+    def tearDown(self) -> None:
+        self._set_active(False)
+
+    def _with_gate(self, active: bool, fn: Callable[[], T]) -> T:
+        self._set_active(active)
+        try:
+            return fn()
+        finally:
+            self._set_active(True)
+
+    def _seam(self, lvalue: Any, typ: Any) -> Any:
+        return _type_kernel.rust_is_assignable_slot(lvalue, typ)
+
+    def _run(self, lvalue: Any, typ: Any) -> tuple[bool, bool]:
+        from mypy.checker import TypeChecker
+
+        def check_one() -> bool:
+            chk = TypeChecker.__new__(TypeChecker)
+            return chk.is_assignable_slot(lvalue, typ)
+
+        off = self._with_gate(False, check_one)
+        on = self._with_gate(True, check_one)
+        return off, on
+
+    def _assert_par(self, lvalue: Any, typ: Any) -> None:
+        off, on = self._run(lvalue, typ)
+        assert_equal(on, off, f"parity for lvalue={lvalue!r} typ={typ!r}")
+
+    def _make_lvalue(self, has_node: bool = False) -> Any:
+        from mypy.nodes import NameExpr
+
+        expr = NameExpr("x")
+        if has_node:
+            from mypy.nodes import Var
+
+            expr.node = Var("x")
+        return expr
+
+    # --- direct seam tests ---
+
+    def test_seam_definition(self) -> None:
+        lv = self._make_lvalue(has_node=True)
+        assert self._seam(lv, self.fx.a) is False
+
+    def test_seam_none_type(self) -> None:
+        lv = self._make_lvalue()
+        assert self._seam(lv, None) is True
+
+    def test_seam_any_type(self) -> None:
+        lv = self._make_lvalue()
+        assert self._seam(lv, AnyType(TypeOfAny.special_form)) is True
+
+    def test_seam_instance_with_set(self) -> None:
+        lv = self._make_lvalue()
+        typ = Instance(self.fx.gi, [])
+        assert self._seam(lv, typ) is False
+
+    def test_seam_function_like(self) -> None:
+        lv = self._make_lvalue()
+        ct = self.fx.callable(self.fx.a, self.fx.a)
+        assert self._seam(lv, ct) is True
+
+    def test_seam_union_defers(self) -> None:
+        lv = self._make_lvalue()
+        u = UnionType([self.fx.a, self.fx.nonet])
+        assert self._seam(lv, u) is None
+
+    def test_seam_other_type_false(self) -> None:
+        lv = self._make_lvalue()
+        assert self._seam(lv, self.fx.nonet) is False
+
+    # --- gate-off vs gate-on parity ---
+
+    def test_parity_definition(self) -> None:
+        lv = self._make_lvalue(has_node=True)
+        self._assert_par(lv, self.fx.a)
+
+    def test_parity_none(self) -> None:
+        lv = self._make_lvalue()
+        self._assert_par(lv, None)
+
+    def test_parity_any(self) -> None:
+        lv = self._make_lvalue()
+        self._assert_par(lv, AnyType(TypeOfAny.special_form))
+
+    def test_parity_instance_no_set(self) -> None:
+        lv = self._make_lvalue()
+        self._assert_par(lv, Instance(self.fx.gi, []))
+
+    def test_parity_callable(self) -> None:
+        lv = self._make_lvalue()
+        ct = self.fx.callable(self.fx.a, self.fx.a)
+        self._assert_par(lv, ct)
+
+    def test_parity_union(self) -> None:
+        lv = self._make_lvalue()
+        u = UnionType([self.fx.a, self.fx.nonet])
+        self._assert_par(lv, u)
+
+    def test_parity_other(self) -> None:
+        lv = self._make_lvalue()
+        self._assert_par(lv, self.fx.nonet)

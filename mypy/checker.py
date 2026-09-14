@@ -407,6 +407,7 @@ try:
         rust_is_definition as _rust_is_definition,
         rust_is_valid_defaultdict_partial_value_type as _rust_is_valid_defaultdict_partial_value_type,
         rust_is_len_of_tuple as _rust_is_len_of_tuple,
+        rust_is_assignable_slot as _rust_is_assignable_slot,
         rust_narrow_type_by_identity_equality as _rust_narrow_type_by_identity_equality,
         rust_narrow_with_len as _rust_narrow_with_len,
         rust_or_conditional_maps as _rust_or_conditional_maps,
@@ -479,6 +480,7 @@ except ImportError:
     _rust_is_definition = None  # type: ignore[assignment]
     _rust_is_valid_defaultdict_partial_value_type = None  # type: ignore[assignment]
     _rust_is_len_of_tuple = None  # type: ignore[assignment]
+    _rust_is_assignable_slot = None  # type: ignore[assignment]
     _rust_is_more_general_arg_prefix = None  # type: ignore[assignment]
     _rust_overload_can_never_match = None  # type: ignore[assignment]
     _rust_is_equality_ambiguous_for_narrowing = None  # type: ignore[assignment]
@@ -5534,6 +5536,14 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
         )
 
     def is_assignable_slot(self, lvalue: Lvalue, typ: Type | None) -> bool:
+        if _native_checker_active and _rust_is_assignable_slot is not None:
+            proper = get_proper_type(typ)
+            try:
+                result = _rust_is_assignable_slot(lvalue, proper)
+                if result is not None:
+                    return result
+            except (AssertionError, NotImplementedError):
+                pass
         if getattr(lvalue, "node", None):
             return False  # This is a definition
 

@@ -1665,6 +1665,42 @@ fn is_valid_defaultdict_partial_value_type_inner(
     Some(false)
 }
 
+/// `TypeChecker.is_assignable_slot` (checker.py:5534-5552): a pure bool
+/// predicate over a live lvalue and proper type. Defers (`None`) on
+/// UnionType (Python recurses) and on an unreadable attribute.
+#[pyfunction]
+pub(crate) fn rust_is_assignable_slot(
+    py: Python<'_>,
+    lvalue: &PyAny,
+    typ: &PyAny,
+) -> PyResult<Option<bool>> {
+    if let Ok(node) = lvalue.getattr("node") {
+        if !node.is_none() {
+            return Ok(Some(false));
+        }
+    }
+    let types_mod = py.import("mypy.types")?;
+    let any_cls = types_mod.getattr("AnyType")?;
+    if typ.is_none() || typ.is_instance(any_cls)? {
+        return Ok(Some(true));
+    }
+    let instance_cls: &PyType = types_mod.getattr("Instance")?.downcast()?;
+    if typ.is_instance(instance_cls)? {
+        let info = typ.getattr("type")?;
+        let get_result = info.getattr("get")?.call1(("__set__",))?;
+        return Ok(Some(!get_result.is_none()));
+    }
+    let function_like_cls: &PyType = types_mod.getattr("FunctionLike")?.downcast()?;
+    if typ.is_instance(function_like_cls)? {
+        return Ok(Some(true));
+    }
+    let union_cls: &PyType = types_mod.getattr("UnionType")?.downcast()?;
+    if typ.is_instance(union_cls)? {
+        return Ok(None);
+    }
+    Ok(Some(false))
+}
+
 #[cfg(test)]
 mod match_args_tests {
     use super::*;
