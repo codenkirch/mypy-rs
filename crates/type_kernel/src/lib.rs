@@ -3223,6 +3223,12 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         module
     )?)?;
 
+    // H1h: is_len_of_tuple AST-shape front (early-return front, defers to Python).
+    module.add_function(wrap_pyfunction!(
+        checker_functions::rust_is_len_of_tuple,
+        module
+    )?)?;
+
     // Issue #1597: check__exit__return_type decision. Rust reads the
     // live FuncItem via PyO3 and returns Some(true) when all returns are
     // builtins.False; the message emission stays Python-side.

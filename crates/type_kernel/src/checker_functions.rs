@@ -1463,6 +1463,40 @@ pub(crate) fn rust_is_definition(_py: Python<'_>, node: &PyAny) -> PyResult<Opti
     Ok(Some(false))
 }
 
+/// `mypy.checker.TypeChecker.is_len_of_tuple` (checker.py:9484-9497):
+/// the AST-shape early-return front. Returns `Some(false)` when the
+/// expression is not a `len(x)` call (not CallExpr, callee does not
+/// refer to `builtins.len`, or arg count != 1). Returns `None` (defer)
+/// when all three shape checks pass, so Python runs `literal()`,
+/// `has_type()`, and `can_be_narrowed_with_len()` (the latter already
+/// native). The `refers_to_fullname` alias case is unreachable for
+/// `builtins.len`, so a plain RefExpr fullname check suffices.
+#[pyfunction]
+pub(crate) fn rust_is_len_of_tuple(_py: Python<'_>, expr: &PyAny) -> PyResult<Option<bool>> {
+    let call_expr_cls = nodes_class(_py, "CallExpr")?;
+    if !expr.is_instance(call_expr_cls)? {
+        return Ok(Some(false));
+    }
+    let callee = expr.getattr("callee")?;
+    let ref_expr_cls = nodes_class(_py, "RefExpr")?;
+    if !callee.is_instance(ref_expr_cls)? {
+        return Ok(Some(false));
+    }
+    let fullname: String = match callee.getattr("fullname") {
+        Ok(f) => f.extract()?,
+        Err(_) => return Ok(Some(false)),
+    };
+    if fullname != "builtins.len" {
+        return Ok(Some(false));
+    }
+    let args = expr.getattr("args")?;
+    let args_len: usize = args.len()?;
+    if args_len != 1 {
+        return Ok(Some(false));
+    }
+    Ok(None)
+}
+
 /// Test-only decision fold of `check_for_untyped_decorator`
 /// (checker.py:6955-6964). The seam inlines the same short-circuit
 /// order; kept for the pure decision-table tests below.

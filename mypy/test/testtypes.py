@@ -60398,3 +60398,113 @@ class NativeIsValidDefaultDictPartialValueTypeSuite(Suite):
 
     def test_parity_non_instance(self) -> None:
         self._assert_par(self.fx.nonet)
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeIsLenOfTupleSuite(Suite):
+    """Parity for the Rust `is_len_of_tuple` AST-shape front (H1h).
+
+    `TypeChecker.is_len_of_tuple` (checker.py:9497-9510) checks whether an
+    expression is a `len(x)` call where x is a tuple or union of tuples.
+    The Rust seam handles the early-return front (CallExpr, builtins.len,
+    arg count == 1) and defers (None) to let Python run `literal()`,
+    `has_type()`, and `can_be_narrowed_with_len()`. Direct seam calls
+    assert the expected bool/None; gate-off vs gate-on differentials drive
+    the real TypeChecker method through a minimal stub.
+    """
+
+    def setUp(self) -> None:
+        from mypy.checker import _set_native_checker_active
+
+        self._set_active = _set_native_checker_active
+        self._set_active(True)
+
+    def tearDown(self) -> None:
+        self._set_active(False)
+
+    def _with_gate(self, active: bool, fn: Callable[[], T]) -> T:
+        self._set_active(active)
+        try:
+            return fn()
+        finally:
+            self._set_active(True)
+
+    def _len_call(self, arg: Expression | None = None) -> CallExpr:
+        callee = NameExpr("len")
+        callee.fullname = "builtins.len"
+        if arg is None:
+            arg = NameExpr("x")
+        return CallExpr(callee, [arg], [ARG_POS], [None])
+
+    def _seam(self, expr: Any) -> Any:
+        return _type_kernel.rust_is_len_of_tuple(expr)
+
+    def test_seam_not_call_expr(self) -> None:
+        assert self._seam(NameExpr("x")) is False
+
+    def test_seam_callee_not_refexpr(self) -> None:
+        c = CallExpr(IntExpr(1), [NameExpr("x")], [ARG_POS], [None])
+        assert self._seam(c) is False
+
+    def test_seam_callee_wrong_fullname(self) -> None:
+        callee = NameExpr("foo")
+        callee.fullname = "builtins.foo"
+        c = CallExpr(callee, [NameExpr("x")], [ARG_POS], [None])
+        assert self._seam(c) is False
+
+    def test_seam_wrong_arg_count(self) -> None:
+        callee = NameExpr("len")
+        callee.fullname = "builtins.len"
+        c = CallExpr(callee, [NameExpr("x"), NameExpr("y")], [ARG_POS, ARG_POS], [None, None])
+        assert self._seam(c) is False
+
+    def test_seam_valid_len_call_defers(self) -> None:
+        c = self._len_call()
+        assert self._seam(c) is None
+
+    def test_seam_zero_args(self) -> None:
+        callee = NameExpr("len")
+        callee.fullname = "builtins.len"
+        c = CallExpr(callee, [], [], [])
+        assert self._seam(c) is False
+
+    def test_parity_not_call_expr(self) -> None:
+        from mypy.checker import TypeChecker
+
+        def check() -> bool:
+            chk = TypeChecker.__new__(TypeChecker)
+            return chk.is_len_of_tuple(NameExpr("x"))
+
+        off = self._with_gate(False, check)
+        on = self._with_gate(True, check)
+        assert_equal(on, off, "is_len_of_tuple parity: not CallExpr")
+
+    def test_parity_wrong_fullname(self) -> None:
+        from mypy.checker import TypeChecker
+
+        callee = NameExpr("foo")
+        callee.fullname = "builtins.foo"
+        c = CallExpr(callee, [NameExpr("x")], [ARG_POS], [None])
+
+        def check() -> bool:
+            chk = TypeChecker.__new__(TypeChecker)
+            return chk.is_len_of_tuple(c)
+
+        off = self._with_gate(False, check)
+        on = self._with_gate(True, check)
+        assert_equal(on, off, "is_len_of_tuple parity: wrong fullname")
+
+    def test_parity_wrong_arg_count(self) -> None:
+        from mypy.checker import TypeChecker
+
+        callee = NameExpr("len")
+        callee.fullname = "builtins.len"
+        c = CallExpr(callee, [NameExpr("x"), NameExpr("y")], [ARG_POS, ARG_POS], [None, None])
+
+        def check() -> bool:
+            chk = TypeChecker.__new__(TypeChecker)
+            return chk.is_len_of_tuple(c)
+
+        off = self._with_gate(False, check)
+        on = self._with_gate(True, check)
+        assert_equal(on, off, "is_len_of_tuple parity: wrong arg count")

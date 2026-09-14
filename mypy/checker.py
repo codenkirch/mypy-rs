@@ -406,6 +406,7 @@ try:
         rust_is_defined_in_base_class as _rust_is_defined_in_base_class,
         rust_is_definition as _rust_is_definition,
         rust_is_valid_defaultdict_partial_value_type as _rust_is_valid_defaultdict_partial_value_type,
+        rust_is_len_of_tuple as _rust_is_len_of_tuple,
         rust_narrow_type_by_identity_equality as _rust_narrow_type_by_identity_equality,
         rust_narrow_with_len as _rust_narrow_with_len,
         rust_or_conditional_maps as _rust_or_conditional_maps,
@@ -477,6 +478,7 @@ except ImportError:
     _rust_is_defined_in_base_class = None  # type: ignore[assignment]
     _rust_is_definition = None  # type: ignore[assignment]
     _rust_is_valid_defaultdict_partial_value_type = None  # type: ignore[assignment]
+    _rust_is_len_of_tuple = None  # type: ignore[assignment]
     _rust_is_more_general_arg_prefix = None  # type: ignore[assignment]
     _rust_overload_can_never_match = None  # type: ignore[assignment]
     _rust_is_equality_ambiguous_for_narrowing = None  # type: ignore[assignment]
@@ -9506,6 +9508,13 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
 
     def is_len_of_tuple(self, expr: Expression) -> bool:
         """Is this expression a `len(x)` call where x is a tuple or union of tuples?"""
+        if _CHECKER_HAS_TYPE_KERNEL and _native_checker_active and _rust_is_len_of_tuple is not None:
+            try:
+                result = _rust_is_len_of_tuple(expr)
+                if result is not None:
+                    return result
+            except (AssertionError, NotImplementedError):
+                pass
         if not isinstance(expr, CallExpr):
             return False
         if not refers_to_fullname(expr.callee, "builtins.len"):
