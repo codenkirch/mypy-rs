@@ -25929,9 +25929,10 @@ class NativeConstraintsPolyGateSuite(Suite):
     """Parity suite for the skip_neg_op / infer_polymorphic gate (issue #1226).
 
     The cb-actual-generic defer fired whenever the actual callable was
-    generic; since #1427 the generic helpers are pinned by body and the
-    deferral set is ambient-mode dependent (Known(false) engages
-    extras-free, Known(true) defers at the FFI boundary).
+    generic; since #1427 the generic helpers are pinned by body. The
+    Known(true) reverse frame now engages as well: its `extra_tvars`
+    attachments ride the #1618 blob section and relink onto the live actual
+    variables on decode.
     """
 
     def setUp(self) -> None:
@@ -26052,7 +26053,7 @@ class NativeConstraintsPolyGateSuite(Suite):
         template = self._generic_callable("f", t1)
         actual = self._generic_callable("g", u1)
         # Gate-on run matches the Python body in both ambient modes,
-        # since the extras channel (#1427) carries the reverse frame.
+        # since the extras channel (#1618) carries the reverse frame.
         self._assert_par(template, actual, SUBTYPE_OF, skip_neg_op=False)
         # Ambient is flipped mid-test, so save and restore the entry value.
         from mypy.typestate import type_state
@@ -26064,14 +26065,110 @@ class NativeConstraintsPolyGateSuite(Suite):
             type_state.infer_polymorphic = False
             raw_off = self._rust(template, actual, SUBTYPE_OF, skip_neg_op=False)
             # Ambient on: the reverse frame attaches the actual's own
-            # variables as extras; the 3-field wire cannot express them, so
-            # defer.
+            # variables as extras; the #1618 blob section carries them, so
+            # the call still decides natively.
             type_state.infer_polymorphic = True
             raw_on = self._rust(template, actual, SUBTYPE_OF, skip_neg_op=False)
         finally:
             type_state.infer_polymorphic = old
         assert raw_off is not None, "Known(false) ambient keeps the call engaged"
-        assert raw_on is None, "Known(true) extras-carrying output must defer"
+        assert raw_on is not None, "Known(true) extras ride the #1618 blob section"
+
+    def test_skip_false_generic_actual_extras_reach_python(self) -> None:
+        # #1618: the reverse frame's extras must reach the Python solver as
+        # objects; `_try_native_constraint_builder` relinks them onto the live
+        # actual variable (like Python's own `c.extra_tvars += cactual.variables`).
+        from mypy.constraints import (
+            _set_native_constraints_resolver,
+            _try_native_constraint_builder,
+        )
+
+        t1 = self.fx.t
+        u1 = self.fx.s
+        template = self._generic_callable("f", t1)
+        actual = self._generic_callable("g", u1)
+        self._polymorphic_on()
+        _set_native_constraints_resolver(self.resolver)
+        try:
+            res = _try_native_constraint_builder(
+                template, actual, SUBTYPE_OF, False, False, True
+            )
+        finally:
+            _set_native_constraints_resolver(None)
+        assert res is not None, "the extras-carrying call must decide natively"
+        extras = [v for c in res for v in c.extra_tvars]
+        assert extras, "the reverse frame must attach the actual's variables"
+        assert all(v is u1 for v in extras), (
+            f"extras must relink onto the live actual variable, got {extras!r}"
+        )
+
+    def test_restore_extra_tvars_loose_meta_level_fallback(self) -> None:
+        # Defensive path: a pre-#1417 wire stream would drop meta_level for
+        # ParamSpec ids, so full-id equality fails; the `(raw_id, namespace)`
+        # fallback must then find the single live variable.
+        from mypy.constraints import _restore_extra_tvars
+
+        fresh = ParamSpecType(
+            "P",
+            "P",
+            TypeVarId(11, 1),
+            ParamSpecFlavor.BARE,
+            self.fx.o,
+            AnyType(TypeOfAny.from_omitted_generics),
+        )
+        decoded = fresh.copy_modified(id=TypeVarId(11, 0))
+        holder = self._param_spec_template(fresh)
+        restored = _restore_extra_tvars([decoded], holder)
+        assert restored[0] is fresh, "decoded ParamSpec must relink onto the live var"
+
+    def test_restore_extra_tvars_id_equal_duplicates_relink(self) -> None:
+        # Two distinct copies of one ParamSpec (same raw_id/meta_level/
+        # namespace) occur in the wild; the relink dedupes on the structural
+        # TypeVarId every consumer keys on and takes the first occurrence.
+        from mypy.constraints import _restore_extra_tvars
+
+        fresh = ParamSpecType(
+            "P",
+            "P",
+            TypeVarId(837, 1),
+            ParamSpecFlavor.BARE,
+            self.fx.o,
+            AnyType(TypeOfAny.from_omitted_generics),
+        )
+        duplicate = fresh.copy_modified()
+        assert duplicate is not fresh
+        holder_a = self._param_spec_template(fresh)
+        holder_b = CallableType(
+            [duplicate],
+            [ARG_POS],
+            [None],
+            self.fx.a,
+            self.fx.function,
+            variables=[duplicate],
+        )
+        decoded = fresh.copy_modified()
+        restored = _restore_extra_tvars([decoded], holder_a, holder_b)
+        assert restored[0] is fresh, "first id-equal occurrence wins"
+
+    def test_restore_extra_tvars_duplicate_occurrences_relink(self) -> None:
+        # A variable occurring twice in the live tree (`Callable[[T], T]`)
+        # appears twice in `get_all_type_vars`; the identity dedupe must
+        # still resolve it to the single live object.
+        from mypy.constraints import _restore_extra_tvars
+
+        t1 = self.fx.t
+        holder = CallableType(
+            [t1],
+            [ARG_POS],
+            [None],
+            t1,
+            self.fx.function,
+            variables=[],
+        )
+        decoded = t1.copy_modified()
+        assert decoded is not t1
+        restored = _restore_extra_tvars([decoded], holder)
+        assert restored[0] is t1
 
     # --- param-spec target mirrors the infer_polymorphic ternary ---
 

@@ -29,18 +29,33 @@ use crate::wire::{self, ReadBuffer, Type, WireError, WriteBuffer};
 
 /// Each constraint on the wire is `origin Type | op int | target Type`
 /// (mirrors constraints_helpers.rs).
+///
+/// `extra_tvars` is the #1618 channel carried *Rust-side* only: the
+/// internal `any_constraints` fold is reached from `rust_infer_constraints_full`
+/// under `PolyModeGuard::install(true)`, where the polymorphic reverse frame
+/// attaches the generic actual's variables (constraints.rs
+/// `callable_vs_callable_native`). Python's writer stays 3-field (no Rust
+/// reader consumes extras semantically on that direction), so FFI inputs
+/// start empty and the field round-trips only constraint lists built by the
+/// kernel itself.
 #[derive(Clone)]
 pub(crate) struct ConstraintRep {
     pub(crate) origin: Type,
     pub(crate) op: i64,
     pub(crate) target: Type,
+    pub(crate) extra_tvars: Vec<Type>,
 }
 
 fn read_constraint(buf: &mut ReadBuffer<'_>) -> Option<ConstraintRep> {
     let origin = wire::read_type(buf, None).ok()?;
     let op = wire::read_int(buf).ok()?;
     let target = wire::read_type(buf, None).ok()?;
-    Some(ConstraintRep { origin, op, target })
+    Some(ConstraintRep {
+        origin,
+        op,
+        target,
+        extra_tvars: Vec::new(),
+    })
 }
 
 /// The options wire format: bare count + N option blobs. A None option is
@@ -127,10 +142,14 @@ fn merge_with_any(constraint: &ConstraintRep) -> Option<ConstraintRep> {
         missing_import_name: None,
     };
     let target = make_union(vec![constraint.target.clone(), any_type]);
+    // Python builds a fresh `Constraint(origin, op, target)` here
+    // (constraints.py:1139-1164), whose `extra_tvars` starts empty: the
+    // rewrite drops the attachments, so the port drops them too.
     Some(ConstraintRep {
         origin: constraint.origin.clone(),
         op: constraint.op,
         target,
+        extra_tvars: Vec::new(),
     })
 }
 
@@ -733,5 +752,92 @@ mod tests {
         let present = options[1].as_ref().expect("second option decodes");
         assert_eq!(present.len(), 1);
         assert_eq!(present[0].op, 0);
+    }
+
+    fn rep_with_extras(target: Type) -> ConstraintRep {
+        let extra = Type::TypeVarType {
+            name: "U".to_string(),
+            fullname: "U".to_string(),
+            raw_id: 9,
+            namespace: "__main__".to_string(),
+            upper_bound: Box::new(Type::AnyType {
+                type_of_any: 6,
+                source_any: None,
+                missing_import_name: None,
+            }),
+            default: Box::new(Type::UninhabitedType { ambiguous: false }),
+            values: vec![],
+            variance: 0,
+            meta_level: 0,
+        };
+        ConstraintRep {
+            origin: Type::TypeVarType {
+                name: "T".to_string(),
+                fullname: "T".to_string(),
+                raw_id: 1,
+                namespace: "__main__".to_string(),
+                upper_bound: Box::new(Type::AnyType {
+                    type_of_any: 6,
+                    source_any: None,
+                    missing_import_name: None,
+                }),
+                default: Box::new(Type::UninhabitedType { ambiguous: false }),
+                values: vec![],
+                variance: 0,
+                meta_level: 0,
+            },
+            op: 1,
+            target,
+            extra_tvars: vec![extra],
+        }
+    }
+
+    fn instance(name: &str) -> Type {
+        Type::Instance {
+            type_ref: name.to_string(),
+            args: vec![],
+            last_known_value: None,
+            extra_attrs: None,
+        }
+    }
+
+    #[test]
+    fn test_merge_with_any_rewrite_drops_extras() {
+        // Python's merge_with_any builds a fresh Constraint, whose
+        // extra_tvars starts empty (constraints.py:1139-1164): the rewrite
+        // must drop the attachments.
+        let rep = rep_with_extras(instance("builtins.int"));
+        let merged = merge_with_any(&rep).expect("plain target merges");
+        assert!(
+            merged.extra_tvars.is_empty(),
+            "a rewritten constraint must not carry the input's extras"
+        );
+        assert!(matches!(merged.target, Type::UnionType { .. }));
+    }
+
+    #[test]
+    fn test_merge_with_any_passthrough_keeps_extras() {
+        // Already-Any targets return the input object untouched, extras
+        // included (constraints.py:1158-1160).
+        let target = Type::UnionType {
+            items: vec![
+                Type::AnyType {
+                    type_of_any: 2,
+                    source_any: None,
+                    missing_import_name: None,
+                },
+                instance("builtins.int"),
+            ],
+            uses_pep604_syntax: false,
+            can_be_true: true,
+            can_be_false: true,
+            is_evaluated: true,
+            original_str_expr: None,
+            original_str_fallback: None,
+        };
+        let rep = rep_with_extras(target);
+        let merged = merge_with_any(&rep).expect("Any-union target keeps intact");
+        assert_eq!(merged.extra_tvars.len(), 1);
+        assert_eq!(merged.extra_tvars[0], rep.extra_tvars[0]);
     }
 }

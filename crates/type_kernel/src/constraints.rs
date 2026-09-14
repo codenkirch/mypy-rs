@@ -50,6 +50,37 @@ pub(crate) fn neg_op(op: i64) -> i64 {
     }
 }
 
+/// Write one constraint into a Rust->Python FFI blob.
+///
+/// Layout: `origin Type | op int | target Type | extras count (bare int) |
+/// extras (Type each)`. The trailing `extra_tvars` section is the #1618
+/// channel: the polymorphic reverse-inference frame attaches the generic
+/// actual's variables to every constraint it emits
+/// (constraints.py:1904), and the solver needs them as live objects
+/// (`mypy/solve.py:247-251`). Python's `_read_constraint_extras`
+/// (mypy/constraints.py) mirrors this layout.
+///
+/// The Python->Rust direction (`_write_constraint` in mypy/constraints.py,
+/// read by `constraints_helpers::read_constraint`) stays 3-field. Every
+/// reader there ignores `extra_tvars`: the solve seams receive the full
+/// variable list separately, and only `solve_constraints_poly_native` reads
+/// per-constraint extras, reached Rust-internally from unify. Teaching the
+/// Python writer the section without teaching every reader would make them
+/// misparse, so it is deliberately asymmetric and documented at the writer.
+pub(crate) fn write_ffi_constraint(
+    buf: &mut WriteBuffer,
+    constraint: &Constraint,
+) -> Result<(), WireError> {
+    write_type(buf, &constraint.origin_type_var)?;
+    write_int(buf, constraint.op)?;
+    write_type(buf, &constraint.target)?;
+    crate::wire::write_int_bare(buf, constraint.extra_tvars.len() as i64)?;
+    for extra in &constraint.extra_tvars {
+        write_type(buf, extra)?;
+    }
+    Ok(())
+}
+
 /// A representation of a type constraint (T <: type or T :> type).
 ///
 /// Unlike the earlier wire format (which dropped `origin_type_var`, the
@@ -194,7 +225,7 @@ pub(crate) fn rust_infer_constraints_full(
     // faithfully; the tri-state mode hands it down through every nested
     // frame so the callable-vs-callable reverse gate sees what Python sees.
     let _poly = PolyModeGuard::install(infer_polymorphic);
-    let constraints = infer_constraints_full_inner(
+    let constraints = match infer_constraints_full_inner(
         &template,
         &actual,
         direction,
@@ -203,21 +234,17 @@ pub(crate) fn rust_infer_constraints_full(
         strict_optional,
         skip_neg_op,
         erase_types,
-    )?;
-    // The wire format stays 3-field: an extras-carrying constraint would
-    // lose its `extra_tvars` in serialization (#1171), so defer the whole
-    // call to Python instead (the Python body re-emits them as objects).
-    if constraints.iter().any(|c| !c.extra_tvars.is_empty()) {
-        return None;
-    }
+    ) {
+        Some(c) => c,
+        None => {
+            return None;
+        }
+    };
     let mut out = Vec::with_capacity(constraints.len());
     for c in constraints {
         let mut b = WriteBuffer::new();
-        match c.write(&mut b) {
-            Ok(()) => {}
-            Err(_) => {
-                return None;
-            }
+        if write_ffi_constraint(&mut b, &c).is_err() {
+            return None;
         }
         out.push(b.into_bytes());
     }
@@ -734,6 +761,7 @@ fn constraint_to_rep(c: Constraint) -> ConstraintRep {
         origin: c.origin_type_var,
         op: c.op,
         target: c.target,
+        extra_tvars: c.extra_tvars,
     }
 }
 
@@ -742,7 +770,7 @@ fn rep_to_constraint(r: ConstraintRep) -> Constraint {
         origin_type_var: r.origin,
         op: r.op,
         target: r.target,
-        extra_tvars: Vec::new(),
+        extra_tvars: r.extra_tvars,
     }
 }
 
@@ -755,14 +783,9 @@ fn run_any_constraints(
     strict_optional: bool,
     resolver: &TypeResolver,
 ) -> Option<Vec<Constraint>> {
-    // ConstraintRep is 3-field and drops `extra_tvars`; an option list
-    // carrying extras would silently lose them, so defer instead.
-    if options.iter().any(|opt| {
-        opt.as_ref()
-            .is_some_and(|cs| cs.iter().any(|c| !c.extra_tvars.is_empty()))
-    }) {
-        return None;
-    }
+    // `ConstraintRep` carries `extra_tvars` (#1618): the fold mirrors
+    // Python's object-level `any_constraints` (pass-through keeps them,
+    // `merge_with_any`'s rebuild drops them; constraints.py:1139-1164).
     let reps: Vec<Option<Vec<ConstraintRep>>> = options
         .into_iter()
         .map(|opt| opt.map(|cs| cs.into_iter().map(constraint_to_rep).collect()))
@@ -3367,17 +3390,13 @@ pub(crate) fn rust_infer_callable_arguments_constraints(
         resolver.alias_resolver(),
         strict_optional,
     )?;
-    // The write loop is 3-field: an extras-carrying constraint would lose
-    // its `extra_tvars` in serialization, so defer to Python instead.
-    if res.iter().any(|c| !c.extra_tvars.is_empty()) {
-        return None;
-    }
+    // Extras (*if* a mode ever leaks into this FFI) ride the blob section;
+    // the Python reader consumes it. No mode is installed on this entry
+    // today, so the reverse gate defers before extras can attach.
     let mut output = WriteBuffer::new();
     crate::wire::write_int_bare(&mut output, res.len() as i64).ok()?;
     for c in &res {
-        write_type(&mut output, &c.origin_type_var).ok()?;
-        write_int(&mut output, c.op).ok()?;
-        write_type(&mut output, &c.target).ok()?;
+        write_ffi_constraint(&mut output, c).ok()?;
     }
     Some(output.into_bytes())
 }
@@ -5251,20 +5270,24 @@ mod tests {
     }
 
     #[test]
-    fn test_run_any_constraints_defers_on_extras() {
+    fn test_run_any_constraints_preserves_extras() {
         let resolver = builtin_resolver();
         let tv2 = type_var(2, "U");
         let c = Constraint {
             origin_type_var: type_var(7, "T"),
             op: SUPERTYPE_OF,
             target: instance_int(),
-            extra_tvars: vec![tv2],
+            extra_tvars: vec![tv2.clone()],
         };
-        assert!(
-            run_any_constraints(vec![Some(vec![c])], true, true, &resolver).is_none(),
-            "extras-carrying constraint blobs cannot survive the 3-field wire"
+        let res = run_any_constraints(vec![Some(vec![c])], true, true, &resolver)
+            .expect("extras-carrying single option engages");
+        assert_eq!(res.len(), 1);
+        assert_eq!(
+            res[0].extra_tvars,
+            vec![tv2],
+            "the #1618 channel must survive the any_constraints fold"
         );
-        // The clean sibling still engages.
+        // The clean sibling still engages and stays clean.
         let c_clean = Constraint {
             origin_type_var: type_var(7, "T"),
             op: SUPERTYPE_OF,
@@ -5309,7 +5332,7 @@ mod tests {
     }
 
     #[test]
-    fn test_ffi_infer_polymorphic_serialization_guard() {
+    fn test_ffi_infer_polymorphic_serializes_extras() {
         let nat = NativeTypeResolver::new(
             builtin_resolver(),
             crate::aliases::TypeAliasResolver::default(),
@@ -5352,21 +5375,35 @@ mod tests {
         .expect("non-polymorphic pair serializes");
         assert!(!clean.is_empty());
 
-        // infer_polymorphic=true: the emissions carry extra_tvars, which
-        // the 3-field wire cannot express, so defer (None).
+        // infer_polymorphic=true: the emissions carry extra_tvars; the
+        // #1618 blob section serializes them instead of deferring.
+        let poly = rust_infer_constraints_full(
+            &nat,
+            &template_bytes,
+            &actual_bytes,
+            SUPERTYPE_OF,
+            false,
+            true,
+            true,
+            true,
+        )
+        .expect("extras-carrying output must serialize");
+        assert!(!poly.is_empty());
+        let mut extras_seen = 0;
+        for blob in &poly {
+            let mut buf = ReadBuffer::new(blob);
+            let _origin = read_type(&mut buf, None).unwrap();
+            let _op = read_int(&mut buf).unwrap();
+            let _target = read_type(&mut buf, None).unwrap();
+            let count = crate::wire::read_int_bare(&mut buf).unwrap();
+            for _ in 0..count {
+                read_type(&mut buf, None).unwrap();
+                extras_seen += 1;
+            }
+        }
         assert!(
-            rust_infer_constraints_full(
-                &nat,
-                &template_bytes,
-                &actual_bytes,
-                SUPERTYPE_OF,
-                false,
-                true,
-                true,
-                true,
-            )
-            .is_none(),
-            "extras-carrying output must defer at the FFI boundary"
+            extras_seen > 0,
+            "the polymorphic reverse frame must attach extras"
         );
     }
 

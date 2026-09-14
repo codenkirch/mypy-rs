@@ -149,6 +149,14 @@ def _try_native_constraint_builder(
     Requires a NativeTypeResolver snapshot (installed by the build manager
     per SCC). Any unsupported type shape makes Rust return None, which we
     turn into an exception so the caller falls back to Python.
+
+    ParamSpec/TypeVarTuple origins are rebuilt from the *template* only. The
+    decoded id must relink onto a live variable, and relaxing that match
+    (searching the actual too, or accepting id-equal duplicates) lets the
+    kernel decide ParamSpec shapes whose results diverge from Python: four
+    testcheck cases (`...VsParamSpec`, `...VsParamSpecConcatenate`,
+    `...SecondOrder`, `...PopOff`) solve free ParamSpecs to `Never`. The
+    #1621 solve-path gap owns that wall; keep the deferral boundary.
     """
     if _native_constraints_resolver is None:
         return None
@@ -176,40 +184,79 @@ def _try_native_constraint_builder(
         origin = _fix_wire_type_allow_erased(data)
         if not isinstance(origin, (TypeVarType, ParamSpecType, TypeVarTupleType)):
             raise NotImplementedError("origin not a type variable")
-        if isinstance(origin, (ParamSpecType, TypeVarTupleType)):
-            # The wire proto drops meta_level for ParamSpec/TypeVarTuple
-            # origins, so the decoded id never matches a fresh call-site var
-            # (meta_level > 0) and the constraint is dropped in solve. Rebuild
-
-            # the id from the matching live variable in the template. c.f.
-            # solve.py:693-695 for the same identity concern.
-            live = [
-                v
-                for v in mypy.typeops.get_all_type_vars(template)
-                if type(v) is type(origin)
-                and v.id.raw_id == origin.id.raw_id
-                and v.id.namespace == origin.id.namespace
-            ]
-            if len(live) != 1:
-                raise NotImplementedError("origin id not resolvable in template")
-            origin = origin.copy_modified(id=live[0].id)
+        # Template-only rebuild: see the docstring for the #1621 wall.
+        origin = _rebuild_wire_origin(origin, template)
         op = read_int(data)
         target = _fix_wire_type_allow_erased(data)
         if target is None:
             raise NotImplementedError("target unresolvable on wire")
-        constraints.append(Constraint(origin, op, target))
+        # #1618 channel: the polymorphic reverse-inference frame's
+        # `extra_tvars` ride the blob instead of deferring the whole call.
+        constraint = Constraint(origin, op, target)  # type: ignore[arg-type]
+        constraint.extra_tvars = _restore_extra_tvars(
+            _read_constraint_extras(data), actual, template
+        )
+        constraints.append(constraint)
     return constraints
+
+
+def _unique_tvars(vars: list[TypeVarLikeType]) -> list[TypeVarLikeType]:
+    """Deduplicate a type-variable list on its `TypeVarId`, order-preserving.
+
+    A variable occurring several times in a tree (`Callable[[T], T]`) appears
+    several times in `get_all_type_vars` output; distinct copies of one
+    logical variable can also coexist (observed ParamSpec duplicates over
+    `(raw_id, meta_level, namespace)` on the cold self-check). Every
+    downstream consumer keys on `v.id` (`mypy/solve.py:246-261`), so the
+    first occurrence per `(class, id)` is the single candidate.
+    """
+    seen: set[tuple[type[TypeVarLikeType], TypeVarId]] = set()
+    out: list[TypeVarLikeType] = []
+    for v in vars:
+        key = (type(v), v.id)
+        if key not in seen:
+            seen.add(key)
+            out.append(v)
+    return out
+
+
+def _find_live_tvar(
+    decoded: TypeVarLikeType, live: list[TypeVarLikeType]
+) -> TypeVarLikeType | None:
+    """Find the live variable `decoded` stands for, or None when ambiguous.
+
+    All three proto writers carry `meta_level` (tagged conditional int,
+    #1417), so the full-id match is exact and `live` (already deduped on
+    `(class, id)`) yields at most one candidate. The `(raw_id, namespace)`
+    fallback is defensive for a pre-#1417 stream that dropped the level; it
+    only answers when it names a single variable, and a non-unique match
+    returns None so the caller keeps the decoded copy rather than guessing.
+    """
+    exact = [v for v in live if type(v) is type(decoded) and v.id == decoded.id]
+    if exact:
+        return exact[0]
+    loose = [
+        v
+        for v in live
+        if type(v) is type(decoded)
+        and v.id.raw_id == decoded.id.raw_id
+        and v.id.namespace == decoded.id.namespace
+    ]
+    return loose[0] if len(loose) == 1 else None
 
 
 def _rebuild_wire_origin(origin: Type, *inputs: Type) -> Type:
     """Restore the live id on a wire-decoded ParamSpec/TypeVarTuple origin.
 
-    The wire proto drops meta_level for ParamSpecType and TypeVarTupleType
-    origins (c.f. _try_native_constraint_builder), so a decoded origin can
-    never match a fresh call-site variable (meta_level > 0) and the
-    constraint would be dropped or mis-solved downstream. Search the live
-    inputs for a variable with the same type, raw_id and namespace and copy
-    its full id across; defer (raise) when it cannot be found.
+    Both protos round-trip `meta_level` (#1417), but the decoded id must
+    still be relinked onto a live variable: downstream edges key on the live
+    `TypeVarId` and the constraint is dropped or mis-solved when it cannot be
+    matched. Search the live inputs for a variable with the same type,
+    raw_id and namespace and copy its full id across; defer (raise) when the
+    match is not unique. The uniqueness requirement is a deliberate
+    engagement boundary: relaxing it (searching the actual too, or accepting
+    id-equal duplicates) lets the kernel decide ParamSpec shapes whose
+    results diverge from Python (see `_try_native_constraint_builder`).
     """
     if not isinstance(origin, (ParamSpecType, TypeVarTupleType)):
         return origin
@@ -226,11 +273,66 @@ def _rebuild_wire_origin(origin: Type, *inputs: Type) -> Type:
     return origin.copy_modified(id=live[0].id)
 
 
+def _read_constraint_extras(data: _ReadBuffer) -> list[TypeVarLikeType]:
+    """Read the trailing `extra_tvars` section of a Rust constraint blob.
+
+    `write_ffi_constraint` (crates/type_kernel/src/constraints.rs) appends a
+    bare count plus that many Type records after the target. The list is the
+    polymorphic reverse-inference frame's payload
+    (`ConstraintBuilderVisitor.visit_callable_type`, constraints.py:1904):
+    the generic actual's `variables`, which the solver needs as type variable
+    objects (`mypy/solve.py:247-251`). Defer (raise) on an undecodable entry.
+    """
+    from mypy.cache import read_int_bare  # type: ignore[attr-defined]
+
+    count = read_int_bare(data)
+    extras: list[TypeVarLikeType] = []
+    for _ in range(count):
+        extra = _fix_wire_type_allow_erased(data)
+        if not isinstance(extra, (TypeVarType, ParamSpecType, TypeVarTupleType)):
+            raise NotImplementedError("extra_tvars entry not a type variable")
+        extras.append(extra)
+    return extras
+
+
+def _restore_extra_tvars(extras: list[TypeVarLikeType], *inputs: Type) -> list[TypeVarLikeType]:
+    """Relink wire-decoded `extra_tvars` onto the live variable objects.
+
+    The extras are the donor callable's `variables`
+    (`ConstraintBuilderVisitor.visit_callable_type`, constraints.py:1904), so
+    the live `actual` (or the template) still holds the objects Python's own
+    path would have used. The wire rebuilds them as fresh objects, and the
+    solver keys `cmap`/`originals` on `v.id` (`mypy/solve.py:246-261`); all
+    three proto writers carry `meta_level` (#1417), so the full-id match is
+    exact and id-equal duplicates collapse to one key. A decoded entry with
+    no live match keeps the decoded copy so the caller still sees the
+    attachment.
+    """
+    live = _unique_tvars([v for t in inputs for v in mypy.typeops.get_all_type_vars(t)])
+    restored: list[TypeVarLikeType] = []
+    for extra in extras:
+        match = _find_live_tvar(extra, live)
+        restored.append(match if match is not None else extra)
+    return restored
+
+
 def _write_constraint(buf: _WriteBuffer, constraint: Constraint) -> None:
     """Serialize a single constraint: origin Type | op int | target Type.
 
     The op carries the LITERAL_INT tag (mypy.cache.write_int), matching the
     Rust reader in constraints_helpers.rs.
+
+    `extra_tvars` is deliberately *not* written: every Rust reader of this
+    direction ignores it. The solve seams (`rust_solve_constraints`,
+    `rust_solve_dependent`, `rust_find_linear`) receive the full
+    `originals` variable list separately (`mypy/solve.py:283-290`) and only
+    `solve_constraints_poly_native` reads per-constraint extras, which is
+    reached Rust-internally from `unify_generic_callable_core`, never through
+    this writer. The helper predicates (select_trivial, merge_with_any,
+    filter_satisfiable, ...) never branch on extras. If a future reader needs
+    them, it must grow a section *and* every reader here, or the blob would
+    misparse; the Rust-to-Python section lives in `write_ffi_constraint`
+    (crates/type_kernel/src/constraints.rs).
     """
     from mypy.cache import write_int
 
@@ -377,12 +479,9 @@ def _try_native_any_constraints(
         raise NotImplementedError("kernel deferred any_constraints")
     from mypy.cache import read_int
 
-    # Kernel's notion of "valid option" mirrors the pure-Python
-    # pre-filter (constraints.py:1170-1173): eager drops empty lists,
-    # otherwise only None. Every decidable kernel path returns
-    # constraints carried over verbatim from these valid options, in
-    # ascending option order, so scan a flattened list with a monotonic
-    # cursor to also disambiguate value-equal duplicates.
+    # Valid options mirror the Python pre-filter (constraints.py:1200): eager
+    # drops empty lists, else only None. Kernel results are verbatim copies in
+    # ascending order, so a monotonic cursor disambiguates equal duplicates.
     if eager:
         valid_options = [option for option in options if option]
     else:
@@ -1551,14 +1650,9 @@ class ConstraintBuilderVisitor(TypeVisitor[list[Constraint]]):
                 template.type.is_protocol
                 and self.direction == SUPERTYPE_OF
                 and
-                # We avoid infinite recursion for structural subtypes by checking
-                # whether this type already appeared in the inference chain.
-                # This is a conservative way to break the inference cycles.
-                # It never produces any "false" constraints but gives up soon
-                # on purely structural inference cycles, see #3829.
-                # Note that we use is_protocol_implementation instead of is_subtype
-                # because some type may be considered a subtype of a protocol
-                # due to _promote, but still not implement the protocol.
+                # Break structural-inference cycles conservatively: this type
+                # must not already sit in the chain. is_protocol_implementation
+                # (not is_subtype) because _promote may suggest otherwise.
                 not any(template == t for t in reversed(template.type.inferring))
                 and mypy.subtypes.is_protocol_implementation(instance, erased, skip=["__call__"])
             ):
@@ -1712,11 +1806,9 @@ class ConstraintBuilderVisitor(TypeVisitor[list[Constraint]]):
                     type_state.infer_polymorphic
                     and cactual.variables
                     and not self.skip_neg_op
-                    # Technically, the correct inferred type for application of e.g.
-                    # Callable[..., T] -> Callable[..., T] (with literal ellipsis), to a generic
-                    # like U -> U, should be Callable[..., Any], but if U is a self-type, we can
-                    # allow it to leak, to be later bound to self. A bunch of existing code
-                    # depends on this old behaviour.
+                    # The correct inferred type for Callable[..., T] -> U -> U
+                    # should be Callable[..., Any], but a self-type U may leak
+                    # and bind later; existing code depends on this behaviour.
                     and not (
                         any(tv.id.is_self() for tv in cactual.variables)
                         and template.is_ellipsis_args
@@ -2328,7 +2420,11 @@ def _try_native_infer_directed_arg_constraints(
         target = _fix_wire_type(data)
         if target is None:
             raise NotImplementedError("target unresolvable on wire")
-        constraints.append(Constraint(origin, op, target))  # type: ignore[arg-type]
+        constraint = Constraint(origin, op, target)  # type: ignore[arg-type]
+        constraint.extra_tvars = _restore_extra_tvars(
+            _read_constraint_extras(data), left, right
+        )
+        constraints.append(constraint)
     return constraints
 
 
@@ -2372,7 +2468,11 @@ def _try_native_infer_callable_args(
         target = _fix_wire_type(data)
         if target is None:
             raise NotImplementedError("target unresolvable on wire")
-        constraints.append(Constraint(origin, op, target))  # type: ignore[arg-type]
+        constraint = Constraint(origin, op, target)  # type: ignore[arg-type]
+        constraint.extra_tvars = _restore_extra_tvars(
+            _read_constraint_extras(data), template, actual
+        )
+        constraints.append(constraint)
     return constraints
 
 
