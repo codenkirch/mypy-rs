@@ -96,6 +96,37 @@ _CLASS_PATTERN_CALLABLE_VAR: Final = 2
 _CLASS_PATTERN_TYPE_TYPE: Final = 3
 _CLASS_PATTERN_ANY: Final = 4
 
+# Branch tags for rust_classify_sequence_pattern_head (issue #1633): the
+# step 1-3 dispatch of visit_sequence_pattern. The four early-non-match
+# tags all map to early_non_match() in the shim.
+_SEQ_CANNOT_MATCH: Final = 0
+_SEQ_UNION: Final = 1
+_SEQ_FIXED_TOO_FEW: Final = 2
+_SEQ_FIXED_TOO_MANY: Final = 3
+_SEQ_FIXED_OK: Final = 4
+_SEQ_VARIADIC_TOO_MANY: Final = 5
+_SEQ_VARIADIC_OK: Final = 6
+_SEQ_ANY: Final = 7
+_SEQ_ITERABLE: Final = 8
+_SEQ_OTHER: Final = 9
+_SEQ_EARLY_NON_MATCH_TAGS: Final = frozenset(
+    {_SEQ_CANNOT_MATCH, _SEQ_FIXED_TOO_FEW, _SEQ_FIXED_TOO_MANY, _SEQ_VARIADIC_TOO_MANY}
+)
+
+# Rest-type tags for rust_classify_sequence_tuple_result (issue #1633).
+_SEQ_REST_ALL: Final = 0
+_SEQ_REST_SINGLE: Final = 1
+_SEQ_REST_KEEP: Final = 2
+
+# Branch tags for rust_classify_mapping_rest (issue #1633).
+_MAP_INSTANCE: Final = 0
+_MAP_DICT_FALLBACK: Final = 1
+
+# Violation tags for rust_classify_class_pattern_keywords (issue #1633).
+_CLS_KW_TOO_MANY: Final = 1
+_CLS_KW_MATCHES_POSITIONAL: Final = 2
+_CLS_KW_DUPLICATE: Final = 3
+
 
 def _deserialize_type_list(result: list[bytes] | list[list[int]]) -> list[Type] | None:
     from mypy.typeops import _deserialize_type
@@ -202,6 +233,30 @@ class PatternChecker(PatternVisitor[PatternType]):
 
         return PatternType(typ, rest_type, type_map)
 
+    def _filter_or_match_types(self, pattern_types: list[PatternType]) -> list[int]:
+        """Indices of or-alternatives whose match type is inhabited (#1633).
+
+        Rust folds the per-alternative `is_uninhabited` checks into one
+        call; the union itself stays with `make_simplified_union` (already
+        native under its own gate), so no union path forks here. The shim
+        maps indices back onto the live PatternTypes, so no decoded type
+        crosses back.
+        """
+        if _HAS_TYPE_KERNEL and _native_checkpattern_active:
+            from mypy.subtypes import _native_subtype_resolver
+
+            resolver = _native_subtype_resolver
+            if resolver is not None:
+                try:
+                    kept = _type_kernel.rust_filter_or_match_types(
+                        [_serialize_type(p.type) for p in pattern_types], resolver
+                    )
+                    if kept is not None:
+                        return [int(i) for i in kept]
+                except (AssertionError, NotImplementedError):
+                    pass
+        return [i for i, p in enumerate(pattern_types) if not is_uninhabited(p.type)]
+
     def visit_or_pattern(self, o: OrPattern) -> PatternType:
         current_type = self.type_context[-1]
 
@@ -218,10 +273,8 @@ class PatternChecker(PatternVisitor[PatternType]):
         #
         # Collect the final type
         #
-        types = []
-        for pattern_type in pattern_types:
-            if not is_uninhabited(pattern_type.type):
-                types.append(pattern_type.type)
+        kept = self._filter_or_match_types(pattern_types)
+        types = [pattern_types[i].type for i in kept]
 
         #
         # Check the capture types
@@ -281,14 +334,106 @@ class PatternChecker(PatternVisitor[PatternType]):
         )
         return PatternType(narrowed_type, rest_type, {})
 
+    def _classify_sequence_head(
+        self, current_type: ProperType, star_position: int | None, required_patterns: int
+    ) -> int:
+        """Step 1-3 dispatch of visit_sequence_pattern (#1633).
+
+        Rust decides the branch in one call (running the already-ported
+        can_match_sequence logic inline); the shim only routes. A `None`
+        answer runs the verbatim Python head below, so routing agrees on
+        both paths by construction.
+        """
+        if _HAS_TYPE_KERNEL and _native_checkpattern_active and self.non_sequence_match_types:
+            from mypy.subtypes import _native_subtype_resolver
+
+            resolver = _native_subtype_resolver
+            if resolver is not None:
+                try:
+                    non_seq_union = UnionType.make_union(self.non_sequence_match_types)
+                    sequence = self.chk.named_type("typing.Sequence")
+                    iterable = self.chk.named_generic_type(
+                        "typing.Iterable", [AnyType(TypeOfAny.special_form)]
+                    )
+                    tag = _type_kernel.rust_classify_sequence_pattern_head(
+                        _serialize_type(current_type),
+                        star_position,
+                        required_patterns,
+                        _serialize_type(non_seq_union),
+                        _serialize_type(sequence),
+                        _serialize_type(iterable),
+                        resolver,
+                    )
+                    if tag is not None:
+                        return int(tag)
+                except (AssertionError, NotImplementedError):
+                    pass
+        return self._sequence_head_python(current_type, star_position, required_patterns)
+
+    def _sequence_head_python(
+        self, current_type: ProperType, star_position: int | None, required_patterns: int
+    ) -> int:
+        if not self.can_match_sequence(current_type):
+            return _SEQ_CANNOT_MATCH
+        if isinstance(current_type, UnionType):
+            return _SEQ_UNION
+        if isinstance(current_type, TupleType):
+            if find_unpack_in_list(current_type.items) is None:
+                size_diff = len(current_type.items) - required_patterns
+                if size_diff < 0:
+                    return _SEQ_FIXED_TOO_FEW
+                if size_diff > 0 and star_position is None:
+                    return _SEQ_FIXED_TOO_MANY
+                return _SEQ_FIXED_OK
+            if len(current_type.items) - 1 > required_patterns and star_position is None:
+                return _SEQ_VARIADIC_TOO_MANY
+            return _SEQ_VARIADIC_OK
+        if isinstance(current_type, AnyType):
+            return _SEQ_ANY
+        if isinstance(current_type, Instance) and self.chk.type_is_iterable(current_type):
+            return _SEQ_ITERABLE
+        return _SEQ_OTHER
+
+    def _classify_sequence_tuple_result(
+        self, new_inner_types: list[Type], rest_inner_types: list[Type]
+    ) -> tuple[bool, int, int, list[bool]]:
+        """Step-5 arbitration for a fixed tuple in visit_sequence_pattern.
+
+        Returns (new_uninhabited, rest_tag, rest_index, rest_mask); the
+        mask lets the shim rebuild the single-conditional tuple without
+        re-querying is_uninhabited per item.
+        """
+        if _HAS_TYPE_KERNEL and _native_checkpattern_active:
+            from mypy.subtypes import _native_subtype_resolver
+
+            resolver = _native_subtype_resolver
+            if resolver is not None:
+                try:
+                    decided = _type_kernel.rust_classify_sequence_tuple_result(
+                        [_serialize_type(t) for t in new_inner_types],
+                        [_serialize_type(t) for t in rest_inner_types],
+                        resolver,
+                    )
+                    if decided is not None:
+                        new_uninh, rest_tag, rest_idx, mask = decided
+                        return (bool(new_uninh), int(rest_tag), int(rest_idx), list(mask))
+                except (AssertionError, NotImplementedError):
+                    pass
+        new_uninhabited = any(is_uninhabited(t) for t in new_inner_types)
+        mask = [is_uninhabited(t) for t in rest_inner_types]
+        num_always_match = sum(mask)
+        if num_always_match == len(rest_inner_types):
+            return (new_uninhabited, _SEQ_REST_ALL, -1, mask)
+        if num_always_match == len(rest_inner_types) - 1:
+            idx = next(i for i, u in enumerate(mask) if not u)
+            return (new_uninhabited, _SEQ_REST_SINGLE, idx, mask)
+        return (new_uninhabited, _SEQ_REST_KEEP, -1, mask)
+
     def visit_sequence_pattern(self, o: SequencePattern) -> PatternType:
         #
         # Step 1. Check for existence of a starred pattern
         #
         current_type = get_proper_type(self.type_context[-1])
-        if not self.can_match_sequence(current_type):
-            return self.early_non_match()
-
         star_positions = [i for i, p in enumerate(o.patterns) if isinstance(p, StarredPattern)]
         star_position: int | None = None
         if len(star_positions) == 1:
@@ -299,10 +444,15 @@ class PatternChecker(PatternVisitor[PatternType]):
         if star_position is not None:
             required_patterns -= 1
 
+        head = self._classify_sequence_head(current_type, star_position, required_patterns)
+        if head in _SEQ_EARLY_NON_MATCH_TAGS:
+            return self.early_non_match()
+
         #
         # Step 2. If we have a union, recurse and return the combined result
         #
-        if isinstance(current_type, UnionType):
+        if head == _SEQ_UNION:
+            assert isinstance(current_type, UnionType)
             match_types: list[Type] = []
             rest_types: list[Type] = []
             captures_list: dict[Expression, list[Type]] = {}
@@ -340,38 +490,38 @@ class PatternChecker(PatternVisitor[PatternType]):
             )
 
         #
-        # Step 3. Get inner types of original type
+        # Step 3. Get inner types of original type (sizes decided by head).
         #
         unpack_index = None
-        if isinstance(current_type, TupleType):
+        if head == _SEQ_FIXED_OK:
+            assert isinstance(current_type, TupleType)
             inner_types: list[Type] = current_type.items
+            assert find_unpack_in_list(inner_types) is None
+        elif head == _SEQ_VARIADIC_OK:
+            assert isinstance(current_type, TupleType)
+            inner_types = current_type.items
             unpack_index = find_unpack_in_list(inner_types)
-            if unpack_index is None:
-                size_diff = len(inner_types) - required_patterns
-                if size_diff < 0:
-                    return self.early_non_match()
-                elif size_diff > 0 and star_position is None:
-                    return self.early_non_match()
-            else:
-                normalized_inner_types = []
-                for it in inner_types:
-                    # Unfortunately, it is not possible to "split" the TypeVarTuple
-                    # into individual items, so we just use its upper bound for the whole
-                    # analysis instead.
-                    if isinstance(it, UnpackType) and isinstance(it.type, TypeVarTupleType):
-                        it = UnpackType(it.type.upper_bound)
-                    normalized_inner_types.append(it)
-                inner_types = normalized_inner_types
-                current_type = current_type.copy_modified(items=normalized_inner_types)
-                if len(inner_types) - 1 > required_patterns and star_position is None:
-                    return self.early_non_match()
-        elif isinstance(current_type, AnyType):
+            assert unpack_index is not None
+            normalized_inner_types = []
+            for it in inner_types:
+                # Unfortunately, it is not possible to "split" the TypeVarTuple
+                # into individual items, so we just use its upper bound for the whole
+                # analysis instead.
+                if isinstance(it, UnpackType) and isinstance(it.type, TypeVarTupleType):
+                    it = UnpackType(it.type.upper_bound)
+                normalized_inner_types.append(it)
+            inner_types = normalized_inner_types
+            current_type = current_type.copy_modified(items=normalized_inner_types)
+        elif head == _SEQ_ANY:
+            assert isinstance(current_type, AnyType)
             inner_type = AnyType(TypeOfAny.from_another_any, current_type)
             inner_types = [inner_type] * len(o.patterns)
-        elif isinstance(current_type, Instance) and self.chk.type_is_iterable(current_type):
+        elif head == _SEQ_ITERABLE:
+            assert isinstance(current_type, Instance)
             inner_type = self.chk.iterable_item_type(current_type, o)
             inner_types = [inner_type] * len(o.patterns)
         else:
+            assert head == _SEQ_OTHER
             inner_type = self.chk.named_type("builtins.object")
             inner_types = [inner_type] * len(o.patterns)
 
@@ -405,22 +555,25 @@ class PatternChecker(PatternVisitor[PatternType]):
         new_type: Type
         rest_type = current_type
         if isinstance(current_type, TupleType) and unpack_index is None:
-            if any(is_uninhabited(typ) for typ in new_inner_types):
+            new_uninhabited, rest_tag, rest_idx, rest_mask = self._classify_sequence_tuple_result(
+                new_inner_types, rest_inner_types
+            )
+            if new_uninhabited:
                 new_type = UninhabitedType()
             else:
                 new_type = TupleType(new_inner_types, current_type.partial_fallback)
 
-            num_always_match = sum(is_uninhabited(typ) for typ in rest_inner_types)
-            if num_always_match == len(rest_inner_types):
+            if rest_tag == _SEQ_REST_ALL:
                 # All subpatterns always match, so we can apply negative narrowing
                 rest_type = UninhabitedType()
-            elif num_always_match == len(rest_inner_types) - 1:
+            elif rest_tag == _SEQ_REST_SINGLE:
+                assert rest_idx >= 0
                 # Exactly one subpattern may conditionally match, the rest always match.
                 # We can apply negative narrowing to this one position.
                 rest_type = TupleType(
                     [
-                        curr if is_uninhabited(rest) else rest
-                        for curr, rest in zip(inner_types, rest_inner_types)
+                        curr if uninh else rest
+                        for curr, rest, uninh in zip(inner_types, rest_inner_types, rest_mask)
                     ],
                     current_type.partial_fallback,
                 )
@@ -570,6 +723,30 @@ class PatternChecker(PatternVisitor[PatternType]):
             captures[o.capture] = list_type
         return PatternType(self.type_context[-1], UninhabitedType(), captures)
 
+    def _classify_mapping_rest(self, current_type: ProperType, mapping: Type) -> int:
+        """The `o.rest` branch of visit_mapping_pattern (#1633).
+
+        Rust folds the `is_subtype(current, Mapping)` check and the
+        `Instance` test into one tag; the shim builds the rest type from
+        live TypeInfos (`map_instance_to_supertype` needs them).
+        """
+        if _HAS_TYPE_KERNEL and _native_checkpattern_active:
+            from mypy.subtypes import _native_subtype_resolver
+
+            resolver = _native_subtype_resolver
+            if resolver is not None:
+                try:
+                    tag = _type_kernel.rust_classify_mapping_rest(
+                        _serialize_type(current_type), _serialize_type(mapping), resolver
+                    )
+                    if tag is not None:
+                        return int(tag)
+                except (AssertionError, NotImplementedError):
+                    pass
+        if is_subtype(current_type, mapping) and isinstance(current_type, Instance):
+            return _MAP_INSTANCE
+        return _MAP_DICT_FALLBACK
+
     def visit_mapping_pattern(self, o: MappingPattern) -> PatternType:
         current_type = get_proper_type(self.type_context[-1])
         can_match = True
@@ -587,7 +764,8 @@ class PatternChecker(PatternVisitor[PatternType]):
 
         if o.rest is not None:
             mapping = self.chk.named_type("typing.Mapping")
-            if is_subtype(current_type, mapping) and isinstance(current_type, Instance):
+            if self._classify_mapping_rest(current_type, mapping) == _MAP_INSTANCE:
+                assert isinstance(current_type, Instance)
                 mapping_inst = map_instance_to_supertype(current_type, mapping.type)
                 dict_typeinfo = self.chk.lookup_typeinfo("builtins.dict")
                 rest_type = Instance(dict_typeinfo, mapping_inst.args)
@@ -649,6 +827,53 @@ class PatternChecker(PatternVisitor[PatternType]):
         )
         return result
 
+    def _is_generic_type_alias(self, type_info: object) -> bool:
+        """The generic-alias gate of visit_class_pattern (#1633).
+
+        Rust reads the live class-ref node (`TypeAlias` + `no_args`);
+        a missing node is a plain non-alias.
+        """
+        if _HAS_TYPE_KERNEL and _native_checkpattern_active:
+            try:
+                decided = _type_kernel.rust_classify_class_pattern_alias_gate(type_info)
+                if decided is not None:
+                    return bool(decided)
+            except (AssertionError, NotImplementedError):
+                pass
+        return isinstance(type_info, TypeAlias) and not type_info.no_args
+
+    def _classify_class_pattern_keywords(
+        self, match_arg_names: list[str | None], num_positionals: int, keyword_keys: list[str]
+    ) -> list[tuple[int, int]]:
+        """Positional-count and duplicate arbitration (#1633).
+
+        Rust returns violations in emission order as (tag, keyword index)
+        pairs (`_CLS_KW_TOO_MANY` carries -1); the shim applies the
+        `msg.fail` calls, which stay Python-side (message text is the
+        testcheck exact-match contract).
+        """
+        if _HAS_TYPE_KERNEL and _native_checkpattern_active:
+            try:
+                violations = _type_kernel.rust_classify_class_pattern_keywords(
+                    match_arg_names, num_positionals, keyword_keys
+                )
+                if violations is not None:
+                    return [(int(tag), int(idx)) for tag, idx in violations]
+            except (AssertionError, NotImplementedError):
+                pass
+        if num_positionals > len(match_arg_names):
+            return [(_CLS_KW_TOO_MANY, -1)]
+        match_arg_set = {name for name in match_arg_names[:num_positionals] if name is not None}
+        seen: set[str] = set()
+        out: list[tuple[int, int]] = []
+        for i, key in enumerate(keyword_keys):
+            if key in match_arg_set:
+                out.append((_CLS_KW_MATCHES_POSITIONAL, i))
+            elif key in seen:
+                out.append((_CLS_KW_DUPLICATE, i))
+            seen.add(key)
+        return out
+
     def visit_class_pattern(self, o: ClassPattern) -> PatternType:
         current_type = get_proper_type(self.type_context[-1])
 
@@ -656,7 +881,7 @@ class PatternChecker(PatternVisitor[PatternType]):
         # Check class type
         #
         type_info = o.class_ref.node
-        if isinstance(type_info, TypeAlias) and not type_info.no_args:
+        if self._is_generic_type_alias(type_info):
             self.msg.fail(message_registry.CLASS_PATTERN_GENERIC_TYPE_ALIAS, o)
             return self.early_non_match()
 
@@ -678,7 +903,9 @@ class PatternChecker(PatternVisitor[PatternType]):
         # Convert positional to keyword patterns
         #
         keyword_pairs: list[tuple[str | None, Pattern]] = []
-        match_arg_set: set[str] = set()
+        # Default for the non-tuple arm and the self-match fall-through:
+        # no known names, so no positional collision is possible.
+        match_arg_names: list[str | None] = [None] * len(o.positionals)
 
         captures: dict[Expression, Type] = {}
 
@@ -719,36 +946,37 @@ class PatternChecker(PatternVisitor[PatternType]):
                 proper_match_args_type = get_proper_type(match_args_type)
                 if isinstance(proper_match_args_type, TupleType):
                     match_arg_names = get_match_arg_names(proper_match_args_type)
-
-                    if len(o.positionals) > len(match_arg_names):
-                        self.msg.fail(message_registry.CLASS_PATTERN_TOO_MANY_POSITIONAL_ARGS, o)
-                        return self.early_non_match()
                 else:
                     match_arg_names = [None] * len(o.positionals)
 
                 for arg_name, pos in zip(match_arg_names, o.positionals):
                     keyword_pairs.append((arg_name, pos))
-                    if arg_name is not None:
-                        match_arg_set.add(arg_name)
 
         #
-        # Check for duplicate patterns
+        # Check for duplicate patterns (violations decided natively).
         #
-        keyword_arg_set = set()
-        has_duplicates = False
         for key, value in zip(o.keyword_keys, o.keyword_values):
             keyword_pairs.append((key, value))
-            if key in match_arg_set:
+        has_duplicates = False
+        for vtag, vidx in self._classify_class_pattern_keywords(
+            match_arg_names, len(o.positionals), o.keyword_keys
+        ):
+            if vtag == _CLS_KW_TOO_MANY:
+                self.msg.fail(message_registry.CLASS_PATTERN_TOO_MANY_POSITIONAL_ARGS, o)
+                return self.early_non_match()
+            value = o.keyword_values[vidx]
+            key = o.keyword_keys[vidx]
+            if vtag == _CLS_KW_MATCHES_POSITIONAL:
                 self.msg.fail(
                     message_registry.CLASS_PATTERN_KEYWORD_MATCHES_POSITIONAL.format(key), value
                 )
                 has_duplicates = True
-            elif key in keyword_arg_set:
+            else:
+                assert vtag == _CLS_KW_DUPLICATE
                 self.msg.fail(
                     message_registry.CLASS_PATTERN_DUPLICATE_KEYWORD_PATTERN.format(key), value
                 )
                 has_duplicates = True
-            keyword_arg_set.add(key)
 
         if has_duplicates:
             return self.early_non_match()

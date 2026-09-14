@@ -878,6 +878,292 @@ fn callable_is_type_obj(fallback: &Type, ret_type: &Type) -> Option<bool> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// #1633 driver-head classifiers (PatternChecker visit_* family)
+// ---------------------------------------------------------------------------
+
+// One branch-tag classifier per `visit_*` dispatch head; the Python shim
+// applies every side effect and keeps the verbatim Python head as the
+// fallback (`None` defers on undecodable/unresolvable/undecided input).
+
+// Tags for `rust_classify_sequence_pattern_head`: the step 1-3 dispatch of
+// `visit_sequence_pattern` (checkpattern.py:284-376). The four
+// early-non-match tags all map to `early_non_match()` in the shim.
+pub(crate) const SEQ_CANNOT_MATCH: i64 = 0;
+pub(crate) const SEQ_UNION: i64 = 1;
+pub(crate) const SEQ_FIXED_TOO_FEW: i64 = 2;
+pub(crate) const SEQ_FIXED_TOO_MANY: i64 = 3;
+pub(crate) const SEQ_FIXED_OK: i64 = 4;
+pub(crate) const SEQ_VARIADIC_TOO_MANY: i64 = 5;
+pub(crate) const SEQ_VARIADIC_OK: i64 = 6;
+pub(crate) const SEQ_ANY: i64 = 7;
+pub(crate) const SEQ_ITERABLE: i64 = 8;
+pub(crate) const SEQ_OTHER: i64 = 9;
+
+// Tags for the rest-type arbitration of `rust_classify_sequence_tuple_result`.
+pub(crate) const SEQ_REST_ALL: i64 = 0;
+pub(crate) const SEQ_REST_SINGLE: i64 = 1;
+pub(crate) const SEQ_REST_KEEP: i64 = 2;
+
+// Tags for `rust_classify_mapping_rest`: the `o.rest` branch of
+// `visit_mapping_pattern` (checkpattern.py:588-600).
+pub(crate) const MAP_INSTANCE: i64 = 0;
+pub(crate) const MAP_DICT_FALLBACK: i64 = 1;
+
+// Violation tags for `rust_classify_class_pattern_keywords`: the duplicate
+// arbitration of `visit_class_pattern` (checkpattern.py:723-754).
+pub(crate) const CLS_KW_TOO_MANY: i64 = 1;
+pub(crate) const CLS_KW_MATCHES_POSITIONAL: i64 = 2;
+pub(crate) const CLS_KW_DUPLICATE: i64 = 3;
+
+/// `visit_sequence_pattern` steps 1-3 in one call (checkpattern.py:284-376).
+///
+/// Python: `can_match_sequence` gate, union-recurse branch, then the
+/// inner-type source dispatch (fixed tuple with size checks, variadic
+/// tuple with its size check, `AnyType`, iterable `Instance`, object
+/// fallback). The star facts ride as scalars (`star_pos`, already `None`
+/// when several starred patterns exist, plus `required_patterns`), so no
+/// AST crosses the seam. The `can_match_sequence` check runs inline via
+/// the shared `can_match_sequence_inner` (an undecided verdict defers the
+/// whole head rather than answering `CANNOT_MATCH`). The iterable arm
+/// mirrors `type_is_iterable` (checker.py:6083): the subject is already an
+/// `Instance` here, so the type-object unwrap never fires and only
+/// `is_subtype(t, Iterable[Any])` is needed; any other non-tuple shape
+/// answers `OTHER` without consulting the resolver.
+#[pyfunction]
+#[pyo3(signature = (typ_bytes, star_pos, required_patterns, non_seq_bytes, sequence_bytes, iterable_bytes, resolver))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn rust_classify_sequence_pattern_head(
+    typ_bytes: &[u8],
+    star_pos: Option<i64>,
+    required_patterns: i64,
+    non_seq_bytes: &[u8],
+    sequence_bytes: &[u8],
+    iterable_bytes: &[u8],
+    resolver: &mut NativeTypeResolver,
+) -> Option<i64> {
+    let star_pos = match star_pos {
+        Some(p) if p < 0 => return None,
+        Some(p) => Some(p as usize),
+        None => None,
+    };
+    let required: usize = required_patterns.try_into().ok()?;
+    let t = decode_type(typ_bytes)?;
+    let non_seq = decode_type(non_seq_bytes)?;
+    let sequence = decode_type(sequence_bytes)?;
+    let iterable = decode_type(iterable_bytes)?;
+    // Step 1 entry: get_proper_type (checkpattern.py:288).
+    let t = crate::checkexpr_functions::get_proper_or_expand(&t, resolver.alias_resolver())?;
+    // Step 1 gate (checkpattern.py:289-290).
+    if !can_match_sequence_inner(&t, &non_seq, &sequence, resolver)? {
+        return Some(SEQ_CANNOT_MATCH);
+    }
+    // Step 2: union recursion (checkpattern.py:305).
+    if matches!(t, Type::UnionType { .. }) {
+        return Some(SEQ_UNION);
+    }
+    // Step 3: inner-type source dispatch (checkpattern.py:346-376).
+    match &t {
+        Type::TupleType { items, .. } => {
+            if find_unpack_in_list_inner(items) < 0 {
+                let size_diff = items.len() as i64 - required as i64;
+                if size_diff < 0 {
+                    Some(SEQ_FIXED_TOO_FEW)
+                } else if size_diff > 0 && star_pos.is_none() {
+                    Some(SEQ_FIXED_TOO_MANY)
+                } else {
+                    Some(SEQ_FIXED_OK)
+                }
+            } else if items.len() as i64 - 1 > required as i64 && star_pos.is_none() {
+                Some(SEQ_VARIADIC_TOO_MANY)
+            } else {
+                Some(SEQ_VARIADIC_OK)
+            }
+        }
+        Type::AnyType { .. } => Some(SEQ_ANY),
+        Type::Instance { .. } => {
+            let ctx = SubtypeContext::new(false, false, false, false, false, true);
+            match is_subtype(&t, &iterable, &ctx, resolver.resolver()) {
+                Some(true) => Some(SEQ_ITERABLE),
+                Some(false) => Some(SEQ_OTHER),
+                None => None,
+            }
+        }
+        _ => Some(SEQ_OTHER),
+    }
+}
+
+/// Step-5 arbitration for a fixed tuple in `visit_sequence_pattern`
+/// (checkpattern.py:407-426): whether any new inner type is uninhabited,
+/// and the rest-type fold over the rest inner types (all-always-match,
+/// exactly-one-conditional with its index, or keep). Returns
+/// `(new_uninhabited, rest_tag, rest_index, rest_uninhabited_mask)`; the
+/// mask lets the shim rebuild the single-conditional tuple without
+/// re-querying `is_uninhabited` per item. Every item expands a top-level
+/// alias through the resolver first (`is_uninhabited_wire`); an
+/// unresolvable alias defers the whole call.
+#[pyfunction]
+pub(crate) fn rust_classify_sequence_tuple_result(
+    new_bytes: Vec<Vec<u8>>,
+    rest_bytes: Vec<Vec<u8>>,
+    resolver: &mut NativeTypeResolver,
+) -> Option<(bool, i64, i64, Vec<bool>)> {
+    let new_types = decode_type_list(&new_bytes)?;
+    let rest_types = decode_type_list(&rest_bytes)?;
+    let aliases = resolver.alias_resolver();
+    let mut new_uninhabited = false;
+    for t in &new_types {
+        if is_uninhabited_wire(t, aliases)? {
+            new_uninhabited = true;
+            break;
+        }
+    }
+    let mut mask = Vec::with_capacity(rest_types.len());
+    let mut count: i64 = 0;
+    let mut single_idx: i64 = -1;
+    for (i, t) in rest_types.iter().enumerate() {
+        let uninhabited = is_uninhabited_wire(t, aliases)?;
+        mask.push(uninhabited);
+        if uninhabited {
+            count += 1;
+        } else {
+            single_idx = i as i64;
+        }
+    }
+    let n = rest_types.len() as i64;
+    if count == n {
+        Some((new_uninhabited, SEQ_REST_ALL, -1, mask))
+    } else if count == n - 1 {
+        Some((new_uninhabited, SEQ_REST_SINGLE, single_idx, mask))
+    } else {
+        Some((new_uninhabited, SEQ_REST_KEEP, -1, mask))
+    }
+}
+
+/// The `o.rest` branch of `visit_mapping_pattern` (checkpattern.py:588-598).
+///
+/// Python: `is_subtype(current_type, mapping) and
+/// isinstance(current_type, Instance)` selects the `map_instance_to_supertype`
+/// arm; anything else builds `dict[object, object]`. The subtype call uses
+/// the default context; the alias at entry expands like the visit method's
+/// own `get_proper_type` (checkpattern.py:574).
+#[pyfunction]
+pub(crate) fn rust_classify_mapping_rest(
+    typ_bytes: &[u8],
+    mapping_bytes: &[u8],
+    resolver: &mut NativeTypeResolver,
+) -> Option<i64> {
+    let t = decode_type(typ_bytes)?;
+    let mapping = decode_type(mapping_bytes)?;
+    let t = crate::checkexpr_functions::get_proper_or_expand(&t, resolver.alias_resolver())?;
+    let ctx = SubtypeContext::new(false, false, false, false, false, true);
+    let is_sub = is_subtype(&t, &mapping, &ctx, resolver.resolver())?;
+    if is_sub && matches!(t, Type::Instance { .. }) {
+        Some(MAP_INSTANCE)
+    } else {
+        Some(MAP_DICT_FALLBACK)
+    }
+}
+
+/// The generic-alias gate of `visit_class_pattern` (checkpattern.py:658-661).
+///
+/// Python: `isinstance(type_info, TypeAlias) and not type_info.no_args`
+/// reports `CLASS_PATTERN_GENERIC_TYPE_ALIAS` and takes `early_non_match`.
+/// A missing/`None` node is a plain non-alias (`Some(false)`); only an
+/// unreadable attribute defers (`None`), mirroring `class_ref_facts`.
+#[pyfunction]
+pub(crate) fn rust_classify_class_pattern_alias_gate(
+    py: Python<'_>,
+    class_ref_node: Option<&PyAny>,
+) -> PyResult<Option<bool>> {
+    let node = match class_ref_node {
+        Some(n) if !n.is_none() => n,
+        _ => return Ok(Some(false)),
+    };
+    let alias_cls = match nodes_class(py, "TypeAlias") {
+        Ok(cls) => cls,
+        Err(_) => return Ok(None),
+    };
+    let is_alias = match node.is_instance(alias_cls) {
+        Ok(v) => v,
+        Err(_) => return Ok(None),
+    };
+    if !is_alias {
+        return Ok(Some(false));
+    }
+    match node.getattr("no_args") {
+        Ok(v) => match v.extract::<bool>() {
+            Ok(no_args) => Ok(Some(!no_args)),
+            Err(_) => Ok(None),
+        },
+        Err(_) => Ok(None),
+    }
+}
+
+/// The positional-count and duplicate arbitration of `visit_class_pattern`
+/// (checkpattern.py:723-754) as pure string-list logic.
+///
+/// The shim passes the already-resolved `match_arg_names` (the tuple arm's
+/// `get_match_arg_names` result, or `[None] * num_positionals` for the
+/// non-tuple arm, exactly as Python builds it), so `num_positionals >
+/// names.len()` fires precisely for the tuple-arm overflow. Returns the
+/// violations in emission order (`TOO_MANY` alone, else the per-key
+/// `MATCHES_POSITIONAL` / `DUPLICATE` hits with the keyword index); an
+/// empty vec means the shim proceeds to the keyword loop. Never defers on
+/// well-formed input (`None` only on a negative count).
+#[pyfunction]
+pub(crate) fn rust_classify_class_pattern_keywords(
+    match_arg_names: Vec<Option<String>>,
+    num_positionals: i64,
+    keyword_keys: Vec<String>,
+) -> Option<Vec<(i64, i64)>> {
+    let n: usize = num_positionals.try_into().ok()?;
+    if n > match_arg_names.len() {
+        return Some(vec![(CLS_KW_TOO_MANY, -1)]);
+    }
+    let match_arg_set: std::collections::HashSet<&str> = match_arg_names
+        .iter()
+        .take(n)
+        .filter_map(|o| o.as_deref())
+        .collect();
+    let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for (i, key) in keyword_keys.iter().enumerate() {
+        if match_arg_set.contains(key.as_str()) {
+            out.push((CLS_KW_MATCHES_POSITIONAL, i as i64));
+        } else if !seen.insert(key.as_str()) {
+            out.push((CLS_KW_DUPLICATE, i as i64));
+        }
+    }
+    Some(out)
+}
+
+/// The match-type filter tail of `visit_or_pattern` (checkpattern.py:221-224).
+///
+/// Python keeps `pattern_type.type for ... if not
+/// is_uninhabited(pattern_type.type)` and unions the survivors with
+/// `make_simplified_union` (which stays Python-side via the already-native
+/// typeops seam, so no union path forks here). Returns the surviving
+/// indices; the shim maps them back onto the live `PatternType`s, so no
+/// decoded type crosses back. An unresolvable alias item defers the whole
+/// call (`is_uninhabited_wire`), preserving the live-`get_proper_type`
+/// fallback.
+#[pyfunction]
+pub(crate) fn rust_filter_or_match_types(
+    match_bytes: Vec<Vec<u8>>,
+    resolver: &mut NativeTypeResolver,
+) -> Option<Vec<i64>> {
+    let types = decode_type_list(&match_bytes)?;
+    let aliases = resolver.alias_resolver();
+    let mut out = Vec::new();
+    for (i, t) in types.iter().enumerate() {
+        if !is_uninhabited_wire(t, aliases)? {
+            out.push(i as i64);
+        }
+    }
+    Some(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1575,5 +1861,340 @@ mod tests {
     fn test_cpr_alias_ret_type_defers() {
         let t = cpr_callable("builtins.type", type_alias("mod.A"));
         assert_eq!(classify_class_pattern_leaf(&t, false), None);
+    }
+
+    // ----- #1633 driver-head classifier tests -----
+
+    fn seq_head(
+        t: &Type,
+        star_pos: Option<i64>,
+        required: i64,
+        resolver: &mut NativeTypeResolver,
+    ) -> Option<i64> {
+        let any = Type::AnyType {
+            type_of_any: 0,
+            source_any: None,
+            missing_import_name: None,
+        };
+        let mut b = crate::wire::WriteBuffer::new();
+        crate::wire::write_type(&mut b, t).unwrap();
+        let t_bytes = b.into_bytes();
+        let mut nb = crate::wire::WriteBuffer::new();
+        crate::wire::write_type(&mut nb, &any).unwrap();
+        let any_bytes = nb.into_bytes();
+        rust_classify_sequence_pattern_head(
+            &t_bytes, star_pos, required, &any_bytes, &any_bytes, &any_bytes, resolver,
+        )
+    }
+
+    fn fixed_tuple(items: Vec<Type>) -> Type {
+        Type::TupleType {
+            partial_fallback: Box::new(instance(
+                "builtins.tuple",
+                vec![instance("builtins.int", vec![])],
+            )),
+            items,
+            implicit: false,
+        }
+    }
+
+    #[test]
+    fn test_seq_head_any_subject() {
+        // AnyType short-circuits can_match_sequence without the resolver,
+        // so the ANY tag decides with an empty snapshot.
+        let any = Type::AnyType {
+            type_of_any: 0,
+            source_any: None,
+            missing_import_name: None,
+        };
+        assert_eq!(seq_head(&any, None, 1, &mut test_resolver()), Some(SEQ_ANY));
+    }
+
+    #[test]
+    fn test_seq_head_negative_star_defers() {
+        let any = Type::AnyType {
+            type_of_any: 0,
+            source_any: None,
+            missing_import_name: None,
+        };
+        assert_eq!(seq_head(&any, Some(-1), 1, &mut test_resolver()), None);
+    }
+
+    #[test]
+    fn test_seq_head_negative_required_defers() {
+        let any = Type::AnyType {
+            type_of_any: 0,
+            source_any: None,
+            missing_import_name: None,
+        };
+        assert_eq!(seq_head(&any, None, -2, &mut test_resolver()), None);
+    }
+
+    #[test]
+    fn test_seq_head_garbage_bytes_defers() {
+        let mut r = test_resolver();
+        let any = vec![0u8; 4];
+        assert_eq!(
+            rust_classify_sequence_pattern_head(&[255u8; 8], None, 1, &any, &any, &any, &mut r),
+            None
+        );
+    }
+
+    #[test]
+    fn test_seq_head_alias_subject_missing_snapshot_defers() {
+        // Step-1 get_proper_type cannot expand without a snapshot.
+        assert_eq!(
+            seq_head(&type_alias("mod.Seq"), None, 1, &mut test_resolver()),
+            None
+        );
+    }
+
+    #[test]
+    fn test_seq_head_tuple_needs_subtype_snapshot() {
+        // A fixed tuple reaches can_match_sequence first, which needs
+        // subtype snapshots; with an empty resolver the head defers.
+        let t = fixed_tuple(vec![instance("builtins.int", vec![])]);
+        let str_t = instance("builtins.str", vec![]);
+        let seq = instance(
+            "typing.Sequence",
+            vec![Type::AnyType {
+                type_of_any: 0,
+                source_any: None,
+                missing_import_name: None,
+            }],
+        );
+        let mut b = crate::wire::WriteBuffer::new();
+        crate::wire::write_type(&mut b, &t).unwrap();
+        let t_bytes = b.into_bytes();
+        let mut nb = crate::wire::WriteBuffer::new();
+        crate::wire::write_type(&mut nb, &str_t).unwrap();
+        let non_seq_bytes = nb.into_bytes();
+        let mut sb = crate::wire::WriteBuffer::new();
+        crate::wire::write_type(&mut sb, &seq).unwrap();
+        let seq_bytes = sb.into_bytes();
+        assert_eq!(
+            rust_classify_sequence_pattern_head(
+                &t_bytes,
+                None,
+                1,
+                &non_seq_bytes,
+                &seq_bytes,
+                &seq_bytes,
+                &mut test_resolver(),
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn test_seq_tuple_result_fixed_arms() {
+        let int = instance("builtins.int", vec![]);
+        let str_t = instance("builtins.str", vec![]);
+        let never = Type::UninhabitedType { ambiguous: false };
+        // New has an uninhabited item; rest all always-match -> ALL.
+        let (new_uninh, tag, idx, mask) = rust_classify_sequence_tuple_result(
+            blobs(&[never.clone(), str_t.clone()]),
+            blobs(&[never.clone(), never.clone()]),
+            &mut test_resolver(),
+        )
+        .unwrap();
+        assert!(new_uninh);
+        assert_eq!((tag, idx), (SEQ_REST_ALL, -1));
+        assert_eq!(mask, vec![true, true]);
+        // Exactly one conditional -> SINGLE with its index.
+        let (new_uninh, tag, idx, mask) = rust_classify_sequence_tuple_result(
+            blobs(&[int.clone(), str_t.clone()]),
+            blobs(&[never.clone(), str_t.clone()]),
+            &mut test_resolver(),
+        )
+        .unwrap();
+        assert!(!new_uninh);
+        assert_eq!((tag, idx), (SEQ_REST_SINGLE, 1));
+        assert_eq!(mask, vec![true, false]);
+        // Two conditionals -> KEEP.
+        let (_, tag, idx, _) = rust_classify_sequence_tuple_result(
+            blobs(&[int.clone(), str_t.clone()]),
+            blobs(&[int.clone(), str_t.clone()]),
+            &mut test_resolver(),
+        )
+        .unwrap();
+        assert_eq!((tag, idx), (SEQ_REST_KEEP, -1));
+    }
+
+    #[test]
+    fn test_seq_tuple_result_empty_rest_is_all() {
+        // Mirrors Python: 0 == len([]) takes the Uninhabited arm.
+        let int = instance("builtins.int", vec![]);
+        let (_, tag, _, mask) =
+            rust_classify_sequence_tuple_result(blobs(&[int]), vec![], &mut test_resolver())
+                .unwrap();
+        assert_eq!(tag, SEQ_REST_ALL);
+        assert!(mask.is_empty());
+    }
+
+    #[test]
+    fn test_seq_tuple_result_alias_item_defers_without_snapshot() {
+        let int = instance("builtins.int", vec![]);
+        assert_eq!(
+            rust_classify_sequence_tuple_result(
+                blobs(&[int.clone()]),
+                blobs(&[type_alias("mod.A")]),
+                &mut test_resolver(),
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn test_seq_tuple_result_alias_item_decides_with_snapshot() {
+        let aliases = alias_resolver_with_targets(&[("mod.A", instance("builtins.int", vec![]))]);
+        let int = instance("builtins.int", vec![]);
+        let (new_uninh, tag, idx, mask) = rust_classify_sequence_tuple_result(
+            blobs(&[int.clone()]),
+            blobs(&[type_alias("mod.A")]),
+            &mut resolver_with_aliases(aliases),
+        )
+        .unwrap();
+        assert!(!new_uninh);
+        // One inhabited rest item: exactly-one-conditional -> SINGLE.
+        assert_eq!((tag, idx), (SEQ_REST_SINGLE, 0));
+        assert_eq!(mask, vec![false]);
+    }
+
+    #[test]
+    fn test_mapping_rest_garbage_defers() {
+        let mut r = test_resolver();
+        assert_eq!(
+            rust_classify_mapping_rest(&[255u8; 8], &[0u8; 4], &mut r),
+            None
+        );
+    }
+
+    #[test]
+    fn test_mapping_rest_alias_subject_defers_without_snapshot() {
+        let any = Type::AnyType {
+            type_of_any: 0,
+            source_any: None,
+            missing_import_name: None,
+        };
+        let mut b = crate::wire::WriteBuffer::new();
+        crate::wire::write_type(&mut b, &any).unwrap();
+        let mapping_bytes = b.into_bytes();
+        assert_eq!(
+            rust_classify_mapping_rest(
+                &make_alias_blob("mod.M"),
+                &mapping_bytes,
+                &mut test_resolver()
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn test_class_keywords_too_many() {
+        assert_eq!(
+            rust_classify_class_pattern_keywords(
+                vec![Some("x".to_string())],
+                2,
+                vec!["a".to_string()]
+            ),
+            Some(vec![(CLS_KW_TOO_MANY, -1)])
+        );
+    }
+
+    #[test]
+    fn test_class_keywords_positional_then_duplicates() {
+        // "y" collides with a positional name, "a" repeats: both reported
+        // in key order, mirroring the Python loop (no early break).
+        assert_eq!(
+            rust_classify_class_pattern_keywords(
+                vec![Some("x".to_string()), None],
+                2,
+                vec!["y".to_string(), "a".to_string(), "a".to_string()],
+            ),
+            Some(vec![(CLS_KW_DUPLICATE, 2)])
+        );
+        assert_eq!(
+            rust_classify_class_pattern_keywords(
+                vec![Some("x".to_string()), Some("y".to_string())],
+                2,
+                vec!["y".to_string(), "a".to_string(), "a".to_string()],
+            ),
+            Some(vec![(CLS_KW_MATCHES_POSITIONAL, 0), (CLS_KW_DUPLICATE, 2)])
+        );
+    }
+
+    #[test]
+    fn test_class_keywords_none_names_never_collide() {
+        // Non-tuple arm passes [None]*n: no positional collision possible.
+        assert_eq!(
+            rust_classify_class_pattern_keywords(
+                vec![None, None],
+                2,
+                vec!["x".to_string(), "x".to_string()],
+            ),
+            Some(vec![(CLS_KW_DUPLICATE, 1)])
+        );
+    }
+
+    #[test]
+    fn test_class_keywords_ok_is_empty() {
+        assert_eq!(
+            rust_classify_class_pattern_keywords(
+                vec![Some("x".to_string())],
+                1,
+                vec!["a".to_string(), "b".to_string()],
+            ),
+            Some(vec![])
+        );
+    }
+
+    #[test]
+    fn test_class_keywords_negative_count_defers() {
+        assert_eq!(
+            rust_classify_class_pattern_keywords(vec![], -1, vec![]),
+            None
+        );
+    }
+
+    #[test]
+    fn test_or_filter_keeps_inhabited_indices() {
+        let int = instance("builtins.int", vec![]);
+        let never = Type::UninhabitedType { ambiguous: false };
+        assert_eq!(
+            rust_filter_or_match_types(blobs(&[int.clone(), never, int]), &mut test_resolver(),),
+            Some(vec![0, 2])
+        );
+    }
+
+    #[test]
+    fn test_or_filter_all_uninhabited_is_empty() {
+        let never = Type::UninhabitedType { ambiguous: false };
+        assert_eq!(
+            rust_filter_or_match_types(blobs(&[never]), &mut test_resolver(),),
+            Some(vec![])
+        );
+    }
+
+    #[test]
+    fn test_or_filter_alias_item_defers_without_snapshot() {
+        let int = instance("builtins.int", vec![]);
+        assert_eq!(
+            rust_filter_or_match_types(blobs(&[int, type_alias("mod.A")]), &mut test_resolver(),),
+            None
+        );
+    }
+
+    #[test]
+    fn test_or_filter_alias_item_decides_with_snapshot() {
+        let aliases = alias_resolver_with_targets(&[("mod.A", instance("builtins.int", vec![]))]);
+        let int = instance("builtins.int", vec![]);
+        assert_eq!(
+            rust_filter_or_match_types(
+                blobs(&[int, type_alias("mod.A")]),
+                &mut resolver_with_aliases(aliases),
+            ),
+            Some(vec![0, 1])
+        );
     }
 }

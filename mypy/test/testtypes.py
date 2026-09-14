@@ -62846,3 +62846,547 @@ class NativeStubgenPrinterSuite(Suite):
         on = self._with_gate(True, lambda: self._gen().get_str_default_of_node(node))
         assert_equal(on, off, "dict none-key parity")
         assert_equal(off, ("...", False))
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativePatternCheckDriverSuite(Suite):
+    """Parity for the #1633 PatternChecker driver-head classifiers.
+
+    `visit_sequence_pattern` steps 1-3 (`rust_classify_sequence_pattern_head`),
+    the fixed-tuple step-5 fold (`rust_classify_sequence_tuple_result`), the
+    mapping `o.rest` branch (`rust_classify_mapping_rest`), the class-pattern
+    alias gate and keyword arbitration (`rust_classify_class_pattern_alias_gate`,
+    `rust_classify_class_pattern_keywords`), and the or-pattern match-type
+    filter (`rust_filter_or_match_types`). Each shim keeps the verbatim Python
+    head as its fallback; direct seam calls prove engagement and deferral,
+    gate-off vs gate-on differentials prove the routing agrees, and the
+    or/value/singleton tests compare full `PatternType` triples.
+
+    What stays Python (per #1633): `accept` recursion, `conditional_types`
+    narrowing, `TypeRange` construction from live TypeInfos, `msg.fail`
+    emission, binder writes via `update_type_map`, and the
+    `get_mapping_item_type` / `iterable_item_type` checker calls.
+    """
+
+    def setUp(self) -> None:
+        from mypy.checkpattern import _set_native_checkpattern_active
+        from mypy.subtypes import _set_native_subtype_resolver
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        self._set_active = _set_native_checkpattern_active
+        self._set_resolver = _set_native_subtype_resolver
+        self._set_active(True)
+        self.fx = TypeFixture()
+        self.options = Options()
+        anyt = AnyType(TypeOfAny.special_form)
+        self.iter_info = self.fx.make_type_info("typing.Iterable", mro=[self.fx.oi])
+        self.seq_info = self.fx.make_type_info("typing.Sequence", mro=[self.iter_info, self.fx.oi])
+        self.map_info = self.fx.make_type_info("typing.Mapping", mro=[self.fx.oi])
+        self.tup_seq_info = self.fx.make_type_info(
+            "test.TupleSeq",
+            mro=[self.seq_info, self.fx.oi],
+            bases=[Instance(self.seq_info, [anyt])],
+        )
+        self.infos = [
+            self.fx.oi,
+            self.fx.ai,
+            self.fx.bi,
+            self.fx.str_type_info,
+            self.fx.std_tuplei,
+            self.fx.std_listi,
+            self.fx.bool_type_info,
+            self.fx.functioni,
+            self.iter_info,
+            self.seq_info,
+            self.map_info,
+            self.tup_seq_info,
+        ]
+        set_wire_typeinfo_map({i.fullname: i for i in self.infos})
+        self.resolver = _type_kernel.build_native_resolver(self.infos, [])
+        self._set_resolver(self.resolver)
+
+    def tearDown(self) -> None:
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        self._set_active(False)
+        self._set_resolver(None)
+        set_wire_typeinfo_map(None)
+
+    def _with_gate(self, active: bool, fn: Callable[[], T]) -> T:
+        self._set_active(active)
+        try:
+            return fn()
+        finally:
+            self._set_active(True)
+
+    def _bytes_of(self, t: Type) -> bytes:
+        buf = _WriteBuffer()
+        t.write(buf)
+        return buf.getvalue()
+
+    def _any(self) -> AnyType:
+        return AnyType(TypeOfAny.special_form)
+
+    def _named_type(self, name: str) -> Type:
+        if name == "typing.Sequence":
+            return Instance(self.seq_info, [self._any()])
+        if name == "typing.Iterable":
+            return Instance(self.iter_info, [self._any()])
+        if name == "typing.Mapping":
+            return Instance(self.map_info, [self._any(), self._any()])
+        if name == "builtins.object":
+            return self.fx.o
+        raise AssertionError(f"unexpected named_type {name}")
+
+    def _named_generic_type(self, name: str, args: list[Type]) -> Type:
+        if name == "typing.Iterable":
+            return Instance(self.iter_info, args)
+        if name == "typing.Sequence":
+            return Instance(self.seq_info, args)
+        if name == "builtins.list":
+            return Instance(self.fx.std_listi, args)
+        raise AssertionError(f"unexpected named_generic_type {name}")
+
+    def _pc(self) -> Any:
+        from mypy.checkpattern import PatternChecker
+
+        pc = PatternChecker.__new__(PatternChecker)
+        pc.chk = SimpleNamespace(  # type: ignore[assignment]
+            named_type=self._named_type,
+            named_generic_type=self._named_generic_type,
+            type_is_iterable=self._type_is_iterable,
+        )
+        pc.msg = SimpleNamespace(fail=lambda msg, ctx: None)  # type: ignore[assignment]
+        pc.options = self.options
+        pc.type_context = []
+        pc.self_match_types = []
+        pc.non_sequence_match_types = [Instance(self.fx.str_type_info, [])]
+        return pc
+
+    def _type_is_iterable(self, t: Type) -> bool:
+        from mypy.subtypes import is_subtype
+
+        return bool(is_subtype(t, Instance(self.iter_info, [self._any()])))
+
+    # ----- sequence head -----
+
+    def _assert_seq_head_par(self, current: Type, star: int | None, required: int) -> int:
+        off = self._with_gate(
+            False, lambda: self._pc()._classify_sequence_head(current, star, required)
+        )
+        on = self._with_gate(
+            True, lambda: self._pc()._classify_sequence_head(current, star, required)
+        )
+        assert_equal(on, off, f"sequence head parity for {current!r}")
+        return int(on)
+
+    def test_seq_head_cannot_match(self) -> None:
+        from mypy.checkpattern import _SEQ_CANNOT_MATCH
+
+        tag = self._assert_seq_head_par(self.fx.a, None, 1)
+        assert_equal(tag, _SEQ_CANNOT_MATCH)
+
+    def test_seq_head_union(self) -> None:
+        from mypy.checkpattern import _SEQ_UNION
+
+        seq = Instance(self.seq_info, [self._any()])
+        tag = self._assert_seq_head_par(UnionType.make_union([seq, self.fx.o]), None, 1)
+        assert_equal(tag, _SEQ_UNION)
+
+    def test_seq_head_any(self) -> None:
+        from mypy.checkpattern import _SEQ_ANY
+
+        tag = self._assert_seq_head_par(AnyType(TypeOfAny.special_form), None, 2)
+        assert_equal(tag, _SEQ_ANY)
+
+    def test_seq_head_iterable(self) -> None:
+        from mypy.checkpattern import _SEQ_ITERABLE
+
+        tag = self._assert_seq_head_par(Instance(self.seq_info, [self._any()]), None, 1)
+        assert_equal(tag, _SEQ_ITERABLE)
+
+    def test_seq_head_other(self) -> None:
+        from mypy.checkpattern import _SEQ_OTHER
+
+        tag = self._assert_seq_head_par(self.fx.o, None, 1)
+        assert_equal(tag, _SEQ_OTHER)
+
+    def _seq_tuple(self, items: list[Type]) -> TupleType:
+        return TupleType(items, Instance(self.tup_seq_info, [self._any()]))
+
+    def test_seq_head_fixed_ok(self) -> None:
+        from mypy.checkpattern import _SEQ_FIXED_OK
+
+        tag = self._assert_seq_head_par(self._seq_tuple([self.fx.a, self.fx.a]), None, 2)
+        assert_equal(tag, _SEQ_FIXED_OK)
+
+    def test_seq_head_fixed_sizes(self) -> None:
+        from mypy.checkpattern import _SEQ_FIXED_TOO_FEW, _SEQ_FIXED_TOO_MANY
+
+        assert_equal(
+            self._assert_seq_head_par(self._seq_tuple([self.fx.a]), None, 2),
+            _SEQ_FIXED_TOO_FEW,
+        )
+        assert_equal(
+            self._assert_seq_head_par(self._seq_tuple([self.fx.a, self.fx.a]), None, 1),
+            _SEQ_FIXED_TOO_MANY,
+        )
+        # A star absorbs the surplus.
+        from mypy.checkpattern import _SEQ_FIXED_OK
+
+        assert_equal(
+            self._assert_seq_head_par(self._seq_tuple([self.fx.a, self.fx.a]), 0, 1),
+            _SEQ_FIXED_OK,
+        )
+
+    def test_seq_head_variadic(self) -> None:
+        from mypy.checkpattern import _SEQ_VARIADIC_OK, _SEQ_VARIADIC_TOO_MANY
+
+        tup = TupleType(
+            [self.fx.a, UnpackType(Instance(self.fx.std_tuplei, [self._any()]))],
+            Instance(self.tup_seq_info, [self._any()]),
+        )
+        assert_equal(self._assert_seq_head_par(tup, None, 0), _SEQ_VARIADIC_TOO_MANY)
+        assert_equal(self._assert_seq_head_par(tup, None, 1), _SEQ_VARIADIC_OK)
+
+    def test_seq_head_alias_defers_to_python(self) -> None:
+        from mypy.checkpattern import _SEQ_CANNOT_MATCH
+
+        alias = TypeAlias(self.fx.a, "mod.A", "mod", -1, -1)
+        typ = TypeAliasType(alias, [])
+        # No alias snapshot installed: the seam defers, the live
+        # get_proper_type fallback expands to A and decides.
+        assert self._seam_seq_head(typ, None, 1) is None
+        assert_equal(self._assert_seq_head_par(typ, None, 1), _SEQ_CANNOT_MATCH)
+
+    def test_seq_head_alias_engages_with_snapshot(self) -> None:
+        from mypy.checkpattern import _SEQ_CANNOT_MATCH
+
+        alias = TypeAlias(self.fx.a, "mod.Snap", "mod", -1, -1)
+        typ = TypeAliasType(alias, [])
+        resolver = _type_kernel.build_native_resolver(self.infos, [alias])
+        non_seq = UnionType.make_union([Instance(self.fx.str_type_info, [])])
+        seq = Instance(self.seq_info, [self._any()])
+        tag = _type_kernel.rust_classify_sequence_pattern_head(
+            self._bytes_of(typ),
+            None,
+            1,
+            self._bytes_of(non_seq),
+            self._bytes_of(seq),
+            self._bytes_of(Instance(self.iter_info, [self._any()])),
+            resolver,
+        )
+        assert_equal(tag, _SEQ_CANNOT_MATCH)
+
+    def _seam_seq_head(self, current: Type, star: int | None, required: int) -> Any:
+        non_seq = UnionType.make_union([Instance(self.fx.str_type_info, [])])
+        seq = Instance(self.seq_info, [self._any()])
+        return _type_kernel.rust_classify_sequence_pattern_head(
+            self._bytes_of(current),
+            star,
+            required,
+            self._bytes_of(non_seq),
+            self._bytes_of(seq),
+            self._bytes_of(Instance(self.iter_info, [self._any()])),
+            self.resolver,
+        )
+
+    def test_seq_head_resolver_missing_falls_back(self) -> None:
+        from mypy.checkpattern import _SEQ_CANNOT_MATCH
+
+        self._set_resolver(None)
+        try:
+            tag = self._with_gate(
+                True, lambda: self._pc()._classify_sequence_head(self.fx.a, None, 1)
+            )
+        finally:
+            self._set_resolver(self.resolver)
+        assert_equal(tag, _SEQ_CANNOT_MATCH)
+
+    # ----- sequence tuple result -----
+
+    def _assert_seq_result_par(
+        self, new: list[Type], rest: list[Type]
+    ) -> tuple[bool, int, int, list[bool]]:
+        off = self._with_gate(False, lambda: self._pc()._classify_sequence_tuple_result(new, rest))
+        on = self._with_gate(True, lambda: self._pc()._classify_sequence_tuple_result(new, rest))
+        assert_equal(on, off, "sequence tuple-result parity")
+        return cast("tuple[bool, int, int, list[bool]]", on)
+
+    def test_seq_result_all(self) -> None:
+        from mypy.checkpattern import _SEQ_REST_ALL
+
+        never = UninhabitedType()
+        new, tag, idx, mask = self._assert_seq_result_par([never, self.fx.a], [never, never])
+        assert new is True
+        assert_equal((tag, idx, mask), (_SEQ_REST_ALL, -1, [True, True]))
+
+    def test_seq_result_single(self) -> None:
+        from mypy.checkpattern import _SEQ_REST_SINGLE
+
+        never = UninhabitedType()
+        new, tag, idx, mask = self._assert_seq_result_par(
+            [self.fx.a, self.fx.b], [never, self.fx.a]
+        )
+        assert new is False
+        assert_equal((tag, idx, mask), (_SEQ_REST_SINGLE, 1, [True, False]))
+
+    def test_seq_result_keep(self) -> None:
+        from mypy.checkpattern import _SEQ_REST_KEEP
+
+        new, tag, idx, mask = self._assert_seq_result_par(
+            [self.fx.a, self.fx.b], [self.fx.a, self.fx.b]
+        )
+        assert new is False
+        assert_equal((tag, idx, mask), (_SEQ_REST_KEEP, -1, [False, False]))
+
+    def test_seq_result_alias_defers(self) -> None:
+        alias = TypeAlias(self.fx.a, "mod.R", "mod", -1, -1)
+        typ = TypeAliasType(alias, [])
+        assert (
+            _type_kernel.rust_classify_sequence_tuple_result(
+                [self._bytes_of(self.fx.a)], [self._bytes_of(typ)], self.resolver
+            )
+            is None
+        )
+        # Parity still holds through the live-alias fallback.
+        self._assert_seq_result_par([self.fx.a], [typ])
+
+    # ----- mapping rest -----
+
+    def _assert_map_rest_par(self, current: Type) -> int:
+        mapping = Instance(self.map_info, [self._any(), self._any()])
+        off = self._with_gate(False, lambda: self._pc()._classify_mapping_rest(current, mapping))
+        on = self._with_gate(True, lambda: self._pc()._classify_mapping_rest(current, mapping))
+        assert_equal(on, off, f"mapping rest parity for {current!r}")
+        return int(on)
+
+    def test_map_rest_instance(self) -> None:
+        from mypy.checkpattern import _MAP_INSTANCE
+
+        assert_equal(
+            self._assert_map_rest_par(Instance(self.map_info, [self._any(), self._any()])),
+            _MAP_INSTANCE,
+        )
+
+    def test_map_rest_dict_fallback(self) -> None:
+        from mypy.checkpattern import _MAP_DICT_FALLBACK
+
+        assert_equal(self._assert_map_rest_par(self.fx.a), _MAP_DICT_FALLBACK)
+
+    def test_map_rest_alias_defers(self) -> None:
+        from mypy.checkpattern import _MAP_DICT_FALLBACK
+
+        alias = TypeAlias(self.fx.a, "mod.M", "mod", -1, -1)
+        typ = TypeAliasType(alias, [])
+        mapping = Instance(self.map_info, [self._any(), self._any()])
+        assert (
+            _type_kernel.rust_classify_mapping_rest(
+                self._bytes_of(typ), self._bytes_of(mapping), self.resolver
+            )
+            is None
+        )
+        assert_equal(self._assert_map_rest_par(typ), _MAP_DICT_FALLBACK)
+
+    # ----- class alias gate -----
+
+    def _assert_alias_gate_par(self, node: Any) -> bool:
+        off = self._with_gate(False, lambda: self._pc()._is_generic_type_alias(node))
+        on = self._with_gate(True, lambda: self._pc()._is_generic_type_alias(node))
+        assert_equal(on, off, "class alias-gate parity")
+        return bool(on)
+
+    def test_alias_gate_none_node(self) -> None:
+        assert _type_kernel.rust_classify_class_pattern_alias_gate(None) is False
+        assert self._assert_alias_gate_par(None) is False
+
+    def test_alias_gate_plain_var(self) -> None:
+        v = Var("x")
+        assert _type_kernel.rust_classify_class_pattern_alias_gate(v) is False
+        assert self._assert_alias_gate_par(v) is False
+
+    def test_alias_gate_generic_alias(self) -> None:
+        alias = TypeAlias(self.fx.a, "mod.G", "mod", -1, -1)
+        assert _type_kernel.rust_classify_class_pattern_alias_gate(alias) is True
+        assert self._assert_alias_gate_par(alias) is True
+
+    def test_alias_gate_no_args_alias(self) -> None:
+        alias = TypeAlias(self.fx.a, "mod.N", "mod", -1, -1, no_args=True)
+        assert _type_kernel.rust_classify_class_pattern_alias_gate(alias) is False
+        assert self._assert_alias_gate_par(alias) is False
+
+    # ----- class keywords -----
+
+    def _assert_kw_par(
+        self, names: list[str | None], n: int, keys: list[str]
+    ) -> list[tuple[int, int]]:
+        off = self._with_gate(
+            False, lambda: self._pc()._classify_class_pattern_keywords(names, n, keys)
+        )
+        on = self._with_gate(
+            True, lambda: self._pc()._classify_class_pattern_keywords(names, n, keys)
+        )
+        assert_equal(on, off, "class keywords parity")
+        return cast("list[tuple[int, int]]", on)
+
+    def test_kw_too_many(self) -> None:
+        from mypy.checkpattern import _CLS_KW_TOO_MANY
+
+        assert_equal(self._assert_kw_par(["x"], 2, ["a"]), [(_CLS_KW_TOO_MANY, -1)])
+        assert_equal(
+            _type_kernel.rust_classify_class_pattern_keywords(["x"], 2, ["a"]),
+            [(_CLS_KW_TOO_MANY, -1)],
+        )
+
+    def test_kw_matches_positional(self) -> None:
+        from mypy.checkpattern import _CLS_KW_MATCHES_POSITIONAL
+
+        assert_equal(
+            self._assert_kw_par(["x", "y"], 2, ["y", "a"]),
+            [(_CLS_KW_MATCHES_POSITIONAL, 0)],
+        )
+
+    def test_kw_duplicate(self) -> None:
+        from mypy.checkpattern import _CLS_KW_DUPLICATE
+
+        assert_equal(self._assert_kw_par(["x"], 1, ["a", "a"]), [(_CLS_KW_DUPLICATE, 1)])
+
+    def test_kw_mixed_order(self) -> None:
+        from mypy.checkpattern import _CLS_KW_DUPLICATE, _CLS_KW_MATCHES_POSITIONAL
+
+        # Both violations reported in key order, no early break.
+        assert_equal(
+            self._assert_kw_par(["x", "y"], 2, ["y", "a", "a"]),
+            [(_CLS_KW_MATCHES_POSITIONAL, 0), (_CLS_KW_DUPLICATE, 2)],
+        )
+
+    def test_kw_ok_empty(self) -> None:
+        assert_equal(self._assert_kw_par(["x"], 1, ["a", "b"]), [])
+        assert_equal(self._assert_kw_par([], 0, []), [])
+
+    # ----- or filter -----
+
+    def _or_types(self, ts: list[Type]) -> list[Any]:
+        from mypy.checkpattern import PatternType
+
+        return [PatternType(t, UninhabitedType(), {}) for t in ts]
+
+    def _assert_or_filter_par(self, ts: list[Type]) -> list[int]:
+        pts = self._or_types(ts)
+        off = self._with_gate(False, lambda: self._pc()._filter_or_match_types(pts))
+        on = self._with_gate(True, lambda: self._pc()._filter_or_match_types(pts))
+        assert_equal(on, off, "or-filter parity")
+        return cast("list[int]", on)
+
+    def test_or_filter_indices(self) -> None:
+        never = UninhabitedType()
+        assert_equal(self._assert_or_filter_par([self.fx.a, never, self.fx.b]), [0, 2])
+        assert_equal(
+            _type_kernel.rust_filter_or_match_types(
+                [self._bytes_of(t) for t in [self.fx.a, never]], self.resolver
+            ),
+            [0],
+        )
+
+    def test_or_filter_all_uninhabited(self) -> None:
+        assert_equal(self._assert_or_filter_par([UninhabitedType()]), [])
+
+    def test_or_filter_alias_defers(self) -> None:
+        alias = TypeAlias(self.fx.a, "mod.O", "mod", -1, -1)
+        typ = TypeAliasType(alias, [])
+        assert (
+            _type_kernel.rust_filter_or_match_types([self._bytes_of(typ)], self.resolver) is None
+        )
+        assert_equal(self._assert_or_filter_par([self.fx.a, typ]), [0, 1])
+
+    # ----- full PatternType differentials -----
+
+    def _triple(self, pt: Any) -> tuple[str, str, list[tuple[str, str]]]:
+        return (
+            str(pt.type),
+            str(pt.rest_type),
+            sorted((str(e), str(t)) for e, t in pt.captures.items()),
+        )
+
+    def _capture(self, name: str) -> Any:
+        from mypy.nodes import NameExpr
+
+        v = Var(name)
+        e = NameExpr(name)
+        e.node = v
+        return e
+
+    def test_or_visit_patterntype_parity(self) -> None:
+        from mypy.patterns import AsPattern, OrPattern, Pattern
+
+        e1 = self._capture("x")
+        e2 = self._capture("x")
+        pats: list[Pattern] = [AsPattern(None, e1), AsPattern(None, e2)]
+
+        def run() -> Any:
+            pc = self._pc()
+            pc.chk = SimpleNamespace(
+                named_type=self._named_type,
+                named_generic_type=self._named_generic_type,
+                type_is_iterable=self._type_is_iterable,
+                conditional_types_with_intersection=(lambda t, ranges, ctx, default: (t, default)),
+            )
+            pc.type_context.append(self.fx.a)
+            try:
+                return pc.visit_or_pattern(OrPattern(pats))
+            finally:
+                pc.type_context.pop()
+
+        off = self._with_gate(False, run)
+        on = self._with_gate(True, run)
+        assert_equal(self._triple(on), self._triple(off), "or-visit triple parity")
+        # Both alternatives capture x: the union is inhabited.
+        assert str(on.type) == "A"
+
+    def test_value_visit_patterntype_parity(self) -> None:
+        from mypy.patterns import ValuePattern
+
+        lit = self._capture("v")
+
+        def run() -> Any:
+            pc = self._pc()
+            pc.chk = SimpleNamespace(
+                named_type=self._named_type,
+                named_generic_type=self._named_generic_type,
+                type_is_iterable=self._type_is_iterable,
+                expr_checker=SimpleNamespace(accept=lambda e: self.fx.a),
+                narrow_type_by_identity_equality=lambda *a, **k: ({}, {}),
+            )
+            pc.type_context.append(self.fx.a)
+            try:
+                return pc.visit_value_pattern(ValuePattern(lit))
+            finally:
+                pc.type_context.pop()
+
+        off = self._with_gate(False, run)
+        on = self._with_gate(True, run)
+        assert_equal(self._triple(on), self._triple(off), "value-visit triple parity")
+        assert_equal(self._triple(on), ("A", "A", []))
+
+    def test_singleton_visit_patterntype_parity(self) -> None:
+        from mypy.patterns import SingletonPattern
+
+        def run() -> Any:
+            pc = self._pc()
+            pc.chk = SimpleNamespace(
+                named_type=self._named_type,
+                named_generic_type=self._named_generic_type,
+                type_is_iterable=self._type_is_iterable,
+                expr_checker=SimpleNamespace(infer_literal_expr_type=lambda v, n: self.fx.a),
+                conditional_types_with_intersection=(lambda t, ranges, ctx, default: (t, default)),
+            )
+            pc.type_context.append(self.fx.a)
+            try:
+                return pc.visit_singleton_pattern(SingletonPattern(True))
+            finally:
+                pc.type_context.pop()
+
+        off = self._with_gate(False, run)
+        on = self._with_gate(True, run)
+        assert_equal(self._triple(on), self._triple(off), "singleton-visit triple parity")
+        assert_equal(self._triple(on), ("A", "A", []))

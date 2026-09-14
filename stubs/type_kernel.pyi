@@ -1410,6 +1410,29 @@ def rust_construct_sequence_child(
     sequence_bytes: bytes,
     resolver: NativeTypeResolver,
 ) -> bytes | None: ...
+def rust_classify_sequence_pattern_head(
+    type_bytes: bytes,
+    star_pos: int | None,
+    required_patterns: int,
+    non_seq_bytes: bytes,
+    sequence_bytes: bytes,
+    iterable_bytes: bytes,
+    resolver: NativeTypeResolver,
+) -> int | None: ...
+def rust_classify_sequence_tuple_result(
+    new_bytes: list[bytes],
+    rest_bytes: list[bytes],
+    resolver: NativeTypeResolver,
+) -> tuple[bool, int, int, list[bool]] | None: ...
+def rust_classify_mapping_rest(
+    type_bytes: bytes,
+    mapping_bytes: bytes,
+    resolver: NativeTypeResolver,
+) -> int | None: ...
+def rust_filter_or_match_types(
+    match_bytes: list[bytes],
+    resolver: NativeTypeResolver,
+) -> list[int] | None: ...
 def rust_has_return_statement(node_bytes: bytes) -> bool | None: ...
 def rust_has_str_expression(node_bytes: bytes) -> bool: ...
 def rust_has_yield_expression(node_bytes: bytes) -> bool: ...
@@ -2215,6 +2238,12 @@ def rust_classify_tuple_type_implicit(
 def rust_classify_class_pattern_ranges(
     typ_bytes: bytes, class_ref_node: Any
 ) -> list[int] | None: ...
+def rust_classify_class_pattern_alias_gate(class_ref_node: Any) -> bool | None: ...
+def rust_classify_class_pattern_keywords(
+    match_arg_names: list[str | None],
+    num_positionals: int,
+    keyword_keys: list[str],
+) -> list[tuple[int, int]] | None: ...
 def rust_classify_raw_expression_type(
     report_invalid_types: bool, base_type_name: str, note_is_none: bool
 ) -> int | None: ...
