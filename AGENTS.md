@@ -4564,6 +4564,106 @@ including:
   skipped, testcheck 8144 passed/69 skipped/7 xfailed, cold self-check
   clean.
 
+### Ledger backfill (2026-09-14)
+
+PRs `#1587`-`#1617` merged without appending their ledger records. The
+entries below were reconstructed from the landed commits
+(`git log` / `git show` on `main` @ `ae0590ece`), so they cite the PR,
+commit, seam and suite that exist in the tree and invent no metrics.
+
+#### G2 shadow series (record-only, default-off `Options.native_ast_mirror`)
+
+- G2.1 `#1587` (`25b06dd60`) — `ImportBase` bool flags plus
+  `Block.is_unreachable` in the statement/def metadata shadow
+  (`mypy/nodes_mirror.py`); 3 new test defs.
+- G2.2 `#1588` (`812323405`) — extended shadow fields for
+  `OverloadedFuncDef` / `Decorator` / `ClassDef` / `FuncDef`; 4 new tests.
+- G2.3 `#1589` (`cef9360a5`) — extended fields for `ClassDef` /
+  `FuncDef` / `TypeAliasStmt` / `Decorator`; 6 new tests.
+- G2.5 `#1590` (`07b6065ba`) — `ClassDef` extended shadow fields with the
+  matching capture sites in `mypy/semanal_namedtuple.py`,
+  `mypy/semanal_typeddict.py` and `mypy/server/aststrip.py`; 1 new test.
+  No G2.4 exists in the log; none is invented here.
+- G2.6 `#1591` (`b28d89398`) — remaining `FuncDef` shadow fields
+  (`mypy/nodes_mirror.py`); coverage extended in place, no new test def.
+- G1.1 `#1593` (`1e1c997e1`) — wire read channel for type-valued
+  expression fields: `rust_node_mirror_capture_field_wire` /
+  `rust_node_mirror_field_wire` store F2 wire bytes on the
+  `FieldValue::Wire` variant and `read_field_type` decodes them back to a
+  live `Type`; new `NativeAstMirrorWireSuite`.
+
+#### H1 series (live-PyO3 decision heads, zero wire bytes)
+
+Every entry below mirrors a pure decision head as a live-object PyO3 read
+(the `rust_is_final_enum_value` / `rust_is_writable_attribute` pattern),
+gated by `_native_checker_active` or `_native_semanal_active`, covered by a
+gate-off vs gate-on differential `Native*Suite` in
+`mypy/test/testtypes.py`, and defers (`None`) only on an unreadable
+attribute so the pure-Python body re-runs unchanged.
+
+- H1c `#1597` (`b6b7b87d5`) `rust_check_exit_return_type` —
+  `TypeChecker.check__exit__return_type` (`mypy/checker.py:3999`, seam at
+  :4007); `incorrect__exit__return` stays Python-side;
+  `NativeCheckExitReturnTypeSuite`.
+- H1d `#1599` (`82af5bb96`) `rust_check_final_deletable` —
+  `TypeChecker.check_final_deletable`; `NativeCheckFinalDeletableSuite`.
+- H1e `#1601` (`949a91db2`) `rust_is_defined_in_base_class` —
+  `TypeChecker.is_defined_in_base_class`; `NativeIsDefinedInBaseClassSuite`.
+- H1f `#1604` (`b7f7def3a`) `rust_is_definition` —
+  `TypeChecker.is_definition` (`mypy/checker.py:6173`); already recorded
+  above; `NativeIsDefinitionSuite`.
+- H1h `#1606` (`f9f5e9703`) `rust_is_len_of_tuple` — the AST-shape front of
+  `TypeChecker.is_len_of_tuple` (`mypy/checker.py:9607`, seam at :9611);
+  `NativeIsLenOfTupleSuite`.
+- H1i `#1607` (`828241026`) `rust_is_assignable_slot` —
+  `TypeChecker.is_assignable_slot` (`mypy/checker.py:5581`);
+  `NativeIsAssignableSlotSuite`.
+- H1j `#1608` (`926be1b10`) `rust_is_noop_for_reachability` —
+  `TypeChecker.is_noop_for_reachability` (`mypy/checker.py:4698`);
+  `NativeIsNoopForReachabilitySuite`.
+- H1k `#1609` (`d3d32f583`) `rust_is_literal_enum` —
+  `TypeChecker.is_literal_enum` (`mypy/checker.py:10684`);
+  `NativeIsLiteralEnumSuite`.
+- H1l `#1610` (`e8cdd4402`) `rust_classify_unbound_return_typevar` — the
+  unbound-return-TypeVar classification inside
+  `check_unbound_return_typevar` (seam at `mypy/checker.py:2845`); Rust
+  returns a tag the Python shim applies; `NativeUnboundReturnTypevarSuite`.
+- H1m `#1611` (`bf92e6cd3`) `rust_check_incompatible_property_override` —
+  `TypeChecker.check_incompatible_property_override`
+  (`mypy/checker.py:7846`); `NativeIncompatiblePropertyOverrideSuite`.
+- H1n `#1612` (`04671283e`) `rust_can_widen_in_scope` —
+  `TypeChecker.can_widen_in_scope` (`mypy/checker.py:6734`);
+  `NativeCanWidenInScopeSuite`.
+- H1o `#1613` (`41eacc989`) `rust_check_untyped_after_decorator` —
+  `TypeChecker.check_untyped_after_decorator` (`mypy/checker.py:7918`);
+  `NativeCheckUntypedAfterDecoratorSuite`.
+- H1p `#1614` (`b19b9733f`) `rust_is_base_class` —
+  `SemanticAnalyzer.is_base_class` (`mypy/semanal.py:3839`);
+  `NativeIsBaseClassSuite`. First H1 seam on the semanal gate.
+- H1q `#1615` (`f3d1b1dcb`) `rust_is_overloaded_item` —
+  `SemanticAnalyzer.is_overloaded_item` (`mypy/semanal.py:8369`);
+  `NativeIsOverloadedItemSuite`.
+- H1r `#1616` (`656cddbe3`) `rust_is_self_member_ref` —
+  `SemanticAnalyzer.is_self_member_ref` (`mypy/semanal.py:6024`);
+  `NativeIsSelfMemberRefSuite`.
+- H1s `#1617` (`ae0590ece`) `rust_is_type_like` —
+  `SemanticAnalyzer.is_type_like` (`mypy/semanal.py:8327`);
+  `NativeIsTypeLikeSuite`. Landed 2026-09-14 after a rebase over H1r; CI
+  `pr-gate`, `parity`, `parity-mirror`, `parity-typeops`, `parity-ast`
+  green; local `ocr` gate 0 blocking / 2 advisory (recorded on the PR).
+
+#### Mass-migration blocker wave (opened 2026-09-14)
+
+`#1625` is the master plan; `#1618`-`#1624` are the seven blockers: wire
+`extra_tvars` channel, resolver snapshot timing gap, wire `Type` format
+gaps, ParamSpec/TypeVarTuple `variables` channel, plugin callback channel,
+live-object identity contracts, and the kernel-net-slower-than-Python
+performance regression. Work is staffed in disjoint-write-scope worktrees;
+the wire trio (`#1618` / `#1620` / `#1621`) is deliberately serialized
+behind one owner because all three extend the same `CallableType` wire
+record and share one `CACHE_VERSION` bump. Wave entries land as those PRs
+merge.
+
 ## Pull Requests
 
 The default branch on this fork is `main` (not `master`). Always target
