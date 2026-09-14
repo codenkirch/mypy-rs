@@ -338,7 +338,8 @@ pub(crate) fn unwrap_type_type_inner(tp: &Type) -> Option<Type> {
 /// inverted direction (argument contravariance).
 ///
 /// Wire layout in: left Type | right Type | direction int.
-/// Wire layout out: count (bare int) + N× [origin Type | op int | target Type].
+/// Wire layout out: count (bare int) + N× `write_ffi_constraint` blobs
+/// (origin Type | op int | target Type | extras count | extras).
 ///
 /// Returns `None` on decode failure or when the inner inference defers.
 #[pyfunction]

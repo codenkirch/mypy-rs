@@ -3368,7 +3368,8 @@ fn callable_arg_fields(t: &Type) -> Option<(&[Type], &[i64], &[Option<String>])>
 /// preserved via the existing `wire::Constraint` write path.
 ///
 /// Wire layout in: template Type | actual Type | direction int.
-/// Wire layout out: count (bare int) + N× [origin Type | op int | target Type].
+/// Wire layout out: count (bare int) + N× `write_ffi_constraint` blobs
+/// (origin Type | op int | target Type | extras count | extras).
 ///
 /// Defers (`None`) when either side is not a CallableType/Parameters, or
 /// any argument-matching step hits an unresolvable shape.
