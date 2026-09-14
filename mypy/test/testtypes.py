@@ -63390,3 +63390,126 @@ class NativePatternCheckDriverSuite(Suite):
         on = self._with_gate(True, run)
         assert_equal(self._triple(on), self._triple(off), "singleton-visit triple parity")
         assert_equal(self._triple(on), ("A", "A", []))
+
+
+class NativeResolverSigSuite(Suite):
+    """Dirty-driven resolver upkeep (#1641).
+
+    The per-SCC feed re-pushes a `builtins.*` info only when its content
+    signature changed since the last feed. The signature covers exactly
+    the snapshot fields with post-seal writers: `_promote` (grows via
+    `add_type_promotion` and via the cache-load backwards-promotion hack
+    in `mypy/fixup.py`, which runs no `add_type_promotion` call, so a
+    mark hook at the mutation site cannot see it), `alt_promote`, and
+    `defn.type_vars` variance (the #1146 pre-feed loop).
+    """
+
+    def setUp(self) -> None:
+        self.fx = TypeFixture()
+
+    def _int_info(self) -> TypeInfo:
+        int_info = self.fx.make_type_info("builtins.int")
+        int_info.defn.info = int_info
+        return int_info
+
+    def test_sig_sees_fixup_shaped_promote_growth(self) -> None:
+        from mypy.build import _native_builtins_sig
+
+        int_info = self._int_info()
+        before = _native_builtins_sig(int_info)
+        # Mirror the fixup.py backwards-promotion hack: a deserialized
+        # native int appends itself to int._promote outside semanal.
+        nativ = self.fx.make_type_info("mypy_extensions.i64")
+        int_info._promote.append(Instance(nativ, []))
+        after = _native_builtins_sig(int_info)
+        assert before != after
+        assert after[0] == ("mypy_extensions.i64",)
+
+    def test_sig_sees_alt_promote(self) -> None:
+        from mypy.build import _native_builtins_sig
+
+        nativ = self.fx.make_type_info("mypy_extensions.i64")
+        nativ.defn.info = nativ
+        before = _native_builtins_sig(nativ)
+        nativ.alt_promote = Instance(self._int_info(), [])
+        assert _native_builtins_sig(nativ) != before
+
+    def test_sig_sees_variance(self) -> None:
+        from mypy.build import _native_builtins_sig
+
+        info = self.fx.make_type_info("builtins.G", typevars=["T"])
+        before = _native_builtins_sig(info)
+        tvar = info.defn.type_vars[0]
+        assert isinstance(tvar, TypeVarType)
+        tvar.variance = CONTRAVARIANT
+        assert _native_builtins_sig(info) != before
+
+    def test_sig_stable_without_mutation(self) -> None:
+        from mypy.build import _native_builtins_sig
+
+        int_info = self._int_info()
+        assert _native_builtins_sig(int_info) == _native_builtins_sig(int_info)
+
+    def test_split_new_changed_unchanged(self) -> None:
+        from mypy.build import _native_builtins_sig, _split_native_pending
+
+        int_info = self._int_info()
+        float_info = self.fx.make_type_info("builtins.float")
+        mod_info = self.fx.make_type_info("mod.A")
+        snapshotted = {"builtins.int", "builtins.float", "mod.A"}
+        prev = {
+            "builtins.int": _native_builtins_sig(int_info),
+            "builtins.float": _native_builtins_sig(float_info),
+        }
+        # Only int gains a promotion; float is untouched; mod.A is new.
+        nativ = self.fx.make_type_info("mypy_extensions.i64")
+        int_info._promote.append(Instance(nativ, []))
+        new_mod = self.fx.make_type_info("mod.B")
+        new, repush, cur = _split_native_pending(
+            [int_info, float_info, mod_info, new_mod], snapshotted, prev
+        )
+        assert [i.fullname for i in new] == ["mod.B"]
+        assert [i.fullname for i in repush] == ["builtins.int"]
+        assert set(cur) == {"builtins.int", "builtins.float"}
+        assert cur["builtins.int"] == _native_builtins_sig(int_info)
+
+    def test_split_unknown_prev_repushes(self) -> None:
+        from mypy.build import _split_native_pending
+
+        int_info = self._int_info()
+        # No recorded signature (bookkeeping gap): fail safe toward a
+        # re-push, never a skip.
+        new, repush, _ = _split_native_pending([int_info], {"builtins.int"}, {})
+        assert new == []
+        assert [i.fullname for i in repush] == ["builtins.int"]
+
+    def test_split_nonbuiltins_never_repush(self) -> None:
+        from mypy.build import _native_builtins_sig, _split_native_pending
+
+        mod_info = self.fx.make_type_info("mod.A")
+        prev = {"mod.A": _native_builtins_sig(mod_info)}
+        new, repush, cur = _split_native_pending([mod_info], {"mod.A"}, prev)
+        assert new == []
+        assert repush == []
+        assert cur == {}
+
+    def test_add_type_promotion_changes_sig(self) -> None:
+        import mypy.semanal_classprop as sc
+
+        from mypy.build import _native_builtins_sig
+
+        int_info = self._int_info()
+        nativ = self.fx.make_type_info("mypy_extensions.i64")
+        nativ.defn.info = nativ
+        builtin_names = SymbolTable()
+        builtin_names["int"] = SymbolTableNode(MDEF, int_info)
+        before = _native_builtins_sig(int_info)
+        old = sc._HAS_RUST_CLASSPROP
+        sc._HAS_RUST_CLASSPROP = False
+        try:
+            options = Options()
+            options.native_type_kernel = True
+            sc.add_type_promotion(nativ, SymbolTable(), options, builtin_names)
+        finally:
+            sc._HAS_RUST_CLASSPROP = old
+        assert _native_builtins_sig(int_info) != before

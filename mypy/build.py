@@ -793,6 +793,73 @@ def find_config_file_line_number(path: str, section: str, setting_name: str) -> 
     return -1
 
 
+def _native_builtins_sig(
+    info: TypeInfo,
+) -> tuple[tuple[str, ...], str | None, tuple[Any, ...]]:
+    """Content signature over a `builtins.*` snapshot's post-seal fields.
+
+    Dirty-driven resolver upkeep (#1641): every other snapshot field is
+    seal-final by the #599 discipline, but `_promote`/`alt_promote` grow
+    after sealing from two producers — later SCCs' `add_type_promotion`
+    and the cache-load backwards-promotion hack (`fixup.py`, mirrored in
+    `fixup.rs`) — and `defn.type_vars` variance resolves in the #1146
+    pre-feed loop. The feed re-pushes an info only when this signature
+    differs from the last-fed one, so every producer is covered without
+    hooking each mutation site (the fixup path has no `add_type_promotion`
+    call to hook). Unknown shapes degrade to a re-push, never a skip.
+    """
+    try:
+        promote = tuple(
+            getattr(getattr(p, "type", None), "fullname", "?") for p in (info._promote or [])
+        )
+    except Exception:
+        promote = ("<unreadable>",)
+    try:
+        alt = getattr(info, "alt_promote", None)
+        if alt is None:
+            alt_sig = None
+        else:
+            alt_sig = getattr(getattr(alt, "type", None), "fullname", None)
+    except Exception:
+        alt_sig = "<unreadable>"
+    try:
+        type_vars = getattr(getattr(info, "defn", None), "type_vars", []) or []
+        variances: tuple[object, ...] = tuple(getattr(tv, "variance", None) for tv in type_vars)
+    except Exception:
+        variances = ("<unreadable>",)
+    return (promote, alt_sig, variances)
+
+
+def _split_native_pending(
+    type_infos: list[TypeInfo],
+    snapshotted: set[str],
+    prev_sigs: dict[str, tuple[tuple[str, ...], str | None, tuple[Any, ...]]],
+) -> tuple[
+    list[TypeInfo], list[TypeInfo], dict[str, tuple[tuple[str, ...], str | None, tuple[Any, ...]]]
+]:
+    """Split collected infos into new snapshots and changed builtins re-pushes.
+
+    Dirty-driven resolver upkeep (#1641): the first observation of a
+    fullname is always snapshotted, but an already-snapshotted info is
+    re-pushed only when it lives under `builtins.*` and its content
+    signature differs from the last-fed one. A fullname with no recorded
+    signature re-pushes (fail-safe toward the old blanket behavior).
+    Returns the new infos, the re-pushes, and the current signatures for
+    every `builtins.*` info seen (the caller merges them into its map).
+    """
+    new_infos = [info for info in type_infos if info.fullname not in snapshotted]
+    repush: list[TypeInfo] = []
+    cur_sigs: dict[str, tuple[tuple[str, ...], str | None, tuple[Any, ...]]] = {}
+    for info in type_infos:
+        if info.fullname not in snapshotted or not info.fullname.startswith("builtins."):
+            continue
+        sig = _native_builtins_sig(info)
+        cur_sigs[info.fullname] = sig
+        if prev_sigs.get(info.fullname) != sig:
+            repush.append(info)
+    return new_infos, repush, cur_sigs
+
+
 def _native_ctor_blob(info: TypeInfo) -> bytes | None:
     """Serialize `typeops.type_object_type(info)` to the type-kernel wire
     format for the subtype kernel's `type[...]` constructor arm
@@ -938,6 +1005,11 @@ class BuildManager:
         # separately from `_native_typeinfo_map`: the semanal hook
         # (`_install_semal_wirefixup`) adds map entries before it runs.
         self._native_snapshotted: set[str] = set()
+        # Last-fed content signatures for `builtins.*` infos (dirty-driven
+        # upkeep, #1641). Cleared by `_clear_native_resolvers`.
+        self._native_builtins_sig: dict[
+            str, tuple[tuple[str, ...], str | None, tuple[Any, ...]]
+        ] = {}
         # Share same modules dictionary with the global fixer state.
         # We need to set allow_missing when doing a fine-grained cache
         # load because we need to gracefully handle missing modules.
@@ -1590,8 +1662,10 @@ class BuildManager:
         A non-builtins class's first observation is after its own SCC's
         semantic analysis sealed it (or it was fully materialized from
         cache), so its snapshot is final; `builtins.*` classes are
-        re-snapshotted every call because their `_promote` lists grow from
-        later SCCs' native-int/TYPE_PROMOTION processing.
+        re-snapshotted only when their content signature changed since
+        the last feed (#1641: `_promote`/`alt_promote` grow post-seal via
+        `add_type_promotion` and the cache-load backwards-promotion hack,
+        and type-var variance resolves in the pre-feed loop).
         `_clear_native_resolvers` resets the held resolver and map so a
         daemon recheck starts fresh.
 
@@ -1662,21 +1736,23 @@ class BuildManager:
             for info in type_infos:
                 self._native_typeinfo_map[info.fullname] = info
                 self._native_snapshotted.add(info.fullname)
+                if info.fullname.startswith("builtins."):
+                    self._native_builtins_sig[info.fullname] = _native_builtins_sig(info)
         else:
             resolver = self._native_resolver
-            # Feed `update` only fullnames not yet snapshotted, plus
-            # `builtins.*` (promotion lists grow). The wirefixup hook
-            # may add map entries early; Rust `update` skips seen ones.
-            new_infos: list[TypeInfo] = []
-            pending: list[TypeInfo] = []
-            for info in type_infos:
-                if info.fullname not in self._native_snapshotted:
-                    new_infos.append(info)
-                    pending.append(info)
-                    self._native_typeinfo_map[info.fullname] = info
-                    self._native_snapshotted.add(info.fullname)
-                elif info.fullname.startswith("builtins."):
-                    pending.append(info)
+            # Dirty-driven upkeep (#1641): new fullnames plus `builtins.*`
+            # re-pushes whose content signature changed since the last
+            # feed (wirefixup map entries early: Rust skips seen ones).
+            new_infos, repush, cur_sigs = _split_native_pending(
+                type_infos, self._native_snapshotted, self._native_builtins_sig
+            )
+            pending = list(new_infos) + repush
+            for info in new_infos:
+                self._native_typeinfo_map[info.fullname] = info
+                self._native_snapshotted.add(info.fullname)
+                if info.fullname.startswith("builtins."):
+                    cur_sigs[info.fullname] = _native_builtins_sig(info)
+            self._native_builtins_sig.update(cur_sigs)
             # Constructor blobs for first-seal classes only; builtins.*
             # re-snapshots skip blobs the same way Rust update does.
             for info in new_infos:
@@ -1885,6 +1961,10 @@ class BuildManager:
         self._native_walked_modules = set()
         self._native_alias_map = {}
         self._native_snapshotted = set()
+        # Last-fed `builtins.*` content signatures are per-build state
+        # like the snapshot; a daemon recheck must re-snapshot, not
+        # diff against the previous build.
+        self._native_builtins_sig = {}
         # The accumulated typeinfo map is re-created for the new build;
         # wire decodes resolved against the old map must not survive.
         # Cleared here (per-manager reset), not by the per-SCC None reset.
