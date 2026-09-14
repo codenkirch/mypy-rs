@@ -3762,5 +3762,11 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         module
     )?)?;
 
+    // H1q: is_overloaded_item pure isinstance + identity check.
+    module.add_function(wrap_pyfunction!(
+        checker_functions::rust_is_overloaded_item,
+        module
+    )?)?;
+
     Ok(())
 }

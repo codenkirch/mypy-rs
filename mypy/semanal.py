@@ -391,6 +391,7 @@ try:
         rust_make_any_non_explicit as _rust_make_any_non_explicit,
         rust_make_any_non_unimported as _rust_make_any_non_unimported,
         rust_replace_implicit_first_type as _rust_replace_implicit_first_type,
+        rust_is_overloaded_item as _rust_is_overloaded_item,
     )
 
     from mypy.types import read_type as _semanal_read_type
@@ -401,6 +402,7 @@ except ImportError:
     _rust_make_any_non_explicit = None  # type: ignore[assignment]
     _rust_make_any_non_unimported = None  # type: ignore[assignment]
     _rust_replace_implicit_first_type = None  # type: ignore[assignment]
+    _rust_is_overloaded_item = None  # type: ignore[assignment]
     _SemanalWriteBuffer = None  # type: ignore[assignment,misc]
     _SemanalReadBuffer = None  # type: ignore[assignment,misc]
     _semanal_read_type = None  # type: ignore[assignment]
@@ -8340,6 +8342,17 @@ class SemanticAnalyzer(
 
     def is_overloaded_item(self, node: SymbolNode, statement: Statement) -> bool:
         """Check whether the function belongs to the overloaded variants"""
+        if (
+            _SEMANAL_HAS_KERNEL
+            and _native_semanal_active
+            and _rust_is_overloaded_item is not None
+        ):
+            try:
+                result = _rust_is_overloaded_item(node, statement)
+            except (AssertionError, NotImplementedError, ValueError, TypeError):
+                result = None
+            if result is not None:
+                return result
         if isinstance(node, OverloadedFuncDef) and isinstance(statement, FuncDef):
             in_items = statement in {
                 item.func if isinstance(item, Decorator) else item for item in node.items

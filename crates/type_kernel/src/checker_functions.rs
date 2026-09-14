@@ -6628,3 +6628,86 @@ pub(crate) fn rust_is_base_class<'py>(
     }
     Ok(Some(false))
 }
+
+/// Mirrors `SemanticAnalyzer.is_overloaded_item` (semanal.py:8328-8339):
+/// pure isinstance + identity check. Returns Some(bool), None on error.
+#[pyfunction]
+pub(crate) fn rust_is_overloaded_item<'py>(
+    py: Python<'py>,
+    node: &PyAny,
+    statement: &PyAny,
+) -> PyResult<Option<bool>> {
+    let nodes_mod = match py.import("mypy.nodes") {
+        Ok(m) => m,
+        Err(_) => return Ok(None),
+    };
+    let ovl_cls: &PyType = match nodes_mod.getattr("OverloadedFuncDef") {
+        Ok(c) => match c.downcast() {
+            Ok(t) => t,
+            Err(_) => return Ok(None),
+        },
+        Err(_) => return Ok(None),
+    };
+    let funcdef_cls: &PyType = match nodes_mod.getattr("FuncDef") {
+        Ok(c) => match c.downcast() {
+            Ok(t) => t,
+            Err(_) => return Ok(None),
+        },
+        Err(_) => return Ok(None),
+    };
+    let decorator_cls: &PyType = match nodes_mod.getattr("Decorator") {
+        Ok(c) => match c.downcast() {
+            Ok(t) => t,
+            Err(_) => return Ok(None),
+        },
+        Err(_) => return Ok(None),
+    };
+    if !node.is_instance(ovl_cls)? || !statement.is_instance(funcdef_cls)? {
+        return Ok(Some(false));
+    }
+    let items = match node.getattr("items") {
+        Ok(i) => i,
+        Err(_) => return Ok(None),
+    };
+    let items_len: usize = match items.len() {
+        Ok(n) => n,
+        Err(_) => return Ok(None),
+    };
+    let mut in_items = false;
+    for i in 0..items_len {
+        let item = match items.get_item(i) {
+            Ok(it) => it,
+            Err(_) => return Ok(None),
+        };
+        let candidate = if item.is_instance(decorator_cls)? {
+            match item.getattr("func") {
+                Ok(f) => f,
+                Err(_) => return Ok(None),
+            }
+        } else {
+            item
+        };
+        if candidate.as_ptr() == statement.as_ptr() {
+            in_items = true;
+            break;
+        }
+    }
+    let mut in_impl = false;
+    let impl_obj = match node.getattr("impl") {
+        Ok(i) => i,
+        Err(_) => return Ok(None),
+    };
+    if !impl_obj.is_none() {
+        if impl_obj.is_instance(decorator_cls)? {
+            if let Ok(impl_func) = impl_obj.getattr("func") {
+                if impl_func.as_ptr() == statement.as_ptr() {
+                    in_impl = true;
+                }
+            }
+        }
+        if !in_impl && impl_obj.as_ptr() == statement.as_ptr() {
+            in_impl = true;
+        }
+    }
+    Ok(Some(in_items || in_impl))
+}

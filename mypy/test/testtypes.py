@@ -61621,3 +61621,118 @@ class NativeIsBaseClassSuite(Suite):
     def test_parity_self(self) -> None:
         t = self._make_info("Self")
         self._assert_par(t, t)
+
+
+class NativeIsOverloadedItemSuite(Suite):
+    """Parity for `rust_is_overloaded_item` (H1q).
+
+    `SemanticAnalyzer.is_overloaded_item` (semanal.py:8328-8339) is a pure
+    isinstance + identity check, no wire bytes.
+    """
+
+    def setUp(self) -> None:
+        from mypy.semanal import _set_native_semanal_active
+
+        self._set_active = _set_native_semanal_active
+        self._set_active(True)
+        self.fx = TypeFixture()
+
+    def tearDown(self) -> None:
+        self._set_active(False)
+
+    def _with_gate(self, active: bool, fn: Callable[[], T]) -> T:
+        self._set_active(active)
+        try:
+            return fn()
+        finally:
+            self._set_active(True)
+
+    def _make_overload(self, funcs: list[FuncDef]) -> OverloadedFuncDef:
+        ovl = OverloadedFuncDef(funcs)  # type: ignore[arg-type]
+        return ovl
+
+    def _make_func(self, name: str = "f") -> FuncDef:
+        from mypy.nodes import Block
+
+        return FuncDef(name, [], Block([]))
+
+    def _make_decorator(self, name: str = "f") -> Decorator:
+        func = self._make_func(name)
+        var = Var(name)
+        return Decorator(func, [], var)
+
+    def _seam(self, node: Any, statement: Any) -> bool | None:
+        return _type_kernel.rust_is_overloaded_item(node, statement)
+
+    def _run(self, node: Any, statement: Any) -> tuple[bool, bool]:
+        from mypy.semanal import SemanticAnalyzer
+
+        def check_one() -> bool:
+            sa = SemanticAnalyzer.__new__(SemanticAnalyzer)
+            return sa.is_overloaded_item(node, statement)
+
+        off = self._with_gate(False, check_one)
+        on = self._with_gate(True, check_one)
+        return off, on
+
+    def _assert_par(self, node: Any, statement: Any) -> None:
+        off, on = self._run(node, statement)
+        assert_equal(on, off, "is_overloaded_item parity")
+
+    def test_seam_item_match(self) -> None:
+        f = self._make_func("f")
+        ovl = self._make_overload([f])
+        assert self._seam(ovl, f) is True
+
+    def test_seam_item_no_match(self) -> None:
+        f1 = self._make_func("f")
+        f2 = self._make_func("g")
+        ovl = self._make_overload([f1])
+        assert self._seam(ovl, f2) is False
+
+    def test_seam_decorator_item_match(self) -> None:
+        dec = self._make_decorator("f")
+        ovl = OverloadedFuncDef([dec])
+        assert self._seam(ovl, dec.func) is True
+
+    def test_seam_impl_match(self) -> None:
+        f = self._make_func("f")
+        ovl = OverloadedFuncDef([])
+        ovl.impl = f
+        assert self._seam(ovl, f) is True
+
+    def test_seam_impl_decorator_match(self) -> None:
+        dec = self._make_decorator("f")
+        ovl = OverloadedFuncDef([])
+        ovl.impl = dec
+        assert self._seam(ovl, dec.func) is True
+
+    def test_seam_not_overloaded(self) -> None:
+        f = self._make_func("f")
+        assert self._seam(f, f) is False
+
+    def test_seam_not_funcdef(self) -> None:
+        f = self._make_func("f")
+        ovl = self._make_overload([f])
+        assert self._seam(ovl, ovl) is False
+
+    def test_parity_item_match(self) -> None:
+        f = self._make_func("f")
+        ovl = self._make_overload([f])
+        self._assert_par(ovl, f)
+
+    def test_parity_no_match(self) -> None:
+        f1 = self._make_func("f")
+        f2 = self._make_func("g")
+        ovl = self._make_overload([f1])
+        self._assert_par(ovl, f2)
+
+    def test_parity_impl(self) -> None:
+        f = self._make_func("f")
+        ovl = OverloadedFuncDef([])
+        ovl.impl = f
+        self._assert_par(ovl, f)
+
+    def test_parity_not_overloaded(self) -> None:
+        f = self._make_func("f")
+        self._assert_par(f, f)
