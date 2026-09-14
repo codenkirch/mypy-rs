@@ -3243,6 +3243,13 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         module
     )?)?;
 
+    // H1p: is_base_class pure graph walk on TypeInfo.bases. Rust reads
+    // the live TypeInfo objects via PyO3 and returns the bool directly.
+    module.add_function(wrap_pyfunction!(
+        checker_functions::rust_is_base_class,
+        module
+    )?)?;
+
     // Issue #1079: infer_operator_assignment_method decision. Rust reads
     // the live proper type via PyO3 and returns the (is_inplace, method)
     // pair; get_proper_type and the ops_with_inplace_method membership

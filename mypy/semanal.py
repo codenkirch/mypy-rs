@@ -460,6 +460,7 @@ try:
         rust_get_deprecated as _rust_get_deprecated,
         rust_get_name_repr_of_expr as _rust_get_name_repr_of_expr,
         rust_get_typevarlike_declaration as _rust_get_typevarlike_declaration,
+        rust_is_base_class as _rust_is_base_class,
         rust_is_core_builtin_class as _rust_is_core_builtin_class,
         rust_is_defined_type_param as _rust_is_defined_type_param,
         rust_is_final_redefinition as _rust_is_final_redefinition,
@@ -552,6 +553,7 @@ except ImportError:
     _rust_is_trivial_body = None  # type: ignore[assignment]
     _rust_find_duplicate = None  # type: ignore[assignment]
     _rust_is_valid_replacement = None  # type: ignore[assignment]
+    _rust_is_base_class = None  # type: ignore[assignment]
     _rust_is_same_symbol = None  # type: ignore[assignment]
     _rust_names_modified_in_lvalue = None  # type: ignore[assignment]
     _rust_names_modified_by_assignment = None  # type: ignore[assignment]
@@ -3830,6 +3832,17 @@ class SemanticAnalyzer(
 
     def is_base_class(self, t: TypeInfo, s: TypeInfo) -> bool:
         """Determine if t is a base class of s (but do not use mro)."""
+        if (
+            _SEMANAL_HAS_KERNEL
+            and _native_semanal_active
+            and _rust_is_base_class is not None
+        ):
+            try:
+                result = _rust_is_base_class(t, s)
+            except (AssertionError, NotImplementedError, ValueError, TypeError):
+                result = None
+            if result is not None:
+                return result
         # Search the base class graph for t, starting from s.
         worklist = [s]
         visited = {s}

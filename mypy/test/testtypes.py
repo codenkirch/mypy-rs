@@ -61522,3 +61522,102 @@ class NativeCanWidenInScopeSuite(Suite):
         name = self._name_expr(kind=3)
         scope = self._scope(in_function=True)
         self._assert_par(name, self.fx.anyt, scope)
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeIsBaseClassSuite(Suite):
+    """Parity for `rust_is_base_class` (H1p).
+
+    `SemanticAnalyzer.is_base_class` (semanal.py:3831-3844) is a pure
+    graph walk on `TypeInfo.bases` — no wire bytes. Returns True if `t`
+    is reachable from `s` via the base-class graph (excluding MRO).
+    """
+
+    def setUp(self) -> None:
+        from mypy.semanal import _set_native_semanal_active
+
+        self._set_active = _set_native_semanal_active
+        self._set_active(True)
+        self.fx = TypeFixture()
+
+    def tearDown(self) -> None:
+        self._set_active(False)
+
+    def _with_gate(self, active: bool, fn: Callable[[], T]) -> T:
+        self._set_active(active)
+        try:
+            return fn()
+        finally:
+            self._set_active(True)
+
+    def _make_info(self, name: str, bases: list[TypeInfo] | None = None) -> TypeInfo:
+        if bases:
+            base_instances = [Instance(b, []) for b in bases]
+            return self.fx.make_type_info(
+                name, mro=[*bases, self.fx.oi], bases=base_instances
+            )
+        return self.fx.make_type_info(name)
+
+    def _seam(self, t: TypeInfo, s: TypeInfo) -> bool | None:
+        return _type_kernel.rust_is_base_class(t, s)
+
+    def _run(self, t: TypeInfo, s: TypeInfo) -> tuple[bool, bool]:
+        from mypy.semanal import SemanticAnalyzer
+
+        def check_one() -> bool:
+            sa = SemanticAnalyzer.__new__(SemanticAnalyzer)
+            return sa.is_base_class(t, s)
+
+        off = self._with_gate(False, check_one)
+        on = self._with_gate(True, check_one)
+        return off, on
+
+    def _assert_par(self, t: TypeInfo, s: TypeInfo) -> None:
+        off, on = self._run(t, s)
+        assert_equal(on, off, f"is_base_class parity for t={t.fullname} s={s.fullname}")
+
+    def test_seam_direct_base(self) -> None:
+        t = self._make_info("Base")
+        s = self._make_info("Sub", bases=[t])
+        assert self._seam(t, s) is True
+
+    def test_seam_transitive_base(self) -> None:
+        t = self._make_info("Grandparent")
+        mid = self._make_info("Parent", bases=[t])
+        s = self._make_info("Child", bases=[mid])
+        assert self._seam(t, s) is True
+
+    def test_seam_not_base(self) -> None:
+        t = self._make_info("A")
+        s = self._make_info("B")
+        assert self._seam(t, s) is False
+
+    def test_seam_self_is_base(self) -> None:
+        t = self._make_info("Self")
+        assert self._seam(t, t) is True
+
+    def test_seam_cycle_safe(self) -> None:
+        a = self._make_info("A")
+        b = self._make_info("B", bases=[a])
+        a.bases.append(Instance(b, []))
+        assert self._seam(b, a) is True
+
+    def test_parity_direct_base(self) -> None:
+        t = self._make_info("Base")
+        s = self._make_info("Sub", bases=[t])
+        self._assert_par(t, s)
+
+    def test_parity_transitive_base(self) -> None:
+        t = self._make_info("Grandparent")
+        mid = self._make_info("Parent", bases=[t])
+        s = self._make_info("Child", bases=[mid])
+        self._assert_par(t, s)
+
+    def test_parity_not_base(self) -> None:
+        t = self._make_info("A")
+        s = self._make_info("B")
+        self._assert_par(t, s)
+
+    def test_parity_self(self) -> None:
+        t = self._make_info("Self")
+        self._assert_par(t, t)

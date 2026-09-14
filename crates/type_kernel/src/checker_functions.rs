@@ -6579,3 +6579,52 @@ pub(crate) fn rust_can_widen_in_scope(
     }
     Ok(Some(false))
 }
+
+/// Mirrors `SemanticAnalyzer.is_base_class` (semanal.py:3831-3844):
+/// pure graph walk on `TypeInfo.bases` — no wire bytes, no resolver.
+/// Returns Some(true) if `t` is a base class of `s`, Some(false)
+/// otherwise, None on an unreadable attribute.
+#[pyfunction]
+pub(crate) fn rust_is_base_class<'py>(
+    py: Python<'py>,
+    t: &PyAny,
+    s: &PyAny,
+) -> PyResult<Option<bool>> {
+    let t_ptr = t.as_ptr();
+    let mut worklist: Vec<Py<PyAny>> = vec![s.into()];
+    let mut visited: Vec<Py<PyAny>> = vec![s.into()];
+
+    while let Some(nxt) = worklist.pop() {
+        let nxt_ref = nxt.as_ref(py);
+        if nxt_ref.as_ptr() == t_ptr {
+            return Ok(Some(true));
+        }
+        let bases = match nxt_ref.getattr("bases") {
+            Ok(b) => b,
+            Err(_) => return Ok(None),
+        };
+        let bases_len = match bases.len() {
+            Ok(n) => n,
+            Err(_) => return Ok(None),
+        };
+        for i in 0..bases_len {
+            let base = match bases.get_item(i) {
+                Ok(b) => b,
+                Err(_) => return Ok(None),
+            };
+            let base_type = match base.getattr("type") {
+                Ok(bt) => bt,
+                Err(_) => return Ok(None),
+            };
+            let base_type_py: Py<PyAny> = base_type.into();
+            let already = visited
+                .iter()
+                .any(|v| v.as_ref(py).as_ptr() == base_type.as_ptr());
+            if !already {
+                visited.push(base_type_py.clone());
+                worklist.push(base_type_py);
+            }
+        }
+    }
+    Ok(Some(false))
+}
