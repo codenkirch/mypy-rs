@@ -68,32 +68,32 @@ pub(crate) fn rust_get_type_triggers(
 
 /// Error sentinel: a child type is not handled by Rust, so the whole
 /// computation must fall back to Python.
-struct DeferError;
+pub(crate) struct DeferError;
 
 /// Set of seen `TypeAliasType` Python objects, tracked by pointer identity
 /// (mirrors the Python `set[TypeAliasType]` which uses `__hash__`/`__eq__`
 /// default object identity).
 #[derive(Default)]
-struct SeenAliases {
+pub(crate) struct SeenAliases {
     ptrs: HashSet<usize>,
 }
 
 impl SeenAliases {
-    fn contains(&self, obj: &PyAny) -> bool {
+    pub(crate) fn contains(&self, obj: &PyAny) -> bool {
         self.ptrs.contains(&(obj.as_ptr() as usize))
     }
-    fn insert(&mut self, obj: &PyAny) {
+    pub(crate) fn insert(&mut self, obj: &PyAny) {
         self.ptrs.insert(obj.as_ptr() as usize);
     }
 }
 
 /// Shared state threaded through the trigger-collection recursion.
-struct TriggerCtx<'a> {
-    use_logical_deps: bool,
-    refs: &'a TypeRefs<'a>,
-    seen: SeenAliases,
-    make_trigger: &'a PyAny,
-    make_wildcard_trigger: &'a PyAny,
+pub(crate) struct TriggerCtx<'a> {
+    pub(crate) use_logical_deps: bool,
+    pub(crate) refs: &'a TypeRefs<'a>,
+    pub(crate) seen: SeenAliases,
+    pub(crate) make_trigger: &'a PyAny,
+    pub(crate) make_wildcard_trigger: &'a PyAny,
 }
 
 impl<'a> TriggerCtx<'a> {
@@ -113,7 +113,7 @@ impl<'a> TriggerCtx<'a> {
     }
 }
 
-fn collect_triggers(
+pub(crate) fn collect_triggers(
     py: Python<'_>,
     obj: &PyAny,
     ctx: &mut TriggerCtx<'_>,
@@ -332,16 +332,20 @@ fn collect_triggers(
 
 // --- Helpers ---
 
-fn get_attr_or_defer<'a>(obj: &'a PyAny, name: &str) -> Result<&'a PyAny, DeferError> {
+pub(crate) fn get_attr_or_defer<'a>(obj: &'a PyAny, name: &str) -> Result<&'a PyAny, DeferError> {
     obj.getattr(name).map_err(|_| DeferError)
 }
 
-fn get_str_attr_or_defer(py: Python<'_>, obj: &PyAny, name: &str) -> Result<String, DeferError> {
+pub(crate) fn get_str_attr_or_defer(
+    py: Python<'_>,
+    obj: &PyAny,
+    name: &str,
+) -> Result<String, DeferError> {
     let attr = obj.getattr(name).map_err(|_| DeferError)?;
     pystr_to_string(py, attr)
 }
 
-fn pystr_to_string(_py: Python<'_>, obj: &PyAny) -> Result<String, DeferError> {
+pub(crate) fn pystr_to_string(_py: Python<'_>, obj: &PyAny) -> Result<String, DeferError> {
     if let Ok(s) = obj.downcast::<PyString>() {
         s.to_str().map(|s| s.to_string()).map_err(|_| DeferError)
     } else {
@@ -380,7 +384,7 @@ fn add_fullname_trigger(
 }
 
 /// Iterate a sequence that is a list or tuple. Defer on anything else.
-fn iter_seq(obj: &PyAny) -> Result<Vec<&PyAny>, DeferError> {
+pub(crate) fn iter_seq(obj: &PyAny) -> Result<Vec<&PyAny>, DeferError> {
     if let Ok(list) = obj.downcast::<PyList>() {
         Ok(list.iter().collect())
     } else if let Ok(tuple) = obj.downcast::<PyTuple>() {
@@ -391,7 +395,7 @@ fn iter_seq(obj: &PyAny) -> Result<Vec<&PyAny>, DeferError> {
 }
 
 /// Check if obj's class name matches `expected`.
-fn class_name_is(obj: &PyAny, expected: &str) -> bool {
+pub(crate) fn class_name_is(obj: &PyAny, expected: &str) -> bool {
     let class = match obj.getattr("__class__") {
         Ok(c) => c,
         Err(_) => return false,
@@ -411,15 +415,15 @@ fn class_name_is(obj: &PyAny, expected: &str) -> bool {
 // ====================================================================
 
 /// Shared state threaded through the attribute-trigger recursion.
-struct AttrTriggerCtx<'a> {
-    name: &'a str,
-    refs: &'a TypeRefs<'a>,
-    make_trigger: &'a PyAny,
-    get_proper_type: &'a PyAny,
+pub(crate) struct AttrTriggerCtx<'a> {
+    pub(crate) name: &'a str,
+    pub(crate) refs: &'a TypeRefs<'a>,
+    pub(crate) make_trigger: &'a PyAny,
+    pub(crate) get_proper_type: &'a PyAny,
 }
 
 impl AttrTriggerCtx<'_> {
-    fn make_trigger_str(&self, member: &str) -> Result<String, DeferError> {
+    pub(crate) fn make_trigger_str(&self, member: &str) -> Result<String, DeferError> {
         let result = self.make_trigger.call1((member,)).map_err(|_| DeferError)?;
         let s: &PyString = result.downcast().map_err(|_| DeferError)?;
         s.to_str().map(|s| s.to_string()).map_err(|_| DeferError)
@@ -428,7 +432,7 @@ impl AttrTriggerCtx<'_> {
     /// Mirrors `mypy.types.get_proper_type` by calling the Python helper, so
     /// alias-expansion edge cases (no_args aliases, TypeGuardedType) behave
     /// identically.
-    fn proper_type(&self, obj: &PyAny) -> Result<&PyAny, DeferError> {
+    pub(crate) fn proper_type(&self, obj: &PyAny) -> Result<&PyAny, DeferError> {
         let expanded = self.get_proper_type.call1((obj,)).map_err(|_| DeferError)?;
         Ok(expanded)
     }
@@ -471,7 +475,7 @@ pub(crate) fn rust_attribute_triggers(
 
 /// The decision body of `DependencyVisitor.attribute_triggers`, recursion
 /// included: type-kind dispatch producing member trigger strings.
-fn attribute_triggers_walk(
+pub(crate) fn attribute_triggers_walk(
     py: Python<'_>,
     typ: &PyAny,
     ctx: &AttrTriggerCtx<'_>,

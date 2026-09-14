@@ -142,6 +142,8 @@ mod semanal_typeddict;
 mod semanal_typeexpr;
 mod semanal_visitor;
 mod serverdeps;
+// Issue #1632: native fine-grained dependency walk (DependencyVisitor).
+mod depswalk;
 mod setops;
 mod solve;
 mod stubgen;
@@ -2082,6 +2084,15 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         module
     )?)?;
     module.add_function(wrap_pyfunction!(serverdeps::rust_has_user_bases, module)?)?;
+    // Issue #1632: native fine-grained dependency walk (DependencyVisitor).
+    module.add_function(wrap_pyfunction!(
+        depswalk::rust_walk_dependency_visitor,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        depswalk::rust_walk_dependency_target,
+        module
+    )?)?;
     module.add_function(wrap_pyfunction!(
         serverdeps::rust_compare_symbol_table_snapshots,
         module

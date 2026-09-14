@@ -46,19 +46,26 @@ from mypy.nodes import (
     Argument,
     AssertStmt,
     AssignmentStmt,
+    Block,
     BytesExpr,
     CallExpr,
     CastExpr,
+    ClassDef,
     ComparisonExpr,
     Context,
     Decorator,
+    DelStmt,
     DictExpr,
     EllipsisExpr,
     Expression,
     ExpressionStmt,
+    ForStmt,
     FuncBase,
     FuncDef,
     FuncItem,
+    Import,
+    ImportAll,
+    ImportFrom,
     IndexExpr,
     IntExpr,
     ListExpr,
@@ -84,8 +91,10 @@ from mypy.nodes import (
     TemplateStrExpr,
     TupleExpr,
     TypeInfo,
+    TypeVarExpr,
     UnaryExpr,
     Var,
+    WithStmt,
 )
 from mypy.options import Options
 from mypy.plugins.common import find_shallow_matching_overload_item
@@ -12002,7 +12011,7 @@ class NativeUnboundWithoutTypeInfoSuite(Suite):
         return SymbolTableNode(MDEF, v)
 
     def _tvar_expr_sym(self, name: str = "T") -> SymbolTableNode:
-        from mypy.nodes import SymbolTableNode, TypeVarExpr
+        from mypy.nodes import SymbolTableNode
 
         tv = TypeVarExpr(name, name, [], self.fx.o, AnyType(TypeOfAny.from_omitted_generics))
         return SymbolTableNode(MDEF, tv)
@@ -12219,7 +12228,6 @@ class NativeUnboundWithoutTypeInfoSuite(Suite):
         # A classic unbound type variable when not allowed -> 'Type
         # variable "..." is unbound' plus the two bind hints.
         t = UnboundType("m.T")
-        from mypy.nodes import TypeVarExpr
 
         tv = TypeVarExpr("T", "m.T", [], self.fx.o, AnyType(TypeOfAny.from_omitted_generics))
         sym = SymbolTableNode(MDEF, tv)
@@ -12230,7 +12238,6 @@ class NativeUnboundWithoutTypeInfoSuite(Suite):
         # A PEP 695 type parameter outside its scope -> 'Name "T" is not
         # defined' with the short name and NAME_DEFINED.
         t = UnboundType("m.T")
-        from mypy.nodes import TypeVarExpr
 
         tv = TypeVarExpr(
             "T", "m.T", [], self.fx.o, AnyType(TypeOfAny.from_omitted_generics), is_new_style=True
@@ -12361,7 +12368,7 @@ class NativeUnboundBranchFrontSuite(Suite):
         return ta, api
 
     def _tvar_expr_sym(self, name: str = "T", fullname: str = "mod.T") -> SymbolTableNode:
-        from mypy.nodes import SymbolTableNode, TypeVarExpr
+        from mypy.nodes import SymbolTableNode
 
         tv = TypeVarExpr(name, fullname, [], self.fx.o, AnyType(TypeOfAny.from_omitted_generics))
         return SymbolTableNode(MDEF, tv)
@@ -36385,7 +36392,6 @@ class NativeSemanalVisitorAuditSuite(Suite):
         # A NameExpr whose node is a TypeVarLikeExpr: the seam decides Some(false).
         # Python's true-path also calls `self.fail` (live analyzer state),
         # so this is a seam-engagement assert only, not a differential.
-        from mypy.nodes import TypeVarExpr
         from mypy.types import AnyType, TypeOfAny
 
         rv = self._name("m.T")
@@ -37415,7 +37421,6 @@ class NativeLvalueValiditySuite(Suite):
         assert_equal(on, off, f"check_lvalue_validity parity for node={node!r}")
 
     def test_seam_typevar_expr(self) -> None:
-        from mypy.nodes import TypeVarExpr
 
         tv = TypeVarExpr(
             "T", "T", [], AnyType(TypeOfAny.special_form), AnyType(TypeOfAny.from_omitted_generics)
@@ -37431,7 +37436,6 @@ class NativeLvalueValiditySuite(Suite):
         assert self._tag(None) == 0
 
     def test_parity_typevar_expr(self) -> None:
-        from mypy.nodes import TypeVarExpr
 
         tv = TypeVarExpr(
             "T", "T", [], AnyType(TypeOfAny.special_form), AnyType(TypeOfAny.from_omitted_generics)
@@ -57677,7 +57681,6 @@ class NativeAstdiffSymbolSnapshotSuite(Suite):
             DataclassTransformSpec,
             ParamSpecExpr,
             TypeAlias,
-            TypeVarExpr,
             TypeVarTupleExpr,
         )
         from mypy.types import Instance
@@ -63513,3 +63516,240 @@ class NativeResolverSigSuite(Suite):
         finally:
             sc._HAS_RUST_CLASSPROP = old
         assert _native_builtins_sig(int_info) != before
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeServerDepsWalkSuite(Suite):
+    """Parity tests for the native DependencyVisitor walk (#1632).
+
+    Each test builds a small hand-made AST, runs `get_dependencies` with the
+    server-deps gate off and on, and asserts the maps match. The gate-on run
+    goes through `rust_walk_dependency_visitor`; tests also call the seam
+    directly and assert it engages (does not defer) except for the deferral
+    pin, which asserts it returns None on an unknown node kind.
+    """
+
+    def setUp(self) -> None:
+        from mypy.server.deps import _set_native_server_deps_active
+
+        self.fx = TypeFixture()
+        self._set_active = _set_native_server_deps_active
+
+    def _tree(self, defs: list[Statement]) -> MypyFile:
+        tree = MypyFile([], [])
+        tree._fullname = "main"
+        tree.names = SymbolTable()
+        tree.path = ""
+        tree.defs = defs
+        return tree
+
+    def _maps(
+        self,
+        tree: MypyFile,
+        type_map: dict[Expression, Type] | None = None,
+        logical: bool = False,
+    ) -> dict[str, set[str]]:
+        from type_kernel import rust_walk_dependency_visitor
+
+        from mypy.server.deps import get_dependencies
+
+        if type_map is None:
+            type_map = {}
+        options = Options()
+        options.logical_deps = logical
+        self._set_active(False)
+        off = get_dependencies(tree, type_map, (3, 13), options)
+        native = rust_walk_dependency_visitor(tree, type_map, tree.alias_deps, logical)
+        assert native is not None, "native walk deferred unexpectedly"
+        native_map = {k: set(v) for k, v in native.items()}
+        assert_equal(native_map, off, "native seam/Python mismatch")
+        self._set_active(True)
+        on = get_dependencies(tree, type_map, (3, 13), options)
+        assert_equal(on, off, "gate-off/gate-on mismatch")
+        return on
+
+    def _ref(self, name: str, fullname: str, kind: int = GDEF) -> NameExpr:
+        ref = NameExpr(name)
+        ref.fullname = fullname
+        ref.kind = kind
+        return ref
+
+    def test_import_shapes(self) -> None:
+        tree = self._tree(
+            [
+                Import([("os", None)]),
+                ImportFrom("collections", 0, [("defaultdict", None)]),
+                ImportAll("typing", 0),
+            ]
+        )
+        assert_equal(
+            self._maps(tree),
+            {
+                "<os>": {"main"},
+                "<collections>": {"main"},
+                "<collections.defaultdict>": {"main"},
+                "<typing[wildcard]>": {"main"},
+            },
+        )
+
+    def test_func_def_plain(self) -> None:
+        body_ref = self._ref("x", "main.x")
+        fdef = FuncDef("f", [], Block([ExpressionStmt(body_ref)]))
+        fdef._fullname = "main.f"
+        tree = self._tree([fdef])
+        assert_equal(self._maps(tree), {"<main.x>": {"main.f"}})
+
+    def test_func_def_typed(self) -> None:
+        from mypy.types import CallableType
+
+        c = CallableType(
+            [self.fx.a, self.fx.b],
+            [ARG_POS, ARG_POS],
+            [None, None],
+            self.fx.anyt,
+            self.fx.function,
+        )
+        fdef = FuncDef("f", [], Block([]), typ=c)
+        fdef._fullname = "main.f"
+        tree = self._tree([fdef])
+        assert_equal(
+            self._maps(tree),
+            {
+                "<A>": {"main.f", "<main.f>"},
+                "<B>": {"main.f", "<main.f>"},
+            },
+        )
+
+    def test_class_def(self) -> None:
+        info = self.fx.make_type_info("C", mro=[self.fx.ai, self.fx.oi])
+        var = Var("y")
+        var.is_initialized_in_class = True
+        var.info = info
+        info.names["y"] = SymbolTableNode(GDEF, var)
+        cdef = ClassDef("C", Block([]))
+        cdef.fullname = "C"
+        cdef.info = info
+        tree = self._tree([cdef])
+        assert_equal(
+            self._maps(tree),
+            {
+                "<C>": {"C"},
+                "<A>": {"C"},
+                "<C.y>": {"main"},
+                "<A.y>": {"<C.y>"},
+                "<A.__bool__>": {"<C.__bool__>"},
+                "<A.__init__>": {"<C.__init__>"},
+                "<A.__new__>": {"<C.__new__>"},
+                "<A.(abstract)>": {"<C.__init__>", "main"},
+            },
+        )
+
+    def test_decorator(self) -> None:
+        func = FuncDef("h", [], Block([]))
+        func._fullname = "main.h"
+        tree = self._tree([Decorator(func, [self._ref("dec", "main.dec")], Var("h"))])
+        assert_equal(self._maps(tree), {"<main.h>": {"main"}, "<main.dec>": {"main"}})
+
+    def test_decorator_logical(self) -> None:
+        func = FuncDef("h", [], Block([]))
+        func._fullname = "main.h"
+        tree = self._tree([Decorator(func, [self._ref("dec", "main.dec")], Var("h"))])
+        assert_equal(
+            self._maps(tree, logical=True), {"<main.dec>": {"main", "<main.h>"}}
+        )
+
+    def test_logical_assignment_tail(self) -> None:
+        callee = self._ref("f", "main.f")
+        call = CallExpr(callee, [], [], [])
+        lv = self._ref("x", "main.x")
+        lv.is_new_def = True
+        tree = self._tree([AssignmentStmt([lv], call)])
+        assert_equal(
+            self._maps(tree, logical=True),
+            {"<main.f>": {"main", "<main.x>"}, "<main.x>": {"main"}},
+        )
+
+    def test_operator_expr(self) -> None:
+        left = NameExpr("a")
+        right = NameExpr("b")
+        tree = self._tree([ExpressionStmt(OpExpr("+", left, right))])
+        assert_equal(
+            self._maps(tree, {left: self.fx.a, right: self.fx.a}),
+            {"<A.__add__>": {"main"}, "<A.__radd__>": {"main"}},
+        )
+
+    def test_member_expr(self) -> None:
+        base = NameExpr("o")
+        member = MemberExpr(base, "y")
+        tree = self._tree([ExpressionStmt(member)])
+        assert_equal(self._maps(tree, {base: self.fx.a}), {"<A.y>": {"main"}})
+
+    def test_for_stmt(self) -> None:
+        index = NameExpr("i")
+        expr = NameExpr("rng")
+        tree = self._tree([ForStmt(index, expr, Block([]), Block([]))])
+        assert_equal(
+            self._maps(tree, {expr: self.fx.a}),
+            {"<A.__iter__>": {"main"}, "<A.__getitem__>": {"main"}},
+        )
+
+    def test_with_and_del_stmt(self) -> None:
+        mgr = NameExpr("m")
+        tree = self._tree([WithStmt([mgr], [None], Block([]))])
+        assert_equal(
+            self._maps(tree, {mgr: self.fx.a}),
+            {"<A.__enter__>": {"main"}, "<A.__exit__>": {"main"}},
+        )
+        base = NameExpr("d")
+        tree2 = self._tree([DelStmt(IndexExpr(base, NameExpr("k")))])
+        assert_equal(
+            self._maps(tree2, {base: self.fx.a}),
+            {"<A.__getitem__>": {"main"}, "<A.__delitem__>": {"main"}},
+        )
+
+    def test_if_stmt_traversal(self) -> None:
+        from mypy.nodes import IfStmt
+
+        cond = self._ref("c", "main.c")
+        tree = self._tree(
+            [
+                IfStmt(
+                    [cond],
+                    [Block([ExpressionStmt(self._ref("t", "main.t"))])],
+                    Block([ExpressionStmt(self._ref("e", "main.e"))]),
+                )
+            ]
+        )
+        assert_equal(
+            self._maps(tree),
+            {"<main.c>": {"main"}, "<main.t>": {"main"}, "<main.e>": {"main"}},
+        )
+
+    def test_target_driver(self) -> None:
+        from type_kernel import rust_walk_dependency_target
+
+        from mypy.server.deps import get_dependencies_of_target
+
+        fdef = FuncDef("f", [], Block([ExpressionStmt(self._ref("x", "main.x"))]))
+        fdef._fullname = "main.f"
+        tree = self._tree([fdef])
+        for target in (tree, fdef):
+            self._set_active(False)
+            off = get_dependencies_of_target("main", tree, target, {}, (3, 13))
+            native = rust_walk_dependency_target("main", tree, target, {})
+            assert native is not None, "native target walk deferred"
+            assert_equal({k: set(v) for k, v in native.items()}, off)
+            self._set_active(True)
+            assert_equal(
+                get_dependencies_of_target("main", tree, target, {}, (3, 13)), off
+            )
+
+    def test_defer_unknown_node(self) -> None:
+        from type_kernel import rust_walk_dependency_visitor
+
+        class Mystery(Statement):
+            pass
+
+        tree = self._tree([Mystery()])
+        native = rust_walk_dependency_visitor(tree, {}, tree.alias_deps, False)
+        assert native is None, "unknown node kind must defer"

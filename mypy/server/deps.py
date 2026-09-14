@@ -95,6 +95,8 @@ try:
         rust_has_user_bases as _rust_has_user_bases,
         rust_merge_dependencies as _rust_merge_dependencies,
         rust_non_trivial_bases as _rust_non_trivial_bases,
+        rust_walk_dependency_target as _rust_walk_dependency_target,
+        rust_walk_dependency_visitor as _rust_walk_dependency_visitor,
     )
 
     _HAS_TYPE_KERNEL = True
@@ -106,6 +108,8 @@ except ImportError:
     _rust_merge_dependencies = None  # type: ignore[assignment]
     _rust_non_trivial_bases = None  # type: ignore[assignment]
     _rust_has_user_bases = None  # type: ignore[assignment]
+    _rust_walk_dependency_visitor = None  # type: ignore[assignment]
+    _rust_walk_dependency_target = None  # type: ignore[assignment]
     _HAS_TYPE_KERNEL = False
 
 # Module-level flag read by the gate below; set by the build manager from
@@ -287,6 +291,18 @@ def get_dependencies(
     options: Options,
 ) -> dict[str, set[str]]:
     """Get all dependencies of a node, recursively."""
+    # Issue #1632: native DependencyVisitor walk. The Rust entry reads live
+    # objects (no wire bytes) and returns None on any unhandled node, in
+    # which case the pure-Python visitor below re-runs.
+    if _HAS_TYPE_KERNEL and _native_server_deps_active:
+        try:
+            native = _rust_walk_dependency_visitor(
+                target, type_map, target.alias_deps, options.logical_deps
+            )
+        except Exception:
+            native = None
+        if native is not None:
+            return native
     visitor = DependencyVisitor(type_map, python_version, target.alias_deps, options)
     target.accept(visitor)
     return visitor.map
@@ -301,6 +317,15 @@ def get_dependencies_of_target(
 ) -> dict[str, set[str]]:
     """Get dependencies of a target -- don't recursive into nested targets."""
     # TODO: Add tests for this function.
+    # Issue #1632: native walk for the target driver (logical deps off, as
+    # the Python driver below constructs the visitor without options).
+    if _HAS_TYPE_KERNEL and _native_server_deps_active:
+        try:
+            native = _rust_walk_dependency_target(module_id, module_tree, target, type_map)
+        except Exception:
+            native = None
+        if native is not None:
+            return native
     visitor = DependencyVisitor(type_map, python_version, module_tree.alias_deps)
     with visitor.scope.module_scope(module_id):
         if isinstance(target, MypyFile):
