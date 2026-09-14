@@ -6711,3 +6711,56 @@ pub(crate) fn rust_is_overloaded_item<'py>(
     }
     Ok(Some(in_items || in_impl))
 }
+
+/// H1r: is_self_member_ref — mirrors SemanticAnalyzer.is_self_member_ref
+/// (semanal.py:6007). Pure isinstance + attribute check on live objects.
+/// Returns Some(bool) or None on unreadable attributes (defers to Python).
+#[pyfunction]
+pub(crate) fn rust_is_self_member_ref(
+    py: Python<'_>,
+    memberexpr: &PyAny,
+) -> PyResult<Option<bool>> {
+    let nodes_mod = match py.import("mypy.nodes") {
+        Ok(m) => m,
+        Err(_) => return Ok(None),
+    };
+    let nameexpr_cls: &PyType = match nodes_mod.getattr("NameExpr") {
+        Ok(c) => match c.downcast() {
+            Ok(t) => t,
+            Err(_) => return Ok(None),
+        },
+        Err(_) => return Ok(None),
+    };
+    let var_cls: &PyType = match nodes_mod.getattr("Var") {
+        Ok(c) => match c.downcast() {
+            Ok(t) => t,
+            Err(_) => return Ok(None),
+        },
+        Err(_) => return Ok(None),
+    };
+    let inner_expr = match memberexpr.getattr("expr") {
+        Ok(e) => e,
+        Err(_) => return Ok(None),
+    };
+    if !inner_expr.is_instance(nameexpr_cls)? {
+        return Ok(Some(false));
+    }
+    let node = match inner_expr.getattr("node") {
+        Ok(n) => n,
+        Err(_) => return Ok(None),
+    };
+    if node.is_none() {
+        return Ok(Some(false));
+    }
+    if !node.is_instance(var_cls)? {
+        return Ok(Some(false));
+    }
+    let is_self: bool = match node.getattr("is_self") {
+        Ok(v) => match v.extract() {
+            Ok(b) => b,
+            Err(_) => return Ok(None),
+        },
+        Err(_) => return Ok(None),
+    };
+    Ok(Some(is_self))
+}

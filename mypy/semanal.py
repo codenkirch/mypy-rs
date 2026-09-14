@@ -392,6 +392,7 @@ try:
         rust_make_any_non_unimported as _rust_make_any_non_unimported,
         rust_replace_implicit_first_type as _rust_replace_implicit_first_type,
         rust_is_overloaded_item as _rust_is_overloaded_item,
+        rust_is_self_member_ref as _rust_is_self_member_ref,
     )
 
     from mypy.types import read_type as _semanal_read_type
@@ -403,6 +404,7 @@ except ImportError:
     _rust_make_any_non_unimported = None  # type: ignore[assignment]
     _rust_replace_implicit_first_type = None  # type: ignore[assignment]
     _rust_is_overloaded_item = None  # type: ignore[assignment]
+    _rust_is_self_member_ref = None  # type: ignore[assignment]
     _SemanalWriteBuffer = None  # type: ignore[assignment,misc]
     _SemanalReadBuffer = None  # type: ignore[assignment,misc]
     _semanal_read_type = None  # type: ignore[assignment]
@@ -6019,6 +6021,17 @@ class SemanticAnalyzer(
 
     def is_self_member_ref(self, memberexpr: MemberExpr) -> bool:
         """Does memberexpr to refer to an attribute of self?"""
+        if (
+            _SEMANAL_HAS_KERNEL
+            and _native_semanal_active
+            and _rust_is_self_member_ref is not None
+        ):
+            try:
+                result = _rust_is_self_member_ref(memberexpr)
+            except (AssertionError, NotImplementedError, ValueError, TypeError):
+                result = None
+            if result is not None:
+                return result
         if not isinstance(memberexpr.expr, NameExpr):
             return False
         node = memberexpr.expr.node

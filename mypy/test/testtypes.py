@@ -61736,3 +61736,121 @@ class NativeIsOverloadedItemSuite(Suite):
     def test_parity_not_overloaded(self) -> None:
         f = self._make_func("f")
         self._assert_par(f, f)
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeIsSelfMemberRefSuite(Suite):
+    """Parity for `rust_is_self_member_ref` (H1r).
+
+    `SemanticAnalyzer.is_self_member_ref` (semanal.py:6007) is a pure
+    isinstance + attribute check: returns True when memberexpr.expr is a
+    NameExpr whose .node is a Var with is_self=True.
+    """
+
+    def setUp(self) -> None:
+        from mypy.semanal import _set_native_semanal_active
+
+        self._set_active = _set_native_semanal_active
+        self._set_active(True)
+        self.fx = TypeFixture()
+
+    def tearDown(self) -> None:
+        self._set_active(False)
+
+    def _with_gate(self, active: bool, fn: Callable[[], T]) -> T:
+        self._set_active(active)
+        try:
+            return fn()
+        finally:
+            self._set_active(True)
+
+    def _make_name_expr(self, name: str = "self") -> NameExpr:
+        return NameExpr(name)
+
+    def _make_self_var(self) -> Var:
+        var = Var("self")
+        var.is_self = True
+        return var
+
+    def _make_member_expr(self, expr: Expression, name: str = "attr") -> MemberExpr:
+        return MemberExpr(expr, name)
+
+    def _seam(self, memberexpr: MemberExpr) -> bool | None:
+        return _type_kernel.rust_is_self_member_ref(memberexpr)
+
+    def _run(self, memberexpr: MemberExpr) -> tuple[bool, bool]:
+        from mypy.semanal import SemanticAnalyzer
+
+        def check_one() -> bool:
+            sa = SemanticAnalyzer.__new__(SemanticAnalyzer)
+            return sa.is_self_member_ref(memberexpr)
+
+        off = self._with_gate(False, check_one)
+        on = self._with_gate(True, check_one)
+        return off, on
+
+    def _assert_par(self, memberexpr: MemberExpr) -> None:
+        off, on = self._run(memberexpr)
+        assert_equal(on, off, "is_self_member_ref parity")
+
+    def test_seam_self_var(self) -> None:
+        ne = self._make_name_expr("self")
+        ne.node = self._make_self_var()
+        me = self._make_member_expr(ne, "x")
+        assert self._seam(me) is True
+
+    def test_seam_non_self_var(self) -> None:
+        ne = self._make_name_expr("other")
+        v = Var("other")
+        v.is_self = False
+        ne.node = v
+        me = self._make_member_expr(ne, "x")
+        assert self._seam(me) is False
+
+    def test_seam_node_none(self) -> None:
+        ne = self._make_name_expr("self")
+        ne.node = None
+        me = self._make_member_expr(ne, "x")
+        assert self._seam(me) is False
+
+    def test_seam_node_not_var(self) -> None:
+        ne = self._make_name_expr("self")
+        ne.node = self.fx.oi  # TypeInfo, not Var
+        me = self._make_member_expr(ne, "x")
+        assert self._seam(me) is False
+
+    def test_seam_expr_not_nameexpr(self) -> None:
+        inner = MemberExpr(NameExpr("x"), "y")
+        me = self._make_member_expr(inner, "z")
+        assert self._seam(me) is False
+
+    def test_parity_self_var(self) -> None:
+        ne = self._make_name_expr("self")
+        ne.node = self._make_self_var()
+        me = self._make_member_expr(ne, "x")
+        self._assert_par(me)
+
+    def test_parity_non_self_var(self) -> None:
+        ne = self._make_name_expr("other")
+        v = Var("other")
+        v.is_self = False
+        ne.node = v
+        me = self._make_member_expr(ne, "x")
+        self._assert_par(me)
+
+    def test_parity_node_none(self) -> None:
+        ne = self._make_name_expr("self")
+        ne.node = None
+        me = self._make_member_expr(ne, "x")
+        self._assert_par(me)
+
+    def test_parity_expr_not_nameexpr(self) -> None:
+        inner = MemberExpr(NameExpr("x"), "y")
+        me = self._make_member_expr(inner, "z")
+        self._assert_par(me)
+
+    def test_parity_node_not_var(self) -> None:
+        ne = self._make_name_expr("self")
+        ne.node = self.fx.oi
+        me = self._make_member_expr(ne, "x")
+        self._assert_par(me)
