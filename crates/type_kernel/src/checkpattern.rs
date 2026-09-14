@@ -931,10 +931,10 @@ pub(crate) const CLS_KW_DUPLICATE: i64 = 3;
 /// `is_subtype(t, Iterable[Any])` is needed; any other non-tuple shape
 /// answers `OTHER` without consulting the resolver.
 #[pyfunction]
-#[pyo3(signature = (typ_bytes, star_pos, required_patterns, non_seq_bytes, sequence_bytes, iterable_bytes, resolver))]
+#[pyo3(signature = (type_bytes, star_pos, required_patterns, non_seq_bytes, sequence_bytes, iterable_bytes, resolver))]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn rust_classify_sequence_pattern_head(
-    typ_bytes: &[u8],
+    type_bytes: &[u8],
     star_pos: Option<i64>,
     required_patterns: i64,
     non_seq_bytes: &[u8],
@@ -948,7 +948,7 @@ pub(crate) fn rust_classify_sequence_pattern_head(
         None => None,
     };
     let required: usize = required_patterns.try_into().ok()?;
-    let t = decode_type(typ_bytes)?;
+    let t = decode_type(type_bytes)?;
     let non_seq = decode_type(non_seq_bytes)?;
     let sequence = decode_type(sequence_bytes)?;
     let iterable = decode_type(iterable_bytes)?;
@@ -1049,11 +1049,11 @@ pub(crate) fn rust_classify_sequence_tuple_result(
 /// own `get_proper_type` (checkpattern.py:574).
 #[pyfunction]
 pub(crate) fn rust_classify_mapping_rest(
-    typ_bytes: &[u8],
+    type_bytes: &[u8],
     mapping_bytes: &[u8],
     resolver: &mut NativeTypeResolver,
 ) -> Option<i64> {
-    let t = decode_type(typ_bytes)?;
+    let t = decode_type(type_bytes)?;
     let mapping = decode_type(mapping_bytes)?;
     let t = crate::checkexpr_functions::get_proper_or_expand(&t, resolver.alias_resolver())?;
     let ctx = SubtypeContext::new(false, false, false, false, false, true);

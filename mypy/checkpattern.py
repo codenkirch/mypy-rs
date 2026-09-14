@@ -349,12 +349,12 @@ class PatternChecker(PatternVisitor[PatternType]):
 
             resolver = _native_subtype_resolver
             if resolver is not None:
+                non_seq_union = UnionType.make_union(self.non_sequence_match_types)
+                sequence = self.chk.named_type("typing.Sequence")
+                iterable = self.chk.named_generic_type(
+                    "typing.Iterable", [AnyType(TypeOfAny.special_form)]
+                )
                 try:
-                    non_seq_union = UnionType.make_union(self.non_sequence_match_types)
-                    sequence = self.chk.named_type("typing.Sequence")
-                    iterable = self.chk.named_generic_type(
-                        "typing.Iterable", [AnyType(TypeOfAny.special_form)]
-                    )
                     tag = _type_kernel.rust_classify_sequence_pattern_head(
                         _serialize_type(current_type),
                         star_position,
