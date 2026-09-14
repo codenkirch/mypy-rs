@@ -6203,4 +6203,3 @@ pub(crate) fn rust_is_literal_enum(
         .is_true()?;
     Ok(Some(is_equal))
 }
-}

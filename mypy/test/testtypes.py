@@ -60529,7 +60529,6 @@ class NativeIsAssignableSlotSuite(Suite):
     gate-off vs gate-on differential drives the real TypeChecker method
     through a stub checker.
     """
-    """
 
     def setUp(self) -> None:
         from mypy.checker import _set_native_checker_active
