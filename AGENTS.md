@@ -4564,6 +4564,92 @@ including:
   skipped, testcheck 8144 passed/69 skipped/7 xfailed, cold self-check
   clean.
 
+- `visit_instance_nominal_live` + `map_supertype_live_non_generic`
+  (issue #1619, PR #1645): the resolver snapshot is fed per SCC after
+  semanal while the Python wire map publishes at module-top-level
+  completion, so semanal-time seams see `in_map=True, in_snap=False`
+  and defer. `LiveNominal` (subtypes.rs) reads the nominal prelude
+  from the live `TypeInfo` at decision time (nothing stored, so no
+  pre-inference variance pinning — the reason on-demand sealing was
+  rejected in #1490): `fallback_to_any && !proper` -> true; any MRO
+  base with a non-empty `_promote` -> defer; `alt_promote.type is
+  right.type` (identity) -> true; the nominal gate (`has_base` /
+  `builtins.object` / `TYPED_NAMEDTUPLE_NAMES`) with non-protocol miss
+  -> false and protocol right -> defer; a nominal branch with a
+  non-generic non-variadic right -> true (empty `type_params` zip).
+  The map seam takes Python's second fast path (maptype.py:206-208)
+  over the live supertype when it has no type vars. Covered by
+  `NativeSnapshotGapLiveNominalSuite` in `mypy/test/testtypes.py`
+  (10 tests). Measured (env-gated probe, stripped before landing):
+  snapshot-miss sites 45 -> 19 on the cold self-check; the four
+  PEP 695 variance tests green. Gates: cargo 2822/11, testtypes
+  3754/7, testcheck 8198/15/7 exact, fine-grained 747/27, daemon 38,
+  cold self-check clean.
+- `write_ffi_constraint` extras channel (issue #1618, PR #1646):
+  `Constraint.extra_tvars` (the polymorphic reverse-inference frame's
+  payload, constraints.py:1810-1812) now ride the Rust->Python FFI
+  blob as a trailing bare-int count plus that many `Type` records
+  (`origin | op | target | extras-count | extras`). The whole-call
+  extras guard is removed from `rust_infer_constraints_full`; the
+  three Rust->Python readers (`_try_native_constraint_builder`,
+  the callable-arguments seam, the directed-args filter seam) consume
+  the section via `_read_constraint_extras`, and `_restore_extra_tvars`
+  relinks decoded extras onto the live donor variables by id (the
+  #1171/#1215 identity precedent). The Python->Rust `_write_constraint`
+  stays 3-field by design (documented there): solve pre-merges extras
+  into `originals`, and any future extras-needing reader must grow the
+  section on both sides together. The dead `callable_with_vars_reachable`
+  (visitor.rs, consumer gone since wave 37) is deleted with its tests;
+  `run_any_constraints` preserves extras through
+  `constraint_to_rep`/`rep_to_constraint`; the stale "wire drops
+  ParamSpec/TVT meta_level" comments are corrected (carried since
+  #1417). **No `CACHE_VERSION` bump**: the section is in-process FFI
+  only; the persistent wire format is untouched (the issue's
+  extend-`CallableType` direction was stale — `extra_tvars` live on
+  `Constraint`, and the wire `CallableType` already carries
+  `variables`). Measured: `rust_infer_constraints_full`
+  22,184 calls / 56 defers -> 22,131 / 5; extras delivered natively on
+  42 constraints across 25 calls; the 95-call origin-rebuild
+  uniqueness boundary is kept (relaxing it mis-solves free ParamSpecs
+  to `Never`; #1621 owns that wall). Gates: cargo 2812/11, testtypes
+  3748/7, testcheck constraint/inference/overload subset 1043/7,
+  full parity green in CI, cold self-check clean (353 files).
+- `resync_var_identities_list` (issue #1623, PR #1644): `remove_trivial`
+  was the last expand-family seam with `_needs_python(meta_gate=True)`.
+  The decoded list is now re-linked onto the live input objects via a
+  list-shaped counterpart of `resync_var_identities` (#1215) using
+  `_VarIdentityCanonicalizer(seed=..., strict=True)`: an occurrence
+  with no structurally-equal live original (or same id / different
+  content) defers to the pure-Python body, so no doppelganger escapes
+  `freeze_all_type_vars`' in-place mutation or id-keyed substitution.
+  `_needs_python` drops the dead `meta_gate` kwarg; var-bearing results
+  stay out of `_expand_remove_trivial_cache` (only var-free results
+  cache); the now-unused `canonicalize_fresh_vars_reported_list` is
+  deleted. The issue's other items were audited stale before porting:
+  `remove_dups` already landed (wave-62C, 41/41 native, 0 defers),
+  `parent_error` is a permanent floor (B6 audit), and the `Name@line`
+  misses were alias-caused (wave-56 #1493). Covered by
+  `NativeRemoveTrivialFreshVarSuite` in `mypy/test/testtypes.py`
+  (engagement-proving spies, plus `instance_type` / `type_guard`
+  relink and cache-gate regressions). Measured: gate defers 459
+  (442 fresh-var) -> 17, native-ok 3,027 -> 3,467, strict-relink
+  defers 0 corpus-wide. Gates: cargo 2822/11, testtypes 3761/3,
+  full parity green in CI, cold self-check clean.
+- Phase-1 wire-traffic audit (issue #1624, docs PR #1643, no code):
+  `docs/plans/2026-09-14-perf-wire-traffic-audit.md` persists the
+  counts audit that exhausts the issue's fix direction 4: only 435 of
+  1,551,898 serialization events (0.028%) are serialized-then-deferred,
+  and the unconsumed bucket is identity-restoration keys (#1623), not
+  closeable gates; 8,307,304 seam calls decide 99.966% natively. Ranks
+  the top-15 hot seams by a calls x (0.63us fixed FFI + 0.04us/byte)
+  cost proxy (`rust_has_recursive_types`, `rust_callable_is_generic`,
+  `rust_check_argument_types_plan`, `rust_copy_modified`,
+  `rust_expand_type` lead) with fix shapes (live-object interface,
+  batching, per-SCC resolver incrementalism, Python-side gating).
+  Follow-ups filed: #1640 (types.py short-call seams), #1641
+  (dirty-driven per-SCC resolver update), #1642 (check_call cluster).
+  #1624 stays open as the standing perf blocker.
+
 ### Ledger backfill (2026-09-14)
 
 PRs `#1587`-`#1617` merged without appending their ledger records. The

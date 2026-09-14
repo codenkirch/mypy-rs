@@ -1,5 +1,102 @@
 # Handoff: strangler-fig Rust migration loop (seam-deferral reduction)
 
+## RESUME POINT — 2026-09-14, evening (stopped swarm finished, all work landed)
+
+The mid-flight swarm from the previous resume point was resumed with four
+parallel agents and finished the same day. All four workstreams landed as
+merged PRs; no work remains uncommitted anywhere. `AGENTS.md` ledger entries
+for the four landings are in the same docs PR as this section.
+
+### Where `main` stands
+
+`main` = `3f2b30293` (fix(expandtype) `remove_trivial` relink, PR `#1644`),
+on top of `8408236c1` (`#1643` perf-audit docs), `3189ff903` (`#1646`
+extras channel), `34204931f` (`#1645` live nominal), `501663e5c` (`#1638`
+Phase-2 ranking), `aa9a3e00a` (`#1639` prior handoff).
+
+Landed this session, in merge order:
+- `#1645` **live nominal fallback for snapshot-missing classes (#1619)**:
+  `LiveNominal` + `visit_instance_nominal_live` + the maptype
+  no-type-vars fast path over the live `TypeInfo` (subtypes.rs). Probe
+  45 -> 19 snapshot-miss sites; the four PEP 695 variance tests green
+  (the on-demand-sealing regression did not recur). Gates: cargo
+  2822/11, testtypes 3754/7, testcheck 8198/15/7 exact, fg 747/27,
+  daemon 38, self-check clean.
+- `#1646` **constraint `extra_tvars` channel (#1618)**: `extra_tvars`
+  ride the Rust->Python FFI blob (`origin | op | target | extras-count
+  | extras`); dead `callable_with_vars_reachable` deleted. 22,184 calls
+  / 56 defers -> 22,131 / 5; 42 extras delivered natively. **No
+  `CACHE_VERSION` bump** (in-process FFI only). Gates: cargo 2812/11,
+  testtypes 3748/7, full parity green in CI.
+- `#1643` **perf wire-traffic audit docs (#1624)**: persists
+  `docs/plans/2026-09-14-perf-wire-traffic-audit.md`. Fix direction 4
+  exhausted (0.028% serialized-then-deferred); top-15 hot-seam ranking
+  with fix shapes. Follow-ups filed: #1640, #1641, #1642. #1624 stays
+  OPEN as the standing perf blocker.
+- `#1644` **`remove_trivial` fresh-var relink (#1623)**: strict
+  `resync_var_identities_list`; `_needs_python` drops `meta_gate`;
+  issue items 1-3 audited stale (remove_dups landed, parent_error a
+  floor, Name@line alias-caused). Gate defers 459 -> 17, strict-relink
+  defers 0. Local OCR 0 findings. Gates: cargo 2822/11, testtypes
+  3761/3, full parity green in CI.
+
+Closed with evidence, no code: `#1249` (self-hosted runner). No owner
+PAT exists in this environment, so re-registration was impossible; the
+label path was retired by setting repo variable
+`ENABLE_AI_CODE_REVIEW` `true` -> `false` (2026-09-14, verified
+read-back). The `ocr-review` job now skips instead of queueing forever.
+OCR stays the reviewer of record, run manually per PR. Restore path
+(re-register with an owner PAT, flip the var back) is on the closed
+issue. The local ephemeral-manager will keep logging its 60s 403
+backoff until then; harmless.
+
+Filed and open: #1632-#1637 (Phase-2 slices, from #1638), #1640-#1642
+(perf follow-ups, from the #1624 audit), #1624 (standing blocker),
+#1626-#1629 (plugin/paramspec follow-ups, prior session).
+
+### Post-merge verification on `3f2b30293` (this session, fresh kernel)
+
+- Kernel rebuilt from the merged head into
+  `/private/tmp/mypy-rs-local-tk-final` (never shared across checkouts).
+- Cold self-check `mypy_self_check.ini -n0 --no-incremental -p mypy
+  -p mypyc`: `Success: no issues found in 353 source files`.
+- Targeted testtypes (constraints + snapshot-gap + remove_trivial +
+  freeze-identity + unify suites): 76 passed.
+- Shared `.venv` editable re-pointed at the main checkout (`uv sync`;
+  concurrent agents had re-pointed it at their worktrees mid-session —
+  always force-prefix the worktree on `PYTHONPATH` when agents run
+  concurrently, or avoid `uv run` entirely in favor of
+  `.venv/bin/python`).
+
+### Queue for the next wave
+
+1. #1640 (types.py short-call seams: `has_recursive_types`,
+   `callable_is_generic`, `copy_modified`) — the top of the hot-seam
+   ranking; live-object or batched interfaces.
+2. #1641 (dirty-driven per-SCC resolver update) — root cause (a),
+   ~1.9s resolver upkeep.
+3. #1618 follow-through: the 95-call origin-rebuild uniqueness
+   boundary is #1621's wall (free ParamSpecs solve to `Never` if
+   relaxed); #1621 slices #1628/#1629 are unblocked file-wise now
+   (`solve.rs` released).
+4. #1620 remaining: `definition` slot, `meta_level` on ParamSpec/TVT
+   ids, `PartialType`, `ErasedType`.
+5. Worktrees below are removed after their merges; `git worktree list`
+   should show only the main checkout. Per-issue scratch `.so` dirs
+   under `/private/tmp/mypy-rs-local-tk-*` may be deleted freely.
+
+### Unmerged branches — none. Worktrees removed this session
+
+`feature/mv-wire-extra-tvars`, `feature/mv-identity-contracts`,
+`perf/mv-wire-traffic`, `docs/handoff-2026-09-14` (branches deleted
+locally and on origin after their squash-merges); `worktrees/mypy-rs-
+1618`, `mypy-rs-wave87-identity`, `worktrees/mypy-rs-1624`,
+`worktrees/mypy-rs-handoff` removed. The two foreign stashes
+(`swarm/seam3-join-type-list`, `swarm/checkexpr-fastpaths`) belong to
+other workspaces and were left alone.
+
+---
+
 ## RESUME POINT — 2026-09-14 (mass-migration swarm, stopped mid-flight)
 
 Work was deliberately stopped on 2026-09-14. Five of six dispatched agents
