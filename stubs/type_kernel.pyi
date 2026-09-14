@@ -242,6 +242,7 @@ __all__ = [
     "rust_is_noop_for_reachability",
     "rust_classify_unbound_return_typevar",
     "rust_check_untyped_after_decorator",
+    "rust_check_incompatible_property_override",
     "rust_classify_comparison_operands",
     "rust_classify_type_check_raise",
     "rust_classify_type_range",
@@ -971,6 +972,7 @@ def rust_check_untyped_after_decorator(
     type_bytes: bytes,
     resolver: Any,
 ) -> bool | None: ...
+def rust_check_incompatible_property_override(e: Any) -> bool | None: ...
 def rust_classify_find_isinstance_head(
     callee: Any, args_len: int, literal_ok: bool
 ) -> int | None: ...

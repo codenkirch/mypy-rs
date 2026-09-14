@@ -61251,3 +61251,148 @@ class NativeCheckUntypedAfterDecoratorSuite(Suite):
             [any_unannotated], [ARG_POS], [None], any_unannotated, self.fx.function
         )
         self._assert_par(ct)
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeIncompatiblePropertyOverrideSuite(Suite):
+    """Parity for the Rust `check_incompatible_property_override` port (H1m).
+
+    `TypeChecker.check_incompatible_property_override` (checker.py:7800)
+    walks `e.func.info.mro[1:]` looking for a base with a settable
+    property of the same name that the read-only `e` overrides. The Rust
+    port (checker_functions.rs) reads the live Decorator via PyO3 and
+    returns Some(true) when the fail should fire, Some(false) otherwise,
+    None on an unreadable attribute.
+    """
+
+    def setUp(self) -> None:
+        from mypy.checker import _set_native_checker_active
+
+        self._set_active = _set_native_checker_active
+        self._set_active(True)
+        self.fx = TypeFixture()
+
+    def tearDown(self) -> None:
+        self._set_active(False)
+
+    def _with_gate(self, active: bool, fn: Callable[[], T]) -> T:
+        self._set_active(active)
+        try:
+            return fn()
+        finally:
+            self._set_active(True)
+
+    def _make_info(self, name: str, mro: list[TypeInfo] | None = None) -> TypeInfo:
+        return self.fx.make_type_info(name, mro=mro)
+
+    def _put_property(
+        self, info: TypeInfo, name: str, is_settable: bool
+    ) -> None:
+        v = Var(name)
+        v.is_property = True
+        v.is_settable_property = is_settable
+        dec = Decorator(FuncDef(name), [], v)
+        ofd = OverloadedFuncDef([dec])
+        ofd.is_property = True
+        info.names[name] = SymbolTableNode(MDEF, ofd)
+
+    def _decorator(
+        self, name: str, info: TypeInfo, is_settable: bool = False
+    ) -> Decorator:
+        v = Var(name)
+        v.is_property = True
+        v.is_settable_property = is_settable
+        fdef = FuncDef(name)
+        fdef.info = info
+        return Decorator(fdef, [], v)
+
+    def _seam(self, e: Decorator) -> Any:
+        return _type_kernel.rust_check_incompatible_property_override(e)
+
+    def _run(self, e: Decorator) -> tuple[list[str], list[str]]:
+        from mypy.checker import TypeChecker
+
+        def check_one() -> list[str]:
+            records: list[str] = []
+            chk = TypeChecker.__new__(TypeChecker)
+            chk.fail = lambda msg, _ctx, **_kw: records.append(str(msg))  # type: ignore[assignment]
+            chk.check_incompatible_property_override(e)
+            return records
+
+        off = self._with_gate(False, check_one)
+        on = self._with_gate(True, check_one)
+        return off, on
+
+    def _assert_par(self, e: Decorator) -> None:
+        off, on = self._run(e)
+        assert_equal(on, off, f"check_incompatible_property_override parity for e={e!r}")
+
+    def test_seam_readonly_overrides_settable(self) -> None:
+        base = self._make_info("Base", mro=[self.fx.oi])
+        self._put_property(base, "prop", is_settable=True)
+        sub = self._make_info("Sub", mro=[base, self.fx.oi])
+        e = self._decorator("prop", sub, is_settable=False)
+        assert self._seam(e) is True
+
+    def test_seam_settable_overrides_settable(self) -> None:
+        base = self._make_info("Base", mro=[self.fx.oi])
+        self._put_property(base, "prop", is_settable=True)
+        sub = self._make_info("Sub", mro=[base, self.fx.oi])
+        e = self._decorator("prop", sub, is_settable=True)
+        assert self._seam(e) is False
+
+    def test_seam_no_base_property(self) -> None:
+        base = self._make_info("Base", mro=[self.fx.oi])
+        sub = self._make_info("Sub", mro=[base, self.fx.oi])
+        e = self._decorator("prop", sub, is_settable=False)
+        assert self._seam(e) is False
+
+    def test_seam_base_property_not_settable(self) -> None:
+        base = self._make_info("Base", mro=[self.fx.oi])
+        self._put_property(base, "prop", is_settable=False)
+        sub = self._make_info("Sub", mro=[base, self.fx.oi])
+        e = self._decorator("prop", sub, is_settable=False)
+        assert self._seam(e) is False
+
+    def test_seam_no_info(self) -> None:
+        fdef = FuncDef("prop")
+        v = Var("prop")
+        v.is_property = True
+        v.is_settable_property = False
+        e = Decorator(fdef, [], v)
+        assert self._seam(e) is False
+
+    def test_seam_base_not_property(self) -> None:
+        base = self._make_info("Base", mro=[self.fx.oi])
+        v = Var("prop")
+        base.names["prop"] = SymbolTableNode(MDEF, v)
+        sub = self._make_info("Sub", mro=[base, self.fx.oi])
+        e = self._decorator("prop", sub, is_settable=False)
+        assert self._seam(e) is False
+
+    def test_parity_readonly_overrides_settable(self) -> None:
+        base = self._make_info("Base", mro=[self.fx.oi])
+        self._put_property(base, "prop", is_settable=True)
+        sub = self._make_info("Sub", mro=[base, self.fx.oi])
+        e = self._decorator("prop", sub, is_settable=False)
+        self._assert_par(e)
+
+    def test_parity_settable_overrides_settable(self) -> None:
+        base = self._make_info("Base", mro=[self.fx.oi])
+        self._put_property(base, "prop", is_settable=True)
+        sub = self._make_info("Sub", mro=[base, self.fx.oi])
+        e = self._decorator("prop", sub, is_settable=True)
+        self._assert_par(e)
+
+    def test_parity_no_base_property(self) -> None:
+        base = self._make_info("Base", mro=[self.fx.oi])
+        sub = self._make_info("Sub", mro=[base, self.fx.oi])
+        e = self._decorator("prop", sub, is_settable=False)
+        self._assert_par(e)
+
+    def test_parity_base_property_not_settable(self) -> None:
+        base = self._make_info("Base", mro=[self.fx.oi])
+        self._put_property(base, "prop", is_settable=False)
+        sub = self._make_info("Sub", mro=[base, self.fx.oi])
+        e = self._decorator("prop", sub, is_settable=False)
+        self._assert_par(e)

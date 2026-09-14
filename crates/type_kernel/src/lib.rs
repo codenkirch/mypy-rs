@@ -3306,6 +3306,13 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         module
     )?)?;
 
+    // H1m: check_incompatible_property_override live-PyO3 seam. Rust
+    // walks the MRO for a read-only property overriding a settable one.
+    module.add_function(wrap_pyfunction!(
+        checker_functions::rust_check_incompatible_property_override,
+        module
+    )?)?;
+
     // Issue #1050: type_check_raise decision-head port. Rust classifies
     // the deleted / not-implemented arbitration into a branch tag; the
     // fail emissions and the check_call recursion stay in Python.

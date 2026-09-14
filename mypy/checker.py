@@ -412,6 +412,7 @@ try:
         rust_is_literal_enum as _rust_is_literal_enum,
         rust_classify_unbound_return_typevar as _rust_classify_unbound_return_typevar,
         rust_check_untyped_after_decorator as _rust_check_untyped_after_decorator,
+        rust_check_incompatible_property_override as _rust_check_incompatible_property_override,
         rust_narrow_type_by_identity_equality as _rust_narrow_type_by_identity_equality,
         rust_narrow_with_len as _rust_narrow_with_len,
         rust_or_conditional_maps as _rust_or_conditional_maps,
@@ -489,6 +490,7 @@ except ImportError:
     _rust_is_literal_enum = None  # type: ignore[assignment]
     _rust_classify_unbound_return_typevar = None  # type: ignore[assignment]
     _rust_check_untyped_after_decorator = None  # type: ignore[assignment]
+    _rust_check_incompatible_property_override = None  # type: ignore[assignment]
     _rust_is_more_general_arg_prefix = None  # type: ignore[assignment]
     _rust_overload_can_never_match = None  # type: ignore[assignment]
     _rust_is_equality_ambiguous_for_narrowing = None  # type: ignore[assignment]
@@ -7828,6 +7830,20 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
             self.msg.typed_function_untyped_decorator(func.name, dec_expr)
 
     def check_incompatible_property_override(self, e: Decorator) -> None:
+        # Native type_kernel seam: MRO walk in Rust; fail stays here.
+        if (
+            _CHECKER_HAS_TYPE_KERNEL
+            and _native_checker_active
+            and _rust_check_incompatible_property_override is not None
+        ):
+            try:
+                result = _rust_check_incompatible_property_override(e)
+                if result is not None:
+                    if result:
+                        self.fail(message_registry.READ_ONLY_PROPERTY_OVERRIDES_READ_WRITE, e)
+                    return
+            except (AssertionError, NotImplementedError, ValueError, TypeError):
+                pass
         if not e.var.is_settable_property and e.func.info:
             name = e.func.name
             for base in e.func.info.mro[1:]:

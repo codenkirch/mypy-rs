@@ -6457,3 +6457,93 @@ fn visit_children_for_tvar<'a>(typ: &'a Type, ids: &mut Vec<(i64, i64, &'a str)>
         _ => {}
     }
 }
+
+/// `TypeChecker.check_incompatible_property_override` (checker.py:7800-7812):
+/// walks `e.func.info.mro[1:]` looking for a base with a settable property
+/// of the same name that the read-only `e` overrides. Returns `Some(true)`
+/// when the READ_ONLY_PROPERTY_OVERRIDES_READ_WRITE fail should fire,
+/// `Some(false)` when the walk completes without a violation, `None` on
+/// an unreadable attribute (defer to the pure-Python body).
+#[pyfunction]
+pub(crate) fn rust_check_incompatible_property_override(
+    py: Python<'_>,
+    e: &PyAny,
+) -> PyResult<Option<bool>> {
+    let var = e.getattr("var")?;
+    let is_settable = var.getattr("is_settable_property").ok();
+    if is_settable
+        .map(|v| v.extract::<bool>().unwrap_or(false))
+        .unwrap_or(false)
+    {
+        return Ok(Some(false));
+    }
+    let func = e.getattr("func")?;
+    let info = match func.getattr("info") {
+        Ok(i) if i.is_true().unwrap_or(false) => i,
+        _ => return Ok(Some(false)),
+    };
+    let name: String = func.getattr("name")?.extract()?;
+    let mro = match info.getattr("mro") {
+        Ok(m) => m,
+        Err(_) => return Ok(None),
+    };
+    let nodes_mod = py.import("mypy.nodes")?;
+    let ofd_cls = nodes_mod
+        .getattr("OverloadedFuncDef")?
+        .downcast::<PyType>()?;
+    let mro_len = mro.len().unwrap_or(0);
+    for i in 1..mro_len {
+        let base = match mro.get_item(i) {
+            Ok(b) => b,
+            Err(_) => return Ok(None),
+        };
+        let names = match base.getattr("names") {
+            Ok(n) => n,
+            Err(_) => return Ok(None),
+        };
+        let sym = match names.call_method1("get", (&name,)) {
+            Ok(s) => s,
+            Err(_) => return Ok(None),
+        };
+        if sym.is_none() {
+            continue;
+        }
+        let node = match sym.getattr("node") {
+            Ok(n) => n,
+            Err(_) => return Ok(None),
+        };
+        if node.is_none() {
+            continue;
+        }
+        if !node.is_instance(ofd_cls)? {
+            continue;
+        }
+        let is_property = match node.getattr("is_property") {
+            Ok(v) => v.extract::<bool>().unwrap_or(false),
+            Err(_) => return Ok(None),
+        };
+        if !is_property {
+            continue;
+        }
+        let items = match node.getattr("items") {
+            Ok(it) => it,
+            Err(_) => return Ok(None),
+        };
+        let first = match items.get_item(0) {
+            Ok(f) => f,
+            Err(_) => return Ok(None),
+        };
+        let first_var = match first.getattr("var") {
+            Ok(v) => v,
+            Err(_) => return Ok(None),
+        };
+        let first_settable = match first_var.getattr("is_settable_property") {
+            Ok(v) => v.extract::<bool>().unwrap_or(false),
+            Err(_) => return Ok(None),
+        };
+        if first_settable {
+            return Ok(Some(true));
+        }
+    }
+    Ok(Some(false))
+}
