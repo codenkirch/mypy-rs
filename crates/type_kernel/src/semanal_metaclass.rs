@@ -156,11 +156,8 @@ pub(crate) fn rust_classify_declared_metaclass(
             Some(t) => {
                 let types_mod = py.import("mypy.types")?;
                 let any_cls: &PyType = types_mod.getattr("AnyType")?.downcast()?;
-                match t.is_instance(any_cls) {
-                    Ok(b) => Some(b),
-                    Err(_) => None,
-                }
-            },
+                t.is_instance(any_cls).ok()
+            }
         }
     } else {
         Some(false)

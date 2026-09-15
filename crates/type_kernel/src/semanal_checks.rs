@@ -574,10 +574,7 @@ pub(crate) fn rust_classify_method_signature(
                 Ok(c) => c,
                 Err(_) => return None,
             };
-            match t.is_instance(any_cls) {
-                Ok(b) => Some(b),
-                Err(_) => None,
-            }
+            t.is_instance(any_cls).ok()
         }
         None => None,
     };
