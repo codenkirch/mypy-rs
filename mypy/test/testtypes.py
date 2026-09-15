@@ -52,6 +52,7 @@ from mypy.nodes import (
     CastExpr,
     ClassDef,
     ComparisonExpr,
+    ConditionalExpr,
     Context,
     Decorator,
     DelStmt,
@@ -78,6 +79,7 @@ from mypy.nodes import (
     PassStmt,
     PlaceholderNode,
     RaiseStmt,
+    RefExpr,
     ReturnStmt,
     RevealExpr,
     SetExpr,
@@ -63498,7 +63500,6 @@ class NativeResolverSigSuite(Suite):
 
     def test_add_type_promotion_changes_sig(self) -> None:
         import mypy.semanal_classprop as sc
-
         from mypy.build import _native_builtins_sig
 
         int_info = self._int_info()
@@ -63753,3 +63754,176 @@ class NativeServerDepsWalkSuite(Suite):
         tree = self._tree([Mystery()])
         native = rust_walk_dependency_visitor(tree, {}, tree.alias_deps, False)
         assert native is None, "unknown node kind must defer"
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeSubexprAststripSuite(Suite):
+    """Parity tests for `rust_get_subexpressions` and `rust_strip_ref_expr`
+    (issue #1635).
+
+    `rust_get_subexpressions` walks a live AST tree (zero wire bytes) and
+    collects every expression node in pre-order, mirroring
+    `SubexpressionFinder`. `rust_strip_ref_expr` resets the five RefExpr
+    fields on a live NameExpr/MemberExpr.
+
+    Tests build small hand-made ASTs, run both the Python and native
+    paths, and assert the results match by identity (same objects).
+    """
+
+    def setUp(self) -> None:
+        from mypy.server.aststrip import _set_native_active as _set_aststrip_active
+        from mypy.server.subexpr import _set_native_active
+
+        self._set_subexpr = _set_native_active
+        self._set_aststrip = _set_aststrip_active
+
+    def _tree(self, defs: list[Statement]) -> MypyFile:
+        tree = MypyFile([], [])
+        tree._fullname = "main"
+        tree.names = SymbolTable()
+        tree.path = ""
+        tree.defs = defs
+        return tree
+
+    # -- get_subexpressions parity --
+
+    def _subexpr_parity(self, tree: MypyFile) -> None:
+        from mypy.server.subexpr import get_subexpressions
+
+        self._set_subexpr(False)
+        off = get_subexpressions(tree)
+        self._set_subexpr(True)
+        on = get_subexpressions(tree)
+        assert len(on) == len(off), f"len mismatch: {len(on)} vs {len(off)}"
+        for i, (a, b) in enumerate(zip(on, off)):
+            assert a is b, f"identity mismatch at {i}: {a} vs {b}"
+
+    def test_simple_name_expr(self) -> None:
+        tree = self._tree([ExpressionStmt(NameExpr("x"))])
+        self._subexpr_parity(tree)
+
+    def test_nested_expressions(self) -> None:
+        # x + y[0]
+        idx = IndexExpr(NameExpr("y"), IntExpr(0))
+        op = OpExpr("+", NameExpr("x"), idx)
+        tree = self._tree([ExpressionStmt(op)])
+        self._subexpr_parity(tree)
+
+    def test_call_expr(self) -> None:
+        # f(a, b.c)
+        call = CallExpr(
+            NameExpr("f"),
+            [NameExpr("a"), MemberExpr(NameExpr("b"), "c")],
+            [ARG_POS, ARG_POS],
+            [None, None],
+        )
+        tree = self._tree([ExpressionStmt(call)])
+        self._subexpr_parity(tree)
+
+    def test_func_def_body(self) -> None:
+        # def f(): return x + 1
+        body = ReturnStmt(OpExpr("+", NameExpr("x"), IntExpr(1)))
+        fdef = FuncDef("f", [], Block([body]))
+        fdef._fullname = "main.f"
+        tree = self._tree([fdef])
+        self._subexpr_parity(tree)
+
+    def test_assignment_stmt(self) -> None:
+        # x = [1, 2]
+        assign = AssignmentStmt([NameExpr("x")], ListExpr([IntExpr(1), IntExpr(2)]))
+        tree = self._tree([assign])
+        self._subexpr_parity(tree)
+
+    def test_conditional_expr(self) -> None:
+        # x if y else z
+        cond = ConditionalExpr(NameExpr("y"), NameExpr("x"), NameExpr("z"))
+        tree = self._tree([ExpressionStmt(cond)])
+        self._subexpr_parity(tree)
+
+    def test_empty_tree(self) -> None:
+        tree = self._tree([])
+        self._subexpr_parity(tree)
+
+    # -- strip_ref_expr parity --
+
+    def _strip_name(self) -> NameExpr:
+        n = NameExpr("foo")
+        n.fullname = "main.foo"
+        n.kind = GDEF
+        n.node = Var("foo")
+        n.is_new_def = True
+        n.is_inferred_def = True
+        return n
+
+    def _strip_member(self) -> MemberExpr:
+        m = MemberExpr(NameExpr("obj"), "attr")
+        m.fullname = "main.obj.attr"
+        m.kind = GDEF
+        m.node = Var("attr")
+        m.is_new_def = True
+        m.is_inferred_def = True
+        return m
+
+    def _assert_stripped(self, node: RefExpr) -> None:
+        assert node.kind is None, f"kind not None: {node.kind}"
+        assert node.node is None, f"node not None: {node.node}"
+        assert node.fullname == "", f"fullname not empty: {node.fullname}"
+        assert node.is_new_def is False, f"is_new_def not False: {node.is_new_def}"
+        assert node.is_inferred_def is False, f"is_inferred_def not False: {node.is_inferred_def}"
+
+    def test_strip_name_expr_native(self) -> None:
+        from type_kernel import rust_strip_ref_expr
+
+        n = self._strip_name()
+        result = rust_strip_ref_expr(n)
+        assert result is True, "native strip should succeed"
+        self._assert_stripped(n)
+
+    def test_strip_member_expr_native(self) -> None:
+        from type_kernel import rust_strip_ref_expr
+
+        m = self._strip_member()
+        result = rust_strip_ref_expr(m)
+        assert result is True, "native strip should succeed"
+        self._assert_stripped(m)
+
+    def test_strip_non_refexpr_defers(self) -> None:
+        from type_kernel import rust_strip_ref_expr
+
+        # IntExpr is not a RefExpr — should defer (None)
+        result = rust_strip_ref_expr(IntExpr(42))
+        assert result is None, "non-RefExpr should defer"
+
+    def test_strip_gate_off_vs_on_name(self) -> None:
+        from mypy.server.aststrip import NodeStripVisitor
+
+        # Gate off: Python body runs
+        n_off = self._strip_name()
+        self._set_aststrip(False)
+        visitor = NodeStripVisitor()
+        visitor.strip_ref_expr(n_off)
+        self._assert_stripped(n_off)
+
+        # Gate on: Rust seam runs
+        n_on = self._strip_name()
+        self._set_aststrip(True)
+        visitor = NodeStripVisitor()
+        visitor.strip_ref_expr(n_on)
+        self._assert_stripped(n_on)
+        self._set_aststrip(False)
+
+    def test_strip_gate_off_vs_on_member(self) -> None:
+        from mypy.server.aststrip import NodeStripVisitor
+
+        m_off = self._strip_member()
+        self._set_aststrip(False)
+        visitor = NodeStripVisitor()
+        visitor.strip_ref_expr(m_off)
+        self._assert_stripped(m_off)
+
+        m_on = self._strip_member()
+        self._set_aststrip(True)
+        visitor = NodeStripVisitor()
+        visitor.strip_ref_expr(m_on)
+        self._assert_stripped(m_on)
+        self._set_aststrip(False)

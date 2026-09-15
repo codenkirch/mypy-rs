@@ -36,8 +36,28 @@ from mypy.nodes import (
 )
 from mypy.traverser import TraverserVisitor
 
+# Issue #1635: native subexpr walk behind the server-deps gate.
+try:
+    from type_kernel import rust_get_subexpressions as _rust_get_subexpressions
+
+    _HAS_TYPE_KERNEL = True
+except ImportError:
+    _rust_get_subexpressions = None  # type: ignore[assignment]
+    _HAS_TYPE_KERNEL = False
+
+_native_active: bool = False
+
+
+def _set_native_active(active: bool) -> None:
+    global _native_active
+    _native_active = active
+
 
 def get_subexpressions(node: Node) -> list[Expression]:
+    if _HAS_TYPE_KERNEL and _native_active:
+        result = _rust_get_subexpressions(node)
+        if result is not None:
+            return result
     visitor = SubexpressionFinder()
     node.accept(visitor)
     return visitor.expressions

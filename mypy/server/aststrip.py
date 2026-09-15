@@ -68,6 +68,22 @@ from mypy.traverser import TraverserVisitor
 from mypy.types import CallableType
 from mypy.typestate import type_state
 
+# Issue #1635: native strip_ref_expr behind the server-deps gate.
+try:
+    from type_kernel import rust_strip_ref_expr as _rust_strip_ref_expr
+
+    _HAS_TYPE_KERNEL = True
+except ImportError:
+    _rust_strip_ref_expr = None  # type: ignore[assignment]
+    _HAS_TYPE_KERNEL = False
+
+_native_active: bool = False
+
+
+def _set_native_active(active: bool) -> None:
+    global _native_active
+    _native_active = active
+
 
 def strip_target(node: MypyFile | FuncDef | OverloadedFuncDef) -> None:
     """Reset a fine-grained incremental target to state before semantic analysis.
@@ -209,6 +225,10 @@ class NodeStripVisitor(TraverserVisitor, SplittingVisitor):
         super().visit_op_expr(node)
 
     def strip_ref_expr(self, node: RefExpr) -> None:
+        if _HAS_TYPE_KERNEL and _native_active:
+            result = _rust_strip_ref_expr(node)
+            if result is not None:
+                return
         node.kind = None
         node.node = None
         node.fullname = ""

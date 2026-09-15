@@ -1338,6 +1338,14 @@ class BuildManager:
         from mypy.server.deps import _set_native_server_deps_active
 
         _set_native_server_deps_active(self.options.native_type_kernel)
+        # Issue #1635: gate the native subexpr walk (same server-deps family).
+        from mypy.server.subexpr import _set_native_active as _set_native_subexpr_active
+
+        _set_native_subexpr_active(self.options.native_type_kernel)
+        # Issue #1635: gate the native aststrip helper (same server-deps family).
+        from mypy.server.aststrip import _set_native_active as _set_native_aststrip_active
+
+        _set_native_aststrip_active(self.options.native_type_kernel)
         # Issue #388: gate pure server update helpers (dedupe_modules,
         # get_module_to_path_map, get_sources, message extraction/sorting).
         from mypy.server.update import _set_native_update_active
