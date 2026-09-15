@@ -4779,9 +4779,19 @@ measurements are appended below as the coordinator reports each landing.
 - `#1679` (`a0f6150a7`, PR #1684) — docs tier. Evidence-artifact convention
   (`docs/plans/wave<N>-evidence/<lane>.json`) plus the wave-5 measurements it
   seeds: local testcheck 8,144 against CI `parity` 8,198 on the same commit
-  (the spread is platform skips), one local `ocr review` pass 9m37s / ~761k
-  tokens, one release kernel build 1m14s at load 86 (provisional; load
-  recorded, `uptime` not).
+  (the spread is platform skips), one release kernel build 1m14s at load 86
+  (provisional; load recorded, `uptime` not), and one local `ocr review`
+  sample at 9m37s / ~761k tokens for 3 files. **That OCR figure is a floor,
+  not a bound**, and the range supersedes it: a second pass (5 files, branch
+  `feature/h1d-checker-decision-heads`) cost ~2.4M tokens (input ~2,370,798,
+  output ~67,778, cache-read ~2,120,448) in 6m56s for 3 `low` findings.
+  Roughly 3x the tokens for under 2x the files, so the wave-level batched
+  pass must be budgeted from the top of the range. The same pass logged three
+  internal `file_read failed: invalid line range` errors (e.g.
+  `start_line 1190 is greater than end_line 560`) before reporting its
+  findings, so an OCR pass can review with its own reads failing and still
+  emit confident findings: treat findings as leads to verify against the
+  code, not as authoritative.
   **Part of that file is falsified.** Its `rust_refers_to_different_scope`
   row records 0 calls and calls the seam a retirement candidate. Lane A4's
   re-run against its own worktree source shows the seam live: suite-level

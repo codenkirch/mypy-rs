@@ -156,7 +156,14 @@ honours the legacy lock for a transition period.
 
 Review: T1/T2 use `ocr delegate preview|rule` plus an independent reader (never
 the author alone, since self-review is not review); T3 and the wave diff use
-`ocr review` (measured 9m37s / 761k tokens per pass, so it is a wave cost).
+`ocr review`. Cost is a wave cost, and the two measured passes span a range:
+3 files at 9m37s / ~760k tokens, and 5 files at 6m56s / ~2.4M tokens, so a
+single early sample understates a batched pass: roughly 3x the tokens for
+under 2x the files. Treat OCR findings as leads to verify against the code,
+not as authoritative statements: the 5-file pass above logged three internal
+`file_read failed: invalid line range` errors before emitting confident
+findings. Prefer `ocr delegate preview|rule` when the rule set is what is
+wanted rather than a verdict.
 
 ### Native resolver / dependency-records parity
 
