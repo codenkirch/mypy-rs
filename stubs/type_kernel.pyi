@@ -262,6 +262,8 @@ __all__ = [
     "rust_classify_lvalue_validity",
     "rust_classify_fixed_args",
     "rust_classify_find_isinstance_head",
+    "rust_classify_match_subject_head",
+    "rust_classify_range_int_gate",
     "rust_conditional_types",
     "rust_is_true_literal",
     "rust_is_false_literal",
@@ -996,6 +998,10 @@ def rust_check_incompatible_property_override(e: Any) -> bool | None: ...
 def rust_classify_find_isinstance_head(
     callee: Any, args_len: int, literal_ok: bool
 ) -> int | None: ...
+def rust_classify_match_subject_head(
+    subject: Any, subject_dummy_is_none: bool
+) -> int | None: ...
+def rust_classify_range_int_gate(expr: Any) -> int | None: ...
 def rust_classify_comparison_operands(
     literal_kinds: list[int],
     operand_flags: list[tuple[bool, bool, bool, bool, bool]],

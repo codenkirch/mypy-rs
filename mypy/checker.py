@@ -353,9 +353,11 @@ try:
         rust_classify_find_isinstance_head as _rust_classify_find_isinstance_head,
         rust_classify_func_def_override as _rust_classify_func_def_override,
         rust_classify_getattr_method as _rust_classify_getattr_method,
+        rust_classify_match_subject_head as _rust_classify_match_subject_head,
         rust_classify_metaclass_compat as _rust_classify_metaclass_compat,
         rust_classify_missing_annotations as _rust_classify_missing_annotations,
         rust_classify_new_signature as _rust_classify_new_signature,
+        rust_classify_range_int_gate as _rust_classify_range_int_gate,
         rust_classify_return_stmt_post as _rust_classify_return_stmt_post,
         rust_classify_return_stmt_pre as _rust_classify_return_stmt_pre,
         rust_classify_return_stmt_variant as _rust_classify_return_stmt_variant,
@@ -468,6 +470,8 @@ except ImportError:
     _rust_classify_missing_annotations = None  # type: ignore[assignment]
     _rust_classify_getattr_method = None  # type: ignore[assignment]
     _rust_classify_find_isinstance_head = None  # type: ignore[assignment]
+    _rust_classify_match_subject_head = None  # type: ignore[assignment]
+    _rust_classify_range_int_gate = None  # type: ignore[assignment]
     _rust_classify_enum_new = None  # type: ignore[assignment]
     _rust_classify_enum_bases = None  # type: ignore[assignment]
     _rust_classify_enum = None  # type: ignore[assignment]
@@ -7634,6 +7638,27 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
 
         Return None if unsuccessful.
         """
+        if _CHECKER_HAS_TYPE_KERNEL and _native_checker_active and _rust_classify_range_int_gate is not None:
+            try:
+                result = _rust_classify_range_int_gate(expr)
+            except (AssertionError, NotImplementedError):
+                result = None
+            if result is not None:
+                if result == 0:
+                    return None
+                assert isinstance(expr, CallExpr)
+                nat_int: Type | None = None
+                ok = True
+                for arg in expr.args:
+                    argt = get_proper_type(self.lookup_type(arg))
+                    if isinstance(argt, Instance) and argt.type.fullname in MYPYC_NATIVE_INT_NAMES:
+                        if nat_int is None:
+                            nat_int = argt
+                        elif argt != nat_int:
+                            ok = False
+                if ok and nat_int:
+                    return nat_int
+                return None
         if (
             isinstance(expr, CallExpr)
             and isinstance(expr.callee, RefExpr)
@@ -8071,6 +8096,25 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
 
     def _make_named_statement_for_match(self, s: MatchStmt, subject: Expression) -> Expression:
         """Construct a fake NameExpr for inference if a match clause is complex."""
+        if _CHECKER_HAS_TYPE_KERNEL and _native_checker_active and _rust_classify_match_subject_head is not None:
+            try:
+                tag = _rust_classify_match_subject_head(subject, s.subject_dummy is None)
+            except (AssertionError, NotImplementedError):
+                pass
+            else:
+                if tag is not None:
+                    if tag == 0:
+                        return subject
+                    elif tag == 1:
+                        assert s.subject_dummy is not None
+                        return s.subject_dummy
+                    else:
+                        name = self.new_unique_dummy_name("match")
+                        v = Var(name)
+                        named_subject = NameExpr(name)
+                        named_subject.node = v
+                        s.subject_dummy = named_subject
+                        return named_subject
         if self.binder.can_put_directly(subject):
             # Already named - we should infer type of it as given
             return subject

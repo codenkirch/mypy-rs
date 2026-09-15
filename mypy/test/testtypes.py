@@ -63929,3 +63929,336 @@ class NativeSubexprAststripSuite(Suite):
         visitor.strip_ref_expr(m_on)
         self._assert_stripped(m_on)
         self._set_aststrip(False)
+
+
+class NativeStmtDriverSuite(Suite):
+    """Parity for `rust_classify_range_int_gate` and
+    `rust_classify_match_subject_head` (issue #1634).
+
+    Two statement-driver decision heads ported as live-PyO3-object
+    classifiers (zero wire bytes):
+
+    * `rust_classify_range_int_gate` mirrors the 5-part entry gate of
+      `TypeChecker.analyze_range_native_int_type` (checker.py:7639-7644):
+      CallExpr + RefExpr callee + fullname == "builtins.range" + 1-3
+      args + all ARG_POS. Returns 1 if gate passes, 0 if fails, None
+      on unreadable attribute.
+
+    * `rust_classify_match_subject_head` mirrors the 3-way head of
+      `TypeChecker._make_named_statement_for_match` (checker.py:8097-8111):
+      `can_put_directly(subject)` (isinstance + `literal() > LITERAL_NO`)
+      then `subject_dummy is not None` then create-dummy. Returns 0 =
+      DIRECT, 1 = HAS_DUMMY, 2 = MAKE_DUMMY, None = defer.
+
+    Direct seam calls assert the expected tag; gate-off vs gate-on
+    differentials drive the real TypeChecker methods and must agree.
+    """
+
+    def setUp(self) -> None:
+        from mypy.checker import _set_native_checker_active
+
+        self.fx = TypeFixture()
+        self._set_active = _set_native_checker_active
+        self._set_active(True)
+
+    def tearDown(self) -> None:
+        self._set_active(False)
+
+    def _with_gate(self, active: bool, fn: Callable[[], T]) -> T:
+        self._set_active(active)
+        try:
+            return fn()
+        finally:
+            self._set_active(True)
+
+    # ------------------------------------------------------------------
+    # range-int-gate direct seam
+    # ------------------------------------------------------------------
+
+    def _seam_range(self, expr: Any) -> Any:
+        return _type_kernel.rust_classify_range_int_gate(expr)
+
+    def _call_expr(
+        self, fullname: str | None, args: list[Any], kinds: list[Any] | None = None
+    ) -> Any:
+        from mypy.nodes import ARG_POS, CallExpr, RefExpr
+
+        callee = RefExpr()
+        if fullname is not None:
+            callee.fullname = fullname
+        if kinds is None:
+            kinds = [ARG_POS] * len(args)
+        ce = CallExpr(callee, args, kinds, [None] * len(args))
+        return ce
+
+    def test_seam_range_not_call_expr(self) -> None:
+        from mypy.nodes import IntExpr
+
+        assert self._seam_range(IntExpr(1)) == 0
+
+    def test_seam_range_callee_not_ref(self) -> None:
+        from mypy.nodes import CallExpr, IntExpr
+
+        ce = CallExpr(IntExpr(1), [], [], [])
+        assert self._seam_range(ce) == 0
+
+    def test_seam_range_wrong_fullname(self) -> None:
+        from mypy.nodes import IntExpr
+
+        ce = self._call_expr("builtins.len", [IntExpr(0)])
+        assert self._seam_range(ce) == 0
+
+    def test_seam_range_zero_args(self) -> None:
+        ce = self._call_expr("builtins.range", [])
+        assert self._seam_range(ce) == 0
+
+    def test_seam_range_four_args(self) -> None:
+        from mypy.nodes import IntExpr
+
+        ce = self._call_expr(
+            "builtins.range", [IntExpr(0), IntExpr(1), IntExpr(2), IntExpr(3)]
+        )
+        assert self._seam_range(ce) == 0
+
+    def test_seam_range_one_arg_pos(self) -> None:
+        from mypy.nodes import IntExpr
+
+        ce = self._call_expr("builtins.range", [IntExpr(0)])
+        assert self._seam_range(ce) == 1
+
+    def test_seam_range_three_args_pos(self) -> None:
+        from mypy.nodes import IntExpr
+
+        ce = self._call_expr("builtins.range", [IntExpr(0), IntExpr(1), IntExpr(2)])
+        assert self._seam_range(ce) == 1
+
+    def test_seam_range_non_positional(self) -> None:
+        from mypy.nodes import IntExpr
+
+        ce = self._call_expr("builtins.range", [IntExpr(0)], kinds=[2])
+        assert self._seam_range(ce) == 0
+
+    def test_seam_range_none_fullname(self) -> None:
+        from mypy.nodes import ARG_POS, CallExpr, IntExpr, RefExpr
+
+        callee = RefExpr()
+        ce = CallExpr(callee, [IntExpr(0)], [ARG_POS], [None])
+        assert self._seam_range(ce) == 0
+
+    # ------------------------------------------------------------------
+    # range-int-gate parity through real method
+    # ------------------------------------------------------------------
+
+    def _run_range(self, expr: Any) -> Type | None:
+        from mypy.checker import TypeChecker
+        from mypy.nodes import CallExpr
+        from mypy.types import AnyType, TypeOfAny
+
+        def check_one() -> Type | None:
+            chk = TypeChecker.__new__(TypeChecker)
+            chk.options = Options()
+            chk.msg = None  # type: ignore[assignment]
+            type_map: dict[Any, Type] = {}
+            if isinstance(expr, CallExpr):
+                for arg in expr.args:
+                    type_map[arg] = AnyType(TypeOfAny.special_form)
+            chk._type_maps = [type_map]
+            return chk.analyze_range_native_int_type(expr)
+
+        off = self._with_gate(False, check_one)
+        on = self._with_gate(True, check_one)
+        assert_equal(on, off, f"analyze_range_native_int_type parity for {expr!r}")
+        return on
+
+    def test_parity_range_not_range(self) -> None:
+        from mypy.nodes import IntExpr
+
+        assert self._run_range(IntExpr(1)) is None
+
+    def test_parity_range_one_arg_no_native_int(self) -> None:
+        from mypy.nodes import IntExpr
+
+        ce = self._call_expr("builtins.range", [IntExpr(0)])
+        assert self._run_range(ce) is None
+
+    def test_parity_range_non_positional(self) -> None:
+        from mypy.nodes import IntExpr
+
+        ce = self._call_expr("builtins.range", [IntExpr(0)], kinds=[2])
+        assert self._run_range(ce) is None
+
+    def test_parity_range_wrong_fullname(self) -> None:
+        from mypy.nodes import IntExpr
+
+        ce = self._call_expr("builtins.len", [IntExpr(0)])
+        assert self._run_range(ce) is None
+
+    # ------------------------------------------------------------------
+    # match-subject-head direct seam
+    # ------------------------------------------------------------------
+
+    def _seam_match(self, subject: Any, subject_dummy_is_none: bool) -> Any:
+        return _type_kernel.rust_classify_match_subject_head(
+            subject, subject_dummy_is_none
+        )
+
+    def test_seam_match_nameexpr_literal_yes(self) -> None:
+        from mypy.nodes import NameExpr, Var
+
+        v = Var("x")
+        v.is_final = True
+        v.final_value = 1
+        n = NameExpr("x")
+        n.node = v
+        assert self._seam_match(n, True) == 0
+
+    def test_seam_match_nameexpr_literal_type(self) -> None:
+        from mypy.nodes import NameExpr, Var
+
+        v = Var("x")
+        v.is_final = False
+        n = NameExpr("x")
+        n.node = v
+        assert self._seam_match(n, True) == 0
+
+    def test_seam_match_nameexpr_no_node(self) -> None:
+        from mypy.nodes import NameExpr
+
+        n = NameExpr("x")
+        n.node = None
+        assert self._seam_match(n, True) == 0
+
+    def test_seam_match_memberexpr_literal_yes(self) -> None:
+        from mypy.nodes import MemberExpr, NameExpr, Var
+
+        v = Var("x")
+        v.is_final = True
+        v.final_value = 1
+        n = NameExpr("x")
+        n.node = v
+        m = MemberExpr(n, "attr")
+        assert self._seam_match(m, True) == 0
+
+    def test_seam_match_indexexpr_literal_yes(self) -> None:
+        from mypy.nodes import IndexExpr, NameExpr, Var
+
+        v = Var("x")
+        v.is_final = True
+        v.final_value = 1
+        base = NameExpr("x")
+        base.node = v
+        idx = IntExpr(0)
+        ie = IndexExpr(base, idx)
+        assert self._seam_match(ie, True) == 0
+
+    def test_seam_match_indexexpr_non_literal_index(self) -> None:
+        from mypy.nodes import CallExpr, IndexExpr, NameExpr, RefExpr
+
+        base = NameExpr("x")
+        base.node = None
+        idx = CallExpr(RefExpr(), [], [], [])
+        ie = IndexExpr(base, idx)
+        assert self._seam_match(ie, True) == 2
+
+    def test_seam_match_non_direct_expr(self) -> None:
+        from mypy.nodes import CallExpr, RefExpr
+
+        ce = CallExpr(RefExpr(), [], [], [])
+        assert self._seam_match(ce, True) == 2
+
+    def test_seam_match_has_dummy(self) -> None:
+        from mypy.nodes import CallExpr, RefExpr
+
+        ce = CallExpr(RefExpr(), [], [], [])
+        assert self._seam_match(ce, False) == 1
+
+    def test_seam_match_intexpr_make_dummy(self) -> None:
+        from mypy.nodes import IntExpr
+
+        assert self._seam_match(IntExpr(1), True) == 2
+
+    # ------------------------------------------------------------------
+    # match-subject-head parity through real method
+    # ------------------------------------------------------------------
+
+    def _run_match(self, subject: Any, has_dummy: bool) -> Any:
+        from mypy.checker import TypeChecker
+        from mypy.nodes import MatchStmt
+
+        def check_one() -> Any:
+            chk = TypeChecker.__new__(TypeChecker)
+            chk.options = Options()
+
+            class _Binder:
+                @staticmethod
+                def can_put_directly(expr: Any) -> bool:
+                    from mypy.literals import literal
+                    from mypy.nodes import LITERAL_NO, IndexExpr, MemberExpr, NameExpr
+
+                    return isinstance(
+                        expr, (IndexExpr, MemberExpr, NameExpr)
+                    ) and literal(expr) > LITERAL_NO
+
+            chk.binder = _Binder()  # type: ignore[assignment]
+            chk._unique_dummy_names = {}  # type: ignore[attr-defined]
+            chk._unique_id = 0
+            s = MatchStmt(subject, [], [], [])
+            if has_dummy:
+                from mypy.nodes import NameExpr, Var
+
+                dummy = NameExpr("_match_dummy")
+                dummy.node = Var("_match_dummy")
+                s.subject_dummy = dummy
+            return chk._make_named_statement_for_match(s, subject)
+
+        off = self._with_gate(False, check_one)
+        on = self._with_gate(True, check_one)
+        assert_equal(
+            type(on).__name__,
+            type(off).__name__,
+            f"_make_named_statement_for_match parity: on={on!r} off={off!r}",
+        )
+        return on
+
+    def test_parity_match_nameexpr_direct(self) -> None:
+        from mypy.nodes import NameExpr, Var
+
+        v = Var("x")
+        v.is_final = True
+        v.final_value = 1
+        n = NameExpr("x")
+        n.node = v
+        result = self._run_match(n, has_dummy=False)
+        assert result is n
+
+    def test_parity_match_memberexpr_direct(self) -> None:
+        from mypy.nodes import MemberExpr, NameExpr, Var
+
+        v = Var("x")
+        v.is_final = True
+        v.final_value = 1
+        base = NameExpr("x")
+        base.node = v
+        m = MemberExpr(base, "attr")
+        result = self._run_match(m, has_dummy=False)
+        assert result is m
+
+    def test_parity_match_non_direct_make_dummy(self) -> None:
+        from mypy.nodes import CallExpr, RefExpr
+
+        ce = CallExpr(RefExpr(), [], [], [])
+        result = self._run_match(ce, has_dummy=False)
+        assert type(result).__name__ == "NameExpr"
+
+    def test_parity_match_non_direct_has_dummy(self) -> None:
+        from mypy.nodes import CallExpr, RefExpr
+
+        ce = CallExpr(RefExpr(), [], [], [])
+        result = self._run_match(ce, has_dummy=True)
+        assert type(result).__name__ == "NameExpr"
+
+    def test_parity_match_intexpr_make_dummy(self) -> None:
+        from mypy.nodes import IntExpr
+
+        result = self._run_match(IntExpr(1), has_dummy=False)
+        assert type(result).__name__ == "NameExpr"

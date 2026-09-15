@@ -6816,3 +6816,291 @@ pub(crate) fn rust_is_type_like(py: Python<'_>, node: &PyAny) -> PyResult<Option
     }
     Ok(Some(false))
 }
+
+// ---------------------------------------------------------------------------
+// Issue #1634: statement-driver decision heads (range-int-gate, match-subject)
+// ---------------------------------------------------------------------------
+
+const LITERAL_NO: i64 = 0;
+const LITERAL_TYPE: i64 = 1;
+const LITERAL_YES: i64 = 2;
+
+/// `mypy.literals.literal` (literals.py:130-162) — recursive literal-kind
+/// classifier. Returns `LITERAL_NO` / `LITERAL_TYPE` / `LITERAL_YES` or
+/// `None` on an unreadable attribute (deferral). A depth cap (50) prevents
+/// unbounded recursion on pathological inputs.
+fn literal_inner(py: Python<'_>, e: &PyAny, depth: u32) -> PyResult<Option<i64>> {
+    if depth > 50 {
+        return Ok(None);
+    }
+    let nodes = py.import("mypy.nodes")?;
+
+    // ComparisonExpr: min(literal(o) for o in e.operands)
+    let comparison_cls: &PyType = nodes.getattr("ComparisonExpr")?.downcast()?;
+    if e.is_instance(comparison_cls)? {
+        let operands = e.getattr("operands")?;
+        let list: &PyList = operands.downcast()?;
+        let mut result: i64 = LITERAL_YES;
+        for item in list.iter() {
+            let v = literal_inner(py, item, depth + 1)?;
+            match v {
+                Some(v) => {
+                    if v < result {
+                        result = v;
+                    }
+                }
+                None => return Ok(None),
+            }
+        }
+        return Ok(Some(result));
+    }
+
+    // OpExpr: min(literal(e.left), literal(e.right))
+    let op_cls: &PyType = nodes.getattr("OpExpr")?.downcast()?;
+    if e.is_instance(op_cls)? {
+        let l = literal_inner(py, e.getattr("left")?, depth + 1)?;
+        let r = literal_inner(py, e.getattr("right")?, depth + 1)?;
+        match (l, r) {
+            (Some(l), Some(r)) => return Ok(Some(l.min(r))),
+            _ => return Ok(None),
+        }
+    }
+
+    // MemberExpr, UnaryExpr, StarExpr: literal(e.expr)
+    for name in ["MemberExpr", "UnaryExpr", "StarExpr"] {
+        let cls: &PyType = nodes.getattr(name)?.downcast()?;
+        if e.is_instance(cls)? {
+            return literal_inner(py, e.getattr("expr")?, depth + 1);
+        }
+    }
+
+    // AssignmentExpr: literal(e.target)
+    let assign_cls: &PyType = nodes.getattr("AssignmentExpr")?.downcast()?;
+    if e.is_instance(assign_cls)? {
+        return literal_inner(py, e.getattr("target")?, depth + 1);
+    }
+
+    // IndexExpr: if literal(e.index) == LITERAL_YES then literal(e.base) else LITERAL_NO
+    let index_cls: &PyType = nodes.getattr("IndexExpr")?.downcast()?;
+    if e.is_instance(index_cls)? {
+        let idx = literal_inner(py, e.getattr("index")?, depth + 1)?;
+        match idx {
+            Some(LITERAL_YES) => return literal_inner(py, e.getattr("base")?, depth + 1),
+            Some(_) => return Ok(Some(LITERAL_NO)),
+            None => return Ok(None),
+        }
+    }
+
+    // NameExpr: LITERAL_YES if final Var with final_value, else LITERAL_TYPE
+    let name_cls: &PyType = nodes.getattr("NameExpr")?.downcast()?;
+    if e.is_instance(name_cls)? {
+        let node = e.getattr("node")?;
+        if node.is_none() {
+            return Ok(Some(LITERAL_TYPE));
+        }
+        let var_cls: &PyType = nodes.getattr("Var")?.downcast()?;
+        if node.is_instance(var_cls)? {
+            let is_final: bool = match node.getattr("is_final") {
+                Ok(v) => v.extract().unwrap_or(false),
+                Err(_) => return Ok(None),
+            };
+            if !is_final {
+                return Ok(Some(LITERAL_TYPE));
+            }
+            let fv = node.getattr("final_value")?;
+            if fv.is_none() {
+                return Ok(Some(LITERAL_TYPE));
+            }
+            return Ok(Some(LITERAL_YES));
+        }
+        return Ok(Some(LITERAL_TYPE));
+    }
+
+    // IntExpr, FloatExpr, ComplexExpr, StrExpr, BytesExpr: LITERAL_YES
+    for name in [
+        "IntExpr",
+        "FloatExpr",
+        "ComplexExpr",
+        "StrExpr",
+        "BytesExpr",
+    ] {
+        let cls: &PyType = nodes.getattr(name)?.downcast()?;
+        if e.is_instance(cls)? {
+            return Ok(Some(LITERAL_YES));
+        }
+    }
+
+    // ListExpr, TupleExpr, SetExpr: LITERAL_YES if all items LITERAL_YES
+    for name in ["ListExpr", "TupleExpr", "SetExpr"] {
+        let cls: &PyType = nodes.getattr(name)?.downcast()?;
+        if e.is_instance(cls)? {
+            let items = e.getattr("items")?;
+            let list: &PyList = items.downcast()?;
+            for item in list.iter() {
+                let v = literal_inner(py, item, depth + 1)?;
+                match v {
+                    Some(LITERAL_YES) => {}
+                    Some(_) => return Ok(Some(LITERAL_NO)),
+                    None => return Ok(None),
+                }
+            }
+            return Ok(Some(LITERAL_YES));
+        }
+    }
+
+    // DictExpr: LITERAL_YES if all (key, val) items are LITERAL_YES
+    let dict_cls: &PyType = nodes.getattr("DictExpr")?.downcast()?;
+    if e.is_instance(dict_cls)? {
+        let items = e.getattr("items")?;
+        let list: &PyList = items.downcast()?;
+        for pair in list.iter() {
+            let tuple: &pyo3::types::PyTuple = pair.downcast()?;
+            let key = tuple.get_item(0)?;
+            let val = tuple.get_item(1)?;
+            if key.is_none() {
+                return Ok(Some(LITERAL_NO));
+            }
+            let k = literal_inner(py, key, depth + 1)?;
+            let v = literal_inner(py, val, depth + 1)?;
+            match (k, v) {
+                (Some(LITERAL_YES), Some(LITERAL_YES)) => {}
+                (Some(_), _) | (_, Some(_)) => return Ok(Some(LITERAL_NO)),
+                _ => return Ok(None),
+            }
+        }
+        return Ok(Some(LITERAL_YES));
+    }
+
+    // Everything else: LITERAL_NO (mirrors literal_hash returning None)
+    Ok(Some(LITERAL_NO))
+}
+
+/// `TypeChecker.analyze_range_native_int_type` entry gate (checker.py:7637-7643):
+/// classifies the 5-part conjunction -- `isinstance(expr, CallExpr)` and
+/// `isinstance(expr.callee, RefExpr)` and `expr.callee.fullname == "builtins.range"`
+/// and `1 <= len(expr.args) <= 3` and `all(kind == ARG_POS ...)`.
+///
+/// Returns `Some(1)` if the gate passes (is a range call with 1-3 positional
+/// args), `Some(0)` if the gate fails, `None` on an unreadable attribute.
+/// The arg-type walk (lines 7644-7654, uses `self.lookup_type` and
+/// `MYPYC_NATIVE_INT_NAMES`) stays in Python.
+#[pyfunction]
+pub(crate) fn rust_classify_range_int_gate(py: Python<'_>, expr: &PyAny) -> PyResult<Option<i64>> {
+    let nodes = py.import("mypy.nodes")?;
+
+    let call_cls: &PyType = nodes.getattr("CallExpr")?.downcast()?;
+    if !expr.is_instance(call_cls)? {
+        return Ok(Some(0));
+    }
+
+    let callee = match expr.getattr("callee") {
+        Ok(c) => c,
+        Err(_) => return Ok(None),
+    };
+
+    let ref_cls: &PyType = nodes.getattr("RefExpr")?.downcast()?;
+    if !callee.is_instance(ref_cls)? {
+        return Ok(Some(0));
+    }
+
+    let fullname = match callee.getattr("fullname") {
+        Ok(f) => f,
+        Err(_) => return Ok(None),
+    };
+    if fullname.is_none() {
+        return Ok(Some(0));
+    }
+    let name: &str = match fullname.downcast::<pyo3::types::PyString>() {
+        Ok(s) => s.to_str()?,
+        Err(_) => return Ok(None),
+    };
+    if name != "builtins.range" {
+        return Ok(Some(0));
+    }
+
+    let args = match expr.getattr("args") {
+        Ok(a) => a,
+        Err(_) => return Ok(None),
+    };
+    let arg_list: &PyList = match args.downcast() {
+        Ok(l) => l,
+        Err(_) => return Ok(None),
+    };
+    let nargs = arg_list.len();
+    if !(1..=3).contains(&nargs) {
+        return Ok(Some(0));
+    }
+
+    let arg_kinds = match expr.getattr("arg_kinds") {
+        Ok(k) => k,
+        Err(_) => return Ok(None),
+    };
+    let kinds_list: &PyList = match arg_kinds.downcast() {
+        Ok(l) => l,
+        Err(_) => return Ok(None),
+    };
+    // ARG_POS == 0 in mypy.types; all positional means every kind value == 0.
+    for kind in kinds_list.iter() {
+        let val: i64 = match kind.extract() {
+            Ok(v) => v,
+            Err(_) => {
+                // ArgKind is a plain enum.Enum (not IntEnum), so extract::<i64>
+                // fails; fall back to reading .value which is the int.
+                match kind.getattr("value") {
+                    Ok(v) => match v.extract() {
+                        Ok(iv) => iv,
+                        Err(_) => return Ok(None),
+                    },
+                    Err(_) => return Ok(None),
+                }
+            }
+        };
+        if val != 0 {
+            return Ok(Some(0));
+        }
+    }
+
+    Ok(Some(1))
+}
+
+/// `TypeChecker._make_named_statement_for_match` 3-way head (checker.py:8072-8078):
+/// classifies `binder.can_put_directly(subject)` (isinstance + `literal() >
+/// LITERAL_NO`), `s.subject_dummy is not None`, and the else-create arm.
+///
+/// Returns `Some(0)` = DIRECT (return subject), `Some(1)` = HAS_DUMMY
+/// (return `s.subject_dummy`), `Some(2)` = MAKE_DUMMY (Python creates the
+/// dummy NameExpr+Var), `None` on an unreadable attribute.
+#[pyfunction]
+pub(crate) fn rust_classify_match_subject_head(
+    py: Python<'_>,
+    subject: &PyAny,
+    subject_dummy_is_none: bool,
+) -> PyResult<Option<i64>> {
+    let nodes = py.import("mypy.nodes")?;
+
+    // can_put_directly: isinstance(expr, (IndexExpr, MemberExpr, NameExpr))
+    // and literal(expr) > LITERAL_NO
+    let mut is_direct_expr = false;
+    for name in ["IndexExpr", "MemberExpr", "NameExpr"] {
+        let cls: &PyType = nodes.getattr(name)?.downcast()?;
+        if subject.is_instance(cls)? {
+            is_direct_expr = true;
+            break;
+        }
+    }
+
+    if is_direct_expr {
+        let lit = literal_inner(py, subject, 0)?;
+        match lit {
+            Some(v) if v > LITERAL_NO => return Ok(Some(0)),
+            Some(_) => {}
+            None => return Ok(None),
+        }
+    }
+
+    if !subject_dummy_is_none {
+        return Ok(Some(1));
+    }
+
+    Ok(Some(2))
+}

@@ -3211,6 +3211,14 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         module
     )?)?;
 
+    // Issue #1634: _make_named_statement_for_match 3-way head. Rust
+    // classifies can_put_directly / has_dummy / make_dummy; the dummy
+    // NameExpr+Var creation stays in Python.
+    module.add_function(wrap_pyfunction!(
+        checker_functions::rust_classify_match_subject_head,
+        module
+    )?)?;
+
     // checker_functions: check_metaclass_compatibility decision-head port.
     // Rust classifies the exempt/conflict predicate into a branch tag; the
     // METACLASS fail + note stay in Python.
@@ -3379,6 +3387,14 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
     // wrong-number messages stay in Python.
     module.add_function(wrap_pyfunction!(
         checker_functions::rust_classify_rvalue_count,
+        module
+    )?)?;
+
+    // Issue #1634: analyze_range_native_int_type entry gate. Rust
+    // classifies the 5-part conjunction (CallExpr + RefExpr callee +
+    // builtins.range + 1-3 args + all ARG_POS); stays in Python.
+    module.add_function(wrap_pyfunction!(
+        checker_functions::rust_classify_range_int_gate,
         module
     )?)?;
 
