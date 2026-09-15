@@ -2942,10 +2942,15 @@ mod tests {
             HashMap::from([((1, 0, String::new()), Type::Parameters(repl))]);
         let out = param_spec_callable_arm(&typ, &env, false);
         assert!(matches!(out, Some(Some(_))), "expected splice to succeed");
-        if let Some(Some(Type::CallableType { arg_types, arg_kinds, .. })) = out {
+        if let Some(Some(Type::CallableType {
+            arg_types,
+            arg_kinds,
+            ..
+        })) = out
+        {
             assert_eq!(arg_types.len(), 1);
             assert_eq!(arg_kinds[0], 2); // still ARG_STAR
-            // The UnpackType was replaced by the tuple's first arg (Any).
+                                         // The UnpackType was replaced by the tuple's first arg (Any).
             assert!(matches!(arg_types[0], Type::AnyType { .. }));
         } else {
             panic!("expected CallableType");
@@ -2976,7 +2981,12 @@ mod tests {
         // is false (no ParamSpec in the result), so the splice succeeds
         // with the alias-bearing UnpackType intact.
         assert!(matches!(out, Some(Some(_))), "expected splice to succeed");
-        if let Some(Some(Type::CallableType { arg_types, arg_kinds, .. })) = out {
+        if let Some(Some(Type::CallableType {
+            arg_types,
+            arg_kinds,
+            ..
+        })) = out
+        {
             assert_eq!(arg_types.len(), 1);
             assert_eq!(arg_kinds[0], 2);
             assert!(matches!(arg_types[0], Type::UnpackType { .. }));
