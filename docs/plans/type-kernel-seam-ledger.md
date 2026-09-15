@@ -4746,4 +4746,52 @@ measurements are appended below as the coordinator reports each landing.
   (`-n2`), cold self-check 0 errors / 353 files,
   `cargo test -p mypy-type-kernel` 2,838/0/11, `cargo fmt --check` and
   `clippy -D warnings` clean.
+- `#1678` (`3329850ac`, PR #1681) — CI tier. `native-kernel-parity.yml` gains
+  a dependency-free `changes` job that diffs the PR `base..head`;
+  `parity-ast` consumes it via `needs` + `if`, so a kernel-only PR no longer
+  pays the AST suite (its own x86 `ast_serialize` build plus
+  `test_nativeparse` / `testparse` / `teststubgen`). The filter is a
+  deliberate superset (`mypy/semanal*.py`, `mypy/nodes.py`, `mypy/errors.py`,
+  `mypy/options.py`, `mypy/stubgen.py`, `mypy/stubutil.py`) because
+  `teststubgen` runs full semantic analysis. Fail-open: no PR SHAs or an
+  unavailable diff publishes `ast=true`, so the worst case is the status quo.
+  Redundancy recorded on that PR, deliberately not fixed: `parity` and
+  `parity-typeops` are the same testcheck corpus (both install the TYPEOPS and
+  CHECKER_STMTS resolvers; `parity-typeops` differs only by
+  `MYPY_NATIVE_TYPE_KERNEL_REQUIRED=1`), and `parity` runs testcheck twice
+  inside itself (bare, then with `testtypes`), so the corpus gate is roughly
+  3x redundant. Merging or deleting a gate is a CI-tier decision about what CI
+  verifies, not tidying.
+- `#1680` (`e9017bf46`, PR #1683) — dev tier. Reusable worktree pool
+  `scripts/worktree_pool.sh` (`init` / `claim` / `release` / `status` /
+  `prune`); `claim` does `checkout -B <branch> origin/main` plus `clean -xdf`
+  excluding `target` and `.venv`, so a slot resets in seconds with a warm
+  `target/`. Compile-unit counts as reported: a fresh worktree with an empty
+  `target/` compiles 25 units; after `release` then `claim` with one source
+  file touched, 1 unit. So the pool removes 24 of 25 compiled units but only
+  about a quarter of the wall clock, because the release compile and link of
+  `mypy-type-kernel` itself is ~59s and is not cacheable across a source
+  change. Wall numbers there are provisional as quoted here (no `uptime`
+  recorded alongside them); the load-invariant evidence is the unit counts.
+  Per-slot `target/` is deliberate, not an oversight: a shared
+  `CARGO_TARGET_DIR` is last-writer-wins on `target/release/libtype_kernel.dylib`,
+  so a lane can copy a kernel it did not build.
+- `#1679` (`a0f6150a7`, PR #1684) — docs tier. Evidence-artifact convention
+  (`docs/plans/wave<N>-evidence/<lane>.json`) plus the wave-5 measurements it
+  seeds: local testcheck 8,144 against CI `parity` 8,198 on the same commit
+  (the spread is platform skips), one local `ocr review` pass 9m37s / ~761k
+  tokens, one release kernel build 1m14s at load 86 (provisional; load
+  recorded, `uptime` not).
+  **Part of that file is falsified.** Its `rust_refers_to_different_scope`
+  row records 0 calls and calls the seam a retirement candidate. Lane A4's
+  re-run against its own worktree source shows the seam live: suite-level
+  `calls=16 / decided=15 / deferred=1`, alongside
+  `rust_should_report_unreachable_issues` 13/12/1, `rust_flatten_lvalues`
+  22/21/1, `rust_literal_int_expr` 41/29/12, 72 tests passed. The zero was a
+  sample-coverage artifact of the 6-file probe, not a dead seam. Correction
+  in flight as PR #1686, which rewrites the section and keeps the mistake
+  visible with the lesson: a zero-call reading from a sampled probe is a
+  statement about the sample's coverage, not about the seam, and only a
+  whole-corpus count licenses "retire". The corrected numbers above are the
+  ones to cite; the zero row is not evidence.
 
