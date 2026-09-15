@@ -1091,39 +1091,79 @@ mod symtable_mirror_tests {
             .collect()
     }
 
+    /// Mirror one Python write: the `dict` key lands first, then the record.
+    /// A store seen from empty is what the ordering claim is about, so the
+    /// table starts empty and both sides are written in the same order.
+    fn write(py: Python<'_>, table: &PyAny, name: &str) {
+        table
+            .set_item(name, py.eval("object()", None, None).unwrap())
+            .unwrap();
+        put(table, name, fresh_object(py), flags(1)).unwrap();
+    }
+
+    fn dict_order(table: &PyAny) -> Vec<String> {
+        table
+            .call_method0("keys")
+            .unwrap()
+            .iter()
+            .unwrap()
+            .map(|k| k.unwrap().extract::<String>().unwrap())
+            .collect()
+    }
+
     #[test]
     fn test_order_follows_dict_insert_replace_delete() {
         with_py(|py| {
             reset();
-            let table = live_table(py, &["a", "b", "c"]);
-            let node = fresh_object(py);
+            flip_counts_reset();
+            let table = py.eval("{}", None, None).unwrap();
             for name in ["a", "b", "c"] {
-                put(table, name, node, flags(1)).unwrap();
+                write(py, table, name);
             }
-            assert_eq!(read_names(py, table), vec!["a", "b", "c"]);
+            assert_eq!(read_names(py, table), dict_order(table));
             // A replace keeps the position, exactly like `dict`.
-            put(table, "b", fresh_object(py), flags(2)).unwrap();
+            write(py, table, "b");
             assert_eq!(read_names(py, table), vec!["a", "b", "c"]);
-            // A delete releases the ordinal; a re-insert lands last, and
-            // the live dict does the same.
-            delete(table, "a").unwrap();
+            assert_eq!(read_names(py, table), dict_order(table));
+            // A delete releases the ordinal; a re-insert lands last.
             table.del_item("a").unwrap();
-            assert_eq!(read_names(py, table), vec!["b", "c"]);
-            put(table, "a", node, flags(1)).unwrap();
+            delete(table, "a").unwrap();
+            assert_eq!(read_names(py, table), dict_order(table));
+            write(py, table, "a");
+            assert_eq!(read_names(py, table), vec!["b", "c", "a"]);
+            assert_eq!(read_names(py, table), dict_order(table));
+            let counts = flip_counts();
+            assert_eq!(counts.tables_mirrored, 6);
+            assert_eq!(counts.defer_inherited, 0);
+        });
+    }
+
+    #[test]
+    fn test_inherited_namespace_is_not_served() {
+        with_py(|py| {
+            reset();
+            flip_counts_reset();
+            // A key in the dict before the store's first write in a build:
+            // its position predates the store's ordinals (aststrip keeps
+            // `@`-named keys, a loaded cache table starts populated).
+            let table = py.eval("{}", None, None).unwrap();
             table
                 .set_item("a", py.eval("object()", None, None).unwrap())
                 .unwrap();
-            assert_eq!(read_names(py, table), vec!["b", "c", "a"]);
-            assert_eq!(
-                read_names(py, table),
-                table
-                    .call_method0("keys")
-                    .unwrap()
-                    .iter()
-                    .unwrap()
-                    .map(|k| k.unwrap().extract::<String>().unwrap())
-                    .collect::<Vec<String>>()
-            );
+            write(py, table, "b");
+            write(py, table, "a");
+            assert!(matches!(
+                entries_if_mirrored(py, table),
+                Err(ShadowGap::Inherited)
+            ));
+            assert_eq!(flip_counts().defer_inherited, 1);
+            // The mark is per build: after a reset, a namespace the store
+            // sees from empty is servable again.
+            reset();
+            flip_counts_reset();
+            let fresh = py.eval("{}", None, None).unwrap();
+            write(py, fresh, "a");
+            assert_eq!(read_names(py, fresh), vec!["a"]);
         });
     }
 
