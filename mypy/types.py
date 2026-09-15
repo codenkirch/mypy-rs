@@ -180,12 +180,36 @@ _serialize_stats = {
     "tvar": 0,
     "bytes": 0,
     "mirror": 0,
+    # #1671: encodes served by the `Instance` view store, before the
+    # wire-cache probe.
+    "view": 0,
+    "view_bytes": 0,
 }
 
 
 def _clear_serialize_stats() -> None:
     for k in _serialize_stats:
         _serialize_stats[k] = 0
+
+
+# Seam-cost clock (env-gated via MYPY_SERIALIZE_CLOCK). Accumulates the
+# wall seconds inside `_serialize_type_for_visitor`, which bounds what any
+# storage-side replacement of the walk can save.
+from time import perf_counter as _perf_counter
+
+_serialize_clock_on: bool = bool(_os.environ.get("MYPY_SERIALIZE_CLOCK"))
+_serialize_funnel_ns: int = 0
+
+
+# F reopening experiment (#1671): the replacement-view encode for the
+# `Instance` family. Installed by `mypy.typeview.activate`; `None` on a
+# gate-off build, so the seam pays one `is not None` test.
+_native_type_view_encode: Callable[[Type], bytes | None] | None = None
+
+
+def _set_native_type_view_encode(fn: Callable[[Type], bytes | None] | None) -> None:
+    global _native_type_view_encode
+    _native_type_view_encode = fn
 
 
 # Phase F2 (#1393): types_mirror.read_fresh_bytes when the F2 mirror-read
@@ -4765,6 +4789,16 @@ def _set_native_visitor_types_active(active: bool) -> None:
 def _serialize_type_for_visitor(t: Type) -> bytes:
     if _serialize_stats_on:
         _serialize_stats["calls"] += 1
+    # The view probe comes before the wire-cache probe: a served encode is
+    # the same bytes the walk would produce, so it subsumes the cache for
+    # the family it covers (#1671).
+    if _native_type_view_encode is not None:
+        served = _native_type_view_encode(t)
+        if served is not None:
+            if _serialize_stats_on:
+                _serialize_stats["view"] += 1
+                _serialize_stats["view_bytes"] += len(served)
+            return served
     key = id(t)
     if _wire_cache_enabled():
         entry = _type_wire_cache.get(key)
@@ -4791,6 +4825,31 @@ def _serialize_type_for_visitor(t: Type) -> bytes:
             _serialize_stats["bytes"] += len(result)
         _type_wire_cache[key] = (t, result)
     return result
+
+
+def _serialize_type_for_visitor_clocked(t: Type) -> bytes:
+    """`_serialize_type_for_visitor_body` plus the seam-cost clock.
+
+    Bound over the plain function only when `MYPY_SERIALIZE_CLOCK` is set,
+    so the instrumented path is never reached in production. The clock
+    covers the whole funnel body: cache probe, fast path, and the encode
+    walk (whose bytes land in `serialize_bytes`).
+    """
+    global _serialize_funnel_ns
+    start = _perf_counter()
+    try:
+        return _serialize_type_for_visitor_body(t)
+    finally:
+        _serialize_funnel_ns += int((_perf_counter() - start) * 1_000_000_000)
+
+
+# The pre-rebinding body. `_serialize_type_for_visitor` is renamed through
+# this alias below so the clocked wrapper reaches the real body instead of
+# itself.
+_serialize_type_for_visitor_body = _serialize_type_for_visitor
+
+if _serialize_clock_on:
+    _serialize_type_for_visitor = _serialize_type_for_visitor_clocked  # type: ignore[assignment]
 
 
 def _encode_no_arg_instance(t: Type, buf_cls: type[WriteBuffer]) -> bytes | None:
