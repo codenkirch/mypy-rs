@@ -52,45 +52,54 @@ serialize totals, and `MYPY_AUDIT_ROOT` drops the `.venv` editable finder when
 it resolves `mypy` outside the requested root.
 
 Run-to-run stability: two independent runs on the unmodified tree agree
-exactly on the target seam (177,899 calls / 177,524 defers in both) and within
-low-double-digit noise elsewhere (the documented `id(bytes)` reuse effect).
+exactly on the target seam's direct counters (177,899 calls / 177,524 defers in
+both). The pre-fix id-keyed tables were less stable than the 09-14 audit's
+"low-double-digit noise" claim suggested; see the harness-fix section.
 
 ## Headline buckets
 
-| bucket | before | after (this PR) | delta |
+**These are the pre-fix-keying numbers and they undercount.** The harness
+keyed its buckets by bare `id(bytes)`; a consumed blob whose reference was
+dropped could hand its number to a fresh allocation and be read as a
+wire-cache hit. The one-file corpus count moves 106,087 -> 198,963 events once
+the keying is fixed, so treat every id-keyed row below as a lower bound. The
+seam call/defer counters and the `MYPY_SERIALIZE_STATS` funnel counters are
+direct counters, not id-keyed, and are unaffected.
+
+| bucket | before (pre-fix keying) | after (pre-fix keying) | fixed keying, post-retirement |
 |---|---:|---:|---:|
-| serialization events | 1,297,835 | 1,223,049 | -74,786 |
-| useful (consumed, decided) | 854,968 (39,454,415 B) | 894,289 (41,339,294 B) | +39,321 |
-| deferred (serialized, seam said `None`) | 137,443 (11,032,608 B) | 659 (149,011 B) | -136,784 |
-| unconsumed (never reached a seam) | 305,424 (6,101,565 B) | 328,101 (7,015,042 B) | +22,677 |
+| serialization events | 1,297,835 | 1,223,049 | 2,177,749 |
+| useful (consumed, decided) | 854,968 | 894,289 | 1,612,939 (67,334,928 B) |
+| deferred (serialized, seam said `None`) | 137,443 | 659 | 1,220 (295,687 B) |
+| unconsumed (never reached a seam) | 305,424 | 328,101 | 564,590 (11,109,651 B) |
 
-The `useful` / `unconsumed` movement is a **re-attribution, not new traffic**.
-The harness marks a blob consumed once and then treats every later
-serialization returning that same object as a wire-cache hit, not a new event.
-Removing a consumer therefore promotes cache-hit re-serializations at unrelated
-call sites into counted events (`types.py:5827` 158,647 -> 172,893,
-`subtypes.py:880` 14,904 -> 21,109). Per-site bucket rows are not comparable
-across this change; the seam-level counters and the global funnel counters below
-are.
+The before/after pair above also moves in the wrong direction for the wrong
+reason: with a consumer removed, fewer blobs get marked consumed, so unrelated
+cache-hit re-serializations counted as new events. No bucket differential is
+claimed from that pair; the retire/keep evidence is the seam-level counters
+below.
 
-Global `MYPY_SERIALIZE_STATS` totals (the issue's named counter):
+Global `MYPY_SERIALIZE_STATS` totals (the issue's named counter; own
+instrumentation, immune to the keying):
 
-| counter | before | after | delta |
+| counter | before (506aa7e4c) | after (rebased head) | delta |
 |---|---:|---:|---:|
-| `serialize_calls` | 2,860,627 | 2,443,622 | -417,005 (-14.6%) |
-| `serialize_writes` | 1,207,503 | 1,050,916 | -156,587 (-13.0%) |
-| `serialize_bytes` | 50,410,933 | 36,344,093 | -14,066,840 (-27.9%) |
-| `serialize_hits` | 1,174,621 | 948,900 | -225,721 (-19.2%) |
-| `serialize_builtin` | 153,520 | 119,002 | -34,518 |
+| `serialize_calls` | 2,860,627 | 2,424,137 | -436,490 (-15.3%) |
+| `serialize_writes` | 1,207,503 | 1,047,142 | -160,361 (-13.3%) |
+| `serialize_bytes` | 50,410,933 | 36,294,640 | -14,116,293 (-28.0%) |
+| `serialize_hits` | 1,174,621 | 938,517 | -236,104 (-20.1%) |
+| `serialize_builtin` | 153,520 | 113,373 | -40,147 |
 
-These come from mypy's own funnel instrumentation, not from the harness's
-identity keying, so the re-attribution above does not touch them. One confound:
-`mypy/test/testtypes.py` is inside the self-check corpus and this PR adds ~150
-lines to it, so the after column carries that extra workload; the reduction is a
-**lower bound**. The seam's decided count is identical in both runs (375), which
-is the direct evidence that the corpus delta does not perturb this seam.
+The after column is the rebased head, so it carries 12 commits of other lanes'
+work as well as this gate; the reduction is therefore a rough figure, not a
+controlled A/B. The controlled A/B is the seam pair below.
 
-## Refreshed top-15 (before this PR)
+## Refreshed top-15, pre-retirement (measured at `506aa7e4c`, pre-fix keying)
+
+Calls, defers and the proxy's fixed-cost term are direct counters. The MB
+columns are id-keyed and therefore undercounts (see the headline section); they
+are shown because the target choice used the ranking's order, which the calls
+column drives.
 
 | # | seam | calls | call MB | enc MB | B/call | proxy | wire? | defers | defer % |
 |--:|---|--:|--:|--:|--:|--:|---|---:|--:|
@@ -142,16 +151,13 @@ slot, and the counters win:
   the requested alternative to re-attempting them.
 - `rust_is_subtype` / `rust_is_subtype_batch` (ranks 9/11) are `#1618`-#1623
   residual-defer territory, not closeable gates.
-- The deferred bucket after this retirement is 659 events (-99.5%), i.e. the
-  class is exhausted: the largest remaining deferred call site is 157 events
-  (`checkexpr.py:1069` container type), then 77 and 73
-  (`checkexpr.py:3184/3168`). No deferred row is above the noise floor of a
-  single seam worth gating.
-- The unconsumed bucket (305,424 -> 328,101 events / 6.10 -> 7.02 MB) is
-  unchanged in kind and is 89% one site, `types.py:5596`
-  `_restore_list_identity`, the identity-restoration keys the 09-14 audit
-  already assigned to `#1623`. Its absolute movement is the re-attribution
-  effect described above, not new traffic.
+- With the fixed keying the deferred bucket is 1,220 events (largest remaining
+  call site 225, `checkexpr.py:1069` container type; then 172 and 118). The
+  class is exhausted in the sense that no deferred row is a seam worth gating,
+  not that the bucket is empty.
+- The unconsumed bucket is 564,590 events / 11.11 MB under the fixed keying and
+  is still dominated by `types.py:5596` `_restore_list_identity`, the
+  identity-restoration keys the 09-14 audit already assigned to `#1623`.
 - `mypy/messages.py` is reserved by the coordinator this wave; its rows
   (`rust_format_type_distinctly` 985 calls, `rust_format_type` 716) are
   low-call/high-byte and are not closeable under the fixed-FFI term.
@@ -177,37 +183,43 @@ each of those cases fails a gate conjunct.
 
 | counter | before | after | delta |
 |---|---:|---:|---:|
-| `rust_check_callable_call` calls | 177,899 | 377 | -177,522 (-99.79%) |
+| `rust_check_callable_call` calls | 177,899 | 378 | -177,521 (-99.79%) |
 | `rust_check_callable_call` defers | 177,524 | 2 | -177,522 |
-| `rust_check_callable_call` decided | 375 | 375 | 0 |
-| `rust_check_callable_call` call MB | 29.73 | 0.00 (242 B) | -29.73 |
-| `rust_check_callable_call` encoded MB | 10.91 | 0.000242 | -10.91 |
-| proxy (fixed + bytes) | 1.74s | 0.0002s | -1.74s |
-| deferred bucket events / bytes | 137,443 / 11,032,608 | 659 / 149,011 | -136,784 / -10,883,597 |
-| `serialize_calls` / `writes` / `bytes` | 2,860,627 / 1,207,503 / 50,410,933 | 2,443,622 / 1,050,916 / 36,344,093 | -14.6% / -13.0% / -27.9% |
+| `rust_check_callable_call` decided | 375 | 376 | +1 (corpus delta) |
+| proxy (fixed term only, both halves direct counters) | 0.11s | 0.0002s | -0.11s |
+| deferred bucket events (id-keyed, undercounts) | 137,443 | 659 | not claimed |
+| `serialize_calls` / `writes` / `bytes` | 2,860,627 / 1,207,503 / 50,410,933 | 2,424,137 / 1,047,142 / 36,294,640 | -15.3% / -13.3% / -28.0% |
 
-The decided count is the parity check that matters: it stays at **375**. A
-lower number would mean the gate rejected a shape Rust decides. The 377
-remaining crossings are 375 decided calls plus 2 Rust-side defers (alias or
+The decided count is the parity check that matters: 375 before, 376 after on the
+rebased corpus, i.e. the gate moved no decision (the +1 is the 12 commits of
+corpus that landed under the rebase, which add calls of their own). A lower
+count would mean the gate rejected a shape Rust decides. The 378 remaining
+crossings are those 375-376 decided calls plus 2 Rust-side defers (alias or
 force-fallback uncertainty inside the shape the gate admits).
 
-`rust_resolve_plugin_hook` is **not** a counterexample: 30,591 -> 30,621 calls
+Only the seam counters and the funnel counters are used for the verdict: the
+call/defer counts are direct per-crossing counters, and the funnel counters come
+from mypy's own instrumentation. Both are immune to the id-keying defect; the
+id-keyed bucket pair is not and is not claimed.
+
+`rust_resolve_plugin_hook` is **not** a counterexample: 30,591 -> 30,623 calls
 (unchanged). Its crossings come from the Python `_try_native_plugin_hook` tail
 that runs for every call with a `callable_name`, not from the gated seam, whose
-internal probe those 377 calls no longer reach at scale.
+internal probe the remaining 378 calls no longer reach at scale.
 
-Post-retirement top 5 (same run, same corpus):
+Current ranking, post-retirement, fixed keying, rebased head:
 
 | # | seam | calls | call MB | enc MB | proxy | defers |
 |--:|---|--:|--:|--:|--:|---:|
-| 1 | `rust_copy_modified` | 263,049 | 19.17 | 6.15 | 1.18s | 0 |
-| 2 | `rust_expand_type` | 117,441 | 10.80 | 6.37 | 0.76s | 0 |
-| 3 | `rust_flatten_nested_unions` | 276,105 | 9.74 | 4.43 | 0.74s | 1 |
-| 4 | `rust_check_overload_call` | 14,482 | 5.92 | 2.41 | 0.34s | 128 |
-| 5 | `rust_analyze_instance_member_dispatch` | 100,760 | 3.44 | 0.71 | 0.23s | 35 |
+| 1 | `rust_copy_modified` | 263,463 | 19.20 | 12.92 | 1.45s | 0 |
+| 2 | `rust_expand_type` | 117,749 | 10.85 | 9.28 | 0.88s | 0 |
+| 3 | `rust_flatten_nested_unions` | 276,228 | 9.75 | 6.55 | 0.83s | 1 |
+| 4 | `rust_check_overload_call` | 14,490 | 5.94 | 3.32 | 0.38s | 128 |
+| 5 | `rust_freshen_function_type_vars` | 23,030 | 3.61 | 3.61 | 0.30s | 0 |
 
-Every one of them is floored: ranks 1-3 on the live-object return interface
-(`#1623`), rank 4 in the reserved `#1642` cluster.
+`rust_check_callable_call` is out of the table entirely: 378 calls, 2 defers.
+Every remaining top row is floored: ranks 1-3 on the live-object return
+interface (`#1623`), rank 4 in the reserved `#1642` cluster.
 
 Engagement and non-regression proof: `NativeCheckCallableCallWireGateSuite`
 (`mypy/test/testtypes.py`) asserts that six rejected shapes (non-type-object
@@ -242,29 +254,43 @@ third run of the before half used as the stability check.
 
 ### Harness fixes after the review
 
-The committed harness no longer prints two **structural zeros**: a probe that
-reports an unreachable branch as a measured `0` breaks the load-invariant
-counter rule this wave runs on. Neither zero is cited anywhere in this document.
+The review of `misc/audit_wire_traffic.py` found two defect classes, both of the
+"silently wrong numbers" kind that this wave's evidence rule cannot tolerate.
+Neither is a style nit, and all of them are fixed by construction rather than by
+a guard clause:
 
-- `unsourced_seam_bytes` (the `entry is None` branch in `consume()` is
-  unreachable: the only caller passes a blob that `_lookup_blob` returned from
-  `pending`): branch and stat line removed.
-- `re_pushed_already_snapshotted` (initialized, never incremented; the
-  classification loop bumps `re_pushed_builtins` / `other_infos`): key removed.
-  The `re_pushed_builtins` figure this document does cite is unaffected.
+1. **Bookkeeping that assumed the happy path.** `report()` ran only after a
+   `SystemExit`, so any other exception from the audited run discarded the whole
+   output; a wrapped seam that raised never incremented `seam_calls`. `report()`
+   now runs in the `finally` block and `seam_calls[name] += 1` precedes the call,
+   so no accounting path is reachable only on success.
+2. **Bookkeeping that assumed `id()` is a stable identity.** The buckets were
+   keyed by bare `id(bytes)`; once a consumed blob was freed, a fresh allocation
+   could reuse its number and be read as a wire-cache hit, silently dropping
+   events. Every registered blob is now held by a strong reference for the
+   process lifetime, so a tracked id cannot be recycled.
 
-Also fixed: `report()` now runs in the `finally` block, so an exception from the
-audited run can no longer discard the counters, and the unused `useful_pair`
-counter was dropped.
+Also removed: two structural zeros printed as measured quantities
+(`unsourced_seam_bytes`, whose branch was unreachable, and
+`re_pushed_already_snapshotted`, which was never incremented), the unused
+`useful_pair` counter, and the dead `_bytes_len` helper.
 
-**The fixes are output-neutral for every cited number.** Two runs of the fixed
-harness on a one-file corpus (`mypy/util.py`) differ from each other by 389 diff
-lines; old against fixed differs by 408, i.e. the fix adds no more than run-to-run
-`id(bytes)` noise. `re_pushed_builtins` is byte-identical across all three runs
-(4,739) and the seam call/defer counts are identical.
+**Behavioural evidence** (fixtures in `/private/tmp/mypy-rs-perf4-check-*.py`,
+run against the old harness copy and the fixed one):
 
-The before/after dumps cited above were produced by the pre-fix harness; the
-removed lines were always `0` and are not part of any claim.
+| check | old | fixed |
+|---|---|---|
+| register+consume+drop over 4,000 equal-length blobs, events recorded | 12 | 4,000 |
+| wrapped seam that raises, `seam_calls` | 0 | 1 |
+| injected `RuntimeError` in the audited run, report emitted | no | yes |
+| one-file corpus (`mypy/util.py`) serialization events | 106,087 | 198,963 |
+
+The last row is why the bucket tables above are labelled undercounts: the old
+keying was dropping roughly half of all events. The seam `calls`/`defers`
+columns and the `MYPY_SERIALIZE_STATS` funnel counters are direct counters and
+are byte-identical across the old and fixed harness on the same corpus
+(`rust_flatten_nested_unions` 25,559 calls / 1 defer, `rust_copy_modified`
+16,557 / 0, `re_pushed_builtins` 4,739 in all runs).
 
 ## Caveats
 
@@ -278,8 +304,11 @@ removed lines were always `0` and are not part of any claim.
   `resolver.update`, before the `#1652` dirty-signature filter, so it does not
   measure post-#1652 re-snapshots; no claim is made about #1652 from these
   numbers.
-- The harness keys serialization events by `id(bytes)` and does not hold
-  consumed ids alive, so id reuse adds low-double-digit noise to the
-  per-call-site tables, and removing a consumer shifts events between buckets
-  (see the headline section). The seam-level counts and the funnel counters
-  are stable across the three runs taken here.
+- The harness keyed its buckets by `id(bytes)` until this PR's last commit; the
+  id-keyed tables here are pre-fix and undercount (demonstrated 106,087 ->
+  198,963 events on a one-file corpus). Seam `calls`/`defers` and the funnel
+  counters are direct counters and are unaffected. The **fixed** keying holds
+  every registered blob alive for the process lifetime, so a full-corpus run
+  carries extra resident memory that the pre-fix runs did not; the measured
+  files are ~50 MB of distinct encoded bytes, and the corrected full-corpus run
+  completed cleanly at 353 files.
