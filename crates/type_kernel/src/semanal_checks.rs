@@ -540,12 +540,14 @@ pub(crate) fn rust_classify_method_signature(
         },
         Err(_) => return None,
     };
+    // One `mypy.types` import for both isinstance probes below (method
+    // signature is a hot path).
+    let types_mod = match func.py().import("mypy.types") {
+        Ok(m) => m,
+        Err(_) => return None,
+    };
     let functype_is_callable = match func.getattr("type") {
         Ok(t) => {
-            let types_mod = match func.py().import("mypy.types") {
-                Ok(m) => m,
-                Err(_) => return None,
-            };
             let callable_cls: &PyType = match types_mod.getattr("CallableType") {
                 Ok(c) => match c.downcast() {
                     Ok(c) => c,
@@ -562,10 +564,6 @@ pub(crate) fn rust_classify_method_signature(
     };
     let self_type_is_any = match self_type {
         Some(t) => {
-            let types_mod = match func.py().import("mypy.types") {
-                Ok(m) => m,
-                Err(_) => return None,
-            };
             let any_cls = match types_mod.getattr("AnyType") {
                 Ok(c) => c,
                 Err(_) => return None,
@@ -724,16 +722,17 @@ fn read_kinds_and_names(typ: &PyAny) -> Option<(Vec<i64>, Vec<Option<String>>)> 
     Some((arg_kinds, arg_names))
 }
 
-/// `#[pyfunction]` entry for `SemanticAnalyzer.remove_unpack_kwargs`
-/// (semanal.py:1575-1598).
+/// Wire-format `#[pyfunction]` entry for `SemanticAnalyzer.remove_unpack_kwargs`
+/// (semanal.py:1575-1598). **Test-only since #1663**: the production shim calls
+/// `rust_classify_remove_unpack_kwargs_live` below (no wire bytes); this entry,
+/// `classify_remove_unpack_kwargs` and `wire_last_arg_facts` are kept so the
+/// wire path stays directly coverable, including its `TypeAliasType` defer.
 ///
 /// `typ` is the live analyzed `CallableType`: Rust reads its `arg_kinds`
 /// (numeric via each `ArgKind.value`) and `arg_names` via PyO3.
-/// `last_type_wire` is the shim's one wire serialization of
-/// `typ.arg_types[-1]`; `None` (serialization failed or the shim skipped
-/// the encode) defers. Returns `Some((tag, sorted_overlap))` for every
-/// decided case; the Python shim applies both `self.fail` emissions and
-/// all three `copy_modified` rewrites.
+/// `last_type_wire` is a wire serialization of `typ.arg_types[-1]`; `None`
+/// (serialization failed) defers. Returns `Some((tag, sorted_overlap))` for
+/// every decided case.
 #[pyfunction]
 #[pyo3(signature = (typ, last_type_wire))]
 pub(crate) fn rust_classify_remove_unpack_kwargs(
@@ -781,8 +780,21 @@ pub(crate) fn rust_classify_remove_unpack_kwargs_live(
         Ok(v) => v,
         Err(_) => return Ok(None),
     };
-    let types_mod = py.import("mypy.types")?;
-    let unpack_cls: &PyType = types_mod.getattr("UnpackType")?.downcast()?;
+    // Every unreadable fact below defers (`Ok(None)`): the shim's except set
+    // does not cover ImportError/AttributeError, so a `?` here would crash
+    // the analyzer instead of letting the pure-Python body run.
+    let types_mod = match py.import("mypy.types") {
+        Ok(m) => m,
+        Err(_) => return Ok(None),
+    };
+    let unpack_cls = match types_mod.getattr("UnpackType") {
+        Ok(c) => c,
+        Err(_) => return Ok(None),
+    };
+    let unpack_cls: &PyType = match unpack_cls.downcast() {
+        Ok(c) => c,
+        Err(_) => return Ok(None),
+    };
     match last.is_instance(unpack_cls) {
         Ok(false) => return Ok(Some((UNPACK_KW_PASSTHROUGH, Vec::new()))),
         Ok(true) => {}
@@ -800,7 +812,14 @@ pub(crate) fn rust_classify_remove_unpack_kwargs_live(
         Ok(v) => v,
         Err(_) => return Ok(None),
     };
-    let td_cls: &PyType = types_mod.getattr("TypedDictType")?.downcast()?;
+    let td_cls = match types_mod.getattr("TypedDictType") {
+        Ok(c) => c,
+        Err(_) => return Ok(None),
+    };
+    let td_cls: &PyType = match td_cls.downcast() {
+        Ok(c) => c,
+        Err(_) => return Ok(None),
+    };
     match proper.is_instance(td_cls) {
         Ok(false) => return Ok(Some((UNPACK_KW_NOT_TD_FAIL, Vec::new()))),
         Ok(true) => {}

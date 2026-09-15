@@ -71,8 +71,8 @@ pub(crate) const RECALC_ENUM_GENERIC_FAIL: i64 = 3;
 /// `mc_name` (None when the expression is not a Name/Member chain),
 /// `sym_missing` (the `lookup_qualified` result was None), the
 /// Var/Placeholder isinstance facts (None when unreadable), `var_any`
-/// (whether the Var symbol's proper type is `AnyType`; None when the wire
-/// bytes are undecodable), and the three metaclass-info facts (None when
+/// (whether the Var symbol's proper type is `AnyType`; None when the live
+/// isinstance on it failed), and the three metaclass-info facts (None when
 /// unreadable). Branch order mirrors Python exactly.
 #[allow(clippy::too_many_arguments)]
 fn classify_declared_metaclass_inner(
