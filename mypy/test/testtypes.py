@@ -13915,15 +13915,17 @@ class NativeCheckArgumentTypesPlanSuite(Suite):
 
     def test_simple_args(self) -> None:
         # def f(a: A, b: B); f(x, y) -> one check_arg per formal.
+        # No unpack formals, so the seam skips wire serialization.
         fx = self.fx
         callee = self._callee([fx.a, fx.b], [ARG_POS, ARG_POS])
-        self._run([fx.a, fx.b], [ARG_POS, ARG_POS], callee, [[0], [1]])
+        self._run([fx.a, fx.b], [ARG_POS, ARG_POS], callee, [[0], [1]], assert_engages=False)
 
     def test_vararg_match(self) -> None:
         # def f(*args: A); f(A, B, A) -> all three actuals to formal 0.
+        # ARG_STAR formal is not UnpackType, so the seam skips.
         fx = self.fx
         callee = self._callee([fx.a], [ARG_STAR])
-        self._run([fx.a, fx.b, fx.a], [ARG_POS, ARG_POS, ARG_POS], callee, [[0, 1, 2]])
+        self._run([fx.a, fx.b, fx.a], [ARG_POS, ARG_POS, ARG_POS], callee, [[0, 1, 2]], assert_engages=False)
 
     def test_too_many_arguments(self) -> None:
         # def f(x: tuple[A, B]); caller passes 3 positional actuals.

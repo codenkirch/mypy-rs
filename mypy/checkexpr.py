@@ -4343,11 +4343,14 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
         # Keep track of consumed tuple *arg items.
         mapper = ArgTypeExpander(self.argument_infer_context())
 
-        # Native seam: Rust derives the per-formal plan; the shim reports
-        # count errors and drives the ArgTypeExpander loop. No-args
-        # aliases expand in Rust; the rest defers (needs the resolver).
+        # Rust planner only adds value for UnpackType formals; skip
+        # wire serialization for plain callees (trivial Python loop).
+        has_unpack = any(
+            isinstance(get_proper_type(t), UnpackType) for t in callee.arg_types
+        )
         if (
-            _CHECKEXPR_HAS_TYPE_KERNEL
+            has_unpack
+            and _CHECKEXPR_HAS_TYPE_KERNEL
             and _native_checkexpr_active
             and _native_checkexpr_resolver is not None
             and _rust_check_argument_types_plan is not None
@@ -4538,50 +4541,6 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
         caller_type = get_proper_type(caller_type)
         original_caller_type = get_proper_type(original_caller_type)
         callee_type = get_proper_type(callee_type)
-
-        # Native type_kernel seam: classify the 4-way dispatch in Rust
-        # (checkexpr_functions.rs); message emission stays here. The two
-        # booleans are pure, so eager evaluation is value-preserving.
-        if (
-            _CHECKEXPR_HAS_TYPE_KERNEL
-            and _native_checkexpr_active
-            and _rust_classify_check_arg is not None
-        ):
-            try:
-                tag = _rust_classify_check_arg(
-                    _serialize_type_for_checkexpr(caller_type),
-                    is_subtype(caller_type, callee_type, options=self.chk.options),
-                    self.has_abstract_type_part(caller_type, callee_type),
-                )
-            except (AssertionError, NotImplementedError, ValueError, TypeError):
-                tag = None
-            if tag is not None:
-                if tag == NATIVE_CHECK_ARG_DELETED:
-                    self.msg.deleted_as_rvalue(cast(DeletedType, caller_type), context)
-                elif tag == NATIVE_CHECK_ARG_ABSTRACT_ONLY:
-                    self.msg.concrete_only_call(callee_type, context)
-                elif tag == NATIVE_CHECK_ARG_INCOMPATIBLE:
-                    error = self.msg.incompatible_argument(
-                        n,
-                        m,
-                        callee,
-                        original_caller_type,
-                        caller_kind,
-                        object_type=object_type,
-                        context=context,
-                        outer_context=outer_context,
-                    )
-                    if not caller_kind.is_star():
-                        # For *args / **kwargs this note would be incorrect: we compare
-                        # iterable/mapping type with union of relevant arg types.
-                        self.msg.incompatible_argument_note(
-                            original_caller_type, callee_type, context, parent_error=error
-                        )
-                    if not self.msg.prefer_simple_messages():
-                        self.chk.check_possible_missing_await(
-                            caller_type, callee_type, context, error.code
-                        )
-                return
 
         if isinstance(caller_type, DeletedType):
             self.msg.deleted_as_rvalue(caller_type, context)
