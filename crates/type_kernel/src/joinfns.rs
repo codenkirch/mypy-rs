@@ -259,6 +259,7 @@ pub(crate) fn combine_similar_callables_core(
         type_guard,
         type_is,
         special_sig: None,
+        definition_ref: None,
     };
     encode_type(&new_callable)
 }

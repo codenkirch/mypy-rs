@@ -69,10 +69,10 @@ from librt.internal import (
 )
 from mypy_extensions import u8
 
-# High-level cache layout format; 13 adds the TypeAliasType
-# recursion-flag conditional int (wave31, #1345): stale entries
-# lack it and the native is_recursive_pair seam misreads them.
-CACHE_VERSION: Final = 13
+# High-level cache layout format; 14 adds the CallableType
+# definition_ref and PartialType wire fields (#1620): stale
+# entries lack both and the kernel misreads them.
+CACHE_VERSION: Final = 14
 
 # Type used internally to represent errors:
 #   (path, line, column, end_line, end_column, severity, message, code)

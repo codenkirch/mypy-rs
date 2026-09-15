@@ -164,6 +164,7 @@ fn is_type_obj(fallback: &Type, ret_type: &Type, resolver: &TypeResolver) -> boo
 fn contains_erased(typ: &Type) -> bool {
     match typ {
         Type::ErasedType => true,
+        Type::PartialType { .. } => false,
         Type::Instance {
             args,
             last_known_value,
@@ -319,6 +320,7 @@ fn bind_self_fast_inner(typ: &Type) -> Option<Type> {
                     type_guard: type_guard.clone(),
                     type_is: type_is.clone(),
                     special_sig: None,
+                    definition_ref: None,
                 }),
                 None => Some(typ.clone()),
             }
@@ -1096,6 +1098,7 @@ fn for_each_child<F: FnMut(&Type)>(typ: &Type, f: &mut F) {
         }
         Type::NoneType
         | Type::ErasedType
+        | Type::PartialType { .. }
         | Type::UninhabitedType { .. }
         | Type::DeletedType { .. } => {}
     }
@@ -1226,6 +1229,7 @@ fn freeze_children<F: FnMut(&mut Type)>(typ: &mut Type, f: &mut F) {
         }
         Type::NoneType
         | Type::ErasedType
+        | Type::PartialType { .. }
         | Type::UninhabitedType { .. }
         | Type::DeletedType { .. } => {}
     }
@@ -3293,6 +3297,7 @@ fn analyze_none_bool_type() -> Type {
         type_guard: None,
         type_is: None,
         special_sig: None,
+        definition_ref: None,
     }
 }
 
@@ -3359,6 +3364,7 @@ fn analyze_typeddict_access_inner(
             type_guard: None,
             type_is: None,
             special_sig: None,
+            definition_ref: None,
         })
     } else {
         // __setitem__ needs checker state; fallback branch recurses on
@@ -4352,6 +4358,7 @@ fn add_class_tvars_inner(
                     type_guard: etg.clone(),
                     type_is: eti.clone(),
                     special_sig: None,
+                    definition_ref: None,
                 },
                 _ => {
                     return None;
@@ -5009,6 +5016,7 @@ mod tests {
             type_guard: None,
             type_is: None,
             special_sig: None,
+            definition_ref: None,
         }
     }
 
@@ -5285,6 +5293,7 @@ mod tests {
             type_guard: None,
             type_is: None,
             special_sig: None,
+            definition_ref: None,
         };
         let result = bind_self_fast_inner(&method).expect("empty-arg method returned unchanged");
         match result {
@@ -6310,6 +6319,7 @@ mod tests {
             type_guard: None,
             type_is: None,
             special_sig: None,
+            definition_ref: None,
         }
     }
 
@@ -6371,6 +6381,7 @@ mod tests {
             type_guard: None,
             type_is: None,
             special_sig: None,
+            definition_ref: None,
         };
         // Empty arg_types -> Python reports no_formal_self -> defer.
         assert!(check_self_arg_inner(
@@ -6454,6 +6465,7 @@ mod tests {
             type_guard: None,
             type_is: None,
             special_sig: None,
+            definition_ref: None,
         };
         let itype = make_instance("builtins.int");
         let result =
@@ -6491,6 +6503,7 @@ mod tests {
             type_guard: None,
             type_is: None,
             special_sig: None,
+            definition_ref: None,
         };
         let itype = make_instance("builtins.int");
         let result = expand_and_bind_callable_inner(&callable, &itype, false, 100, true, &resolver)
@@ -6533,6 +6546,7 @@ mod tests {
             type_guard: None,
             type_is: None,
             special_sig: None,
+            definition_ref: None,
         };
         let result = add_class_tvars_inner(
             &callable,
@@ -6700,6 +6714,7 @@ mod tests {
             type_guard: None,
             type_is: None,
             special_sig: None,
+            definition_ref: None,
         }
     }
 
@@ -6774,6 +6789,7 @@ mod tests {
             type_guard: None,
             type_is: None,
             special_sig: None,
+            definition_ref: None,
         };
         let result = member_method_inner(
             &make_ga_instance(),
@@ -6811,6 +6827,7 @@ mod tests {
             type_guard: None,
             type_is: None,
             special_sig: None,
+            definition_ref: None,
         };
         let result = member_method_inner(
             &make_ga_instance(),
@@ -6941,6 +6958,7 @@ mod tests {
             type_guard: None,
             type_is: None,
             special_sig: None,
+            definition_ref: None,
         }
     }
 

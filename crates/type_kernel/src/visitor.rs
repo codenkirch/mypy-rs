@@ -252,7 +252,8 @@ pub(crate) fn has_recursive_types_inner(typ: &Type) -> bool {
         | Type::NoneType
         | Type::ErasedType
         | Type::DeletedType { .. }
-        | Type::LiteralType { .. } => false,
+        | Type::LiteralType { .. }
+        | Type::PartialType { .. } => false,
     }
 }
 
@@ -654,6 +655,7 @@ pub(crate) fn callable_with_ellipsis_inner(
         type_guard: None,
         type_is: None,
         special_sig: None,
+        definition_ref: None,
     }
 }
 
@@ -1245,6 +1247,7 @@ mod tests {
             type_guard: None,
             type_is: None,
             special_sig: None,
+            definition_ref: None,
         }
     }
 
@@ -1544,6 +1547,7 @@ mod tests {
                 type_guard: None,
                 type_is: None,
                 special_sig: None,
+                definition_ref: None,
             }
         }
         let result = remove_dups_py_eq_inner(&[callable(false), callable(true)]);

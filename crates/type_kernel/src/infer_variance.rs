@@ -164,6 +164,7 @@ fn erase_return_self_types_wire(typ: &Type, self_type: &Type) -> Option<Type> {
                     type_guard,
                     type_is,
                     special_sig: None,
+                    definition_ref: None,
                 })
             } else {
                 Some(t)
@@ -313,6 +314,7 @@ mod tests {
             type_guard: None,
             type_is: None,
             special_sig: None,
+            definition_ref: None,
         }
     }
 

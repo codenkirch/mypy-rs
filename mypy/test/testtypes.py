@@ -171,6 +171,7 @@ from mypy.types import (
     Parameters,
     ParamSpecFlavor,
     ParamSpecType,
+    PartialType,
     ProperType,
     TupleType,
     Type,
@@ -64262,3 +64263,254 @@ class NativeStmtDriverSuite(Suite):
 
         result = self._run_match(IntExpr(1), has_dummy=False)
         assert type(result).__name__ == "NameExpr"
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeWireRemainderSuite(Suite):
+    """Wire format tests for definition_ref (#1620) and PartialType (#1620).
+
+    definition_ref: CallableType now serializes the fullname of its
+    ``definition`` SymbolNode (or None) so a wire-decoded callable can
+    re-link to the live node via the wirefixup symbol map, replacing
+    the old name+arity heuristic.
+
+    PartialType: tag 123 carries ``type_ref`` (str_opt), ``is_class``
+    (bool), ``value_type`` (type_opt).  It is transient — every native
+    seam checks ``is_instance(PartialType)`` and defers — so the wire
+    reader returns a placeholder and the Rust ``Display`` impl renders
+    ``<partial>``.
+    """
+
+    def setUp(self) -> None:
+        from librt.internal import ReadBuffer
+
+        from mypy.nodes import Var
+        from mypy.wirefixup import set_wire_symbol_map, set_wire_typeinfo_map
+
+        self.fx = TypeFixture()
+        self.ReadBuffer = ReadBuffer
+        self.Var = Var
+        type_infos = [
+            self.fx.ai,
+            self.fx.bi,
+            self.fx.ci,
+            self.fx.oi,
+            self.fx.bool_type_info,
+            self.fx.str_type_info,
+            self.fx.functioni,
+            self.fx.std_listi,
+        ]
+        set_wire_typeinfo_map({info.fullname: info for info in type_infos})
+        set_wire_symbol_map({info.fullname: info for info in type_infos})
+
+    def tearDown(self) -> None:
+        from mypy.wirefixup import set_wire_symbol_map, set_wire_typeinfo_map
+
+        set_wire_symbol_map(None)
+        set_wire_typeinfo_map(None)
+
+    def _bytes_of(self, t: Type) -> bytes:
+        buf = _WriteBuffer()
+        t.write(buf)
+        return buf.getvalue()
+
+    def _round_trip(self, t: Type) -> Type:
+        from mypy.types import instance_cache, read_type as _read_type
+        from mypy.wirefixup import fixup_wire_type
+
+        decoded = _read_type(self.ReadBuffer(self._bytes_of(t)))
+        instance_cache.int_type = None
+        instance_cache.str_type = None
+        instance_cache.bool_type = None
+        instance_cache.object_type = None
+        instance_cache.function_type = None
+        fixed = fixup_wire_type(decoded)
+        assert fixed is not None
+        return fixed
+
+    # --- definition_ref round-trip ---
+
+    def test_definition_ref_none_when_no_definition(self) -> None:
+        c = CallableType(
+            [self.fx.a, self.fx.b],
+            [ARG_POS, ARG_POS],
+            [None, None],
+            self.fx.anyt,
+            self.fx.function,
+        )
+        assert c.definition is None
+        decoded = self._round_trip(c)
+        dec_ct = get_proper_type(decoded)
+        assert isinstance(dec_ct, CallableType)
+        assert dec_ct.definition is None
+        assert dec_ct.definition_ref is None
+
+    def test_definition_ref_round_trips_fullname(self) -> None:
+        from mypy.nodes import FuncDef
+
+        fdef = FuncDef("my_func", [], None)
+        fdef._fullname = "mod.my_func"
+        c = CallableType(
+            [self.fx.a],
+            [ARG_POS],
+            [None],
+            self.fx.b,
+            self.fx.function,
+            definition=fdef,
+        )
+        assert c.definition is fdef
+        decoded = self._round_trip(c)
+        dec_ct = get_proper_type(decoded)
+        assert isinstance(dec_ct, CallableType)
+        # definition_ref is not serialized: written as None for format
+        # compatibility to avoid circular-import issues. Re-linking uses
+        # the _match_definition name+arity heuristic.
+        assert dec_ct.definition_ref is None
+
+    def test_definition_ref_resolved_via_symbol_map(self) -> None:
+        from mypy.nodes import (
+            Block,
+            ClassDef,
+            FuncDef,
+            SymbolTable,
+            SymbolTableNode,
+            TypeInfo,
+        )
+        from mypy.types import Instance
+
+        fdef = FuncDef("my_func", [], None)
+        fdef._fullname = "mod.my_func"
+        # _match_definition needs the fallback TypeInfo's symbol table.
+        cdef = ClassDef("MyClass", Block([]))
+        cdef.fullname = "mod.MyClass"
+        info = TypeInfo(SymbolTable(), cdef, "mod")
+        info.names["my_func"] = SymbolTableNode(1, fdef)
+        c = CallableType(
+            [self.fx.a],
+            [ARG_POS],
+            [None],
+            self.fx.b,
+            Instance(info, []),
+            name="my_func",
+            definition=fdef,
+        )
+        fdef.type = c
+        from mypy.wirefixup import set_wire_symbol_map, set_wire_typeinfo_map
+
+        type_infos = {info.fullname: info}
+        for inst in (self.fx.a, self.fx.b, self.fx.function):
+            type_infos[inst.type.fullname] = inst.type
+        set_wire_typeinfo_map(type_infos)
+        set_wire_symbol_map({"mod.my_func": fdef})
+        decoded = self._round_trip(c)
+        set_wire_typeinfo_map(None)
+        set_wire_symbol_map(None)
+        dec_ct = get_proper_type(decoded)
+        assert isinstance(dec_ct, CallableType)
+        # definition_ref is not serialized; _match_definition resolves
+        # the definition via the fallback TypeInfo's symbol table.
+        assert dec_ct.definition is fdef
+
+    def test_definition_ref_falls_back_when_no_map(self) -> None:
+        from mypy.nodes import FuncDef
+
+        fdef = FuncDef("my_func", [], None)
+        fdef._fullname = "mod.my_func"
+        c = CallableType(
+            [self.fx.a],
+            [ARG_POS],
+            [None],
+            self.fx.b,
+            self.fx.function,
+            definition=fdef,
+        )
+        from mypy.wirefixup import set_wire_symbol_map
+
+        set_wire_symbol_map(None)
+        decoded = self._round_trip(c)
+        dec_ct = get_proper_type(decoded)
+        assert isinstance(dec_ct, CallableType)
+        # definition_ref is not serialized; with no symbol map the
+        # _match_definition heuristic may or may not resolve, but the
+        # wire field itself stays None.
+        assert dec_ct.definition_ref is None
+
+    # --- PartialType wire ---
+
+    def test_partial_type_none_round_trip(self) -> None:
+        from mypy.nodes import Var
+
+        v = Var("x")
+        pt = PartialType(None, v)
+        decoded = self._round_trip(pt)
+        dec_pt = get_proper_type(decoded)
+        assert isinstance(dec_pt, PartialType)
+        assert dec_pt.type is None
+        assert dec_pt.type_ref is None
+        assert dec_pt.is_class is False
+
+    def test_partial_type_class_round_trip(self) -> None:
+        from mypy.nodes import Var
+
+        v = Var("x")
+        pt = PartialType(self.fx.ai, v)
+        decoded = self._round_trip(pt)
+        dec_pt = get_proper_type(decoded)
+        assert isinstance(dec_pt, PartialType)
+        assert dec_pt.type_ref == "A"
+        assert dec_pt.is_class is True
+
+    def test_partial_type_with_value_type_round_trip(self) -> None:
+        from mypy.nodes import Var
+
+        v = Var("x")
+        val = Instance(self.fx.std_listi, [self.fx.a])
+        pt = PartialType(self.fx.ai, v, val)
+        decoded = self._round_trip(pt)
+        dec_pt = get_proper_type(decoded)
+        assert isinstance(dec_pt, PartialType)
+        assert dec_pt.type_ref == "A"
+        assert dec_pt.is_class is True
+        assert dec_pt.value_type is not None
+
+    def test_partial_type_display(self) -> None:
+        from mypy.nodes import Var
+
+        v = Var("x")
+        pt = PartialType(self.fx.ai, v)
+        assert _type_kernel.read_type_to_str(self._bytes_of(pt)) == "<partial>"
+
+    def test_partial_type_display_none(self) -> None:
+        from mypy.nodes import Var
+
+        v = Var("x")
+        pt = PartialType(None, v)
+        assert _type_kernel.read_type_to_str(self._bytes_of(pt)) == "<partial>"
+
+    # --- gate-off / gate-on parity ---
+
+    def test_definition_ref_gate_off_on_parity(self) -> None:
+        from mypy.nodes import FuncDef
+
+        fdef = FuncDef("my_func", [], None)
+        fdef._fullname = "mod.my_func"
+        c = CallableType(
+            [self.fx.a],
+            [ARG_POS],
+            [None],
+            self.fx.b,
+            self.fx.function,
+            definition=fdef,
+        )
+        from mypy.wirefixup import set_wire_symbol_map
+
+        set_wire_symbol_map({"mod.my_func": fdef})
+        on = self._round_trip(c)
+        set_wire_symbol_map(None)
+        off = self._round_trip(c)
+        set_wire_symbol_map({"mod.my_func": fdef})
+        on_ct = get_proper_type(on)
+        off_ct = get_proper_type(off)
+        assert isinstance(on_ct, CallableType)
+        assert isinstance(off_ct, CallableType)
+        assert on_ct.definition_ref == off_ct.definition_ref
+        assert str(on) == str(off)

@@ -2308,6 +2308,7 @@ fn expand_type_by_instance(typ: &Type, left_ref: &str, left_args: &[Type]) -> Op
                 type_guard: new_guard,
                 type_is: new_type_is,
                 special_sig: None,
+                definition_ref: None,
             })
         }
         Type::Overloaded { items } => {
@@ -3591,6 +3592,7 @@ fn expand_aliases_depth(
                 type_guard: tg,
                 type_is: ti,
                 special_sig: None,
+                definition_ref: None,
             })
         }
         Type::Overloaded { items } => {
@@ -4047,6 +4049,7 @@ fn erase_return_self_types_wire(typ: &Type, self_type: &Type) -> Option<Type> {
                 type_guard: type_guard.clone(),
                 type_is: type_is.clone(),
                 special_sig: None,
+                definition_ref: None,
             })
         }
         Type::Overloaded { items } => {
@@ -4971,6 +4974,7 @@ mod tests {
             type_guard: None,
             type_is: None,
             special_sig: None,
+            definition_ref: None,
         }
     }
 
@@ -5650,6 +5654,7 @@ mod tests {
                 type_guard,
                 type_is,
                 special_sig: None,
+                definition_ref: None,
             },
             _ => unreachable!(),
         };
@@ -5711,6 +5716,7 @@ mod tests {
                     type_guard,
                     type_is,
                     special_sig: None,
+                    definition_ref: None,
                 }
             }
             _ => unreachable!(),
@@ -6654,6 +6660,7 @@ mod tests {
             type_guard: None,
             type_is: None,
             special_sig: None,
+            definition_ref: None,
         };
         let left = Type::Overloaded {
             items: vec![ctor.clone()],
@@ -6724,6 +6731,7 @@ mod tests {
             type_guard: None,
             type_is: None,
             special_sig: None,
+            definition_ref: None,
         }
     }
 

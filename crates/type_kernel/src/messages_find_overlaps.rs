@@ -237,6 +237,7 @@ fn collect_named_types(t: &Type, d: &mut HashMap<String, HashSet<String>>) -> Re
         | Type::UninhabitedType { .. }
         | Type::NoneType
         | Type::ErasedType
+        | Type::PartialType { .. }
         | Type::DeletedType { .. } => {}
     }
     Ok(())

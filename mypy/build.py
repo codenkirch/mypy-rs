@@ -1001,6 +1001,9 @@ class BuildManager:
         self._native_walked_modules: set[str] = set()
         # Persistent alias map, grown incrementally per SCC.
         self._native_alias_map: dict[str, TypeAlias] = {}
+        # Persistent symbol map (fullname -> SymbolNode) for resolving
+        # CallableType.definition_ref on wire-decoded callables.
+        self._native_symbol_map: dict[str, Any] = {}
         # Fullnames already fed to the Rust resolver snapshot. Tracked
         # separately from `_native_typeinfo_map`: the semanal hook
         # (`_install_semal_wirefixup`) adds map entries before it runs.
@@ -1968,6 +1971,7 @@ class BuildManager:
         self._native_typeinfo_map = {}
         self._native_walked_modules = set()
         self._native_alias_map = {}
+        self._native_symbol_map = {}
         self._native_snapshotted = set()
         # Last-fed `builtins.*` content signatures are per-build state
         # like the snapshot; a daemon recheck must re-snapshot, not
@@ -1983,15 +1987,16 @@ class BuildManager:
         from mypy.mro import _set_native_mro_resolver
         from mypy.nodes import _clear_native_metaclass_memo
         from mypy.subtypes import _set_native_subtype_resolver
-        from mypy.wirefixup import set_wire_alias_map
+        from mypy.wirefixup import set_wire_alias_map, set_wire_symbol_map
 
         _clear_native_metaclass_memo()
         _set_native_subtype_resolver(None)
         _set_native_join_resolver(None)
         _set_native_join_typeinfo_map(None)
-        # The alias map is derived from the same build's resolver snapshot;
-        # a stale alias must never resolve into the new build.
+        # The alias and symbol maps are derived from the same build's
+        # resolver snapshot; a stale entry must never resolve into the new build.
         set_wire_alias_map(None)
+        set_wire_symbol_map(None)
         _set_native_mro_resolver(None, None)
         from mypy.solve import _set_native_solve_resolver
 
@@ -2068,7 +2073,7 @@ class BuildManager:
         if module is None:
             return
         from mypy.nodes import TypeAlias, TypeInfo
-        from mypy.wirefixup import set_wire_alias_map, set_wire_typeinfo_map
+        from mypy.wirefixup import set_wire_alias_map, set_wire_symbol_map, set_wire_typeinfo_map
 
         # Mirror `_collect_incremental`'s per-module walk: TypeInfos
         # including nested classes, top-level aliases plus info-reachable
@@ -2088,11 +2093,42 @@ class BuildManager:
             self._native_alias_map[alias.fullname] = alias
         for info in infos:
             self._native_typeinfo_map[info.fullname] = info
+        # Collect SymbolNodes (FuncDef, OverloadedFuncDef, Decorator) for
+        # resolving CallableType.definition_ref on wire-decoded callables.
+        self._collect_symbol_nodes(module, infos)
         # Same-identity installs are no-ops for the deser caches; the
         # first install (or the post-clear fresh map) triggers the
         # invalidation `set_wire_typeinfo_map` owns.
         set_wire_typeinfo_map(self._native_typeinfo_map)
         set_wire_alias_map(self._native_alias_map)
+        set_wire_symbol_map(self._native_symbol_map)
+
+    def _collect_symbol_nodes(
+        self, module: MypyFile, infos: list[TypeInfo]
+    ) -> None:
+        """Collect FuncDef/OverloadedFuncDef/Decorator nodes into the symbol map.
+
+        Walks the module symbol table and each TypeInfo's symbol table so
+        ``CallableType.definition_ref`` can resolve to the exact live node
+        instead of the name+arity heuristic in ``_TypeRefFixer._match_definition``.
+        """
+        from mypy.nodes import Decorator, FuncDef, OverloadedFuncDef
+
+        def _walk_table(table: Any) -> None:
+            for sym in table.values():
+                node = sym.node
+                if isinstance(node, (FuncDef, OverloadedFuncDef, Decorator)):
+                    if node.fullname:
+                        self._native_symbol_map[node.fullname] = node
+                    if isinstance(node, OverloadedFuncDef):
+                        for item in node.items:
+                            if isinstance(item, (FuncDef, Decorator)):
+                                if item.fullname:
+                                    self._native_symbol_map[item.fullname] = item
+
+        _walk_table(module.names)
+        for info in infos:
+            _walk_table(info.names)
 
     def _refresh_native_wirefixup_maps(self, module: MypyFile) -> None:
         """Re-home wirefixup map entries after fine-grained merge_asts.
@@ -2111,6 +2147,7 @@ class BuildManager:
         from mypy.wirefixup import (
             clear_wire_decode_caches,
             set_wire_alias_map,
+            set_wire_symbol_map,
             set_wire_typeinfo_map,
         )
 
@@ -2142,6 +2179,7 @@ class BuildManager:
             # Same-dict installs: re-point the module-level wire globals.
             set_wire_typeinfo_map(self._native_typeinfo_map)
             set_wire_alias_map(self._native_alias_map)
+            set_wire_symbol_map(self._native_symbol_map)
 
     def _build_plugin_hook_registry(self) -> None:
         """Build the Stage 4 plugin-hook snapshot and install it.

@@ -119,7 +119,8 @@ fn tree_has_alias(t: &Type) -> bool {
         Type::UninhabitedType { .. }
         | Type::NoneType
         | Type::ErasedType
-        | Type::DeletedType { .. } => false,
+        | Type::DeletedType { .. }
+        | Type::PartialType { .. } => false,
     }
 }
 

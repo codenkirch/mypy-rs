@@ -1142,6 +1142,7 @@ fn meet_similar_callables_impl(
         type_guard: None,
         type_is: None,
         special_sig: None,
+        definition_ref: None,
     };
 
     encode_callable(new_callable)
@@ -1942,6 +1943,7 @@ fn join_similar_callables_impl(
         type_guard,
         type_is,
         special_sig: None,
+        definition_ref: None,
     };
     encode_callable(new_callable)
 }
@@ -2018,6 +2020,7 @@ fn combine_similar_callables(
         type_guard,
         type_is,
         special_sig: None,
+        definition_ref: None,
     };
     let _ = t;
     let _ = s;
@@ -4185,6 +4188,7 @@ fn contains_recursive_alias_at(t: &Type, depth: u32) -> bool {
         | Type::ErasedType
         | Type::UninhabitedType { .. }
         | Type::DeletedType { .. } => false,
+        Type::PartialType { .. } => false,
         Type::Parameters(p) => {
             p.arg_types
                 .iter()
@@ -6667,6 +6671,7 @@ mod tests {
             type_guard: None,
             type_is: None,
             special_sig: None,
+            definition_ref: None,
         }
     }
 
@@ -6701,6 +6706,7 @@ mod tests {
             type_guard: None,
             type_is: None,
             special_sig: None,
+            definition_ref: None,
         }
     }
 
@@ -11193,6 +11199,7 @@ mod tests {
                 type_guard: None,
                 type_is: None,
                 special_sig: None,
+                definition_ref: None,
             }
         }
 

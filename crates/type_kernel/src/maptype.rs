@@ -471,6 +471,7 @@ mod tests {
                 type_guard: None,
                 type_is: None,
                 special_sig: None,
+                definition_ref: None,
             },
         ])
         .unwrap();

@@ -3020,6 +3020,7 @@ mod tests {
             type_guard: None,
             type_is: None,
             special_sig: None,
+            definition_ref: None,
         };
         let owned: HashSet<TvId> = HashSet::from([(7, 1, "fn".to_string())]);
         let out = solve_one_for_dependent(&[lo], &[], false, true, &r, &owned);

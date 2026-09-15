@@ -275,6 +275,7 @@ pub(crate) fn erase_type(t: &Type, strict_optional: bool, res: &TypeResolver) ->
             type_guard: None,
             type_is: None,
             special_sig: None,
+            definition_ref: None,
         }),
         // visit_overloaded (erasetype.py:218-219): `t.fallback.accept(self)`,
         // where `Overloaded.fallback` is `items[0].fallback`. An empty items
@@ -310,6 +311,7 @@ pub(crate) fn erase_type(t: &Type, strict_optional: bool, res: &TypeResolver) ->
             let erased_item = erase_type(item, strict_optional, res)?;
             make_normalized_type_type(erased_item, *is_type_form)
         }
+        Type::PartialType { .. } => None,
         Type::Parameters(_) => None,
     }
 }
@@ -563,6 +565,7 @@ mod tests {
             type_guard: None,
             type_is: None,
             special_sig: None,
+            definition_ref: None,
         }
     }
 

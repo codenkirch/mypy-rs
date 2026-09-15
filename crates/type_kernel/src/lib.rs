@@ -40,6 +40,7 @@
 //! full staging roadmap.
 
 #![allow(non_local_definitions)]
+#![allow(clippy::large_enum_variant)]
 
 mod aliases;
 mod applytype;

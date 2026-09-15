@@ -129,6 +129,7 @@ fn id_rewrite(expanded: Type, new_vars: Vec<Type>) -> Type {
             type_guard,
             type_is,
             special_sig: None,
+            definition_ref: None,
         },
         _ => unreachable!("id_rewrite: non-CallableType"),
     }
@@ -416,6 +417,7 @@ pub(crate) fn freshen_type(
         Type::AnyType { .. }
         | Type::NoneType
         | Type::ErasedType
+        | Type::PartialType { .. }
         | Type::UninhabitedType { .. }
         | Type::DeletedType { .. }
         | Type::UnboundType { .. }
@@ -659,6 +661,7 @@ pub(crate) fn freshen_type(
                 type_guard: type_guard.clone(),
                 type_is: type_is.clone(),
                 special_sig: None,
+                definition_ref: None,
             };
 
             if variables.is_empty() {
@@ -906,6 +909,7 @@ fn set_callable_variables(t: Type, tvs: Vec<Type>) -> Type {
             type_guard,
             type_is,
             special_sig: None,
+            definition_ref: None,
         },
         _ => unreachable!("freshen: non-CallableType"),
     }
@@ -961,6 +965,7 @@ mod tests {
             type_guard: None,
             type_is: None,
             special_sig: None,
+            definition_ref: None,
         }
     }
 
@@ -1082,6 +1087,7 @@ mod tests {
             type_guard: None,
             type_is: None,
             special_sig: None,
+            definition_ref: None,
         };
         let (next, t_wire, s_wire) = rust_match_generic_callables(
             2,
@@ -1220,6 +1226,7 @@ mod tests {
             type_guard: None,
             type_is: None,
             special_sig: None,
+            definition_ref: None,
         };
         let (t_out, s_out) = renumber_generic_pair(&t, &s, &TypeResolver::new()).unwrap();
         assert_eq!(t_out, t);

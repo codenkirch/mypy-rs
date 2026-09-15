@@ -1206,6 +1206,7 @@ fn format_type_inner_hint(
             Some(format!("[{args}]"))
         }
 
+        Type::PartialType { .. } => None,
         Type::TypeAliasType { .. } => {
             // Already handled above; this is unreachable but the match
             // needs to be exhaustive.
@@ -3145,6 +3146,7 @@ mod tests {
             type_guard: None,
             type_is: None,
             special_sig: None,
+            definition_ref: None,
         }
     }
 

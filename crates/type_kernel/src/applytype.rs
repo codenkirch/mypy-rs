@@ -295,6 +295,7 @@ pub(crate) fn apply_generic_arguments_inner(
         type_guard: new_type_guard,
         type_is: new_type_is,
         special_sig: None,
+        definition_ref: None,
     })
 }
 

@@ -602,6 +602,7 @@ fn callable_fields(handle: u64) -> Option<CallableFields> {
         type_guard,
         type_is,
         special_sig: _,
+        definition_ref: None,
     } = stored
     else {
         return None;
@@ -652,6 +653,7 @@ fn store_callable(handle: u64, cf: CallableFields) -> Option<Vec<u8>> {
         variables: cf.variables,
         type_guard: cf.type_guard,
         type_is: cf.type_is,
+        definition_ref: None,
     };
     let mut wbuf = WriteBuffer::new();
     write_type(&mut wbuf, &patched).ok()?;
@@ -1917,6 +1919,7 @@ mod mirror_tests {
             variables: vec![tvt("T")],
             type_guard: None,
             type_is: None,
+            definition_ref: None,
         };
         let mut w = WriteBuffer::new();
         write_type(&mut w, &t).unwrap();

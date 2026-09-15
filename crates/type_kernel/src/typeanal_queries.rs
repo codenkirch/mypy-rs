@@ -1479,6 +1479,7 @@ fn find_self_type_wire(
         | Type::NoneType
         | Type::UninhabitedType { .. }
         | Type::ErasedType
+        | Type::PartialType { .. }
         | Type::DeletedType { .. }
         // visit_literal_type: strategy([]), the fallback is not queried.
         | Type::LiteralType { .. } => Ok(false),
@@ -2545,6 +2546,7 @@ mod tests {
             type_guard: None,
             type_is: None,
             special_sig: None,
+            definition_ref: None,
         }
     }
 
@@ -3472,6 +3474,7 @@ fn analyze_type_inner(
                 type_guard,
                 type_is,
                 special_sig: None,
+                definition_ref: None,
             })
         }
 
@@ -3604,6 +3607,7 @@ fn analyze_type_inner(
                 is_type_form: *is_type_form,
             })
         }
+        Type::PartialType { .. } => None,
     }
 }
 

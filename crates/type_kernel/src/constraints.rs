@@ -614,6 +614,7 @@ fn infer_constraints_dispatch(
         // Unsupported template shapes: defer to Python.
         Type::TypeVarTupleType { .. } | Type::UnpackType { .. } | Type::Parameters(..) => None,
         Type::ErasedType => Some(vec![]),
+        Type::PartialType { .. } => Some(vec![]),
     }
 }
 
@@ -3683,6 +3684,7 @@ mod tests {
             type_guard: None,
             type_is: None,
             special_sig: None,
+            definition_ref: None,
         }
     }
 
@@ -3801,6 +3803,7 @@ mod tests {
             type_guard: None,
             type_is: None,
             special_sig: None,
+            definition_ref: None,
         };
         assert!(visit_callable_native(
             &template,
@@ -3854,6 +3857,7 @@ mod tests {
             type_guard: None,
             type_is: None,
             special_sig: None,
+            definition_ref: None,
         };
         assert!(visit_callable_native(
             &template,
@@ -4437,6 +4441,7 @@ mod tests {
             type_guard: None,
             type_is: None,
             special_sig: None,
+            definition_ref: None,
         }
     }
 
@@ -4622,6 +4627,7 @@ mod tests {
             type_guard: None,
             type_is: None,
             special_sig: None,
+            definition_ref: None,
         }
     }
 
@@ -5453,6 +5459,7 @@ mod tests {
             type_guard: None,
             type_is: None,
             special_sig: None,
+            definition_ref: None,
         }
     }
 

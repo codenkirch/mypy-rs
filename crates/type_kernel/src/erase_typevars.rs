@@ -170,6 +170,7 @@ pub(crate) fn erase_typevars_inner(
         Type::AnyType { .. }
         | Type::NoneType
         | Type::ErasedType
+        | Type::PartialType { .. }
         | Type::UninhabitedType { .. }
         | Type::DeletedType { .. } => Some(typ.clone()),
 
@@ -387,6 +388,7 @@ pub(crate) fn erase_typevars_inner(
                 type_guard: new_type_guard.map(Box::new),
                 type_is: new_type_is.map(Box::new),
                 special_sig: None,
+                definition_ref: None,
             })
         }
 
@@ -723,6 +725,7 @@ fn erase_typevars_with_meta_check(typ: &Type, target: &Type) -> Option<Type> {
                 type_guard: new_type_guard,
                 type_is: new_type_is,
                 special_sig: None,
+                definition_ref: None,
             })
         }
         Type::UnionType {
@@ -802,6 +805,7 @@ fn erase_typevars_with_meta_check(typ: &Type, target: &Type) -> Option<Type> {
         Type::AnyType { .. }
         | Type::NoneType
         | Type::ErasedType
+        | Type::PartialType { .. }
         | Type::UninhabitedType { .. }
         | Type::DeletedType { .. } => Some(typ.clone()),
         // Deferred (mirror main's wire deferral contract).

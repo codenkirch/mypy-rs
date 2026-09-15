@@ -5299,6 +5299,7 @@ mod tests {
             type_guard: None,
             type_is: None,
             special_sig: None,
+            definition_ref: None,
         }
     }
 
@@ -5407,6 +5408,7 @@ mod tests {
             type_guard: None,
             type_is: None,
             special_sig: None,
+            definition_ref: None,
         };
         assert_eq!(method_fullname_inner(&t, "foo", &empty_resolver()), None);
     }

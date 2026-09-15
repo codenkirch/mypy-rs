@@ -1294,6 +1294,7 @@ mod tests {
             type_guard: None,
             type_is: None,
             special_sig: None,
+            definition_ref: None,
         };
         let bytes = encode(&t);
         assert_eq!(
@@ -1328,6 +1329,7 @@ mod tests {
             type_guard: None,
             type_is: None,
             special_sig: None,
+            definition_ref: None,
         };
         let bytes = encode(&t);
         // Negative position: Python slow-path negative-indexes
@@ -1370,6 +1372,7 @@ mod tests {
             type_guard: None,
             type_is: None,
             special_sig: None,
+            definition_ref: None,
         };
         let t_no_star = make(vec![ARG_POS, 1, 3]);
         let bytes = encode(&t_no_star);
@@ -1411,6 +1414,7 @@ mod tests {
             type_guard: None,
             type_is: None,
             special_sig: None,
+            definition_ref: None,
         };
         let t_no_kw = make(vec![ARG_POS, 1, 3]);
         let bytes = encode(&t_no_kw);
@@ -1452,6 +1456,7 @@ mod tests {
             type_guard: None,
             type_is: None,
             special_sig: None,
+            definition_ref: None,
         };
         let t_plain = make(vec![ARG_POS, 0, 1, 3]);
         let bytes = encode(&t_plain);
@@ -1499,6 +1504,7 @@ mod tests {
             type_guard: None,
             type_is: None,
             special_sig: None,
+            definition_ref: None,
         };
         let t_no_vars = make(vec![]);
         let bytes = encode(&t_no_vars);

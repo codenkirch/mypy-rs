@@ -57,6 +57,8 @@ _wire_typeinfo_map: dict[str, Any] | None = None
 _last_real_map: dict[str, Any] | None = None
 _wire_alias_map: dict[str, Any] | None = None
 _last_alias_map: dict[str, Any] | None = None
+_wire_symbol_map: dict[str, Any] | None = None
+_last_symbol_map: dict[str, Any] | None = None
 
 
 def clear_wire_decode_caches() -> None:
@@ -140,6 +142,23 @@ def set_wire_alias_map(alias_map: dict[str, Any] | None) -> None:
     _wire_alias_map = alias_map
 
 
+def set_wire_symbol_map(symbol_map: dict[str, Any] | None) -> None:
+    """Install the fullname -> SymbolNode map for resolving definition_ref.
+
+    Mirrors ``set_wire_alias_map``: the map lives for the lifetime of the
+    resolver it was derived from. A brand-new map identity clears the
+    Python-side decode caches: cached decodes may carry definition_ref
+    strings re-linked from the previous map, which would point at stale
+    SymbolNode objects. An explicit ``None`` (build teardown / suite
+    teardown) also clears.
+    """
+    global _wire_symbol_map, _last_symbol_map
+    if _last_symbol_map is not None and symbol_map is not _last_symbol_map:
+        clear_wire_decode_caches()
+    _last_symbol_map = symbol_map
+    _wire_symbol_map = symbol_map
+
+
 def fixup_wire_type(typ: Type, *, resolve_aliases: bool = False) -> Type | None:
     """Resolve type_ref strings in a wire-decoded Type to live objects.
 
@@ -160,7 +179,7 @@ def fixup_wire_type(typ: Type, *, resolve_aliases: bool = False) -> Type | None:
         fixup_instance_cache()
         return None
     alias_map = _wire_alias_map if resolve_aliases else None
-    fixer = _TypeRefFixer(_wire_typeinfo_map, alias_map)
+    fixer = _TypeRefFixer(_wire_typeinfo_map, alias_map, _wire_symbol_map)
     result = typ.accept(fixer)
     # Also fixup shared instance_cache singletons that read_type may
     # have populated with NOT_READY instances: a failed fixup (returning
@@ -756,11 +775,13 @@ class _TypeRefFixer(TypeTranslator):
     """
 
     def __init__(
-        self, typeinfo_map: dict[str, Any], alias_map: dict[str, Any] | None = None
+        self, typeinfo_map: dict[str, Any], alias_map: dict[str, Any] | None = None,
+        symbol_map: dict[str, Any] | None = None,
     ) -> None:
         super().__init__()
         self.typeinfo_map = typeinfo_map
         self.alias_map = alias_map
+        self.symbol_map = symbol_map
         self.missing = False
 
     def visit_instance(self, t: Instance, /) -> Type:
@@ -824,16 +845,33 @@ class _TypeRefFixer(TypeTranslator):
             type_is=type_is,
         )
         # The wire format drops CallableType.definition (only used for
-        # error messages); re-link it so messages render `f(self)` and
-        # self-typevar solving sees the original argument. Match the
-
-        # containing class's symbol table by name + arity, mirroring
-        # fixup.py's FuncDef/OverloadedFuncDef linking.
+        # error messages); re-link it via the wire definition_ref field
+        # (exact fullname lookup) when a symbol map is available, falling
+        # back to the name+arity heuristic otherwise.
         if result.definition is None and not self.missing:
-            definition = self._match_definition(result)
+            definition = self._resolve_definition(result)
             if definition is not None:
                 result = result.copy_modified(definition=definition)
         return result
+
+    def _resolve_definition(self, t: CallableType) -> Any:
+        """Resolve a decoded callable's definition SymbolNode.
+
+        Prefers the exact ``definition_ref`` wire field (fullname -> node
+        via the symbol map), falling back to ``_match_definition``'s
+        name+arity heuristic when no ref or no map is available.
+        OverloadedFuncDef items share a fullname, so a direct hit returns
+        the overload root; Decorator wraps a FuncDef whose fullname is the
+        wrapper's — both fall through to ``_match_definition`` which
+        disambiguates by arity.
+        """
+        from mypy.nodes import Decorator, OverloadedFuncDef
+
+        if t.definition_ref is not None and self.symbol_map is not None:
+            node = self.symbol_map.get(t.definition_ref)
+            if node is not None and not isinstance(node, (OverloadedFuncDef, Decorator)):
+                return node
+        return self._match_definition(t)
 
     def _match_definition(self, t: CallableType) -> Any:
         """Find the live FuncDef/OverloadedFuncDef item for a decoded callable.
@@ -863,6 +901,9 @@ class _TypeRefFixer(TypeTranslator):
             # Decorator wraps a FuncDef; its .type is the decorated callable.
             ctyp = get_proper_type(sym.type) if sym.type else None
             if isinstance(ctyp, CallableType) and len(ctyp.arg_types) == len(t.arg_types):
+                return sym.func
+            ftyp = sym.func.type if sym.func else None
+            if isinstance(ftyp, CallableType) and len(ftyp.arg_types) == len(t.arg_types):
                 return sym.func
             return None
         if isinstance(sym, FuncDef):

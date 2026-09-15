@@ -2452,6 +2452,9 @@ class CallableType(FunctionLike):
         "unpack_kwargs",  # Was an Unpack[...] with **kwargs used to define this callable?
         "instance_type",  # Real underlying type of a type object. This is different from
         # ret_type in case we have e.g. a custom __new__() return annotation.
+        "definition_ref",  # Wire-only: fullname of the definition SymbolNode,
+        # resolved to `definition` by the wire fixup pass. None when no
+        # definition was serialized or before fixup.
     )
 
     def __init__(
@@ -2497,6 +2500,7 @@ class CallableType(FunctionLike):
         #   * If it is a non-decorated function, FuncDef is the definition
         #   * If it is a decorated function, enclosing Decorator is the definition
         self.definition = definition
+        self.definition_ref: str | None = None
         self.variables: tuple[TypeVarLikeType, ...]
         if variables is None:
             self.variables = ()
@@ -2621,6 +2625,7 @@ class CallableType(FunctionLike):
             unpack_kwargs=unpack_kwargs if unpack_kwargs is not _dummy else self.unpack_kwargs,
             instance_type=instance_type if instance_type is not _dummy else self.instance_type,
         )
+        modified.definition_ref = self.definition_ref
         # Optimization: Only NewTypes are supported as subtypes since
         # the class is effectively final, so we can use a cast safely.
         return cast(CT, modified)
@@ -3055,6 +3060,7 @@ class CallableType(FunctionLike):
         write_type_list(data, self.variables)
         write_type_opt(data, self.type_guard)
         write_type_opt(data, self.type_is)
+        write_str_opt(data, None)
         write_tag(data, END_TAG)
 
     @classmethod
@@ -3092,6 +3098,9 @@ class CallableType(FunctionLike):
             from_type_type=from_type_type,
             instance_type=instance_type,
         )
+        definition_ref = read_str_opt(data)
+        if definition_ref is not None:
+            ret.definition_ref = definition_ref
         assert read_tag(data) == END_TAG
         return ret
 
@@ -3969,7 +3978,7 @@ class PartialType(ProperType):
           x = 1  # Infer actual type int for x
     """
 
-    __slots__ = ("type", "var", "value_type")
+    __slots__ = ("type", "var", "value_type", "type_ref", "is_class")
 
     # None for the 'None' partial type; otherwise a generic class
     type: mypy.nodes.TypeInfo | None
@@ -3988,9 +3997,34 @@ class PartialType(ProperType):
         self.type = type
         self.var = var
         self.value_type = value_type
+        self.type_ref: str | None = None
+        self.is_class: bool = False
 
     def accept(self, visitor: TypeVisitor[T]) -> T:
         return visitor.visit_partial_type(self)
+
+    def write(self, data: WriteBuffer) -> None:
+        write_tag(data, PARTIAL_TYPE)
+        type_ref = self.type.fullname if self.type is not None else None
+        write_str_opt(data, type_ref)
+        write_bool(data, self.type is not None)
+        write_type_opt(data, self.value_type)
+        write_tag(data, END_TAG)
+
+    @classmethod
+    def read(cls, data: ReadBuffer) -> PartialType:
+        type_ref = read_str_opt(data)
+        is_class = read_bool(data)
+        value_type = read_type_opt(data)
+        assert read_tag(data) == END_TAG
+        # PartialType is transient (never cached). type/var are live
+        # objects with no wire form, so read returns a placeholder;
+        # native seams that see it defer to pure-Python.
+        dummy_var = mypy.nodes.Var("<partial>")
+        ret = PartialType(None, dummy_var, value_type)  # type: ignore[arg-type]
+        ret.type_ref = type_ref
+        ret.is_class = is_class
+        return ret
 
 
 class EllipsisType(ProperType):
@@ -6107,6 +6141,7 @@ ELLIPSIS_TYPE: Final[Tag] = 119  # Only valid in serialized ASTs
 RAW_EXPRESSION_TYPE: Final[Tag] = 120  # Only valid in serialized ASTs
 CALL_TYPE: Final[Tag] = 121  # Only valid in serialized ASTs
 ERASED_TYPE: Final[Tag] = 122  # First free tag after the AST-only range.
+PARTIAL_TYPE: Final[Tag] = 123
 
 # Opt-in wire ErasedType decode: `read_type` lacks an ERASED_TYPE branch by
 # default (ErasedType is transient, never cached), so seams enable the flag
@@ -6162,6 +6197,8 @@ def read_type(data: ReadBuffer, tag: Tag | None = None) -> Type:
         return UnboundType.read(data)
     if tag == DELETED_TYPE:
         return DeletedType.read(data)
+    if tag == PARTIAL_TYPE:
+        return PartialType.read(data)
     assert False, f"Unknown type tag {tag}"
 
 

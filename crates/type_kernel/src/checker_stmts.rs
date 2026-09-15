@@ -123,6 +123,7 @@ fn type_requires_usage_inner(
         | Type::TypeType { .. }
         | Type::UnpackType { .. }
         | Type::UnboundType { .. }
+        | Type::PartialType { .. }
         | Type::Parameters(_) => Some(2),
     }
 }
@@ -2031,6 +2032,7 @@ mod tests {
             type_guard: None,
             type_is: None,
             special_sig: None,
+            definition_ref: None,
         };
         assert_eq!(
             is_valid_inferred_type_inner(&t, false, false, false),
@@ -2095,6 +2097,7 @@ mod tests {
             type_guard: None,
             type_is: None,
             special_sig: None,
+            definition_ref: None,
         }
     }
 

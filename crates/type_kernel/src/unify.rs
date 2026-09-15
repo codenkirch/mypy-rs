@@ -145,6 +145,7 @@ fn strip_ret(t: &Type) -> Option<Type> {
         type_guard: type_guard.clone(),
         type_is: type_is.clone(),
         special_sig: special_sig.clone(),
+        definition_ref: None,
     })
 }
 
@@ -181,6 +182,7 @@ mod tests {
             type_guard: None,
             type_is: None,
             special_sig: None,
+            definition_ref: None,
         }
     }
 

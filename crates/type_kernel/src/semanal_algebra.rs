@@ -225,6 +225,7 @@ fn replace_implicit_first_type_inner(sig: Type, new: &Type) -> Option<Type> {
                 type_guard,
                 type_is,
                 special_sig: None,
+                definition_ref: None,
             }
         } else {
             let mut new_arg_types = Vec::with_capacity(arg_types.len());
@@ -249,6 +250,7 @@ fn replace_implicit_first_type_inner(sig: Type, new: &Type) -> Option<Type> {
                 type_guard,
                 type_is,
                 special_sig: None,
+                definition_ref: None,
             }
         }),
         Type::Overloaded { items } => {
@@ -368,6 +370,7 @@ fn transform_children<F: Fn(Type) -> Type>(t: Type, f: F) -> Type {
             type_guard: type_guard.map(|tg| Box::new(f(*tg))),
             type_is: type_is.map(|ti| Box::new(f(*ti))),
             special_sig: None,
+            definition_ref: None,
         },
         Type::Overloaded { items } => Type::Overloaded {
             items: items.into_iter().map(&f).collect(),
@@ -489,6 +492,7 @@ fn transform_children<F: Fn(Type) -> Type>(t: Type, f: F) -> Type {
         Type::UninhabitedType { .. } => Type::UninhabitedType { ambiguous: false },
         Type::NoneType => Type::NoneType,
         Type::ErasedType => Type::ErasedType,
+        Type::PartialType { .. } => t,
         Type::Parameters(_) => t,
     }
 }
@@ -737,6 +741,7 @@ mod tests {
             type_guard: None,
             type_is: None,
             special_sig: None,
+            definition_ref: None,
         }
     }
 

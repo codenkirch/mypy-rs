@@ -365,6 +365,7 @@ impl CallableBase {
             type_guard: self.type_guard,
             type_is: self.type_is,
             special_sig: None,
+            definition_ref: None,
         }
     }
 }
@@ -1174,7 +1175,8 @@ fn contains_function_like(t: &Type) -> bool {
         | Type::LiteralType { .. }
         | Type::UninhabitedType { .. }
         | Type::ErasedType
-        | Type::DeletedType { .. } => false,
+        | Type::DeletedType { .. }
+        | Type::PartialType { .. } => false,
     }
 }
 
@@ -1590,6 +1592,7 @@ mod tests {
             type_guard: None,
             type_is: None,
             special_sig: None,
+            definition_ref: None,
         }
     }
 
@@ -1644,6 +1647,7 @@ mod tests {
             type_guard: None,
             type_is: None,
             special_sig: None,
+            definition_ref: None,
         }
     }
 
@@ -1845,6 +1849,7 @@ mod tests {
             type_guard: None,
             type_is: None,
             special_sig: None,
+            definition_ref: None,
         }
     }
 
@@ -2214,6 +2219,7 @@ mod tests {
             type_guard: None,
             type_is: None,
             special_sig: None,
+            definition_ref: None,
         }
     }
 
@@ -2387,6 +2393,7 @@ mod tests {
             type_guard: None,
             type_is: None,
             special_sig: None,
+            definition_ref: None,
         }
     }
 

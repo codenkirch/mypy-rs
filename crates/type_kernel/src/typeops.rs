@@ -2070,6 +2070,7 @@ fn bind_self_inner(typ: &Type) -> Option<Type> {
                     type_guard: type_guard.clone(),
                     type_is: type_is.clone(),
                     special_sig: None,
+                    definition_ref: None,
                 }),
                 None => None,
             }
@@ -2712,6 +2713,7 @@ fn generic_bind_self_item(
             type_guard: type_guard.clone(),
             type_is: type_is.clone(),
             special_sig: None,
+            definition_ref: None,
         });
     }
     // Solve for the method's variables that appear in the self type.
@@ -2831,6 +2833,7 @@ fn generic_bind_self_item(
         type_guard: ex_guard,
         type_is: ex_tis,
         special_sig: None,
+        definition_ref: None,
     })
 }
 
@@ -2957,6 +2960,7 @@ fn class_callable_item_wire(
         type_guard: type_guard.clone(),
         type_is: type_is.clone(),
         special_sig: None,
+        definition_ref: None,
     })
 }
 
@@ -3171,6 +3175,7 @@ fn dummy_callable(fallback: &Type) -> Type {
         type_guard: None,
         type_is: None,
         special_sig: None,
+        definition_ref: None,
     }
 }
 
@@ -3262,6 +3267,7 @@ fn callable_type_inner(
         type_guard: None,
         type_is: None,
         special_sig: None,
+        definition_ref: None,
     })
 }
 
@@ -4232,6 +4238,7 @@ mod tests {
             type_guard: None,
             type_is: None,
             special_sig: None,
+            definition_ref: None,
         };
         assert_eq!(is_literal_type_like(&t, None), Some(false));
     }
@@ -4654,6 +4661,7 @@ mod tests {
             type_guard: None,
             type_is: None,
             special_sig: None,
+            definition_ref: None,
         };
         assert_eq!(
             try_getting_instance_fallback(&callable, &empty_aliases()),
@@ -4683,6 +4691,7 @@ mod tests {
                 type_guard: None,
                 type_is: None,
                 special_sig: None,
+                definition_ref: None,
             }],
         };
         assert_eq!(
@@ -5111,6 +5120,7 @@ mod tests {
             type_guard: None,
             type_is: None,
             special_sig: None,
+            definition_ref: None,
         };
         let blobs = rust_get_type_vars(&encode(&t), false).unwrap();
         assert_eq!(blobs.len(), 3);

@@ -100,6 +100,7 @@ const UNION_TYPE: u8 = 115;
 const TYPE_TYPE: u8 = 116;
 const PARAMETERS: u8 = 117;
 pub(crate) const ERASED_TYPE: u8 = 122;
+const PARTIAL_TYPE: u8 = 123;
 
 // ---------------------------------------------------------------------------
 // ReadBuffer + error type
@@ -759,6 +760,9 @@ pub(crate) enum Type {
         /// `CallableType.special_sig` ("partial" or None) — round-trips on
         /// the wire, serialized after `name`.
         special_sig: Option<String>,
+        /// `CallableType.definition_ref` — the fullname of the SymbolNode
+        /// definition, or None. Serialized after `type_is`, before END_TAG.
+        definition_ref: Option<String>,
     },
     Overloaded {
         items: Vec<Type>,
@@ -795,6 +799,11 @@ pub(crate) enum Type {
         is_type_form: bool,
     },
     Parameters(Parameters),
+    PartialType {
+        type_ref: Option<String>,
+        is_class: bool,
+        value_type: Option<Box<Type>>,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -1180,6 +1189,19 @@ fn read_deleted_type(buf: &mut ReadBuffer<'_>) -> Result<Type, WireError> {
     Ok(Type::DeletedType { source })
 }
 
+/// Read a `PartialType` (tag already consumed).
+fn read_partial_type(buf: &mut ReadBuffer<'_>) -> Result<Type, WireError> {
+    let type_ref = read_str_opt(buf)?;
+    let is_class = read_bool(buf)?;
+    let value_type = read_type_opt(buf)?.map(Box::new);
+    expect_end_tag(buf)?;
+    Ok(Type::PartialType {
+        type_ref,
+        is_class,
+        value_type,
+    })
+}
+
 /// Read a `CallableType` (tag already consumed).
 fn read_callable_type(buf: &mut ReadBuffer<'_>) -> Result<Type, WireError> {
     // fallback: an inline Instance.
@@ -1210,6 +1232,7 @@ fn read_callable_type(buf: &mut ReadBuffer<'_>) -> Result<Type, WireError> {
     let variables = read_type_var_likes(buf)?;
     let type_guard = read_type_opt(buf)?;
     let type_is = read_type_opt(buf)?;
+    let definition_ref = read_str_opt(buf)?;
     expect_end_tag(buf)?;
     Ok(Type::CallableType {
         fallback: Box::new(fallback),
@@ -1230,6 +1253,7 @@ fn read_callable_type(buf: &mut ReadBuffer<'_>) -> Result<Type, WireError> {
         type_guard: type_guard.map(Box::new),
         type_is: type_is.map(Box::new),
         special_sig,
+        definition_ref,
     })
 }
 
@@ -1461,6 +1485,7 @@ pub(crate) fn read_type(buf: &mut ReadBuffer<'_>, tag: Option<u8>) -> Result<Typ
         ERASED_TYPE => read_erased_type(buf),
         UNBOUND_TYPE => read_unbound_type(buf),
         DELETED_TYPE => read_deleted_type(buf),
+        PARTIAL_TYPE => read_partial_type(buf),
         _ => Err(WireError::invalid(format!("unknown type tag {tag}"))),
     }
 }
@@ -1570,6 +1595,7 @@ impl fmt::Display for Type {
             Type::AnyType { .. } => write!(f, "Any"),
             Type::NoneType => write!(f, "None"),
             Type::ErasedType => write!(f, "<Erased>"),
+            Type::PartialType { .. } => write!(f, "<partial>"),
             Type::UninhabitedType { .. } => write!(f, "Never"),
             Type::DeletedType { source } => match source {
                 None => write!(f, "<Deleted>"),
@@ -2488,6 +2514,7 @@ pub(crate) fn write_type(buf: &mut WriteBuffer, t: &Type) -> Result<(), WireErro
             variables,
             type_guard,
             type_is,
+            definition_ref,
             ..
         } => {
             write_tag(buf, CALLABLE_TYPE);
@@ -2515,6 +2542,7 @@ pub(crate) fn write_type(buf: &mut WriteBuffer, t: &Type) -> Result<(), WireErro
             write_type_var_likes(buf, variables)?;
             write_type_opt(buf, type_guard.as_deref())?;
             write_type_opt(buf, type_is.as_deref())?;
+            write_str_opt(buf, definition_ref.as_deref())?;
             write_tag(buf, END_TAG);
             Ok(())
         }
@@ -2711,6 +2739,19 @@ pub(crate) fn write_type(buf: &mut WriteBuffer, t: &Type) -> Result<(), WireErro
 
         Type::Parameters(p) => write_parameters(buf, p),
 
+        Type::PartialType {
+            type_ref,
+            is_class,
+            value_type,
+        } => {
+            write_tag(buf, PARTIAL_TYPE);
+            write_str_opt(buf, type_ref.as_deref())?;
+            write_bool(buf, *is_class);
+            write_type_opt(buf, value_type.as_deref())?;
+            write_tag(buf, END_TAG);
+            Ok(())
+        }
+
         Type::UnboundType {
             name,
             args,
@@ -2756,6 +2797,7 @@ impl Type {
             Type::LiteralType { .. } => "LiteralType",
             Type::UnionType { .. } => "UnionType",
             Type::TypeType { .. } => "TypeType",
+            Type::PartialType { .. } => "PartialType",
             Type::Parameters(_) => "Parameters",
         }
     }
@@ -3968,6 +4010,7 @@ mod tests {
             type_guard: None,
             type_is: None,
             special_sig: None,
+            definition_ref: None,
         };
         assert_eq!(round_trip(&t), t);
     }
@@ -4020,6 +4063,7 @@ mod tests {
             type_guard: None,
             type_is: None,
             special_sig: None,
+            definition_ref: None,
         };
         assert_eq!(round_trip(&t), t);
     }
@@ -4323,6 +4367,7 @@ mod tests {
             type_guard: None,
             type_is: None,
             special_sig,
+            definition_ref: None,
         };
         match round_trip(&mk(None)) {
             Type::CallableType { special_sig, .. } => assert_eq!(special_sig, None),
@@ -4447,6 +4492,7 @@ mod tests {
             type_guard: None,
             type_is: None,
             special_sig: None,
+            definition_ref: None,
         };
         // First arg renders `*a: int`; missing kind/name on the second
         // degrade to ARG_POS/unnamed and still render.

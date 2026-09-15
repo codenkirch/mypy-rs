@@ -680,6 +680,7 @@ fn contains_param_spec(t: &Type) -> bool {
         Type::TypeType { item, .. } => contains_param_spec(item),
         Type::NoneType
         | Type::ErasedType
+        | Type::PartialType { .. }
         | Type::DeletedType { .. }
         | Type::UninhabitedType { .. } => false,
     }
@@ -987,6 +988,7 @@ pub(crate) fn expand_type_inner(
         Type::AnyType { .. }
         | Type::NoneType
         | Type::ErasedType
+        | Type::PartialType { .. }
         | Type::UninhabitedType { .. }
         | Type::DeletedType { .. }
         | Type::UnboundType { .. } => Some(typ.clone()),
@@ -1289,6 +1291,7 @@ pub(crate) fn expand_type_inner(
                 type_guard: new_type_guard,
                 type_is: new_type_is,
                 special_sig: None,
+                definition_ref: None,
             };
             if normalize {
                 let mut base = crate::checkcall::callable_base(&res).ok()?;
@@ -2096,6 +2099,7 @@ mod tests {
             type_guard: None,
             type_is: None,
             special_sig: None,
+            definition_ref: None,
         };
         let env: HashMap<EnvKey, Type> = HashMap::new();
         let out = expand_type_inner(&typ, &env, false).expect("interpolation must decide");
@@ -2741,6 +2745,7 @@ mod tests {
             type_guard: None,
             type_is: None,
             special_sig: None,
+            definition_ref: None,
         }
     }
 
