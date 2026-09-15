@@ -38,10 +38,11 @@ while it still is:
   nearly every seam, and a descriptor there would tax the whole build), so
   the Rust side verifies the stored fullname against the live
   `TypeInfo.fullname` on every serve and refuses on a mismatch.
-- An instance carrying a `last_known_value` or `extra_attrs`, a pre-fixup
-  instance (`type_ref is not None`), an instance with an argument that has
-  no view of its own, and any tvar-tainted argument set are never
-  registered.
+- An instance carrying a `last_known_value` or `extra_attrs`, an instance
+  with an argument that has no view of its own, and any tvar-tainted
+  argument set are never registered. A pre-fixup instance
+  (`type_ref is not None`) is registered with `fixed_up` unset and is
+  refused at serve time instead.
 
 Every one of those is a miss, not a guess: a miss returns `None` and the
 caller runs its own encode, so an unproven entry can only cost a lookup.
@@ -52,7 +53,7 @@ caller runs its own encode, so an unproven entry can only cost a lookup.
 from __future__ import annotations
 
 import os as _os
-from typing import Any, Callable
+from typing import Any
 
 import mypy.types as _types_mod
 from mypy.types import Instance, ParamSpecType, TypeVarTupleType, TypeVarType
@@ -81,9 +82,18 @@ _HANDLES: dict[int, int] = {}
 # id(obj) -> live object. The Rust store pins too; both drop together, so a
 # handle key (derived from `id()`) can never be adopted by a new object.
 _PINS: dict[int, Any] = {}
+# id(obj) -> the stamp a late registration last failed at, so a permanently
+# unservable instance pays the scan once rather than on every seam call (the
+# view probe runs ahead of the wire-cache hit).
+_MISSES: dict[int, int] = {}
 
 _audit: dict[str, int] = {}
 _audit_mode = False
+
+# `Instance.__setattr__` at activation, or None when the class had none
+# ("restore by deletion"). Chained through, never replaced: the F1 mirror
+# installs its own hook on the same class (mypy/types_mirror.py:1576-1581).
+_ORIG_SETATTR: Any = None
 
 
 def _count(key: str, n: int = 1) -> None:
@@ -137,7 +147,7 @@ def register(inst: Any) -> None:
         type_ref = _slot_get(inst, "type_ref")
         lkv = _slot_get(inst, "last_known_value")
         extra = _slot_get(inst, "extra_attrs")
-    except (AttributeError, TypeError):
+    except (AttributeError, TypeError, KeyError):
         # A partially constructed instance (or an object with none of these
         # slots): the last `__init__` assignment re-registers the full set.
         _count("register.partial")
@@ -176,15 +186,8 @@ def register(inst: Any) -> None:
         return
     _HANDLES[id(inst)] = handle
     _PINS[id(inst)] = inst
+    _MISSES.pop(id(inst), None)
     _count("register")
-
-
-def touch(obj: Any) -> None:
-    """Invalidate the entry for `obj` after an uncaptured in-place mutation."""
-    if not _active:
-        return
-    _drop(obj)
-    _count("touch")
 
 
 def encode(t: Any) -> bytes | None:
@@ -198,14 +201,19 @@ def encode(t: Any) -> bytes | None:
     if type(t) is not Instance:
         _count("encode.not_instance")
         return None
-    handle = _HANDLES.get(id(t))
+    key = id(t)
+    handle = _HANDLES.get(key)
     if handle is None:
         # A construction-order gap: an argument may have become registrable
-        # after this instance was built. One re-registration attempt on the
-        # miss path closes it, and a failing instance drops again.
+        # after this instance was built. Retried once per object per stamp, so
+        # a permanently unservable instance pays the scan once, not per call.
+        if _MISSES.get(key) == _STAMP:
+            _count("encode.miss")
+            return None
         register(t)
-        handle = _HANDLES.get(id(t))
+        handle = _HANDLES.get(key)
         if handle is None:
+            _MISSES[key] = _STAMP
             _count("encode.miss")
             return None
         _count("encode.late_register")
@@ -222,8 +230,12 @@ def encode(t: Any) -> bytes | None:
 
 
 def _inst_setattr(inst: Instance, name: str, value: Any) -> None:
-    """`Instance` attribute write, routed through the view store."""
-    object.__setattr__(inst, name, value)
+    """`Instance` attribute write, routed through the view store.
+
+    Chains into whatever hook was installed before the gate activated, so a
+    co-active `types_mirror` capture keeps working.
+    """
+    (_ORIG_SETATTR or object.__setattr__)(inst, name, value)
     if name in _VIEW_FIELDS:
         register(inst)
 
@@ -247,22 +259,36 @@ def _install_hooks(read_route: bool) -> None:
     The `__slots__` contract is preserved: the member descriptors stay the
     storage of record, the class keeps its name, `isinstance` behaviour and
     attribute API, and only the access path changes.
+
+    Safe to call again for an arm switch. The slot descriptors are captured
+    once and never re-captured, so a routed `args` property can never become
+    the storage of record (which would make `_slot_get` recurse through its
+    own getter), and the read arm is un-installed on the way out of arm 2.
     """
+    global _ORIG_SETATTR
     for name in _VIEW_FIELDS:
+        if name in _MEMBERS:
+            continue
         member = Instance.__dict__.get(name)
-        if member is None or not hasattr(member, "__set__"):
+        if member is None or isinstance(member, property) or not hasattr(member, "__set__"):
             _count("install.skipped")
             continue
         _MEMBERS[name] = member
-    Instance.__setattr__ = _inst_setattr  # type: ignore[method-assign,assignment]
     if read_route and "args" in _MEMBERS:
-        args_member = _MEMBERS["args"]
         # The gate replaces the slot descriptor deliberately. mypy's own
         # checker rejects that shape statically (`args` in `__slots__`
         # conflicts with a class variable), recorded as an ADR finding.
         Instance.args = property(  # type: ignore[assignment,misc]
-            _get_args_routed, args_member.__set__
+            _get_args_routed, _MEMBERS["args"].__set__
         )
+    elif "args" in _MEMBERS and isinstance(Instance.__dict__.get("args"), property):
+        setattr(Instance, "args", _MEMBERS["args"])
+    if Instance.__dict__.get("__setattr__") is not _inst_setattr:
+        # Captured once. `None` records "the class had no hook of its own",
+        # which `deactivate` restores by deletion; re-capturing here on an arm
+        # switch would record our own hook and loop `_inst_setattr`.
+        _ORIG_SETATTR = Instance.__dict__.get("__setattr__")
+    Instance.__setattr__ = _inst_setattr  # type: ignore[method-assign,assignment]
     _types_mod._set_native_type_view_encode(encode)
     _count("install")
 
@@ -279,6 +305,10 @@ def activate(*, read_route: bool = False, audit: bool = False) -> bool:
             import type_kernel as _kernel
         except ImportError:
             _count("activate.no_type_kernel")
+            return False
+        if not hasattr(_kernel, "rust_view_put"):
+            # A stale extension without the view store: leave the gate off.
+            _count("activate.no_view_store")
             return False
         _km = _kernel
         _active = True
@@ -304,6 +334,7 @@ def reset(*, clear_counts: bool = False) -> None:
         _km.rust_view_reset()
     _HANDLES.clear()
     _PINS.clear()
+    _MISSES.clear()
     _STAMP += 1
     _count("reset")
     if clear_counts:
@@ -319,12 +350,17 @@ def deactivate() -> None:
     `__slots__`, `isinstance` and the attribute API return to exactly the
     pre-activation shape.
     """
-    global _active, _read_route
+    global _active, _read_route, _ORIG_SETATTR
     if not _active:
         return
     for name, member in _MEMBERS.items():
         setattr(Instance, name, member)
-    Instance.__setattr__ = object.__setattr__  # type: ignore[method-assign]
+    if Instance.__dict__.get("__setattr__") is _inst_setattr:
+        if _ORIG_SETATTR is None:
+            del Instance.__setattr__
+        else:
+            Instance.__setattr__ = _ORIG_SETATTR  # type: ignore[method-assign]
+    _ORIG_SETATTR = None
     _types_mod._set_native_type_view_encode(None)
     reset()
     _active = False

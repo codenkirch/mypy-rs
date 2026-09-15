@@ -4831,9 +4831,11 @@ def _serialize_type_for_visitor_clocked(t: Type) -> bytes:
     """`_serialize_type_for_visitor_body` plus the seam-cost clock.
 
     Bound over the plain function only when `MYPY_SERIALIZE_CLOCK` is set,
-    so the instrumented path is never reached in production. The clock
-    covers the whole funnel body: cache probe, fast path, and the encode
-    walk (whose bytes land in `serialize_bytes`).
+    so the instrumented path is never reached in production. The clock covers
+    the whole funnel body: view probe, cache probe, fast path, and the encode
+    walk (whose bytes land in `serialize_bytes`). A view-gate serve is timed
+    too, so with the gate on the clock measures the replacement, not the walk
+    it bounds; the two are not meant to be combined in one reading.
     """
     global _serialize_funnel_ns
     start = _perf_counter()

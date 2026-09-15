@@ -173,7 +173,17 @@ fn encode_instance(
         return Some(buf.into_bytes());
     }
     for index in 0..child_count {
-        let child = with_store(|store| store.by_handle.get(&handle).map(|e| e.arg_handles[index]))?;
+        // Bounds-checked: a re-entrant `rust_view_put` could shorten the
+        // argument list between the two borrows, and an out-of-bounds index
+        // aborts the interpreter across the FFI boundary.
+        let child = with_store(|store| {
+            store
+                .by_handle
+                .get(&handle)?
+                .arg_handles
+                .get(index)
+                .copied()
+        })?;
         if child == 0 {
             return None;
         }

@@ -181,6 +181,23 @@ Two legs, reported separately on purpose.
 Counts and the RSS probe are load-invariant. `serialize_funnel_s` is a clock and
 is read as a *share*, not as an absolute.
 
+**Instrument limit, stated before the numbers are used.** `MYPY_SERIALIZE_CLOCK`
+was on in all three legs, and the clock wraps the whole funnel body, which now
+includes the view probe (`mypy/types.py`, `_serialize_type_for_visitor_clocked`).
+So in the two gate-on legs a *served* encode is timed as if it were walk cost,
+and those runs' `serialize_funnel_s` measures the replacement as well as the walk
+it was meant to bound. The two experiments are not meant to be combined, and the
+figures below are read accordingly:
+
+- The headline verdict does **not** depend on the clock. `serialize_writes`,
+  `serialize_view`, `typeview_*` and max RSS are counters, and the phase times
+  come from `--dump-build-stats`. Those are what the NO-GO rests on.
+- The **baseline** leg has no gate active, so its clock is a clean bound on the
+  walk: `1.347s` is the whole funnel, unproxied. That single figure is the
+  ceiling argument.
+- The arm-1/arm-2 clock values (`1.852s`, `1.990s`) include the probe by
+  construction and are reported as *directionally* indicative only.
+
 | Counter | baseline (`MYPY_TYPE_VIEW` unset) | arm 1 (store + serve) | arm 2 (+ routed reads) |
 |---|---|---|---|
 | `serialize_calls` | 2,839,640 | 2,839,692 | 2,839,637 |

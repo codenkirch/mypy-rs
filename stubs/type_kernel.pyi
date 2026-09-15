@@ -537,6 +537,13 @@ __all__ = [
     "rust_refers_to_different_scope",
     "rust_flatten_lvalues",
     "rust_literal_int_expr",
+    "rust_view_put",
+    "rust_view_encode",
+    "rust_view_args",
+    "rust_view_touch",
+    "rust_view_reset",
+    "rust_view_count",
+    "rust_view_stats",
     "IdMapper",
 ]
 
@@ -2926,3 +2933,22 @@ def rust_flatten_lvalues(lvalues: list[Expression]) -> list[Expression] | None: 
 def rust_literal_int_expr(
     type_maps: list[dict[Expression, Type]], expr: Expression
 ) -> tuple[int, int | None] | None: ...
+
+# F reopening experiment (#1671): Rust-owned `Instance` field storage.
+# Handles are minted by rust_view_put through the shared identity service;
+# an encode is served only while its stamp still matches the caller's.
+def rust_view_put(
+    obj: Any,
+    fullname: str,
+    args: list[Any],
+    arg_handles: list[int],
+    fixed_up: bool,
+    args_tvar_clean: bool,
+    stamp: int,
+) -> int: ...
+def rust_view_encode(handle: int, stamp: int, live_fullname: str) -> bytes | None: ...
+def rust_view_args(handle: int, stamp: int) -> tuple[Any, ...] | None: ...
+def rust_view_touch(handle: int) -> bool: ...
+def rust_view_reset() -> int: ...
+def rust_view_count() -> int: ...
+def rust_view_stats() -> tuple[int, int, int]: ...

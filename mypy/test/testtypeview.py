@@ -65,12 +65,16 @@ class TypeViewSuite(unittest.TestCase):
         cls.fx = TypeFixture()
 
     def setUp(self) -> None:
+        # `types_mirror.activate()` patches `Instance.__setattr__` too, and
+        # this process is shared with the mirror suites in testtypes.py, so the
+        # invariant under test is a restore of whatever hook was found.
         typeview.deactivate()
         self.addCleanup(typeview.deactivate)
+        self.setattr_before = Instance.__dict__.get("__setattr__", object.__setattr__)
         typeview.reset(clear_counts=True)
 
     def _activate(self, *, read_route: bool = False) -> None:
-        if not typeview.activate(read_route=read_route):
+        if not typeview.activate(read_route=read_route, audit=True):
             raise unittest.SkipTest("type_kernel exposes no view store")
         typeview.reset(clear_counts=True)
 
@@ -85,7 +89,7 @@ class TypeViewSuite(unittest.TestCase):
         """An unactivated gate installs nothing on `Instance`."""
         self.assertFalse(typeview.active())
         self.assertIsNone(types._native_type_view_encode)
-        self.assertIs(Instance.__setattr__, object.__setattr__)
+        self.assertIs(Instance.__dict__.get("__setattr__", object.__setattr__), self.setattr_before)
         # `args` is still the `__slots__` member descriptor, not a property.
         self.assertNotIsInstance(Instance.__dict__["args"], property)
         self.assertIn("args", Instance.__slots__)
@@ -94,12 +98,38 @@ class TypeViewSuite(unittest.TestCase):
         self._activate()
         self.assertTrue(typeview.active())
         self.assertIsNotNone(types._native_type_view_encode)
-        self.assertIsNot(Instance.__setattr__, object.__setattr__)
+        self.assertIs(Instance.__dict__["__setattr__"], typeview._inst_setattr)
         typeview.deactivate()
         self.assertFalse(typeview.active())
         self.assertIsNone(types._native_type_view_encode)
-        self.assertIs(Instance.__setattr__, object.__setattr__)
+        self.assertIs(Instance.__dict__.get("__setattr__", object.__setattr__), self.setattr_before)
         self.assertNotIsInstance(Instance.__dict__["args"], property)
+
+    def test_chains_and_restores_a_pre_existing_setattr(self) -> None:
+        """A co-active hook (the mirror's) must survive the gate's install."""
+        seen: list[str] = []
+
+        def foreign(inst: object, name: str, value: object) -> None:
+            seen.append(name)
+            object.__setattr__(inst, name, value)
+
+        original = Instance.__dict__.get("__setattr__", object.__setattr__)
+        Instance.__setattr__ = foreign  # type: ignore[method-assign]
+        try:
+            self._activate()
+            inst = Instance(self.fx.std_listi, [self.fx.a])
+            self.assertIn("args", seen)
+            del inst
+            typeview.deactivate()
+            self.assertIs(Instance.__dict__["__setattr__"], foreign)
+        finally:
+            Instance.__setattr__ = original  # type: ignore[method-assign]
+
+    def test_deactivate_is_idempotent(self) -> None:
+        self._activate()
+        typeview.deactivate()
+        typeview.deactivate()
+        self.assertIs(Instance.__dict__.get("__setattr__", object.__setattr__), self.setattr_before)
 
     def test_read_arm_installs_and_restores_the_args_descriptor(self) -> None:
         self._activate(read_route=True)
@@ -107,6 +137,27 @@ class TypeViewSuite(unittest.TestCase):
         typeview.deactivate()
         self.assertNotIsInstance(Instance.__dict__["args"], property)
         self.assertIn("args", Instance.__slots__)
+
+    def test_arm_switch_two_to_one_uninstalls_the_route(self) -> None:
+        """2 -> 1 must undo the routed property, or `_slot_get` recurses."""
+        self._activate(read_route=True)
+        self.assertIsInstance(Instance.__dict__["args"], property)
+        self._activate(read_route=False)
+        self.assertNotIsInstance(Instance.__dict__["args"], property)
+        # A route miss on an unregistered instance must reach the slot, not
+        # the property's own getter (unbounded recursion).
+        inst = Instance(self.fx.std_listi, [self.fx.a])
+        self.assertEqual(inst.args, (self.fx.a,))
+
+    def test_arm_switch_keeps_the_slot_descriptors(self) -> None:
+        """A re-install must not capture its own property as the storage."""
+        self._activate(read_route=True)
+        self._activate(read_route=True)
+        self.assertIsInstance(Instance.__dict__["args"], property)
+        self.assertNotIsInstance(typeview._MEMBERS["args"], property)
+        inst = Instance(self.fx.std_listi, [self.fx.a])
+        self._register(self.fx.a, inst)
+        self.assertIsNotNone(typeview.encode(inst))
 
     # ---- byte parity ----
 
@@ -243,6 +294,21 @@ class TypeViewSuite(unittest.TestCase):
         """The `__setattr__` hook registers from the constructor writes."""
         self._activate()
         inst = Instance(self.fx.std_listi, [])
+        self.assertIsNotNone(typeview.encode(inst))
+
+    def test_unservable_instance_is_attempted_once_per_stamp(self) -> None:
+        """The late-registration retry is memoized, not paid per seam call."""
+        inst = Instance(self.fx.std_listi, [self.fx.a])
+        self._activate()
+        self._register(inst)
+        self.assertIsNone(typeview.encode(inst))
+        first = typeview.report().get("a_encode.miss", 0)
+        self.assertIsNone(typeview.encode(inst))
+        self.assertIsNone(typeview.encode(inst))
+        after = typeview.report().get("a_encode.miss", 0)
+        self.assertEqual(after - first, 2)
+        # A successful registration clears the memo.
+        self._register(self.fx.a, inst)
         self.assertIsNotNone(typeview.encode(inst))
 
     def test_not_ready_typeinfo_never_registers(self) -> None:

@@ -482,7 +482,6 @@ def parse_options(
     # Phase F3 (#1397) write flip is a differential mirror gate: splices
     # only engage when the capture mirror is on.
     options.native_type_instance_write = _env_gate("TEST_NATIVE_TYPE_INSTANCE_WRITE")
-    # ADR-0004 proxy (#1553) is a read-shadow gate; P1 is scaffold-only.
     # Phase G1.0a (#1572) node shadow is capture-only; the option only
     # installs the AST-mirror hooks, so a missing extension is a no-op.
     options.native_ast_mirror = _env_gate("TEST_NATIVE_AST_MIRROR")

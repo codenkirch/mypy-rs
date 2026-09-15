@@ -58989,9 +58989,8 @@ class NativeAstMirrorSuite(Suite):
         expr.kind = GDEF
         handle = self._handle(expr)
         # One identity namespace: the non-minting lookups of the node
-        # store, the proxy and the mirror all answer the same handle.
+        # store and the type mirror answer the same handle.
         assert self._k.rust_node_mirror_handle_of(expr) == handle
-        assert self._k.rust_mirror_handle_of(expr) == handle
         assert self._k.rust_mirror_handle_of(expr) == handle
 
     def test_reset_drops_entries_and_keeps_activation(self) -> None:
@@ -60012,10 +60011,9 @@ class NativeStmtDefMirrorSuite(Suite):
         var = nodes_mod.Var("x")
         var.is_final = True
         handle = self._handle(var)
-        # One identity namespace: the metadata store, the expression
-        # store, the proxy and the mirror all answer the same handle.
+        # One identity namespace: the metadata store, the expression store
+        # and the type mirror all answer the same handle.
         assert self._k.rust_node_mirror_handle_of(var) == handle
-        assert self._k.rust_mirror_handle_of(var) == handle
         assert self._k.rust_mirror_handle_of(var) == handle
 
 
@@ -60230,10 +60228,9 @@ class NativeSymtableMirrorSuite(Suite):
         put_names_entry(table, "x", sym)
         handle = self._m.handle_of(table)
         assert handle is not None
-        # One identity namespace: the symtable store, the proxy and the
-        # mirror all answer the same handle for the same object.
+        # One identity namespace: the symtable store and the type mirror
+        # answer the same handle for the same object.
         assert self._k.rust_symtable_mirror_handle_of(table) == handle
-        assert self._k.rust_mirror_handle_of(table) == handle
         assert self._k.rust_mirror_handle_of(table) == handle
         node_handle = self._m._NODE_HANDLES.get(id(sym))
         assert node_handle is not None
