@@ -66,6 +66,17 @@ struct InstanceView {
     stamp: u64,
 }
 
+/// The field set one registration carries, grouped so the two adjacent
+/// booleans and the two parallel lists cannot be transposed at a call site.
+pub(crate) struct InstanceFields {
+    pub(crate) fullname: String,
+    pub(crate) args: Vec<Py<PyAny>>,
+    pub(crate) arg_handles: Vec<u64>,
+    pub(crate) fixed_up: bool,
+    pub(crate) args_tvar_clean: bool,
+    pub(crate) stamp: u64,
+}
+
 struct ViewStore {
     by_handle: HashMap<u64, InstanceView>,
     /// Strong pins, keyed like the entries: the handle keys are `id()`-derived
@@ -74,6 +85,10 @@ struct ViewStore {
     encodes: u64,
     defers: u64,
     read_routes: u64,
+    /// Bumped by every mutation of `by_handle`. A serve captures it with the
+    /// header it wrote, so a re-entrant put or touch mid-encode is a miss
+    /// rather than a hybrid of two registrations.
+    mutations: u64,
 }
 
 impl ViewStore {
@@ -84,6 +99,7 @@ impl ViewStore {
             encodes: 0,
             defers: 0,
             read_routes: 0,
+            mutations: 0,
         }
     }
 }
@@ -141,7 +157,7 @@ fn encode_instance(
     // The header is built while the store is borrowed: nothing is copied out
     // except the child list length, so a serve costs no per-entry allocation
     // and a miss costs no allocation at all.
-    let child_count = with_store(|store| -> Option<usize> {
+    let (child_count, header_mutations) = with_store(|store| -> Option<(usize, u64)> {
         let entry = store.by_handle.get(&handle)?;
         if entry.stamp != stamp || !entry.fixed_up || !entry.args_tvar_clean {
             return None;
@@ -161,22 +177,25 @@ fn encode_instance(
                     write_str_bare(&mut buf, &entry.fullname).ok()?;
                 }
             }
-            return Some(0);
+            return Some((0, store.mutations));
         }
         write_tag(&mut buf, INSTANCE_GENERIC);
         write_str(&mut buf, &entry.fullname).ok()?;
         write_tag(&mut buf, LIST_GEN);
         write_int_bare(&mut buf, entry.arg_handles.len() as i64).ok()?;
-        Some(entry.arg_handles.len())
+        Some((entry.arg_handles.len(), store.mutations))
     })?;
     if child_count == 0 {
         return Some(buf.into_bytes());
     }
     for index in 0..child_count {
-        // Bounds-checked: a re-entrant `rust_view_put` could shorten the
-        // argument list between the two borrows, and an out-of-bounds index
-        // aborts the interpreter across the FFI boundary.
+        // The header was written from one registration; any mutation since (a
+        // re-entrant put or touch) means this list is not the one the header
+        // describes, so miss rather than emit a hybrid encode.
         let child = with_store(|store| {
+            if store.mutations != header_mutations {
+                return None;
+            }
             store
                 .by_handle
                 .get(&handle)?
@@ -202,19 +221,30 @@ fn encode_instance(
 
 /// Register (or re-register) the field set of `obj`. Returns the handle.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn put(
-    obj: &PyAny,
-    fullname: String,
-    args: Vec<Py<PyAny>>,
-    arg_handles: Vec<u64>,
-    fixed_up: bool,
-    args_tvar_clean: bool,
-    stamp: u64,
-) -> PyResult<u64> {
+pub(crate) fn put(obj: &PyAny, fields: InstanceFields) -> PyResult<u64> {
+    let InstanceFields {
+        fullname,
+        args,
+        arg_handles,
+        fixed_up,
+        args_tvar_clean,
+        stamp,
+    } = fields;
     if args.len() != arg_handles.len() {
         return Err(PyValueError::new_err(
             "typeview: args and arg_handles must have equal length",
         ));
+    }
+    // FFI boundary into caller-supplied parallel lists: a handle naming a
+    // different object than its argument would silently encode the wrong
+    // child and still count as a hit.
+    let py = obj.py();
+    for (arg, &child) in args.iter().zip(arg_handles.iter()) {
+        if child != 0 && identity::handle_of(arg.as_ref(py)) != Some(child) {
+            return Err(PyValueError::new_err(
+                "typeview: arg handle does not name the matching argument",
+            ));
+        }
     }
     let handle = identity::handle_for_registration(obj)
         .ok_or_else(|| PyValueError::new_err("typeview: object has no identity handle"))?;
@@ -233,6 +263,7 @@ pub(crate) fn put(
             },
         );
         let replaced_pin = store.pins.insert(handle, Py::from(obj));
+        store.mutations += 1;
         (replaced, replaced_pin)
     });
     drop(replaced);
@@ -273,6 +304,9 @@ pub(crate) fn touch(handle: u64) -> bool {
     let (entry, pin) = with_store(|store| {
         let entry = store.by_handle.remove(&handle);
         let pin = store.pins.remove(&handle);
+        if entry.is_some() {
+            store.mutations += 1;
+        }
         (entry, pin)
     });
     // Both are dropped after the borrow is released: the entry owns the
@@ -298,6 +332,7 @@ pub(crate) fn reset() -> usize {
         store.encodes = 0;
         store.defers = 0;
         store.read_routes = 0;
+        store.mutations += 1;
         (count, entries, pins)
     });
     drop(entries);
@@ -330,12 +365,14 @@ pub(crate) fn rust_view_put(
 ) -> PyResult<u64> {
     put(
         obj,
-        fullname,
-        args,
-        arg_handles,
-        fixed_up,
-        args_tvar_clean,
-        stamp,
+        InstanceFields {
+            fullname,
+            args,
+            arg_handles,
+            fixed_up,
+            args_tvar_clean,
+            stamp,
+        },
     )
 }
 
@@ -412,6 +449,30 @@ mod typeview_tests {
         namespace(py, &[("type", type_info)])
     }
 
+    /// Register a field set. Named, so the adjacent booleans and the two
+    /// parallel lists cannot be transposed at a call site.
+    fn register_fields(
+        obj: &PyAny,
+        fullname: &str,
+        args: Vec<Py<PyAny>>,
+        arg_handles: Vec<u64>,
+        fixed_up: bool,
+        args_tvar_clean: bool,
+        stamp: u64,
+    ) -> PyResult<u64> {
+        put(
+            obj,
+            InstanceFields {
+                fullname: fullname.into(),
+                args,
+                arg_handles,
+                fixed_up,
+                args_tvar_clean,
+                stamp,
+            },
+        )
+    }
+
     /// `write_int_bare`'s 1-byte tier for an in-range value.
     fn short_int(value: i64) -> u8 {
         ((value + 10) << 1) as u8
@@ -422,9 +483,9 @@ mod typeview_tests {
         with_py(|py| {
             reset();
             let obj = instance(py, "builtins.int");
-            let h = put(
+            let h = register_fields(
                 obj.as_ref(py),
-                "builtins.int".into(),
+                "builtins.int",
                 vec![],
                 vec![],
                 true,
@@ -444,16 +505,8 @@ mod typeview_tests {
         with_py(|py| {
             reset();
             let obj = instance(py, "foo.Bar");
-            let h = put(
-                obj.as_ref(py),
-                "foo.Bar".into(),
-                vec![],
-                vec![],
-                true,
-                true,
-                1,
-            )
-            .unwrap();
+            let h =
+                register_fields(obj.as_ref(py), "foo.Bar", vec![], vec![], true, true, 1).unwrap();
             let bytes = encode(py, h, 1, "foo.Bar").unwrap();
             assert_eq!(bytes[0], INSTANCE);
             assert_eq!(bytes[1], INSTANCE_SIMPLE);
@@ -467,9 +520,9 @@ mod typeview_tests {
         with_py(|py| {
             reset();
             let child = instance(py, "builtins.int");
-            let child_h = put(
+            let child_h = register_fields(
                 child.as_ref(py),
-                "builtins.int".into(),
+                "builtins.int",
                 vec![],
                 vec![],
                 true,
@@ -478,9 +531,9 @@ mod typeview_tests {
             )
             .unwrap();
             let parent = instance(py, "builtins.list");
-            let parent_h = put(
+            let parent_h = register_fields(
                 parent.as_ref(py),
-                "builtins.list".into(),
+                "builtins.list",
                 vec![child.clone_ref(py)],
                 vec![child_h],
                 true,
@@ -503,9 +556,9 @@ mod typeview_tests {
         with_py(|py| {
             reset();
             let obj = instance(py, "builtins.int");
-            let h = put(
+            let h = register_fields(
                 obj.as_ref(py),
-                "builtins.int".into(),
+                "builtins.int",
                 vec![],
                 vec![],
                 true,
@@ -523,9 +576,9 @@ mod typeview_tests {
         with_py(|py| {
             reset();
             let obj = instance(py, "builtins.int");
-            let h = put(
+            let h = register_fields(
                 obj.as_ref(py),
-                "builtins.int".into(),
+                "builtins.int",
                 vec![],
                 vec![],
                 true,
@@ -543,9 +596,9 @@ mod typeview_tests {
         with_py(|py| {
             reset();
             let obj = instance(py, "builtins.int");
-            let h = put(
+            let h = register_fields(
                 obj.as_ref(py),
-                "builtins.int".into(),
+                "builtins.int",
                 vec![],
                 vec![],
                 false,
@@ -562,9 +615,9 @@ mod typeview_tests {
         with_py(|py| {
             reset();
             let obj = instance(py, "builtins.list");
-            let h = put(
+            let h = register_fields(
                 obj.as_ref(py),
-                "builtins.list".into(),
+                "builtins.list",
                 vec![],
                 vec![],
                 true,
@@ -582,9 +635,9 @@ mod typeview_tests {
             reset();
             let child = instance(py, "builtins.int");
             let parent = instance(py, "builtins.list");
-            let h = put(
+            let h = register_fields(
                 parent.as_ref(py),
-                "builtins.list".into(),
+                "builtins.list",
                 vec![child],
                 vec![0],
                 true,
@@ -601,9 +654,9 @@ mod typeview_tests {
         with_py(|py| {
             reset();
             let child = instance(py, "builtins.int");
-            let child_h = put(
+            let child_h = register_fields(
                 child.as_ref(py),
-                "builtins.int".into(),
+                "builtins.int",
                 vec![],
                 vec![],
                 true,
@@ -612,9 +665,9 @@ mod typeview_tests {
             )
             .unwrap();
             let parent = instance(py, "builtins.list");
-            let h = put(
+            let h = register_fields(
                 parent.as_ref(py),
-                "builtins.list".into(),
+                "builtins.list",
                 vec![child.clone_ref(py)],
                 vec![child_h],
                 true,
@@ -634,9 +687,9 @@ mod typeview_tests {
         with_py(|py| {
             reset();
             let obj = instance(py, "builtins.int");
-            let h = put(
+            let h = register_fields(
                 obj.as_ref(py),
-                "builtins.int".into(),
+                "builtins.int",
                 vec![],
                 vec![],
                 true,
@@ -656,9 +709,9 @@ mod typeview_tests {
             reset();
             let child = instance(py, "builtins.int");
             let parent = instance(py, "builtins.list");
-            let h = put(
+            let h = register_fields(
                 parent.as_ref(py),
-                "builtins.list".into(),
+                "builtins.list",
                 vec![child.clone_ref(py)],
                 vec![0],
                 true,
@@ -678,9 +731,9 @@ mod typeview_tests {
         with_py(|py| {
             reset();
             let obj = instance(py, "builtins.int");
-            let h = put(
+            let h = register_fields(
                 obj.as_ref(py),
-                "builtins.int".into(),
+                "builtins.int",
                 vec![],
                 vec![],
                 true,
@@ -704,9 +757,9 @@ mod typeview_tests {
             let child = instance(py, "builtins.int");
             let child_ref: Py<PyAny> = child.clone_ref(py);
             let parent = instance(py, "builtins.list");
-            put(
+            register_fields(
                 parent.as_ref(py),
-                "builtins.list".into(),
+                "builtins.list",
                 vec![child],
                 vec![0],
                 true,
@@ -729,9 +782,9 @@ mod typeview_tests {
             let child = instance(py, "builtins.int");
             let child_ref: Py<PyAny> = child.clone_ref(py);
             let parent = instance(py, "builtins.list");
-            let handle = put(
+            let handle = register_fields(
                 parent.as_ref(py),
-                "builtins.list".into(),
+                "builtins.list",
                 vec![child],
                 vec![0],
                 true,
@@ -752,9 +805,9 @@ mod typeview_tests {
             let first = instance(py, "builtins.int");
             let first_ref: Py<PyAny> = first.clone_ref(py);
             let parent = instance(py, "builtins.list");
-            put(
+            register_fields(
                 parent.as_ref(py),
-                "builtins.list".into(),
+                "builtins.list",
                 vec![first],
                 vec![0],
                 true,
@@ -764,9 +817,9 @@ mod typeview_tests {
             .unwrap();
             let during = first_ref.as_ref(py).get_refcnt();
             let second = instance(py, "builtins.int");
-            put(
+            register_fields(
                 parent.as_ref(py),
-                "builtins.list".into(),
+                "builtins.list",
                 vec![second],
                 vec![0],
                 true,
@@ -784,9 +837,9 @@ mod typeview_tests {
         with_py(|py| {
             reset();
             let obj = instance(py, "builtins.int");
-            assert!(put(
+            assert!(register_fields(
                 obj.as_ref(py),
-                "builtins.int".into(),
+                "builtins.int",
                 vec![],
                 vec![1],
                 true,

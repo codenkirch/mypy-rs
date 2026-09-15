@@ -82,10 +82,10 @@ _HANDLES: dict[int, int] = {}
 # id(obj) -> live object. The Rust store pins too; both drop together, so a
 # handle key (derived from `id()`) can never be adopted by a new object.
 _PINS: dict[int, Any] = {}
-# id(obj) -> the stamp a late registration last failed at, so a permanently
-# unservable instance pays the scan once rather than on every seam call (the
-# view probe runs ahead of the wire-cache hit).
-_MISSES: dict[int, int] = {}
+# id(obj) -> (obj, the stamp a late registration last failed at). Holding the
+# object stops a freed instance's `id()` from suppressing a new object's retry;
+# the stamp expires the memo with the store.
+_MISSES: dict[int, tuple[Any, int]] = {}
 
 _audit: dict[str, int] = {}
 _audit_mode = False
@@ -207,13 +207,14 @@ def encode(t: Any) -> bytes | None:
         # A construction-order gap: an argument may have become registrable
         # after this instance was built. Retried once per object per stamp, so
         # a permanently unservable instance pays the scan once, not per call.
-        if _MISSES.get(key) == _STAMP:
+        memo = _MISSES.get(key)
+        if memo is not None and memo[0] is t and memo[1] == _STAMP:
             _count("encode.miss")
             return None
         register(t)
         handle = _HANDLES.get(key)
         if handle is None:
-            _MISSES[key] = _STAMP
+            _MISSES[key] = (t, _STAMP)
             _count("encode.miss")
             return None
         _count("encode.late_register")
@@ -317,8 +318,17 @@ def activate(*, read_route: bool = False, audit: bool = False) -> bool:
     if read_route != _read_route:
         _read_route = read_route
         _install_hooks(read_route)
-    elif not _MEMBERS:
+    elif not _MEMBERS or Instance.__dict__.get("__setattr__") is not _inst_setattr:
+        # A co-resident hook (types_mirror.activate is one-shot and does not
+        # chain) may have taken the slot while the gate stayed active.
+        # Re-assert, and count the steal.
+        _count("activate.reassert")
         _install_hooks(read_route)
+    if Instance.__dict__.get("__setattr__") is not _inst_setattr:
+        # Observable guard: `install` succeeding while the slot is not ours
+        # means a third mechanism is fighting for it, and the gate would be
+        # believed active while inert.
+        _count("activate.hook_not_held")
     return True
 
 

@@ -113,7 +113,10 @@ class TypeViewSuite(unittest.TestCase):
             seen.append(name)
             object.__setattr__(inst, name, value)
 
-        original = Instance.__dict__.get("__setattr__", object.__setattr__)
+        # `None` means "there was none", which the finally-block restores by
+        # deletion: installing `object.__setattr__` instead would leak a class
+        # shape change into every later test in this shared process.
+        original = Instance.__dict__.get("__setattr__")
         Instance.__setattr__ = foreign  # type: ignore[method-assign]
         try:
             self._activate()
@@ -123,7 +126,10 @@ class TypeViewSuite(unittest.TestCase):
             typeview.deactivate()
             self.assertIs(Instance.__dict__["__setattr__"], foreign)
         finally:
-            Instance.__setattr__ = original  # type: ignore[method-assign]
+            if original is None:
+                del Instance.__setattr__
+            else:
+                Instance.__setattr__ = original  # type: ignore[method-assign]
 
     def test_deactivate_is_idempotent(self) -> None:
         self._activate()
@@ -137,6 +143,25 @@ class TypeViewSuite(unittest.TestCase):
         typeview.deactivate()
         self.assertNotIsInstance(Instance.__dict__["args"], property)
         self.assertIn("args", Instance.__slots__)
+
+    def test_activation_reasserts_a_hook_stolen_by_a_co_resident(self) -> None:
+        """Order must not matter: a later co-resident hook cannot go inert."""
+        self._activate()
+        stolen: list[str] = []
+
+        def foreign(inst: object, name: str, value: object) -> None:
+            stolen.append(name)
+            object.__setattr__(inst, name, value)
+
+        Instance.__setattr__ = foreign  # type: ignore[method-assign]
+        # Already active, so this path must re-assert rather than assume.
+        self._activate()
+        self.assertIs(Instance.__dict__["__setattr__"], typeview._inst_setattr)
+        # And the stolen hook is now the chain link, so neither mechanism is
+        # silently inert.
+        inst = Instance(self.fx.std_listi, [self.fx.a])
+        self.assertIn("args", stolen)
+        del inst
 
     def test_arm_switch_two_to_one_uninstalls_the_route(self) -> None:
         """2 -> 1 must undo the routed property, or `_slot_get` recurses."""
@@ -303,10 +328,16 @@ class TypeViewSuite(unittest.TestCase):
         self._register(inst)
         self.assertIsNone(typeview.encode(inst))
         first = typeview.report().get("a_encode.miss", 0)
+        first_scan = typeview.report().get("a_register.unregistered_arg", 0)
         self.assertIsNone(typeview.encode(inst))
         self.assertIsNone(typeview.encode(inst))
         after = typeview.report().get("a_encode.miss", 0)
         self.assertEqual(after - first, 2)
+        # The memoized part: two more calls must not pay the registration scan
+        # again. Only a register-side counter can tell memoized from not.
+        self.assertEqual(
+            typeview.report().get("a_register.unregistered_arg", 0) - first_scan, 0
+        )
         # A successful registration clears the memo.
         self._register(self.fx.a, inst)
         self.assertIsNotNone(typeview.encode(inst))
