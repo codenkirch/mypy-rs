@@ -1684,6 +1684,25 @@ including:
   direct seam calls), plus 9 pure decision unit tests in
   `findmember.rs`.
 
+- `rust_check_call_head` (issue #1642, PR #1659) — batches the
+  `enum_callable_base` and `typeobj_gate` per-call FFI seams in
+  `mypy/checkexpr.py`'s `check_callable_call` into one FFI crossing.
+  `rust_check_call_head(callable_node, callee, enum_bases)` returns
+  `(enum_hit, typeobj_tag)`: the enum-callable-base check (live PyO3
+  RefExpr isinstance + fullname-in-ENUM_BASES, never defers) and the
+  typeobj gate (live PyO3 `is_type_obj()` + `type_object()` flags, defers
+  None on PyAttributeError) are combined. Saves ~183k FFI crossings on
+  the cold self-check (167k `check_callable_call` calls, each
+  previously making 2 FFI crossings). Falls back to individual seams
+  (`_rust_is_enum_callable_base`, `_rust_classify_typeobj_gate`) on
+  exception. The other 4 scalar seams in `check_callable_call` cannot
+  be batched: `map_actuals_to_formals` -> `compute_arg_context` ->
+  `check_argument_count` form a sequential dependency chain, and
+  `has_abstract_type` is per-arg granularity. Covered by the existing
+  `NativeTypeobjGateSuite` gate-off/on differential. Gates: cargo
+  2836/11, testtypes 325/3554, testcheck 8198/15/7 exact, fine-grained
+  747/27, cold self-check clean 353.
+
 - `rust_check_argument_count` (issue #1136) — reworked the wire-fact
   seam into a pure scalar-fact interface: no wire bytes cross the
   boundary. The seam folds `check_for_extra_actual_arguments` and the
