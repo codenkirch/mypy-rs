@@ -63,6 +63,7 @@ jobs:
     # trigger, this narrows it so a kernel-only change skips the AST suite.
     # Fail-open by design: no SHAs or no diff means every job still runs.
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     outputs:
       ast: ${{ steps.filter.outputs.ast }}
     steps:
@@ -86,7 +87,7 @@ jobs:
             exit 0
           fi
           echo "changed files:"; cat /tmp/changed.txt
-          PATTERN='^(crates/ast_serialize/|stubs/ast_serialize\.pyi$|mypy/nativeparse\.py$|mypy/fastparse\.py$|mypy/parse\.py$|mypy/nodes\.py$|mypy/errors\.py$|mypy/options\.py$|mypy/stubgen\.py$|mypy/stubutil\.py$|mypy/semanal[a-z_]*\.py$|mypy/test/test_nativeparse\.py$|mypy/test/testparse\.py$|mypy/test/teststubgen\.py$)'
+          PATTERN='^(\.github/workflows/native-kernel-parity\.yml$|crates/ast_serialize/|stubs/ast_serialize\.pyi$|mypy/nativeparse\.py$|mypy/fastparse\.py$|mypy/parse\.py$|mypy/nodes\.py$|mypy/errors\.py$|mypy/options\.py$|mypy/stubgen\.py$|mypy/stubutil\.py$|mypy/semanal[a-z_]*\.py$|mypy/test/conftest\.py$|mypy/test/test_nativeparse\.py$|mypy/test/testparse\.py$|mypy/test/teststubgen\.py$)'
           if grep -Eq "$PATTERN" /tmp/changed.txt; then
             echo "ast=true" >> "$GITHUB_OUTPUT"
           else
