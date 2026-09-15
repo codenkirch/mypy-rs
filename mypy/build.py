@@ -1395,22 +1395,25 @@ class BuildManager:
         # Phase G1.0a (#1572): activate the expression dual-write node
         # shadow (capture-only; no consumer reads it). Independent of the
         # type-kernel gate: it wraps live node classes.
+        capture_active = False
         if self.options.native_ast_mirror:
             import os as _os_ast_mirror
 
             from mypy import nodes_mirror
 
-            nodes_mirror.activate(
+            capture_active = nodes_mirror.activate(
                 audit=_os_ast_mirror.environ.get("MYPY_TK_AST_MIRROR_AUDIT") == "1"
             )
-            # Phase G1.2 (#1674): the aststrip lvalue read flip is a differential
-            # gate on the same shadow, so it stays off unless the capture
-            # mirror is on and every served read has a record behind it.
-            from mypy.server.aststrip import (
-                _set_native_shadow_read_active as _set_aststrip_shadow_read_active,
-            )
+        # Phase G1.2 (#1674): the aststrip read flip is a differential gate on
+        # the same shadow. Written on every manager, including the off
+        # case, so no later run inherits a stale True.
+        from mypy.server.aststrip import (
+            _set_native_shadow_read_active as _set_aststrip_shadow_read_active,
+        )
 
-            _set_aststrip_shadow_read_active(self.options.native_ast_mirror_read)
+        _set_aststrip_shadow_read_active(
+            capture_active and self.options.native_ast_mirror_read
+        )
         # Phase G3.0a (#1581): activate the namespace dual-write capture
         # shadow (capture-only; no consumer reads it). Independent of the
         # type-kernel gate: it wraps live SymbolTable classes.

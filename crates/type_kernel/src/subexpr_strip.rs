@@ -665,12 +665,11 @@ fn lvalue_value<'py>(
     if !names_dict.contains(key).map_err(|_| DeferError)? {
         return Ok(Some(false));
     }
-    // Mirror the `delete_names_entry` accessor: raw dict delete plus an
-    // explicit shadow drop, and only for a table that already has an
-    // identity handle (no minting for an unregistered table).
+    // Same order as `delete_names_entry`: live delete, then the shadow
+    // drop, and only for a table with an identity handle (no minting).
+    names_dict.del_item(key).map_err(|_| DeferError)?;
     if crate::identity::handle_of(names).is_some() {
         let _ = crate::symtable_mirror::delete(names, &name);
     }
-    names_dict.del_item(key).map_err(|_| DeferError)?;
     Ok(Some(true))
 }

@@ -43,23 +43,7 @@ G1_REF_STRUCT = {
     "is_new_def": "NodeShadow.is_new_def",
     "is_inferred_def": "NodeShadow.is_inferred_def",
 }
-G1_FIELD_MAP = (
-    "is_alias_rvalue",
-    "is_special_form",
-    "right_always",
-    "right_unreachable",
-    "method_type",
-    "as_type",
-    "type_guard",
-    "type_is",
-    "method_types",
-    "def_var",
-    "name",
-)
 G1_ANALYZED = "analyzed"
-# Fields that ``ast_serialize`` owns: written by the parser before any
-# analysis pass, so the node shadow is not their home (see the doc).
-G1_STRUCTURAL = ("name", "expr", "callee", "args", "arg_kinds", "arg_names", "left", "right", "op")
 # Expression classes the G1 patch installs on.
 G1_PATCHED = (
     "RefExpr",
@@ -168,7 +152,6 @@ OBJECT_VALUED = {
 class Slot:
     name: str
     line: int
-    owner: str
 
 
 @dataclass
@@ -176,7 +159,6 @@ class Tracked:
     name: str
     line: int
     table: str
-    owner: str = ""
 
 
 @dataclass
@@ -209,7 +191,7 @@ def parse_slots(path: Path) -> dict[str, list[Slot]]:
                 isinstance(t, ast.Name) and t.id == "__slots__" for t in stmt.targets
             ):
                 continue
-            slots.extend(Slot(name, line, node.name) for name, line in _literal_strings(stmt.value))
+            slots.extend(Slot(name, line) for name, line in _literal_strings(stmt.value))
         if slots:
             out[node.name] = slots
     return out
@@ -296,10 +278,7 @@ def parse_tracked_map(path: Path) -> dict[str, list[Tracked]]:
         for key, item in zip(value.keys, value.values):
             if not isinstance(key, ast.Name):
                 continue
-            entries = [
-                Tracked(name, line, table, key.id)
-                for name, line in _resolve_members(item, flat)
-            ]
+            entries = [Tracked(name, line, table) for name, line in _resolve_members(item, flat)]
             out.setdefault(key.id, []).extend(entries)
     return out
 
@@ -402,15 +381,26 @@ def mutation_sites(slot: str, owner: str, limit: int = 3) -> list[str]:
     )
     hits: list[tuple[str, str]] = []
     seen: set[str] = set()
+    # `rg` exit 1 is "no matches" (legitimate); anything else is an error
+    # whose empty stdout would otherwise read as "no gap found", i.e. a
+    # silently structural zero in the evidence.
+    if proc.returncode not in (0, 1):
+        raise RuntimeError(
+            f"rg failed ({proc.returncode}) scanning {slot!r}: {proc.stderr.strip()}"
+        )
     for line in proc.stdout.splitlines():
         path, _, rest = line.partition(":")
         if path.endswith("nodes.py") or "/test" in path or "test/" in path:
             continue
         if path in seen:
             continue
-        if subprocess.run(
-            ["rg", "-q", "-w", owner, path], cwd=ROOT, capture_output=True
-        ).returncode != 0:
+        probe = subprocess.run(["rg", "-q", "-w", owner, path], cwd=ROOT, capture_output=True)
+        if probe.returncode not in (0, 1):
+            raise RuntimeError(
+                f"rg failed ({probe.returncode}) probing {owner} in {path}: "
+                f"{probe.stderr.decode().strip()}"
+            )
+        if probe.returncode == 1:
             continue
         seen.add(path)
         hits.append((path, rest.split(":", 1)[0]))
@@ -420,7 +410,7 @@ def mutation_sites(slot: str, owner: str, limit: int = 3) -> list[str]:
     return [f"`{path}:{line}`" for path, line in hits[:limit]]
 
 
-def _verdict(slot: str, tracked: bool, writes: int, g1: bool) -> str:
+def _verdict(slot: str, tracked: bool, writes: int) -> str:
     if tracked:
         if slot in G1_REF_STRUCT:
             return "served"
@@ -438,7 +428,7 @@ def _verdict(slot: str, tracked: bool, writes: int, g1: bool) -> str:
     # (the AST wire writer owns it).
     if writes == 0:
         return "AST wire (structural)"
-    return "gap" if g1 else "gap"
+    return "gap"
 
 
 def emit() -> str:
@@ -509,7 +499,7 @@ def emit() -> str:
             # `writes` shells out to ripgrep per candidate file; only an
             # untracked slot needs that evidence.
             sites = [] if tracked else writes(slot.name, cls)
-            verdict = _verdict(slot.name, tracked, len(sites), True)
+            verdict = _verdict(slot.name, tracked, len(sites))
             lines.append(
                 f"| `{cls}` | `{slot.name}` ({NODES_PY.name}:{slot.line}) | {rust} "
                 f"| {served} | {verdict} |"
@@ -530,7 +520,7 @@ def emit() -> str:
             else:
                 anchor = "-"
             sites = [] if tracked else writes(slot.name, cls)
-            verdict = _verdict(slot.name, tracked, len(sites), False)
+            verdict = _verdict(slot.name, tracked, len(sites))
             lines.append(
                 f"| `{cls}` | `{slot.name}` ({NODES_PY.name}:{slot.line}) | {anchor} | {verdict} |"
             )
@@ -547,7 +537,7 @@ def emit() -> str:
             tracked = bool(entries)
             anchor = f"`symtables_mirror.py:{entries[0].line}` via `{entries[0].table}`" if tracked else "-"
             sites = [] if tracked else writes(slot.name, cls)
-            verdict = _verdict(slot.name, tracked, len(sites), False)
+            verdict = _verdict(slot.name, tracked, len(sites))
             lines.append(
                 f"| `{cls}` | `{slot.name}` ({NODES_PY.name}:{slot.line}) | {anchor} | {verdict} |"
             )
@@ -581,16 +571,21 @@ def emit() -> str:
 
 
 def main(argv: list[str]) -> int:
-    text = emit()
-    if len(argv) >= 3 and argv[1] == "--check":
+    if "--check" in argv[1:]:
+        if len(argv) != 3:
+            print("usage: g12_node_shadow_audit.py --check <doc-path>", file=sys.stderr)
+            return 2
         doc = Path(argv[2])
-        committed = doc.read_text()
-        if text not in committed:
+        if not doc.is_file():
+            print(f"no such document: {doc}", file=sys.stderr)
+            return 2
+        text = emit()
+        if text not in doc.read_text():
             print(f"stale audit tables in {doc}: re-run the generator", file=sys.stderr)
             return 1
         print(f"{doc}: audit tables match the derived state")
         return 0
-    sys.stdout.write(text)
+    sys.stdout.write(emit())
     return 0
 
 

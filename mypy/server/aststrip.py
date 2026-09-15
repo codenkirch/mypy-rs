@@ -257,7 +257,7 @@ class NodeStripVisitor(TraverserVisitor, SplittingVisitor):
         super().visit_super_expr(node)
 
     def process_lvalue_in_method(self, lvalue: Node) -> None:
-        if _native_shadow_read_active:
+        if _HAS_TYPE_KERNEL and _native_shadow_read_active:
             # G1.2 (#1674) read flip: `is_new_def` and `name` are served
             # from the node shadow and the class-namespace delete runs
             # natively; `None` keeps the tail below as the fallback.

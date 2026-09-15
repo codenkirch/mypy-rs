@@ -421,7 +421,7 @@ account for minutes of difference.
 | G1 | `IndexExpr` | `base` | `mypy/checkstrformat.py:863` |
 | G1 | `IndexExpr` | `index` | `mypy/checkstrformat.py:858` |
 | G2 | `ImportFrom` | `id` | `mypy/build.py:232` |
-| G2 | `ImportFrom` | `names` | `mypy/build.py:4647`, `mypy/treetransform.py:156` |
+| G2 | `ImportFrom` | `names` | `mypy/build.py:4654`, `mypy/treetransform.py:156` |
 | G2 | `ImportAll` | `id` | `mypy/build.py:232` |
 | G2 | `Block` | `body` | `mypy/fastparse.py:852`, `mypy/nativeparse.py:1936`, `mypy/semanal_namedtuple.py:145` |
 | G2 | `ForStmt` | `body` | `mypy/fastparse.py:852`, `mypy/nativeparse.py:1936`, `mypy/server/aststrip.py:147` |

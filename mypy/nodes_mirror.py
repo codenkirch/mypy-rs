@@ -657,17 +657,21 @@ def activate(*, audit: bool = False) -> None:
     Activation is one-shot (un-patching mid-run would desync live
     records), matching the type mirror. A later activate call may still
     turn counters on.
+
+    Returns whether the store is active afterwards, so a caller that
+    gates a consumer on the shadow (the G1.2 read flip) can refuse to
+    enable it against a missing extension instead of trusting the option.
     """
     global _active, _audit_mode, _kernel_mod
     if _active:
         if audit:
             _audit_mode = True
-        return
+        return True
     try:
         import type_kernel as _km
     except ImportError:
         _count("activate_failed.no_type_kernel")
-        return
+        return False
     _kernel_mod = _km
     _audit_mode = audit
     # G1.0b adds ComparisonExpr / StrExpr / UnaryExpr; NameExpr and
@@ -687,11 +691,12 @@ def activate(*, audit: bool = False) -> None:
             # A compiled (mypyc) class refuses class-level patching; a
             # partial install stays inert because `_active` never flips.
             _count("activate_failed.patch")
-            return
+            return False
     _active = True
     _count("activate")
     # G2.0 (#1577): patch the statement/def family (separate section).
     _activate_meta()
+    return True
 
 
 

@@ -66393,7 +66393,6 @@ class NativeNodeShadowReadFlipSuite(Suite):
         assert Options().native_ast_mirror_read is False
         assert "native_ast_mirror_read" not in OPTIONS_AFFECTING_CACHE
 
-
     # -- unmet preconditions must fail closed --
 
     def test_guard_falls_back_without_the_extension(self) -> None:
