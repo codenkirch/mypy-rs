@@ -62,7 +62,7 @@ from mypy.nodes import (
     TupleExpr,
     TypeInfo,
 )
-from mypy.nodes_mirror import touch as _touch_node_meta
+from mypy.nodes_mirror import count as _shadow_count, touch as _touch_node_meta
 from mypy.symtable_access import delete_names_entry as _delete_names_entry
 from mypy.traverser import TraverserVisitor
 from mypy.types import CallableType
@@ -70,19 +70,32 @@ from mypy.typestate import type_state
 
 # Issue #1635: native strip_ref_expr behind the server-deps gate.
 try:
-    from type_kernel import rust_strip_ref_expr as _rust_strip_ref_expr
+    from type_kernel import (
+        rust_aststrip_process_lvalue as _rust_aststrip_process_lvalue,
+        rust_strip_ref_expr as _rust_strip_ref_expr,
+    )
 
     _HAS_TYPE_KERNEL = True
 except ImportError:
     _rust_strip_ref_expr = None  # type: ignore[assignment]
+    _rust_aststrip_process_lvalue = None  # type: ignore[assignment]
     _HAS_TYPE_KERNEL = False
 
 _native_active: bool = False
+# G1.2 (#1674): serve the MemberExpr lvalue read from the node shadow. Set
+# from build.py only when the capture mirror is on, so the flip can never
+# run against an empty store.
+_native_shadow_read_active: bool = False
 
 
 def _set_native_active(active: bool) -> None:
     global _native_active
     _native_active = active
+
+
+def _set_native_shadow_read_active(active: bool) -> None:
+    global _native_shadow_read_active
+    _native_shadow_read_active = active
 
 
 def strip_target(node: MypyFile | FuncDef | OverloadedFuncDef) -> None:
@@ -244,6 +257,15 @@ class NodeStripVisitor(TraverserVisitor, SplittingVisitor):
         super().visit_super_expr(node)
 
     def process_lvalue_in_method(self, lvalue: Node) -> None:
+        if _native_shadow_read_active:
+            # G1.2 (#1674) read flip: `is_new_def` and `name` are served
+            # from the node shadow and the class-namespace delete runs
+            # natively; `None` keeps the tail below as the fallback.
+            served = _rust_aststrip_process_lvalue(self.type, lvalue)
+            if served is not None:
+                _shadow_count("aststrip.served" if served else "aststrip.served_noop")
+                return
+            _shadow_count("aststrip.deferred")
         if isinstance(lvalue, MemberExpr):
             if lvalue.is_new_def:
                 # Remove defined attribute from the class symbol table. If is_new_def is

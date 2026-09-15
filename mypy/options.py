@@ -426,6 +426,10 @@ class Options:
         # AST family (RefExpr bindings + analyzed); capture-only and not in
         # OPTIONS_AFFECTING_CACHE: no shadow state may enter the cache.
         self.native_ast_mirror = False
+        # Phase G1.2 (#1674): when the node shadow is on, the aststrip MemberExpr
+        # lvalue read (`is_new_def` + `name`) and its class-namespace delete
+        # are served from shadow storage; not in OPTIONS_AFFECTING_CACHE.
+        self.native_ast_mirror_read = False
         # Phase G3.0a (#1581): opt-in dual-write namespace capture shadow
         # for symbol tables (semanal adding funnel via put_names_entry).
         # Capture-only, not in OPTIONS_AFFECTING_CACHE.

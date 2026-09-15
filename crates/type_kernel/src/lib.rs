@@ -3706,6 +3706,10 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         module
     )?)?;
     module.add_function(wrap_pyfunction!(
+        node_mirror::rust_node_mirror_capture_field_text,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
         node_mirror::rust_node_mirror_field,
         module
     )?)?;
@@ -3899,6 +3903,10 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
     )?)?;
     module.add_function(wrap_pyfunction!(
         subexpr_strip::rust_strip_ref_expr,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        subexpr_strip::rust_aststrip_process_lvalue,
         module
     )?)?;
 

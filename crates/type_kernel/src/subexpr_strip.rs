@@ -585,3 +585,92 @@ pub(crate) fn rust_strip_ref_expr(node: &PyAny) -> PyResult<Option<bool>> {
         Err(_) => Ok(None),
     }
 }
+
+// ---------------------------------------------------------------------------
+// G1.2 (#1674): shadow-served read flip for the aststrip lvalue arm
+// ---------------------------------------------------------------------------
+
+/// Native `NodeStripVisitor.process_lvalue_in_method`, MemberExpr arm.
+///
+/// The first expression-node **read flip**: `MemberExpr.is_new_def` and
+/// `MemberExpr.name` are served from the G1 node shadow (`mypy/nodes_mirror`
+/// + `crate::node_mirror`) instead of crossing to the live Python slots,
+/// and the class-namespace delete goes through `crate::symtable_mirror`
+/// exactly like the Python `delete_names_entry` accessor.
+///
+/// Reads only shadowed slots, never infers them: `is_new_def` comes from
+/// the G1.0a record and `name` from the G1.2 text record, both written by
+/// the same `__setattr__` hook that the live slots go through, so the
+/// served values cannot drift from Python. `None` means "the store does
+/// not cover this read" (no record, another lvalue shape, `type` None)
+/// and the Python body stays the identical fallback, including its
+/// `assert self.type is not None`.
+///
+/// Returns `Some(deleted)` when the shadow served the read: `deleted` is
+/// whether the name was removed from the class namespace.
+#[pyfunction]
+#[pyo3(signature = (type_info, lvalue))]
+pub(crate) fn rust_aststrip_process_lvalue<'py>(
+    py: Python<'py>,
+    type_info: Option<&'py PyAny>,
+    lvalue: &'py PyAny,
+) -> PyResult<Option<bool>> {
+    match lvalue_value(py, type_info, lvalue) {
+        Ok(served) => Ok(served),
+        Err(_) => Ok(None),
+    }
+}
+
+fn lvalue_value<'py>(
+    py: Python<'py>,
+    type_info: Option<&'py PyAny>,
+    lvalue: &'py PyAny,
+) -> Result<Option<bool>, DeferError> {
+    // Only the MemberExpr arm of `process_lvalue_in_method` is flipped;
+    // tuple/list/star lvalues stay on the Python recursion.
+    if !class_name_is(lvalue, "MemberExpr") {
+        return Ok(None);
+    }
+    let handle = match crate::identity::handle_of(lvalue) {
+        Some(handle) => handle,
+        None => return Ok(None),
+    };
+    let is_new_def = match crate::node_mirror::shadow_is_new_def(handle) {
+        Some(value) => value,
+        None => return Ok(None),
+    };
+    let name = match crate::node_mirror::shadow_field_text(handle, "name") {
+        Some(value) => value,
+        None => return Ok(None),
+    };
+    if !is_new_def {
+        return Ok(Some(false));
+    }
+    // `assert self.type is not None` stays Python-side: defer so the
+    // identical assert fires.
+    let info = match type_info {
+        Some(info) => {
+            if info.is_none() {
+                return Ok(None);
+            }
+            info
+        }
+        None => return Ok(None),
+    };
+    let names = get_attr_or_defer(info, "names")?;
+    let names_dict = names
+        .downcast::<pyo3::types::PyDict>()
+        .map_err(|_| DeferError)?;
+    let key = PyString::new(py, &name);
+    if !names_dict.contains(key).map_err(|_| DeferError)? {
+        return Ok(Some(false));
+    }
+    // Mirror the `delete_names_entry` accessor: raw dict delete plus an
+    // explicit shadow drop, and only for a table that already has an
+    // identity handle (no minting for an unregistered table).
+    if crate::identity::handle_of(names).is_some() {
+        let _ = crate::symtable_mirror::delete(names, &name);
+    }
+    names_dict.del_item(key).map_err(|_| DeferError)?;
+    Ok(Some(true))
+}

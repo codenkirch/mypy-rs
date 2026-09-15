@@ -394,6 +394,7 @@ _NATIVE_ENV_MODULE_PROBES = {
         "type_kernel",
         "rust_snapshot_symbol_table_shadow",
     ),
+    "TEST_NATIVE_AST_MIRROR_READ": ("type_kernel", "rust_aststrip_process_lvalue"),
 }
 
 
@@ -485,6 +486,9 @@ def parse_options(
     # Phase G1.0a (#1572) node shadow is capture-only; the option only
     # installs the AST-mirror hooks, so a missing extension is a no-op.
     options.native_ast_mirror = _env_gate("TEST_NATIVE_AST_MIRROR")
+    # Phase G1.2 (#1674) read flip is a differential mirror gate: the
+    # aststrip lvalue read is only served when the capture mirror is on.
+    options.native_ast_mirror_read = _env_gate("TEST_NATIVE_AST_MIRROR_READ")
     # Phase G3.0a (#1581) namespace shadow is capture-only for the same
     # reason: the option installs the SymbolTable class hooks only.
     options.native_symtable_mirror = _env_gate("TEST_NATIVE_SYMTABLE_MIRROR")

@@ -59176,9 +59176,15 @@ class NativeAstMirrorFieldSuite(Suite):
         expr.type_guard = self.fx.a
         handle = self._handle(expr)
         assert self._k.rust_node_mirror_ref(handle) == (GDEF, None, "", False, False)
-        assert self._k.rust_node_mirror_fields(handle) == ["is_alias_rvalue", "type_guard"]
+        assert self._k.rust_node_mirror_fields(handle) == [
+            "is_alias_rvalue",
+            "name",
+            "type_guard",
+        ]
         assert self._k.rust_node_mirror_captures(handle) == (1, 0)
-        assert self._k.rust_node_mirror_field_captures(handle) == 2
+        # G1.2 (#1674) seeds the node's own `name` at adoption, so the
+        # two explicit field writes plus that seed are counted here.
+        assert self._k.rust_node_mirror_field_captures(handle) == 3
         assert self._k.rust_node_mirror_entry_count() == 1
 
     def test_baseline_field_writes_do_not_adopt(self) -> None:
@@ -66152,3 +66158,289 @@ class NativeReplaceImplicitFirstTypeRetiredSuite(Suite):
         first = get_proper_type(decoded.arg_types[0])
         assert isinstance(first, Instance)
         assert first.type_ref == "builtins.object"
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeNodeShadowReadFlipSuite(Suite):
+    """G1.2 (#1674): the `name` gap closure and the first read flip.
+
+    `mypy/nodes_mirror` seeds `NameExpr.name` / `MemberExpr.name` at
+    adoption (the constructor write is invisible to the adopted-only
+    rule, so a read-back seed is what puts the slot in the record) and
+    captures later writes, which lets `rust_aststrip_process_lvalue`
+    serve the aststrip lvalue read (`is_new_def` + `name`) plus the
+    class-namespace delete from shadow storage.
+
+    `None` from the seam keeps the Python tail: every gate-off,
+    uncovered-shape and `type is None` assertion below pins that
+    fallback, and the differential asserts flip-off and flip-on agree on
+    the resulting namespace.
+    """
+
+    def setUp(self) -> None:
+        import type_kernel as kernel
+
+        from mypy import nodes_mirror
+
+        nodes_mirror.activate(audit=True)
+        nodes_mirror.reset(clear_counts=True)
+        self._k = kernel
+        self._m = nodes_mirror
+        self.fx = TypeFixture()
+
+    def tearDown(self) -> None:
+        from mypy.server import aststrip
+
+        aststrip._set_native_shadow_read_active(False)
+        self._m.reset(clear_counts=True)
+
+    def _handle(self, node: Any) -> int:
+        handle = self._m._NODE_HANDLES.get(id(node))
+        assert handle is not None, "node was not adopted by the shadow"
+        return handle
+
+    def _delta(self, before: dict[str, int]) -> dict[str, int]:
+        after = self._m.report()
+        return {k: v - before.get(k, 0) for k, v in after.items() if v != before.get(k, 0)}
+
+    def _type_info(self, names: list[str]) -> Any:
+        info = TypeInfo(SymbolTable(), ClassDef("C", Block([]), None, []), "mod")
+        for name in names:
+            info.names[name] = SymbolTableNode(MDEF, Var(name))
+        return info
+
+    def _adopted_member(self, name: str, *, is_new_def: bool, target: Any = None) -> MemberExpr:
+        """A MemberExpr the shadow holds a record for, as semanal leaves it."""
+        member = MemberExpr(NameExpr("self"), name)
+        member.kind = MDEF if is_new_def else LDEF
+        member.node = target
+        member.is_new_def = is_new_def
+        return member
+
+    def _unrecorded_member(self, name: str) -> MemberExpr:
+        """A `self.x = ...` lvalue the capture gate never saw."""
+        member = MemberExpr(NameExpr("self"), name)
+        self._m._active = False
+        try:
+            member.is_new_def = True
+        finally:
+            self._m._active = True
+        assert id(member) not in self._m._NODE_HANDLES
+        return member
+
+    # -- the name gap closure --
+
+    def test_adoption_seeds_the_name_slot(self) -> None:
+        member = MemberExpr(NameExpr("self"), "v")
+        assert id(member) not in self._m._NODE_HANDLES
+        member.kind = MDEF
+        handle = self._handle(member)
+        assert self._k.rust_node_mirror_field(handle, "name") == ("text", "v")
+        expr = NameExpr("x")
+        expr.kind = GDEF
+        assert self._k.rust_node_mirror_field(self._handle(expr), "name") == ("text", "x")
+
+    def test_constructor_name_write_never_adopts(self) -> None:
+        expr = NameExpr("x")
+        MemberExpr(NameExpr("self"), "v")
+        assert id(expr) not in self._m._NODE_HANDLES
+        assert self._k.rust_node_mirror_entry_count() == 0
+
+    def test_refexpr_without_a_name_slot_seeds_nothing(self) -> None:
+        from mypy.nodes import TypeApplication
+
+        call = CallExpr(NameExpr("f"), [], [], [])
+        call.analyzed = TypeApplication(NameExpr("f"), [self.fx.a])
+        handle = self._handle(call)
+        assert self._k.rust_node_mirror_field(handle, "name") is None
+
+    def test_later_name_write_refreshes_the_record(self) -> None:
+        # `mypy/renaming.py` renames NameExpr slots in place; that write
+        # must land in the record or a served read would go stale.
+        expr = NameExpr("x")
+        expr.kind = LDEF
+        handle = self._handle(expr)
+        expr.name = "x'"
+        assert self._k.rust_node_mirror_field(handle, "name") == ("text", "x'")
+        other = NameExpr("y")
+        other.name = "y'"  # unadopted: no record, so no stale name
+        assert id(other) not in self._m._NODE_HANDLES
+
+    # -- the seam --
+
+    def test_seam_serves_the_read_and_deletes(self) -> None:
+        target = Var("v")
+        member = self._adopted_member("v", is_new_def=True, target=target)
+        info = self._type_info(["v", "other"])
+        assert self._k.rust_aststrip_process_lvalue(info, member) is True
+        assert "v" not in info.names
+        assert set(info.names) == {"other"}
+
+    def test_seam_serves_a_noop_when_the_name_is_absent(self) -> None:
+        member = self._adopted_member("missing", is_new_def=True)
+        info = self._type_info(["other"])
+        assert self._k.rust_aststrip_process_lvalue(info, member) is False
+        assert set(info.names) == {"other"}
+
+    def test_seam_serves_false_for_an_established_member(self) -> None:
+        member = self._adopted_member("v", is_new_def=False)
+        info = self._type_info(["v"])
+        assert self._k.rust_aststrip_process_lvalue(info, member) is False
+        assert "v" in info.names, "a non-defining member must not delete"
+
+    def test_seam_defers_without_a_record(self) -> None:
+        member = MemberExpr(NameExpr("self"), "v")
+        info = self._type_info(["v"])
+        assert self._k.rust_aststrip_process_lvalue(info, member) is None
+        assert "v" in info.names
+
+    def test_seam_defers_for_other_lvalue_shapes(self) -> None:
+        info = self._type_info(["v"])
+        name = NameExpr("v")
+        name.kind = LDEF
+        assert self._k.rust_aststrip_process_lvalue(info, name) is None
+        assert self._k.rust_aststrip_process_lvalue(info, TupleExpr([name])) is None
+        assert "v" in info.names
+
+    def test_seam_defers_when_the_active_class_is_none(self) -> None:
+        member = self._adopted_member("v", is_new_def=True)
+        assert self._k.rust_aststrip_process_lvalue(None, member) is None
+
+    def test_seam_drops_the_namespace_shadow_record(self) -> None:
+        from mypy import symtables_mirror
+        from mypy.symtable_access import put_names_entry
+
+        member = self._adopted_member("v", is_new_def=True)
+        info = self._type_info([])
+        symtables_mirror.activate()
+        try:
+            put_names_entry(info.names, "v", SymbolTableNode(MDEF, Var("v")))
+            assert self._k.rust_symtable_mirror_lookup(info.names, "v") is not None
+            assert self._k.rust_aststrip_process_lvalue(info, member) is True
+            assert "v" not in info.names
+            assert self._k.rust_symtable_mirror_lookup(info.names, "v") is None
+        finally:
+            symtables_mirror.reset()
+
+    # -- the differential --
+
+    def test_differential_flip_off_and_on_agree(self) -> None:
+        from mypy.server import aststrip
+
+        before = dict(self._m.report())
+        aststrip._set_native_shadow_read_active(False)
+        tail_off = self._type_info(["v", "keep"])
+        self._run_visitor(tail_off, self._adopted_member("v", is_new_def=True))
+        plain_off = self._type_info(["v", "keep"])
+        self._run_visitor(plain_off, self._unrecorded_member("v"))
+        aststrip._set_native_shadow_read_active(True)
+        served_on = self._type_info(["v", "keep"])
+        self._run_visitor(served_on, self._adopted_member("v", is_new_def=True))
+        plain_on = self._type_info(["v", "keep"])
+        self._run_visitor(plain_on, self._unrecorded_member("v"))
+        # Both pairs agree: the recorded lvalue is served from the shadow,
+        # the unrecorded one keeps the Python tail.
+        for info in (tail_off, plain_off, served_on, plain_on):
+            assert set(info.names) == {"keep"}
+        delta = self._delta(before)
+        assert delta.get("aststrip.served") == 1, delta
+        assert delta.get("aststrip.deferred") == 1, delta
+
+    def _run_visitor(self, info: Any, lvalue: Any) -> None:
+        from mypy.server.aststrip import NodeStripVisitor
+
+        visitor = NodeStripVisitor()
+        visitor.type = info
+        visitor.process_lvalue_in_method(lvalue)
+
+    def test_differential_covers_a_nested_tuple_lvalue(self) -> None:
+        from mypy.server import aststrip
+
+        before = dict(self._m.report())
+        tuple_off = TupleExpr([NameExpr("self"), self._adopted_member("v", is_new_def=True)])
+        tuple_on = TupleExpr([NameExpr("self"), self._adopted_member("v", is_new_def=True)])
+        info_off = self._type_info(["v", "keep"])
+        info_on = self._type_info(["v", "keep"])
+        aststrip._set_native_shadow_read_active(False)
+        self._run_visitor(info_off, tuple_off)
+        aststrip._set_native_shadow_read_active(True)
+        self._run_visitor(info_on, tuple_on)
+        assert set(info_off.names) == set(info_on.names) == {"keep"}
+        delta = self._delta(before)
+        # The container arm and its plain NameExpr item defer to Python;
+        # the inner MemberExpr is the one read the flip serves.
+        assert delta.get("aststrip.deferred") == 2, delta
+        assert delta.get("aststrip.served") == 1, delta
+
+    # -- gate contract --
+
+    def test_gate_off_writes_leave_nothing_to_serve(self) -> None:
+        from mypy.server import aststrip
+
+        before = dict(self._m.report())
+        member = self._unrecorded_member("v")
+        info = self._type_info(["v", "keep"])
+        aststrip._set_native_shadow_read_active(True)
+        self._run_visitor(info, member)
+        # No record, so the seam defers and the Python tail still deletes.
+        assert "v" not in info.names
+        delta = self._delta(before)
+        assert delta.get("aststrip.deferred") == 1, delta
+        assert delta.get("aststrip.served") is None, delta
+
+    def test_option_default_off_and_not_cache_affecting(self) -> None:
+        from mypy.options import OPTIONS_AFFECTING_CACHE, Options
+
+        assert Options().native_ast_mirror_read is False
+        assert "native_ast_mirror_read" not in OPTIONS_AFFECTING_CACHE
+
+
+    # -- unmet preconditions must fail closed --
+
+    def test_guard_falls_back_without_the_extension(self) -> None:
+        """A missing extension must not turn the flipped call into a crash."""
+        from mypy.server import aststrip
+
+        member = self._adopted_member("v", is_new_def=True)
+        info = self._type_info(["v", "keep"])
+        before = dict(self._m.report())
+        aststrip._set_native_shadow_read_active(True)
+        original = aststrip._HAS_TYPE_KERNEL
+        aststrip._HAS_TYPE_KERNEL = False
+        try:
+            self._run_visitor(info, member)
+        finally:
+            aststrip._HAS_TYPE_KERNEL = original
+        # The guarded path never enters the seam: the Python tail removes
+        # the name and neither a serve nor a defer is counted.
+        assert "v" not in info.names
+        delta = self._delta(before)
+        assert delta.get("aststrip.served") is None, delta
+        assert delta.get("aststrip.deferred") is None, delta
+
+    def test_activate_reports_whether_the_store_is_live(self) -> None:
+        """`activate` must say when it could not install anything.
+
+        build.py gates the read flip on this return value, so a store that
+        stayed off (missing extension) can never enable a flip whose
+        substrate is absent.
+        """
+        import sys
+
+        from mypy import nodes_mirror
+
+        assert nodes_mirror.activate() is True, "the scratch extension is present"
+        saved_module = sys.modules.get("type_kernel")
+        saved_active = nodes_mirror._active
+        saved_kernel = nodes_mirror._kernel_mod
+        # Force the not-yet-active path with the extension unavailable, the
+        # state build.py must never enable the flip from.
+        nodes_mirror._active = False
+        nodes_mirror._kernel_mod = None
+        sys.modules["type_kernel"] = None  # type: ignore[assignment]
+        try:
+            assert nodes_mirror.activate() is False
+        finally:
+            if saved_module is not None:
+                sys.modules["type_kernel"] = saved_module
+            nodes_mirror._active = saved_active
+            nodes_mirror._kernel_mod = saved_kernel

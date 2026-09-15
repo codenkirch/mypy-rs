@@ -270,6 +270,9 @@ pub(crate) enum FieldValue {
     Flag(bool),
     /// Definition link (`MemberExpr.def_var`): the target fullname.
     Name(Option<String>),
+    /// Plain string slot (`NameExpr.name`, `MemberExpr.name`); G1.2
+    /// (#1674) closes the name gap the aststrip lvalue read needs.
+    Text(String),
     /// Type list (`ComparisonExpr.method_types`): class per item.
     Kinds(Vec<Option<String>>),
     /// G1.1: wire bytes for a type-valued field, plus the class name
@@ -456,6 +459,16 @@ pub(crate) fn rust_node_mirror_capture_field_name(
     capture_field_value(obj, field, FieldValue::Name(name))
 }
 
+/// Capture a plain string slot (`NameExpr.name`, `MemberExpr.name`).
+#[pyfunction]
+pub(crate) fn rust_node_mirror_capture_field_text(
+    obj: &PyAny,
+    field: String,
+    value: String,
+) -> PyResult<u64> {
+    capture_field_value(obj, field, FieldValue::Text(value))
+}
+
 /// Capture a type list (`ComparisonExpr.method_types`).
 #[pyfunction]
 pub(crate) fn rust_node_mirror_capture_field_kinds(
@@ -471,6 +484,7 @@ fn field_value_object(py: Python<'_>, value: &FieldValue) -> PyObject {
         FieldValue::Kind(kind) => ("kind", kind.clone()).into_py(py),
         FieldValue::Flag(flag) => ("flag", *flag).into_py(py),
         FieldValue::Name(name) => ("name", name.clone()).into_py(py),
+        FieldValue::Text(text) => ("text", text.clone()).into_py(py),
         FieldValue::Kinds(kinds) => ("kinds", kinds.clone()).into_py(py),
         FieldValue::Wire { kind, bytes } => ("wire", kind.clone(), bytes.clone()).into_py(py),
     }
@@ -534,6 +548,29 @@ pub(crate) fn rust_node_mirror_field_captures(handle: u64) -> Option<u64> {
             .by_handle
             .get(&handle)
             .map(|entry| entry.field_captures)
+    })
+}
+
+// ---- G1.2 (#1674): internal accessors for shadow-served reads ----
+// Native seams read a shadowed slot through these instead of crossing to
+// the live object; `None` keeps the caller's live read (F2 fallback).
+
+/// `RefExpr.is_new_def` from the record; None when the object has no
+/// entry (the lazy-adoption baseline: an unrecorded node is never served).
+pub(crate) fn shadow_is_new_def(handle: u64) -> Option<bool> {
+    with_store(|store| store.by_handle.get(&handle).map(|e| e.is_new_def))
+}
+
+/// A `Text`-valued field (`NameExpr.name`, `MemberExpr.name`); None when
+/// the object/field has no record or the field is another shape.
+pub(crate) fn shadow_field_text(handle: u64, field: &str) -> Option<String> {
+    with_store(|store| {
+        store.by_handle.get(&handle).and_then(|entry| {
+            entry.fields.get(field).and_then(|value| match value {
+                FieldValue::Text(text) => Some(text.clone()),
+                _ => None,
+            })
+        })
     })
 }
 
@@ -1166,6 +1203,34 @@ mod node_field_shadow_tests {
                     "right_always".to_string()
                 ])
             );
+        });
+    }
+
+    #[test]
+    fn test_capture_field_text_roundtrip() {
+        with_py(|py| {
+            reset();
+            let obj = fresh_object(py);
+            let h = rust_node_mirror_capture_field_text(obj, "name".to_string(), "x".to_string())
+                .unwrap();
+            let (tag, text) = obj_field(py, h, "name")
+                .unwrap()
+                .extract::<(String, String)>(py)
+                .unwrap();
+            assert_eq!((tag.as_str(), text.as_str()), ("text", "x"));
+            assert_eq!(shadow_field_text(h, "name").as_deref(), Some("x"));
+            // A field written as another shape is not served as text.
+            rust_node_mirror_capture_flag(obj, "is_special_form".to_string(), true).unwrap();
+            assert_eq!(shadow_field_text(h, "is_special_form"), None);
+            // `is_new_def` is the G1.0a record field (never a map entry):
+            // its default is False until a binding capture writes it.
+            assert_eq!(shadow_is_new_def(h), Some(false));
+            rust_node_mirror_capture_ref(obj, Some(1), None, "m.x".to_string(), true, false)
+                .unwrap();
+            assert_eq!(shadow_is_new_def(h), Some(true));
+            // An unknown handle serves nothing (the caller keeps live).
+            assert_eq!(shadow_field_text(h + 1, "name"), None);
+            assert_eq!(shadow_is_new_def(h + 1), None);
         });
     }
 }

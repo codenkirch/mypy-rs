@@ -503,6 +503,7 @@ __all__ = [
     "rust_node_mirror_capture_flag",
     "rust_node_mirror_capture_field_name",
     "rust_node_mirror_capture_field_kinds",
+    "rust_node_mirror_capture_field_text",
     "rust_node_mirror_field",
     "rust_node_mirror_fields",
     "rust_node_mirror_field_captures",
@@ -544,6 +545,7 @@ __all__ = [
     "rust_view_reset",
     "rust_view_count",
     "rust_view_stats",
+    "rust_aststrip_process_lvalue",
     "IdMapper",
 ]
 
@@ -2952,3 +2954,5 @@ def rust_view_touch(handle: int) -> bool: ...
 def rust_view_reset() -> int: ...
 def rust_view_count() -> int: ...
 def rust_view_stats() -> tuple[int, int, int]: ...
+def rust_aststrip_process_lvalue(type_info: Any, lvalue: Any) -> bool | None: ...
+def rust_node_mirror_capture_field_text(obj: Any, field: str, value: str) -> int: ...

@@ -10,12 +10,16 @@ the store to the remaining G1 expression fields: `method_type`
 (OpExpr/IndexExpr/UnaryExpr), `method_types` (ComparisonExpr), `as_type`
 (OpExpr/IndexExpr/StrExpr), `right_always`/`right_unreachable` (OpExpr),
 `def_var` (MemberExpr) and the RefExpr/NameExpr `is_special_form`,
-`is_alias_rvalue`, `type_guard` and `type_is` flags. Each field keeps a
+`is_alias_rvalue`, `type_guard` and `type_is` flags. G1.2 (#1674) adds
+the node's own `name` slot (`NameExpr`/`MemberExpr`) so the aststrip
+lvalue read flip has a shadow record to serve. Each field keeps a
 presence marker plus a shape record (class name, bool, fullname, or
 kind list); the payload type graph is G1.1, which extends these records
-with wire bytes. No consumer reads the store in G1.0a/G1.0b; it exists
-to prove the capture path before any read flip, exactly like the F1
-type mirror proved construction capture.
+with wire bytes. G1.2 (#1674) gives the store its first consumer: the
+aststrip lvalue read (`mypy/server/aststrip.py`, gated by
+`Options.native_ast_mirror_read`) is served from here for the
+`is_new_def` and `name` slots, and falls back to the live slots for
+everything the records do not cover.
 
 Design notes:
 - Capture is via class-level monkeypatching of ``__setattr__`` on
@@ -128,7 +132,13 @@ _FLAG_FIELDS: Final[frozenset[str]] = frozenset(
 )
 _NAME_FIELDS: Final[frozenset[str]] = frozenset({"def_var"})
 _KINDS_FIELDS: Final[frozenset[str]] = frozenset({"method_types"})
-_FIELD_NAMES: Final[frozenset[str]] = _KIND_FIELDS | _FLAG_FIELDS | _NAME_FIELDS | _KINDS_FIELDS
+# G1.2 (#1674): the node's own name slot (NameExpr/MemberExpr). Parse-time
+# shaped, so it is captured only for an already-adopted node (see
+# `_node_setattr`) plus a read-back seed at adoption (`_seed_name`).
+_TEXT_FIELDS: Final[frozenset[str]] = frozenset({"name"})
+_FIELD_NAMES: Final[frozenset[str]] = (
+    _KIND_FIELDS | _FLAG_FIELDS | _NAME_FIELDS | _KINDS_FIELDS | _TEXT_FIELDS
+)
 
 _kernel_mod: Any = None
 _active = False
@@ -148,6 +158,15 @@ def _count(key: str, n: int = 1) -> None:
     if not _audit_mode:
         return
     _audit[key] = _audit.get(key, 0) + n
+
+
+def count(key: str, n: int = 1) -> None:
+    """Record one engagement counter; a no-op without the audit flag.
+
+    Read-flip seams (`mypy/server/aststrip.py`) report served reads and
+    fallbacks through this so the flip's engagement is provable per path.
+    """
+    _count(key, n)
 
 
 def _serialize_type_wire(t: MypyType) -> bytes:
@@ -203,6 +222,22 @@ def _is_baseline(name: str, value: Any) -> bool:
     return value is False  # is_new_def / is_inferred_def
 
 
+def _seed_name(node: Any) -> None:
+    """Read back the node's own `name` slot at adoption (G1.2, #1674).
+
+    `name` is written by the constructor, before any adopted write can
+    see it, so adoption reads it back instead; every later write to the
+    slot is captured by the adopted-only rule in `_node_setattr` (the
+    `mypy/renaming.py` rename is the one production writer).
+    """
+    try:
+        name = node.name
+    except AttributeError:
+        return
+    if isinstance(name, str):
+        _kernel_mod.rust_node_mirror_capture_field_text(node, "name", name)
+
+
 def _capture_ref(node: RefExpr) -> None:
     global _in_capture
     _in_capture = True
@@ -221,6 +256,7 @@ def _capture_ref(node: RefExpr) -> None:
         )
         _NODE_HANDLES[id(node)] = handle
         _count("capture_ref")
+        _seed_name(node)
     except Exception:
         _count("capture_fail.ref")
     finally:
@@ -278,6 +314,8 @@ def _capture_field(node: Any, name: str) -> None:
                 )
         elif name in _FLAG_FIELDS:
             handle = _kernel_mod.rust_node_mirror_capture_flag(node, name, bool(value))
+        elif name in _TEXT_FIELDS:
+            handle = _kernel_mod.rust_node_mirror_capture_field_text(node, name, str(value))
         elif name in _NAME_FIELDS:
             target = value
             fullname: str | None = None
@@ -318,6 +356,14 @@ def _node_setattr(self: Any, name: str, value: Any) -> None:
         _count("baseline_skip.analyzed")
     elif name == "analyzed":
         _capture_analyzed(self)
+    elif name in _TEXT_FIELDS:
+        # G1.2 (#1674): a parse-time slot, so the constructor write is not
+        # a capture trigger; only an adopted node can hold a stale record
+        # for it (`mypy/renaming.py` renames NameExpr slots in place).
+        if _NODE_HANDLES.get(id(self)) is None:
+            _count("baseline_skip." + name)
+            return
+        _capture_field(self, name)
     elif name in _FIELD_NAMES:
         if _NODE_HANDLES.get(id(self)) is None and _is_field_baseline(name, value):
             _count("baseline_skip." + name)
@@ -326,15 +372,12 @@ def _node_setattr(self: Any, name: str, value: Any) -> None:
 
 
 # ===========================================================================
-# G2.0 statement/def metadata shadow (issue #1577)
-# G2.1 extension: ImportBase bool flags + Block.is_unreachable
+# G2.0 statement/def metadata shadow (issue #1577) + G2.1 ImportBase flags.
 # ===========================================================================
 
-# Record-only metadata capture for the statement and def families, added
-# in its own section because the parallel G1.0b agent extends the G1
-# classes above. G2.1 extends ImportBase tracking to four bool flags
-# (is_unreachable, is_unreachable_dependency, is_top_level, is_mypy_only)
-# set by semanal pass1 and reachability, and adds Block.is_unreachable.
+# Record-only metadata capture for the statement and def families, in its
+# own section because the parallel G1.0b agent extends the G1 classes
+# above; G2.1 adds the ImportBase bool flags and Block.is_unreachable.
 
 # Same gate (`Options.native_ast_mirror`) and identity base as G1.0a;
 # no consumer reads a record. The tracked field table is per patch
