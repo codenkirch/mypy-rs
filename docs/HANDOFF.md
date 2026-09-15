@@ -1,5 +1,130 @@
 # Handoff: strangler-fig Rust migration loop (seam-deferral reduction)
 
+## RESUME POINT — 2026-09-15, night (wave 5: tiered feedback, ledger archived out of AGENTS.md)
+
+Eight lanes ran wave 5 under a new feedback protocol: gates are chosen by blast
+radius (tiers T1-T4), the full local corpus is a wave-level step rather than a
+per-lane step, and heavy ops go through a weighted pool instead of a flat
+mutex. The seam ledger itself moved out of `AGENTS.md` into
+`docs/plans/type-kernel-seam-ledger.md` in the same wave.
+
+### Where `main` stands
+
+`main` = `08ef56f57` (`fix(ci): match parity AST paths with POSIX globs`, PR
+`#1691`), on top of `3d5ace300` (seam-split planner, PR `#1692`),
+`e531197d3` (zero-call correction, PR `#1686`), `a0f6150a7` (evidence
+convention, PR `#1684`), `e9017bf46` (worktree pool, PR `#1683`),
+`3329850ac` (`parity-ast` path gate, PR `#1681`), `271175175` (the ledger
+archive, PR `#1676`) and `618c2b196` (#1669). Wave 5 branched from `506aa7e4c`.
+
+Landed this wave, in merge order:
+
+- `618c2b196` **retire residual scalar-only wire seams (#1668, PR #1669)** —
+  five gates deleted (`rust_descriptor_has_get_set`, the singleton
+  identity/equality pair, `rust_is_recursive_pair`,
+  `rust_analyze_none_member_access`); 43,909 calls / 953,594 bytes -> 0 as
+  reported by that lane. Tier T3.
+- `271175175` **archive the seam ledger out of `AGENTS.md` (PR #1676)** —
+  `AGENTS.md` 4,937 -> 232 lines, lossless: of 4,708 nonblank removed lines,
+  4,628 byte-identical in the archive, 80 in `docs/native-build-reference.md`,
+  0 unaccounted. Tier T1.
+- `3329850ac` **gate the AST parity job on AST-path changes (#1678, PR
+  #1681)** — CI tier; the redundancy it records (parity and parity-typeops are
+  the same corpus; parity runs testcheck twice inside itself) was deliberately
+  not fixed.
+- `e9017bf46` **reusable worktree pool (#1680, PR #1683)** — compiled-unit
+  counts, not wall clock, are the load-invariant evidence.
+- `a0f6150a7` **wave evidence-artifact convention plus wave-5 measurements
+  (#1679, PR #1684)** — docs tier.
+- `e531197d3` **correct the zero-call seam claim (#1679, PR #1686)** — the
+  falsified claim is left visible with its lesson. Docs tier.
+- `3d5ace300` **verified planner for the seam-registration split (#1677, PR
+  #1692)** — 961 `wrap_pyfunction!` sites across 120 defining modules. Tier T1.
+- `08ef56f57` **POSIX glob for the `parity-ast` path gate (#1681, PR #1691)** —
+  the previous regex had been verified with BSD `grep` while CI runs GNU
+  `grep`; the skip is now verified on a real kernel PR (#1690). CI tier.
+
+### T4 baseline (lane A8), measured at `271175175`
+
+Kernel rebuilt from source into a private scratch dir; the worktree's
+`crates/type_kernel/src` hashed identical to the main checkout's (126 files),
+and the source-tree guard printed the worktree path for `mypy`.
+
+- `cargo test -p mypy-type-kernel` -> `test result: ok. 2838 passed; 0 failed;
+  11 ignored; 0 measured; 0 filtered out; finished in 0.16s`
+- `testcheck -n0` -> `8198 passed, 15 skipped, 7 xfailed in 684.41s (0:11:24)`,
+  identical to the CI `parity` line; the ledger's older 8,144/69/7 figure came
+  from the `TEST_NATIVE_PARSER=1 TEST_NATIVE_RESOLVER=1` differential form
+- cold self-check `-n0 --no-incremental -p mypy -p mypyc` -> `Success: no
+  issues found in 353 source files`
+
+**`main` moved three times after that measurement** (`271175175` ->
+`e531197d3` -> `3d5ace300` -> `08ef56f57`), all docs, CI and scripts, so the
+battery above is a statement about the code at `271175175` and not about those
+later commits. The wall-clock figure is provisional: `uptime` was recorded
+alongside the run, but the host was under external load (load average 34-48),
+not quiet.
+
+### Process change: tiers, the weighted pool, the source-tree guard
+
+- The tiers are recorded in `AGENTS.md` under `Verification Expectations`. The
+  local full corpus is now the T4 wave step, not a per-lane step: CI runs
+  `pr-gate` plus the `parity*` jobs on every production PR, so a lane restores
+  only its own suite file, the gate-off/on differential and engagement
+  counters. T3 lanes are capped at one or two per wave.
+- Heavy ops run through `/private/tmp/mypy-rs-sem.sh` (3 slots; build = 1,
+  corpus = 2). The flat `/private/tmp/mypy-rs-heavy.lock` mutex is retired: a
+  release kernel build used to wait out an entire corpus run behind it.
+- Review: `ocr review` for T3 and the wave diff; `ocr delegate preview|rule`
+  plus an independent reader for T1/T2.
+
+### Invariants learned this wave
+
+- **Source-tree guard.** A worktree `.venv` symlinks to the main checkout's
+  venv and its editable install points at the main checkout, so `import mypy`
+  can resolve there and invalidate every count. The symptom is
+  `ImportPathMismatchError` naming the main checkout's `mypy/test/conftest.py`
+  against the worktree's, with 0 engagement on every seam while a probe reports
+  thousands. The guard must print the worktree path before any number is
+  trusted.
+- **A sampled-probe zero is not a dead seam.** A zero-call reading from a
+  sampled probe says something about the sample's coverage, not about the seam;
+  only a whole-corpus count licenses "retire" (PR #1686 kept the falsified row
+  visible for this reason).
+- **GNU versus BSD tooling produces confident wrong numbers, not errors.** The
+  `parity-ast` regex was verified with BSD `grep` while CI runs GNU `grep` (PR
+  #1691), and a BSD `sed` that ignores `\s*` produced a wrong seam count (PR
+  #1692). When a measurement feeds a decision, do it in Python.
+- **OCR findings are leads, not verdicts.** A pass emits confident findings
+  while its own reads fail (three internal `file_read failed: invalid line
+  range` errors in one 5-file pass). Cost is a range, not a figure: 3 files at
+  9m37s / ~760k tokens to 5 files at 6m56s / ~2.4M tokens.
+- **Numeric claims need their head and their load.** Wall-clock numbers carry
+  `uptime` and a provisional mark; load-invariant counters (compiled units,
+  call and defer totals) are the primary evidence on this host.
+
+### Queue for the next wave
+
+1. **The first read flip is blocked on a real defect, not on CI latency.** The
+   read-flip lane's own new gate `parity-symtable-flip` (added in #1687) fails
+   with `RuntimeError: G3.1 read flip changed namespace order for '__main__'`,
+   showing both a reordered namespace and leaked `X@N` placeholder keys
+   (`D@5`, `A@3`, `E@6`). Fix the ordering and placeholder defect before the
+   flip can land.
+2. **The seam-registration split.** `scripts/plan_seam_split.py --verify`
+   supplies the grouping (961 sites, 120 defining modules, 5 declared modules
+   registering nothing); the transform itself (per-module
+   `register_registry(m)`) is the next commit. Confirm the six doubly
+   registered names before moving them: `rust_classify_simple_literal_type`,
+   `rust_classify_tuple_type_implicit`, `rust_count_stats`,
+   `rust_object_from_instance`, `rust_pretty_seq`,
+   `rust_refers_to_typeddict`.
+3. Remaining wave-5 lane landings are appended to
+   `docs/plans/type-kernel-seam-ledger.md` as the coordinator reports each
+   merged PR with its measurements.
+4. Open at handoff time: PR #1682 (this handoff, the tier text and the wave-5
+   ledger entries).
+
 ## RESUME POINT — 2026-09-14, night (second parallel wave landed)
 
 Five parallel workers ran the top of the queue (perf #1640/#1641 +
