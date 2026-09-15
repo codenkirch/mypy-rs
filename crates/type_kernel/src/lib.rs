@@ -1690,6 +1690,12 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         semanal_checks::rust_classify_remove_unpack_kwargs,
         module
     )?)?;
+    // semanal_checks: live-object remove_unpack_kwargs entry (#1663); no
+    // wire serialization, the unpack target is resolved via get_proper_type.
+    module.add_function(wrap_pyfunction!(
+        semanal_checks::rust_classify_remove_unpack_kwargs_live,
+        module
+    )?)?;
     module.add_function(wrap_pyfunction!(semanal_visitor::rust_lookup, module)?)?;
     module.add_function(wrap_pyfunction!(
         semanal_lookup::rust_lookup_qualified,

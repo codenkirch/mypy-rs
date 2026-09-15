@@ -45206,20 +45206,17 @@ class NativeDeclaredMetaclassSuite(Suite):
 
     def test_seam_declared_any_var(self) -> None:
         from mypy.nodes import Var
-        from mypy.semanal import _META_ANY, _META_INVALID, _serialize_semanal_type
+        from mypy.semanal import _META_ANY, _META_INVALID
 
         fx = self.fx
         v = Var("M")
         v.type = fx.anyt
-        result = _type_kernel.rust_classify_declared_metaclass(
-            "M", v, _serialize_semanal_type(fx.anyt), v
-        )
+        # Issue #1663: the seam takes the live proper type, not wire bytes.
+        result = _type_kernel.rust_classify_declared_metaclass("M", v, fx.anyt, v)
         assert result == _META_ANY
         # A Var symbol whose type is not Any falls into the invalid arm.
         v.type = fx.str_type
-        result = _type_kernel.rust_classify_declared_metaclass(
-            "M", v, _serialize_semanal_type(fx.str_type), v
-        )
+        result = _type_kernel.rust_classify_declared_metaclass("M", v, fx.str_type, v)
         assert result == _META_INVALID
 
     def test_seam_declared_placeholder_and_invalid(self) -> None:
@@ -45238,11 +45235,13 @@ class NativeDeclaredMetaclassSuite(Suite):
 
     def test_seam_declared_defers(self) -> None:
         from mypy.nodes import Var
+        from mypy.semanal import _META_INVALID
 
-        # Undecodable wire bytes for a Var symbol defer the whole seam.
+        # Issue #1663: the seam reads the live proper type, so a non-`Any`
+        # live type decides the invalid arm instead of deferring.
         v = Var("M")
         v.type = self.fx.a
-        assert _type_kernel.rust_classify_declared_metaclass("M", v, b"\x63garbage", v) is None
+        assert _type_kernel.rust_classify_declared_metaclass("M", v, self.fx.a, v) == _META_INVALID
         # Unreadable sym/meta objects defer too.
         assert _type_kernel.rust_classify_declared_metaclass("M", v, None, None) is None
 
@@ -45463,18 +45462,29 @@ class NativeDeclaredMetaclassSuite(Suite):
             semanal_mod._rust_classify_declared_metaclass = saved_d  # type: ignore[attr-defined]
             semanal_mod._rust_classify_recalculate_metaclass = saved_r  # type: ignore[attr-defined]
 
-    def test_shim_declared_falls_back_on_garbage_wire(self) -> None:
+    def test_shim_declared_does_not_serialize(self) -> None:
+        # Issue #1663: the seam reads the live Var type. `get_declared_metaclass`
+        # must stay a parity path even when the serializer is unusable.
         import mypy.semanal as semanal_mod
 
         v = Var("M")
         v.type = self.fx.a
         saved = semanal_mod._serialize_semanal_type
-        semanal_mod._serialize_semanal_type = lambda t: b"\x63garbage"
+        calls: list[Type] = []
+
+        # A recording spy, not a raise: the shim swallows AssertionError as a
+        # deferral signal, so a raising stub would hide a reintroduced call.
+        def spy(t: Type) -> bytes:
+            calls.append(t)
+            return saved(t)
+
+        semanal_mod._serialize_semanal_type = spy
         try:
             off = self._run_declared(NameExpr("M"), v, gate=False)
             on = self._run_declared(NameExpr("M"), v, gate=True)
         finally:
             semanal_mod._serialize_semanal_type = saved
+        assert calls == [], f"get_declared_metaclass serialized {len(calls)} types"
         assert_equal(on, off)
 
 
@@ -45514,11 +45524,6 @@ class NativePrepareMethodSignatureSuite(Suite):
             return fn()
         finally:
             self._set_active(True)
-
-    def _wire(self, t: Type) -> bytes:
-        from mypy.subtypes import _serialize_type
-
-        return _serialize_type(t)
 
     def _info(self) -> TypeInfo:
         from mypy.nodes import Block, ClassDef
@@ -45564,14 +45569,15 @@ class NativePrepareMethodSignatureSuite(Suite):
     def _tag(
         self,
         fdef: FuncDef,
-        self_type_wire: bytes | None,
+        self_type: Type | None,
         unanalyzed_kind: int,
         expected_self: bool | None,
         has_self_type: bool,
     ) -> tuple[bool, bool, int] | None:
         assert _type_kernel is not None
+        # Issue #1663: the seam takes the live proper type, not wire bytes.
         return _type_kernel.rust_classify_method_signature(
-            fdef, self_type_wire, unanalyzed_kind, expected_self, has_self_type
+            fdef, self_type, unanalyzed_kind, expected_self, has_self_type
         )
 
     def _run(
@@ -45632,7 +45638,7 @@ class NativePrepareMethodSignatureSuite(Suite):
     def test_seam_any_self_trivial(self) -> None:
         fdef = self._fdef("m", [AnyType(TypeOfAny.unannotated)])
 
-        assert self._tag(fdef, self._wire(AnyType(TypeOfAny.unannotated)), 0, None, False) == (
+        assert self._tag(fdef, AnyType(TypeOfAny.unannotated), 0, None, False) == (
             False,
             False,
             1,
@@ -45641,7 +45647,7 @@ class NativePrepareMethodSignatureSuite(Suite):
     def test_seam_any_self_replace(self) -> None:
         fdef = self._fdef("m", [AnyType(TypeOfAny.unannotated)])
 
-        assert self._tag(fdef, self._wire(AnyType(TypeOfAny.unannotated)), 0, None, True) == (
+        assert self._tag(fdef, AnyType(TypeOfAny.unannotated), 0, None, True) == (
             False,
             False,
             0,
@@ -45655,7 +45661,7 @@ class NativePrepareMethodSignatureSuite(Suite):
     def test_seam_new_with_any_self(self) -> None:
         fdef = self._fdef("__new__", [AnyType(TypeOfAny.unannotated)])
 
-        assert self._tag(fdef, self._wire(AnyType(TypeOfAny.unannotated)), 0, None, False) == (
+        assert self._tag(fdef, AnyType(TypeOfAny.unannotated), 0, None, False) == (
             True,
             False,
             1,
@@ -45664,7 +45670,7 @@ class NativePrepareMethodSignatureSuite(Suite):
     def test_seam_class_special_write(self) -> None:
         fx = TypeFixture()
         fdef = self._fdef("__init_subclass__", [fx.a])
-        assert self._tag(fdef, self._wire(fx.a), 0, None, False) == (False, True, 5)
+        assert self._tag(fdef, fx.a, 0, None, False) == (False, True, 5)
 
     def test_seam_static_self_fail(self) -> None:
         fx = TypeFixture()
@@ -45675,23 +45681,23 @@ class NativePrepareMethodSignatureSuite(Suite):
         fx = TypeFixture()
         fdef = self._fdef("m", [fx.str_type], unanalyzed_arg0=fx.str_type)
 
-        assert self._tag(fdef, self._wire(fx.str_type), 2, True, True) == (False, False, 2)
-        assert self._tag(fdef, self._wire(fx.str_type), 2, False, True) == (False, False, 3)
+        assert self._tag(fdef, fx.str_type, 2, True, True) == (False, False, 2)
+        assert self._tag(fdef, fx.str_type, 2, False, True) == (False, False, 3)
 
     def test_seam_ok_tails(self) -> None:
         fx = TypeFixture()
         fdef = self._fdef("m", [fx.a])
 
-        assert self._tag(fdef, self._wire(fx.a), 0, None, False) == (False, False, 5)
-        assert self._tag(fdef, self._wire(fx.a), 1, None, True) == (False, False, 5)
-        assert self._tag(fdef, self._wire(fx.a), 0, None, True) == (False, False, 5)
+        assert self._tag(fdef, fx.a, 0, None, False) == (False, False, 5)
+        assert self._tag(fdef, fx.a, 1, None, True) == (False, False, 5)
+        assert self._tag(fdef, fx.a, 0, None, True) == (False, False, 5)
 
     def test_seam_defers(self) -> None:
         fx = TypeFixture()
         fdef = self._fdef("m", [fx.a])
 
         assert self._tag(fdef, None, 0, None, False) is None
-        assert self._tag(fdef, self._wire(fx.a), 2, None, True) is None
+        assert self._tag(fdef, fx.a, 2, None, True) is None
 
     def test_parity_trivial_self(self) -> None:
         self._assert_par("m", AnyType(TypeOfAny.unannotated), False)
@@ -66082,3 +66088,223 @@ class NativeResidualScalarCheckmemberSeamsRetiredSuite(Suite):
         assert instance_fallback(self._typeddict()) is self.fx.o
         assert meta_has_operator(AnyType(TypeOfAny.special_form), "__add__") is True
         assert meta_has_operator(self._meta_instance(), "__add__") is False
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeRemoveUnpackKwargsLiveSuite(Suite):
+    """Parity for the live-object remove_unpack_kwargs seam (#1663).
+
+    The Python shim no longer serializes `typ.arg_types[-1]`: Rust reads
+    the live `CallableType` and resolves the unpack target through
+    `mypy.types.get_proper_type`, so a `TypeAliasType` target is expanded
+    instead of deferred. The trailing-kind guard keeps non-`**kw` calls
+    off the FFI and the wire pyfunction stays registered for direct-seam
+    tests. Measured on the cold self-check: 28,807 calls / 7,970 wire
+    bytes before; the wire payload is gone after.
+    """
+
+    def setUp(self) -> None:
+        import type_kernel as _tk
+
+        self._tk = _tk
+        self.fx = TypeFixture()
+        from mypy.semanal import _set_native_semanal_visitor_active
+
+        self._set_active = _set_native_semanal_visitor_active
+        self._set_active(True)
+
+    def tearDown(self) -> None:
+        self._set_active(False)
+
+    def _td(self, keys: list[str]) -> TypedDictType:
+        return TypedDictType(
+            {k: self.fx.o for k in keys}, set(keys), set(), Instance(self.fx.ai, [])
+        )
+
+    def _callable(
+        self, arg_names: list[str | None], last_type: Type, arg_kinds: list[ArgKind] | None = None
+    ) -> CallableType:
+        if arg_kinds is None:
+            arg_kinds = [ARG_POS] * (len(arg_names) - 1) + [ARG_STAR2] if arg_names else []
+        arg_types: list[Type] = [self.fx.a] * len(arg_names)
+        if arg_names:
+            arg_types[-1] = last_type
+        return CallableType(arg_types, arg_kinds, list(arg_names), self.fx.a, self.fx.function)
+
+    def _run_shim(self, typ: CallableType) -> tuple[CallableType, list[str]]:
+        from mypy import semanal
+
+        failures: list[str] = []
+
+        class _Analyzer:
+            def fail(self, msg: str, ctx: object, *, code: object = None) -> None:
+                failures.append(str(msg))
+
+        ret = semanal.SemanticAnalyzer.remove_unpack_kwargs(
+            _Analyzer(),  # type: ignore[arg-type]
+            object(),  # type: ignore[arg-type]
+            typ,
+        )
+        return ret, failures
+
+    def test_live_tags_match_wire(self) -> None:
+        from mypy.semanal import _serialize_semanal_type
+
+        cases: list[tuple[list[str | None], Type]] = [
+            (["x", "kw"], self.fx.a),
+            (["x", "kw"], UnpackType(self.fx.a)),
+            (["x", "kw"], UnpackType(self._td(["y"]))),
+            (["a", "kw"], UnpackType(self._td(["z", "a"]))),
+        ]
+        for names, last in cases:
+            typ = self._callable(names, last)
+            live = self._tk.rust_classify_remove_unpack_kwargs_live(typ)
+            wire = self._tk.rust_classify_remove_unpack_kwargs(
+                typ, _serialize_semanal_type(typ.arg_types[-1])
+            )
+            assert live == wire, (names, last)
+
+    def test_live_resolves_alias_target(self) -> None:
+        from mypy.semanal import _serialize_semanal_type
+
+        td = self._td(["z", "a"])
+        alias = TypeAlias(td, "m.Alias", "m", 1, 1)
+        typ = self._callable(["a", "kw"], UnpackType(TypeAliasType(alias, [])))
+        assert self._tk.rust_classify_remove_unpack_kwargs_live(typ) == (2, ["a"])
+        # The wire variant cannot resolve the alias and defers.
+        wire = self._tk.rust_classify_remove_unpack_kwargs(
+            typ, _serialize_semanal_type(typ.arg_types[-1])
+        )
+        assert wire is None
+
+    def test_live_defers_on_unreadable_object(self) -> None:
+        assert self._tk.rust_classify_remove_unpack_kwargs_live(cast(Any, object())) is None
+
+    def test_shim_does_not_serialize(self) -> None:
+        from mypy import semanal
+
+        calls: list[Type] = []
+        orig = semanal._serialize_semanal_type
+
+        def spy(t: Type) -> bytes:
+            calls.append(t)
+            return orig(t)
+
+        semanal._serialize_semanal_type = spy
+        try:
+            typ = self._callable(["a", "kw"], UnpackType(self._td(["z", "a"])))
+            ret, failures = self._run_shim(typ)
+            ok = self._callable(["x", "kw"], UnpackType(self._td(["y"])))
+            ret_ok, failures_ok = self._run_shim(ok)
+        finally:
+            semanal._serialize_semanal_type = orig
+        assert calls == []
+        assert ret.unpack_kwargs is False
+        assert failures == ['Overlap between parameter names and ** TypedDict items: "a"']
+        assert ret_ok.unpack_kwargs is True
+        assert failures_ok == []
+
+    def test_shim_skips_ffi_without_star2(self) -> None:
+        from mypy import semanal
+
+        calls: list[object] = []
+        orig = getattr(semanal, "_rust_classify_remove_unpack_kwargs_live")
+
+        def spy(typ: CallableType) -> Any:
+            calls.append(typ)
+            return orig(typ)
+
+        setattr(semanal, "_rust_classify_remove_unpack_kwargs_live", spy)
+        try:
+            plain = self._callable(["x", "kw"], self.fx.a, [ARG_POS, ARG_POS])
+            ret_plain, _ = self._run_shim(plain)
+            empty = self._callable([], self.fx.a)
+            ret_empty, _ = self._run_shim(empty)
+            unpack = self._callable(["x", "kw"], UnpackType(self._td(["y"])))
+            ret_unpack, _ = self._run_shim(unpack)
+        finally:
+            setattr(semanal, "_rust_classify_remove_unpack_kwargs_live", orig)
+        assert calls == [unpack]
+        assert ret_plain is plain
+        assert ret_empty is empty
+        assert ret_unpack.unpack_kwargs is True
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeReplaceImplicitFirstTypeRetiredSuite(Suite):
+    """Pin the #1663 retirement of the replace_implicit_first_type seam.
+
+    Production calls always serialized a method `CallableType` whose
+    fallback is still a `FakeInfo` ("fallback can't be filled out until
+    semanal"), so the wire encode raised on every call and the Python body
+    ran anyway: 21,974 Python calls / 0 Rust engagements on the cold
+    self-check. The Rust pyfunction stays registered for direct-seam tests.
+    """
+
+    def setUp(self) -> None:
+        self.fx = TypeFixture()
+
+    def test_native_shim_removed(self) -> None:
+        import inspect
+
+        from mypy import semanal
+
+        src = inspect.getsource(semanal.replace_implicit_first_type)
+        assert "rust_replace_implicit_first_type" not in src, (
+            "replace_implicit_first_type should not call the native seam"
+        )
+
+    def test_no_wire_serialization(self) -> None:
+        from mypy import semanal
+
+        sig = CallableType(
+            [self.fx.a, self.fx.b],
+            [ARG_POS, ARG_POS],
+            [None, None],
+            self.fx.anyt,
+            self.fx.function,
+        )
+        calls: list[Type] = []
+        orig = semanal._serialize_semanal_type
+
+        def spy(t: Type) -> bytes:
+            calls.append(t)
+            return orig(t)
+
+        semanal._serialize_semanal_type = spy
+        semanal._set_native_semanal_active(True)
+        try:
+            out = semanal.replace_implicit_first_type(sig, self.fx.o)
+        finally:
+            semanal._serialize_semanal_type = orig
+            semanal._set_native_semanal_active(False)
+        assert calls == []
+        assert isinstance(out, CallableType)
+        assert_equal(out.arg_types, [self.fx.o, self.fx.b])
+
+    def test_rust_pyfunction_still_registered(self) -> None:
+        import type_kernel as _type_kernel
+        from librt.internal import ReadBuffer
+
+        from mypy.semanal import _serialize_semanal_type
+        from mypy.types import read_type as _read_type
+
+        sig = CallableType(
+            [self.fx.a, self.fx.b],
+            [ARG_POS, ARG_POS],
+            [None, None],
+            self.fx.anyt,
+            self.fx.function,
+        )
+        result = _type_kernel.rust_replace_implicit_first_type(
+            _serialize_semanal_type(sig), _serialize_semanal_type(self.fx.o)
+        )
+        assert result is not None
+        decoded = get_proper_type(_read_type(ReadBuffer(bytes(result))))
+        assert isinstance(decoded, CallableType)
+        assert len(decoded.arg_types) == 2
+        # The first slot is the replacement; the round-trip keeps the
+        # unresolved type_ref because fixup_wire_type is not applied here.
+        first = get_proper_type(decoded.arg_types[0])
+        assert isinstance(first, Instance)
+        assert first.type_ref == "builtins.object"

@@ -378,19 +378,14 @@ _MULTIPLE_WORDS_NONTYPE_RE = re.compile(r'\s*[^\s.\'"|\[]+\s+[^\s.\'"|\[]')
 
 
 # Stage 15: native semanal_algebra seam (parity-only, default-off).
-
-# When `type_kernel` is importable and the gate is active, the pure
-# Type-transformation helpers `make_any_non_explicit`,
-# `make_any_non_unimported`, and `replace_implicit_first_type` route
-
-# through Rust via the wire format. Rust returns None for types it cannot
-# handle (decode failure), falling back to the pure-Python visitors.
+# make_any_non_explicit / make_any_non_unimported route through Rust via
+# the wire format; Rust returns None to fall back to the Python visitors.
+# `replace_implicit_first_type` was retired to pure Python in #1663.
 try:
     from librt.internal import ReadBuffer as _SemanalReadBuffer, WriteBuffer as _SemanalWriteBuffer
     from type_kernel import (
         rust_make_any_non_explicit as _rust_make_any_non_explicit,
         rust_make_any_non_unimported as _rust_make_any_non_unimported,
-        rust_replace_implicit_first_type as _rust_replace_implicit_first_type,
         rust_is_overloaded_item as _rust_is_overloaded_item,
         rust_is_self_member_ref as _rust_is_self_member_ref,
         rust_is_type_like as _rust_is_type_like,
@@ -403,7 +398,6 @@ try:
 except ImportError:
     _rust_make_any_non_explicit = None  # type: ignore[assignment]
     _rust_make_any_non_unimported = None  # type: ignore[assignment]
-    _rust_replace_implicit_first_type = None  # type: ignore[assignment]
     _rust_is_overloaded_item = None  # type: ignore[assignment]
     _rust_is_self_member_ref = None  # type: ignore[assignment]
     _rust_is_type_like = None  # type: ignore[assignment]
@@ -454,7 +448,7 @@ try:
         rust_classify_member_resolution as _rust_classify_member_resolution,
         rust_classify_method_signature as _rust_classify_method_signature,
         rust_classify_recalculate_metaclass as _rust_classify_recalculate_metaclass,
-        rust_classify_remove_unpack_kwargs as _rust_classify_remove_unpack_kwargs,
+        rust_classify_remove_unpack_kwargs_live as _rust_classify_remove_unpack_kwargs_live,
         rust_classify_setup_type_vars as _rust_classify_setup_type_vars,
         rust_classify_simple_literal_type as _rust_classify_simple_literal_type,
         rust_classify_type_expression as _rust_classify_type_expression,
@@ -580,7 +574,7 @@ except ImportError:
     _rust_classify_method_signature = None  # type: ignore[assignment]
     _rust_classify_declared_metaclass = None  # type: ignore[assignment]
     _rust_classify_recalculate_metaclass = None  # type: ignore[assignment]
-    _rust_classify_remove_unpack_kwargs = None  # type: ignore[assignment]
+    _rust_classify_remove_unpack_kwargs_live = None  # type: ignore[assignment]
     _rust_classify_simple_literal_type = None  # type: ignore[assignment]
     _rust_classify_setup_type_vars = None  # type: ignore[assignment]
     _rust_classify_type_expression = None  # type: ignore[assignment]
@@ -1600,19 +1594,19 @@ class SemanticAnalyzer(
         self.pop_type_args(defn.type_args)
 
     def remove_unpack_kwargs(self, defn: FuncDef, typ: CallableType) -> CallableType:
-        # Issue #1044: native unpack-kwargs arbitration (strangler-fig).
-        # Rust classifies the guard chain + overlap set from the live CallableType
-        # facts + one wire blob; fails and rewrites stay here. None -> Python body.
-        if _SEMANAL_VISITOR_HAS_KERNEL and _native_semanal_visitor_active:
-            # Only **kw signatures reach the wire encode; the kind check
-            # mirrors the first Python guard to keep the encode cold-path.
-            last_type_wire: bytes | None = None
-            if typ.arg_kinds and typ.arg_kinds[-1] is ArgKind.ARG_STAR2:
-                try:
-                    last_type_wire = _serialize_semanal_type(typ.arg_types[-1])
-                except (AssertionError, NotImplementedError, ValueError, TypeError):
-                    last_type_wire = None
-            decided = _rust_classify_remove_unpack_kwargs(typ, last_type_wire)
+        # Issue #1044/#1663: native unpack-kwargs arbitration (strangler-fig).
+        # The seam reads the live CallableType (no wire); fails and rewrites
+        # stay here. None -> Python body.
+        if (
+            _SEMANAL_VISITOR_HAS_KERNEL
+            and _native_semanal_visitor_active
+            and typ.arg_kinds
+            and typ.arg_kinds[-1] is ArgKind.ARG_STAR2
+        ):
+            try:
+                decided = _rust_classify_remove_unpack_kwargs_live(typ)
+            except (AssertionError, NotImplementedError, ValueError, TypeError):
+                decided = None
             if decided is not None:
                 tag, overlapped_names = decided
                 if tag == _NATIVE_UNPACK_KW_PASSTHROUGH:
@@ -10118,18 +10112,9 @@ class SemanticAnalyzer(
 
 
 def replace_implicit_first_type(sig: FunctionLike, new: Type) -> FunctionLike:
-    if _SEMANAL_HAS_KERNEL and _native_semanal_active:
-        try:
-            data = _serialize_semanal_type(sig)
-            new_data = _serialize_semanal_type(new)
-            result = _rust_replace_implicit_first_type(data, new_data)
-            if result is not None:
-                buf = _SemanalReadBuffer(bytes(result))
-                decoded = fixup_wire_type(_semanal_read_type(buf))
-                if decoded is not None:
-                    return cast(FunctionLike, decoded)
-        except (AssertionError, NotImplementedError):
-            pass
+    # Issue #1663: the wire seam never engaged in production (a method's
+    # CallableType carries a FakeInfo fallback, so serialization raised on
+    # every call); retired to pure Python per #1661. Rust fn stays registered.
     if isinstance(sig, CallableType):
         if len(sig.arg_types) == 0:
             return sig

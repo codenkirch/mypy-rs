@@ -307,6 +307,7 @@ __all__ = [
     "rust_classify_imports",
     "rust_classify_setup_type_vars",
     "rust_classify_remove_unpack_kwargs",
+    "rust_classify_remove_unpack_kwargs_live",
     "rust_visit_list_set_expr",
     "rust_visit_dict_expr",
     "rust_visit_template_str_expr",
@@ -1788,6 +1789,9 @@ def rust_classify_method_signature(
 ) -> tuple[bool, bool, int] | None: ...
 def rust_classify_remove_unpack_kwargs(
     typ: CallableType, last_type_wire: bytes | None
+) -> tuple[int, list[str]] | None: ...
+def rust_classify_remove_unpack_kwargs_live(
+    typ: CallableType,
 ) -> tuple[int, list[str]] | None: ...
 def rust_extract_typevarlike_name(s: AssignmentStmt, call: CallExpr) -> str | None: ...
 def rust_is_defined_type_param(locals: list[SymbolTable | None], name: str) -> bool: ...

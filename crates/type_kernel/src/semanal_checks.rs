@@ -591,46 +591,23 @@ pub(crate) const UNPACK_KW_OK: i64 = 3;
 
 const ARG_STAR2: i64 = 4;
 
-/// Pure decision core of `SemanticAnalyzer.remove_unpack_kwargs`
-/// (semanal.py:1575-1598), kept separate from the PyO3 entry so the guard
-/// chain + overlap set are unit-testable without a Python runtime.
-///
-/// `arg_kinds` are the numeric `ArgKind` values (`ARG_STAR2 == 4`);
-/// `arg_names` the callable's arg names (None for positional-only);
-/// `last_type` the decoded wire serialization of `typ.arg_types[-1]`
-/// (`None` = undecodable, defer).
-///
-/// Returns `(tag, sorted_overlap)`. The overlap list (OVERLAP_FAIL only)
-/// is the set intersection of the arg names and the TypedDict keys,
-/// minus the trailing kwargs name (the "kwargs key is OK" rule), sorted
-/// and deduped like Python's `sorted(filter(None, overlap))`.
-fn classify_remove_unpack_kwargs(
-    arg_kinds: &[i64],
+/// Last-arg facts feeding the arbitration chain, extracted by each entry
+/// (wire decode or live PyO3 reads) so the chain itself is source-agnostic.
+enum LastArgFacts<'a> {
+    /// The last arg type is not an `UnpackType`: PASSTHROUGH.
+    NotUnpack,
+    /// The unpack target is not a `TypedDictType`: NOT_TD_FAIL.
+    NotTypedDict,
+    /// The unpack target is a `TypedDictType` with these item keys.
+    TypedDictKeys(std::collections::HashSet<&'a str>),
+}
+
+/// Overlap set: arg names ∩ TypedDict keys, minus the trailing kwargs
+/// name, sorted and deduped like `sorted(filter(None, overlap))`.
+fn overlap_decision(
     arg_names: &[Option<String>],
-    last_type: Option<&crate::wire::Type>,
-) -> Option<(i64, Vec<String>)> {
-    let last_kind = match arg_kinds.last() {
-        Some(k) => *k,
-        // No arg_kinds: Python returns typ unchanged (PASSTHROUGH). But the
-        // wire blob is what can fail; an empty kinds list is decidable.
-        None => return Some((UNPACK_KW_PASSTHROUGH, Vec::new())),
-    };
-    if last_kind != ARG_STAR2 {
-        return Some((UNPACK_KW_PASSTHROUGH, Vec::new()));
-    }
-    let last_type = last_type?;
-    let Type::UnpackType { typ, .. } = last_type else {
-        return Some((UNPACK_KW_PASSTHROUGH, Vec::new()));
-    };
-    // get_proper_type(last_type.type): a TypeAliasType target cannot be
-    // resolved on the wire, so defer and let the Python body expand it.
-    if matches!(typ.as_ref(), Type::TypeAliasType { .. }) {
-        return None;
-    }
-    let Type::TypedDictType { items, .. } = typ.as_ref() else {
-        return Some((UNPACK_KW_NOT_TD_FAIL, Vec::new()));
-    };
-    let td_keys: std::collections::HashSet<&str> = items.iter().map(|(k, _)| k.as_str()).collect();
+    td_keys: &std::collections::HashSet<&str>,
+) -> (i64, Vec<String>) {
     let mut overlap: Vec<&str> = arg_names
         .iter()
         .flatten()
@@ -642,14 +619,97 @@ fn classify_remove_unpack_kwargs(
         overlap.retain(|n| *n != last_name.as_str());
     }
     if overlap.is_empty() {
-        return Some((UNPACK_KW_OK, Vec::new()));
+        return (UNPACK_KW_OK, Vec::new());
     }
     overlap.sort_unstable();
     overlap.dedup();
-    Some((
+    (
         UNPACK_KW_OVERLAP_FAIL,
         overlap.into_iter().map(String::from).collect(),
+    )
+}
+
+/// Shared decision core of `SemanticAnalyzer.remove_unpack_kwargs`
+/// (semanal.py:1575-1598), kept separate from the PyO3 entries so the
+/// guard chain + overlap set are unit-testable without a Python runtime.
+///
+/// `arg_kinds` are the numeric `ArgKind` values (`ARG_STAR2 == 4`);
+/// `arg_names` the callable's arg names (None for positional-only);
+/// `facts` the last-arg classification (`None` = unresolvable, defer).
+///
+/// Returns `(tag, sorted_overlap)`.
+fn classify_from_facts(
+    arg_kinds: &[i64],
+    arg_names: &[Option<String>],
+    facts: Option<LastArgFacts<'_>>,
+) -> Option<(i64, Vec<String>)> {
+    let last_kind = match arg_kinds.last() {
+        Some(k) => *k,
+        // No arg_kinds: Python returns typ unchanged (PASSTHROUGH). But the
+        // wire blob is what can fail; an empty kinds list is decidable.
+        None => return Some((UNPACK_KW_PASSTHROUGH, Vec::new())),
+    };
+    if last_kind != ARG_STAR2 {
+        return Some((UNPACK_KW_PASSTHROUGH, Vec::new()));
+    }
+    match facts? {
+        LastArgFacts::NotUnpack => Some((UNPACK_KW_PASSTHROUGH, Vec::new())),
+        LastArgFacts::NotTypedDict => Some((UNPACK_KW_NOT_TD_FAIL, Vec::new())),
+        LastArgFacts::TypedDictKeys(td_keys) => Some(overlap_decision(arg_names, &td_keys)),
+    }
+}
+
+/// Wire-decode variant of the last-arg classification: a `TypeAliasType`
+/// target cannot be resolved on the wire, so it defers (`None`).
+fn wire_last_arg_facts(last_type: Option<&Type>) -> Option<LastArgFacts<'_>> {
+    let last_type = last_type?;
+    let Type::UnpackType { typ, .. } = last_type else {
+        return Some(LastArgFacts::NotUnpack);
+    };
+    // get_proper_type(last_type.type): a TypeAliasType target cannot be
+    // resolved on the wire, so defer and let the Python body expand it.
+    if matches!(typ.as_ref(), Type::TypeAliasType { .. }) {
+        return None;
+    }
+    let Type::TypedDictType { items, .. } = typ.as_ref() else {
+        return Some(LastArgFacts::NotTypedDict);
+    };
+    Some(LastArgFacts::TypedDictKeys(
+        items.iter().map(|(k, _)| k.as_str()).collect(),
     ))
+}
+
+/// Pure wire-decision core, kept for the wire entry and its unit tests.
+fn classify_remove_unpack_kwargs(
+    arg_kinds: &[i64],
+    arg_names: &[Option<String>],
+    last_type: Option<&crate::wire::Type>,
+) -> Option<(i64, Vec<String>)> {
+    classify_from_facts(arg_kinds, arg_names, wire_last_arg_facts(last_type))
+}
+
+/// Read the numeric `arg_kinds` and `arg_names` off a live callable.
+/// Returns `None` when any element is unreadable, deferring the seam.
+fn read_kinds_and_names(typ: &PyAny) -> Option<(Vec<i64>, Vec<Option<String>>)> {
+    let kinds_py = typ.getattr("arg_kinds").ok()?;
+    let kinds_list: &PyList = kinds_py.downcast().ok()?;
+    let mut arg_kinds: Vec<i64> = Vec::with_capacity(kinds_list.len());
+    for kind in kinds_list {
+        let value = kind.getattr("value").ok()?;
+        arg_kinds.push(value.extract::<i64>().ok()?);
+    }
+    let names_py = typ.getattr("arg_names").ok()?;
+    let names_list: &PyList = names_py.downcast().ok()?;
+    let mut arg_names: Vec<Option<String>> = Vec::with_capacity(names_list.len());
+    for name in names_list {
+        if name.is_none() {
+            arg_names.push(None);
+            continue;
+        }
+        let s: &PyString = name.downcast().ok()?;
+        arg_names.push(Some(s.to_str().ok()?.to_string()));
+    }
+    Some((arg_kinds, arg_names))
 }
 
 /// `#[pyfunction]` entry for `SemanticAnalyzer.remove_unpack_kwargs`
@@ -668,49 +728,107 @@ pub(crate) fn rust_classify_remove_unpack_kwargs(
     typ: &PyAny,
     last_type_wire: Option<&[u8]>,
 ) -> Option<(i64, Vec<String>)> {
-    let kinds_py = match typ.getattr("arg_kinds") {
-        Ok(v) => v,
-        Err(_) => return None,
-    };
-    let kinds_list: &PyList = match kinds_py.downcast() {
-        Ok(l) => l,
-        Err(_) => return None,
-    };
-    let mut arg_kinds: Vec<i64> = Vec::with_capacity(kinds_list.len());
-    for kind in kinds_list {
-        let value = match kind.getattr("value") {
-            Ok(v) => v,
-            Err(_) => return None,
-        };
-        match value.extract::<i64>() {
-            Ok(v) => arg_kinds.push(v),
-            Err(_) => return None,
-        }
-    }
-    let names_py = match typ.getattr("arg_names") {
-        Ok(v) => v,
-        Err(_) => return None,
-    };
-    let names_list: &PyList = match names_py.downcast() {
-        Ok(l) => l,
-        Err(_) => return None,
-    };
-    let mut arg_names: Vec<Option<String>> = Vec::with_capacity(names_list.len());
-    for name in names_list {
-        if name.is_none() {
-            arg_names.push(None);
-            continue;
-        }
-        match name.downcast::<PyString>() {
-            Ok(s) => match s.to_str() {
-                Ok(s) => arg_names.push(Some(s.to_string())),
-                Err(_) => return None,
-            },
-            Err(_) => return None,
-        }
-    }
+    let (arg_kinds, arg_names) = read_kinds_and_names(typ)?;
     let last_type = last_type_wire.and_then(crate::checkmember::decode_type);
     classify_remove_unpack_kwargs(&arg_kinds, &arg_names, last_type.as_ref())
+}
+
+/// Live-object entry for `SemanticAnalyzer.remove_unpack_kwargs`
+/// (semanal.py:1602). Issue #1663: no wire serialization at all. `typ` is
+/// the live analyzed `CallableType`; Rust reads `arg_kinds`, `arg_names`,
+/// and `arg_types[-1]` via PyO3 and resolves the unpack target through
+/// `mypy.types.get_proper_type`, so aliases are expanded like Python.
+/// Defers (`None`) on any unreadable attribute; the Python shim applies
+/// both fails and all three `copy_modified` rewrites.
+#[pyfunction]
+#[pyo3(signature = (typ))]
+pub(crate) fn rust_classify_remove_unpack_kwargs_live(
+    py: Python<'_>,
+    typ: &PyAny,
+) -> PyResult<Option<(i64, Vec<String>)>> {
+    let (arg_kinds, arg_names) = match read_kinds_and_names(typ) {
+        Some(v) => v,
+        None => return Ok(None),
+    };
+    if arg_kinds.last() != Some(&ARG_STAR2) {
+        // Only a trailing **kwargs can reach the last-type inspection.
+        return Ok(Some((UNPACK_KW_PASSTHROUGH, Vec::new())));
+    }
+    let arg_types_py = match typ.getattr("arg_types") {
+        Ok(v) => v,
+        Err(_) => return Ok(None),
+    };
+    let arg_types: &PyList = match arg_types_py.downcast() {
+        Ok(l) => l,
+        Err(_) => return Ok(None),
+    };
+    if arg_types.is_empty() {
+        return Ok(None);
+    }
+    let last = match arg_types.get_item(arg_types.len() - 1) {
+        Ok(v) => v,
+        Err(_) => return Ok(None),
+    };
+    let types_mod = py.import("mypy.types")?;
+    let unpack_cls: &PyType = types_mod.getattr("UnpackType")?.downcast()?;
+    match last.is_instance(unpack_cls) {
+        Ok(false) => return Ok(Some((UNPACK_KW_PASSTHROUGH, Vec::new()))),
+        Ok(true) => {}
+        Err(_) => return Ok(None),
+    }
+    let inner = match last.getattr("type") {
+        Ok(v) => v,
+        Err(_) => return Ok(None),
+    };
+    // get_proper_type: live alias expansion replaces the wire defer.
+    let proper = match types_mod
+        .getattr("get_proper_type")
+        .and_then(|f| f.call1((inner,)))
+    {
+        Ok(v) => v,
+        Err(_) => return Ok(None),
+    };
+    let td_cls: &PyType = types_mod.getattr("TypedDictType")?.downcast()?;
+    match proper.is_instance(td_cls) {
+        Ok(false) => return Ok(Some((UNPACK_KW_NOT_TD_FAIL, Vec::new()))),
+        Ok(true) => {}
+        Err(_) => return Ok(None),
+    }
+    let items = match proper.getattr("items") {
+        Ok(v) => v,
+        Err(_) => return Ok(None),
+    };
+    let keys_obj = match items.call_method0("keys") {
+        Ok(v) => v,
+        Err(_) => return Ok(None),
+    };
+    let keys_iter = match keys_obj.iter() {
+        Ok(v) => v,
+        Err(_) => return Ok(None),
+    };
+    let mut keys: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for key in keys_iter {
+        let key = match key {
+            Ok(k) => k,
+            Err(_) => return Ok(None),
+        };
+        let key_str: &PyString = match key.downcast() {
+            Ok(s) => s,
+            Err(_) => return Ok(None),
+        };
+        match key_str.to_str() {
+            Ok(s) => {
+                keys.insert(s.to_string());
+            }
+            Err(_) => return Ok(None),
+        }
+    }
+    let key_refs: std::collections::HashSet<&str> = keys.iter().map(|s| s.as_str()).collect();
+    Ok(classify_from_facts(
+        &arg_kinds,
+        &arg_names,
+        Some(LastArgFacts::TypedDictKeys(key_refs)),
+    ))
 }
 
 #[cfg(test)]
@@ -1227,5 +1345,84 @@ mod tests {
             classify_wire(&[0, 4], vec![Some("x"), Some("kw")], Some(&wire)),
             None
         );
+    }
+
+    // shared facts core (issue #1663)
+
+    fn names(items: &[Option<&str>]) -> Vec<Option<String>> {
+        items.iter().map(|n| n.map(String::from)).collect()
+    }
+
+    #[test]
+    fn test_facts_kind_guard_wins_before_defer() {
+        // A non-**kw kind is decidable even when the facts are missing;
+        // this is the fast path the Python shim now guards on.
+        assert_eq!(
+            classify_from_facts(&[0, 0], &names(&[Some("a"), None]), None),
+            Some((UNPACK_KW_PASSTHROUGH, vec![]))
+        );
+        // Star2 + missing facts defers.
+        assert_eq!(
+            classify_from_facts(&[0, 4], &names(&[Some("a"), Some("kw")]), None),
+            None
+        );
+    }
+
+    #[test]
+    fn test_facts_live_variants() {
+        let empty = std::collections::HashSet::new();
+        assert_eq!(
+            classify_from_facts(
+                &[0, 4],
+                &names(&[Some("a"), Some("kw")]),
+                Some(LastArgFacts::NotUnpack)
+            ),
+            Some((UNPACK_KW_PASSTHROUGH, vec![]))
+        );
+        assert_eq!(
+            classify_from_facts(
+                &[0, 4],
+                &names(&[Some("a"), Some("kw")]),
+                Some(LastArgFacts::NotTypedDict)
+            ),
+            Some((UNPACK_KW_NOT_TD_FAIL, vec![]))
+        );
+        assert_eq!(
+            classify_from_facts(
+                &[0, 4],
+                &names(&[Some("a"), Some("kw")]),
+                Some(LastArgFacts::TypedDictKeys(empty))
+            ),
+            Some((UNPACK_KW_OK, vec![]))
+        );
+    }
+
+    #[test]
+    fn test_overlap_decision_sorted_deduped() {
+        let keys: std::collections::HashSet<&str> = ["b", "a", "kw"].into_iter().collect();
+        let (tag, overlap) = overlap_decision(&names(&[Some("b"), Some("a"), Some("kw")]), &keys);
+        assert_eq!(tag, UNPACK_KW_OVERLAP_FAIL);
+        assert_eq!(overlap, vec!["a".to_string(), "b".to_string()]);
+    }
+
+    #[test]
+    fn test_wire_facts_alias_and_typeddict() {
+        let alias = Type::TypeAliasType {
+            args: vec![],
+            type_ref: "m.Alias".to_string(),
+            is_recursive: false,
+        };
+        let alias_wire = unpack_wire(&alias).unwrap();
+        let decoded = crate::checkmember::decode_type(&alias_wire).unwrap();
+        assert!(wire_last_arg_facts(Some(&decoded)).is_none());
+        let td_wire = unpack_wire(&td_type(&["x"])).unwrap();
+        let decoded = crate::checkmember::decode_type(&td_wire).unwrap();
+        match wire_last_arg_facts(Some(&decoded)) {
+            Some(LastArgFacts::TypedDictKeys(keys)) => {
+                assert!(keys.contains("x"));
+            }
+            _ => panic!("expected TypedDictKeys"),
+        }
+        assert!(matches!(wire_last_arg_facts(None), None));
     }
 }
