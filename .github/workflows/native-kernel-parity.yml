@@ -82,7 +82,11 @@ jobs:
             exit 0
           fi
           if ! git diff --name-only "$BASE" "$HEAD" > /tmp/changed.txt 2>/dev/null; then
-            git fetch --no-tags --quiet origin "$BASE" 2>/dev/null || true
+            if git fetch --no-tags --quiet origin "$BASE" 2>/dev/null; then
+              echo "fetched $BASE for diff retry"
+            else
+              echo "fetch of $BASE failed" >&2
+            fi
             if ! git diff --name-only "$BASE" "$HEAD" > /tmp/changed.txt 2>/dev/null; then
               echo "diff unavailable after fetch; running every parity job"
               echo "ast=true" >> "$GITHUB_OUTPUT"
@@ -91,7 +95,7 @@ jobs:
           fi
           echo "changed files:"; cat /tmp/changed.txt
           ast=false
-          while IFS= read -r f; do
+          while IFS= read -r f || [ -n "$f" ]; do
             case "$f" in
               .github/workflows/native-kernel-parity.yml) ast=true ;;
               crates/ast_serialize/*) ast=true ;;
