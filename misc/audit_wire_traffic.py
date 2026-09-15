@@ -78,9 +78,13 @@ SERIALIZER_PREFIX = "_serialize"
 FIXED_FFI_US = 0.63
 ENCODE_US_PER_BYTE = 0.04
 
-# id(blob) -> [caller, nbytes]
+# id(blob) -> [caller, nbytes, blob]
 pending: dict[int, list[Any]] = {}
 consumed_ids: set[int] = set()
+# Strong references to every registered blob. The buckets key on `id()`, which
+# is only stable while the object lives: a freed consumed blob can hand its
+# number to a fresh allocation and read as a wire-cache hit.
+_tracked_blobs: dict[int, Any] = {}
 # id(blob) -> nbytes, kept for every blob ever serialized (incl. wire-cache
 # hits) so per-call payload bytes can be attributed to the consuming seam.
 blob_lens: dict[int, int] = {}
@@ -130,12 +134,6 @@ def site() -> str:
     return f"{os.path.basename(code.co_filename)}:{f.f_lineno}:{code.co_name}"
 
 
-def _bytes_len(v: Any) -> int:
-    if isinstance(v, (bytes, bytearray, memoryview)):
-        return len(v)
-    return 0
-
-
 def _iter_blob_ids(args: tuple[Any, ...], kwargs: dict[str, Any]) -> list[int]:
     out: list[int] = []
     for a in args:
@@ -164,6 +162,7 @@ def register_serializer_result(result: Any, caller: str) -> None:
         return
     for b in blobs:
         key = id(b)
+        _tracked_blobs[key] = b
         blob_lens[key] = len(b)
         if key in consumed_ids:
             # A wire-cache hit returns an already-consumed blob; not a new event.
@@ -171,7 +170,7 @@ def register_serializer_result(result: Any, caller: str) -> None:
         pending[key] = [caller, len(b), b]
 
 
-def consume(blob: Any, useful_: bool, seam: str, caller: str) -> None:
+def consume(blob: Any, useful_: bool, seam: str) -> None:
     # The only caller passes a blob fetched by `_lookup_blob`, which returns
     # non-None only while `pending` holds that id, so the pop cannot miss.
     key = id(blob)
@@ -190,9 +189,10 @@ def consume(blob: Any, useful_: bool, seam: str, caller: str) -> None:
 
 def make_seam(name: str, fn: Callable[..., Any]) -> Callable[..., Any]:
     def wrapper(*args: Any, **kwargs: Any) -> Any:
-        caller = site()
-        result = fn(*args, **kwargs)
+        # Counted before the call: a seam that raises is still a crossing, and
+        # no accounting path may be reachable only on the happy path.
         seam_calls[name] += 1
+        result = fn(*args, **kwargs)
         deferred_ = False
         if name in _BATCH_SLOT_SEAMS:
             if isinstance(result, list) and any(s == -1 for s in result):
@@ -205,7 +205,7 @@ def make_seam(name: str, fn: Callable[..., Any]) -> Callable[..., Any]:
         for blob_id in _iter_blob_ids(args, kwargs):
             blob = _lookup_blob(blob_id)
             if blob is not None:
-                consume(blob, not deferred_, name, caller)
+                consume(blob, not deferred_, name)
             n = blob_lens.get(blob_id)
             if n is not None:
                 seam_call_bytes[name] += n
