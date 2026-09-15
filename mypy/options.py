@@ -422,10 +422,6 @@ class Options:
         # write is pushed into the stored blob by the Rust splice op instead
         # of a full Python re-serialize. Default off until parity.
         self.native_type_instance_write = False
-        # ADR-0004 proxy (#1553): blob-backed read shadow, P1 scaffold-only
-        # (the gate is inert; P2 wires the lazy Instance read shadow). Not
-        # in OPTIONS_AFFECTING_CACHE: no proxy state may enter the cache.
-        self.native_type_proxy = False
         # Phase G1.0a (#1572): opt-in dual-write node shadow of the first
         # AST family (RefExpr bindings + analyzed); capture-only and not in
         # OPTIONS_AFFECTING_CACHE: no shadow state may enter the cache.

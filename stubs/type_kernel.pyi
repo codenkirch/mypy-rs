@@ -490,12 +490,6 @@ __all__ = [
     "rust_check_unpacks_in_list",
     "rust_find_matching_overload_items",
     "rust_infer_operator_assignment_method",
-    "rust_proxy_read",
-    "rust_proxy_put",
-    "rust_proxy_drop",
-    "rust_proxy_reset",
-    "rust_proxy_entry_count",
-    "rust_proxy_handle_of",
     "rust_node_mirror_capture_ref",
     "rust_node_mirror_capture_analyzed",
     "rust_node_mirror_ref",
@@ -2800,16 +2794,6 @@ def rust_lookup_definer(typ: Instance, attr_name: str) -> str | None: ...
 def rust_infer_operator_assignment_method(
     typ: Any, method: str, in_ops: bool
 ) -> tuple[bool, str] | None: ...
-
-# ADR-0004 proxy P1 (#1553): blob-backed read-shadow store. Handles are
-# minted by rust_proxy_put through the shared identity service; a read
-# serves bytes only while its stamp still matches the caller's epoch.
-def rust_proxy_read(handle: int, stamp: int) -> bytes | None: ...
-def rust_proxy_put(obj: Any, bytes: bytes, stamp: int) -> int: ...
-def rust_proxy_drop(handle: int) -> bool: ...
-def rust_proxy_reset() -> int: ...
-def rust_proxy_entry_count() -> int: ...
-def rust_proxy_handle_of(obj: Any) -> int | None: ...
 
 # Phase G1.0a (#1572): expression dual-write node shadow. `capture_*`
 # mint (or reuse) the shared identity handle and return it; reads return
