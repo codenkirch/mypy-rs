@@ -47,7 +47,7 @@ uid-501 RSS 37-39 GB against the 51 GB cap.
 
 ### Lane-reported counters (attributed, not re-derived)
 
-Lane A4 (H1d, #1672) engagement probe on its corpus, `gate_active=False`:
+Lane A4 (H1d, #1672) engagement probe on a 6-file sample, `gate_active=False`:
 
 | Seam | Calls | Deferred | Wire bytes |
 | --- | --- | --- | --- |
@@ -56,8 +56,32 @@ Lane A4 (H1d, #1672) engagement probe on its corpus, `gate_active=False`:
 | `rust_literal_int_expr` | 8957 | 0 | 24 |
 | `rust_refers_to_different_scope` | 0 | 0 | 0 |
 
-The zero-call seam is recorded as-is: it is a candidate for retirement rather
-than a port, and the lane's own report supersedes this table.
+**Correction (2026-09-15, later the same day). The last row was wrong, and the
+error was mine, not the lane's.** The zero was a *sample-coverage artifact* of a
+6-file probe, not a dead seam. On lane A4's re-run against its own worktree
+source, suite-level engagement reads:
+
+| Seam | Calls | Decided | Deferred |
+| --- | --- | --- | --- |
+| `rust_should_report_unreachable_issues` | 13 | 12 | 1 |
+| `rust_refers_to_different_scope` | 16 | 15 | 1 |
+| `rust_flatten_lvalues` | 22 | 21 | 1 |
+| `rust_literal_int_expr` | 41 | 29 | 12 |
+
+So **do not retire `rust_refers_to_different_scope` on the earlier zero.** The
+general lesson, which is why this correction is kept rather than deleted: a
+zero-call reading from a sampled probe is a statement about the sample's
+coverage, not about the seam. Only a whole-corpus count licenses "retire".
+
+Two related hazards found the same hour, both repaired by the same guard:
+- The zero reading above was first taken while the run resolved `import mypy` to
+  the **main** checkout instead of the worktree (symptom:
+  `_pytest.pathlib.ImportPathMismatchError` on `mypy.test.conftest`). Any count
+  is attributable only after
+  `PYTHONPATH=<worktree>:<scratch .so dir>:$PYTHONPATH .venv/bin/python -c "import mypy; print(mypy.__file__)"`
+  prints the worktree path.
+- The probe's own harness exited 0 while raising, so a crashed probe read as a
+  green run. A probe whose failure exits 0 is worse than no probe.
 
 ## Why this file exists
 
