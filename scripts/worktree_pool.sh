@@ -55,8 +55,23 @@ cmd_release() {
         git -C "$p" status --short >&2
         exit 1
     fi
+    br="$(cat "$STATE/$slot.branch" 2>/dev/null || true)"
     rm -f "$STATE/$slot.branch"
     git -C "$p" checkout --detach origin/main >/dev/null 2>&1 || true
+    if [ -n "$br" ]; then
+        if ! pushed="$(git -C "$p" rev-list --count "origin/$br..$br" 2>/dev/null)"; then
+            pushed=1
+        fi
+        if ! git -C "$p" rev-parse --verify --quiet "refs/remotes/origin/$br" >/dev/null; then
+            echo "kept local branch $br: no origin/$br to verify against" >&2
+        elif [ "$pushed" != "0" ]; then
+            echo "kept local branch $br: has unpushed commits" >&2
+        elif git -C "$p" branch -D "$br" >/dev/null 2>&1; then
+            echo "deleted local branch $br"
+        else
+            echo "kept local branch $br: checked out in another worktree" >&2
+        fi
+    fi
     echo "released $slot (target kept warm)"
 }
 
@@ -96,5 +111,16 @@ case "${1:-}" in
     release) shift; cmd_release "$@" ;;
     status) cmd_status ;;
     prune) cmd_prune ;;
-    *) sed -n '2,3p' "$0"; exit 2 ;;
+    *)
+        cat >&2 <<'USAGE'
+usage: worktree_pool.sh <command>
+
+  init [count]           create pool slots (default 4)
+  claim <slot> <branch>  claim a slot, reset to origin/main on <branch>
+  release <slot>         release a slot (keeps target warm)
+  status                 show slot, claim state, branch, target size
+  prune                  remove every clean pool worktree
+USAGE
+        exit 2
+        ;;
 esac
