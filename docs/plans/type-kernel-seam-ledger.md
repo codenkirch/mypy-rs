@@ -4798,10 +4798,53 @@ measurements are appended below as the coordinator reports each landing.
   `calls=16 / decided=15 / deferred=1`, alongside
   `rust_should_report_unreachable_issues` 13/12/1, `rust_flatten_lvalues`
   22/21/1, `rust_literal_int_expr` 41/29/12, 72 tests passed. The zero was a
-  sample-coverage artifact of the 6-file probe, not a dead seam. Correction
-  in flight as PR #1686, which rewrites the section and keeps the mistake
-  visible with the lesson: a zero-call reading from a sampled probe is a
-  statement about the sample's coverage, not about the seam, and only a
-  whole-corpus count licenses "retire". The corrected numbers above are the
-  ones to cite; the zero row is not evidence.
+  sample-coverage artifact of the 6-file probe, not a dead seam. Corrected in
+  the file itself by `#1686` (`e531197d3`, PR #1686), tier T1, which leaves
+  the wrong row visible because the lesson is the point: a zero-call reading
+  from a sampled probe says something about the sample's coverage, not about
+  the seam, and only a whole-corpus count licenses "retire". That PR also
+  records the two same-hour hazards it was entangled with, the run resolving
+  `import mypy` to the main checkout and a probe harness that exits 0 while
+  raising. The corrected numbers above are the ones to cite; the zero row is
+  not evidence.
+- `#1677` (`3d5ace300`, PR #1692) — chore/scripts, tier T1. Adds
+  `scripts/plan_seam_split.py`, a verified planner for splitting the 961
+  `wrap_pyfunction!` registrations in `crates/type_kernel/src/lib.rs` by
+  defining module: 120 defining modules, 49 of them registering exactly one
+  function, 125 declared `mod` lines of which 5 register nothing, 955 unique
+  names for 961 sites so 6 names are registered twice, all single-level
+  `mod::fn` paths with receiver `module`. Largest units: `message_registry`
+  154, `semanal_visitor` 97, `checkexpr_functions` 50, `checker_functions`
+  47, `messages` 35, `typeops` 32. `--verify` fails non-zero on a site count
+  the parse did not see (a silently dropped registration nulls a whole seam
+  battery through the single `try: from type_kernel import (...)` block), a
+  parsed module that is not declared in `lib.rs`, a function name that is
+  really a module name, or a malformed name. Six names registered at two
+  sites each are flagged for confirmation before any move:
+  `rust_classify_simple_literal_type`, `rust_classify_tuple_type_implicit`,
+  `rust_count_stats`, `rust_object_from_instance`, `rust_pretty_seq`,
+  `rust_refers_to_typeddict`. Two figures from an earlier inventory comment
+  are retracted in that PR and must not be built on ("40 defining modules";
+  "199 sites with two colons", the latter an artifact of BSD `sed` ignoring
+  `\s*`). The lesson recorded there is a rule for this host: when a
+  measurement feeds a decision, do it in Python rather than through a BSD
+  shell pipeline, since three of four measurement mistakes that day came from
+  GNU-versus-BSD tooling assumptions and each produced a confident wrong
+  number rather than an error.
+- `#1681` follow-up (`08ef56f57`, PR #1691) — CI tier. The `parity-ast` path
+  gate from `#1681` is rewritten to match paths with a POSIX `case` glob
+  instead of a grep regex. Reason: the regex had been verified with macOS BSD
+  `grep` while CI runs GNU `grep`, so that verification did not validate CI
+  behaviour at all. The skip is now verified on a real kernel PR: `#1690`
+  (`crates/type_kernel/src/checker_functions.rs`, `mypy/checker.py`,
+  `stubs/type_kernel.pyi`, `mypy/test/testtypes.py`) reports
+  `parity-ast: skipped` with `changes: success` and the three kernel jobs
+  green. A skipped job renders as `SKIPPED` in the rollup, the same as
+  `ocr-review`, which settles an earlier anomaly: `#1685` showed
+  `parity-ast: SUCCESS`, so the job really did run there, best explained by
+  the fail-open branch firing silently rather than by a regex mismatch. Its
+  own OCR pass found two defects, both fixed: the fetch retry logged nothing
+  about why the retry failed (the exact ambiguity the change exists to
+  resolve), and `while IFS= read -r f` dropped an unterminated final line, a
+  fail-closed path inside a gate documented to fail open.
 
