@@ -2697,7 +2697,7 @@ def rust_analyze_instance_member_dispatch(
     instance_bytes: bytes,
     name: str,
     override_info: str | None,
-    self_type_bytes: bytes,
+    self_type_bytes: bytes | None,
     _no_deferral: bool,
     preserve_type_var_ids: bool,
     start_raw_id: int,

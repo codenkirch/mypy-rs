@@ -781,12 +781,15 @@ def analyze_instance_member_access(
         and not mx.is_lvalue
     ):
         try:
+            _self_type_bytes = (
+                None if mx.self_type is typ else _serialize_type_for_checkmember(mx.self_type)
+            )
             result = _rust_analyze_instance_member_dispatch(
                 _native_checkmember_resolver,
                 _serialize_type_for_checkmember(typ),
                 name,
                 override_info.fullname if override_info else None,
-                _serialize_type_for_checkmember(mx.self_type),
+                _self_type_bytes,
                 mx.no_deferral,
                 mx.preserve_type_var_ids,
                 TypeVarId.next_raw_id,

@@ -2302,7 +2302,7 @@ pub(crate) fn rust_analyze_instance_member_dispatch(
     instance_bytes: &[u8],
     name: &str,
     override_info: Option<String>,
-    self_type_bytes: &[u8],
+    self_type_bytes: Option<&[u8]>,
     _no_deferral: bool,
     preserve_type_var_ids: bool,
     start_raw_id: i64,
@@ -2315,11 +2315,14 @@ pub(crate) fn rust_analyze_instance_member_dispatch(
             return None;
         }
     };
-    let self_type = match decode_type(self_type_bytes) {
-        Some(t) => t,
-        None => {
-            return None;
-        }
+    let self_type = match self_type_bytes {
+        Some(b) => match decode_type(b) {
+            Some(t) => t,
+            None => {
+                return None;
+            }
+        },
+        None => instance.clone(),
     };
     let mut next_raw_id = start_raw_id;
     let mut changed = false;
