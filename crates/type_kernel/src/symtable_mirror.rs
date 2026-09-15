@@ -62,6 +62,8 @@ pub(crate) struct SymEntry {
 pub(crate) enum ShadowGap {
     /// The table was never adopted (no `put` ever recorded it).
     NoHandle,
+    /// The candidate has no `len()` at all, so the size gate cannot run.
+    NotSized,
     /// Fewer records than live entries: a write bypassed the capture.
     LenShort,
     /// More records than live entries: a delete bypassed the capture.
@@ -74,7 +76,7 @@ pub(crate) enum ShadowGap {
 /// G3.1 read-flip evidence counters. Process lifetime: `reset` drops
 /// entries and pins but keeps these, so a corpus run accumulates them
 /// across build boundaries (tests clear them explicitly).
-#[derive(Default)]
+#[derive(Default, Clone, Copy, Debug)]
 pub(crate) struct FlipCounts {
     /// Tables consulted through the mirror gate (top level and nested).
     pub(crate) tables_looked: u64,
@@ -83,6 +85,7 @@ pub(crate) struct FlipCounts {
     /// Entries handed to the consumer from the store.
     pub(crate) entries_mirrored: u64,
     pub(crate) defer_no_handle: u64,
+    pub(crate) defer_not_sized: u64,
     pub(crate) defer_len_short: u64,
     pub(crate) defer_len_long: u64,
     pub(crate) defer_no_pin: u64,
@@ -365,13 +368,25 @@ fn bump_flip(f: impl FnOnce(&mut FlipCounts)) {
 /// for `table`, in the namespace's insertion order, or the reason the
 /// store cannot stand in for the live table.
 ///
-/// The gate is the shadow-consistency invariant the G3 brief pins:
-/// `entry_count(owner) == len(owner.names)`. A table the store does not
-/// mirror exactly (never adopted, a write or delete the class patch could
-/// not see, a lost pin) never serves a read, so a read flip can only ever
-/// return what the live table would have returned. Ordering is the
-/// namespace ordinal, which reproduces `dict.items()` for insert,
-/// replace, delete and re-insert.
+/// **The gate**: the record count must equal the live namespace size
+/// (`entry_count(owner) == len(owner.names)`, the invariant the G3 brief
+/// pins), the owner must have been adopted, and every record's symbol must
+/// still be pinned. Anything else returns the `ShadowGap` reason and the
+/// caller walks the live table, so a read flip never serves a namespace
+/// the capture could not see.
+///
+/// **What the gate does not prove**: it compares cardinality, not content.
+/// A C-level same-key replace on an adopted table (`dict` C paths, a Rust
+/// `PyDict::set_item` bypass) is length-preserving, so the gate passes and
+/// read-flip mode 1 would serve the pinned symbol the store still holds
+/// rather than the replaced one. Mode 2 (`..._READ_FLIP_VERIFY`) is the
+/// differential for exactly that class: it recomputes the flip-off
+/// snapshot per table and raises on divergence. Reading the live keys here
+/// to close it would re-add the namespace read this flip removes, so the
+/// assumption is stated instead of paid for.
+///
+/// Ordering is the namespace ordinal, which reproduces `dict.items()` for
+/// insert, replace, delete and re-insert.
 pub(crate) fn entries_if_mirrored(
     py: Python<'_>,
     table: &PyAny,
@@ -382,10 +397,12 @@ pub(crate) fn entries_if_mirrored(
         return Err(ShadowGap::NoHandle);
     };
     let Ok(table_len) = table.len() else {
-        bump_flip(|c| c.defer_no_handle += 1);
-        return Err(ShadowGap::NoHandle);
+        bump_flip(|c| c.defer_not_sized += 1);
+        return Err(ShadowGap::NotSized);
     };
-    let triples: Vec<(u64, String, u64)> = with_store(|store| {
+    // One store acquisition: order this owner's entries and resolve each
+    // pin while the borrow is held.
+    let (count, out, lost) = with_store(|store| {
         let mut triples: Vec<(u64, String, u64)> = store
             .by_owner
             .get(&handle)
@@ -402,25 +419,28 @@ pub(crate) fn entries_if_mirrored(
             })
             .unwrap_or_default();
         triples.sort_by_key(|(order, _, _)| *order);
-        triples
+        let count = triples.len();
+        let mut out: Vec<(String, Py<PyAny>)> = Vec::with_capacity(count);
+        let mut lost = 0usize;
+        for (_, name, node_handle) in triples {
+            match store.pins.get(&node_handle) {
+                Some(pin) => out.push((name, pin.clone_ref(py))),
+                None => lost += 1,
+            }
+        }
+        (count, out, lost)
     });
-    if triples.len() < table_len {
+    if count < table_len {
         bump_flip(|c| c.defer_len_short += 1);
         return Err(ShadowGap::LenShort);
     }
-    if triples.len() > table_len {
+    if count > table_len {
         bump_flip(|c| c.defer_len_long += 1);
         return Err(ShadowGap::LenLong);
     }
-    let mut out: Vec<(String, Py<PyAny>)> = Vec::with_capacity(triples.len());
-    for (_, name, node_handle) in triples {
-        match with_store(|store| store.pins.get(&node_handle).map(|pin| pin.clone_ref(py))) {
-            Some(symbol) => out.push((name, symbol)),
-            None => {
-                bump_flip(|c| c.defer_no_pin += 1);
-                return Err(ShadowGap::NoPin);
-            }
-        }
+    if lost > 0 {
+        bump_flip(|c| c.defer_no_pin += 1);
+        return Err(ShadowGap::NoPin);
     }
     bump_flip(|c| {
         c.tables_mirrored += 1;
@@ -431,15 +451,7 @@ pub(crate) fn entries_if_mirrored(
 
 /// Read-flip counters snapshot (evidence).
 pub(crate) fn flip_counts() -> FlipCounts {
-    with_store(|store| FlipCounts {
-        tables_looked: store.flip.tables_looked,
-        tables_mirrored: store.flip.tables_mirrored,
-        entries_mirrored: store.flip.entries_mirrored,
-        defer_no_handle: store.flip.defer_no_handle,
-        defer_len_short: store.flip.defer_len_short,
-        defer_len_long: store.flip.defer_len_long,
-        defer_no_pin: store.flip.defer_no_pin,
-    })
+    with_store(|store| store.flip)
 }
 
 /// Drop the read-flip counters (tests and per-run evidence boundaries).
@@ -645,6 +657,7 @@ pub(crate) fn rust_symtable_mirror_flip_counts<'py>(py: Python<'py>) -> PyResult
     dict.set_item("tables_mirrored", counts.tables_mirrored)?;
     dict.set_item("entries_mirrored", counts.entries_mirrored)?;
     dict.set_item("defer_no_handle", counts.defer_no_handle)?;
+    dict.set_item("defer_not_sized", counts.defer_not_sized)?;
     dict.set_item("defer_len_short", counts.defer_len_short)?;
     dict.set_item("defer_len_long", counts.defer_len_long)?;
     dict.set_item("defer_no_pin", counts.defer_no_pin)?;

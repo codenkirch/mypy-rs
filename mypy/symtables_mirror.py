@@ -492,7 +492,8 @@ def flip_report() -> dict[str, int]:
     the per-reason mirror-gate defers (process lifetime)."""
     if _kernel_mod is None:
         return {}
-    return {key: int(value) for key, value in _kernel_mod.rust_symtable_mirror_flip_counts().items()}
+    counts = _kernel_mod.rust_symtable_mirror_flip_counts()
+    return {key: int(value) for key, value in counts.items()}
 
 
 def entry_count(owner: Any) -> int:

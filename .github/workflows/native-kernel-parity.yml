@@ -35,11 +35,14 @@ on:
       - mypy/types.py
       - mypy/types_mirror.py
       - mypy/server/astdiff.py
+      - mypy/symtable_access.py
       - mypy/symtables_mirror.py
       - mypy/test/testcheck.py
       - mypy/test/testtypes.py
       - mypy/test/testdiff.py
       - mypy/test/testfinegrained.py
+      - mypy/test/testfinegrainedcache.py
+      - mypy/test/testdaemon.py
       - mypy/test/testinfer.py
       - mypy/nativeparse.py
       - mypy/fastparse.py

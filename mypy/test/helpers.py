@@ -390,6 +390,10 @@ _NATIVE_ENV_MODULE_PROBES = {
     "TEST_NATIVE_TYPE_KERNEL": ("type_kernel", "erase_type"),
     "TEST_NATIVE_AST_MIRROR": ("type_kernel", "rust_node_mirror_entry_count"),
     "TEST_NATIVE_SYMTABLE_READ_FLIP": ("type_kernel", "rust_snapshot_symbol_table_shadow"),
+    "TEST_NATIVE_SYMTABLE_READ_FLIP_VERIFY": (
+        "type_kernel",
+        "rust_snapshot_symbol_table_shadow",
+    ),
 }
 
 

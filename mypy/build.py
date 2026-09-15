@@ -1401,21 +1401,16 @@ class BuildManager:
                 audit=_os_symtable_mirror.environ.get("MYPY_TK_SYMTABLE_AUDIT") == "1"
             )
         # Phase G3.1 (#1670): the read flip is a differential gate on the
-        # same shadow. Set on every build (including 0) so a later build
-        # cannot inherit a mode from an earlier one.
-        if (
-            self.options.native_symtable_mirror
-            or self.options.native_symtable_read_flip
-            or self.options.native_symtable_read_flip_verify
-        ):
-            from mypy import symtables_mirror
+        # same shadow. Set on every build, so a later build with the gates
+        # off cannot inherit a mode from an earlier one in the process.
+        from mypy import symtables_mirror
 
-            if self.options.native_symtable_read_flip_verify:
-                symtables_mirror.set_read_flip(2)
-            elif self.options.native_symtable_read_flip:
-                symtables_mirror.set_read_flip(1)
-            else:
-                symtables_mirror.set_read_flip(0)
+        if self.options.native_symtable_read_flip_verify:
+            symtables_mirror.set_read_flip(2)
+        elif self.options.native_symtable_read_flip:
+            symtables_mirror.set_read_flip(1)
+        else:
+            symtables_mirror.set_read_flip(0)
         # Stage 3c/4 production wiring (M8bb): the resolver is built per
         # SCC in `process_stale_scc` (after semantic analysis populates
         # the TypeInfo graph). See `_build_native_resolvers` for status.
@@ -1967,7 +1962,11 @@ class BuildManager:
             from mypy import nodes_mirror
 
             nodes_mirror.reset()
-        if self.options.native_symtable_mirror or self.options.native_symtable_read_flip:
+        if (
+            self.options.native_symtable_mirror
+            or self.options.native_symtable_read_flip
+            or self.options.native_symtable_read_flip_verify
+        ):
             # Phase G3.0a (#1581) / G3.1 (#1670): the shadow entries pin
             # symbol tables and nodes, and the read flip shares the same
             # storage; reset before the preserving type-mirror reset.
