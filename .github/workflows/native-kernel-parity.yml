@@ -58,6 +58,41 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  changes:
+    # Per-job path gating (#1678): the workflow-level paths list is the outer
+    # trigger, this narrows it so a kernel-only change skips the AST suite.
+    # Fail-open by design: no SHAs or no diff means every job still runs.
+    runs-on: ubuntu-latest
+    outputs:
+      ast: ${{ steps.filter.outputs.ast }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - id: filter
+        run: |
+          set -eu
+          BASE="${{ github.event.pull_request.base.sha }}"
+          HEAD="${{ github.event.pull_request.head.sha }}"
+          if [ -z "${BASE:-}" ] || [ -z "${HEAD:-}" ]; then
+            echo "no PR SHAs; running every parity job"
+            echo "ast=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if ! git diff --name-only "$BASE" "$HEAD" > /tmp/changed.txt 2>/dev/null; then
+            echo "diff unavailable; running every parity job"
+            echo "ast=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "changed files:"; cat /tmp/changed.txt
+          PATTERN='^(crates/ast_serialize/|stubs/ast_serialize\.pyi$|mypy/nativeparse\.py$|mypy/fastparse\.py$|mypy/parse\.py$|mypy/nodes\.py$|mypy/errors\.py$|mypy/options\.py$|mypy/stubgen\.py$|mypy/stubutil\.py$|mypy/semanal[a-z_]*\.py$|mypy/test/test_nativeparse\.py$|mypy/test/testparse\.py$|mypy/test/teststubgen\.py$)'
+          if grep -Eq "$PATTERN" /tmp/changed.txt; then
+            echo "ast=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "ast=false" >> "$GITHUB_OUTPUT"
+          fi
+
   parity:
     runs-on: ubuntu-latest
     steps:
@@ -347,6 +382,8 @@ jobs:
     # G0.2 (#1546): the AST path (test_nativeparse / testparse /
     # teststubgen) ran in no workflow. teststubgen always parses natively:
     # stubgen builds its own Options and ignores TEST_NATIVE_PARSER.
+    needs: changes
+    if: needs.changes.outputs.ast == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
