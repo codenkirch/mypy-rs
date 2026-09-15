@@ -21316,29 +21316,36 @@ class NativeCheckMemberSuite(Suite):
         # superclass lookup, so this resolves with no resolver floor.
         assert has_operator(AnyType(TypeOfAny.special_form), "__eq__") is True
 
-    def test_meta_has_operator_rust_answers(self) -> None:
+    def test_meta_has_operator_gate_retired(self) -> None:
+        # #1668 retired this gate. The old pin asserted the Rust
+        # default-metaclass answer; the Python body needs live builtins
+        # state, which TypeFixture lacks, so only AnyType survives here.
+        from mypy import checkmember
         from mypy.checkmember import meta_has_operator
 
-        # No fixture has a metaclass, so Python's std-lib "type" fallback
-        # would crash in this test env. Rust returns Some(false) via the
-        # default-metaclass path, so False proves Rust answered.
-        assert meta_has_operator(self.fx.a, "__call__") is False
+        assert not hasattr(checkmember, "_rust_meta_has_operator")
+        assert meta_has_operator(AnyType(TypeOfAny.special_form), "__call__") is True
+        # The Rust pyfunction stays registered for direct-seam tests.
+        assert (
+            self._tk.rust_meta_has_operator(
+                self.resolver, self._bytes_of(AnyType(TypeOfAny.special_form)), "__call__"
+            )
+            is True
+        )
 
     def test_instance_fallback_parity(self) -> None:
         from mypy.checkmember import instance_fallback
 
-        for t in (self.fx.a, self.fx.lit1):
-            self._set_active(False)
-            try:
-                expected = instance_fallback(t)
-            finally:
-                self._set_active(True)
+        # The gate is retired (#1668), so both sides below are the Python
+        # body; the Rust seam is exercised directly instead.
+        for t, expected in ((self.fx.a, self.fx.a), (self.fx.lit1, self.fx.a)):
             actual = instance_fallback(t)
             assert isinstance(actual, Instance)
-            assert actual == expected
+            assert actual is expected
+            assert self._tk.rust_instance_fallback(self._bytes_of(t)) is not None
 
     def test_instance_fallback_rust_tuple_parity(self) -> None:
-        from mypy.checkmember import instance_fallback
+        from mypy.checkmember import _deserialize_type_for_checkmember, instance_fallback
         from mypy.types import TupleType
 
         cases = [
@@ -21350,16 +21357,14 @@ class NativeCheckMemberSuite(Suite):
             (TupleType([self.fx.a], Instance(self.fx.ai, [])), self.fx.ai),
         ]
         for t, expected_info in cases:
-            self._set_active(False)
-            try:
-                expected = instance_fallback(t)
-            finally:
-                self._set_active(True)
             actual = instance_fallback(t)
             assert isinstance(actual, Instance)
-            assert isinstance(expected, Instance)
             assert actual.type is expected_info
-            assert expected.type is expected_info
+            rust_bytes = self._tk.rust_instance_fallback(self._bytes_of(t))
+            assert rust_bytes is not None
+            decoded = _deserialize_type_for_checkmember(bytes(rust_bytes))
+            assert isinstance(decoded, Instance)
+            assert decoded.type is expected_info
 
     def test_defined_in_superclass_parity(self) -> None:
         # member_info is captured eagerly when the resolver is built, so a
