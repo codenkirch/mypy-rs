@@ -240,6 +240,32 @@ third run of the before half used as the stability check.
   gained this PR's suite between the halves, so the global funnel deltas are a
   lower bound.
 
+### Harness fixes after the review
+
+The committed harness no longer prints two **structural zeros**: a probe that
+reports an unreachable branch as a measured `0` breaks the load-invariant
+counter rule this wave runs on. Neither zero is cited anywhere in this document.
+
+- `unsourced_seam_bytes` (the `entry is None` branch in `consume()` is
+  unreachable: the only caller passes a blob that `_lookup_blob` returned from
+  `pending`): branch and stat line removed.
+- `re_pushed_already_snapshotted` (initialized, never incremented; the
+  classification loop bumps `re_pushed_builtins` / `other_infos`): key removed.
+  The `re_pushed_builtins` figure this document does cite is unaffected.
+
+Also fixed: `report()` now runs in the `finally` block, so an exception from the
+audited run can no longer discard the counters, and the unused `useful_pair`
+counter was dropped.
+
+**The fixes are output-neutral for every cited number.** Two runs of the fixed
+harness on a one-file corpus (`mypy/util.py`) differ from each other by 389 diff
+lines; old against fixed differs by 408, i.e. the fix adds no more than run-to-run
+`id(bytes)` noise. `re_pushed_builtins` is byte-identical across all three runs
+(4,739) and the seam call/defer counts are identical.
+
+The before/after dumps cited above were produced by the pre-fix harness; the
+removed lines were always `0` and are not part of any claim.
+
 ## Caveats
 
 - Load-invariant counters are the verdict here. The `--dump-build-stats` wall

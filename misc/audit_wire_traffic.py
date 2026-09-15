@@ -91,9 +91,9 @@ unconsumed: collections.Counter = collections.Counter()
 useful_bytes: collections.Counter = collections.Counter()
 deferred_bytes: collections.Counter = collections.Counter()
 unconsumed_bytes: collections.Counter = collections.Counter()
-# (caller, seam) -> events
+# (caller, seam) -> events, for the deferred list only: a useful pair list
+# was collected and never read, so it is not collected at all.
 deferred_pair: collections.Counter = collections.Counter()
-useful_pair: collections.Counter = collections.Counter()
 seam_calls: collections.Counter = collections.Counter()
 seam_defers: collections.Counter = collections.Counter()
 seam_bytes: collections.Counter = collections.Counter()
@@ -101,9 +101,8 @@ seam_bytes: collections.Counter = collections.Counter()
 # this is the per-call payload the Rust side re-decodes, the dominant
 # per-call cost for whole-tree wire seams.
 seam_call_bytes: collections.Counter = collections.Counter()
-unsourced_seam_bytes = 0
 probe_calls: collections.Counter = collections.Counter()
-probe_stats: dict[str, dict[str, int]] = {}
+probe_stats: dict[str, dict[str, Any]] = {}
 
 # Python-side sites worth counting directly: parity-only oracles and the
 # per-SCC resolver-snapshot upkeep the issue names as root cause (a).
@@ -173,19 +172,16 @@ def register_serializer_result(result: Any, caller: str) -> None:
 
 
 def consume(blob: Any, useful_: bool, seam: str, caller: str) -> None:
-    global unsourced_seam_bytes
+    # The only caller passes a blob fetched by `_lookup_blob`, which returns
+    # non-None only while `pending` holds that id, so the pop cannot miss.
     key = id(blob)
-    entry = pending.pop(key, None)
-    if entry is None:
-        unsourced_seam_bytes += len(blob)
-        return
+    entry = pending.pop(key)
     consumed_ids.add(key)
     origin, nbytes = entry[0], entry[1]
     seam_bytes[seam] += nbytes
     if useful_:
         useful[origin] += 1
         useful_bytes[origin] += nbytes
-        useful_pair[(origin, seam)] += 1
     else:
         deferred[origin] += 1
         deferred_bytes[origin] += nbytes
@@ -301,7 +297,6 @@ def patch_probes() -> int:
             "infos": 0,
             "aliases": 0,
             "new_infos": 0,
-            "re_pushed_already_snapshotted": 0,
             "re_pushed_builtins": 0,
             "other_infos": 0,
             "resolver_build_s": 0.0,
@@ -355,7 +350,6 @@ def report() -> None:
     print(f"  useful:      {sum(useful.values())} ({sum(useful_bytes.values())} B)", file=out)
     print(f"  deferred:    {sum(deferred.values())} ({sum(deferred_bytes.values())} B)", file=out)
     print(f"  unconsumed:  {sum(unconsumed.values())} ({sum(unconsumed_bytes.values())} B)", file=out)
-    print(f"unsourced seam bytes (constants/pre-interned): {unsourced_seam_bytes}", file=out)
 
     print("\n--- A. serialized then SEAM DEFERRED (top 25 call sites) ---", file=out)
     for site_, cnt in deferred.most_common(25):
@@ -454,13 +448,18 @@ def main() -> int:
         mypy.main.main(clean_exit=True)
     except SystemExit:
         pass
+    except Exception:
+        # The counters are the whole point: report them on the error path too.
+        import traceback
+
+        traceback.print_exc()
     finally:
         total_run_s = _time.perf_counter() - _t0
         print(
             f"\n[audit] total run wall {total_run_s:.1f}s (load-contaminated)",
             file=sys.stderr,
         )
-    report()
+        report()
     return 0
 
 
