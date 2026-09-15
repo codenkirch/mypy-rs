@@ -417,37 +417,37 @@ account for minutes of difference.
 | family | class | slot | writes outside `nodes.py` |
 |---|---|---|---|
 | G1 | `MemberExpr` | `expr` | `mypy/checkstrformat.py:865` |
-| G1 | `CallExpr` | `args` | `mypy/exprtotype.py:132`, `mypy/semanal.py:2896`, `mypy/semanal_shared.py:331` |
+| G1 | `CallExpr` | `args` | `mypy/exprtotype.py:132`, `mypy/semanal.py:2889`, `mypy/semanal_shared.py:331` |
 | G1 | `IndexExpr` | `base` | `mypy/checkstrformat.py:863` |
 | G1 | `IndexExpr` | `index` | `mypy/checkstrformat.py:858` |
 | G2 | `ImportFrom` | `id` | `mypy/build.py:232` |
-| G2 | `ImportFrom` | `names` | `mypy/build.py:4654`, `mypy/treetransform.py:156` |
+| G2 | `ImportFrom` | `names` | `mypy/build.py:4650`, `mypy/treetransform.py:156` |
 | G2 | `ImportAll` | `id` | `mypy/build.py:232` |
 | G2 | `Block` | `body` | `mypy/fastparse.py:852`, `mypy/nativeparse.py:1936`, `mypy/semanal_namedtuple.py:145` |
 | G2 | `ForStmt` | `body` | `mypy/fastparse.py:852`, `mypy/nativeparse.py:1936`, `mypy/server/aststrip.py:147` |
 | G2 | `ForStmt` | `is_async` | `mypy/fastparse.py:1329`, `mypy/nativeparse.py:471`, `mypy/treetransform.py:355` |
-| G2 | `WithStmt` | `target` | `mypy/semanal.py:5546` |
-| G2 | `WithStmt` | `unanalyzed_type` | `mypy/fastparse.py:1050`, `mypy/nativeparse.py:789`, `mypy/semanal.py:10221` |
+| G2 | `WithStmt` | `target` | `mypy/semanal.py:5539` |
+| G2 | `WithStmt` | `unanalyzed_type` | `mypy/fastparse.py:1050`, `mypy/nativeparse.py:789`, `mypy/semanal.py:10205` |
 | G2 | `WithStmt` | `body` | `mypy/fastparse.py:852`, `mypy/nativeparse.py:1936` |
 | G2 | `WithStmt` | `is_async` | `mypy/fastparse.py:1329`, `mypy/nativeparse.py:471`, `mypy/treetransform.py:355` |
 | G2 | `IfStmt` | `body` | `mypy/fastparse.py:852`, `mypy/nativeparse.py:1936` |
 | G2 | `IfStmt` | `else_body` | `mypy/reachability.py:101` |
 | G2 | `TypeAliasStmt` | `name` | `mypy/stubutil.py:335` |
-| G2 | `TypeAliasStmt` | `type_args` | `mypy/semanal.py:10216` |
+| G2 | `TypeAliasStmt` | `type_args` | `mypy/semanal.py:10200` |
 | G2 | `ClassDef` | `name` | `mypy/plugins/dataclasses.py:357`, `mypy/renaming.py:585`, `mypy/stubutil.py:335` |
 | G2 | `ClassDef` | `defs` | `mypy/server/astmerge.py:212` |
-| G2 | `ClassDef` | `type_args` | `mypy/semanal.py:10216` |
-| G2 | `ClassDef` | `decorators` | `mypy/fastparse.py:1192`, `mypy/nativeparse.py:830`, `mypy/semanal.py:2366` |
+| G2 | `ClassDef` | `type_args` | `mypy/semanal.py:10200` |
+| G2 | `ClassDef` | `decorators` | `mypy/fastparse.py:1192`, `mypy/nativeparse.py:830`, `mypy/semanal.py:2359` |
 | G2 | `ClassDef` | `docstring` | `mypy/fastparse.py:1073`, `mypy/nativeparse.py:775`, `mypy/stubutil.py:337` |
 | G3 | `SymbolTableNode` | `unfixed` | `mypy/fixup.py:157` |
 | G3 | `SymbolTableNode` | `stored_info` | `mypy/fixup.py:166` |
 | G3 | `TypeInfo` | `module_name` | `mypy/stubgen.py:590` |
-| G3 | `TypeInfo` | `defn` | `mypy/semanal.py:3445` |
+| G3 | `TypeInfo` | `defn` | `mypy/semanal.py:3438` |
 | G3 | `TypeInfo` | `_mro_refs` | `mypy/fixup.py:138` |
 | G3 | `TypeInfo` | `is_abstract` | `mypy/semanal_classprop.py:73` |
 | G3 | `TypeInfo` | `abstract_attributes` | `mypy/semanal_classprop.py:74` |
-| G3 | `TypeInfo` | `deletable_attributes` | `mypy/semanal.py:6787` |
-| G3 | `TypeInfo` | `slots` | `mypy/plugins/attrs.py:1252`, `mypy/plugins/dataclasses.py:714`, `mypy/semanal.py:6846` |
+| G3 | `TypeInfo` | `deletable_attributes` | `mypy/semanal.py:6780` |
+| G3 | `TypeInfo` | `slots` | `mypy/plugins/attrs.py:1252`, `mypy/plugins/dataclasses.py:714`, `mypy/semanal.py:6839` |
 | G3 | `TypeInfo` | `inferring` | `mypy/typestate.py:130` |
 | G3 | `TypeInfo` | `tuple_type` | `mypy/checker.py:8517` |
 | G3 | `TypeInfo` | `special_alias` | `mypy/fixup.py:473` |
