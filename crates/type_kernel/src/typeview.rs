@@ -39,20 +39,13 @@ use crate::identity;
 use crate::wire::{
     write_int_bare, write_str, write_str_bare, write_tag, WriteBuffer, END_TAG, INSTANCE,
     INSTANCE_BOOL, INSTANCE_FUNCTION, INSTANCE_GENERIC, INSTANCE_INT, INSTANCE_OBJECT,
-    INSTANCE_SIMPLE, INSTANCE_STR, LITERAL_NONE, LIST_GEN,
+    INSTANCE_SIMPLE, INSTANCE_STR, LIST_GEN, LITERAL_NONE,
 };
 
 /// Recursion budget for a serve. mypy type graphs are DAGs in practice, but
 /// "in practice" is not a soundness argument, so the walk is bounded rather
 /// than trusting the graph to be acyclic.
 const ENCODE_DEPTH_BUDGET: u32 = 64;
-
-/// The fields a serve needs, copied out of the store so no borrow is held
-/// across the recursion (which re-enters the store for each child).
-struct ServePlan {
-    fullname: String,
-    arg_handles: Vec<u64>,
-}
 
 /// One stored `Instance` field set.
 struct InstanceView {
@@ -117,21 +110,6 @@ fn singleton_tag(fullname: &str) -> Option<u8> {
     }
 }
 
-/// The serve plan for `handle`, or `None` when the entry is absent, stale,
-/// pre-fixup, or tvar-tainted.
-fn serve_plan(handle: u64, stamp: u64) -> Option<ServePlan> {
-    with_store(|store| {
-        let entry = store.by_handle.get(&handle)?;
-        if entry.stamp != stamp || !entry.fixed_up || !entry.args_tvar_clean {
-            return None;
-        }
-        Some(ServePlan {
-            fullname: entry.fullname.clone(),
-            arg_handles: entry.arg_handles.clone(),
-        })
-    })
-}
-
 /// The live object pinned for `handle` (a registered child), or `None`.
 fn pinned(py: Python<'_>, handle: u64) -> Option<Py<PyAny>> {
     with_store(|store| store.pins.get(&handle).map(|pin| pin.clone_ref(py)))
@@ -159,31 +137,43 @@ fn encode_instance(
     if budget == 0 {
         return None;
     }
-    let plan = serve_plan(handle, stamp)?;
-    // The `type` slot has no Python writer hook, so the live fullname is the
-    // only trustworthy source. A mismatch means the instance was retyped in
-    // place; refuse rather than emit bytes for the old type.
-    if plan.fullname != live {
-        return None;
-    }
-
     let mut buf = WriteBuffer::new();
-    write_tag(&mut buf, INSTANCE);
-    if plan.arg_handles.is_empty() {
-        match singleton_tag(&plan.fullname) {
-            Some(tag) => write_tag(&mut buf, tag),
-            None => {
-                write_tag(&mut buf, INSTANCE_SIMPLE);
-                write_str_bare(&mut buf, &plan.fullname).ok()?;
-            }
+    // The header is built while the store is borrowed: nothing is copied out
+    // except the child list length, so a serve costs no per-entry allocation
+    // and a miss costs no allocation at all.
+    let child_count = with_store(|store| -> Option<usize> {
+        let entry = store.by_handle.get(&handle)?;
+        if entry.stamp != stamp || !entry.fixed_up || !entry.args_tvar_clean {
+            return None;
         }
+        // The `type` slot has no Python writer hook, so the live fullname is
+        // the only trustworthy source. A mismatch means the instance was
+        // retyped in place; refuse rather than emit bytes for the old type.
+        if entry.fullname != live {
+            return None;
+        }
+        write_tag(&mut buf, INSTANCE);
+        if entry.arg_handles.is_empty() {
+            match singleton_tag(&entry.fullname) {
+                Some(tag) => write_tag(&mut buf, tag),
+                None => {
+                    write_tag(&mut buf, INSTANCE_SIMPLE);
+                    write_str_bare(&mut buf, &entry.fullname).ok()?;
+                }
+            }
+            return Some(0);
+        }
+        write_tag(&mut buf, INSTANCE_GENERIC);
+        write_str(&mut buf, &entry.fullname).ok()?;
+        write_tag(&mut buf, LIST_GEN);
+        write_int_bare(&mut buf, entry.arg_handles.len() as i64).ok()?;
+        Some(entry.arg_handles.len())
+    })?;
+    if child_count == 0 {
         return Some(buf.into_bytes());
     }
-    write_tag(&mut buf, INSTANCE_GENERIC);
-    write_str(&mut buf, &plan.fullname).ok()?;
-    write_tag(&mut buf, LIST_GEN);
-    write_int_bare(&mut buf, plan.arg_handles.len() as i64).ok()?;
-    for &child in &plan.arg_handles {
+    for index in 0..child_count {
+        let child = with_store(|store| store.by_handle.get(&handle).map(|e| e.arg_handles[index]))?;
         if child == 0 {
             return None;
         }
@@ -237,12 +227,7 @@ pub(crate) fn put(
 }
 
 /// Serve the wire bytes for `handle` when the stored field set is current.
-pub(crate) fn encode(
-    py: Python<'_>,
-    handle: u64,
-    stamp: u64,
-    live: &str,
-) -> Option<Vec<u8>> {
+pub(crate) fn encode(py: Python<'_>, handle: u64, stamp: u64, live: &str) -> Option<Vec<u8>> {
     let bytes = encode_instance(py, handle, stamp, live, ENCODE_DEPTH_BUDGET);
     with_store(|store| {
         if bytes.is_some() {
@@ -322,7 +307,15 @@ pub(crate) fn rust_view_put(
     args_tvar_clean: bool,
     stamp: u64,
 ) -> PyResult<u64> {
-    put(obj, fullname, args, arg_handles, fixed_up, args_tvar_clean, stamp)
+    put(
+        obj,
+        fullname,
+        args,
+        arg_handles,
+        fixed_up,
+        args_tvar_clean,
+        stamp,
+    )
 }
 
 /// Wire bytes for `handle`, or `None` when the stored field set cannot be
@@ -408,8 +401,16 @@ mod typeview_tests {
         with_py(|py| {
             reset();
             let obj = instance(py, "builtins.int");
-            let h = put(obj.as_ref(py), "builtins.int".into(), vec![], vec![], true, true, 1)
-                .unwrap();
+            let h = put(
+                obj.as_ref(py),
+                "builtins.int".into(),
+                vec![],
+                vec![],
+                true,
+                true,
+                1,
+            )
+            .unwrap();
             assert_eq!(entry_count(), 1);
             let bytes = encode(py, h, 1, "builtins.int").unwrap();
             assert_eq!(bytes, vec![INSTANCE, INSTANCE_INT]);
@@ -422,7 +423,16 @@ mod typeview_tests {
         with_py(|py| {
             reset();
             let obj = instance(py, "foo.Bar");
-            let h = put(obj.as_ref(py), "foo.Bar".into(), vec![], vec![], true, true, 1).unwrap();
+            let h = put(
+                obj.as_ref(py),
+                "foo.Bar".into(),
+                vec![],
+                vec![],
+                true,
+                true,
+                1,
+            )
+            .unwrap();
             let bytes = encode(py, h, 1, "foo.Bar").unwrap();
             assert_eq!(bytes[0], INSTANCE);
             assert_eq!(bytes[1], INSTANCE_SIMPLE);
@@ -436,9 +446,16 @@ mod typeview_tests {
         with_py(|py| {
             reset();
             let child = instance(py, "builtins.int");
-            let child_h =
-                put(child.as_ref(py), "builtins.int".into(), vec![], vec![], true, true, 1)
-                    .unwrap();
+            let child_h = put(
+                child.as_ref(py),
+                "builtins.int".into(),
+                vec![],
+                vec![],
+                true,
+                true,
+                1,
+            )
+            .unwrap();
             let parent = instance(py, "builtins.list");
             let parent_h = put(
                 parent.as_ref(py),
@@ -465,8 +482,16 @@ mod typeview_tests {
         with_py(|py| {
             reset();
             let obj = instance(py, "builtins.int");
-            let h = put(obj.as_ref(py), "builtins.int".into(), vec![], vec![], true, true, 1)
-                .unwrap();
+            let h = put(
+                obj.as_ref(py),
+                "builtins.int".into(),
+                vec![],
+                vec![],
+                true,
+                true,
+                1,
+            )
+            .unwrap();
             assert!(encode(py, h, 2, "builtins.int").is_none());
             assert_eq!(stats().1, 1);
         });
@@ -477,8 +502,16 @@ mod typeview_tests {
         with_py(|py| {
             reset();
             let obj = instance(py, "builtins.int");
-            let h = put(obj.as_ref(py), "builtins.int".into(), vec![], vec![], true, true, 1)
-                .unwrap();
+            let h = put(
+                obj.as_ref(py),
+                "builtins.int".into(),
+                vec![],
+                vec![],
+                true,
+                true,
+                1,
+            )
+            .unwrap();
             // The live fullname moved: the stored entry is refused.
             assert!(encode(py, h, 1, "builtins.str").is_none());
         });
@@ -489,8 +522,16 @@ mod typeview_tests {
         with_py(|py| {
             reset();
             let obj = instance(py, "builtins.int");
-            let h = put(obj.as_ref(py), "builtins.int".into(), vec![], vec![], false, true, 1)
-                .unwrap();
+            let h = put(
+                obj.as_ref(py),
+                "builtins.int".into(),
+                vec![],
+                vec![],
+                false,
+                true,
+                1,
+            )
+            .unwrap();
             assert!(encode(py, h, 1, "builtins.int").is_none());
         });
     }
@@ -500,8 +541,16 @@ mod typeview_tests {
         with_py(|py| {
             reset();
             let obj = instance(py, "builtins.list");
-            let h = put(obj.as_ref(py), "builtins.list".into(), vec![], vec![], true, false, 1)
-                .unwrap();
+            let h = put(
+                obj.as_ref(py),
+                "builtins.list".into(),
+                vec![],
+                vec![],
+                true,
+                false,
+                1,
+            )
+            .unwrap();
             assert!(encode(py, h, 1, "builtins.list").is_none());
         });
     }
@@ -531,9 +580,16 @@ mod typeview_tests {
         with_py(|py| {
             reset();
             let child = instance(py, "builtins.int");
-            let child_h =
-                put(child.as_ref(py), "builtins.int".into(), vec![], vec![], true, true, 1)
-                    .unwrap();
+            let child_h = put(
+                child.as_ref(py),
+                "builtins.int".into(),
+                vec![],
+                vec![],
+                true,
+                true,
+                1,
+            )
+            .unwrap();
             let parent = instance(py, "builtins.list");
             let h = put(
                 parent.as_ref(py),
@@ -557,8 +613,16 @@ mod typeview_tests {
         with_py(|py| {
             reset();
             let obj = instance(py, "builtins.int");
-            let h = put(obj.as_ref(py), "builtins.int".into(), vec![], vec![], true, true, 1)
-                .unwrap();
+            let h = put(
+                obj.as_ref(py),
+                "builtins.int".into(),
+                vec![],
+                vec![],
+                true,
+                true,
+                1,
+            )
+            .unwrap();
             assert!(touch(h));
             assert_eq!(entry_count(), 0);
             assert!(!touch(h));
@@ -593,7 +657,16 @@ mod typeview_tests {
         with_py(|py| {
             reset();
             let obj = instance(py, "builtins.int");
-            let h = put(obj.as_ref(py), "builtins.int".into(), vec![], vec![], true, true, 1).unwrap();
+            let h = put(
+                obj.as_ref(py),
+                "builtins.int".into(),
+                vec![],
+                vec![],
+                true,
+                true,
+                1,
+            )
+            .unwrap();
             encode(py, h, 1, "builtins.int").unwrap();
             assert_eq!(entry_count(), 1);
             assert_eq!(stats().0, 1);

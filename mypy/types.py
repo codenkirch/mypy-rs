@@ -4849,7 +4849,7 @@ def _serialize_type_for_visitor_clocked(t: Type) -> bytes:
 _serialize_type_for_visitor_body = _serialize_type_for_visitor
 
 if _serialize_clock_on:
-    _serialize_type_for_visitor = _serialize_type_for_visitor_clocked  # type: ignore[assignment]
+    _serialize_type_for_visitor = _serialize_type_for_visitor_clocked
 
 
 def _encode_no_arg_instance(t: Type, buf_cls: type[WriteBuffer]) -> bytes | None:
