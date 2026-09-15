@@ -3861,6 +3861,28 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         module
     )?)?;
 
+    // H1d cluster (#1672): live-object decision heads, zero wire bytes.
+    // should_report_unreachable_issues inlines in_checked_function.
+    module.add_function(wrap_pyfunction!(
+        checker_functions::rust_should_report_unreachable_issues,
+        module
+    )?)?;
+    // refers_to_different_scope: live NameExpr + Scope + MypyFile.
+    module.add_function(wrap_pyfunction!(
+        checker_functions::rust_refers_to_different_scope,
+        module
+    )?)?;
+    // flatten_lvalues: recursive live read of the lvalue sequence.
+    module.add_function(wrap_pyfunction!(
+        checker_functions::rust_flatten_lvalues,
+        module
+    )?)?;
+    // literal_int_expr: live _type_maps scan + literal classification.
+    module.add_function(wrap_pyfunction!(
+        checker_functions::rust_literal_int_expr,
+        module
+    )?)?;
+
     module.add_function(wrap_pyfunction!(
         subexpr_strip::rust_get_subexpressions,
         module

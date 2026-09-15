@@ -416,6 +416,10 @@ try:
         rust_classify_unbound_return_typevar as _rust_classify_unbound_return_typevar,
         rust_check_untyped_after_decorator as _rust_check_untyped_after_decorator,
         rust_check_incompatible_property_override as _rust_check_incompatible_property_override,
+        rust_should_report_unreachable_issues as _rust_should_report_unreachable_issues,
+        rust_refers_to_different_scope as _rust_refers_to_different_scope,
+        rust_flatten_lvalues as _rust_flatten_lvalues,
+        rust_literal_int_expr as _rust_literal_int_expr,
         rust_narrow_type_by_identity_equality as _rust_narrow_type_by_identity_equality,
         rust_narrow_with_len as _rust_narrow_with_len,
         rust_or_conditional_maps as _rust_or_conditional_maps,
@@ -497,6 +501,10 @@ except ImportError:
     _rust_classify_unbound_return_typevar = None  # type: ignore[assignment]
     _rust_check_untyped_after_decorator = None  # type: ignore[assignment]
     _rust_check_incompatible_property_override = None  # type: ignore[assignment]
+    _rust_should_report_unreachable_issues = None  # type: ignore[assignment]
+    _rust_refers_to_different_scope = None  # type: ignore[assignment]
+    _rust_flatten_lvalues = None  # type: ignore[assignment]
+    _rust_literal_int_expr = None  # type: ignore[assignment]
     _rust_is_more_general_arg_prefix = None  # type: ignore[assignment]
     _rust_overload_can_never_match = None  # type: ignore[assignment]
     _rust_is_equality_ambiguous_for_narrowing = None  # type: ignore[assignment]
@@ -4692,6 +4700,20 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
                 self.expr_checker.expr_cache.clear()
 
     def should_report_unreachable_issues(self) -> bool:
+        # Native seam (H1d, #1672): the whole conjunction plus the inlined
+        # in_checked_function() is a pure read over live checker state.
+        # None defers to the pure-Python body below.
+        if (
+            _CHECKER_HAS_TYPE_KERNEL
+            and _native_checker_active
+            and _rust_should_report_unreachable_issues is not None
+        ):
+            try:
+                result = _rust_should_report_unreachable_issues(self)
+                if result is not None:
+                    return result
+            except (AssertionError, NotImplementedError, ValueError, TypeError):
+                pass
         return (
             self.in_checked_function()
             and self.options.warn_unreachable
@@ -5926,6 +5948,19 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
         self.no_partial_types = False
 
     def flatten_lvalues(self, lvalues: list[Expression]) -> list[Expression]:
+        # Native seam (H1d, #1672): pure recursive read over the live
+        # lvalue expressions. None defers to the pure-Python body below.
+        if (
+            _CHECKER_HAS_TYPE_KERNEL
+            and _native_checker_active
+            and _rust_flatten_lvalues is not None
+        ):
+            try:
+                result = _rust_flatten_lvalues(lvalues)
+                if result is not None:
+                    return result
+            except (AssertionError, NotImplementedError, ValueError, TypeError):
+                pass
         res: list[Expression] = []
         for lv in lvalues:
             if isinstance(lv, (TupleExpr, ListExpr)):
@@ -6724,6 +6759,19 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
         return rvalue_type, lvalue_type
 
     def refers_to_different_scope(self, name: NameExpr) -> bool:
+        # Native seam (H1d, #1672): pure read over the live NameExpr, the
+        # live Scope and the enclosing MypyFile. None defers below.
+        if (
+            _CHECKER_HAS_TYPE_KERNEL
+            and _native_checker_active
+            and _rust_refers_to_different_scope is not None
+        ):
+            try:
+                result = _rust_refers_to_different_scope(name, self.scope, self.tree)
+                if result is not None:
+                    return result
+            except (AssertionError, NotImplementedError, ValueError, TypeError):
+                pass
         if name.kind == LDEF:
             # TODO: Consider reference to outer function as a different scope?
             return False
@@ -9714,6 +9762,21 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
 
         If yes, return the corresponding int value, otherwise return None.
         """
+        # Native seam (H1d, #1672): live _type_maps scan plus the literal
+        # classification. The payload is (flag, value): flag 1 = literal
+        # int, flag 0 = not a literal int. None defers to the body below.
+        if (
+            _CHECKER_HAS_TYPE_KERNEL
+            and _native_checker_active
+            and _rust_literal_int_expr is not None
+        ):
+            try:
+                classified = _rust_literal_int_expr(self._type_maps, expr)
+            except (AssertionError, NotImplementedError, ValueError, TypeError):
+                classified = None
+            if classified is not None:
+                is_literal_int, value = classified
+                return value if is_literal_int else None
         if not self.has_type(expr):
             return None
         expr_type = self.lookup_type(expr)

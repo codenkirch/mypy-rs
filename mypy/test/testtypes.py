@@ -64837,3 +64837,624 @@ class NativeScalarCheckmemberSeamsRetiredSuite(Suite):
         plain = self._plain_instance()
         assert analyze_descriptor_access(plain, mx) is plain
         assert analyze_descriptor_access(plain, self._make_mx(is_lvalue=True)) is plain
+
+
+# H1d cluster (#1672): live-object decision heads on the checker gate.
+# Each suite pins the seam payload directly, then drives the real method
+# gate-off vs gate-on. None of the four seams serializes anything.
+
+class _H1dBinderStub:
+    """`ConditionalTypeBinder` stand-in: only the suppression query is read."""
+
+    def __init__(self, suppressed: bool) -> None:
+        self._suppressed = suppressed
+
+    def is_unreachable_warning_suppressed(self) -> bool:
+        return self._suppressed
+
+
+class _H1dCheckerStub:
+    """Attribute bag standing in for `TypeChecker` in direct seam calls."""
+
+    def __init__(
+        self,
+        options: Options,
+        dynamic_funcs: list[bool],
+        current_node_deferred: bool,
+        binder: _H1dBinderStub,
+    ) -> None:
+        self.options = options
+        self.dynamic_funcs = dynamic_funcs
+        self.current_node_deferred = current_node_deferred
+        self.binder = binder
+
+
+class _H1dScopeCheckerStub:
+    """`TypeChecker` stand-in carrying only `scope` and `tree`."""
+
+    def __init__(self, scope: Any, tree: Any) -> None:
+        self.scope = scope
+        self.tree = tree
+
+
+def _h1d_module(fullname: str) -> MypyFile:
+    """A bare `MypyFile` with `fullname` assigned (the bare ctor omits it)."""
+    module = MypyFile([], [])
+    module._fullname = fullname
+    return module
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeShouldReportUnreachableIssuesSuite(Suite):
+    """Parity for `rust_should_report_unreachable_issues` (H1d, #1672).
+
+    `TypeChecker.should_report_unreachable_issues` (checker.py:4702) is a
+    conjunction over `in_checked_function` (checker.py:10235) plus
+    `options.warn_unreachable`, `current_node_deferred`, and the binder's
+    suppression flag. The Rust port reads the live checker and
+    short-circuits in the same order, so `None` (defer) is reachable only
+    through an unreadable attribute.
+    """
+
+    def setUp(self) -> None:
+        self._set_active(True)
+
+    def tearDown(self) -> None:
+        self._set_active(False)
+
+    def _set_active(self, active: bool) -> None:
+        from mypy.checker import _set_native_checker_active
+
+        _set_native_checker_active(active)
+
+    def _with_gate(self, active: bool, fn: Callable[[], bool]) -> bool:
+        self._set_active(active)
+        try:
+            return fn()
+        finally:
+            self._set_active(True)
+
+    def _stub(
+        self,
+        *,
+        check_untyped_defs: bool = False,
+        dynamic_funcs: list[bool] | None = None,
+        warn_unreachable: bool = True,
+        deferred: bool = False,
+        suppressed: bool = False,
+    ) -> _H1dCheckerStub:
+        options = Options()
+        options.check_untyped_defs = check_untyped_defs
+        options.warn_unreachable = warn_unreachable
+        return _H1dCheckerStub(
+            options,
+            [] if dynamic_funcs is None else dynamic_funcs,
+            deferred,
+            _H1dBinderStub(suppressed),
+        )
+
+    def _seam(self, chk: Any) -> bool | None:
+        return _type_kernel.rust_should_report_unreachable_issues(chk)
+
+    def _run(self, chk: Any) -> tuple[bool, bool]:
+        from mypy.checker import TypeChecker
+
+        def check_one() -> bool:
+            real = TypeChecker.__new__(TypeChecker)
+            real.options = chk.options
+            real.dynamic_funcs = chk.dynamic_funcs
+            real.current_node_deferred = chk.current_node_deferred
+            real.binder = chk.binder
+            return real.should_report_unreachable_issues()
+
+        return self._with_gate(False, check_one), self._with_gate(True, check_one)
+
+    def _assert_par(self, chk: Any) -> None:
+        off, on = self._run(chk)
+        assert_equal(on, off, "should_report_unreachable_issues parity")
+
+    # --- Direct seam calls ---
+
+    def test_seam_check_untyped_defs_but_warn_off(self) -> None:
+        """check_untyped_defs makes in_checked_function True; warn off -> False."""
+        chk = self._stub(check_untyped_defs=True, dynamic_funcs=[True], warn_unreachable=False)
+        assert self._seam(chk) is False
+
+    def test_seam_empty_dynamic_funcs(self) -> None:
+        """`not []` is True, so an empty stack is in a checked function."""
+        assert self._seam(self._stub(dynamic_funcs=[])) is True
+
+    def test_seam_last_dynamic_func_false(self) -> None:
+        """`not dynamic_funcs[-1]` is True for a False top of stack."""
+        assert self._seam(self._stub(dynamic_funcs=[True, False])) is True
+
+    def test_seam_last_dynamic_func_true(self) -> None:
+        """`not dynamic_funcs[-1]` is False for a True top of stack."""
+        assert self._seam(self._stub(dynamic_funcs=[True])) is False
+
+    def test_seam_node_deferred(self) -> None:
+        """`current_node_deferred` short-circuits to False."""
+        assert self._seam(self._stub(deferred=True)) is False
+
+    def test_seam_warnings_suppressed(self) -> None:
+        """A suppressing binder frame short-circuits to False."""
+        assert self._seam(self._stub(suppressed=True)) is False
+
+    def test_seam_unreadable_checker_defers(self) -> None:
+        """An object without `options` defers rather than raising."""
+        assert self._seam(object()) is None
+
+    # --- Gate-off vs gate-on parity ---
+
+    def test_parity_warn_off(self) -> None:
+        self._assert_par(self._stub(check_untyped_defs=True, warn_unreachable=False))
+
+    def test_parity_empty_dynamic_funcs(self) -> None:
+        self._assert_par(self._stub(dynamic_funcs=[]))
+
+    def test_parity_last_dynamic_func_false(self) -> None:
+        self._assert_par(self._stub(dynamic_funcs=[True, False]))
+
+    def test_parity_last_dynamic_func_true(self) -> None:
+        self._assert_par(self._stub(dynamic_funcs=[True]))
+
+    def test_parity_node_deferred(self) -> None:
+        self._assert_par(self._stub(deferred=True))
+
+    def test_parity_warnings_suppressed(self) -> None:
+        self._assert_par(self._stub(suppressed=True))
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeRefersToDifferentScopeSuite(Suite):
+    """Parity for `rust_refers_to_different_scope` (H1d, #1672).
+
+    `TypeChecker.refers_to_different_scope` (checker.py:6762) is a pure
+    bool over the live `NameExpr.kind`, the live `Scope`, and the enclosing
+    `MypyFile.fullname`. `RefExpr.kind` values are LDEF=0, GDEF=1, MDEF=2
+    (mypy/nodes.py:215-217).
+    """
+
+    def setUp(self) -> None:
+        self._set_active(True)
+
+    def tearDown(self) -> None:
+        self._set_active(False)
+
+    def _set_active(self, active: bool) -> None:
+        from mypy.checker import _set_native_checker_active
+
+        _set_native_checker_active(active)
+
+    def _with_gate(self, active: bool, fn: Callable[[], bool]) -> bool:
+        self._set_active(active)
+        try:
+            return fn()
+        finally:
+            self._set_active(True)
+
+    def _name(
+        self, kind: int | None, fullname: str = "x", *, readable: bool = True
+    ) -> Any:
+        if not readable:
+            return object()
+        name = NameExpr("x")
+        name.kind = kind
+        name._fullname = fullname
+        return name
+
+    def _checker(self, module_name: str, *, in_function: bool) -> _H1dScopeCheckerStub:
+        from mypy.checker_shared import CheckerScope
+
+        scope = CheckerScope(_h1d_module(module_name))
+        if in_function:
+            scope.stack.append(FuncDef("f", [], Block([])))
+        return _H1dScopeCheckerStub(scope, _h1d_module(module_name))
+
+    def _seam(self, name: Any, chk: _H1dScopeCheckerStub) -> bool | None:
+        return _type_kernel.rust_refers_to_different_scope(name, chk.scope, chk.tree)
+
+    def _run(self, name: Any, chk: _H1dScopeCheckerStub) -> tuple[bool, bool]:
+        from mypy.checker import TypeChecker
+
+        def check_one() -> bool:
+            real = TypeChecker.__new__(TypeChecker)
+            real.scope = chk.scope
+            real.tree = chk.tree
+            return real.refers_to_different_scope(name)
+
+        return self._with_gate(False, check_one), self._with_gate(True, check_one)
+
+    def _assert_par(self, name: Any, chk: _H1dScopeCheckerStub) -> None:
+        off, on = self._run(name, chk)
+        assert_equal(on, off, "refers_to_different_scope parity")
+
+    # --- Direct seam calls ---
+
+    def test_seam_ldef_is_local(self) -> None:
+        """LDEF is never a different scope, even inside a function."""
+        chk = self._checker("m", in_function=True)
+        assert self._seam(self._name(0), chk) is False
+
+    def test_seam_unbound_kind_in_function(self) -> None:
+        """`kind is None` inside a function is a different scope."""
+        chk = self._checker("m", in_function=True)
+        assert self._seam(self._name(None), chk) is True
+
+    def test_seam_mdef_in_function(self) -> None:
+        """MDEF inside a function is a different scope."""
+        chk = self._checker("m", in_function=True)
+        assert self._seam(self._name(2), chk) is True
+
+    def test_seam_unbound_kind_outside_function(self) -> None:
+        """`kind is None` at module scope is not a different scope."""
+        chk = self._checker("m", in_function=False)
+        assert self._seam(self._name(None), chk) is False
+
+    def test_seam_gdef_other_module(self) -> None:
+        """GDEF whose parent module differs from the tree is foreign."""
+        chk = self._checker("m", in_function=True)
+        assert self._seam(self._name(1, "other.mod.x"), chk) is True
+
+    def test_seam_gdef_same_module(self) -> None:
+        """GDEF whose parent module is the tree is local."""
+        chk = self._checker("m", in_function=True)
+        assert self._seam(self._name(1, "m.x"), chk) is False
+
+    def test_seam_gdef_no_dot_matches_empty_tree(self) -> None:
+        """`rpartition(".")[0]` is "" for a dot-free fullname."""
+        chk = self._checker("", in_function=False)
+        assert self._seam(self._name(1, "x"), chk) is False
+
+    def test_seam_gdef_outside_function(self) -> None:
+        """A module-scope GDEF reads its own module as the scope."""
+        chk = self._checker("m", in_function=False)
+        assert self._seam(self._name(1, "m.x"), chk) is False
+
+    def test_seam_unreadable_name_defers(self) -> None:
+        """A name without `kind` defers rather than raising."""
+        chk = self._checker("m", in_function=True)
+        assert self._seam(self._name(0, readable=False), chk) is None
+
+    # --- Gate-off vs gate-on parity ---
+
+    def test_parity_ldef_is_local(self) -> None:
+        self._assert_par(self._name(0), self._checker("m", in_function=True))
+
+    def test_parity_unbound_kind_in_function(self) -> None:
+        self._assert_par(self._name(None), self._checker("m", in_function=True))
+
+    def test_parity_mdef_in_function(self) -> None:
+        self._assert_par(self._name(2), self._checker("m", in_function=True))
+
+    def test_parity_gdef_other_module(self) -> None:
+        self._assert_par(self._name(1, "other.mod.x"), self._checker("m", in_function=True))
+
+    def test_parity_gdef_same_module(self) -> None:
+        self._assert_par(self._name(1, "m.x"), self._checker("m", in_function=True))
+
+    def test_parity_gdef_outside_function(self) -> None:
+        self._assert_par(self._name(1, "m.x"), self._checker("m", in_function=False))
+
+    def test_parity_unbound_kind_outside_function(self) -> None:
+        self._assert_par(self._name(None), self._checker("m", in_function=False))
+
+
+def _h1d_names(expressions: Sequence[Expression]) -> list[str]:
+    """Stable identity fingerprint for a list of expression nodes."""
+    return [f"{type(e).__name__}:{id(e)}" for e in expressions]
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeFlattenLvaluesSuite(Suite):
+    """Parity for `rust_flatten_lvalues` (H1d, #1672).
+
+    `TypeChecker.flatten_lvalues` (checker.py:5947) is a pure recursive read
+    over the live lvalue expressions. The Python body is not `elif`-chained:
+    a `TupleExpr` / `ListExpr` contributes its flattened `items` *and*
+    itself, and a `StarExpr` is appended unwrapped.
+    """
+
+    def setUp(self) -> None:
+        self._set_active(True)
+
+    def tearDown(self) -> None:
+        self._set_active(False)
+
+    def _set_active(self, active: bool) -> None:
+        from mypy.checker import _set_native_checker_active
+
+        _set_native_checker_active(active)
+
+    def _with_gate(self, active: bool, fn: Callable[[], list[Expression]]) -> list[Expression]:
+        self._set_active(active)
+        try:
+            return fn()
+        finally:
+            self._set_active(True)
+
+    def _seam(self, lvalues: Any) -> list[Expression] | None:
+        return _type_kernel.rust_flatten_lvalues(lvalues)
+
+    def _run(self, lvalues: list[Expression]) -> tuple[list[str], list[str]]:
+        from mypy.checker import TypeChecker
+
+        def check_one() -> list[Expression]:
+            real = TypeChecker.__new__(TypeChecker)
+            return real.flatten_lvalues(lvalues)
+
+        off = self._with_gate(False, check_one)
+        on = self._with_gate(True, check_one)
+        return _h1d_names(off), _h1d_names(on)
+
+    def _assert_par(self, lvalues: list[Expression]) -> None:
+        off, on = self._run(lvalues)
+        assert_equal(on, off, "flatten_lvalues parity")
+        seam = self._seam(lvalues)
+        assert seam is not None
+        assert_equal(_h1d_names(seam), off, "flatten_lvalues seam parity")
+
+    # --- Direct seam calls ---
+
+    def test_seam_empty(self) -> None:
+        assert self._seam([]) == []
+
+    def test_seam_flat_names_preserve_identity(self) -> None:
+        a, b = NameExpr("a"), NameExpr("b")
+        assert self._seam([a, b]) == [a, b]
+
+    def test_seam_tuple_keeps_itself_and_unwraps_items(self) -> None:
+        a, b = NameExpr("a"), NameExpr("b")
+        tup = TupleExpr([a, b])
+        assert self._seam([tup]) == [a, b, tup]
+
+    def test_seam_list_expr_keeps_itself(self) -> None:
+        a = NameExpr("a")
+        lst = ListExpr([a])
+        assert self._seam([lst]) == [a, lst]
+
+    def test_seam_nested_tuple_order(self) -> None:
+        a, b, c = NameExpr("a"), NameExpr("b"), NameExpr("c")
+        inner = TupleExpr([a, b])
+        outer = TupleExpr([inner, c])
+        assert self._seam([outer]) == [a, b, inner, c, outer]
+
+    def test_seam_star_expr_is_unwrapped(self) -> None:
+        a = NameExpr("a")
+        star = StarExpr(a)
+        assert self._seam([star]) == [a]
+
+    def test_seam_star_expr_inside_tuple(self) -> None:
+        a, b = NameExpr("a"), NameExpr("b")
+        star = StarExpr(a)
+        tup = TupleExpr([star, b])
+        assert self._seam([tup]) == [a, b, tup]
+
+    def test_seam_unreadable_input_defers(self) -> None:
+        """A non-sequence input defers rather than raising."""
+        assert self._seam(42) is None
+
+    # --- Gate-off vs gate-on parity ---
+
+    def test_parity_empty(self) -> None:
+        self._assert_par([])
+
+    def test_parity_flat_names(self) -> None:
+        self._assert_par([NameExpr("a"), NameExpr("b")])
+
+    def test_parity_tuple(self) -> None:
+        self._assert_par([TupleExpr([NameExpr("a"), NameExpr("b")])])
+
+    def test_parity_list_expr(self) -> None:
+        self._assert_par([ListExpr([NameExpr("a")])])
+
+    def test_parity_nested_tuple(self) -> None:
+        inner = TupleExpr([NameExpr("a"), NameExpr("b")])
+        self._assert_par([TupleExpr([inner, NameExpr("c")])])
+
+    def test_parity_star_expr(self) -> None:
+        self._assert_par([StarExpr(NameExpr("a"))])
+
+    def test_parity_star_expr_inside_tuple(self) -> None:
+        tup = TupleExpr([StarExpr(NameExpr("a")), NameExpr("b")])
+        self._assert_par([tup])
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeLiteralIntExprSuite(Suite):
+    """Parity for `rust_literal_int_expr` (H1d, #1672).
+
+    `TypeChecker.literal_int_expr` (checker.py:9772) scans the live
+    `_type_maps` stack (`has_type` + `lookup_type`, innermost map first),
+    coerces to a literal, and returns the value only when the proper type is
+    a `LiteralType` whose `value` passes `isinstance(v, int)` (which accepts
+    `bool`). The seam returns `(flag, value)`; flag 1 means literal int.
+    """
+
+    def setUp(self) -> None:
+        self.fx = TypeFixture()
+        self._set_active(True)
+
+    def tearDown(self) -> None:
+        self._set_active(False)
+
+    def _set_active(self, active: bool) -> None:
+        from mypy.checker import _set_native_checker_active
+
+        _set_native_checker_active(active)
+
+    def _with_gate(self, active: bool, fn: Callable[[], int | None]) -> int | None:
+        self._set_active(active)
+        try:
+            return fn()
+        finally:
+            self._set_active(True)
+
+    def _literal(self, value: Any) -> LiteralType:
+        return LiteralType(value, self.fx.a)
+
+    def _seam(self, type_maps: Any, expr: Any) -> tuple[int, Any] | None:
+        return _type_kernel.rust_literal_int_expr(type_maps, expr)
+
+    def _run(self, type_maps: Any, expr: Any) -> tuple[int | None, int | None]:
+        from mypy.checker import TypeChecker
+
+        def check_one() -> int | None:
+            real = TypeChecker.__new__(TypeChecker)
+            real._type_maps = type_maps
+            return real.literal_int_expr(expr)
+
+        return self._with_gate(False, check_one), self._with_gate(True, check_one)
+
+    def _assert_par(self, type_maps: Any, expr: Any) -> None:
+        off, on = self._run(type_maps, expr)
+        assert_equal(on, off, "literal_int_expr parity")
+        seam = self._seam(type_maps, expr)
+        assert seam is not None
+        flag, value = seam
+        assert_equal(value if flag else None, off, "literal_int_expr seam parity")
+
+    # --- Direct seam calls ---
+
+    def test_seam_no_type_maps(self) -> None:
+        assert self._seam([], NameExpr("x")) == (0, None)
+
+    def test_seam_absent_expression(self) -> None:
+        expr = NameExpr("x")
+        assert self._seam([{}], expr) == (0, None)
+
+    def test_seam_literal_int(self) -> None:
+        expr = NameExpr("x")
+        assert self._seam([{expr: self._literal(3)}], expr) == (1, 3)
+
+    def test_seam_literal_bool_counts_as_int(self) -> None:
+        """`isinstance(True, int)` is True, so a bool literal is a literal int."""
+        expr = NameExpr("x")
+        flag, value = self._seam([{expr: self._literal(True)}], expr) or (0, None)
+        assert flag == 1
+        assert value is True
+
+    def test_seam_literal_str_is_not_int(self) -> None:
+        expr = NameExpr("x")
+        assert self._seam([{expr: self._literal("s")}], expr) == (0, None)
+
+    def test_seam_last_known_value_instance(self) -> None:
+        """`coerce_to_literal` turns a last-known-value Instance into a literal."""
+        expr = NameExpr("x")
+        inst = Instance(self.fx.a.type, [], last_known_value=self._literal(5))
+        assert self._seam([{expr: inst}], expr) == (1, 5)
+
+    def test_seam_plain_instance(self) -> None:
+        expr = NameExpr("x")
+        assert self._seam([{expr: self.fx.a}], expr) == (0, None)
+
+    def test_seam_any_type(self) -> None:
+        expr = NameExpr("x")
+        assert self._seam([{expr: self.fx.anyt}], expr) == (0, None)
+
+    def test_seam_union_defers(self) -> None:
+        """A union is not read live; the seam defers to the Python body."""
+        expr = NameExpr("x")
+        union = UnionType.make_union([self._literal(3), self.fx.anyt])
+        assert self._seam([{expr: union}], expr) is None
+
+    def test_seam_single_item_union_defers(self) -> None:
+        """A one-item union can collapse to a literal, so it must defer."""
+        expr = NameExpr("x")
+        assert self._seam([{expr: UnionType([self._literal(3)])}], expr) is None
+
+    def _alias_type(self) -> TypeAliasType:
+        """`TypeAliasType` wrapping an int literal, for the deferral test."""
+        alias = TypeAlias(self._literal(3), "mod.A", "mod", 1, 1)
+        return TypeAliasType(alias, [])
+
+    def test_seam_type_alias_defers(self) -> None:
+        """`get_proper_type` is not identity for an alias, so the seam defers."""
+        expr = NameExpr("x")
+        assert self._seam([{expr: self._alias_type()}], expr) is None
+
+    def test_parity_type_alias_defers(self) -> None:
+        """The alias still resolves to the int through the Python body."""
+        expr = NameExpr("x")
+        self._assert_par_deferring([{expr: self._alias_type()}], expr)
+        assert self._run([{expr: self._alias_type()}], expr) == (3, 3)
+
+    def test_seam_enum_like_instance_is_not_an_int_literal(self) -> None:
+        """An Instance without last-known-value never yields an int literal."""
+        expr = NameExpr("x")
+        assert self._seam([{expr: self.fx.a}], expr) == (0, None)
+
+    def test_seam_innermost_map_wins(self) -> None:
+        """`lookup_type` scans reversed, so the last map shadows outer ones."""
+        expr = NameExpr("x")
+        maps = [{expr: self._literal(3)}, {expr: self.fx.anyt}]
+        assert self._seam(maps, expr) == (0, None)
+
+    def test_seam_older_map_used_when_inner_misses(self) -> None:
+        expr = NameExpr("x")
+        maps = [{expr: self._literal(7)}, {}]
+        assert self._seam(maps, expr) == (1, 7)
+
+    def test_seam_identity_keyed(self) -> None:
+        """Two distinct `NameExpr("x")` nodes are different keys."""
+        stored, queried = NameExpr("x"), NameExpr("x")
+        assert self._seam([{stored: self._literal(9)}], queried) == (0, None)
+
+    def test_seam_big_int_is_exact(self) -> None:
+        expr = NameExpr("x")
+        big = 10**30
+        assert self._seam([{expr: self._literal(big)}], expr) == (1, big)
+
+    def test_seam_unreadable_maps_defers(self) -> None:
+        assert self._seam(42, NameExpr("x")) is None
+
+    # --- Gate-off vs gate-on parity ---
+
+    def test_parity_absent_expression(self) -> None:
+        self._assert_par([{}], NameExpr("x"))
+
+    def test_parity_literal_int(self) -> None:
+        expr = NameExpr("x")
+        self._assert_par([{expr: self._literal(3)}], expr)
+
+    def test_parity_literal_bool(self) -> None:
+        expr = NameExpr("x")
+        self._assert_par([{expr: self._literal(True)}], expr)
+
+    def test_parity_literal_str(self) -> None:
+        expr = NameExpr("x")
+        self._assert_par([{expr: self._literal("s")}], expr)
+
+    def test_parity_last_known_value_instance(self) -> None:
+        expr = NameExpr("x")
+        inst = Instance(self.fx.a.type, [], last_known_value=self._literal(5))
+        self._assert_par([{expr: inst}], expr)
+
+    def test_parity_plain_instance(self) -> None:
+        expr = NameExpr("x")
+        self._assert_par([{expr: self.fx.a}], expr)
+
+    def test_parity_innermost_map_wins(self) -> None:
+        expr = NameExpr("x")
+        self._assert_par([{expr: self._literal(3)}, {expr: self.fx.anyt}], expr)
+
+    def test_parity_older_map_used_when_inner_misses(self) -> None:
+        expr = NameExpr("x")
+        self._assert_par([{expr: self._literal(7)}, {}], expr)
+
+    def _assert_par_deferring(self, type_maps: Any, expr: Any) -> None:
+        """Differential for a head the seam deliberately defers on."""
+        off, on = self._run(type_maps, expr)
+        assert_equal(on, off, "literal_int_expr deferring parity")
+        assert self._seam(type_maps, expr) is None
+
+    def test_parity_union_defers(self) -> None:
+        expr = NameExpr("x")
+        union = UnionType.make_union([self._literal(3), self.fx.anyt])
+        self._assert_par_deferring([{expr: union}], expr)
+
+    def test_parity_single_item_union_defers(self) -> None:
+        """The collapsing one-item union still resolves to the int literal."""
+        expr = NameExpr("x")
+        self._assert_par_deferring([{expr: UnionType([self._literal(3)])}], expr)
+        assert self._run([{expr: UnionType([self._literal(3)])}], expr) == (3, 3)

@@ -21,7 +21,7 @@
 
 use pyo3::exceptions::PyAttributeError;
 use pyo3::prelude::*;
-use pyo3::types::{PyAny, PyDict, PyList, PyType};
+use pyo3::types::{PyAny, PyDict, PyInt, PyList, PyType};
 use std::collections::HashSet;
 
 use crate::checker_visitor::{rust_is_false_literal, rust_is_literal_not_implemented};
@@ -3965,10 +3965,9 @@ pub(crate) fn rust_classify_check_final(
             Err(_) => return Ok(None),
         };
         if let Some(active) = cls {
-            // These additional checks exist to give more error messages
-            // even if the final attribute was overridden with a new symbol
-            // (which is itself an error); overriding a final method is
-            // caught in `check_compatibility_final_super()` instead.
+            // Extra messages even when the final attribute was overridden
+            // with a new symbol (itself an error); overriding a final method
+            // is caught in `check_compatibility_final_super()` instead.
             let mro = match active.getattr("mro") {
                 Ok(m) => m,
                 Err(_) => return Ok(None),
@@ -4901,9 +4900,8 @@ fn classify_simple_assignment(
         return Some(SIMPLE_ASSIGNMENT_DIRECT);
     }
     // Python evaluates is_typeddict_type_context(lvalue_type) only when
-    // try_fallback holds and the lvalue type is present; an alias target
-    // the resolver cannot expand defers the whole classification. The
-    // empty resolver preserves the pre-#1309 alias-deferral contract.
+    // try_fallback holds and the lvalue type is present; an alias target the
+    // resolver cannot expand defers the classification (pre-#1309 contract).
     let aliases = crate::aliases::TypeAliasResolver::new();
     if !crate::checkexpr_functions::is_typeddict_type_context_inner(lvalue.unwrap(), &aliases)? {
         if has_inferred && !inferred_is_argument {
@@ -7103,4 +7101,298 @@ pub(crate) fn rust_classify_match_subject_head(
     }
 
     Ok(Some(2))
+}
+
+// H1d cluster (issue #1672): live-object decision heads on the checker
+// gate. Each seam reads live PyO3 objects and returns `Option<T>`; `None`
+// defers to the unchanged pure-Python body. Zero wire bytes.
+
+/// `RefExpr.kind` values (`mypy/nodes.py:215-216`).
+const H1D_LDEF: i64 = 0;
+const H1D_GDEF: i64 = 1;
+
+/// Defer-on-unreadable attribute read shared by the H1d heads.
+fn h1d_attr<'py>(obj: &'py PyAny, name: &str) -> PyResult<Option<&'py PyAny>> {
+    match obj.getattr(name) {
+        Ok(v) => Ok(Some(v)),
+        Err(_) => Ok(None),
+    }
+}
+
+/// `TypeChecker.should_report_unreachable_issues` (`mypy/checker.py:4694`)
+/// with `TypeChecker.in_checked_function` (`mypy/checker.py:10235`)
+/// inlined. Pure bool over live checker state: no wire bytes, no error
+/// emission, no mutation.
+///
+/// Rust short-circuits in the same order as the Python `and` chain, so
+/// `None` (defer) is produced only by an unreadable attribute.
+#[pyfunction]
+pub(crate) fn rust_should_report_unreachable_issues(chk: &PyAny) -> PyResult<Option<bool>> {
+    let Some(options) = h1d_attr(chk, "options")? else {
+        return Ok(None);
+    };
+    let check_untyped_defs = match read_bool_attr(options, "check_untyped_defs")? {
+        Some(v) => v,
+        None => return Ok(None),
+    };
+    // in_checked_function(): `check_untyped_defs or not dynamic_funcs or
+    // not dynamic_funcs[-1]`.
+    let mut in_checked_function = check_untyped_defs;
+    if !in_checked_function {
+        let Some(dynamic_funcs) = h1d_attr(chk, "dynamic_funcs")? else {
+            return Ok(None);
+        };
+        let len = match dynamic_funcs.len() {
+            Ok(n) => n,
+            Err(_) => return Ok(None),
+        };
+        let flag = if len == 0 {
+            // `not []` is True.
+            true
+        } else {
+            match dynamic_funcs.get_item(len - 1) {
+                Ok(last) => match last.is_true() {
+                    Ok(t) => !t,
+                    Err(_) => return Ok(None),
+                },
+                Err(_) => return Ok(None),
+            }
+        };
+        in_checked_function = flag;
+    }
+    if !in_checked_function {
+        return Ok(Some(false));
+    }
+    let warn_unreachable = match read_bool_attr(options, "warn_unreachable")? {
+        Some(v) => v,
+        None => return Ok(None),
+    };
+    if !warn_unreachable {
+        return Ok(Some(false));
+    }
+    let deferred = match read_bool_attr(chk, "current_node_deferred")? {
+        Some(v) => v,
+        None => return Ok(None),
+    };
+    if deferred {
+        return Ok(Some(false));
+    }
+    let Some(binder) = h1d_attr(chk, "binder")? else {
+        return Ok(None);
+    };
+    // `ConditionalTypeBinder.is_unreachable_warning_suppressed` is itself a
+    // native seam (H1b); the call stays live, it carries no wire bytes.
+    let suppressed = match binder.call_method0("is_unreachable_warning_suppressed") {
+        Ok(v) => v,
+        Err(_) => return Ok(None),
+    };
+    match suppressed.is_true() {
+        Ok(s) => Ok(Some(!s)),
+        Err(_) => Ok(None),
+    }
+}
+
+/// `TypeChecker.refers_to_different_scope` (`mypy/checker.py:6726`): a pure
+/// bool predicate over the live `NameExpr`, the live `Scope`, and the
+/// enclosing `MypyFile`. Zero wire bytes, no emission, no mutation.
+#[pyfunction]
+pub(crate) fn rust_refers_to_different_scope(
+    name: &PyAny,
+    scope: &PyAny,
+    tree: &PyAny,
+) -> PyResult<Option<bool>> {
+    let Some(kind_obj) = h1d_attr(name, "kind")? else {
+        return Ok(None);
+    };
+    let kind: Option<i64> = if kind_obj.is_none() {
+        None
+    } else {
+        match kind_obj.extract::<i64>() {
+            Ok(v) => Some(v),
+            Err(_) => return Ok(None),
+        }
+    };
+    if kind == Some(H1D_LDEF) {
+        return Ok(Some(false));
+    }
+    let top_level_function = match scope.getattr("top_level_function") {
+        Ok(f) => match f.call0() {
+            Ok(v) => v,
+            Err(_) => return Ok(None),
+        },
+        Err(_) => return Ok(None),
+    };
+    if !top_level_function.is_none() && kind != Some(H1D_GDEF) {
+        return Ok(Some(true));
+    }
+    if kind == Some(H1D_GDEF) {
+        let fullname: String = match name.getattr("fullname").and_then(|v| v.extract()) {
+            Ok(v) => v,
+            Err(_) => return Ok(None),
+        };
+        let tree_fullname: String = match tree.getattr("fullname").and_then(|v| v.extract()) {
+            Ok(v) => v,
+            Err(_) => return Ok(None),
+        };
+        // `name.fullname.rpartition(".")[0]`
+        let head = match fullname.rfind('.') {
+            Some(i) => &fullname[..i],
+            None => "",
+        };
+        if head != tree_fullname {
+            return Ok(Some(true));
+        }
+    }
+    Ok(Some(false))
+}
+
+/// `TypeChecker.flatten_lvalues` (`mypy/checker.py:5928`): a pure read over
+/// the live lvalue sequence. Rust recurses through `TupleExpr` / `ListExpr`
+/// and unwraps `StarExpr`, building the same list the Python body builds.
+/// Zero wire bytes, no emission, no mutation.
+///
+/// Note the Python body is not `elif`-chained: a `TupleExpr` / `ListExpr`
+/// contributes both its flattened `items` *and* itself.
+#[pyfunction]
+pub(crate) fn rust_flatten_lvalues(
+    py: Python<'_>,
+    lvalues: &PyAny,
+) -> PyResult<Option<Vec<Py<PyAny>>>> {
+    let tuple_cls = nodes_class(py, "TupleExpr")?;
+    let list_cls = nodes_class(py, "ListExpr")?;
+    let star_cls = nodes_class(py, "StarExpr")?;
+    let mut res: Vec<Py<PyAny>> = Vec::new();
+    match flatten_lvalues_inner(lvalues, tuple_cls, list_cls, star_cls, &mut res) {
+        Ok(()) => Ok(Some(res)),
+        Err(_) => Ok(None),
+    }
+}
+
+fn flatten_lvalues_inner(
+    lvalues: &PyAny,
+    tuple_cls: &PyType,
+    list_cls: &PyType,
+    star_cls: &PyType,
+    res: &mut Vec<Py<PyAny>>,
+) -> PyResult<()> {
+    for lv in lvalues.iter()? {
+        let lv = lv?;
+        if lv.is_instance(tuple_cls)? || lv.is_instance(list_cls)? {
+            flatten_lvalues_inner(lv.getattr("items")?, tuple_cls, list_cls, star_cls, res)?;
+        }
+        // `StarExpr` is unwrapped and the *unwrapped* expression is
+        // appended; the `StarExpr` node itself is never added.
+        if lv.is_instance(star_cls)? {
+            res.push(lv.getattr("expr")?.into());
+        } else {
+            res.push(lv.into());
+        }
+    }
+    Ok(())
+}
+
+/// `TypeChecker.literal_int_expr` (`mypy/checker.py:9712`): a pure
+/// classification over the live `_type_maps` stack.
+///
+/// Rust mirrors `has_type` + `lookup_type` (innermost map first) and reads
+/// the live type attributes only: no Python call, no serialization. The
+/// Python body routes through `coerce_to_literal` and `get_proper_type`;
+/// both are resolved here by reading the live type instead.
+///
+/// `mypy.typeops.coerce_to_literal` has its own native seam that serializes
+/// the operand, so its arms are read live. Three cases defer (`None`):
+/// a `TypeAliasType` or `TypeGuardedType` (where `get_proper_type` is not
+/// the identity, `mypy/types.py:4210`), and a `UnionType` (a one-item union
+/// can collapse to a literal). An enum `Instance` without a
+/// last-known-value is "not a literal int" without reading `is_enum`: its
+/// only coercible form is `LiteralType(value=<member name>)`, a `str`.
+///
+/// `isinstance(value, int)` accepts `bool` in Python, so `PyBool` is
+/// deliberately not excluded. Returns `Some((1, value))` for a literal int,
+/// `Some((0, None))` for "not a literal int", `None` to defer.
+#[pyfunction]
+pub(crate) fn rust_literal_int_expr(
+    py: Python<'_>,
+    type_maps: &PyAny,
+    expr: &PyAny,
+) -> PyResult<Option<(i64, Py<PyAny>)>> {
+    let mut key_present = false;
+    let len = match type_maps.len() {
+        Ok(n) => n,
+        Err(_) => return Ok(None),
+    };
+    let mut found: Option<&PyAny> = None;
+    for i in (0..len).rev() {
+        let m = match type_maps.get_item(i) {
+            Ok(m) => m,
+            Err(_) => return Ok(None),
+        };
+        let dict = match m.downcast::<PyDict>() {
+            Ok(d) => d,
+            Err(_) => return Ok(None),
+        };
+        match dict.get_item(expr) {
+            Ok(Some(v)) => {
+                key_present = true;
+                if !v.is_none() {
+                    found = Some(v);
+                    break;
+                }
+            }
+            Ok(None) => {}
+            Err(_) => return Ok(None),
+        }
+    }
+    let Some(typ) = found else {
+        if key_present {
+            // A present key with no readable value is the `lookup_type`
+            // `KeyError` case; defer rather than mirror a crash.
+            return Ok(None);
+        }
+        // `not self.has_type(expr)`
+        return Ok(Some((0, py.None())));
+    };
+    let types_mod = py.import("mypy.types")?;
+    // `get_proper_type` is identity for anything that is not an alias or a
+    // guarded type (mypy/types.py:4210), so those two defer and the rest is
+    // read directly. No Python call is made from this seam.
+    let alias_cls: &PyType = types_mod.getattr("TypeAliasType")?.downcast()?;
+    let guarded_cls: &PyType = types_mod.getattr("TypeGuardedType")?.downcast()?;
+    if typ.is_instance(alias_cls)? || typ.is_instance(guarded_cls)? {
+        return Ok(None);
+    }
+    let literal_cls: &PyType = types_mod.getattr("LiteralType")?.downcast()?;
+    let union_cls: &PyType = types_mod.getattr("UnionType")?.downcast()?;
+    if typ.is_instance(union_cls)? {
+        return Ok(None);
+    }
+    let literal = if typ.is_instance(literal_cls)? {
+        typ
+    } else {
+        let instance_cls: &PyType = types_mod.getattr("Instance")?.downcast()?;
+        if !typ.is_instance(instance_cls)? {
+            return Ok(Some((0, py.None())));
+        }
+        let last_known = match typ.getattr("last_known_value") {
+            Ok(v) => v,
+            Err(_) => return Ok(None),
+        };
+        match last_known.is_true() {
+            // `if typ.last_known_value: return typ.last_known_value`
+            Ok(true) => last_known,
+            Ok(false) => return Ok(Some((0, py.None()))),
+            Err(_) => return Ok(None),
+        }
+    };
+    if !literal.is_instance(literal_cls)? {
+        return Ok(Some((0, py.None())));
+    }
+    let value = match literal.getattr("value") {
+        Ok(v) => v,
+        Err(_) => return Ok(None),
+    };
+    if !value.is_instance_of::<PyInt>() {
+        return Ok(Some((0, py.None())));
+    }
+    Ok(Some((1, value.into())))
 }
