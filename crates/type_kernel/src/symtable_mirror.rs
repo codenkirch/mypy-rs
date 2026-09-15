@@ -124,6 +124,9 @@ struct SymStore {
     generations: HashMap<u64, u64>,
     /// Node handle -> the (owner, name) pairs referencing it.
     by_node: HashMap<u64, Vec<(u64, String)>>,
+    /// Owner handle -> the names recorded for it, so serving one
+    /// namespace costs its own entries instead of a scan of the store.
+    by_owner: HashMap<u64, Vec<String>>,
     /// Strong pins: handles key on raw `id()`s, so each stored object
     /// stays alive until its entry is dropped or the store resets.
     pins: HashMap<u64, Py<PyAny>>,
@@ -144,6 +147,7 @@ impl SymStore {
             entries: HashMap::new(),
             generations: HashMap::new(),
             by_node: HashMap::new(),
+            by_owner: HashMap::new(),
             pins: HashMap::new(),
             meta: HashMap::new(),
             flip: FlipCounts::default(),
@@ -229,7 +233,14 @@ pub(crate) fn put(
             no_serialize: flags.no_serialize,
             cross_ref: flags.cross_ref,
         };
-        store.entries.insert(key, entry);
+        let is_new = store.entries.insert(key, entry).is_none();
+        if is_new {
+            store
+                .by_owner
+                .entry(owner_handle)
+                .or_default()
+                .push(name.to_string());
+        }
         let refs = store.by_node.entry(node_handle).or_default();
         if !refs.iter().any(|(o, n)| *o == owner_handle && n == name) {
             refs.push((owner_handle, name.to_string()));
@@ -250,11 +261,22 @@ pub(crate) fn delete(owner: &PyAny, name: &str) -> PyResult<bool> {
         let key = (owner_handle, name.to_string());
         if let Some(entry) = store.entries.remove(&key) {
             unlink_node(store, entry.node_handle, owner_handle, name);
+            unlink_owner(store, owner_handle, name);
             true
         } else {
             false
         }
     }))
+}
+
+/// Drop one name from the owner index (and the owner when it empties).
+fn unlink_owner(store: &mut SymStore, owner_handle: u64, name: &str) {
+    if let Some(names) = store.by_owner.get_mut(&owner_handle) {
+        names.retain(|n| n != name);
+        if names.is_empty() {
+            store.by_owner.remove(&owner_handle);
+        }
+    }
 }
 
 /// Refresh the flags of every record referencing `node`; returns whether
@@ -300,6 +322,7 @@ pub(crate) fn reset() -> usize {
         store.entries.clear();
         store.generations.clear();
         store.by_node.clear();
+        store.by_owner.clear();
         store.meta.clear();
         store.next_generation = 0;
         store.next_seq = 0;
@@ -364,11 +387,20 @@ pub(crate) fn entries_if_mirrored(
     };
     let triples: Vec<(u64, String, u64)> = with_store(|store| {
         let mut triples: Vec<(u64, String, u64)> = store
-            .entries
-            .iter()
-            .filter(|((owner, _), _)| *owner == handle)
-            .map(|((_, name), entry)| (entry.order, name.clone(), entry.node_handle))
-            .collect();
+            .by_owner
+            .get(&handle)
+            .map(|names| {
+                names
+                    .iter()
+                    .filter_map(|name| {
+                        store
+                            .entries
+                            .get(&(handle, name.clone()))
+                            .map(|entry| (entry.order, name.clone(), entry.node_handle))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
         triples.sort_by_key(|(order, _, _)| *order);
         triples
     });
@@ -1089,6 +1121,35 @@ mod symtable_mirror_tests {
             assert_eq!(counts.defer_no_handle, 1);
             assert_eq!(counts.defer_len_short, 1);
             assert_eq!(counts.defer_len_long, 1);
+        });
+    }
+
+    #[test]
+    fn test_owner_index_tracks_entries_exactly() {
+        with_py(|py| {
+            reset();
+            let table = live_table(py, &["a", "b"]);
+            let node = fresh_object(py);
+            let handle = identity::handle_for(table).unwrap();
+            for name in ["a", "b"] {
+                put(table, name, node, flags(1)).unwrap();
+            }
+            // A replace must not double-add the name to the index.
+            put(table, "a", fresh_object(py), flags(2)).unwrap();
+            let indexed = with_store(|store| store.by_owner.get(&handle).map(Vec::len));
+            assert_eq!(indexed, Some(2));
+            assert_eq!(entry_count_of(handle), 2);
+            delete(table, "b").unwrap();
+            let indexed = with_store(|store| store.by_owner.get(&handle).map(Vec::len));
+            assert_eq!(indexed, Some(1));
+            assert_eq!(entry_count_of(handle), 1);
+            delete(table, "a").unwrap();
+            // An emptied owner drops out of the index entirely.
+            assert_eq!(
+                with_store(|store| store.by_owner.get(&handle).map(Vec::len)),
+                None
+            );
+            assert_eq!(entry_count_of(handle), 0);
         });
     }
 
