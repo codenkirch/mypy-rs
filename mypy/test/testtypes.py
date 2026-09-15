@@ -65720,3 +65720,158 @@ class NativeSymtableReadFlipSuite(Suite):
     def test_read_flip_mode_validation(self) -> None:
         with self.assertRaises(ValueError):
             self._m.set_read_flip(3)
+
+
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeCheckCallableCallWireGateSuite(Suite):
+    """#1673: the check_callable_call tail seam crosses only on shapes it
+    can decide.
+
+    `_try_native_check_callable_call` serialized the whole callee plus
+    every argument type before asking Rust, then deferred on 177,524 of
+    177,899 cold-self-check calls (99.79%) for shapes the Rust tail cannot
+    calibrate (`check_callable_call_tail` needs a type-object call with
+    exactly one argument whose instance type is `builtins.type`). The new
+    live-object gate reuses the conjuncts the pure-Python calibration two
+    branches below already computes.
+
+    Two halves are pinned: a rejected shape crosses nothing, and the
+    ungated Rust seam would have deferred on that same shape anyway, so
+    the gate moves no decision.
+    """
+
+    def setUp(self) -> None:
+        from mypy.checkexpr import (
+            _set_native_checkcall_active,
+            _set_native_checkexpr_active,
+            _set_native_checkexpr_resolver,
+            _set_native_plugin_hook_registry,
+        )
+        from mypy.options import Options
+        from mypy.plugins.default import DefaultPlugin
+
+        self.fx = TypeFixture()
+        self._resolver = _type_kernel.build_native_resolver(_base_infos(self.fx), [])
+        self._registry = _type_kernel.PluginHookRegistry({})
+        self._plugin = DefaultPlugin(Options())
+        _set_native_checkexpr_active(True)
+        _set_native_checkcall_active(True)
+        _set_native_checkexpr_resolver(self._resolver)
+        _set_native_plugin_hook_registry(self._registry, False, [self._plugin])
+
+    def tearDown(self) -> None:
+        from mypy.checkexpr import (
+            _set_native_checkcall_active,
+            _set_native_checkexpr_active,
+            _set_native_checkexpr_resolver,
+            _set_native_plugin_hook_registry,
+        )
+
+        _set_native_checkexpr_active(False)
+        _set_native_checkcall_active(False)
+        _set_native_checkexpr_resolver(None)
+        _set_native_plugin_hook_registry(None, False)
+
+    def _spy_crossings(self) -> list[bytes]:
+        """Count real `rust_check_callable_call` crossings (delegating).
+
+        The name is a private alias inside `mypy.checkexpr` (not a
+        re-export), so it is read and written by string.
+        """
+        import mypy.checkexpr as _ce
+
+        seen: list[bytes] = []
+        orig = getattr(_ce, "_rust_check_callable_call")
+
+        def wrapper(*args: Any, **kwargs: Any) -> Any:
+            seen.append(args[1])
+            return orig(*args, **kwargs)
+
+        setattr(_ce, "_rust_check_callable_call", wrapper)
+        self.addCleanup(setattr, _ce, "_rust_check_callable_call", orig)
+        return seen
+
+    def _type_callable(self, *a: Type) -> CallableType:
+        """A callable with `builtins.type` as both fallback and return, so
+        `get_instance_type()` is `builtins.type` when the tail can fire."""
+        n = len(a) - 1
+        return CallableType(
+            list(a[:-1]), [ARG_POS] * n, [None] * n, a[-1], self.fx.type_type
+        )
+
+    def _rejected_shapes(self) -> list[tuple[str, CallableType, list[Type]]]:
+        """Shapes the gate must reject, each one declared un-calibratable."""
+        from mypy.nodes import TypeAlias as _TypeAlias
+        from mypy.types import TupleType, TypeAliasType
+
+        fx = self.fx
+        alias = TypeAliasType(_TypeAlias(fx.a, "mod.Alias", "mod", -1, -1), [])
+        two_args = self._type_callable(fx.a, fx.b, fx.type_type)
+        foreign_self = self._type_callable(fx.a, fx.type_type)
+        foreign_self.instance_type = fx.a
+        tuple_ret = CallableType(
+            [fx.a], [ARG_POS], [None], TupleType([fx.a], fx.std_tuple), fx.type_type
+        )
+        alias_ret = CallableType([fx.a], [ARG_POS], [None], alias, fx.type_type)
+        return [
+            ("non-type-object callee", fx.callable(fx.a, fx.b), [fx.a]),
+            ("two positional arguments", two_args, [fx.a, fx.b]),
+            ("no positional arguments", self._type_callable(fx.type_type), []),
+            ("non-builtins.type instance_type", foreign_self, [fx.a]),
+            ("tuple ret_type", tuple_ret, [fx.a]),
+            ("alias ret_type", alias_ret, [fx.a]),
+        ]
+
+    def test_rejected_shapes_cross_nothing(self) -> None:
+        from mypy.checkexpr import _try_native_check_callable_call
+
+        seen = self._spy_crossings()
+        for name, callee, args in self._rejected_shapes():
+            assert _try_native_check_callable_call(callee, args, None, False) is None, name
+            assert (
+                _try_native_check_callable_call(callee, args, "builtins.print", True) is None
+            ), name
+        assert seen == [], f"{len(seen)} crossings on gated-out shapes"
+
+    def test_rejected_shapes_defer_in_ungated_rust(self) -> None:
+        from mypy.checkexpr import _serialize_type_for_checkexpr
+
+        for name, callee, args in self._rejected_shapes():
+            try:
+                callee_bytes = _serialize_type_for_checkexpr(callee)
+                arg_bytes = [_serialize_type_for_checkexpr(t) for t in args]
+            except (AssertionError, NotImplementedError, ValueError, TypeError):
+                continue  # the wire cannot even carry it; the gate skips the try
+            raw = _type_kernel.rust_check_callable_call(
+                self._resolver,
+                callee_bytes,
+                arg_bytes,
+                None,
+                False,
+                self._registry,
+                False,
+                [self._plugin],
+            )
+            assert raw is None, f"gate rejected a shape Rust decides: {name}"
+
+    def test_accepted_shape_still_crosses_and_decides(self) -> None:
+        from mypy.checkexpr import _serialize_type_for_checkexpr, _try_native_check_callable_call
+
+        callee = self._type_callable(self.fx.a, self.fx.type_type)
+        assert callee.is_type_obj()
+        seen = self._spy_crossings()
+        _try_native_check_callable_call(callee, [self.fx.a], None, False)
+        assert len(seen) == 1, "the calibratable shape must still cross"
+        raw = _type_kernel.rust_check_callable_call(
+            self._resolver,
+            _serialize_type_for_checkexpr(callee),
+            [_serialize_type_for_checkexpr(self.fx.a)],
+            None,
+            False,
+            self._registry,
+            False,
+            [self._plugin],
+        )
+        assert raw is not None, "the accepted shape must be decided by Rust"

@@ -1106,6 +1106,15 @@ def _try_native_check_callable_call(
         and _native_checkexpr_resolver is not None
     ):
         return None
+    # Wire-shape gate (#1673): the Rust tail calibrates only a type-object
+    # call with one argument; other shapes paid a full callee + arg
+    # serialization per defer. Same conjuncts the Python calibration uses.
+    if not (
+        callee.is_type_obj()
+        and len(arg_types) == 1
+        and is_named_instance(callee.get_instance_type(), "builtins.type")
+    ):
+        return None
     if _native_plugin_hook_has_user_plugins or _native_plugin_hook_registry is None:
         return None
     plugins = _native_plugin_hook_plugins
