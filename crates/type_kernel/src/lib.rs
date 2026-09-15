@@ -650,6 +650,12 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         checkcall_typeobj::rust_classify_typeobj_gate,
         module
     )?)?;
+    // Issue #1642: batched check_callable_call head. Combines the
+    // enum-callable-base and typeobj-gate seams into one FFI crossing.
+    module.add_function(wrap_pyfunction!(
+        checkcall_typeobj::rust_check_call_head,
+        module
+    )?)?;
     // Issue #1064: infer_arg_types_in_context index decision. Rust returns
     // the formal-index-per-actual map (star args skipped); the accept
     // recursion and the infer_unions toggle stay in Python.

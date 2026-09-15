@@ -251,6 +251,7 @@ __all__ = [
     "rust_classify_type_check_raise",
     "rust_classify_type_range",
     "rust_classify_typeobj_gate",
+    "rust_check_call_head",
     "rust_classify_rvalue_count",
     "rust_classify_truthy_type",
     "rust_classify_missing_annotations",
@@ -1013,6 +1014,9 @@ def rust_classify_type_check_raise(
 ) -> int | None: ...
 def rust_classify_type_range(t: Any) -> tuple[int, bool] | None: ...
 def rust_classify_typeobj_gate(callee: Any) -> int | None: ...
+def rust_check_call_head(
+    callable_node: Any, callee: Any, enum_bases: Any
+) -> tuple[bool, int | None]: ...
 def rust_classify_type_object_type(info: Any) -> tuple[int, bool, bool, bool, Any] | None: ...
 def rust_classify_rvalue_count(
     lvalues: Any, rvalue_count: int, rvalue_unpack: int | None

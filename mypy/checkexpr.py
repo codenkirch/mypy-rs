@@ -267,6 +267,7 @@ try:
         rust_classify_super_arg_types as _rust_classify_super_arg_types,
         rust_classify_typeddict_call as _rust_classify_typeddict_call,
         rust_classify_typeobj_gate as _rust_classify_typeobj_gate,
+        rust_check_call_head as _rust_check_call_head,
         rust_classify_visit_op_expr as _rust_classify_visit_op_expr,
         rust_combine_function_signatures as _rust_combine_function_signatures,
         rust_compute_arg_context_indices as _rust_compute_arg_context_indices,
@@ -358,6 +359,7 @@ except ImportError:
     _rust_classify_check_boolean_op = None  # type: ignore[assignment]
     _rust_classify_typeddict_call = None  # type: ignore[assignment]
     _rust_classify_typeobj_gate = None  # type: ignore[assignment]
+    _rust_check_call_head = None  # type: ignore[assignment]
     _rust_refers_to_typeddict = None  # type: ignore[assignment]
     _rust_calibrate_type_obj_return = None  # type: ignore[assignment]
     _rust_normalize_callable = None  # type: ignore[assignment]
@@ -2948,11 +2950,38 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
             if isinstance(instance_type, Instance):
                 callable_name = instance_type.type.fullname
         enum_hit: bool | None = None
-        if _CHECKEXPR_HAS_TYPE_KERNEL and _native_checkexpr_active:
+        tag: int | None = None
+        if (
+            _CHECKEXPR_HAS_TYPE_KERNEL
+            and _native_checkexpr_active
+            and _rust_check_call_head is not None
+        ):
+            # Issue #1642: batch enum_callable_base + typeobj_gate into
+            # one FFI crossing (saves ~183k crossings on cold self-check).
             try:
-                enum_hit = _rust_is_enum_callable_base(callable_node, ENUM_BASES)
-            except (AssertionError, NotImplementedError):
-                enum_hit = None
+                enum_hit, tag = _rust_check_call_head(
+                    callable_node, callee, ENUM_BASES
+                )
+            except (AssertionError, NotImplementedError, ValueError, TypeError):
+                enum_hit, tag = None, None
+        if enum_hit is None:
+            # Fallback: individual seams or pure-Python paths.
+            if _CHECKEXPR_HAS_TYPE_KERNEL and _native_checkexpr_active:
+                try:
+                    enum_hit = _rust_is_enum_callable_base(
+                        callable_node, ENUM_BASES
+                    )
+                except (AssertionError, NotImplementedError):
+                    enum_hit = None
+            if (
+                _CHECKEXPR_HAS_TYPE_KERNEL
+                and _native_checkexpr_active
+                and _rust_classify_typeobj_gate is not None
+            ):
+                try:
+                    tag = _rust_classify_typeobj_gate(callee)
+                except (AssertionError, NotImplementedError, ValueError, TypeError):
+                    tag = None
         if enum_hit is True or (
             enum_hit is None
             and isinstance(callable_node, RefExpr)
@@ -2964,16 +2993,6 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
         # Native type_kernel seam (issue #1464 C2): Rust collapses the
         # if/elif double-evaluation of is_type_obj()/type_object() into one
         # arm tag; the two fails and the can_return_none fold stay here.
-        tag: int | None = None
-        if (
-            _CHECKEXPR_HAS_TYPE_KERNEL
-            and _native_checkexpr_active
-            and _rust_classify_typeobj_gate is not None
-        ):
-            try:
-                tag = _rust_classify_typeobj_gate(callee)
-            except (AssertionError, NotImplementedError, ValueError, TypeError):
-                tag = None
         if tag is None:
             if (
                 callee.is_type_obj()

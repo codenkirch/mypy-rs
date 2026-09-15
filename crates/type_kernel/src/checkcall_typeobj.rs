@@ -20,9 +20,11 @@
 //! `try/except`. Every reachable arm is classified, including the
 //! no-fail tail.
 
+use std::collections::HashSet;
+
 use pyo3::exceptions::PyAttributeError;
 use pyo3::prelude::*;
-use pyo3::types::PyAny;
+use pyo3::types::{PyAny, PyFrozenSet, PyString, PyTuple, PyType};
 
 /// Decision tags for the typeobj-fail gate; must match
 /// `NATIVE_TYPEOBJ_GATE_*` in mypy/checkexpr.py.
@@ -88,6 +90,86 @@ pub(crate) fn rust_classify_typeobj_gate(py: Python<'_>, callee: &PyAny) -> PyRe
         Err(e) if e.is_instance_of::<PyAttributeError>(py) => Ok(None),
         Err(e) => Err(e),
     }
+}
+
+/// Batched head of `check_callable_call` (checkexpr.py:2950-2976):
+/// combines `rust_is_enum_callable_base` and `rust_classify_typeobj_gate`
+/// into one FFI crossing. Returns `(enum_hit, typeobj_tag)` where
+/// `enum_hit` is a bool (never defers) and `typeobj_tag` is `Some(tag)`
+/// or `None` (defer). On a PyAttributeError from the typeobj path, the
+/// enum result still fires and the typeobj tag is `None`.
+#[pyfunction]
+pub(crate) fn rust_check_call_head(
+    py: Python<'_>,
+    callable_node: &PyAny,
+    callee: &PyAny,
+    enum_bases: &PyAny,
+) -> PyResult<(bool, Option<i64>)> {
+    // Enum-callable-base: live PyO3, never defers.
+    let nodes_mod = py.import("mypy.nodes")?;
+    let ref_expr_cls: &PyType = nodes_mod.getattr("RefExpr")?.downcast()?;
+    let is_ref = callable_node.is_instance(ref_expr_cls)?;
+    let enum_hit = if is_ref {
+        let enum_set = normalize_enum_bases(enum_bases)?;
+        let fullname = callable_node.getattr("fullname")?;
+        let fullname_str: &str = fullname.downcast::<PyString>()?.to_str()?;
+        enum_set.contains(fullname_str)
+    } else {
+        false
+    };
+
+    // Typeobj gate: live PyO3, may defer (None) on PyAttributeError.
+    let typeobj_tag: Option<i64> = (|| -> PyResult<Option<i64>> {
+        let is_to = callee.call_method0("is_type_obj")?.extract::<bool>()?;
+        if !is_to {
+            return Ok(Some(classify_typeobj_gate(
+                false, false, false, false, false,
+            )));
+        }
+        let to = callee.call_method0("type_object")?;
+        let is_protocol = to.getattr("is_protocol")?.extract::<bool>()?;
+        let is_abstract = to.getattr("is_abstract")?.extract::<bool>()?;
+        let fallback_to_any = to.getattr("fallback_to_any")?.extract::<bool>()?;
+        let from_type_type = callee.getattr("from_type_type")?.extract::<bool>()?;
+        Ok(Some(classify_typeobj_gate(
+            is_to,
+            is_protocol,
+            is_abstract,
+            from_type_type,
+            fallback_to_any,
+        )))
+    })()
+    .or_else(|e| {
+        if e.is_instance_of::<PyAttributeError>(py) {
+            Ok(None)
+        } else {
+            Err(e)
+        }
+    })?;
+
+    Ok((enum_hit, typeobj_tag))
+}
+
+/// Normalize `enum_bases` (frozenset, tuple, or str) into a `HashSet`.
+fn normalize_enum_bases(enum_bases: &PyAny) -> PyResult<HashSet<String>> {
+    if let Ok(fs) = enum_bases.downcast::<PyFrozenSet>() {
+        let mut result = HashSet::with_capacity(fs.len());
+        for item in fs.iter() {
+            let s = item.downcast::<PyString>()?;
+            result.insert(s.to_str()?.to_string());
+        }
+        return Ok(result);
+    }
+    if let Ok(tup) = enum_bases.downcast::<PyTuple>() {
+        let mut result = HashSet::with_capacity(tup.len());
+        for item in tup.iter() {
+            let s = item.downcast::<PyString>()?;
+            result.insert(s.to_str()?.to_string());
+        }
+        return Ok(result);
+    }
+    let s = enum_bases.downcast::<PyString>()?;
+    Ok([s.to_str()?.to_string()].into_iter().collect())
 }
 
 #[cfg(test)]
