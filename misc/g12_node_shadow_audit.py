@@ -215,16 +215,46 @@ def parse_slots(path: Path) -> dict[str, list[Slot]]:
     return out
 
 
+def _resolve_members(node: ast.AST, flat: dict[str, list[Tracked]]) -> list[tuple[str, int]]:
+    """``(name, line)`` members of a table expression.
+
+    The mirror composes tables with set operators (``_G2_FUNC_DEF =
+    frozenset({...}) | _G2_FUNC_BASE | _G2_FUNC_FLAGS``,
+    ``OverloadedFuncDef: frozenset({...}) | _G2_FUNC_BASE``,
+    ``_META_EXTRA = _META_FIELDS - _META_CORE``), so a literal-only scan
+    would drop every member that arrives through an operand and publish
+    tracked slots as gaps.
+    """
+    if isinstance(node, ast.BinOp):
+        left = _resolve_members(node.left, flat)
+        if isinstance(node.op, ast.BitOr):
+            right = _resolve_members(node.right, flat)
+            return left + [item for item in right if item not in left]
+        if isinstance(node.op, ast.Sub):
+            excluded = {name for name, _ in _resolve_members(node.right, flat)}
+            return [item for item in left if item[0] not in excluded]
+        return left
+    if isinstance(node, ast.Name) and node.id in flat:
+        return [(t.name, t.line) for t in flat[node.id]]
+    return _literal_strings(node)
+
+
 def parse_tracked(path: Path) -> list[Tracked]:
-    """Tracked-field literals with line anchors, table name included."""
+    """Tracked-field literals with line anchors, table name included.
+
+    Tables are resolved in file order, so a table may reference the ones
+    declared above it (``_G2_FUNC_DEF`` before ``_G2_TRACKED``).
+    """
     tree = ast.parse(path.read_text())
     out: list[Tracked] = []
+    flat: dict[str, list[Tracked]] = {}
     for node in tree.body:
         table = _assign_target(node)
         if table is None or not table.startswith("_"):
             continue
-        for name, line in _literal_strings(_assign_value(node)):
-            out.append(Tracked(name, line, table))
+        entries = [Tracked(name, line, table) for name, line in _resolve_members(_assign_value(node), flat)]
+        flat.setdefault(table, []).extend(entries)
+        out.extend(entries)
     return out
 
 
@@ -246,8 +276,10 @@ def _assign_value(node: ast.stmt) -> ast.AST:
 def parse_tracked_map(path: Path) -> dict[str, list[Tracked]]:
     """``_G2_TRACKED``-style ``Class -> [Tracked]`` dicts.
 
-    A dict value may name a module-level table (``Var: _G2_VAR``) rather
-    than spell a literal, so the flat tables resolve by name first.
+    A dict value may name a module-level table (``Var: _G2_VAR``) or
+    compose one (``OverloadedFuncDef: frozenset({...}) | _G2_FUNC_BASE``),
+    so both forms resolve through the flat index built from
+    ``parse_tracked``.
     """
     tree = ast.parse(path.read_text())
     flat: dict[str, list[Tracked]] = {}
@@ -264,12 +296,10 @@ def parse_tracked_map(path: Path) -> dict[str, list[Tracked]]:
         for key, item in zip(value.keys, value.values):
             if not isinstance(key, ast.Name):
                 continue
-            if isinstance(item, ast.Name) and item.id in flat:
-                entries = [Tracked(t.name, t.line, t.table, key.id) for t in flat[item.id]]
-            else:
-                entries = [
-                    Tracked(name, line, table, key.id) for name, line in _literal_strings(item)
-                ]
+            entries = [
+                Tracked(name, line, table, key.id)
+                for name, line in _resolve_members(item, flat)
+            ]
             out.setdefault(key.id, []).extend(entries)
     return out
 
@@ -316,10 +346,17 @@ def parse_g1_tracked(path: Path) -> dict[str, int]:
 
 
 def parse_rust_shape(path: Path) -> RustShape:
-    """``NodeShadow`` record fields and ``FieldValue`` variants (text scan)."""
+    """``NodeShadow`` record fields and ``FieldValue`` variants (text scan).
+
+    Both scans are scoped to their own block: the module holds other
+    structs with ``pub(crate)`` fields (``MetaEntry.captures``), so an
+    unscoped scan could report the wrong declaration line for a name that
+    later collides.
+    """
     text = path.read_text().splitlines()
     shape = RustShape()
     in_enum = False
+    in_node_shadow = False
     for n, line in enumerate(text, start=1):
         if "pub(crate) enum FieldValue" in line:
             in_enum = True
@@ -331,9 +368,17 @@ def parse_rust_shape(path: Path) -> RustShape:
             m = re.match(r"\s+([A-Z]\w*)\b", line)
             if m:
                 shape.variants.setdefault(m.group(1), n)
-        m = re.match(r"\s+pub\(crate\) (\w+):", line)
-        if m:
-            shape.record.setdefault(m.group(1), n)
+            continue
+        if re.match(r"\s*(?:pub\(crate\) )?struct NodeShadow\b", line):
+            in_node_shadow = True
+            continue
+        if in_node_shadow:
+            if line.startswith("}"):
+                in_node_shadow = False
+                continue
+            m = re.match(r"\s+pub\(crate\) (\w+):", line)
+            if m:
+                shape.record.setdefault(m.group(1), n)
     return shape
 
 
@@ -461,7 +506,10 @@ def emit() -> str:
             else:
                 rust = "-"
                 served = "-"
-            verdict = _verdict(slot.name, tracked, len(writes(slot.name, cls)), True)
+            # `writes` shells out to ripgrep per candidate file; only an
+            # untracked slot needs that evidence.
+            sites = [] if tracked else writes(slot.name, cls)
+            verdict = _verdict(slot.name, tracked, len(sites), True)
             lines.append(
                 f"| `{cls}` | `{slot.name}` ({NODES_PY.name}:{slot.line}) | {rust} "
                 f"| {served} | {verdict} |"
@@ -481,7 +529,8 @@ def emit() -> str:
                 )
             else:
                 anchor = "-"
-            verdict = _verdict(slot.name, tracked, len(writes(slot.name, cls)), False)
+            sites = [] if tracked else writes(slot.name, cls)
+            verdict = _verdict(slot.name, tracked, len(sites), False)
             lines.append(
                 f"| `{cls}` | `{slot.name}` ({NODES_PY.name}:{slot.line}) | {anchor} | {verdict} |"
             )
@@ -497,7 +546,8 @@ def emit() -> str:
                 entries = [t for t in g3_tracked if t.name == slot.name]
             tracked = bool(entries)
             anchor = f"`symtables_mirror.py:{entries[0].line}` via `{entries[0].table}`" if tracked else "-"
-            verdict = _verdict(slot.name, tracked, len(writes(slot.name, cls)), False)
+            sites = [] if tracked else writes(slot.name, cls)
+            verdict = _verdict(slot.name, tracked, len(sites), False)
             lines.append(
                 f"| `{cls}` | `{slot.name}` ({NODES_PY.name}:{slot.line}) | {anchor} | {verdict} |"
             )

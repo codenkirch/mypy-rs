@@ -42,9 +42,9 @@ Verdict vocabulary, per slot:
   the shadow has no record for it.
 
 Totals over the three shadowed families (213 slot rows):
-`served` 70, `served (wire)` 8, `partial (marker only)` 42,
+`served` 76, `served (wire)` 8, `partial (marker only)` 42,
 `partial (element/class-name only)` 6, `AST wire (structural)` 41,
-`gap` 46.
+`gap` 40.
 
 ## Bottom line
 
@@ -180,50 +180,50 @@ account for minutes of difference.
 | `RefExpr` | `_fullname` (nodes.py:2503) | `node_mirror.rs:39` | NodeShadow.fullname | served |
 | `RefExpr` | `is_new_def` (nodes.py:2504) | `node_mirror.rs:40` | NodeShadow.is_new_def | served |
 | `RefExpr` | `is_inferred_def` (nodes.py:2505) | `node_mirror.rs:41` | NodeShadow.is_inferred_def | served |
-| `RefExpr` | `is_alias_rvalue` (nodes.py:2506) | `node_mirror.rs:270` | `FieldValue::Flag` (`nodes_mirror.py:129`) | served |
-| `RefExpr` | `type_guard` (nodes.py:2507) | `node_mirror.rs:280` | `FieldValue::Wire` (`nodes_mirror.py:126`) | served (kind + G1.1 wire bytes) |
-| `RefExpr` | `type_is` (nodes.py:2508) | `node_mirror.rs:280` | `FieldValue::Wire` (`nodes_mirror.py:126`) | served (kind + G1.1 wire bytes) |
-| `NameExpr` | `name` (nodes.py:2549) | `node_mirror.rs:275` | `FieldValue::Text` (`nodes_mirror.py:136`) | served |
-| `NameExpr` | `is_special_form` (nodes.py:2549) | `node_mirror.rs:270` | `FieldValue::Flag` (`nodes_mirror.py:129`) | served |
+| `RefExpr` | `is_alias_rvalue` (nodes.py:2506) | `node_mirror.rs:270` | `FieldValue::Flag` (`nodes_mirror.py:131`) | served |
+| `RefExpr` | `type_guard` (nodes.py:2507) | `node_mirror.rs:280` | `FieldValue::Wire` (`nodes_mirror.py:128`) | served (kind + G1.1 wire bytes) |
+| `RefExpr` | `type_is` (nodes.py:2508) | `node_mirror.rs:280` | `FieldValue::Wire` (`nodes_mirror.py:128`) | served (kind + G1.1 wire bytes) |
+| `NameExpr` | `name` (nodes.py:2549) | `node_mirror.rs:275` | `FieldValue::Text` (`nodes_mirror.py:138`) | served |
+| `NameExpr` | `is_special_form` (nodes.py:2549) | `node_mirror.rs:270` | `FieldValue::Flag` (`nodes_mirror.py:131`) | served |
 | `MemberExpr` | `expr` (nodes.py:2569) | - | - | gap |
-| `MemberExpr` | `name` (nodes.py:2569) | `node_mirror.rs:275` | `FieldValue::Text` (`nodes_mirror.py:136`) | served |
-| `MemberExpr` | `def_var` (nodes.py:2569) | `node_mirror.rs:272` | `FieldValue::Name` (`nodes_mirror.py:131`) | partial (element fullname/class only) |
+| `MemberExpr` | `name` (nodes.py:2569) | `node_mirror.rs:275` | `FieldValue::Text` (`nodes_mirror.py:138`) | served |
+| `MemberExpr` | `def_var` (nodes.py:2569) | `node_mirror.rs:272` | `FieldValue::Name` (`nodes_mirror.py:133`) | partial (element fullname/class only) |
 | `CallExpr` | `callee` (nodes.py:2634) | - | - | AST wire (structural) |
 | `CallExpr` | `args` (nodes.py:2634) | - | - | gap |
 | `CallExpr` | `arg_kinds` (nodes.py:2634) | - | - | AST wire (structural) |
 | `CallExpr` | `arg_names` (nodes.py:2634) | - | - | AST wire (structural) |
-| `CallExpr` | `analyzed` (nodes.py:2634) | `node_mirror.rs:43` | `NodeShadow.analyzed_kind` (`nodes_mirror.py:121`) | partial (replacement class name only) |
+| `CallExpr` | `analyzed` (nodes.py:2634) | `node_mirror.rs:43` | `NodeShadow.analyzed_kind` (`nodes_mirror.py:123`) | partial (replacement class name only) |
 | `IndexExpr` | `base` (nodes.py:2699) | - | - | gap |
 | `IndexExpr` | `index` (nodes.py:2699) | - | - | gap |
-| `IndexExpr` | `method_type` (nodes.py:2699) | `node_mirror.rs:280` | `FieldValue::Wire` (`nodes_mirror.py:126`) | served (kind + G1.1 wire bytes) |
-| `IndexExpr` | `analyzed` (nodes.py:2699) | `node_mirror.rs:43` | `NodeShadow.analyzed_kind` (`nodes_mirror.py:121`) | partial (replacement class name only) |
-| `IndexExpr` | `as_type` (nodes.py:2699) | `node_mirror.rs:280` | `FieldValue::Wire` (`nodes_mirror.py:126`) | served (kind + G1.1 wire bytes) |
+| `IndexExpr` | `method_type` (nodes.py:2699) | `node_mirror.rs:280` | `FieldValue::Wire` (`nodes_mirror.py:128`) | served (kind + G1.1 wire bytes) |
+| `IndexExpr` | `analyzed` (nodes.py:2699) | `node_mirror.rs:43` | `NodeShadow.analyzed_kind` (`nodes_mirror.py:123`) | partial (replacement class name only) |
+| `IndexExpr` | `as_type` (nodes.py:2699) | `node_mirror.rs:280` | `FieldValue::Wire` (`nodes_mirror.py:128`) | served (kind + G1.1 wire bytes) |
 | `OpExpr` | `op` (nodes.py:2772) | - | - | AST wire (structural) |
 | `OpExpr` | `left` (nodes.py:2773) | - | - | AST wire (structural) |
 | `OpExpr` | `right` (nodes.py:2774) | - | - | AST wire (structural) |
-| `OpExpr` | `method_type` (nodes.py:2775) | `node_mirror.rs:280` | `FieldValue::Wire` (`nodes_mirror.py:126`) | served (kind + G1.1 wire bytes) |
-| `OpExpr` | `right_always` (nodes.py:2776) | `node_mirror.rs:270` | `FieldValue::Flag` (`nodes_mirror.py:129`) | served |
-| `OpExpr` | `right_unreachable` (nodes.py:2777) | `node_mirror.rs:270` | `FieldValue::Flag` (`nodes_mirror.py:129`) | served |
-| `OpExpr` | `analyzed` (nodes.py:2778) | `node_mirror.rs:43` | `NodeShadow.analyzed_kind` (`nodes_mirror.py:121`) | partial (replacement class name only) |
-| `OpExpr` | `as_type` (nodes.py:2779) | `node_mirror.rs:280` | `FieldValue::Wire` (`nodes_mirror.py:126`) | served (kind + G1.1 wire bytes) |
+| `OpExpr` | `method_type` (nodes.py:2775) | `node_mirror.rs:280` | `FieldValue::Wire` (`nodes_mirror.py:128`) | served (kind + G1.1 wire bytes) |
+| `OpExpr` | `right_always` (nodes.py:2776) | `node_mirror.rs:270` | `FieldValue::Flag` (`nodes_mirror.py:131`) | served |
+| `OpExpr` | `right_unreachable` (nodes.py:2777) | `node_mirror.rs:270` | `FieldValue::Flag` (`nodes_mirror.py:131`) | served |
+| `OpExpr` | `analyzed` (nodes.py:2778) | `node_mirror.rs:43` | `NodeShadow.analyzed_kind` (`nodes_mirror.py:123`) | partial (replacement class name only) |
+| `OpExpr` | `as_type` (nodes.py:2779) | `node_mirror.rs:280` | `FieldValue::Wire` (`nodes_mirror.py:128`) | served (kind + G1.1 wire bytes) |
 | `UnaryExpr` | `op` (nodes.py:2730) | - | - | AST wire (structural) |
 | `UnaryExpr` | `expr` (nodes.py:2730) | - | - | AST wire (structural) |
-| `UnaryExpr` | `method_type` (nodes.py:2730) | `node_mirror.rs:280` | `FieldValue::Wire` (`nodes_mirror.py:126`) | served (kind + G1.1 wire bytes) |
+| `UnaryExpr` | `method_type` (nodes.py:2730) | `node_mirror.rs:280` | `FieldValue::Wire` (`nodes_mirror.py:128`) | served (kind + G1.1 wire bytes) |
 | `ComparisonExpr` | `operators` (nodes.py:2828) | - | - | AST wire (structural) |
 | `ComparisonExpr` | `operands` (nodes.py:2828) | - | - | AST wire (structural) |
-| `ComparisonExpr` | `method_types` (nodes.py:2828) | `node_mirror.rs:277` | `FieldValue::Kinds` (`nodes_mirror.py:132`) | partial (element fullname/class only) |
+| `ComparisonExpr` | `method_types` (nodes.py:2828) | `node_mirror.rs:277` | `FieldValue::Kinds` (`nodes_mirror.py:134`) | partial (element fullname/class only) |
 | `StrExpr` | `value` (nodes.py:2382) | - | - | AST wire (structural) |
-| `StrExpr` | `as_type` (nodes.py:2382) | `node_mirror.rs:280` | `FieldValue::Wire` (`nodes_mirror.py:126`) | served (kind + G1.1 wire bytes) |
+| `StrExpr` | `as_type` (nodes.py:2382) | `node_mirror.rs:280` | `FieldValue::Wire` (`nodes_mirror.py:128`) | served (kind + G1.1 wire bytes) |
 
 ### G2 statement/def shadow (field-name keyed meta record)
 
 | Python class | slot (`mypy/nodes.py`) | home | verdict |
 |---|---|---|---|
-| `ImportBase` | `is_unreachable` (nodes.py:697) | `nodes_mirror.py:485` via `_G2_TRACKED[ImportBase]` | served |
-| `ImportBase` | `is_unreachable_dependency` (nodes.py:698) | `nodes_mirror.py:486` via `_G2_TRACKED[ImportBase]` | served |
-| `ImportBase` | `is_top_level` (nodes.py:699) | `nodes_mirror.py:487` via `_G2_TRACKED[ImportBase]` | served |
-| `ImportBase` | `is_mypy_only` (nodes.py:700) | `nodes_mirror.py:488` via `_G2_TRACKED[ImportBase]` | served |
-| `ImportBase` | `assignments` (nodes.py:701) | `nodes_mirror.py:484` via `_G2_TRACKED[ImportBase]` | partial (marker only) |
+| `ImportBase` | `is_unreachable` (nodes.py:697) | `nodes_mirror.py:484` via `_G2_TRACKED[ImportBase]` | served |
+| `ImportBase` | `is_unreachable_dependency` (nodes.py:698) | `nodes_mirror.py:485` via `_G2_TRACKED[ImportBase]` | served |
+| `ImportBase` | `is_top_level` (nodes.py:699) | `nodes_mirror.py:486` via `_G2_TRACKED[ImportBase]` | served |
+| `ImportBase` | `is_mypy_only` (nodes.py:700) | `nodes_mirror.py:487` via `_G2_TRACKED[ImportBase]` | served |
+| `ImportBase` | `assignments` (nodes.py:701) | `nodes_mirror.py:483` via `_G2_TRACKED[ImportBase]` | partial (marker only) |
 | `Import` | `ids` (nodes.py:730) | - | AST wire (structural) |
 | `ImportFrom` | `id` (nodes.py:747) | - | gap |
 | `ImportFrom` | `names` (nodes.py:747) | - | gap |
@@ -231,20 +231,20 @@ account for minutes of difference.
 | `ImportAll` | `id` (nodes.py:768) | - | gap |
 | `ImportAll` | `relative` (nodes.py:768) | - | AST wire (structural) |
 | `Block` | `body` (nodes.py:1915) | - | gap |
-| `Block` | `is_unreachable` (nodes.py:1915) | `nodes_mirror.py:491` via `_G2_TRACKED[Block]` | served |
+| `Block` | `is_unreachable` (nodes.py:1915) | `nodes_mirror.py:490` via `_G2_TRACKED[Block]` | served |
 | `AssignmentStmt` | `lvalues` (nodes.py:1966) | - | AST wire (structural) |
 | `AssignmentStmt` | `rvalue` (nodes.py:1967) | - | AST wire (structural) |
-| `AssignmentStmt` | `type` (nodes.py:1968) | `nodes_mirror.py:493` via `_G2_TRACKED[AssignmentStmt]` | partial (marker only) |
-| `AssignmentStmt` | `unanalyzed_type` (nodes.py:1969) | `nodes_mirror.py:493` via `_G2_TRACKED[AssignmentStmt]` | partial (marker only) |
+| `AssignmentStmt` | `type` (nodes.py:1968) | `nodes_mirror.py:492` via `_G2_TRACKED[AssignmentStmt]` | partial (marker only) |
+| `AssignmentStmt` | `unanalyzed_type` (nodes.py:1969) | `nodes_mirror.py:492` via `_G2_TRACKED[AssignmentStmt]` | partial (marker only) |
 | `AssignmentStmt` | `new_syntax` (nodes.py:1970) | - | AST wire (structural) |
-| `AssignmentStmt` | `is_alias_def` (nodes.py:1971) | `nodes_mirror.py:493` via `_G2_TRACKED[AssignmentStmt]` | served |
-| `AssignmentStmt` | `is_final_def` (nodes.py:1972) | `nodes_mirror.py:493` via `_G2_TRACKED[AssignmentStmt]` | served |
-| `AssignmentStmt` | `invalid_recursive_alias` (nodes.py:1973) | `nodes_mirror.py:493` via `_G2_TRACKED[AssignmentStmt]` | served |
-| `ForStmt` | `index` (nodes.py:2064) | `nodes_mirror.py:497` via `_G2_TRACKED[ForStmt]` | partial (marker only) |
-| `ForStmt` | `index_type` (nodes.py:2065) | `nodes_mirror.py:498` via `_G2_TRACKED[ForStmt]` | partial (marker only) |
-| `ForStmt` | `unanalyzed_index_type` (nodes.py:2066) | `nodes_mirror.py:499` via `_G2_TRACKED[ForStmt]` | partial (marker only) |
-| `ForStmt` | `inferred_item_type` (nodes.py:2067) | `nodes_mirror.py:500` via `_G2_TRACKED[ForStmt]` | partial (marker only) |
-| `ForStmt` | `inferred_iterator_type` (nodes.py:2068) | `nodes_mirror.py:501` via `_G2_TRACKED[ForStmt]` | partial (marker only) |
+| `AssignmentStmt` | `is_alias_def` (nodes.py:1971) | `nodes_mirror.py:492` via `_G2_TRACKED[AssignmentStmt]` | served |
+| `AssignmentStmt` | `is_final_def` (nodes.py:1972) | `nodes_mirror.py:492` via `_G2_TRACKED[AssignmentStmt]` | served |
+| `AssignmentStmt` | `invalid_recursive_alias` (nodes.py:1973) | `nodes_mirror.py:492` via `_G2_TRACKED[AssignmentStmt]` | served |
+| `ForStmt` | `index` (nodes.py:2064) | `nodes_mirror.py:496` via `_G2_TRACKED[ForStmt]` | partial (marker only) |
+| `ForStmt` | `index_type` (nodes.py:2065) | `nodes_mirror.py:497` via `_G2_TRACKED[ForStmt]` | partial (marker only) |
+| `ForStmt` | `unanalyzed_index_type` (nodes.py:2066) | `nodes_mirror.py:498` via `_G2_TRACKED[ForStmt]` | partial (marker only) |
+| `ForStmt` | `inferred_item_type` (nodes.py:2067) | `nodes_mirror.py:499` via `_G2_TRACKED[ForStmt]` | partial (marker only) |
+| `ForStmt` | `inferred_iterator_type` (nodes.py:2068) | `nodes_mirror.py:500` via `_G2_TRACKED[ForStmt]` | partial (marker only) |
 | `ForStmt` | `expr` (nodes.py:2069) | - | AST wire (structural) |
 | `ForStmt` | `body` (nodes.py:2070) | - | gap |
 | `ForStmt` | `else_body` (nodes.py:2071) | - | AST wire (structural) |
@@ -252,90 +252,90 @@ account for minutes of difference.
 | `WithStmt` | `expr` (nodes.py:2267) | - | AST wire (structural) |
 | `WithStmt` | `target` (nodes.py:2267) | - | gap |
 | `WithStmt` | `unanalyzed_type` (nodes.py:2267) | - | gap |
-| `WithStmt` | `analyzed_types` (nodes.py:2267) | `nodes_mirror.py:504` via `_G2_TRACKED[WithStmt]` | partial (marker only) |
+| `WithStmt` | `analyzed_types` (nodes.py:2267) | `nodes_mirror.py:503` via `_G2_TRACKED[WithStmt]` | partial (marker only) |
 | `WithStmt` | `body` (nodes.py:2267) | - | gap |
 | `WithStmt` | `is_async` (nodes.py:2267) | - | gap |
 | `IfStmt` | `expr` (nodes.py:2185) | - | AST wire (structural) |
 | `IfStmt` | `body` (nodes.py:2185) | - | gap |
 | `IfStmt` | `else_body` (nodes.py:2185) | - | gap |
-| `IfStmt` | `unreachable_else` (nodes.py:2185) | `nodes_mirror.py:505` via `_G2_TRACKED[IfStmt]` | partial (marker only) |
+| `IfStmt` | `unreachable_else` (nodes.py:2185) | `nodes_mirror.py:504` via `_G2_TRACKED[IfStmt]` | partial (marker only) |
 | `MatchStmt` | `subject` (nodes.py:2300) | - | AST wire (structural) |
-| `MatchStmt` | `subject_dummy` (nodes.py:2300) | `nodes_mirror.py:506` via `_G2_TRACKED[MatchStmt]` | partial (marker only) |
+| `MatchStmt` | `subject_dummy` (nodes.py:2300) | `nodes_mirror.py:505` via `_G2_TRACKED[MatchStmt]` | partial (marker only) |
 | `MatchStmt` | `patterns` (nodes.py:2300) | - | AST wire (structural) |
 | `MatchStmt` | `guards` (nodes.py:2300) | - | AST wire (structural) |
 | `MatchStmt` | `bodies` (nodes.py:2300) | - | AST wire (structural) |
 | `TypeAliasStmt` | `name` (nodes.py:2330) | - | gap |
 | `TypeAliasStmt` | `type_args` (nodes.py:2330) | - | gap |
 | `TypeAliasStmt` | `value` (nodes.py:2330) | - | AST wire (structural) |
-| `TypeAliasStmt` | `invalid_recursive_alias` (nodes.py:2330) | `nodes_mirror.py:507` via `_G2_TRACKED[TypeAliasStmt]` | served |
-| `TypeAliasStmt` | `alias_node` (nodes.py:2330) | `nodes_mirror.py:507` via `_G2_TRACKED[TypeAliasStmt]` | partial (marker only) |
+| `TypeAliasStmt` | `invalid_recursive_alias` (nodes.py:2330) | `nodes_mirror.py:506` via `_G2_TRACKED[TypeAliasStmt]` | served |
+| `TypeAliasStmt` | `alias_node` (nodes.py:2330) | `nodes_mirror.py:506` via `_G2_TRACKED[TypeAliasStmt]` | partial (marker only) |
 | `FuncDef` | `_name` (nodes.py:1202) | - | AST wire (structural) |
-| `FuncDef` | `is_decorated` (nodes.py:1203) | - | gap |
-| `FuncDef` | `is_conditional` (nodes.py:1204) | - | gap |
-| `FuncDef` | `abstract_status` (nodes.py:1205) | `nodes_mirror.py:436` via `_G2_FUNC_DEF[FuncDef]` | served |
-| `FuncDef` | `original_def` (nodes.py:1206) | `nodes_mirror.py:438` via `_G2_FUNC_DEF[FuncDef]` | partial (marker only) |
-| `FuncDef` | `is_trivial_body` (nodes.py:1207) | - | gap |
-| `FuncDef` | `is_trivial_self` (nodes.py:1208) | - | gap |
-| `FuncDef` | `is_invalid_redefinition` (nodes.py:1209) | - | gap |
-| `FuncDef` | `is_mypy_only` (nodes.py:1210) | - | gap |
-| `FuncDef` | `dataclass_transform_spec` (nodes.py:1212) | `nodes_mirror.py:439` via `_G2_FUNC_DEF[FuncDef]` | partial (marker only) |
-| `FuncDef` | `docstring` (nodes.py:1213) | `nodes_mirror.py:440` via `_G2_FUNC_DEF[FuncDef]` | served |
-| `FuncDef` | `deprecated` (nodes.py:1214) | `nodes_mirror.py:437` via `_G2_FUNC_DEF[FuncDef]` | served |
+| `FuncDef` | `is_decorated` (nodes.py:1203) | `nodes_mirror.py:420` via `_G2_TRACKED[FuncDef]` | served |
+| `FuncDef` | `is_conditional` (nodes.py:1204) | `nodes_mirror.py:421` via `_G2_TRACKED[FuncDef]` | served |
+| `FuncDef` | `abstract_status` (nodes.py:1205) | `nodes_mirror.py:435` via `_G2_TRACKED[FuncDef]` | served |
+| `FuncDef` | `original_def` (nodes.py:1206) | `nodes_mirror.py:437` via `_G2_TRACKED[FuncDef]` | partial (marker only) |
+| `FuncDef` | `is_trivial_body` (nodes.py:1207) | `nodes_mirror.py:422` via `_G2_TRACKED[FuncDef]` | served |
+| `FuncDef` | `is_trivial_self` (nodes.py:1208) | `nodes_mirror.py:423` via `_G2_TRACKED[FuncDef]` | served |
+| `FuncDef` | `is_invalid_redefinition` (nodes.py:1209) | `nodes_mirror.py:425` via `_G2_TRACKED[FuncDef]` | served |
+| `FuncDef` | `is_mypy_only` (nodes.py:1210) | `nodes_mirror.py:424` via `_G2_TRACKED[FuncDef]` | served |
+| `FuncDef` | `dataclass_transform_spec` (nodes.py:1212) | `nodes_mirror.py:438` via `_G2_TRACKED[FuncDef]` | partial (marker only) |
+| `FuncDef` | `docstring` (nodes.py:1213) | `nodes_mirror.py:439` via `_G2_TRACKED[FuncDef]` | served |
+| `FuncDef` | `deprecated` (nodes.py:1214) | `nodes_mirror.py:436` via `_G2_TRACKED[FuncDef]` | served |
 | `FuncDef` | `original_first_arg` (nodes.py:1215) | - | AST wire (structural) |
-| `OverloadedFuncDef` | `items` (nodes.py:888) | `nodes_mirror.py:510` via `_G2_TRACKED[OverloadedFuncDef]` | partial (marker only) |
-| `OverloadedFuncDef` | `unanalyzed_items` (nodes.py:889) | `nodes_mirror.py:510` via `_G2_TRACKED[OverloadedFuncDef]` | partial (marker only) |
-| `OverloadedFuncDef` | `impl` (nodes.py:890) | `nodes_mirror.py:510` via `_G2_TRACKED[OverloadedFuncDef]` | partial (marker only) |
-| `OverloadedFuncDef` | `deprecated` (nodes.py:891) | `nodes_mirror.py:510` via `_G2_TRACKED[OverloadedFuncDef]` | served |
-| `OverloadedFuncDef` | `setter_index` (nodes.py:892) | `nodes_mirror.py:510` via `_G2_TRACKED[OverloadedFuncDef]` | served |
-| `OverloadedFuncDef` | `_is_trivial_self` (nodes.py:893) | `nodes_mirror.py:510` via `_G2_TRACKED[OverloadedFuncDef]` | served |
-| `Decorator` | `func` (nodes.py:1418) | `nodes_mirror.py:514` via `_G2_TRACKED[Decorator]` | partial (marker only) |
-| `Decorator` | `decorators` (nodes.py:1418) | `nodes_mirror.py:514` via `_G2_TRACKED[Decorator]` | partial (marker only) |
-| `Decorator` | `original_decorators` (nodes.py:1418) | `nodes_mirror.py:514` via `_G2_TRACKED[Decorator]` | partial (marker only) |
-| `Decorator` | `var` (nodes.py:1418) | `nodes_mirror.py:514` via `_G2_TRACKED[Decorator]` | partial (marker only) |
-| `Decorator` | `is_overload` (nodes.py:1418) | `nodes_mirror.py:514` via `_G2_TRACKED[Decorator]` | served |
+| `OverloadedFuncDef` | `items` (nodes.py:888) | `nodes_mirror.py:509` via `_G2_TRACKED[OverloadedFuncDef]` | partial (marker only) |
+| `OverloadedFuncDef` | `unanalyzed_items` (nodes.py:889) | `nodes_mirror.py:509` via `_G2_TRACKED[OverloadedFuncDef]` | partial (marker only) |
+| `OverloadedFuncDef` | `impl` (nodes.py:890) | `nodes_mirror.py:509` via `_G2_TRACKED[OverloadedFuncDef]` | partial (marker only) |
+| `OverloadedFuncDef` | `deprecated` (nodes.py:891) | `nodes_mirror.py:509` via `_G2_TRACKED[OverloadedFuncDef]` | served |
+| `OverloadedFuncDef` | `setter_index` (nodes.py:892) | `nodes_mirror.py:509` via `_G2_TRACKED[OverloadedFuncDef]` | served |
+| `OverloadedFuncDef` | `_is_trivial_self` (nodes.py:893) | `nodes_mirror.py:509` via `_G2_TRACKED[OverloadedFuncDef]` | served |
+| `Decorator` | `func` (nodes.py:1418) | `nodes_mirror.py:513` via `_G2_TRACKED[Decorator]` | partial (marker only) |
+| `Decorator` | `decorators` (nodes.py:1418) | `nodes_mirror.py:513` via `_G2_TRACKED[Decorator]` | partial (marker only) |
+| `Decorator` | `original_decorators` (nodes.py:1418) | `nodes_mirror.py:513` via `_G2_TRACKED[Decorator]` | partial (marker only) |
+| `Decorator` | `var` (nodes.py:1418) | `nodes_mirror.py:513` via `_G2_TRACKED[Decorator]` | partial (marker only) |
+| `Decorator` | `is_overload` (nodes.py:1418) | `nodes_mirror.py:513` via `_G2_TRACKED[Decorator]` | served |
 | `ClassDef` | `name` (nodes.py:1760) | - | gap |
-| `ClassDef` | `_fullname` (nodes.py:1761) | `nodes_mirror.py:522` via `_G2_TRACKED[ClassDef]` | served |
+| `ClassDef` | `_fullname` (nodes.py:1761) | `nodes_mirror.py:521` via `_G2_TRACKED[ClassDef]` | served |
 | `ClassDef` | `defs` (nodes.py:1762) | - | gap |
 | `ClassDef` | `type_args` (nodes.py:1763) | - | gap |
-| `ClassDef` | `type_vars` (nodes.py:1764) | `nodes_mirror.py:524` via `_G2_TRACKED[ClassDef]` | partial (marker only) |
-| `ClassDef` | `base_type_exprs` (nodes.py:1765) | `nodes_mirror.py:525` via `_G2_TRACKED[ClassDef]` | partial (marker only) |
-| `ClassDef` | `removed_base_type_exprs` (nodes.py:1766) | `nodes_mirror.py:523` via `_G2_TRACKED[ClassDef]` | partial (marker only) |
-| `ClassDef` | `info` (nodes.py:1767) | `nodes_mirror.py:518` via `_G2_TRACKED[ClassDef]` | partial (marker only) |
-| `ClassDef` | `metaclass` (nodes.py:1768) | `nodes_mirror.py:521` via `_G2_TRACKED[ClassDef]` | partial (marker only) |
+| `ClassDef` | `type_vars` (nodes.py:1764) | `nodes_mirror.py:523` via `_G2_TRACKED[ClassDef]` | partial (marker only) |
+| `ClassDef` | `base_type_exprs` (nodes.py:1765) | `nodes_mirror.py:524` via `_G2_TRACKED[ClassDef]` | partial (marker only) |
+| `ClassDef` | `removed_base_type_exprs` (nodes.py:1766) | `nodes_mirror.py:522` via `_G2_TRACKED[ClassDef]` | partial (marker only) |
+| `ClassDef` | `info` (nodes.py:1767) | `nodes_mirror.py:517` via `_G2_TRACKED[ClassDef]` | partial (marker only) |
+| `ClassDef` | `metaclass` (nodes.py:1768) | `nodes_mirror.py:520` via `_G2_TRACKED[ClassDef]` | partial (marker only) |
 | `ClassDef` | `decorators` (nodes.py:1769) | - | gap |
 | `ClassDef` | `keywords` (nodes.py:1770) | - | AST wire (structural) |
-| `ClassDef` | `analyzed` (nodes.py:1771) | `nodes_mirror.py:519` via `_G2_TRACKED[ClassDef]` | partial (replacement class name only) |
-| `ClassDef` | `has_incompatible_baseclass` (nodes.py:1772) | `nodes_mirror.py:520` via `_G2_TRACKED[ClassDef]` | served |
+| `ClassDef` | `analyzed` (nodes.py:1771) | `nodes_mirror.py:518` via `_G2_TRACKED[ClassDef]` | partial (replacement class name only) |
+| `ClassDef` | `has_incompatible_baseclass` (nodes.py:1772) | `nodes_mirror.py:519` via `_G2_TRACKED[ClassDef]` | served |
 | `ClassDef` | `docstring` (nodes.py:1773) | - | gap |
-| `ClassDef` | `removed_statements` (nodes.py:1774) | `nodes_mirror.py:526` via `_G2_TRACKED[ClassDef]` | partial (marker only) |
+| `ClassDef` | `removed_statements` (nodes.py:1774) | `nodes_mirror.py:525` via `_G2_TRACKED[ClassDef]` | partial (marker only) |
 | `Var` | `_name` (nodes.py:1535) | - | AST wire (structural) |
-| `Var` | `_fullname` (nodes.py:1536) | `nodes_mirror.py:449` via `_G2_VAR[Var]` | served |
-| `Var` | `info` (nodes.py:1537) | `nodes_mirror.py:452` via `_G2_VAR[Var]` | partial (marker only) |
-| `Var` | `type` (nodes.py:1538) | `nodes_mirror.py:450` via `_G2_VAR[Var]` | partial (marker only) |
-| `Var` | `setter_type` (nodes.py:1539) | `nodes_mirror.py:451` via `_G2_VAR[Var]` | partial (marker only) |
-| `Var` | `final_value` (nodes.py:1540) | `nodes_mirror.py:453` via `_G2_VAR[Var]` | partial (marker only) |
-| `Var` | `is_self` (nodes.py:1541) | `nodes_mirror.py:454` via `_G2_VAR[Var]` | served |
-| `Var` | `is_cls` (nodes.py:1542) | `nodes_mirror.py:455` via `_G2_VAR[Var]` | served |
-| `Var` | `is_ready` (nodes.py:1543) | `nodes_mirror.py:456` via `_G2_VAR[Var]` | served |
-| `Var` | `is_inferred` (nodes.py:1544) | `nodes_mirror.py:457` via `_G2_VAR[Var]` | served |
-| `Var` | `is_initialized_in_class` (nodes.py:1545) | `nodes_mirror.py:458` via `_G2_VAR[Var]` | served |
-| `Var` | `is_staticmethod` (nodes.py:1546) | `nodes_mirror.py:459` via `_G2_VAR[Var]` | served |
-| `Var` | `is_classmethod` (nodes.py:1547) | `nodes_mirror.py:460` via `_G2_VAR[Var]` | served |
-| `Var` | `is_property` (nodes.py:1548) | `nodes_mirror.py:461` via `_G2_VAR[Var]` | served |
-| `Var` | `is_settable_property` (nodes.py:1549) | `nodes_mirror.py:462` via `_G2_VAR[Var]` | served |
-| `Var` | `is_classvar` (nodes.py:1550) | `nodes_mirror.py:463` via `_G2_VAR[Var]` | served |
-| `Var` | `is_abstract_var` (nodes.py:1551) | `nodes_mirror.py:464` via `_G2_VAR[Var]` | served |
-| `Var` | `is_final` (nodes.py:1552) | `nodes_mirror.py:465` via `_G2_VAR[Var]` | served |
-| `Var` | `is_index_var` (nodes.py:1553) | `nodes_mirror.py:466` via `_G2_VAR[Var]` | served |
-| `Var` | `final_unset_in_class` (nodes.py:1554) | `nodes_mirror.py:467` via `_G2_VAR[Var]` | served |
-| `Var` | `final_set_in_init` (nodes.py:1555) | `nodes_mirror.py:468` via `_G2_VAR[Var]` | served |
-| `Var` | `is_suppressed_import` (nodes.py:1556) | `nodes_mirror.py:469` via `_G2_VAR[Var]` | served |
-| `Var` | `explicit_self_type` (nodes.py:1557) | `nodes_mirror.py:470` via `_G2_VAR[Var]` | served |
-| `Var` | `from_module_getattr` (nodes.py:1558) | `nodes_mirror.py:471` via `_G2_VAR[Var]` | served |
-| `Var` | `has_explicit_value` (nodes.py:1559) | `nodes_mirror.py:472` via `_G2_VAR[Var]` | served |
-| `Var` | `allow_incompatible_override` (nodes.py:1560) | `nodes_mirror.py:473` via `_G2_VAR[Var]` | served |
-| `Var` | `invalid_partial_type` (nodes.py:1561) | `nodes_mirror.py:474` via `_G2_VAR[Var]` | served |
-| `Var` | `is_argument` (nodes.py:1562) | `nodes_mirror.py:475` via `_G2_VAR[Var]` | served |
+| `Var` | `_fullname` (nodes.py:1536) | `nodes_mirror.py:448` via `_G2_TRACKED[Var]` | served |
+| `Var` | `info` (nodes.py:1537) | `nodes_mirror.py:451` via `_G2_TRACKED[Var]` | partial (marker only) |
+| `Var` | `type` (nodes.py:1538) | `nodes_mirror.py:449` via `_G2_TRACKED[Var]` | partial (marker only) |
+| `Var` | `setter_type` (nodes.py:1539) | `nodes_mirror.py:450` via `_G2_TRACKED[Var]` | partial (marker only) |
+| `Var` | `final_value` (nodes.py:1540) | `nodes_mirror.py:452` via `_G2_TRACKED[Var]` | partial (marker only) |
+| `Var` | `is_self` (nodes.py:1541) | `nodes_mirror.py:453` via `_G2_TRACKED[Var]` | served |
+| `Var` | `is_cls` (nodes.py:1542) | `nodes_mirror.py:454` via `_G2_TRACKED[Var]` | served |
+| `Var` | `is_ready` (nodes.py:1543) | `nodes_mirror.py:455` via `_G2_TRACKED[Var]` | served |
+| `Var` | `is_inferred` (nodes.py:1544) | `nodes_mirror.py:456` via `_G2_TRACKED[Var]` | served |
+| `Var` | `is_initialized_in_class` (nodes.py:1545) | `nodes_mirror.py:457` via `_G2_TRACKED[Var]` | served |
+| `Var` | `is_staticmethod` (nodes.py:1546) | `nodes_mirror.py:458` via `_G2_TRACKED[Var]` | served |
+| `Var` | `is_classmethod` (nodes.py:1547) | `nodes_mirror.py:459` via `_G2_TRACKED[Var]` | served |
+| `Var` | `is_property` (nodes.py:1548) | `nodes_mirror.py:460` via `_G2_TRACKED[Var]` | served |
+| `Var` | `is_settable_property` (nodes.py:1549) | `nodes_mirror.py:461` via `_G2_TRACKED[Var]` | served |
+| `Var` | `is_classvar` (nodes.py:1550) | `nodes_mirror.py:462` via `_G2_TRACKED[Var]` | served |
+| `Var` | `is_abstract_var` (nodes.py:1551) | `nodes_mirror.py:463` via `_G2_TRACKED[Var]` | served |
+| `Var` | `is_final` (nodes.py:1552) | `nodes_mirror.py:464` via `_G2_TRACKED[Var]` | served |
+| `Var` | `is_index_var` (nodes.py:1553) | `nodes_mirror.py:465` via `_G2_TRACKED[Var]` | served |
+| `Var` | `final_unset_in_class` (nodes.py:1554) | `nodes_mirror.py:466` via `_G2_TRACKED[Var]` | served |
+| `Var` | `final_set_in_init` (nodes.py:1555) | `nodes_mirror.py:467` via `_G2_TRACKED[Var]` | served |
+| `Var` | `is_suppressed_import` (nodes.py:1556) | `nodes_mirror.py:468` via `_G2_TRACKED[Var]` | served |
+| `Var` | `explicit_self_type` (nodes.py:1557) | `nodes_mirror.py:469` via `_G2_TRACKED[Var]` | served |
+| `Var` | `from_module_getattr` (nodes.py:1558) | `nodes_mirror.py:470` via `_G2_TRACKED[Var]` | served |
+| `Var` | `has_explicit_value` (nodes.py:1559) | `nodes_mirror.py:471` via `_G2_TRACKED[Var]` | served |
+| `Var` | `allow_incompatible_override` (nodes.py:1560) | `nodes_mirror.py:472` via `_G2_TRACKED[Var]` | served |
+| `Var` | `invalid_partial_type` (nodes.py:1561) | `nodes_mirror.py:473` via `_G2_TRACKED[Var]` | served |
+| `Var` | `is_argument` (nodes.py:1562) | `nodes_mirror.py:474` via `_G2_TRACKED[Var]` | served |
 
 ### G3 symbol-table shadow (`symtables_mirror.py`, keyed by table+name)
 
@@ -408,10 +408,10 @@ account for minutes of difference.
 | G1 | `IndexExpr` | `base` | `mypy/checkstrformat.py:863` |
 | G1 | `IndexExpr` | `index` | `mypy/checkstrformat.py:858` |
 | G2 | `ImportFrom` | `id` | `mypy/build.py:232` |
-| G2 | `ImportFrom` | `names` | `mypy/build.py:4633`, `mypy/treetransform.py:156` |
+| G2 | `ImportFrom` | `names` | `mypy/build.py:4632`, `mypy/treetransform.py:156` |
 | G2 | `ImportAll` | `id` | `mypy/build.py:232` |
 | G2 | `Block` | `body` | `mypy/fastparse.py:852`, `mypy/nativeparse.py:1936`, `mypy/semanal_namedtuple.py:145` |
-| G2 | `ForStmt` | `body` | `mypy/fastparse.py:852`, `mypy/nativeparse.py:1936`, `mypy/server/aststrip.py:146` |
+| G2 | `ForStmt` | `body` | `mypy/fastparse.py:852`, `mypy/nativeparse.py:1936`, `mypy/server/aststrip.py:147` |
 | G2 | `ForStmt` | `is_async` | `mypy/fastparse.py:1329`, `mypy/nativeparse.py:471`, `mypy/treetransform.py:355` |
 | G2 | `WithStmt` | `target` | `mypy/semanal.py:5546` |
 | G2 | `WithStmt` | `unanalyzed_type` | `mypy/fastparse.py:1050`, `mypy/nativeparse.py:789`, `mypy/semanal.py:10221` |
@@ -421,12 +421,6 @@ account for minutes of difference.
 | G2 | `IfStmt` | `else_body` | `mypy/reachability.py:101` |
 | G2 | `TypeAliasStmt` | `name` | `mypy/stubutil.py:335` |
 | G2 | `TypeAliasStmt` | `type_args` | `mypy/semanal.py:10216` |
-| G2 | `FuncDef` | `is_decorated` | `mypy/fastparse.py:1062`, `mypy/nativeparse.py:496`, `mypy/plugins/common.py:320` |
-| G2 | `FuncDef` | `is_conditional` | `mypy/semanal.py:1459`, `mypy/treetransform.py:208` |
-| G2 | `FuncDef` | `is_trivial_body` | `mypy/semanal.py:1579` |
-| G2 | `FuncDef` | `is_trivial_self` | `mypy/semanal.py:1689` |
-| G2 | `FuncDef` | `is_invalid_redefinition` | `mypy/checker.py:2398` |
-| G2 | `FuncDef` | `is_mypy_only` | `mypy/nativeparse.py:2293`, `mypy/reachability.py:435` |
 | G2 | `ClassDef` | `name` | `mypy/plugins/dataclasses.py:357`, `mypy/renaming.py:585`, `mypy/stubutil.py:335` |
 | G2 | `ClassDef` | `defs` | `mypy/server/astmerge.py:212` |
 | G2 | `ClassDef` | `type_args` | `mypy/semanal.py:10216` |
@@ -442,12 +436,12 @@ account for minutes of difference.
 | G3 | `TypeInfo` | `deletable_attributes` | `mypy/semanal.py:6787` |
 | G3 | `TypeInfo` | `slots` | `mypy/plugins/attrs.py:1252`, `mypy/plugins/dataclasses.py:714`, `mypy/semanal.py:6846` |
 | G3 | `TypeInfo` | `inferring` | `mypy/typestate.py:130` |
-| G3 | `TypeInfo` | `tuple_type` | `mypy/checker.py:8469` |
+| G3 | `TypeInfo` | `tuple_type` | `mypy/checker.py:8517` |
 | G3 | `TypeInfo` | `special_alias` | `mypy/fixup.py:473` |
 | G3 | `TypeInfo` | `is_named_tuple` | `mypy/semanal_namedtuple.py:497` |
 | G3 | `TypeInfo` | `is_newtype` | `mypy/semanal_newtype.py:235` |
 | G3 | `TypeInfo` | `alt_promote` | `mypy/semanal_classprop.py:229` |
-| G3 | `TypeInfo` | `type_object_type` | `mypy/typeops.py:489` |
+| G3 | `TypeInfo` | `type_object_type` | `mypy/typeops.py:476` |
 | G3 | `TypeInfo` | `typeddict_data` | `mypy/semanal_typeddict.py:852` |
 
 <!-- END GENERATED -->
