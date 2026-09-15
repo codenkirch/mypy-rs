@@ -823,13 +823,52 @@ def _native_add_metaclass_classification(dec_expr: CallExpr) -> int | None:
         return None
 
 
-def _serialize_semanal_type(t: Type) -> bytes:
+# TEMP #1663 audit: per-seam wire call/byte counters (stripped before land).
+import os as _os
+
+_AUDIT_ON = bool(_os.environ.get("MYPY_TK_1663_AUDIT"))
+_AUDIT: dict[str, list[int]] = {}
+
+
+def _audit(name: str, nbytes: int) -> None:
+    e = _AUDIT.get(name)
+    if e is None:
+        _AUDIT[name] = [1, nbytes]
+    else:
+        e[0] += 1
+        e[1] += nbytes
+
+
+def _audit_ret(name: str, decided: object) -> None:
+    if _AUDIT_ON:
+        _audit(f"{name}:{'native' if decided is not None else 'defer'}", 0)
+
+
+if _AUDIT_ON:
+
+    def _audit_dump() -> None:
+        out = "".join(
+            f"[1663] {k} calls={v[0]} bytes={v[1]}\n" for k, v in sorted(_AUDIT.items())
+        )
+        _os.write(2, out.encode())
+
+    import atexit as _audit_atexit
+
+    _audit_atexit.register(_audit_dump)
+
+
+def _serialize_semanal_type(t: Type, _audit_name: str = "") -> bytes:
     fast = _encode_no_arg_instance(t, _SemanalWriteBuffer)
     if fast is not None:
+        if _AUDIT_ON and _audit_name:
+            _audit(_audit_name, len(fast))
         return fast
     buf = _SemanalWriteBuffer()
     t.write(buf)
-    return buf.getvalue()
+    out = buf.getvalue()
+    if _AUDIT_ON and _audit_name:
+        _audit(_audit_name, len(out))
+    return out
 
 
 class SemanticAnalyzer(
@@ -1749,7 +1788,7 @@ class SemanticAnalyzer(
         passed in as a bool (the rust_class_callable pattern); a failure
         to compute it defers the whole seam.
         """
-        self_type_wire: bytes | None = None
+        self_type: ProperType | None = None
         # Unanalyzed-arg kind: 0 = the unanalyzed elif did not apply (not
         # gathered / unanalyzed_type not callable), 1 = unanalyzed arg0 is
         # AnyType, 2 = unanalyzed arg0 is not AnyType.
@@ -1757,7 +1796,6 @@ class SemanticAnalyzer(
         expected_self: bool | None = None
         if func.has_self_or_cls_argument and func.arguments and isinstance(functype, CallableType):
             self_type = get_proper_type(functype.arg_types[0])
-            self_type_wire = _serialize_semanal_type(self_type)
             if has_self_type and not isinstance(self_type, AnyType):
                 if isinstance(func.unanalyzed_type, CallableType):
                     unanalyzed_arg0 = get_proper_type(func.unanalyzed_type.arg_types[0])
@@ -1772,9 +1810,11 @@ class SemanticAnalyzer(
                         or func.name == "__new__"
                     )
                     expected_self = self.is_expected_self_type(self_type, effective_is_class)
-        return _rust_classify_method_signature(
-            func, self_type_wire, unanalyzed_kind, expected_self, has_self_type
+        _res = _rust_classify_method_signature(
+            func, self_type, unanalyzed_kind, expected_self, has_self_type
         )
+        _audit_ret("method_signature", _res)
+        return _res
 
     def is_expected_self_type(self, typ: Type, is_classmethod: bool) -> bool:
         """Does this (analyzed or not) type represent the expected Self type for a method?"""
@@ -3620,13 +3660,14 @@ class SemanticAnalyzer(
             except (AssertionError, NotImplementedError, AttributeError):
                 return False
         result = _rust_classify_configure_bases(
-            [_serialize_semanal_type(base) for base in base_list],
+            [_serialize_semanal_type(base, "configure_bases") for base in base_list],
             is_newtypes,
             self.options.disallow_subclassing_any,
             self.options.disallow_any_unimported,
             self.options.disallow_any_explicit,
             self.is_typeshed_stub_file,
         )
+        _audit_ret("configure_bases", result)
         if result is None or len(result) != len(bases):
             return False
         info = defn.info
@@ -3886,7 +3927,7 @@ class SemanticAnalyzer(
                     metaclass_name = get_member_expr_fullname(metaclass_expr)
                 sym_node = None
                 metaclass_info: Node | None = None
-                var_type_wire = None
+                var_type: ProperType | None = None
                 if metaclass_name is not None:
                     sym = self.lookup_qualified(metaclass_name, metaclass_expr)
                     if sym is not None:
@@ -3902,10 +3943,11 @@ class SemanticAnalyzer(
                             if isinstance(target, Instance):
                                 metaclass_info = target.type
                     if isinstance(sym_node, Var) and sym_node.type is not None:
-                        var_type_wire = _serialize_semanal_type(get_proper_type(sym_node.type))
+                        var_type = get_proper_type(sym_node.type)
                 tag = _rust_classify_declared_metaclass(
-                    metaclass_name, sym_node, var_type_wire, metaclass_info
+                    metaclass_name, sym_node, var_type, metaclass_info
                 )
+                _audit_ret("declared_metaclass", tag)
                 if tag == _META_OK:
                     assert isinstance(metaclass_info, TypeInfo)
                     inst = fill_typevars(metaclass_info)
@@ -10287,8 +10329,9 @@ def make_any_non_explicit(t: Type) -> Type:
     """Replace all Any types within in with Any that has attribute 'explicit' set to False"""
     if _SEMANAL_HAS_KERNEL and _native_semanal_active:
         try:
-            data = _serialize_semanal_type(t)
+            data = _serialize_semanal_type(t, "make_any_non_explicit")
             result = _rust_make_any_non_explicit(data)
+            _audit_ret("make_any_non_explicit", result)
             if result is not None:
                 buf = _SemanalReadBuffer(bytes(result))
                 decoded = fixup_wire_type(_semanal_read_type(buf))
@@ -10314,8 +10357,9 @@ def make_any_non_unimported(t: Type) -> Type:
     """Replace all Any types that come from unimported types with special form Any."""
     if _SEMANAL_HAS_KERNEL and _native_semanal_active:
         try:
-            data = _serialize_semanal_type(t)
+            data = _serialize_semanal_type(t, "make_any_non_unimported")
             result = _rust_make_any_non_unimported(data)
+            _audit_ret("make_any_non_unimported", result)
             if result is not None:
                 buf = _SemanalReadBuffer(bytes(result))
                 decoded = fixup_wire_type(_semanal_read_type(buf))

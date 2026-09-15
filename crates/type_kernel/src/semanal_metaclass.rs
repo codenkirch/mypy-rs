@@ -27,7 +27,6 @@ use pyo3::prelude::*;
 use pyo3::types::{PyList, PyType};
 
 use crate::checker_visitor::rust_typeinfo_is_metaclass;
-use crate::wire::{read_type, ReadBuffer, Type};
 
 /// Decision tags for `get_declared_metaclass`, mirroring the sequential
 /// gate chain (semanal.py:3778-3835):
@@ -117,27 +116,23 @@ fn classify_declared_metaclass_inner(
     Some(META_OK)
 }
 
-fn decode_type(bytes: &[u8]) -> Option<Type> {
-    let mut buf = ReadBuffer::new(bytes);
-    read_type(&mut buf, None).ok()
-}
-
 /// `SemanticAnalyzer.get_declared_metaclass` decision head (semanal.py:3767).
 /// The shim performs `lookup_qualified` (Python state), the alias unwrap into
-/// `meta_info` (pure reads mirroring semanal.py:3808-3816), and the one wire
-/// serialization of a Var symbol's proper type. Rust owns the gate chain:
-/// the Var-Any arm decodes the wire bytes, the metaclass checks read the
+/// `meta_info` (pure reads mirroring semanal.py:3808-3816), and the
+/// `get_proper_type` of a Var symbol's type. Rust owns the gate chain:
+/// the Var-Any arm runs the `AnyType` isinstance on that live proper type
+/// (issue #1663: no wire bytes), the metaclass checks read the
 /// live TypeInfo via PyO3 (`tuple_type`, `is_metaclass` via
 /// `rust_typeinfo_is_metaclass`). Python applies the four `self.fail` calls,
 /// the `disallow_subclassing_any` option gate, and `fill_typevars`.
-/// Defers (`None`) on any unreadable attribute or undecodable wire bytes.
+/// Defers (`None`) on any unreadable attribute.
 #[pyfunction]
-#[pyo3(signature = (mc_name, sym_node, var_type_wire, meta_info))]
+#[pyo3(signature = (mc_name, sym_node, var_type, meta_info))]
 pub(crate) fn rust_classify_declared_metaclass(
     py: Python<'_>,
     mc_name: Option<String>,
     sym_node: Option<&PyAny>,
-    var_type_wire: Option<&[u8]>,
+    var_type: Option<&PyAny>,
     meta_info: Option<&PyAny>,
 ) -> PyResult<Option<i64>> {
     let nodes_mod = py.import("mypy.nodes")?;
@@ -153,15 +148,18 @@ pub(crate) fn rust_classify_declared_metaclass(
         Some(node) => node.is_instance(placeholder_cls).ok(),
         None => Some(false),
     };
-    // The shim passes None wire bytes when the Var has no type at all
-    // (`get_proper_type(None)` is not `AnyType`); garbage bytes defer.
+    // The shim passes None when the Var has no type at all
+    // (`get_proper_type(None)` is not `AnyType`).
     let var_any = if sym_is_var == Some(true) {
-        match var_type_wire {
+        match var_type {
             None => Some(false),
-            Some(bytes) => match decode_type(bytes) {
-                Some(Type::AnyType { .. }) => Some(true),
-                Some(_) => Some(false),
-                None => None,
+            Some(t) => {
+                let types_mod = py.import("mypy.types")?;
+                let any_cls: &PyType = types_mod.getattr("AnyType")?.downcast()?;
+                match t.is_instance(any_cls) {
+                    Ok(b) => Some(b),
+                    Err(_) => None,
+                }
             },
         }
     } else {

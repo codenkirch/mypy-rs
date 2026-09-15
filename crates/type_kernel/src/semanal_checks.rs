@@ -500,17 +500,18 @@ fn classify_method_signature(
 /// `func` is the live `FuncDef`; Rust reads `name`,
 /// `has_self_or_cls_argument`, `arguments` (non-empty), and the
 /// `CallableType` isinstance of `func.type` via PyO3. The shim passes the
-/// analyzed first-argument proper type serialized once to the wire format
-/// (the AnyType check), the unanalyzed-arg kind, the precomputed
-/// `is_expected_self_type` bool, and `has_self_type`. Returns
+/// live analyzed first-argument proper type (issue #1663: no wire bytes)
+/// and Rust runs the `AnyType` isinstance on it, plus the unanalyzed-arg
+/// kind, the precomputed `is_expected_self_type` bool, and
+/// `has_self_type`. Returns
 /// `Some((set_is_static, set_is_class, tag))` for every decided case and
-/// `None` to defer when a fact is unreadable or undecodable; the Python
-/// shim applies all writes and error emissions.
+/// `None` to defer when a fact is unreadable; the Python shim applies all
+/// writes and error emissions.
 #[pyfunction]
-#[pyo3(signature = (func, self_type_wire, unanalyzed_kind, expected_self, has_self_type))]
+#[pyo3(signature = (func, self_type, unanalyzed_kind, expected_self, has_self_type))]
 pub(crate) fn rust_classify_method_signature(
     func: &PyAny,
-    self_type_wire: Option<&[u8]>,
+    self_type: Option<&PyAny>,
     unanalyzed_kind: i64,
     expected_self: Option<bool>,
     has_self_type: bool,
@@ -559,10 +560,24 @@ pub(crate) fn rust_classify_method_signature(
         }
         Err(_) => return None,
     };
-    let self_type_is_any = match self_type_wire {
-        Some(bytes) => {
-            let t = crate::checkmember::decode_type(bytes)?;
-            Some(matches!(t, crate::wire::Type::AnyType { .. }))
+    let self_type_is_any = match self_type {
+        Some(t) => {
+            let types_mod = match func.py().import("mypy.types") {
+                Ok(m) => m,
+                Err(_) => return None,
+            };
+            let any_cls = match types_mod.getattr("AnyType") {
+                Ok(c) => c,
+                Err(_) => return None,
+            };
+            let any_cls: &PyType = match any_cls.downcast() {
+                Ok(c) => c,
+                Err(_) => return None,
+            };
+            match t.is_instance(any_cls) {
+                Ok(b) => Some(b),
+                Err(_) => None,
+            }
         }
         None => None,
     };
