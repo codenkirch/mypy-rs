@@ -93,6 +93,19 @@ Totals over the three shadowed families (213 slot rows):
      gap closed here), then does a class-namespace delete
      (`mypy/symtable_access.py:delete_names_entry`, whose shadow half is
      the G3 store). **This is the consumer this PR flips.**
+   - Post-audit note: the symbol-table *enumeration* half of the first
+     candidate landed separately as G3.1 (#1670, `rust_snapshot_symbol_table_shadow`,
+     `crates/type_kernel/src/symtable_mirror.rs`), flipping namespace
+     storage and order while the walk still reads the live node graph.
+     That does not change this table: the `snapshot_definition` arms it
+     feeds still read `Var.type` / `TypeInfo.bases` and stay floored.
+
+   Idiom note: this flip's deferral follows `subexpr_strip.rs`'s existing
+   contract (`Option`, `None` = the Python body stays), not the
+   store-level `ShadowGap` reason enum in `symtable_mirror.rs`, whose
+   purpose is to report *why* a namespace cannot be served. Reasons here
+   are counted Python-side (`nodes_mirror.count` → `aststrip.served` /
+   `aststrip.deferred`).
 
 ## What landed
 
@@ -341,62 +354,62 @@ account for minutes of difference.
 
 | Python class | slot (`mypy/nodes.py`) | home | verdict |
 |---|---|---|---|
-| `SymbolTableNode` | `kind` (nodes.py:5075) | `symtables_mirror.py:75` via `_FLAG_FIELDS` | served |
-| `SymbolTableNode` | `_node` (nodes.py:5076) | `symtables_mirror.py:82` via `_FLAG_FIELDS` | served |
+| `SymbolTableNode` | `kind` (nodes.py:5075) | `symtables_mirror.py:79` via `_FLAG_FIELDS` | served |
+| `SymbolTableNode` | `_node` (nodes.py:5076) | `symtables_mirror.py:86` via `_FLAG_FIELDS` | served |
 | `SymbolTableNode` | `_node_bytes` (nodes.py:5077) | - | AST wire (structural) |
 | `SymbolTableNode` | `_node_tag` (nodes.py:5078) | - | AST wire (structural) |
-| `SymbolTableNode` | `module_public` (nodes.py:5079) | `symtables_mirror.py:76` via `_FLAG_FIELDS` | served |
-| `SymbolTableNode` | `module_hidden` (nodes.py:5080) | `symtables_mirror.py:77` via `_FLAG_FIELDS` | served |
-| `SymbolTableNode` | `cross_ref` (nodes.py:5081) | `symtables_mirror.py:81` via `_FLAG_FIELDS` | served |
-| `SymbolTableNode` | `implicit` (nodes.py:5082) | `symtables_mirror.py:78` via `_FLAG_FIELDS` | served |
-| `SymbolTableNode` | `plugin_generated` (nodes.py:5083) | `symtables_mirror.py:79` via `_FLAG_FIELDS` | served |
-| `SymbolTableNode` | `no_serialize` (nodes.py:5084) | `symtables_mirror.py:80` via `_FLAG_FIELDS` | served |
+| `SymbolTableNode` | `module_public` (nodes.py:5079) | `symtables_mirror.py:80` via `_FLAG_FIELDS` | served |
+| `SymbolTableNode` | `module_hidden` (nodes.py:5080) | `symtables_mirror.py:81` via `_FLAG_FIELDS` | served |
+| `SymbolTableNode` | `cross_ref` (nodes.py:5081) | `symtables_mirror.py:85` via `_FLAG_FIELDS` | served |
+| `SymbolTableNode` | `implicit` (nodes.py:5082) | `symtables_mirror.py:82` via `_FLAG_FIELDS` | served |
+| `SymbolTableNode` | `plugin_generated` (nodes.py:5083) | `symtables_mirror.py:83` via `_FLAG_FIELDS` | served |
+| `SymbolTableNode` | `no_serialize` (nodes.py:5084) | `symtables_mirror.py:84` via `_FLAG_FIELDS` | served |
 | `SymbolTableNode` | `unfixed` (nodes.py:5085) | - | gap |
 | `SymbolTableNode` | `stored_info` (nodes.py:5086) | - | gap |
-| `TypeInfo` | `_fullname` (nodes.py:3752) | `symtables_mirror.py:95` via `_META_FIELDS` | served |
+| `TypeInfo` | `_fullname` (nodes.py:3752) | `symtables_mirror.py:98` via `_META_FIELDS` | served |
 | `TypeInfo` | `module_name` (nodes.py:3753) | - | gap |
 | `TypeInfo` | `defn` (nodes.py:3754) | - | gap |
-| `TypeInfo` | `mro` (nodes.py:3755) | `symtables_mirror.py:93` via `_META_FIELDS` | partial (marker only) |
+| `TypeInfo` | `mro` (nodes.py:3755) | `symtables_mirror.py:96` via `_META_FIELDS` | partial (marker only) |
 | `TypeInfo` | `_mro_refs` (nodes.py:3756) | - | gap |
-| `TypeInfo` | `bad_mro` (nodes.py:3757) | `symtables_mirror.py:98` via `_META_FIELDS` | served |
-| `TypeInfo` | `is_final` (nodes.py:3758) | `symtables_mirror.py:99` via `_META_FIELDS` | served |
-| `TypeInfo` | `is_disjoint_base` (nodes.py:3759) | `symtables_mirror.py:100` via `_META_FIELDS` | served |
-| `TypeInfo` | `declared_metaclass` (nodes.py:3760) | `symtables_mirror.py:108` via `_META_FIELDS` | partial (marker only) |
-| `TypeInfo` | `metaclass_type` (nodes.py:3761) | `symtables_mirror.py:94` via `_META_FIELDS` | partial (marker only) |
-| `TypeInfo` | `names` (nodes.py:3762) | `symtables_mirror.py:96` via `_META_FIELDS` | partial (marker only) |
+| `TypeInfo` | `bad_mro` (nodes.py:3757) | `symtables_mirror.py:101` via `_META_FIELDS` | served |
+| `TypeInfo` | `is_final` (nodes.py:3758) | `symtables_mirror.py:102` via `_META_FIELDS` | served |
+| `TypeInfo` | `is_disjoint_base` (nodes.py:3759) | `symtables_mirror.py:103` via `_META_FIELDS` | served |
+| `TypeInfo` | `declared_metaclass` (nodes.py:3760) | `symtables_mirror.py:111` via `_META_FIELDS` | partial (marker only) |
+| `TypeInfo` | `metaclass_type` (nodes.py:3761) | `symtables_mirror.py:97` via `_META_FIELDS` | partial (marker only) |
+| `TypeInfo` | `names` (nodes.py:3762) | `symtables_mirror.py:99` via `_META_FIELDS` | partial (marker only) |
 | `TypeInfo` | `is_abstract` (nodes.py:3763) | - | gap |
-| `TypeInfo` | `is_protocol` (nodes.py:3764) | `symtables_mirror.py:102` via `_META_FIELDS` | served |
-| `TypeInfo` | `runtime_protocol` (nodes.py:3765) | `symtables_mirror.py:107` via `_META_FIELDS` | served |
+| `TypeInfo` | `is_protocol` (nodes.py:3764) | `symtables_mirror.py:105` via `_META_FIELDS` | served |
+| `TypeInfo` | `runtime_protocol` (nodes.py:3765) | `symtables_mirror.py:110` via `_META_FIELDS` | served |
 | `TypeInfo` | `abstract_attributes` (nodes.py:3766) | - | gap |
 | `TypeInfo` | `deletable_attributes` (nodes.py:3767) | - | gap |
 | `TypeInfo` | `slots` (nodes.py:3768) | - | gap |
 | `TypeInfo` | `assuming` (nodes.py:3769) | - | AST wire (structural) |
 | `TypeInfo` | `assuming_proper` (nodes.py:3770) | - | AST wire (structural) |
 | `TypeInfo` | `inferring` (nodes.py:3771) | - | gap |
-| `TypeInfo` | `is_enum` (nodes.py:3772) | `symtables_mirror.py:101` via `_META_FIELDS` | served |
-| `TypeInfo` | `fallback_to_any` (nodes.py:3773) | `symtables_mirror.py:105` via `_META_FIELDS` | partial (marker only) |
-| `TypeInfo` | `meta_fallback_to_any` (nodes.py:3774) | `symtables_mirror.py:106` via `_META_FIELDS` | partial (marker only) |
-| `TypeInfo` | `type_vars` (nodes.py:3775) | `symtables_mirror.py:109` via `_META_FIELDS` | partial (marker only) |
+| `TypeInfo` | `is_enum` (nodes.py:3772) | `symtables_mirror.py:104` via `_META_FIELDS` | served |
+| `TypeInfo` | `fallback_to_any` (nodes.py:3773) | `symtables_mirror.py:108` via `_META_FIELDS` | partial (marker only) |
+| `TypeInfo` | `meta_fallback_to_any` (nodes.py:3774) | `symtables_mirror.py:109` via `_META_FIELDS` | partial (marker only) |
+| `TypeInfo` | `type_vars` (nodes.py:3775) | `symtables_mirror.py:112` via `_META_FIELDS` | partial (marker only) |
 | `TypeInfo` | `has_param_spec_type` (nodes.py:3776) | - | AST wire (structural) |
-| `TypeInfo` | `bases` (nodes.py:3777) | `symtables_mirror.py:92` via `_META_FIELDS` | partial (marker only) |
+| `TypeInfo` | `bases` (nodes.py:3777) | `symtables_mirror.py:95` via `_META_FIELDS` | partial (marker only) |
 | `TypeInfo` | `_promote` (nodes.py:3778) | - | AST wire (structural) |
 | `TypeInfo` | `tuple_type` (nodes.py:3779) | - | gap |
 | `TypeInfo` | `special_alias` (nodes.py:3780) | - | gap |
 | `TypeInfo` | `is_named_tuple` (nodes.py:3781) | - | gap |
 | `TypeInfo` | `typeddict_type` (nodes.py:3782) | - | AST wire (structural) |
 | `TypeInfo` | `is_newtype` (nodes.py:3783) | - | gap |
-| `TypeInfo` | `is_intersection` (nodes.py:3784) | `symtables_mirror.py:104` via `_META_FIELDS` | served |
+| `TypeInfo` | `is_intersection` (nodes.py:3784) | `symtables_mirror.py:107` via `_META_FIELDS` | served |
 | `TypeInfo` | `metadata` (nodes.py:3785) | - | AST wire (structural) |
 | `TypeInfo` | `alt_promote` (nodes.py:3786) | - | gap |
 | `TypeInfo` | `has_type_var_tuple_type` (nodes.py:3787) | - | AST wire (structural) |
 | `TypeInfo` | `type_var_tuple_prefix` (nodes.py:3788) | - | AST wire (structural) |
 | `TypeInfo` | `type_var_tuple_suffix` (nodes.py:3789) | - | AST wire (structural) |
-| `TypeInfo` | `self_type` (nodes.py:3790) | `symtables_mirror.py:110` via `_META_FIELDS` | partial (marker only) |
-| `TypeInfo` | `dataclass_transform_spec` (nodes.py:3791) | `symtables_mirror.py:111` via `_META_FIELDS` | partial (marker only) |
-| `TypeInfo` | `is_type_check_only` (nodes.py:3792) | `symtables_mirror.py:103` via `_META_FIELDS` | served |
-| `TypeInfo` | `deprecated` (nodes.py:3793) | `symtables_mirror.py:112` via `_META_FIELDS` | served |
+| `TypeInfo` | `self_type` (nodes.py:3790) | `symtables_mirror.py:113` via `_META_FIELDS` | partial (marker only) |
+| `TypeInfo` | `dataclass_transform_spec` (nodes.py:3791) | `symtables_mirror.py:114` via `_META_FIELDS` | partial (marker only) |
+| `TypeInfo` | `is_type_check_only` (nodes.py:3792) | `symtables_mirror.py:106` via `_META_FIELDS` | served |
+| `TypeInfo` | `deprecated` (nodes.py:3793) | `symtables_mirror.py:115` via `_META_FIELDS` | served |
 | `TypeInfo` | `type_object_type` (nodes.py:3794) | - | gap |
-| `TypeInfo` | `default_depends` (nodes.py:3795) | `symtables_mirror.py:113` via `_META_FIELDS` | partial (marker only) |
+| `TypeInfo` | `default_depends` (nodes.py:3795) | `symtables_mirror.py:116` via `_META_FIELDS` | partial (marker only) |
 | `TypeInfo` | `typeddict_data` (nodes.py:3796) | - | gap |
 
 ### Gap ledger (Python write sites outside `mypy/nodes.py`)
@@ -408,7 +421,7 @@ account for minutes of difference.
 | G1 | `IndexExpr` | `base` | `mypy/checkstrformat.py:863` |
 | G1 | `IndexExpr` | `index` | `mypy/checkstrformat.py:858` |
 | G2 | `ImportFrom` | `id` | `mypy/build.py:232` |
-| G2 | `ImportFrom` | `names` | `mypy/build.py:4632`, `mypy/treetransform.py:156` |
+| G2 | `ImportFrom` | `names` | `mypy/build.py:4647`, `mypy/treetransform.py:156` |
 | G2 | `ImportAll` | `id` | `mypy/build.py:232` |
 | G2 | `Block` | `body` | `mypy/fastparse.py:852`, `mypy/nativeparse.py:1936`, `mypy/semanal_namedtuple.py:145` |
 | G2 | `ForStmt` | `body` | `mypy/fastparse.py:852`, `mypy/nativeparse.py:1936`, `mypy/server/aststrip.py:147` |
