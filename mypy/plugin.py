@@ -816,6 +816,21 @@ class Plugin(CommonPluginApi):
         """
         return None
 
+    def declare_hook_fullnames(self) -> dict[str, frozenset[str]] | None:
+        """Declare the enumerable hook-fullname surface of this plugin.
+
+        Returns a mapping from hook-method name (e.g. ``"get_function_hook"``)
+        to the set of fullnames that the plugin's corresponding ``get_*_hook``
+        method may match. The union over all plugins feeds the native
+        ``PluginHookRegistry`` so that ``plugin_hook_known_absent`` can
+        short-circuit without crossing into Python.
+
+        Return ``None`` when the plugin's hooks are not statically enumerable
+        (e.g. they match by runtime pattern). A single ``None`` from any
+        child of a ``ChainedPlugin`` forces the whole chain to defer.
+        """
+        return None
+
 
 T = TypeVar("T")
 
@@ -934,3 +949,21 @@ class ChainedPlugin(Plugin):
             if hook is not None:
                 return hook
         return None
+
+    def declare_hook_fullnames(self) -> dict[str, frozenset[str]] | None:
+        """Union the enumerable surfaces of all child plugins.
+
+        Returns ``None`` when any child returns ``None`` (non-enumerable),
+        forcing the native registry to defer all lookups to Python.
+        """
+        result: dict[str, frozenset[str]] = {}
+        for plugin in self._plugins:
+            declared = plugin.declare_hook_fullnames()
+            if declared is None:
+                return None
+            for kind, names in declared.items():
+                if kind in result:
+                    result[kind] = result[kind] | names
+                else:
+                    result[kind] = names
+        return result

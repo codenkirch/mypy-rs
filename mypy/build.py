@@ -2184,18 +2184,18 @@ class BuildManager:
     def _build_plugin_hook_registry(self) -> None:
         """Build the Stage 4 plugin-hook snapshot and install it.
 
-        Collects the DefaultPlugin's call-hook fullnames (the four
-        ``get_*_hook`` methods, all literal equality / finite-set
-        membership) into a Rust ``PluginHookRegistry`` so that
+        Collects each plugin's declared hook fullnames
+        (``Plugin.declare_hook_fullnames``) into a Rust
+        ``PluginHookRegistry`` so that
         ``checkexpr.plugin_call_hook_known_absent`` can short-circuit the
-        Python ``Plugin.get_*_hook`` chain with one Rust ``HashSet::contains``.
+        Python ``Plugin.get_*_hook`` chain with one Rust
+        ``HashSet::contains``.
 
-        When user plugins are present (``len(self.plugin._plugins) > 1``),
-        the registry is installed with ``has_user_plugins=True`` so all
-        lookups defer to Python (user-plugin hooks are not enumerable
-        without a declaration API). No-op unless
-        ``Options.native_type_kernel`` is set and the ``type_kernel``
-        extension is importable.
+        When any plugin's ``declare_hook_fullnames`` returns ``None``
+        (non-enumerable hooks), the registry is installed with
+        ``has_user_plugins=True`` so all lookups defer to Python. No-op
+        unless ``Options.native_type_kernel`` is set and the
+        ``type_kernel`` extension is importable.
         """
         if not self.options.native_type_kernel:
             return
@@ -2212,17 +2212,20 @@ class BuildManager:
                 ) from None
             return
         from mypy.checkexpr import _set_native_plugin_hook_registry
-        from mypy.plugins.default import DEFAULT_HOOK_FULLNAMES_BY_KIND
 
         # self.plugin is always a ChainedPlugin after __init__ (a bare
         # DefaultPlugin is wrapped in ChainedPlugin(options, [plugin])).
         # _plugins is ordered custom-plugins-first, DefaultPlugin last.
-        plugins = self.plugin._plugins
-        has_user_plugins = len(plugins) > 1
-        registry = _type_kernel.PluginHookRegistry(
-            {kind: list(names) for kind, names in DEFAULT_HOOK_FULLNAMES_BY_KIND.items()}
-        )
-        _set_native_plugin_hook_registry(registry, has_user_plugins, plugins)
+        declared = self.plugin.declare_hook_fullnames()
+        if declared is None:
+            has_user_plugins = True
+            registry = _type_kernel.PluginHookRegistry({})
+        else:
+            has_user_plugins = False
+            registry = _type_kernel.PluginHookRegistry(
+                {kind: list(names) for kind, names in declared.items()}
+            )
+        _set_native_plugin_hook_registry(registry, has_user_plugins, self.plugin._plugins)
 
     def dump_stats(self) -> None:
         if self.stats_enabled:

@@ -328,6 +328,9 @@ class DefaultPlugin(Plugin):
             )
         return None
 
+    def declare_hook_fullnames(self) -> dict[str, frozenset[str]] | None:
+        return DEFAULT_HOOK_FULLNAMES_BY_KIND
+
 
 def len_callback(ctx: FunctionContext) -> Type:
     """Infer a better return type for 'len'."""

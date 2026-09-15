@@ -51,6 +51,13 @@ class ProperTypePlugin(Plugin):
             return proper_types_hook
         return None
 
+    def declare_hook_fullnames(self) -> dict[str, frozenset[str]] | None:
+        return {
+            "get_function_hook": frozenset(
+                {"builtins.isinstance", "mypy.types.get_proper_type", "mypy.types.get_proper_types"}
+            )
+        }
+
 
 def isinstance_proper_hook(ctx: FunctionContext) -> Type:
     if len(ctx.arg_types) != 2 or not ctx.arg_types[1]:
