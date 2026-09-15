@@ -112,6 +112,17 @@ pub(crate) fn handle_for(obj: &PyAny) -> Option<u64> {
     })
 }
 
+/// Mint (or return) the handle a *registering* seam should store an object
+/// under: stable-first, raw as the fallback.
+///
+/// The stable layer outlives a preserving reset (#1528), so a daemon recheck
+/// re-registers an astmerge-preserved object under the handle it already had.
+/// Every store that pins a live object per handle uses this rule; it is one
+/// function rather than a convention so the two layers cannot drift.
+pub(crate) fn handle_for_registration(obj: &PyAny) -> Option<u64> {
+    handle_for_stable(obj).or_else(|| handle_for(obj))
+}
+
 /// Look up an existing handle without minting one: the stable layer first,
 /// then the raw layer. `None` means the object has never been registered on
 /// this thread (or both layers were reset).

@@ -206,11 +206,12 @@ pub(crate) fn put(
             "typeview: args and arg_handles must have equal length",
         ));
     }
-    let handle = identity::handle_for_stable(obj)
-        .or_else(|| identity::handle_for(obj))
+    let handle = identity::handle_for_registration(obj)
         .ok_or_else(|| PyValueError::new_err("typeview: object has no identity handle"))?;
-    with_store(|store| {
-        store.by_handle.insert(
+    // A re-registration displaces the previous entry and pin; both are
+    // dropped after the borrow is released (see `reset`).
+    let (replaced, replaced_pin) = with_store(|store| {
+        let replaced = store.by_handle.insert(
             handle,
             InstanceView {
                 fullname,
@@ -221,8 +222,11 @@ pub(crate) fn put(
                 stamp,
             },
         );
-        store.pins.insert(handle, Py::from(obj));
+        let replaced_pin = store.pins.insert(handle, Py::from(obj));
+        (replaced, replaced_pin)
     });
+    drop(replaced);
+    drop(replaced_pin);
     Ok(handle)
 }
 
@@ -256,13 +260,16 @@ pub(crate) fn args_tuple(py: Python<'_>, handle: u64, stamp: u64) -> Option<Py<P
 /// the next registration re-mints it, so a stale pin cannot keep a retyped
 /// instance alive under an old fullname.
 pub(crate) fn touch(handle: u64) -> bool {
-    let (present, pin) = with_store(|store| {
-        let present = store.by_handle.remove(&handle).is_some();
+    let (entry, pin) = with_store(|store| {
+        let entry = store.by_handle.remove(&handle);
         let pin = store.pins.remove(&handle);
-        (present, pin)
+        (entry, pin)
     });
-    // Dropped after the borrow is released: releasing the last reference can
-    // run a Python deallocator that re-enters the store.
+    // Both are dropped after the borrow is released: the entry owns the
+    // pinned argument objects, so releasing the last reference here can run a
+    // Python deallocator that re-enters the store.
+    let present = entry.is_some();
+    drop(entry);
     drop(pin);
     present
 }
@@ -271,17 +278,21 @@ pub(crate) fn touch(handle: u64) -> bool {
 /// owned here: `rust_mirror_reset` alone resets the handle registry, so view
 /// state cannot invalidate handles other seams hold.
 pub(crate) fn reset() -> usize {
-    let (entries, pins) = with_store(|store| {
-        let entries = store.by_handle.len();
+    let (count, entries, pins) = with_store(|store| {
+        let count = store.by_handle.len();
+        // Drained, not cleared: each entry owns its pinned argument objects,
+        // and dropping one inside the borrow can run a Python deallocator
+        // that re-enters the store (same rule as the pins below).
+        let entries: Vec<InstanceView> = store.by_handle.drain().map(|(_, e)| e).collect();
         let pins: Vec<Py<PyAny>> = store.pins.drain().map(|(_, pin)| pin).collect();
-        store.by_handle.clear();
         store.encodes = 0;
         store.defers = 0;
         store.read_routes = 0;
-        (entries, pins)
+        (count, entries, pins)
     });
+    drop(entries);
     drop(pins);
-    entries
+    count
 }
 
 pub(crate) fn entry_count() -> usize {
@@ -673,6 +684,88 @@ mod typeview_tests {
             assert_eq!(reset(), 1);
             assert_eq!(entry_count(), 0);
             assert_eq!(stats(), (0, 0, 0));
+        });
+    }
+
+    #[test]
+    fn test_reset_releases_the_entry_argument_pins() {
+        with_py(|py| {
+            reset();
+            let child = instance(py, "builtins.int");
+            let child_ref: Py<PyAny> = child.clone_ref(py);
+            let parent = instance(py, "builtins.list");
+            put(
+                parent.as_ref(py),
+                "builtins.list".into(),
+                vec![child],
+                vec![0],
+                true,
+                true,
+                1,
+            )
+            .unwrap();
+            let during = child_ref.as_ref(py).get_refcnt();
+            reset();
+            // The entry was drained and dropped after the borrow, so its copy
+            // of the object is gone: the refcount falls by exactly one.
+            assert_eq!(child_ref.as_ref(py).get_refcnt(), during - 1);
+        });
+    }
+
+    #[test]
+    fn test_touch_releases_the_entry_argument_pins() {
+        with_py(|py| {
+            reset();
+            let child = instance(py, "builtins.int");
+            let child_ref: Py<PyAny> = child.clone_ref(py);
+            let parent = instance(py, "builtins.list");
+            let handle = put(
+                parent.as_ref(py),
+                "builtins.list".into(),
+                vec![child],
+                vec![0],
+                true,
+                true,
+                1,
+            )
+            .unwrap();
+            let during = child_ref.as_ref(py).get_refcnt();
+            assert!(touch(handle));
+            assert_eq!(child_ref.as_ref(py).get_refcnt(), during - 1);
+        });
+    }
+
+    #[test]
+    fn test_re_registration_releases_the_displaced_entry() {
+        with_py(|py| {
+            reset();
+            let first = instance(py, "builtins.int");
+            let first_ref: Py<PyAny> = first.clone_ref(py);
+            let parent = instance(py, "builtins.list");
+            put(
+                parent.as_ref(py),
+                "builtins.list".into(),
+                vec![first],
+                vec![0],
+                true,
+                true,
+                1,
+            )
+            .unwrap();
+            let during = first_ref.as_ref(py).get_refcnt();
+            let second = instance(py, "builtins.int");
+            put(
+                parent.as_ref(py),
+                "builtins.list".into(),
+                vec![second],
+                vec![0],
+                true,
+                true,
+                1,
+            )
+            .unwrap();
+            // The re-registration displaced and dropped the first entry's copy.
+            assert_eq!(first_ref.as_ref(py).get_refcnt(), during - 1);
         });
     }
 

@@ -114,8 +114,7 @@ pub(crate) fn register(
     // Stable-first (issue #1528): a stable handle outlives a preserving
     // reset, so a daemon recheck re-registers an astmerge-preserved
     // object under the handle it already had. Raw stays the fallback.
-    let handle = identity::handle_for_stable(obj)
-        .or_else(|| identity::handle_for(obj))
+    let handle = identity::handle_for_registration(obj)
         .ok_or_else(|| PyValueError::new_err("mirror: object has no identity handle"))?;
     with_mirror(|m| {
         // Unlink the previous child list (kept in children_of) before
