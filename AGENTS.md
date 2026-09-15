@@ -150,9 +150,14 @@ worse than no probe: read its exit status before reading its numbers.
 Heavy ops (cargo build/test, pytest, self-check) run through the weighted pool:
 `/private/tmp/mypy-rs-sem.sh run 1 <build>` for a build, `run 2 <corpus>` for a
 corpus run. Three slots, build = 1, corpus = 2, so a corpus and a build overlap
-while two corpora never do. The flat `/private/tmp/mypy-rs-heavy.lock` mutex is
-retired: a build used to wait out an entire corpus run behind it. The pool still
-honours the legacy lock for a transition period.
+while two corpora never do. Class by cost, not by whether the command is pytest:
+a single suite file is build-class (`run 1`, one slot, never queues behind a
+corpus), while `testcheck`, a self-check or a multi-file run is `run 2`. The
+flat `/private/tmp/mypy-rs-heavy.lock` mutex is retired: a build used to wait
+out an entire corpus run behind it. The pool still honours the legacy lock for a
+transition period, and acquiring it is a race rather than a queue, so a
+mis-classed command starves (a 9-second suite was once queued 24 minutes behind
+fourteen `run 2` waiters).
 
 Review: T1/T2 use `ocr delegate preview|rule` plus an independent reader (never
 the author alone, since self-review is not review); T3 and the wave diff use

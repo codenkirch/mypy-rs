@@ -52,6 +52,10 @@ and the source-tree guard printed the worktree path for `mypy`.
 
 - `cargo test -p mypy-type-kernel` -> `test result: ok. 2838 passed; 0 failed;
   11 ignored; 0 measured; 0 filtered out; finished in 0.16s`
+- `testtypes -n0` -> `3905 passed, 7 skipped in 7.28s`. The suite's native
+  classes are gated on `_NATIVE_WIRE_ENABLED = _env_gate("TEST_NATIVE_TYPE_KERNEL")
+  and _HAS_TYPE_KERNEL_WIRE`, so the same file without that env var reports
+  `354 passed, 3558 skipped` and proves nothing about the native seams.
 - `testcheck -n0` -> `8198 passed, 15 skipped, 7 xfailed in 684.41s (0:11:24)`,
   identical to the CI `parity` line; the ledger's older 8,144/69/7 figure came
   from the `TEST_NATIVE_PARSER=1 TEST_NATIVE_RESOLVER=1` differential form
@@ -102,6 +106,11 @@ not quiet.
 - **Numeric claims need their head and their load.** Wall-clock numbers carry
   `uptime` and a provisional mark; load-invariant counters (compiled units,
   call and defer totals) are the primary evidence on this host.
+- **Class heavy ops by cost, and expect the pool to be a race.** Pool
+  acquisition is not FIFO: a 9-second single-file suite classed as `run 2` sat
+  behind fourteen waiters and the legacy lock for 24 minutes, while the same
+  command as `run 1` acquired a slot and finished in 51 seconds. A single suite
+  file is build-class; only a real corpus is `run 2`.
 
 ### Queue for the next wave
 
