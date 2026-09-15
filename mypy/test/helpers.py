@@ -389,6 +389,7 @@ _NATIVE_ENV_MODULE_PROBES = {
     "TEST_NATIVE_RESOLVER": ("module_resolver", "NativeResolver"),
     "TEST_NATIVE_TYPE_KERNEL": ("type_kernel", "erase_type"),
     "TEST_NATIVE_AST_MIRROR": ("type_kernel", "rust_node_mirror_entry_count"),
+    "TEST_NATIVE_SYMTABLE_READ_FLIP": ("type_kernel", "rust_snapshot_symbol_table_shadow"),
 }
 
 
@@ -485,6 +486,13 @@ def parse_options(
     # Phase G3.0a (#1581) namespace shadow is capture-only for the same
     # reason: the option installs the SymbolTable class hooks only.
     options.native_symtable_mirror = _env_gate("TEST_NATIVE_SYMTABLE_MIRROR")
+    # Phase G3.1 (#1670) read flip is a differential gate on that shadow:
+    # reads engage only where the shadow captured the table exactly, and
+    # the verify gate runs the flip-off path alongside (implies the flip).
+    options.native_symtable_read_flip_verify = _env_gate("TEST_NATIVE_SYMTABLE_READ_FLIP_VERIFY")
+    options.native_symtable_read_flip = _env_gate("TEST_NATIVE_SYMTABLE_READ_FLIP") or (
+        options.native_symtable_read_flip_verify
+    )
     options.native_cache_data = _env_gate("TEST_NATIVE_CACHE_DATA")
     _ensure_native_modules_available()
 

@@ -20,6 +20,15 @@
 //! 4. **Identity is not owned here.** `reset` clears entries and pins
 //!    only; `identity::reset` stays with `rust_mirror_reset` (mirror.rs)
 //!    so namespace-shadow state cannot invalidate handles other seams hold.
+//! 5. **Namespace order.** Each record carries the insertion ordinal of
+//!    its name (assigned on insert, kept on replace, released on delete),
+//!    which reproduces `dict.items()` order for insert, replace, delete
+//!    and re-insert. That is what lets G3.1 serve a read from here.
+//! 6. **The read gate is the consistency invariant (#1670).** A read is
+//!    served only when `entry_count(owner) == len(owner.names)`;
+//!    `entries_if_mirrored` returns the `ShadowGap` reason otherwise, so a
+//!    namespace the capture could not see (a C-level `dict` write, a
+//!    never-adopted table) never answers a read.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -36,6 +45,7 @@ use crate::identity;
 pub(crate) struct SymEntry {
     pub(crate) generation: u64,
     pub(crate) seq: u64,
+    pub(crate) order: u64,
     pub(crate) node_handle: u64,
     pub(crate) kind: i64,
     pub(crate) node_fullname: Option<String>,
@@ -45,6 +55,37 @@ pub(crate) struct SymEntry {
     pub(crate) plugin_generated: bool,
     pub(crate) no_serialize: bool,
     pub(crate) cross_ref: Option<String>,
+}
+
+/// Why the store cannot stand in for a live table (G3.1 read flip).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum ShadowGap {
+    /// The table was never adopted (no `put` ever recorded it).
+    NoHandle,
+    /// Fewer records than live entries: a write bypassed the capture.
+    LenShort,
+    /// More records than live entries: a delete bypassed the capture.
+    LenLong,
+    /// A record's pinned symbol is gone (defensive; cannot happen while
+    /// the pins are held).
+    NoPin,
+}
+
+/// G3.1 read-flip evidence counters. Process lifetime: `reset` drops
+/// entries and pins but keeps these, so a corpus run accumulates them
+/// across build boundaries (tests clear them explicitly).
+#[derive(Default)]
+pub(crate) struct FlipCounts {
+    /// Tables consulted through the mirror gate (top level and nested).
+    pub(crate) tables_looked: u64,
+    /// Tables the store mirrored exactly, read in insertion order.
+    pub(crate) tables_mirrored: u64,
+    /// Entries handed to the consumer from the store.
+    pub(crate) entries_mirrored: u64,
+    pub(crate) defer_no_handle: u64,
+    pub(crate) defer_len_short: u64,
+    pub(crate) defer_len_long: u64,
+    pub(crate) defer_no_pin: u64,
 }
 
 /// The ref flags passed on every put/refresh.
@@ -88,8 +129,13 @@ struct SymStore {
     pins: HashMap<u64, Py<PyAny>>,
     /// G3.0c: TypeInfo meta-field records keyed by the TypeInfo handle.
     meta: HashMap<u64, MetaEntry>,
+    /// G3.1: read-flip evidence counters.
+    flip: FlipCounts,
     next_generation: u64,
     next_seq: u64,
+    /// G3.1: monotonic namespace insertion ordinal (never reused while
+    /// the entry lives, so ordering is a total order).
+    next_order: u64,
 }
 
 impl SymStore {
@@ -100,8 +146,10 @@ impl SymStore {
             by_node: HashMap::new(),
             pins: HashMap::new(),
             meta: HashMap::new(),
+            flip: FlipCounts::default(),
             next_generation: 0,
             next_seq: 0,
+            next_order: 0,
         }
     }
 
@@ -150,15 +198,27 @@ pub(crate) fn put(
         store.next_seq += 1;
         let seq = store.next_seq;
         let key = (owner_handle, name.to_string());
-        if let Some(old) = store.entries.get(&key) {
-            let old_node = old.node_handle;
-            if old_node != node_handle {
-                unlink_node(store, old_node, owner_handle, name);
+        // Namespace order follows `dict` semantics: a replace keeps the
+        // original position, a delete releases it and a re-insert lands
+        // at the end (fresh ordinal).
+        let order = match store.entries.get(&key) {
+            Some(old) => {
+                let old_order = old.order;
+                let old_node = old.node_handle;
+                if old_node != node_handle {
+                    unlink_node(store, old_node, owner_handle, name);
+                }
+                old_order
             }
-        }
+            None => {
+                store.next_order += 1;
+                store.next_order
+            }
+        };
         let entry = SymEntry {
             generation,
             seq,
+            order,
             node_handle,
             kind: flags.kind,
             node_fullname: flags.node_fullname,
@@ -243,6 +303,7 @@ pub(crate) fn reset() -> usize {
         store.meta.clear();
         store.next_generation = 0;
         store.next_seq = 0;
+        store.next_order = 0;
         (entries, pins)
     });
     // Drop the pins only after the guard is released: releasing the last
@@ -254,18 +315,104 @@ pub(crate) fn reset() -> usize {
 /// Live entry count for one owner.
 pub(crate) fn entry_count(owner: &PyAny) -> PyResult<usize> {
     let owner_handle = handle_or_error(owner)?;
-    Ok(with_store(|store| {
+    Ok(entry_count_of(owner_handle))
+}
+
+/// Entry count for a handle already known to the caller (no minting).
+pub(crate) fn entry_count_of(owner_handle: u64) -> usize {
+    with_store(|store| {
         store
             .entries
             .keys()
             .filter(|(handle, _)| *handle == owner_handle)
             .count()
-    }))
+    })
 }
 
 /// Live entry count across all owners.
 pub(crate) fn total_entry_count() -> usize {
     with_store(|store| store.entries.len())
+}
+
+fn bump_flip(f: impl FnOnce(&mut FlipCounts)) {
+    with_store(|store| f(&mut store.flip));
+}
+
+/// G3.1 read-flip read path: the `(name, symbol)` pairs the store holds
+/// for `table`, in the namespace's insertion order, or the reason the
+/// store cannot stand in for the live table.
+///
+/// The gate is the shadow-consistency invariant the G3 brief pins:
+/// `entry_count(owner) == len(owner.names)`. A table the store does not
+/// mirror exactly (never adopted, a write or delete the class patch could
+/// not see, a lost pin) never serves a read, so a read flip can only ever
+/// return what the live table would have returned. Ordering is the
+/// namespace ordinal, which reproduces `dict.items()` for insert,
+/// replace, delete and re-insert.
+pub(crate) fn entries_if_mirrored(
+    py: Python<'_>,
+    table: &PyAny,
+) -> Result<Vec<(String, Py<PyAny>)>, ShadowGap> {
+    bump_flip(|c| c.tables_looked += 1);
+    let Some(handle) = identity::handle_of(table) else {
+        bump_flip(|c| c.defer_no_handle += 1);
+        return Err(ShadowGap::NoHandle);
+    };
+    let Ok(table_len) = table.len() else {
+        bump_flip(|c| c.defer_no_handle += 1);
+        return Err(ShadowGap::NoHandle);
+    };
+    let triples: Vec<(u64, String, u64)> = with_store(|store| {
+        let mut triples: Vec<(u64, String, u64)> = store
+            .entries
+            .iter()
+            .filter(|((owner, _), _)| *owner == handle)
+            .map(|((_, name), entry)| (entry.order, name.clone(), entry.node_handle))
+            .collect();
+        triples.sort_by_key(|(order, _, _)| *order);
+        triples
+    });
+    if triples.len() < table_len {
+        bump_flip(|c| c.defer_len_short += 1);
+        return Err(ShadowGap::LenShort);
+    }
+    if triples.len() > table_len {
+        bump_flip(|c| c.defer_len_long += 1);
+        return Err(ShadowGap::LenLong);
+    }
+    let mut out: Vec<(String, Py<PyAny>)> = Vec::with_capacity(triples.len());
+    for (_, name, node_handle) in triples {
+        match with_store(|store| store.pins.get(&node_handle).map(|pin| pin.clone_ref(py))) {
+            Some(symbol) => out.push((name, symbol)),
+            None => {
+                bump_flip(|c| c.defer_no_pin += 1);
+                return Err(ShadowGap::NoPin);
+            }
+        }
+    }
+    bump_flip(|c| {
+        c.tables_mirrored += 1;
+        c.entries_mirrored += out.len() as u64;
+    });
+    Ok(out)
+}
+
+/// Read-flip counters snapshot (evidence).
+pub(crate) fn flip_counts() -> FlipCounts {
+    with_store(|store| FlipCounts {
+        tables_looked: store.flip.tables_looked,
+        tables_mirrored: store.flip.tables_mirrored,
+        entries_mirrored: store.flip.entries_mirrored,
+        defer_no_handle: store.flip.defer_no_handle,
+        defer_len_short: store.flip.defer_len_short,
+        defer_len_long: store.flip.defer_len_long,
+        defer_no_pin: store.flip.defer_no_pin,
+    })
+}
+
+/// Drop the read-flip counters (tests and per-run evidence boundaries).
+pub(crate) fn flip_counts_reset() {
+    with_store(|store| store.flip = FlipCounts::default());
 }
 
 // ---- pyfunction wrappers ----
@@ -453,6 +600,32 @@ pub(crate) fn rust_symtable_mirror_reset() -> usize {
 #[pyfunction]
 pub(crate) fn rust_symtable_mirror_handle_of(obj: &PyAny) -> Option<u64> {
     identity::handle_of(obj)
+}
+
+/// G3.1 read-flip evidence counters: tables consulted / mirrored from
+/// the store, entries served, and the per-reason defer counts of the
+/// mirror gate. Process lifetime (reset keeps them).
+#[pyfunction]
+pub(crate) fn rust_symtable_mirror_flip_counts<'py>(py: Python<'py>) -> PyResult<&'py PyDict> {
+    let counts = flip_counts();
+    let dict = PyDict::new(py);
+    dict.set_item("tables_looked", counts.tables_looked)?;
+    dict.set_item("tables_mirrored", counts.tables_mirrored)?;
+    dict.set_item("entries_mirrored", counts.entries_mirrored)?;
+    dict.set_item("defer_no_handle", counts.defer_no_handle)?;
+    dict.set_item("defer_len_short", counts.defer_len_short)?;
+    dict.set_item("defer_len_long", counts.defer_len_long)?;
+    dict.set_item("defer_no_pin", counts.defer_no_pin)?;
+    Ok(dict)
+}
+
+/// Drop the read-flip counters; returns the tables-mirrored count that
+/// was cleared (evidence receipt).
+#[pyfunction]
+pub(crate) fn rust_symtable_mirror_flip_counts_reset() -> u64 {
+    let mirrored = flip_counts().tables_mirrored;
+    flip_counts_reset();
+    mirrored
 }
 
 // ---- G3.0c: TypeInfo meta-field capture ----
@@ -818,8 +991,8 @@ mod symtable_mirror_tests {
                 .entries
                 .get(&(owner_handle, name.to_string()))
                 .map(|e| {
-                    let fullname = e.node_fullname.clone();
-                    (e.kind, fullname)
+                    let node_fullname = e.node_fullname.clone();
+                    (e.kind, node_fullname)
                 })
         })
     }
@@ -827,5 +1000,117 @@ mod symtable_mirror_tests {
     fn generation_for(owner: &PyAny) -> u64 {
         let handle = identity::handle_for(owner).unwrap();
         with_store(|store| *store.generations.get(&handle).unwrap())
+    }
+
+    fn live_table<'py>(py: Python<'py>, names: &[&str]) -> &'py PyAny {
+        let table = py.eval("{}", None, None).unwrap();
+        for name in names {
+            table
+                .set_item(*name, py.eval("object()", None, None).unwrap())
+                .unwrap();
+        }
+        table
+    }
+
+    fn read_names(py: Python<'_>, table: &PyAny) -> Vec<String> {
+        entries_if_mirrored(py, table)
+            .unwrap()
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect()
+    }
+
+    #[test]
+    fn test_order_follows_dict_insert_replace_delete() {
+        with_py(|py| {
+            reset();
+            let table = live_table(py, &["a", "b", "c"]);
+            let node = fresh_object(py);
+            for name in ["a", "b", "c"] {
+                put(table, name, node, flags(1)).unwrap();
+            }
+            assert_eq!(read_names(py, table), vec!["a", "b", "c"]);
+            // A replace keeps the position, exactly like `dict`.
+            put(table, "b", fresh_object(py), flags(2)).unwrap();
+            assert_eq!(read_names(py, table), vec!["a", "b", "c"]);
+            // A delete releases the ordinal; a re-insert lands last, and
+            // the live dict does the same.
+            delete(table, "a").unwrap();
+            table.del_item("a").unwrap();
+            assert_eq!(read_names(py, table), vec!["b", "c"]);
+            put(table, "a", node, flags(1)).unwrap();
+            table
+                .set_item("a", py.eval("object()", None, None).unwrap())
+                .unwrap();
+            assert_eq!(read_names(py, table), vec!["b", "c", "a"]);
+            assert_eq!(
+                read_names(py, table),
+                table
+                    .call_method0("keys")
+                    .unwrap()
+                    .iter()
+                    .unwrap()
+                    .map(|k| k.unwrap().extract::<String>().unwrap())
+                    .collect::<Vec<String>>()
+            );
+        });
+    }
+
+    #[test]
+    fn test_gate_defers_on_unknown_owner_and_length_drift() {
+        with_py(|py| {
+            reset();
+            flip_counts_reset();
+            let table = live_table(py, &["a"]);
+            // Never adopted -> no handle.
+            assert!(matches!(
+                entries_if_mirrored(py, table),
+                Err(ShadowGap::NoHandle)
+            ));
+            put(table, "a", fresh_object(py), flags(1)).unwrap();
+            assert_eq!(read_names(py, table), vec!["a"]);
+            // A live entry the store never saw (a C-level write).
+            table.set_item("b", fresh_object(py)).unwrap();
+            assert!(matches!(
+                entries_if_mirrored(py, table),
+                Err(ShadowGap::LenShort)
+            ));
+            // A store record the live table no longer has.
+            table.del_item("b").unwrap();
+            put(table, "b", fresh_object(py), flags(1)).unwrap();
+            assert!(matches!(
+                entries_if_mirrored(py, table),
+                Err(ShadowGap::LenLong)
+            ));
+            let counts = flip_counts();
+            assert_eq!(counts.tables_looked, 4);
+            assert_eq!(counts.tables_mirrored, 1);
+            assert_eq!(counts.entries_mirrored, 1);
+            assert_eq!(counts.defer_no_handle, 1);
+            assert_eq!(counts.defer_len_short, 1);
+            assert_eq!(counts.defer_len_long, 1);
+        });
+    }
+
+    #[test]
+    fn test_flip_counts_survive_entries_reset() {
+        with_py(|py| {
+            reset();
+            flip_counts_reset();
+            let table = live_table(py, &["a"]);
+            put(table, "a", fresh_object(py), flags(1)).unwrap();
+            assert_eq!(read_names(py, table), vec!["a"]);
+            assert_eq!(rust_symtable_mirror_flip_counts_reset(), 1);
+            assert_eq!(flip_counts().tables_looked, 0);
+            // `reset` drops entries and pins but keeps the evidence.
+            put(table, "a", fresh_object(py), flags(1)).unwrap();
+            assert_eq!(read_names(py, table), vec!["a"]);
+            assert_eq!(reset(), 1);
+            assert_eq!(flip_counts().tables_mirrored, 1);
+            assert!(matches!(
+                entries_if_mirrored(py, table),
+                Err(ShadowGap::LenShort)
+            ));
+        });
     }
 }

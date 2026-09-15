@@ -104,11 +104,16 @@ from mypy.types import (
 )
 from mypy.util import get_prefix
 
+# Phase G3.1 (#1670): the read flip reads its mode from the namespace
+# shadow that owns the storage; the import is a leaf (no server imports).
+from mypy import symtables_mirror
+
 # M388: native snapshot comparator seam (mirrors the deps.py/update.py gate).
 try:
     from type_kernel import (
         rust_compare_symbol_table_snapshots as _rust_compare_symbol_table_snapshots,
         rust_snapshot_symbol_table as _rust_snapshot_symbol_table,
+        rust_snapshot_symbol_table_shadow as _rust_snapshot_symbol_table_shadow,
         rust_snapshot_type as _rust_snapshot_type,
     )
 
@@ -116,6 +121,7 @@ try:
 except ImportError:
     _rust_compare_symbol_table_snapshots = None  # type: ignore[assignment]
     _rust_snapshot_symbol_table = None  # type: ignore[assignment]
+    _rust_snapshot_symbol_table_shadow = None  # type: ignore[assignment]
     _rust_snapshot_type = None  # type: ignore[assignment]
     _HAS_TYPE_KERNEL = False
 
@@ -126,6 +132,21 @@ def _set_native_astdiff_active(active: bool) -> None:
     """Called by the build manager to enable/disable the Rust path."""
     global _native_astdiff_active
     _native_astdiff_active = active
+
+
+# Phase G3.1 (#1670) read-flip evidence counters (process lifetime).
+_read_flip_stats: dict[str, int] = {}
+
+
+def read_flip_stats() -> dict[str, int]:
+    """Read-flip counters for `snapshot_symbol_table`: `calls` considered,
+    `served` from Rust-owned storage, `deferred` to the live walk, and the
+    `verify.*` differential outcomes of mode 2."""
+    return dict(_read_flip_stats)
+
+
+def _count_read_flip(key: str) -> None:
+    _read_flip_stats[key] = _read_flip_stats.get(key, 0) + 1
 
 
 # Snapshot representation of a symbol table node or type. The representation is
@@ -205,10 +226,68 @@ def snapshot_symbol_table(name_prefix: str, table: SymbolTable) -> dict[str, Sym
     the targets.
     """
     # B7 slice 2 (#1500): native builder; `None` defers to the pure-Python body.
+    # G3.1 (#1670): the read flip is tried first; `None` falls through to
+    # the live-table native walk, which is the flip-off path exactly.
     if _HAS_TYPE_KERNEL and _native_astdiff_active:
+        owned = _snapshot_symbol_table_flip(name_prefix, table)
+        if owned is not None:
+            return owned
         native = _rust_snapshot_symbol_table(name_prefix, table)
         if native is not None:
             return native
+    return _python_snapshot_symbol_table(name_prefix, table)
+
+
+def _snapshot_symbol_table_flip(
+    name_prefix: str, table: SymbolTable
+) -> dict[str, SymbolSnapshot] | None:
+    """G3.1 read flip: serve a snapshot from Rust-owned namespace storage.
+
+    Returns `None` when the flip is off, when the store cannot mirror
+    `table` exactly (a namespace the G3.0a capture never saw, either
+    because no write touched it or because a write bypassed the class
+    patch), or when the flipped walk defers. Every `None` falls back to
+    the live-table walk, so the flip can only change *where* the namespace
+    comes from, never *what* the snapshot says.
+
+    In verify mode (2) the flip-off result for the same table is computed
+    alongside and any divergence raises instead of serving a snapshot the
+    flip-off tree would not have produced.
+    """
+    mode = symtables_mirror.read_flip_mode()
+    if not mode:
+        return None
+    _count_read_flip("calls")
+    owned = _rust_snapshot_symbol_table_shadow(name_prefix, table)
+    if owned is None:
+        _count_read_flip("deferred")
+        return None
+    _count_read_flip("served")
+    if mode < 2:
+        return owned
+    baseline = _rust_snapshot_symbol_table(name_prefix, table)
+    if baseline is None:
+        baseline = _python_snapshot_symbol_table(name_prefix, table)
+    if owned != baseline:
+        _count_read_flip("verify.mismatch")
+        raise RuntimeError(
+            "G3.1 read flip diverged from the live-table snapshot for "
+            f"{name_prefix!r} ({len(owned)} vs {len(baseline)} entries)"
+        )
+    if list(owned) != list(baseline):
+        _count_read_flip("verify.order_mismatch")
+        raise RuntimeError(
+            f"G3.1 read flip changed namespace order for {name_prefix!r}: "
+            f"{list(owned)[:8]} vs {list(baseline)[:8]}"
+        )
+    _count_read_flip("verify.ok")
+    return owned
+
+
+def _python_snapshot_symbol_table(
+    name_prefix: str, table: SymbolTable
+) -> dict[str, SymbolSnapshot]:
+    """The pure-Python snapshot body (the terminal fallback)."""
     result: dict[str, SymbolSnapshot] = {}
     for name, symbol in table.items():
         node = symbol.node

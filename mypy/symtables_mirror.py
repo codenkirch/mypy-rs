@@ -48,6 +48,10 @@ from mypy.nodes import SymbolTable, SymbolTableNode, TypeInfo
 _kernel_mod: Any = None
 _active = False
 _audit_mode = False
+# G3.1 (#1670) read-flip mode: 0 off, 1 serve reads from the shadow,
+# 2 serve + verify every read against the flip-off path. Set by the build
+# manager from `Options.native_symtable_read_flip[_verify]`.
+_read_flip_mode = 0
 # Re-entrancy guard: a capture reads live fields, never writes them, but
 # the guard keeps a future field-property hook from recursing.
 _in_capture = False
@@ -85,8 +89,7 @@ _FLAG_FIELDS: Final[frozenset[str]] = frozenset(
 
 # G3.0c: TypeInfo meta fields captured by `TypeInfo.__setattr__`.
 # Core fields use meta_put (bases/mro count, metaclass fullname,
-# _fullname, names handle); extended fields use meta_put_field.
-# Extended values are string-encoded (bool -> "true"/"false", etc.).
+# _fullname, names handle); extras use meta_put_field, string-encoded.
 _META_FIELDS: Final[frozenset[str]] = frozenset(
     {
         "bases",
@@ -447,7 +450,11 @@ def reset(*, clear_counts: bool = False) -> None:
 
     Deliberately does not touch ``identity``: ``rust_mirror_reset`` alone
     owns the raw handle registry, so other seams' handles survive a reset.
-    Activation is one-shot and kept across reset, like the mirrors.
+    Activation is one-shot and kept across reset, like the mirrors, and so
+    is the read-flip mode (it follows the options, not the build).
+
+    The Rust read-flip counters are process-lifetime evidence and survive
+    a per-build reset; ``clear_counts`` drops them explicitly.
     """
     if _kernel_mod is not None:
         _kernel_mod.rust_symtable_mirror_reset()
@@ -458,6 +465,34 @@ def reset(*, clear_counts: bool = False) -> None:
     if clear_counts:
         _audit.clear()
         _site_counts.clear()
+        if _kernel_mod is not None:
+            _kernel_mod.rust_symtable_mirror_flip_counts_reset()
+
+
+def set_read_flip(mode: int) -> None:
+    """Set the G3.1 read-flip mode (0 off, 1 serve, 2 serve + verify).
+
+    The build manager sets this from the options on every build; unit
+    tests set it directly. The mode is meaningful only while the shadow is
+    active: with no records every read defers to the live table.
+    """
+    global _read_flip_mode
+    if mode not in (0, 1, 2):
+        raise ValueError(f"read flip mode must be 0/1/2 (got {mode!r})")
+    _read_flip_mode = mode
+
+
+def read_flip_mode() -> int:
+    """Current read-flip mode (0 when off)."""
+    return _read_flip_mode
+
+
+def flip_report() -> dict[str, int]:
+    """Rust read-flip counters: tables looked/mirrored, entries served and
+    the per-reason mirror-gate defers (process lifetime)."""
+    if _kernel_mod is None:
+        return {}
+    return {key: int(value) for key, value in _kernel_mod.rust_symtable_mirror_flip_counts().items()}
 
 
 def entry_count(owner: Any) -> int:

@@ -34,8 +34,11 @@ on:
       - mypy/solve.py
       - mypy/types.py
       - mypy/types_mirror.py
+      - mypy/server/astdiff.py
+      - mypy/symtables_mirror.py
       - mypy/test/testcheck.py
       - mypy/test/testtypes.py
+      - mypy/test/testdiff.py
       - mypy/test/testfinegrained.py
       - mypy/test/testinfer.py
       - mypy/nativeparse.py
@@ -326,6 +329,87 @@ jobs:
           TEST_NATIVE_TYPE_MIRROR_READ: "1"
           MYPY_NATIVE_TYPE_KERNEL_REQUIRED: "1"
         run: uv run python -m pytest mypy/test/testfinegrained.py -q -n4 --timeout=30 --timeout-method=thread
+
+  parity-symtable-flip:
+    # G3.1 (#1670): the namespace shadow's read flip, and the first CI run
+    # of the symbol-table store (G3.0a shipped capture-only without one).
+    # VERIFY serves every mirrored snapshot and diffs it against flip-off.
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Python 3.13
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          version: "0.11.14"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-parity-${{ runner.os }}-${{ hashFiles('**/Cargo.toml') }}
+          restore-keys: cargo-parity-${{ runner.os }}-
+
+      - name: Sync Python deps (uv)
+        run: uv sync --group test
+
+      - name: Build type_kernel extension
+        run: |
+          SCRATCH=/tmp/type-kernel-ext
+          mkdir -p "$SCRATCH"
+          cargo rustc -p mypy-type-kernel --features extension-module \
+            --lib --crate-type cdylib --release
+          EXT_SUFFIX=$(uv run python -c "import sysconfig; print(sysconfig.get_config_var('EXT_SUFFIX'))")
+          cp target/release/libtype_kernel.so "$SCRATCH/type_kernel${EXT_SUFFIX}" 2>/dev/null || cp target/release/libtype_kernel.dylib "$SCRATCH/type_kernel${EXT_SUFFIX}"
+          echo "SCRATCH=$SCRATCH" >> "$GITHUB_ENV"
+          echo "EXT_SUFFIX=$EXT_SUFFIX" >> "$GITHUB_ENV"
+
+      - name: Shadow + read-flip verify (seam suite)
+        env:
+          PYTHONPATH: ${{ env.SCRATCH }}
+          TEST_NATIVE_TYPE_KERNEL: "1"
+          TEST_NATIVE_SYMTABLE_MIRROR: "1"
+          TEST_NATIVE_SYMTABLE_READ_FLIP_VERIFY: "1"
+          MYPY_NATIVE_TYPE_KERNEL_REQUIRED: "1"
+        run: |
+          uv run python -m pytest mypy/test/testtypes.py -q -n4 \
+            -k "Symtable or AstdiffSymbol" --timeout=30 --timeout-method=thread
+
+      - name: Read-flip differential (astdiff + cache data)
+        env:
+          PYTHONPATH: ${{ env.SCRATCH }}
+          TEST_NATIVE_TYPE_KERNEL: "1"
+          TEST_NATIVE_SYMTABLE_MIRROR: "1"
+          TEST_NATIVE_SYMTABLE_READ_FLIP_VERIFY: "1"
+          MYPY_NATIVE_TYPE_KERNEL_REQUIRED: "1"
+        run: |
+          uv run python -m pytest mypy/test/testdiff.py mypy/test/testcachedata.py -q -n4 \
+            --timeout=120 --timeout-method=thread
+
+      - name: Read-flip differential (fine-grained + daemon)
+        env:
+          PYTHONPATH: ${{ env.SCRATCH }}
+          TEST_NATIVE_TYPE_KERNEL: "1"
+          TEST_NATIVE_SYMTABLE_MIRROR: "1"
+          TEST_NATIVE_SYMTABLE_READ_FLIP_VERIFY: "1"
+          MYPY_NATIVE_TYPE_KERNEL_REQUIRED: "1"
+        run: |
+          uv run python -m pytest mypy/test/testfinegrained.py mypy/test/testfinegrainedcache.py \
+            mypy/test/testdaemon.py -q -n4 --timeout=120 --timeout-method=thread
 
   parity-typeops:
     # Gating: typeops graduation (#203, M16) shipped; the truthiness fix

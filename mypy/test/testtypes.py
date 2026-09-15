@@ -65458,3 +65458,248 @@ class NativeLiteralIntExprSuite(Suite):
         expr = NameExpr("x")
         self._assert_par_deferring([{expr: UnionType([self._literal(3)])}], expr)
         assert self._run([{expr: UnionType([self._literal(3)])}], expr) == (3, 3)
+class NativeSymtableReadFlipSuite(Suite):
+    """Issue #1670 (G3.1): symbol-table read flip for the astdiff snapshot.
+
+    The G3.0a shadow is capture-only; G3.1 makes the first *read* come from
+    it. `astdiff.snapshot_symbol_table` serves the namespace from Rust
+    storage when the store mirrors the table exactly, and every other table
+    falls back to the live-table walk. These pins hold the two halves of
+    that contract: the store is served (and the served snapshot is
+    byte-identical to the flip-off one, order included), and a table the
+    capture could not see (a C-level `dict` write, a stale record, a never
+    adopted namespace) defers instead of answering. The verify mode is the
+    differential that would catch an aliased record the length gate cannot
+    see, and it raises rather than serving the wrong snapshot.
+    """
+
+    def setUp(self) -> None:
+        import type_kernel as kernel
+
+        from mypy import symtables_mirror
+        from mypy.server import astdiff
+
+        self._k = kernel
+        self._m = symtables_mirror
+        self._astdiff = astdiff
+        self._prev_active = astdiff._native_astdiff_active
+        self._prev_mode = symtables_mirror.read_flip_mode()
+        astdiff._set_native_astdiff_active(True)
+        symtables_mirror.activate(audit=True)
+        symtables_mirror.set_read_flip(0)
+        symtables_mirror.reset(clear_counts=True)
+        self._astdiff._read_flip_stats.clear()
+
+    def tearDown(self) -> None:
+        self._m.set_read_flip(self._prev_mode)
+        self._m.reset(clear_counts=True)
+        self._astdiff._read_flip_stats.clear()
+        self._astdiff._set_native_astdiff_active(self._prev_active)
+
+    # ---- helpers ----
+
+    def _var(self, name: str, fullname: str) -> Var:
+        var = Var(name)
+        var._fullname = fullname
+        return var
+
+    def _sym(self, name: str, fullname: str) -> SymbolTableNode:
+        return SymbolTableNode(GDEF, self._var(name, fullname))
+
+    def _table(self, fullnames: dict[str, str]) -> SymbolTable:
+        from mypy.symtable_access import put_names_entry
+
+        table: SymbolTable = SymbolTable()
+        for name, fullname in fullnames.items():
+            put_names_entry(table, name, self._sym(name, fullname))
+        return table
+
+    def _snapshot(self, table: SymbolTable, mode: int) -> Any:
+        self._m.set_read_flip(mode)
+        try:
+            return self._astdiff.snapshot_symbol_table("mod", table)
+        finally:
+            self._m.set_read_flip(0)
+
+    def _stats(self) -> dict[str, int]:
+        return self._astdiff.read_flip_stats()
+
+    def _record(self, table: SymbolTable, name: str, fullname: str) -> None:
+        """Write one store record without touching the live table.
+
+        The FFI is the only way to model a record the `dict` does not back
+        (the accessor writes both); it is how the drift pins below
+        construct a shadow the live namespace disagrees with.
+        """
+        self._k.rust_symtable_mirror_put(
+            table,
+            name,
+            self._sym(name, fullname),
+            GDEF,
+            fullname,
+            True,
+            False,
+            False,
+            False,
+            False,
+            None,
+        )
+
+    def _suppressed_puts(self) -> int:
+        """Un-routed namespace writes the class patch saw (audit counter)."""
+        return self._m.report().get("bypass.put", 0)
+
+    # ---- served: the store answers the read ----
+
+    def test_flip_serves_shadow_and_matches_live(self) -> None:
+        table = self._table({"a": "mod.a", "b": "mod.b", "c": "mod.c"})
+        live = self._snapshot(table, 0)
+        assert live == {
+            "a": ("Var", ("mod.a", GDEF, True), ("<not set>",), False),
+            "b": ("Var", ("mod.b", GDEF, True), ("<not set>",), False),
+            "c": ("Var", ("mod.c", GDEF, True), ("<not set>",), False),
+        }
+        # The flip-off snapshot never consults the store.
+        assert self._stats() == {}
+        flipped = self._snapshot(table, 1)
+        assert flipped == live
+        assert list(flipped) == list(table)
+        assert self._stats() == {"calls": 1, "served": 1}
+        # The shadow-consistency invariants the G3 brief pins, flip on.
+        assert self._m.entry_count(table) == len(table)
+        assert self._suppressed_puts() == 0
+        counters = self._m.flip_report()
+        assert counters["tables_looked"] == 1
+        assert counters["tables_mirrored"] == 1
+        assert counters["entries_mirrored"] == 3
+
+    def test_flip_off_never_touches_the_store(self) -> None:
+        table = self._table({"a": "mod.a"})
+        live = self._snapshot(table, 0)
+        assert list(live) == ["a"]
+        assert self._stats() == {}
+        assert self._m.flip_report()["tables_looked"] == 0
+
+    def test_bypass_captured_write_is_served(self) -> None:
+        # `table[name] = ...` is not routed through `put_names_entry`, but
+        # the class patch still captures it: the shadow stays complete, so
+        # the entry is `bypass.put` *and* servable.
+        table: SymbolTable = SymbolTable()
+        table["a"] = self._sym("a", "mod.a")
+        assert self._suppressed_puts() >= 1
+        assert self._m.entry_count(table) == len(table) == 1
+        flipped = self._snapshot(table, 1)
+        assert flipped == self._snapshot(table, 0)
+        assert list(flipped) == ["a"]
+        assert self._stats() == {"calls": 1, "served": 1}
+
+    def test_replace_keeps_position_and_reinsert_moves_last(self) -> None:
+        from mypy.symtable_access import delete_names_entry
+
+        table = self._table({"a": "mod.a", "b": "mod.b", "c": "mod.c"})
+        # A replace keeps the namespace position in both models.
+        from mypy.symtable_access import put_names_entry
+
+        put_names_entry(table, "b", self._sym("b", "mod.b2"))
+        flipped = self._snapshot(table, 1)
+        assert list(flipped) == ["a", "b", "c"] == list(table)
+        assert flipped == self._snapshot(table, 0)
+        # A delete releases the ordinal; the re-insert lands last.
+        delete_names_entry(table, "a")
+        put_names_entry(table, "a", self._sym("a", "mod.a"))
+        flipped = self._snapshot(table, 1)
+        assert list(flipped) == ["b", "c", "a"] == list(table)
+        assert flipped == self._snapshot(table, 0)
+        assert self._stats() == {"calls": 2, "served": 2}
+
+    def test_nested_class_namespace_is_served_too(self) -> None:
+        from mypy.symtable_access import put_names_entry
+
+        names: SymbolTable = SymbolTable()
+        body = FuncDef("m", [], Block([]), None)
+        body._fullname = "mod.C.m"
+        put_names_entry(names, "m", SymbolTableNode(MDEF, body))
+        cdef = ClassDef("C", Block([]))
+        cdef.fullname = "mod.C"
+        info = TypeInfo(names, cdef, "mod")
+        cdef.info = info
+        outer: SymbolTable = SymbolTable()
+        put_names_entry(outer, "C", SymbolTableNode(GDEF, info))
+        flipped = self._snapshot(outer, 1)
+        assert flipped == self._snapshot(outer, 0)
+        # Both the module and the class namespace came from the store.
+        counters = self._m.flip_report()
+        assert counters["tables_mirrored"] == 2
+        assert counters["entries_mirrored"] == 2
+        assert self._stats() == {"calls": 1, "served": 1}
+
+    # ---- deferred: the store cannot answer, the live walk does ----
+
+    def test_unmirrored_c_level_write_defers(self) -> None:
+        table = self._table({"a": "mod.a"})
+        # `dict.__setitem__` is invisible to the class patch: the live
+        # table gains an entry the store never saw.
+        dict.__setitem__(table, "b", self._sym("b", "mod.b"))
+        flipped = self._snapshot(table, 1)
+        assert flipped == self._snapshot(table, 0)
+        assert list(flipped) == ["a", "b"]
+        assert self._stats() == {"calls": 1, "deferred": 1}
+        assert self._m.flip_report()["defer_len_short"] == 1
+
+    def test_stale_record_defers(self) -> None:
+        table = self._table({"a": "mod.a"})
+        # A store record with no live entry of that name: length drift the
+        # other way round (an uncaptured delete would do this in the wild).
+        self._record(table, "ghost", "mod.ghost")
+        flipped = self._snapshot(table, 1)
+        assert flipped == self._snapshot(table, 0)
+        assert list(flipped) == ["a"]
+        assert self._stats() == {"calls": 1, "deferred": 1}
+        assert self._m.flip_report()["defer_len_long"] == 1
+
+    def test_never_adopted_table_defers(self) -> None:
+        table: SymbolTable = SymbolTable()
+        dict.__setitem__(table, "a", self._sym("a", "mod.a"))
+        assert self._k.rust_symtable_mirror_handle_of(table) is None
+        assert len(table) == 1
+        flipped = self._snapshot(table, 1)
+        assert flipped == self._snapshot(table, 0)
+        assert list(flipped) == ["a"]
+        assert self._stats() == {"calls": 1, "deferred": 1}
+        assert self._m.flip_report()["defer_no_handle"] == 1
+
+    # ---- verify mode: the differential ----
+
+    def test_verify_mode_matches_and_counts(self) -> None:
+        table = self._table({"a": "mod.a", "b": "mod.b"})
+        flipped = self._snapshot(table, 2)
+        assert flipped == self._snapshot(table, 0)
+        assert self._stats() == {"calls": 1, "served": 1, "verify.ok": 1}
+
+    def test_verify_mode_raises_on_aliased_record(self) -> None:
+        table = self._table({"a": "mod.a", "b": "mod.b"})
+        # Same length, same names, different bound node: only the
+        # differential can see this record, and it must never be served.
+        self._record(table, "b", "mod.OTHER")
+        with self.assertRaises(RuntimeError) as ctx:
+            self._snapshot(table, 2)
+        assert "diverged" in str(ctx.exception)
+        assert self._stats() == {"calls": 1, "served": 1, "verify.mismatch": 1}
+
+    def test_verify_mode_raises_on_order_divergence(self) -> None:
+        table = self._table({"a": "mod.a", "b": "mod.b"})
+        symbol = table["a"]
+        # An uncaptured delete + re-insert moves the name to the end of the
+        # live namespace while the store keeps its original ordinal: same
+        # values, same length, different order.
+        dict.__delitem__(table, "a")
+        dict.__setitem__(table, "a", symbol)
+        assert list(table) == ["b", "a"]
+        with self.assertRaises(RuntimeError) as ctx:
+            self._snapshot(table, 2)
+        assert "order" in str(ctx.exception)
+        assert self._stats() == {"calls": 1, "served": 1, "verify.order_mismatch": 1}
+
+    def test_read_flip_mode_validation(self) -> None:
+        with self.assertRaises(ValueError):
+            self._m.set_read_flip(3)

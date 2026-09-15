@@ -2128,6 +2128,12 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         astdiff_symbols::rust_snapshot_symbol_table,
         module
     )?)?;
+    // G3.1 (#1670): read flip for that builder — the namespace comes from
+    // the G3.0a symtable shadow store instead of the live `dict`.
+    module.add_function(wrap_pyfunction!(
+        astdiff_symbols::rust_snapshot_symbol_table_shadow,
+        module
+    )?)?;
     module.add_function(wrap_pyfunction!(
         serverdeps::rust_is_expr_literal_type,
         module
@@ -3796,6 +3802,15 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
     )?)?;
     module.add_function(wrap_pyfunction!(
         symtable_mirror::rust_symtable_mirror_handle_of,
+        module
+    )?)?;
+    // G3.1 (#1670): read-flip evidence counters for the mirror gate.
+    module.add_function(wrap_pyfunction!(
+        symtable_mirror::rust_symtable_mirror_flip_counts,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        symtable_mirror::rust_symtable_mirror_flip_counts_reset,
         module
     )?)?;
     // H1k: is_literal_enum decision. Rust reads the two resolved proper

@@ -434,6 +434,13 @@ class Options:
         # for symbol tables (semanal adding funnel via put_names_entry).
         # Capture-only, not in OPTIONS_AFFECTING_CACHE.
         self.native_symtable_mirror = False
+        # Phase G3.1 (#1670): opt-in read flip for the namespace shadow.
+        # `snapshot_symbol_table` serves from Rust-owned storage when the
+        # store mirrors the table exactly; not in OPTIONS_AFFECTING_CACHE.
+        self.native_symtable_read_flip = False
+        # Phase G3.1 differential: run the flip-off path alongside and
+        # raise on divergence. Implies the flip.
+        self.native_symtable_read_flip_verify = False
         # G0.5 (#1566): opt-in Rust fixed-format cache-data writer; the
         # hybrid write phase measured ~1.5x the Python writer per round, so
         # the bridge ships default-off until the type payloads move too.
