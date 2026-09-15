@@ -131,6 +131,22 @@ never the engagement proof. A change that trips an unexpected behavior change
 escalates itself to T3. Cap T3 lanes at one or two per wave, since this machine
 holds about two heavy ops under its memory cap.
 
+Pre-flight for T2/T3/T4: prove which source tree you are testing. A worktree
+`.venv` is a symlink to the main checkout's venv, and that venv's editable
+install points at the main checkout, so `import mypy` can silently resolve
+there. The symptom is `_pytest.pathlib.ImportPathMismatchError` naming the main
+checkout's `mypy/test/conftest.py` against yours, with 0 engagement on every
+seam while a probe reports thousands. Before trusting any count, suite result
+or engagement number:
+
+```bash
+PYTHONPATH=<worktree>:<scratch .so dir>:$PYTHONPATH \
+  .venv/bin/python -c "import mypy; print(mypy.__file__)"
+```
+
+It must print the worktree path. A probe harness that exits 0 while raising is
+worse than no probe: read its exit status before reading its numbers.
+
 Heavy ops (cargo build/test, pytest, self-check) run through the weighted pool:
 `/private/tmp/mypy-rs-sem.sh run 1 <build>` for a build, `run 2 <corpus>` for a
 corpus run. Three slots, build = 1, corpus = 2, so a corpus and a build overlap
