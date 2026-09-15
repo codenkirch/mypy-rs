@@ -132,12 +132,23 @@ external load (load average 34-48), not quiet.
 
 ### Queue for the next wave
 
-1. **The first read flip is blocked on a real defect, not on CI latency.** The
-   read-flip lane's own new gate `parity-symtable-flip` (added in #1687) fails
-   with `RuntimeError: G3.1 read flip changed namespace order for '__main__'`,
-   showing both a reordered namespace and leaked `X@N` placeholder keys
-   (`D@5`, `A@3`, `E@6`). Fix the ordering and placeholder defect before the
-   flip can land.
+1. **Landed: the first read flip** — `ac68f0eaf` (#1687, issue #1670),
+   default-off: `rust_snapshot_symbol_table_shadow` serves the namespace from the
+   G3.0a shadow store instead of `table.items()`, behind
+   `Options.native_symtable_read_flip` (plus `..._verify`, which implies it),
+   with `CACHE_VERSION` and `OPTIONS_AFFECTING_CACHE` untouched. Its own new gate
+   `parity-symtable-flip` failed on its first run with `RuntimeError: … changed
+   namespace order for '__main__'`, and the cause was **ordering only, not a
+   leak**: `mypy/server/aststrip.py:113-118` keeps `@`-named keys across a strip,
+   so `D@5` kept its original dict position while the store re-minted its ordinal
+   after a per-build reset — same key set, same values, only the position moved
+   (the dump carries the same 10 keys on both paths). Fixed by treating an owner
+   whose first recorded write already finds keys as `ShadowGap::Inherited`
+   (`defer_inherited`) and deferring to the live walk, with both differential
+   assertions left strict (values/keys and `list(owned)` order). **Residual for
+   G3.2:** only namespaces the store saw from empty in this build are served;
+   aststrip survivors and cache-loaded tables defer, so closing that needs the
+   store to survive the build boundary.
 2. **The seam-registration split.** `scripts/plan_seam_split.py --verify`
    supplies the grouping (961 sites, 120 defining modules, 5 declared modules
    registering nothing); the transform itself (per-module
@@ -149,10 +160,11 @@ external load (load average 34-48), not quiet.
 3. Remaining wave-5 lane landings are appended to
    `docs/plans/type-kernel-seam-ledger.md` as the coordinator reports each
    merged PR with its measurements.
-4. Open PRs at handoff time: `#1687` (G3.1 symtable read flip, the blocked one
-   above), `#1695` (G1.2 node-shadow audit and first expression-node read
-   flip), `#1694` (F reopening measurement), `#1685` (residual scalar-seam
-   sweep).
+4. Open PRs at handoff time: `#1695` (G1.2 node-shadow audit and first
+   expression-node read flip), `#1694` (F reopening measurement), `#1685`
+   (residual scalar-seam sweep), `#1699` (semanal non-wire interfaces with the
+   gate flip), `#1700` (hot-seam rerank, including fixes to the audit probe's
+   structural zeros and lost-report path).
 
 ## RESUME POINT — 2026-09-14, night (second parallel wave landed)
 
