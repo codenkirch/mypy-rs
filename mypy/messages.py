@@ -4034,17 +4034,44 @@ def append_invariance_notes(
     notes: list[str], arg_type: Instance, expected_type: Instance
 ) -> list[str]:
     """Explain that the type is invariant and give notes for how to solve the issue."""
-    if _HAS_TYPE_KERNEL and _native_messages_active and _native_messages_resolver is not None:
+    if _HAS_TYPE_KERNEL and _native_messages_active:
         try:
-            result = _type_kernel.rust_append_invariance_notes(
-                _serialize_type_for_messages(arg_type),
-                _serialize_type_for_messages(expected_type),
-                _native_messages_resolver,
+            arg_fn = arg_type.type.fullname
+            exp_fn = expected_type.type.fullname
+            arg_args = arg_type.args
+            exp_args = expected_type.args
+            arg_subtype_result: bool | None = None
+            key_same_result: bool | None = None
+            val_subtype_result: bool | None = None
+            if arg_fn == "builtins.list" and exp_fn == "builtins.list":
+                if arg_args and exp_args:
+                    arg_subtype_result = is_subtype(arg_args[0], exp_args[0])
+            elif arg_fn == "builtins.dict" and exp_fn == "builtins.dict":
+                if len(arg_args) >= 2 and len(exp_args) >= 2:
+                    key_same_result = is_same_type(arg_args[0], exp_args[0])
+                    val_subtype_result = is_subtype(arg_args[1], exp_args[1])
+            result = _type_kernel.rust_append_invariance_notes_live(
+                arg_type,
+                expected_type,
+                arg_subtype_result,
+                key_same_result,
+                val_subtype_result,
             )
             if result is not None:
                 return notes + result
         except (AssertionError, NotImplementedError):
             pass
+        if _native_messages_resolver is not None:
+            try:
+                result = _type_kernel.rust_append_invariance_notes(
+                    _serialize_type_for_messages(arg_type),
+                    _serialize_type_for_messages(expected_type),
+                    _native_messages_resolver,
+                )
+                if result is not None:
+                    return notes + result
+            except (AssertionError, NotImplementedError):
+                pass
     invariant_type = ""
     covariant_suggestion = ""
     if (
@@ -4108,6 +4135,12 @@ def append_numbers_notes(
     """Explain if an unsupported type from "numbers" is used in a subtype check."""
     if _HAS_TYPE_KERNEL and _native_messages_active:
         try:
+            result = _type_kernel.rust_append_numbers_notes_live(expected_type)
+            if result is not None:
+                return notes + result
+        except (AssertionError, NotImplementedError):
+            pass
+        try:
             result = _type_kernel.rust_append_numbers_notes(
                 _serialize_type_for_messages(expected_type)
             )
@@ -4141,14 +4174,12 @@ def make_inferred_type_note(
                     is_subtype(sub_arg, sup_arg)
                     for sub_arg, sup_arg in zip(subtype.args, supertype.args)
                 ]
-                if _type_kernel.rust_make_inferred_type_note(
-                    _serialize_type_for_messages(subtype),
-                    _serialize_type_for_messages(supertype),
+                if _type_kernel.rust_make_inferred_type_note_live(
+                    subtype,
+                    supertype,
                     arg_results,
                     context,
                 ):
-                    # The Rust gate already verified ReturnStmt + NameExpr
-                    # (inferred_note_context_fires), so narrow for mypy.
                     assert isinstance(context, ReturnStmt)
                     assert isinstance(context.expr, NameExpr)
                     var_name = context.expr.name

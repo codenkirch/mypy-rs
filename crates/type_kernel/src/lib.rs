@@ -1044,6 +1044,10 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         messages::rust_append_invariance_notes,
         module
     )?)?;
+    module.add_function(wrap_pyfunction!(
+        messages::rust_append_invariance_notes_live,
+        module
+    )?)?;
     // Issue #749: find_type_overlaps (messages.py:3055-3079).
     module.add_function(wrap_pyfunction!(
         messages_find_overlaps::rust_find_type_overlaps,
@@ -1053,9 +1057,17 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         messages::rust_append_numbers_notes,
         module
     )?)?;
+    module.add_function(wrap_pyfunction!(
+        messages::rust_append_numbers_notes_live,
+        module
+    )?)?;
     // Issue #982: make_inferred_type_note decision (messages.py:3770-3800).
     module.add_function(wrap_pyfunction!(
         messages::rust_make_inferred_type_note,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        messages::rust_make_inferred_type_note_live,
         module
     )?)?;
     module.add_function(wrap_pyfunction!(messages::rust_append_union_note, module)?)?;

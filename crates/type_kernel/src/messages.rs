@@ -2129,10 +2129,100 @@ pub fn rust_append_invariance_notes(
     append_invariance_notes_inner(&arg, &expected, resolver.resolver())
 }
 
+/// Live-object variant of `rust_append_invariance_notes` (issue #1637).
+/// Reads Instance fullnames and arg-list lengths via PyO3 instead of
+/// deserializing wire bytes. The subtype/same-type results on args[0]/args[1]
+/// are pre-computed by the Python shim (using the already-native
+/// `is_subtype`/`is_same_type`) and passed in as `Option<bool>`.
+/// Returns `None` (defer) when an `Option<bool>` is `None` (undecidable)
+/// or the object is not an Instance.
+#[pyfunction]
+pub fn rust_append_invariance_notes_live(
+    py: Python<'_>,
+    arg_type: &PyAny,
+    expected_type: &PyAny,
+    arg_subtype_result: Option<bool>,
+    key_same_result: Option<bool>,
+    val_subtype_result: Option<bool>,
+) -> PyResult<Option<Vec<String>>> {
+    let types_mod = py.import("mypy.types")?;
+    let instance_cls = types_mod.getattr("Instance")?.downcast::<PyType>()?;
+    if !arg_type.is_instance(instance_cls)? || !expected_type.is_instance(instance_cls)? {
+        return Ok(None);
+    }
+    let arg_ref: String = arg_type.getattr("type")?.getattr("fullname")?.extract()?;
+    let exp_ref: String = expected_type.getattr("type")?.getattr("fullname")?.extract()?;
+    let arg_args_len = arg_type.getattr("args")?.len()?;
+    let exp_args_len = expected_type.getattr("args")?.len()?;
+
+    let (invariant_type, covariant_suggestion) =
+        if arg_ref == "builtins.list" && exp_ref == "builtins.list" {
+            if arg_args_len == 0 || exp_args_len == 0 {
+                return Ok(None);
+            }
+            match arg_subtype_result {
+                Some(true) => (
+                    "list",
+                    "Consider using \"Sequence\" instead, which is covariant",
+                ),
+                Some(false) => return Ok(Some(Vec::new())),
+                None => return Ok(None),
+            }
+        } else if arg_ref == "builtins.dict" && exp_ref == "builtins.dict" {
+            if arg_args_len < 2 || exp_args_len < 2 {
+                return Ok(None);
+            }
+            match key_same_result {
+                Some(true) => {}
+                Some(false) => return Ok(Some(Vec::new())),
+                None => return Ok(None),
+            }
+            match val_subtype_result {
+                Some(true) => (
+                    "dict",
+                    "Consider using \"Mapping\" instead, which is covariant in the value type",
+                ),
+                Some(false) => return Ok(Some(Vec::new())),
+                None => return Ok(None),
+            }
+        } else {
+            return Ok(Some(Vec::new()));
+        };
+
+    Ok(Some(vec![
+        format!(
+            "\"{invariant_type}\" is invariant -- see \
+             https://mypy.readthedocs.io/en/stable/common_issues.html#variance"
+        ),
+        covariant_suggestion.to_string(),
+    ]))
+}
+
 #[pyfunction]
 pub fn rust_append_numbers_notes(expected_bytes: &[u8]) -> Option<Vec<String>> {
     let expected = wire::read_type(&mut ReadBuffer::new(expected_bytes), None).ok()?;
     append_numbers_notes_inner(&expected)
+}
+
+/// Live-object variant of `rust_append_numbers_notes` (issue #1637).
+/// Reads `expected_type.type.fullname` via PyO3 instead of deserializing
+/// wire bytes. Returns `None` (defer) when the object is not an `Instance`.
+#[pyfunction]
+pub fn rust_append_numbers_notes_live(py: Python<'_>, expected: &PyAny) -> PyResult<Option<Vec<String>>> {
+    let types_mod = py.import("mypy.types")?;
+    let instance_cls = types_mod.getattr("Instance")?.downcast::<PyType>()?;
+    if !expected.is_instance(instance_cls)? {
+        return Ok(None);
+    }
+    let fullname: String = expected.getattr("type")?.getattr("fullname")?.extract()?;
+    if !UNSUPPORTED_NUMBERS_TYPES.contains(&fullname.as_str()) {
+        return Ok(Some(Vec::new()));
+    }
+    Ok(Some(vec![
+        "Types from \"numbers\" are not supported for static type checking".to_string(),
+        "See https://peps.python.org/pep-0484/#the-numeric-tower".to_string(),
+        "Consider using a protocol instead, such as typing.SupportsFloat".to_string(),
+    ]))
 }
 
 #[pyfunction]
@@ -2276,6 +2366,39 @@ pub fn rust_make_inferred_type_note(
         Err(_) => return Ok(false),
     };
     if !inferred_note_wire_decision(&subtype, &supertype, &arg_results) {
+        return Ok(false);
+    }
+    inferred_note_context_fires(py, context)
+}
+
+/// Live-object variant of `rust_make_inferred_type_note` (issue #1637).
+/// Reads Instance fullnames and arg-list lengths via PyO3 instead of
+/// deserializing wire bytes. Never defers: a non-Instance or an unreadable
+/// fact decides `false` (note absent), matching the wire variant's shape.
+#[pyfunction]
+pub fn rust_make_inferred_type_note_live(
+    py: Python<'_>,
+    subtype: &PyAny,
+    supertype: &PyAny,
+    arg_results: Vec<bool>,
+    context: &PyAny,
+) -> PyResult<bool> {
+    let types_mod = py.import("mypy.types")?;
+    let instance_cls = types_mod.getattr("Instance")?.downcast::<PyType>()?;
+    if !subtype.is_instance(instance_cls)? || !supertype.is_instance(instance_cls)? {
+        return Ok(false);
+    }
+    let sub_fullname: String = subtype.getattr("type")?.getattr("fullname")?.extract()?;
+    let sup_fullname: String = supertype.getattr("type")?.getattr("fullname")?.extract()?;
+    if sub_fullname != sup_fullname {
+        return Ok(false);
+    }
+    let sub_args_len = subtype.getattr("args")?.len()?;
+    let sup_args_len = supertype.getattr("args")?.len()?;
+    if sub_args_len == 0 || sup_args_len == 0 {
+        return Ok(false);
+    }
+    if !arg_results.iter().all(|&ok| ok) {
         return Ok(false);
     }
     inferred_note_context_fires(py, context)
