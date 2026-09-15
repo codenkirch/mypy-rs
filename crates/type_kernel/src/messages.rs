@@ -2151,7 +2151,10 @@ pub fn rust_append_invariance_notes_live(
         return Ok(None);
     }
     let arg_ref: String = arg_type.getattr("type")?.getattr("fullname")?.extract()?;
-    let exp_ref: String = expected_type.getattr("type")?.getattr("fullname")?.extract()?;
+    let exp_ref: String = expected_type
+        .getattr("type")?
+        .getattr("fullname")?
+        .extract()?;
     let arg_args_len = arg_type.getattr("args")?.len()?;
     let exp_args_len = expected_type.getattr("args")?.len()?;
 
@@ -2208,7 +2211,10 @@ pub fn rust_append_numbers_notes(expected_bytes: &[u8]) -> Option<Vec<String>> {
 /// Reads `expected_type.type.fullname` via PyO3 instead of deserializing
 /// wire bytes. Returns `None` (defer) when the object is not an `Instance`.
 #[pyfunction]
-pub fn rust_append_numbers_notes_live(py: Python<'_>, expected: &PyAny) -> PyResult<Option<Vec<String>>> {
+pub fn rust_append_numbers_notes_live(
+    py: Python<'_>,
+    expected: &PyAny,
+) -> PyResult<Option<Vec<String>>> {
     let types_mod = py.import("mypy.types")?;
     let instance_cls = types_mod.getattr("Instance")?.downcast::<PyType>()?;
     if !expected.is_instance(instance_cls)? {
