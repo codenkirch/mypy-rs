@@ -22305,7 +22305,13 @@ class NativeMemberAccessDispatchSuite(Suite):
         self._add_method(self.fx.ai, "__bool__", self._sig([], [], [], self.fx.a), is_static=True)
         union = UnionType([self.fx.a, NoneType()])
         chk = SimpleNamespace(
-            named_type=lambda n: self.fx.oi,
+            named_type=lambda n: (
+                self.fx.bool_type
+                if n == "builtins.bool"
+                else self.fx.function
+                if n == "builtins.function"
+                else Instance(self.fx.oi, [])
+            ),
             msg=SimpleNamespace(
                 filter_errors=lambda *a, **kw: _NoopCtx(),
                 disable_type_names=lambda: _NoopCtx(),
@@ -64674,3 +64680,160 @@ class NativePluginHookDeclareSuite(Suite):
             assert plugin_hook_known_absent("get_function_hook", "builtins.print")
         finally:
             _set_native_plugin_hook_registry(None, False)
+
+
+class NativeScalarTypeopsSeamsRetiredSuite(Suite):
+    """Pin the #1668 retirement of the scalar-only typeops wire seams.
+
+    `is_recursive_pair`, `is_singleton_identity_type` and
+    `is_singleton_equality_type` serialized the whole type tree so Rust
+    could read a couple of scalar fields (audit ranks 2-4, #1637). The
+    Python bodies are shallow isinstance chains, so the wire round-trip
+    cost more than the decision. The native shims are retired; the Rust
+    pyfunctions stay registered for direct-seam tests. This suite fails
+    if any native call returns on these paths.
+    """
+
+    _SEAMS = {
+        "is_recursive_pair": "rust_is_recursive_pair",
+        "is_singleton_identity_type": "rust_is_singleton_identity_type",
+        "is_singleton_equality_type": "rust_is_singleton_equality_type",
+    }
+
+    def setUp(self) -> None:
+        self.fx = TypeFixture()
+
+    def test_native_shims_removed(self) -> None:
+        import inspect
+
+        from mypy import typeops
+
+        for func_name, seam_name in self._SEAMS.items():
+            src = inspect.getsource(getattr(typeops, func_name))
+            assert seam_name not in src, f"{func_name} should not call {seam_name}"
+
+    def test_no_wire_serialization(self) -> None:
+        from mypy import typeops
+        from mypy.typeops import (
+            is_recursive_pair,
+            is_singleton_equality_type,
+            is_singleton_identity_type,
+        )
+
+        calls: list[str] = []
+        orig = typeops._serialize_type
+
+        def spy(t: Any) -> bytes:
+            calls.append("serialize")
+            return orig(t)
+
+        typeops._serialize_type = spy
+        try:
+            recursive_alias, _ = self.fx.def_alias_1(self.fx.a)
+            assert is_recursive_pair(recursive_alias, self.fx.b) is True
+            assert is_recursive_pair(self.fx.a, self.fx.b) is False
+            assert is_singleton_identity_type(NoneType()) is True
+            assert is_singleton_identity_type(self.fx.a) is False
+            assert is_singleton_equality_type(self.fx.lit1) is True
+            assert is_singleton_equality_type(self.fx.a) is False
+        finally:
+            typeops._serialize_type = orig
+        assert calls == [], f"retired typeops seams serialized: {len(calls)} calls"
+
+    def test_values_match_python(self) -> None:
+        from mypy.typeops import (
+            is_recursive_pair,
+            is_singleton_equality_type,
+            is_singleton_identity_type,
+        )
+
+        recursive_alias, _ = self.fx.def_alias_1(self.fx.a)
+        assert is_recursive_pair(recursive_alias, self.fx.b) is True
+        assert is_recursive_pair(self.fx.a, self.fx.b) is False
+        assert is_singleton_identity_type(NoneType()) is True
+        assert is_singleton_identity_type(self.fx.a) is False
+        assert is_singleton_equality_type(self.fx.lit1) is True
+        assert is_singleton_equality_type(self.fx.a) is False
+
+
+class NativeScalarCheckmemberSeamsRetiredSuite(Suite):
+    """Pin the #1668 retirement of the scalar-only checkmember wire seams.
+
+    `descriptor_has_get_set` (audit rank 1, 22.8k calls on the cold
+    self-check) and `analyze_none_member_access` (audit rank 5) both
+    serialized the type tree to read a member-presence bool / tag. The
+    Python bodies are a `has_readable_member("__get__")` MRO walk and a
+    `name == "__bool__"` split; the native shims are retired and the Rust
+    pyfunctions stay registered for direct-seam tests.
+    """
+
+    def setUp(self) -> None:
+        self.fx = TypeFixture()
+
+    def _make_mx(self, is_lvalue: bool = False) -> Any:
+        from mypy.checkmember import MemberContext
+        from mypy.options import Options
+
+        def named_type(name: str) -> Instance:
+            return self.fx.bool_type if name == "builtins.bool" else self.fx.function
+
+        chk = SimpleNamespace(
+            msg=SimpleNamespace(fail=lambda *a, **kw: None, options=Options()),
+            named_type=named_type,
+        )
+        return MemberContext(
+            is_lvalue=is_lvalue,
+            is_super=False,
+            is_operator=False,
+            original_type=self.fx.o,
+            context=NameExpr("x"),
+            chk=cast(Any, chk),
+        )
+
+    def _plain_instance(self) -> Instance:
+        return Instance(self.fx.make_type_info("mod.Plain", mro=[self.fx.oi]), [])
+
+    def test_native_shims_removed(self) -> None:
+        import inspect
+
+        from mypy import checkmember
+
+        none_src = inspect.getsource(checkmember.analyze_none_member_access)
+        assert "rust_" not in none_src, "analyze_none_member_access should be pure Python"
+        desc_src = inspect.getsource(checkmember.analyze_descriptor_access)
+        assert "rust_descriptor_has_get_set" not in desc_src
+        assert not hasattr(checkmember, "_rust_analyze_none_member_access")
+        assert not hasattr(checkmember, "_rust_descriptor_has_get_set")
+
+    def test_no_wire_serialization(self) -> None:
+        from mypy import checkmember
+        from mypy.checkmember import analyze_descriptor_access, analyze_none_member_access
+
+        calls: list[str] = []
+        orig = checkmember._serialize_type_for_checkmember
+
+        def spy(t: Any) -> bytes:
+            calls.append("serialize")
+            return orig(t)
+
+        checkmember._serialize_type_for_checkmember = spy
+        try:
+            mx = self._make_mx()
+            bool_member = analyze_none_member_access("__bool__", NoneType(), mx)
+            assert str(bool_member) == "def () -> Literal[False]"
+            plain = self._plain_instance()
+            assert analyze_descriptor_access(plain, mx) is plain
+        finally:
+            checkmember._serialize_type_for_checkmember = orig
+        assert calls == [], f"retired checkmember seams serialized: {len(calls)} calls"
+
+    def test_values_match_python(self) -> None:
+        from mypy.checkmember import analyze_descriptor_access, analyze_none_member_access
+
+        mx = self._make_mx()
+        bool_member = get_proper_type(analyze_none_member_access("__bool__", NoneType(), mx))
+        assert isinstance(bool_member, CallableType)
+        assert str(bool_member.ret_type) == "Literal[False]"
+        plain = self._plain_instance()
+        assert analyze_descriptor_access(plain, mx) is plain
+        assert analyze_descriptor_access(plain, self._make_mx(is_lvalue=True)) is plain

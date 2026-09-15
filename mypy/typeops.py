@@ -361,19 +361,6 @@ def is_recursive_pair(s: Type, t: Type) -> bool:
     here, but this function is called in very hot code, so we try to keep it simple
     and return True only in cases we know may have problems.
     """
-    if _HAS_TYPE_KERNEL and _native_typeops_active and _native_typeops_resolver is not None:
-        # Only recursive alias pairs (or the TupleType-fallback arm, which
-        # also needs a recursive alias) can be recursive, so skip the wire
-        # round-trip for non-alias pairs: the Python fallback is False.
-        if isinstance(s, TypeAliasType) or isinstance(t, TypeAliasType):
-            try:
-                result = _type_kernel.rust_is_recursive_pair(
-                    _serialize_type(s), _serialize_type(t), _native_typeops_resolver
-                )
-                if result is not None:
-                    return result
-            except (AssertionError, NotImplementedError):
-                pass
     if isinstance(s, TypeAliasType) and s.is_recursive:
         return (
             isinstance(get_proper_type(t), (Instance, UnionType))
@@ -1409,10 +1396,9 @@ def make_simplified_union(
 def _remove_redundant_union_items(items: list[Type], keep_erased: bool) -> list[Type]:
     if _HAS_TYPE_KERNEL and _native_typeops_active and _native_typeops_resolver is not None:
         try:
-            # The wire drops can_be_true/can_be_false: pass them as a
-            # per-item blob (flags + mutated bit). A widened survivor comes
-            # back marked in result[2]; the shim rebuilds that slot with
-            # true_or_false(items[src]) on the live object.
+            # The wire drops can_be_true/can_be_false: pass per-item flags
+            # (flags + mutated bit). A widened survivor comes back marked
+            # in result[2]; the shim rebuilds it via true_or_false.
             flags_blob = bytearray()
             mutated_any = False
             for item in items:
@@ -1960,15 +1946,6 @@ def is_singleton_identity_type(typ: ProperType) -> bool:
 
     Note that this is not true of certain LiteralType, such as Literal[100001] or Literal["string"]
     """
-    if _HAS_TYPE_KERNEL and _native_typeops_active and _native_typeops_resolver is not None:
-        try:
-            result = _type_kernel.rust_is_singleton_identity_type(
-                _serialize_type(typ), _native_typeops_resolver
-            )
-            if result is not None:
-                return result
-        except (AssertionError, NotImplementedError, ValueError):
-            pass
     if isinstance(typ, NoneType):
         return True
     if isinstance(typ, Instance):
@@ -1991,15 +1968,6 @@ def is_singleton_equality_type(typ: ProperType) -> bool:
     Returns True if every value of this type compares equal to every other value of this type,
     as judged by the `==` operator.
     """
-    if _HAS_TYPE_KERNEL and _native_typeops_active and _native_typeops_resolver is not None:
-        try:
-            result = _type_kernel.rust_is_singleton_equality_type(
-                _serialize_type(typ), _native_typeops_resolver
-            )
-            if result is not None:
-                return result
-        except (AssertionError, NotImplementedError, ValueError):
-            pass
     return isinstance(typ, LiteralType) or is_singleton_identity_type(typ)
 
 

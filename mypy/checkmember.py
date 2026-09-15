@@ -109,8 +109,6 @@ from mypy.types import (
 # link used by error-message rendering and Self-typevar solving, so their
 # gates defer to Python via `is not None` checks. They import real when
 # available so the Rust bytes still count toward the migration;
-
-# `descriptor_has_get_set` is parity-clean (0 failures) and fully active.
 try:
     from librt.internal import (
         ReadBuffer as _CheckMemberReadBuffer,
@@ -123,7 +121,6 @@ try:
         rust_analyze_instance_member_dispatch as _rust_analyze_instance_member_dispatch,
         rust_analyze_member_access as _rust_analyze_member_access,
         rust_analyze_member_method as _rust_analyze_member_method,
-        rust_analyze_none_member_access as _rust_analyze_none_member_access,
         rust_analyze_typeddict_access as _rust_analyze_typeddict_access,
         rust_analyze_union_member_access as _rust_analyze_union_member_access,
         rust_bind_self_fast as _rust_bind_self_fast,
@@ -155,7 +152,6 @@ except ImportError:
     _rust_analyze_instance_member_access = None  # type: ignore[assignment]
     _rust_analyze_instance_member_dispatch = None  # type: ignore[assignment]
     _rust_analyze_union_member_access = None  # type: ignore[assignment]
-    _rust_analyze_none_member_access = None  # type: ignore[assignment]
     _rust_analyze_typeddict_access = None  # type: ignore[assignment]
     _rust_analyze_enum_class_attribute_access = None  # type: ignore[assignment]
     _rust_analyze_descriptor_access = None  # type: ignore[assignment]
@@ -164,9 +160,9 @@ except ImportError:
     _checkmember_read_type = None  # type: ignore[assignment]
     _HAS_TYPE_KERNEL = False
 
-# Issue-#476 kernels. `descriptor_has_get_set` is parity-clean and active.
-# The other four were deferred in #484 because the wire format drops
-# CallableType.definition; wirefixup now re-links definition by name + arity
+# Issue-#476 kernels. The other four were deferred in #484 because the
+# wire format drops CallableType.definition; wirefixup now re-links
+# definition by name + arity
 
 # (issue #485), so they are active again via the inner try-block below.
 # Any kernels that fail to import fall back to Python (None gates).
@@ -174,12 +170,7 @@ _rust_check_self_arg: Any = None
 _rust_expand_without_binding: Any = None
 _rust_expand_and_bind_callable: Any = None
 _rust_add_class_tvars: Any = None
-_rust_descriptor_has_get_set: Any = None
 if _HAS_TYPE_KERNEL:
-    try:
-        from type_kernel import rust_descriptor_has_get_set as _rust_descriptor_has_get_set
-    except ImportError:
-        pass
     try:
         from type_kernel import (
             rust_add_class_tvars as _rust_add_class_tvars,
@@ -1236,44 +1227,6 @@ def analyze_union_member_access(name: str, typ: UnionType, mx: MemberContext) ->
 
 
 def analyze_none_member_access(name: str, typ: NoneType, mx: MemberContext) -> Type:
-    # M20: gate the NoneType branch through Rust. __bool__ returns a pure
-    # CallableType (ret=Literal[False]); any other name recurses on
-    # builtins.object through the live-method dispatch with the caller's
-
-    # mx facts (self_type / lvalue / super). Defer (None) when the
-    # dispatch defers.
-    if (
-        _HAS_TYPE_KERNEL
-        and _native_checkmember_active
-        and _native_checkmember_resolver is not None
-        and _rust_analyze_none_member_access is not None
-    ):
-        try:
-            result = _rust_analyze_none_member_access(
-                _native_checkmember_resolver,
-                name,
-                _serialize_type_for_checkmember(typ),
-                _serialize_type_for_checkmember(mx.self_type),
-                mx.is_lvalue,
-                mx.is_super,
-                mx.preserve_type_var_ids,
-                TypeVarId.next_raw_id,
-                state.state.strict_optional,
-            )
-            if result is not None:
-                next_raw_id, changed, wire_bytes = result
-                if changed:
-                    TypeVarId.next_raw_id = next_raw_id
-                decoded = _deserialize_type_for_checkmember(bytes(wire_bytes))
-                if decoded is not None:
-                    if isinstance(decoded, ProperType):
-                        decoded.line = typ.line
-                        decoded.column = typ.column
-                        if isinstance(decoded, CallableType):
-                            decoded.fallback.line = decoded.line
-                    return decoded
-        except (AssertionError, NotImplementedError):
-            pass
     if name == "__bool__":
         literal_false = LiteralType(False, fallback=mx.named_type("builtins.bool"))
         return CallableType(
@@ -1500,30 +1453,8 @@ def analyze_descriptor_access(descriptor_type: Type, mx: MemberContext) -> Type:
     elif not isinstance(descriptor_type, Instance):
         return orig_descriptor_type
 
-    if not mx.is_lvalue:
-        # M20: gate the __get__ presence check through Rust. Rust reads
-        # member presence from the resolver snapshots; defer (None) when
-        # the class snapshot is missing.
-        rust_decided = False
-        if (
-            _HAS_TYPE_KERNEL
-            and _native_checkmember_active
-            and _native_checkmember_resolver is not None
-            and _rust_descriptor_has_get_set is not None
-        ):
-            try:
-                result = _rust_descriptor_has_get_set(
-                    _native_checkmember_resolver, _serialize_type_for_checkmember(descriptor_type)
-                )
-                if result is not None:
-                    rust_decided = True
-                    has_get, _has_set = result
-                    if not has_get:
-                        return orig_descriptor_type
-            except (AssertionError, NotImplementedError):
-                pass
-        if not rust_decided and not descriptor_type.type.has_readable_member("__get__"):
-            return orig_descriptor_type
+    if not mx.is_lvalue and not descriptor_type.type.has_readable_member("__get__"):
+        return orig_descriptor_type
 
     # We do this check first to accommodate for descriptors with only __set__ method.
     # If there is no __set__, we type-check that the assigned value matches
