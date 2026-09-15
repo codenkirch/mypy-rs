@@ -65880,6 +65880,8 @@ class NativeCheckCallableCallWireGateSuite(Suite):
             [self._plugin],
         )
         assert raw is not None, "the accepted shape must be decided by Rust"
+
+
 class NativeResidualScalarTypeopsSeamsRetiredSuite(Suite):
     """Pin the #1668 residual sweep of the scalar-only typeops seams.
 
