@@ -4882,4 +4882,104 @@ measurements are appended below as the coordinator reports each landing.
   Gates: CI `pr-gate` pass (268s), `ocr-review` skipped; local
   `ocr review --from origin/main --to docs/wave5-tiers-ledger` selected 0 items
   (docs-only diff), 0 blocking.
+- `#1670` (`ac68f0eaf`, PR #1687) — feat: the G3.1 read flip,
+  `rust_snapshot_symbol_table_shadow` serves the namespace from the G3.0a shadow
+  store instead of `table.items()`, behind `Options.native_symtable_read_flip`
+  (default False, plus `native_symtable_read_flip_verify` which implies it, runs
+  the flip-off path alongside and raises on divergence). Verified here: neither
+  option is in `OPTIONS_AFFECTING_CACHE`, and the flip's diff touches no cache or
+  wire file, so `CACHE_VERSION` is untouched. `mypy/build.py` sets the mode on
+  every build so a later build cannot inherit it. A new CI gate,
+  `parity-symtable-flip`, was added with it, and on its first run that gate
+  failed with `RuntimeError: ... changed namespace order for '__main__'`. The
+  cause was **ordering only, not a leak**: `mypy/server/aststrip.py:113-118`
+  keeps `@`-named keys across a strip, so `D@5` kept its original dict position
+  while the store re-minted its ordinal after a per-build reset, the same key set
+  and the same values with only the position moved. Fixed by treating an owner
+  whose first recorded write already finds keys as `ShadowGap::Inherited`
+  (`defer_inherited`) and deferring to the live walk, with both differential
+  assertions left strict. Residual for G3.2: only namespaces the store saw from
+  empty in this build are served, so aststrip survivors and cache-loaded tables
+  defer, and closing that needs the store to survive the build boundary.
+- `e28cbca16` (PR #1703, coordinator) — docs/`AGENTS.md`, tier T1: measurement
+  code is evidence-critical regardless of tier, with the two defect families
+  observed in one wave (structural zeros: an unreachable branch, a stats key
+  initialized and never incremented, a counter incremented and never read;
+  accounting bypassed on the abnormal path: bookkeeping skipped when a wrapped
+  call raises, a report emitted only on `SystemExit`) and the reason they need
+  the full review pass even when they look like T1, namely that a probe fails by
+  printing a plausible number and exiting 0, which no test catches. Both families
+  were demonstrated in this wave, by the #1700 harness and by the discarded
+  all-zero run in #1690.
+- `d6647b8bc` (PR #1704, coordinator) — docs/handoff, tier T1: corrects this
+  wave's read-flip entry. The flip landed (`ac68f0eaf`) and its defect was
+  ordering, not a leak, so the earlier "leaked `X@N` keys" line was an inference
+  from one side of a diff dump. It is retracted here and kept only as the lesson.
+- `24ddff920` (PR #1705, coordinator) — dev/pool, tier T1: resolves the main
+  checkout through `git rev-parse --git-common-dir` instead of the script's own
+  directory, and re-points `.venv` on every `claim`, because deleting the
+  worktree that launched the pool had left all three slots with dangling venvs.
+  It also reorders lock acquisition (slots first, legacy second) and releases the
+  legacy lock only when it was acquired, via a `got_legacy` flag, since the naive
+  reorder stole an old-protocol holder's lock on `TERM`.
+- `#1673` (`9b0f426ca`, PR #1700) — perf: gate the `check_callable_call` tail
+  seam and refresh the hot-seam ranking. Tier T2/T3 (a seam that answered in
+  production was retired). `rust_check_callable_call` becomes shape d, a
+  live-object gate reusing the conjuncts the Python calibration below it already
+  computed: calls 177,899 -> 378, defers 177,524 -> 2 (it was 99.79% deferring),
+  decided 375 -> 376. Aggregate `serialize_calls` -15.3% (2,860,627 ->
+  2,424,137), writes -13.3%, bytes -28.0%, as reported by that lane. Gates:
+  testcheck `8198 passed, 15 skipped, 7 xfailed in 159.56s`; cold self-check
+  `Success: no issues found in 353 source files`; own suite `3 passed, 3997
+  deselected`; CI green. The refreshed ranking is published in
+  `docs/plans/2026-09-15-hot-seam-rerank-round4.md`: ranks 2-4 are the documented
+  copytype/flatten live-object-return floors (#1623), rank 5 and the live rows
+  are the #1642 `check_call` cluster, and `messages.py` is reserved, all counted
+  rather than re-opened. **The lane also fixed its own harness in the same PR**:
+  id-keyed buckets dropped events when a freed blob's id was recycled (a one-file
+  corpus went 106,087 -> 198,963; 4,000 equal-length blobs reported 12 instead of
+  4,000) and `report()` was lost on any non-`SystemExit` failure. Both fixed by
+  construction (strong-reference registry, count before the call, report in
+  `finally`) with behavioural fixtures. The 2026-09-14 audit's id-keyed byte and
+  bucket columns are therefore flagged as **undercounts** on #1624 and in that
+  document, while seam `calls`/`defers` and `MYPY_SERIALIZE_STATS` were never
+  affected, so that audit's verdict stands.
+- `#1668` residual sweep (`0046062a1`, PR #1685) — perf: seven scalar-only gates
+  retired from the #1637 audit's recommendation-5 batch (items 6-11 plus three
+  zero-engagement sites), in the same two files as #1669. Tier T3 (seams that
+  answered in production were deleted). Per-seam counters: 204 calls / 190
+  answered / 10,942 bytes -> 0 / 0 / 0; `rust_analyze_typeddict_access` was
+  called 14 times and answered zero, serializing 1,766 bytes to return `None`.
+  The aggregate `MYPY_SERIALIZE_STATS` delta is quoted on the PR but
+  **explicitly not claimed**, because the before and after trees differ by six or
+  more foreign commits and only per-seam numbers are attributable. That lane also
+  re-verified #1669's merged head `618c2b196` independently: testtypes `3905
+  passed, 7 skipped`, testcheck `8144 passed, 69 skipped, 7 xfailed` with
+  `TEST_NATIVE_PARSER=1 TEST_NATIVE_RESOLVER=1 -n2`, self-check clean. A
+  test-quality catch worth carrying: the retirement made two parity pins vacuous
+  (`test_instance_fallback_parity` and its `..._rust_tuple_parity` sibling were
+  comparing Python against Python), now exercising the Rust seam directly. It
+  also filed #1706 (`hard_exit` flushes stdout before
+  `atexit._run_exitfuncs()` and then `os._exit`s without flushing, dropping
+  redirected-stdout writes, the thing the #1061 comment claims to prevent).
+- `#1663` (`cd54ca293`, PR #1699) — perf: live-object semanal seams for
+  `remove_unpack_kwargs`, `method_signature` and `declared_metaclass`. Tier T3
+  attempted, closed NO-GO: it landed the non-wire conversion and **did not flip
+  any gate default** (verified here: the diff touches no `options.py` and no
+  `build.py`, and `main` still gates on `native_type_kernel and
+  MYPY_ENABLE_NATIVE_SEMANAL`). The issue's stated mechanism was disproven: the
+  entire semanal wire footprint is 287,369 of 50,373,200 bytes = 0.54% of corpus
+  writes, so removing it cannot recover the loss. Real cause, from load-invariant
+  min-of-5 ns/call against a 48ns raw-FFI floor: 3,177,447 gated non-wire calls,
+  28% of all 9,635,996 seam calls, of which `refers_to_fullname` costs +556ns
+  over 981,323 calls (+0.55s), `rust_lookup` +273ns over 1,132,833 calls
+  (+0.31s) and `refers_to_class_or_function` +497ns; the per-call work is
+  `normalize_fullnames` allocating a `HashSet<String>`. `semanal_time` off versus
+  on over five windows, each with its load line: +6.68/+8.51 at load 64,
+  +2.01/-0.20 interleaved, +1.93 at load 13, +5.19, +3.96, so four of five
+  adjacent pairs are positive and in the stable or falling-load windows the delta
+  runs against the load trend. Residual left deliberately on the wire:
+  `configure_bases` (206KB) and `make_any_non_explicit` (81KB). Follow-up #1698
+  was filed and assigned for the hot net-loss seams plus the quiet-host
+  re-measurement that must precede any future flip.
 
