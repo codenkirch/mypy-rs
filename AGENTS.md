@@ -131,6 +131,18 @@ never the engagement proof. A change that trips an unexpected behavior change
 escalates itself to T3. Cap T3 lanes at one or two per wave, since this machine
 holds about two heavy ops under its memory cap.
 
+**Measurement code is treated as evidence-critical regardless of its size.** A
+probe, counter or audit script fails by printing *silently wrong numbers*, which
+no test catches because the tool runs and emits values, so give any probe or
+measurement change the full `ocr review` pass even when it looks like T1. Treat
+its findings as defects rather than advisories in these two families, both
+observed in one wave: **structural zeros** (an unreachable branch, a stats key
+initialized and never incremented, a counter incremented and never read) and
+**accounting bypassed on the abnormal path** (bookkeeping skipped when a wrapped
+call raises; a report emitted only on `SystemExit`, so any other exception
+discards the output the script exists to produce). A probe that can undercount is
+worse than no probe, because its numbers are treated as primary evidence.
+
 Pre-flight for T2/T3/T4: prove which source tree you are testing. A worktree
 `.venv` is a symlink to the main checkout's venv, and that venv's editable
 install points at the main checkout, so `import mypy` can silently resolve
