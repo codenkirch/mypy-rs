@@ -1,0 +1,623 @@
+//! F reopening experiment (#1671): Rust-owned storage for one `Type`
+//! family, the "replacement view" arm ADR-0004 Decision 1 declined.
+//!
+//! The current native default routes wire-seam reads through Python: the
+//! funnel (`mypy.types._serialize_type_for_visitor`) walks the live
+//! `Instance` with `getattr`, encodes it, and hands the bytes across FFI.
+//! A *view* inverts that: the `Instance` field set lives in Rust, Python
+//! attribute writes push it in, and the encode is emitted from the store
+//! with no Python walk at all.
+//!
+//! Scope, deliberately one family and deliberately bounded:
+//!
+//! - Storage is per live object, keyed by the shared `identity::handle_for`
+//!   handle (#1528), never by `id()`. The store pins the object, so a
+//!   handle cannot outlive its referent.
+//! - `args` are stored as child handles, not as encoded bytes. An
+//!   `Instance` is served only when every argument is itself a registered,
+//!   fresh, tvar-clean view, so the recursion never encodes a Python leaf.
+//!   Any other argument kind (a `CallableType`, a `TupleType`, a typevar)
+//!   makes the serve a miss and the caller falls back to its own encode.
+//! - `Instance.type` has no writer hook in Python (a plain slot), so the
+//!   stored fullname is verified against the live `TypeInfo.fullname` on
+//!   every serve. A mismatch is a miss, never stale bytes.
+//! - `last_known_value` and `extra_attrs` are stored as presence flags only;
+//!   an `Instance` carrying either is not served.
+//!
+//! Soundness rule: every path that cannot prove the stored entry current
+//! returns `None`. The caller's existing encode then runs unchanged, so a
+//! miss costs a store lookup and nothing else.
+
+use std::cell::RefCell;
+use std::collections::HashMap;
+
+use pyo3::exceptions::PyValueError;
+use pyo3::prelude::*;
+use pyo3::types::{PyBytes, PyTuple};
+
+use crate::identity;
+use crate::wire::{
+    write_int_bare, write_str, write_str_bare, write_tag, WriteBuffer, END_TAG, INSTANCE,
+    INSTANCE_BOOL, INSTANCE_FUNCTION, INSTANCE_GENERIC, INSTANCE_INT, INSTANCE_OBJECT,
+    INSTANCE_SIMPLE, INSTANCE_STR, LITERAL_NONE, LIST_GEN,
+};
+
+/// Recursion budget for a serve. mypy type graphs are DAGs in practice, but
+/// "in practice" is not a soundness argument, so the walk is bounded rather
+/// than trusting the graph to be acyclic.
+const ENCODE_DEPTH_BUDGET: u32 = 64;
+
+/// The fields a serve needs, copied out of the store so no borrow is held
+/// across the recursion (which re-enters the store for each child).
+struct ServePlan {
+    fullname: String,
+    arg_handles: Vec<u64>,
+}
+
+/// One stored `Instance` field set.
+struct InstanceView {
+    /// `Instance.type.fullname`, verified against the live `TypeInfo` on
+    /// every serve (the field has no Python writer hook).
+    fullname: String,
+    /// The live argument objects, pinned. `arg_handles[i] == 0` means the
+    /// argument has no view of its own; a serve then misses.
+    args: Vec<Py<PyAny>>,
+    arg_handles: Vec<u64>,
+    /// `Instance.type_ref is None`: the instance has been fixed up. A
+    /// pre-fixup instance is never served (mirrors the F3 cache rule).
+    fixed_up: bool,
+    /// No direct argument is `TypeVarType`/`ParamSpecType`/`TypeVarTupleType`.
+    /// Nested taint is caught by the recursion, which requires every child
+    /// entry to be tvar-clean as well.
+    args_tvar_clean: bool,
+    stamp: u64,
+}
+
+struct ViewStore {
+    by_handle: HashMap<u64, InstanceView>,
+    /// Strong pins, keyed like the entries: the handle keys are `id()`-derived
+    /// at the identity layer, so a stored object must be held alive.
+    pins: HashMap<u64, Py<PyAny>>,
+    encodes: u64,
+    defers: u64,
+    read_routes: u64,
+}
+
+impl ViewStore {
+    fn new() -> Self {
+        ViewStore {
+            by_handle: HashMap::new(),
+            pins: HashMap::new(),
+            encodes: 0,
+            defers: 0,
+            read_routes: 0,
+        }
+    }
+}
+
+thread_local! {
+    static STORE: RefCell<ViewStore> = RefCell::new(ViewStore::new());
+}
+
+fn with_store<T>(f: impl FnOnce(&mut ViewStore) -> T) -> T {
+    STORE.with(|cell| f(&mut cell.borrow_mut()))
+}
+
+/// The singleton tags the Python writer emits for an argument-less
+/// `Instance`, or `None` for the `INSTANCE_SIMPLE` branch (which needs the
+/// bare fullname).
+fn singleton_tag(fullname: &str) -> Option<u8> {
+    match fullname {
+        "builtins.str" => Some(INSTANCE_STR),
+        "builtins.function" => Some(INSTANCE_FUNCTION),
+        "builtins.int" => Some(INSTANCE_INT),
+        "builtins.bool" => Some(INSTANCE_BOOL),
+        "builtins.object" => Some(INSTANCE_OBJECT),
+        _ => None,
+    }
+}
+
+/// The serve plan for `handle`, or `None` when the entry is absent, stale,
+/// pre-fixup, or tvar-tainted.
+fn serve_plan(handle: u64, stamp: u64) -> Option<ServePlan> {
+    with_store(|store| {
+        let entry = store.by_handle.get(&handle)?;
+        if entry.stamp != stamp || !entry.fixed_up || !entry.args_tvar_clean {
+            return None;
+        }
+        Some(ServePlan {
+            fullname: entry.fullname.clone(),
+            arg_handles: entry.arg_handles.clone(),
+        })
+    })
+}
+
+/// The live object pinned for `handle` (a registered child), or `None`.
+fn pinned(py: Python<'_>, handle: u64) -> Option<Py<PyAny>> {
+    with_store(|store| store.pins.get(&handle).map(|pin| pin.clone_ref(py)))
+}
+
+/// The live `TypeInfo.fullname` behind a registered object's `type` slot.
+fn live_fullname(py: Python<'_>, obj: &Py<PyAny>) -> Option<String> {
+    obj.as_ref(py)
+        .getattr("type")
+        .ok()?
+        .getattr("fullname")
+        .ok()?
+        .extract::<String>()
+        .ok()
+}
+
+/// Emit one registered `Instance` from the store, or `None` on any doubt.
+fn encode_instance(
+    py: Python<'_>,
+    handle: u64,
+    stamp: u64,
+    live: &str,
+    budget: u32,
+) -> Option<Vec<u8>> {
+    if budget == 0 {
+        return None;
+    }
+    let plan = serve_plan(handle, stamp)?;
+    // The `type` slot has no Python writer hook, so the live fullname is the
+    // only trustworthy source. A mismatch means the instance was retyped in
+    // place; refuse rather than emit bytes for the old type.
+    if plan.fullname != live {
+        return None;
+    }
+
+    let mut buf = WriteBuffer::new();
+    write_tag(&mut buf, INSTANCE);
+    if plan.arg_handles.is_empty() {
+        match singleton_tag(&plan.fullname) {
+            Some(tag) => write_tag(&mut buf, tag),
+            None => {
+                write_tag(&mut buf, INSTANCE_SIMPLE);
+                write_str_bare(&mut buf, &plan.fullname).ok()?;
+            }
+        }
+        return Some(buf.into_bytes());
+    }
+    write_tag(&mut buf, INSTANCE_GENERIC);
+    write_str(&mut buf, &plan.fullname).ok()?;
+    write_tag(&mut buf, LIST_GEN);
+    write_int_bare(&mut buf, plan.arg_handles.len() as i64).ok()?;
+    for &child in &plan.arg_handles {
+        if child == 0 {
+            return None;
+        }
+        let child_obj = pinned(py, child)?;
+        let child_live = live_fullname(py, &child_obj)?;
+        buf.extend(&encode_instance(py, child, stamp, &child_live, budget - 1)?);
+    }
+    // `args_tvar_clean` is required at registration and both scalar side
+    // fields refuse registration, so the shorthand tags never apply here and
+    // the two optional slots are always the `LITERAL_NONE` clears.
+    write_tag(&mut buf, LITERAL_NONE);
+    write_tag(&mut buf, LITERAL_NONE);
+    write_tag(&mut buf, END_TAG);
+    Some(buf.into_bytes())
+}
+
+/// Register (or re-register) the field set of `obj`. Returns the handle.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn put(
+    obj: &PyAny,
+    fullname: String,
+    args: Vec<Py<PyAny>>,
+    arg_handles: Vec<u64>,
+    fixed_up: bool,
+    args_tvar_clean: bool,
+    stamp: u64,
+) -> PyResult<u64> {
+    if args.len() != arg_handles.len() {
+        return Err(PyValueError::new_err(
+            "typeview: args and arg_handles must have equal length",
+        ));
+    }
+    let handle = identity::handle_for_stable(obj)
+        .or_else(|| identity::handle_for(obj))
+        .ok_or_else(|| PyValueError::new_err("typeview: object has no identity handle"))?;
+    with_store(|store| {
+        store.by_handle.insert(
+            handle,
+            InstanceView {
+                fullname,
+                args,
+                arg_handles,
+                fixed_up,
+                args_tvar_clean,
+                stamp,
+            },
+        );
+        store.pins.insert(handle, Py::from(obj));
+    });
+    Ok(handle)
+}
+
+/// Serve the wire bytes for `handle` when the stored field set is current.
+pub(crate) fn encode(
+    py: Python<'_>,
+    handle: u64,
+    stamp: u64,
+    live: &str,
+) -> Option<Vec<u8>> {
+    let bytes = encode_instance(py, handle, stamp, live, ENCODE_DEPTH_BUDGET);
+    with_store(|store| {
+        if bytes.is_some() {
+            store.encodes += 1;
+        } else {
+            store.defers += 1;
+        }
+    });
+    bytes
+}
+
+/// The stored `args` as a live tuple (the read-route arm).
+pub(crate) fn args_tuple(py: Python<'_>, handle: u64, stamp: u64) -> Option<Py<PyTuple>> {
+    let items: Vec<Py<PyAny>> = with_store(|store| {
+        let entry = store.by_handle.get(&handle)?;
+        if entry.stamp != stamp {
+            return None;
+        }
+        Some(entry.args.iter().map(|o| o.clone_ref(py)).collect())
+    })?;
+    with_store(|store| store.read_routes += 1);
+    Some(PyTuple::new(py, items).into())
+}
+
+/// Invalidate one entry after a Python field write. The pin is released too:
+/// the next registration re-mints it, so a stale pin cannot keep a retyped
+/// instance alive under an old fullname.
+pub(crate) fn touch(handle: u64) -> bool {
+    let (present, pin) = with_store(|store| {
+        let present = store.by_handle.remove(&handle).is_some();
+        let pin = store.pins.remove(&handle);
+        (present, pin)
+    });
+    // Dropped after the borrow is released: releasing the last reference can
+    // run a Python deallocator that re-enters the store.
+    drop(pin);
+    present
+}
+
+/// Clear every entry and pin, and zero the serve counters. Identity is not
+/// owned here: `rust_mirror_reset` alone resets the handle registry, so view
+/// state cannot invalidate handles other seams hold.
+pub(crate) fn reset() -> usize {
+    let (entries, pins) = with_store(|store| {
+        let entries = store.by_handle.len();
+        let pins: Vec<Py<PyAny>> = store.pins.drain().map(|(_, pin)| pin).collect();
+        store.by_handle.clear();
+        store.encodes = 0;
+        store.defers = 0;
+        store.read_routes = 0;
+        (entries, pins)
+    });
+    drop(pins);
+    entries
+}
+
+pub(crate) fn entry_count() -> usize {
+    with_store(|store| store.by_handle.len())
+}
+
+/// `(encodes, defers, read_routes)` since the last `reset`.
+pub(crate) fn stats() -> (u64, u64, u64) {
+    with_store(|store| (store.encodes, store.defers, store.read_routes))
+}
+
+// ---- pyfunction wrappers ----
+
+/// Register the `Instance` field set for `obj`; returns the identity handle.
+#[pyfunction]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn rust_view_put(
+    obj: &PyAny,
+    fullname: String,
+    args: Vec<Py<PyAny>>,
+    arg_handles: Vec<u64>,
+    fixed_up: bool,
+    args_tvar_clean: bool,
+    stamp: u64,
+) -> PyResult<u64> {
+    put(obj, fullname, args, arg_handles, fixed_up, args_tvar_clean, stamp)
+}
+
+/// Wire bytes for `handle`, or `None` when the stored field set cannot be
+/// proven current.
+#[pyfunction]
+pub(crate) fn rust_view_encode(
+    py: Python<'_>,
+    handle: u64,
+    stamp: u64,
+    live_fullname: &str,
+) -> Option<Py<PyBytes>> {
+    encode(py, handle, stamp, live_fullname).map(|bytes| PyBytes::new(py, &bytes).into())
+}
+
+/// The stored `args` as a live tuple, or `None` when the entry is not current.
+#[pyfunction]
+pub(crate) fn rust_view_args(py: Python<'_>, handle: u64, stamp: u64) -> Option<Py<PyTuple>> {
+    args_tuple(py, handle, stamp)
+}
+
+/// Drop the entry for `handle` (a Python field write invalidated it).
+#[pyfunction]
+pub(crate) fn rust_view_touch(handle: u64) -> bool {
+    touch(handle)
+}
+
+/// Clear every entry and pin; returns the dropped entry count.
+#[pyfunction]
+pub(crate) fn rust_view_reset() -> usize {
+    reset()
+}
+
+/// Live entry count (audit + tests).
+#[pyfunction]
+pub(crate) fn rust_view_count() -> usize {
+    entry_count()
+}
+
+/// `(encodes, defers, read_routes)` since the last reset.
+#[pyfunction]
+pub(crate) fn rust_view_stats() -> (u64, u64, u64) {
+    stats()
+}
+
+#[cfg(test)]
+mod typeview_tests {
+    use super::*;
+
+    fn with_py<T>(f: impl FnOnce(Python<'_>) -> T) -> T {
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(f)
+    }
+
+    /// A `types.SimpleNamespace` carrying the given attributes.
+    fn namespace(py: Python<'_>, attrs: &[(&str, PyObject)]) -> Py<PyAny> {
+        let ns = pyo3::types::PyDict::new(py);
+        for (name, value) in attrs {
+            ns.set_item(name, value).unwrap();
+        }
+        pyo3::types::PyModule::import(py, "types")
+            .unwrap()
+            .getattr("SimpleNamespace")
+            .unwrap()
+            .call((), Some(ns))
+            .unwrap()
+            .into()
+    }
+
+    /// An `Instance`-shaped stub: the only live field this store reads is
+    /// `type.fullname`, which a serve verifies on every call.
+    fn instance(py: Python<'_>, fullname: &str) -> Py<PyAny> {
+        let type_info = namespace(py, &[("fullname", fullname.into_py(py))]);
+        namespace(py, &[("type", type_info)])
+    }
+
+    /// `write_int_bare`'s 1-byte tier for an in-range value.
+    fn short_int(value: i64) -> u8 {
+        ((value + 10) << 1) as u8
+    }
+
+    #[test]
+    fn test_put_and_encode_leaf() {
+        with_py(|py| {
+            reset();
+            let obj = instance(py, "builtins.int");
+            let h = put(obj.as_ref(py), "builtins.int".into(), vec![], vec![], true, true, 1)
+                .unwrap();
+            assert_eq!(entry_count(), 1);
+            let bytes = encode(py, h, 1, "builtins.int").unwrap();
+            assert_eq!(bytes, vec![INSTANCE, INSTANCE_INT]);
+            assert_eq!(stats().0, 1);
+        });
+    }
+
+    #[test]
+    fn test_encode_simple_fullname() {
+        with_py(|py| {
+            reset();
+            let obj = instance(py, "foo.Bar");
+            let h = put(obj.as_ref(py), "foo.Bar".into(), vec![], vec![], true, true, 1).unwrap();
+            let bytes = encode(py, h, 1, "foo.Bar").unwrap();
+            assert_eq!(bytes[0], INSTANCE);
+            assert_eq!(bytes[1], INSTANCE_SIMPLE);
+            assert_eq!(bytes[2], short_int(7));
+            assert_eq!(&bytes[3..], b"foo.Bar");
+        });
+    }
+
+    #[test]
+    fn test_nested_registered_child_encodes_recursively() {
+        with_py(|py| {
+            reset();
+            let child = instance(py, "builtins.int");
+            let child_h =
+                put(child.as_ref(py), "builtins.int".into(), vec![], vec![], true, true, 1)
+                    .unwrap();
+            let parent = instance(py, "builtins.list");
+            let parent_h = put(
+                parent.as_ref(py),
+                "builtins.list".into(),
+                vec![child.clone_ref(py)],
+                vec![child_h],
+                true,
+                true,
+                1,
+            )
+            .unwrap();
+            let bytes = encode(py, parent_h, 1, "builtins.list").unwrap();
+            let mut expected = vec![INSTANCE, INSTANCE_GENERIC, crate::wire::LITERAL_STR];
+            expected.push(short_int(13));
+            expected.extend_from_slice(b"builtins.list");
+            expected.extend_from_slice(&[LIST_GEN, short_int(1), INSTANCE, INSTANCE_INT]);
+            expected.extend_from_slice(&[LITERAL_NONE, LITERAL_NONE, END_TAG]);
+            assert_eq!(bytes, expected);
+        });
+    }
+
+    #[test]
+    fn test_stale_stamp_defers() {
+        with_py(|py| {
+            reset();
+            let obj = instance(py, "builtins.int");
+            let h = put(obj.as_ref(py), "builtins.int".into(), vec![], vec![], true, true, 1)
+                .unwrap();
+            assert!(encode(py, h, 2, "builtins.int").is_none());
+            assert_eq!(stats().1, 1);
+        });
+    }
+
+    #[test]
+    fn test_retyped_instance_defers() {
+        with_py(|py| {
+            reset();
+            let obj = instance(py, "builtins.int");
+            let h = put(obj.as_ref(py), "builtins.int".into(), vec![], vec![], true, true, 1)
+                .unwrap();
+            // The live fullname moved: the stored entry is refused.
+            assert!(encode(py, h, 1, "builtins.str").is_none());
+        });
+    }
+
+    #[test]
+    fn test_pre_fixup_instance_defers() {
+        with_py(|py| {
+            reset();
+            let obj = instance(py, "builtins.int");
+            let h = put(obj.as_ref(py), "builtins.int".into(), vec![], vec![], false, true, 1)
+                .unwrap();
+            assert!(encode(py, h, 1, "builtins.int").is_none());
+        });
+    }
+
+    #[test]
+    fn test_tvar_tainted_args_defer() {
+        with_py(|py| {
+            reset();
+            let obj = instance(py, "builtins.list");
+            let h = put(obj.as_ref(py), "builtins.list".into(), vec![], vec![], true, false, 1)
+                .unwrap();
+            assert!(encode(py, h, 1, "builtins.list").is_none());
+        });
+    }
+
+    #[test]
+    fn test_unregistered_child_defers() {
+        with_py(|py| {
+            reset();
+            let child = instance(py, "builtins.int");
+            let parent = instance(py, "builtins.list");
+            let h = put(
+                parent.as_ref(py),
+                "builtins.list".into(),
+                vec![child],
+                vec![0],
+                true,
+                true,
+                1,
+            )
+            .unwrap();
+            assert!(encode(py, h, 1, "builtins.list").is_none());
+        });
+    }
+
+    #[test]
+    fn test_mismatched_child_fullname_defers() {
+        with_py(|py| {
+            reset();
+            let child = instance(py, "builtins.int");
+            let child_h =
+                put(child.as_ref(py), "builtins.int".into(), vec![], vec![], true, true, 1)
+                    .unwrap();
+            let parent = instance(py, "builtins.list");
+            let h = put(
+                parent.as_ref(py),
+                "builtins.list".into(),
+                vec![child.clone_ref(py)],
+                vec![child_h],
+                true,
+                true,
+                1,
+            )
+            .unwrap();
+            // The child was retyped in place after registration.
+            let retyped = namespace(py, &[("fullname", "builtins.str".into_py(py))]);
+            child.as_ref(py).setattr("type", retyped).unwrap();
+            assert!(encode(py, h, 1, "builtins.list").is_none());
+        });
+    }
+
+    #[test]
+    fn test_touch_drops_entry() {
+        with_py(|py| {
+            reset();
+            let obj = instance(py, "builtins.int");
+            let h = put(obj.as_ref(py), "builtins.int".into(), vec![], vec![], true, true, 1)
+                .unwrap();
+            assert!(touch(h));
+            assert_eq!(entry_count(), 0);
+            assert!(!touch(h));
+        });
+    }
+
+    #[test]
+    fn test_args_route_returns_live_tuple() {
+        with_py(|py| {
+            reset();
+            let child = instance(py, "builtins.int");
+            let parent = instance(py, "builtins.list");
+            let h = put(
+                parent.as_ref(py),
+                "builtins.list".into(),
+                vec![child.clone_ref(py)],
+                vec![0],
+                true,
+                true,
+                1,
+            )
+            .unwrap();
+            let tup = args_tuple(py, h, 1).unwrap();
+            assert_eq!(tup.as_ref(py).len(), 1);
+            assert!(tup.as_ref(py).get_item(0).unwrap().is(child.as_ref(py)));
+            assert_eq!(stats().2, 1);
+        });
+    }
+
+    #[test]
+    fn test_reset_clears_entries() {
+        with_py(|py| {
+            reset();
+            let obj = instance(py, "builtins.int");
+            let h = put(obj.as_ref(py), "builtins.int".into(), vec![], vec![], true, true, 1).unwrap();
+            encode(py, h, 1, "builtins.int").unwrap();
+            assert_eq!(entry_count(), 1);
+            assert_eq!(stats().0, 1);
+            assert_eq!(reset(), 1);
+            assert_eq!(entry_count(), 0);
+            assert_eq!(stats(), (0, 0, 0));
+        });
+    }
+
+    #[test]
+    fn test_length_mismatch_rejected() {
+        with_py(|py| {
+            reset();
+            let obj = instance(py, "builtins.int");
+            assert!(put(
+                obj.as_ref(py),
+                "builtins.int".into(),
+                vec![],
+                vec![1],
+                true,
+                true,
+                1
+            )
+            .is_err());
+        });
+    }
+}

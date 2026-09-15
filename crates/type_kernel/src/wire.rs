@@ -70,15 +70,16 @@ pub(crate) const EXTRA_ATTRS: u8 = 150;
 // Reserved / end markers (cache.py:327-328).
 pub(crate) const END_TAG: u8 = 255;
 
-// Instance family tags (types.py:4425-4432).
-const INSTANCE: u8 = 80;
-const INSTANCE_SIMPLE: u8 = 81;
-const INSTANCE_GENERIC: u8 = 82;
-const INSTANCE_STR: u8 = 83;
-const INSTANCE_FUNCTION: u8 = 84;
-const INSTANCE_INT: u8 = 85;
-const INSTANCE_BOOL: u8 = 86;
-const INSTANCE_OBJECT: u8 = 87;
+// Instance family tags (types.py:4425-4432). `pub(crate)` because the
+// replacement-view encoder (`typeview.rs`) emits the same layout.
+pub(crate) const INSTANCE: u8 = 80;
+pub(crate) const INSTANCE_SIMPLE: u8 = 81;
+pub(crate) const INSTANCE_GENERIC: u8 = 82;
+pub(crate) const INSTANCE_STR: u8 = 83;
+pub(crate) const INSTANCE_FUNCTION: u8 = 84;
+pub(crate) const INSTANCE_INT: u8 = 85;
+pub(crate) const INSTANCE_BOOL: u8 = 86;
+pub(crate) const INSTANCE_OBJECT: u8 = 87;
 
 // Other type tags (types.py:4435-4452).
 pub(crate) const TYPE_ALIAS_TYPE: u8 = 100;

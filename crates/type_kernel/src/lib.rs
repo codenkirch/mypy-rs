@@ -119,8 +119,6 @@ mod overload;
 mod overload_never;
 mod overload_override;
 mod protocols;
-// ADR-0004 proxy P1 (#1553): blob-backed read-shadow store scaffold.
-mod proxy;
 // Phase G1.0a (#1572): expression dual-write node shadow store.
 mod node_mirror;
 
@@ -171,6 +169,7 @@ mod typeanal_unbound2;
 mod typeinfo;
 mod typeops;
 mod types_impl;
+mod typeview;
 mod unify;
 mod util;
 mod visitor;
@@ -3651,19 +3650,9 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         module
     )?)?;
 
-    // ADR-0004 proxy P1 (#1553): blob-backed read-shadow store keyed by
-    // identity handles. No funnel reads an entry in P1 (zero behavior
-    // change); P2 wires the lazy Instance read shadow.
-    module.add_function(wrap_pyfunction!(proxy::rust_proxy_read, module)?)?;
-    module.add_function(wrap_pyfunction!(proxy::rust_proxy_put, module)?)?;
-    module.add_function(wrap_pyfunction!(proxy::rust_proxy_drop, module)?)?;
-    module.add_function(wrap_pyfunction!(proxy::rust_proxy_reset, module)?)?;
-    module.add_function(wrap_pyfunction!(proxy::rust_proxy_entry_count, module)?)?;
-    module.add_function(wrap_pyfunction!(proxy::rust_proxy_handle_of, module)?)?;
-
     // Phase G1.0a (#1572): expression dual-write node shadow. Capture-only
     // in G1 (no consumer reads an entry), keyed by the shared identity
-    // handles like the proxy store.
+    // handles like the type mirror.
     module.add_function(wrap_pyfunction!(
         node_mirror::rust_node_mirror_capture_ref,
         module
@@ -3769,7 +3758,7 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
 
     // Phase G3.0a (#1581): namespace dual-write capture shadow. One
     // record per (owner table handle, name) with generation + seq;
-    // capture-only, same identity base as the proxy/mirror stores.
+    // capture-only, same identity base as the type mirror.
     module.add_function(wrap_pyfunction!(
         symtable_mirror::rust_symtable_mirror_put,
         module
@@ -3912,6 +3901,15 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         subexpr_strip::rust_strip_ref_expr,
         module
     )?)?;
+
+    // F reopening experiment (#1671): Rust-owned `Instance` field storage.
+    module.add_function(wrap_pyfunction!(typeview::rust_view_put, module)?)?;
+    module.add_function(wrap_pyfunction!(typeview::rust_view_encode, module)?)?;
+    module.add_function(wrap_pyfunction!(typeview::rust_view_args, module)?)?;
+    module.add_function(wrap_pyfunction!(typeview::rust_view_touch, module)?)?;
+    module.add_function(wrap_pyfunction!(typeview::rust_view_reset, module)?)?;
+    module.add_function(wrap_pyfunction!(typeview::rust_view_count, module)?)?;
+    module.add_function(wrap_pyfunction!(typeview::rust_view_stats, module)?)?;
 
     Ok(())
 }
