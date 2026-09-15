@@ -66045,8 +66045,8 @@ class NativeResidualScalarCheckmemberSeamsRetiredSuite(Suite):
 
         checkmember._serialize_type_for_checkmember = spy
         try:
-            deleted = analyze_typeddict_access(
-                "__delitem__", self._typeddict(), self._make_mx(), None
+            deleted = get_proper_type(
+                analyze_typeddict_access("__delitem__", self._typeddict(), self._make_mx(), None)
             )
             assert isinstance(deleted, CallableType)
             assert deleted.name == "__delitem__"
@@ -66065,8 +66065,8 @@ class NativeResidualScalarCheckmemberSeamsRetiredSuite(Suite):
             meta_has_operator,
         )
 
-        deleted = analyze_typeddict_access(
-            "__delitem__", self._typeddict(), self._make_mx(), None
+        deleted = get_proper_type(
+            analyze_typeddict_access("__delitem__", self._typeddict(), self._make_mx(), None)
         )
         assert isinstance(deleted, CallableType)
         assert [str(a) for a in deleted.arg_types] == ["builtins.str"]
