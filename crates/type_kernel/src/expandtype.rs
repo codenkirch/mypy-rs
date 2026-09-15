@@ -758,13 +758,39 @@ fn param_spec_leaf(t: &Type, env: &HashMap<EnvKey, Type>, strict_optional: bool)
     res
 }
 
+/// `CallableType.normalize_trivial_unpack` (types.py:2852-2865): replace
+/// an ARG_STAR `UnpackType(builtins.tuple[X, ...])` with `X`. Alias inner
+/// is a no-op (needs `get_proper_type`, no wire target).
+fn normalize_trivial_unpack(t: &mut Type) {
+    let Type::CallableType {
+        arg_kinds,
+        arg_types,
+        ..
+    } = t
+    else {
+        return;
+    };
+    let Some(star_idx) = arg_kinds.iter().position(|&k| k == ARG_STAR) else {
+        return;
+    };
+    let Type::UnpackType { typ, .. } = &arg_types[star_idx] else {
+        return;
+    };
+    // get_proper_type(star_type.type): an alias has no resolved target.
+    if let Type::Instance { type_ref, args, .. } = typ.as_ref() {
+        if type_ref == "builtins.tuple" && !args.is_empty() {
+            arg_types[star_idx] = args[0].clone();
+        }
+    }
+}
+
 /// `ExpandTypeVisitor.visit_callable_type` ParamSpec splice
 /// (expandtype.py:1149-1195). Returns `Some(Some(t))` when the splice
-/// ran, `Some(None)` when the case defers to Python (an UnpackType in
-/// the splice result, a fresh meta var substitute the wire cannot
-/// key, or an ARGS/KWARGS ParamSpec leaf the Parameters arm cannot
-/// key), and `None` when there is no ParamSpec replacement in the env
-/// (the caller continues with the generic expansion path).
+/// ran, `Some(None)` when the case defers to Python (a fresh meta var
+/// substitute the wire cannot key, or an ARGS/KWARGS ParamSpec leaf the
+/// Parameters arm cannot key), and `None` when there is no ParamSpec
+/// replacement in the env (the caller continues with the generic
+/// expansion path).
 fn param_spec_callable_arm(
     t: &Type,
     env: &HashMap<EnvKey, Type>,
@@ -803,16 +829,6 @@ fn param_spec_callable_arm(
     match repl {
         Type::Parameters(repl_params) => {
             let n = arg_types.len();
-            // Python only normalizes the new var_arg via
-            // normalize_trivial_unpack (expandtype.py:1173-1176), not
-            // ported: defer whenever the splice carries an unpack.
-            if arg_types[..n - 2]
-                .iter()
-                .chain(repl_params.arg_types.iter())
-                .any(|at| matches!(at, Type::UnpackType { .. }))
-            {
-                return Some(None);
-            }
             let mut new_arg_types = Vec::with_capacity(n - 2 + repl_params.arg_types.len());
             for at in &arg_types[..n - 2] {
                 new_arg_types.push(expand_type_inner(at, env, strict_optional)?);
@@ -853,6 +869,9 @@ fn param_spec_callable_arm(
                 *imprecise_arg_kinds = *imprecise_arg_kinds || repl_params.imprecise_arg_kinds;
                 *variables = [repl_params.variables.clone(), variables.clone()].concat();
             }
+            // normalize_trivial_unpack (types.py:2852-2865): replace
+            // *args: *tuple[X, ...] -> *args: X. Alias inner is a no-op.
+            normalize_trivial_unpack(&mut res);
             if contains_param_spec(&res) {
                 return Some(None);
             }
@@ -2881,9 +2900,10 @@ mod tests {
     }
 
     #[test]
-    fn ps_splice_callable_unpack_repl_defers() {
-        // The splice result carries an unpack Python would normalize;
-        // the port defers instead (expandtype.py:1173-1176 unported).
+    fn ps_splice_callable_unpack_repl_no_star_no_normalize() {
+        // The repl carries an UnpackType at ARG_POS (no ARG_STAR in the
+        // spliced result), so normalize_trivial_unpack is a no-op.
+        // The splice succeeds (no ParamSpec survives).
         let typ = ps_callable(1, vec![], any());
         let env: HashMap<EnvKey, Type> = HashMap::from([(
             (1, 0, String::new()),
@@ -2895,11 +2915,74 @@ mod tests {
                 vec![],
             )),
         )]);
-        assert!(matches!(
-            param_spec_callable_arm(&typ, &env, false),
-            Some(None)
-        ));
-        assert!(expand_type_inner(&typ, &env, false).is_none());
+        let out = param_spec_callable_arm(&typ, &env, false);
+        assert!(matches!(out, Some(Some(_))), "expected splice to succeed");
+        if let Some(Some(Type::CallableType { arg_types, .. })) = out {
+            assert_eq!(arg_types.len(), 1);
+            assert!(matches!(arg_types[0], Type::UnpackType { .. }));
+        } else {
+            panic!("expected CallableType");
+        }
+    }
+
+    #[test]
+    fn ps_splice_callable_unpack_star_normalizes() {
+        // ARG_STAR UnpackType wrapping builtins.tuple[Any, ...] normalizes
+        // to the tuple's first arg (Any), matching types.py:2852-2865.
+        let typ = ps_callable(1, vec![], any());
+        let mut repl = params_of(
+            vec![Type::UnpackType {
+                typ: Box::new(tuple_instance()),
+                from_star_syntax: false,
+            }],
+            vec![],
+        );
+        repl.arg_kinds[0] = 2; // ARG_STAR
+        let env: HashMap<EnvKey, Type> =
+            HashMap::from([((1, 0, String::new()), Type::Parameters(repl))]);
+        let out = param_spec_callable_arm(&typ, &env, false);
+        assert!(matches!(out, Some(Some(_))), "expected splice to succeed");
+        if let Some(Some(Type::CallableType { arg_types, arg_kinds, .. })) = out {
+            assert_eq!(arg_types.len(), 1);
+            assert_eq!(arg_kinds[0], 2); // still ARG_STAR
+            // The UnpackType was replaced by the tuple's first arg (Any).
+            assert!(matches!(arg_types[0], Type::AnyType { .. }));
+        } else {
+            panic!("expected CallableType");
+        }
+    }
+
+    #[test]
+    fn ps_splice_callable_unpack_star_alias_defers() {
+        // ARG_STAR UnpackType wrapping a TypeAliasType: no Instance to
+        // normalize, UnpackType survives, contains_param_spec handles it.
+        let typ = ps_callable(1, vec![], any());
+        let mut repl = params_of(
+            vec![Type::UnpackType {
+                typ: Box::new(Type::TypeAliasType {
+                    type_ref: "mod.Alias".to_string(),
+                    args: vec![],
+                    is_recursive: false,
+                }),
+                from_star_syntax: false,
+            }],
+            vec![],
+        );
+        repl.arg_kinds[0] = 2; // ARG_STAR
+        let env: HashMap<EnvKey, Type> =
+            HashMap::from([((1, 0, String::new()), Type::Parameters(repl))]);
+        let out = param_spec_callable_arm(&typ, &env, false);
+        // The alias UnpackType survives normalization; contains_param_spec
+        // is false (no ParamSpec in the result), so the splice succeeds
+        // with the alias-bearing UnpackType intact.
+        assert!(matches!(out, Some(Some(_))), "expected splice to succeed");
+        if let Some(Some(Type::CallableType { arg_types, arg_kinds, .. })) = out {
+            assert_eq!(arg_types.len(), 1);
+            assert_eq!(arg_kinds[0], 2);
+            assert!(matches!(arg_types[0], Type::UnpackType { .. }));
+        } else {
+            panic!("expected CallableType");
+        }
     }
 
     #[test]

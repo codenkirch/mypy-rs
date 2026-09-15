@@ -1949,18 +1949,6 @@ pub(crate) fn rust_infer_function_type_arguments(
             return None;
         };
     };
-    // ParamSpec/TypeVarTuple variables use the deferred constraint paths
-    // (constraints.py:475-494, filter_imprecise_kinds): defer.
-    if variables.iter().any(|v| {
-        matches!(
-            v,
-            Type::ParamSpecType { .. } | Type::TypeVarTupleType { .. }
-        )
-    }) {
-        {
-            return None;
-        };
-    }
     // UnpackType formals use the star-unpack branch (constraints.py:388-438): defer.
     if formal_types
         .iter()

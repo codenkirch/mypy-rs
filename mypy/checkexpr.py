@@ -3098,9 +3098,9 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
                     callee = callee.copy_modified(arg_types=[new_arg_type])
 
         if callee.is_generic():
-            # Stage 9: try native generic-call solving. Native path runs only
-            # when the kernel is active and the callee has no ParamSpec /
-            # TypeVarTuple variables (those always go through Python).
+            # Stage 9: try native generic-call solving. The native solve
+            # handles ParamSpec/TypeVarTuple variables; need_refresh still
+            # recalculates formal_to_actual after solving (below).
             need_refresh = any(
                 isinstance(v, (ParamSpecType, TypeVarTupleType)) for v in callee.variables
             )
@@ -3119,7 +3119,6 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
                 _CHECKEXPR_HAS_TYPE_KERNEL
                 and _native_checkcall_active
                 and _native_checkexpr_resolver is not None
-                and not need_refresh
                 and not has_rec_ctx
                 and not py_dict_kwargs
             ):

@@ -858,16 +858,6 @@ pub(crate) fn solve_generic_call_core(
         }
     };
 
-    // Defer on ParamSpec/TypeVarTuple variables — expand_type defers.
-    if variables.iter().any(|v| {
-        matches!(
-            v,
-            Type::ParamSpecType { .. } | Type::TypeVarTupleType { .. }
-        )
-    }) {
-        return None;
-    }
-
     // Step 2: Infer constraints by iterating formal-to-actual.
     let mut all_constraints: Vec<crate::constraints::Constraint> = Vec::new();
     let arg_types_vec: Vec<Type> = arg_types_bytes

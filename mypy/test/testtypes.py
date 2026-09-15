@@ -6074,16 +6074,17 @@ class NativeExpandParamSpecSpliceSuite(Suite):
         assert not self._engaged(callee, env), "fresh-key splice engaged"
         self._assert_par(callee, env)
 
-    def test_splice_unpack_repl_defers(self) -> None:
-        # An unpack in the splice result needs Python's
-        # normalize_trivial_unpack (expandtype.py:1173-1176); defer.
+    def test_splice_unpack_star_normalizes(self) -> None:
+        # An ARG_STAR UnpackType wrapping builtins.tuple in the splice
+        # result is normalized natively (normalize_trivial_unpack port):
+        # *args: *tuple[Any, ...] -> *args: Any.  The seam engages.
         from mypy.types import Parameters, UnpackType
 
         ps = self._param_spec()
         callee = self._splice_callable(ps, [self.fx.a])
         unpacked = UnpackType(Instance(self.fx.std_tuplei, [self.fx.anyt]))
         env = {ps.id: Parameters([unpacked], [ARG_STAR], [None])}
-        assert not self._engaged(callee, env), "unpack splice engaged"
+        assert self._engaged(callee, env), "unpack splice deferred"
         self._assert_par(callee, env)
 
     def test_leaf_bare_parameters_repl(self) -> None:
