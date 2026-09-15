@@ -4697,3 +4697,53 @@ bounded by 7,121 invocations on a 66.8s self-check, ~0.02-0.05% wall).
   non-wire interfaces; dispatched after the four Phase-1 merges;
   entry appended here on landing.
 
+#### Wave 5 (started 2026-09-15) — tiered feedback + ledger archive
+
+Starting position `main = 506aa7e4c`. Eight lanes in parallel; the wave's
+process change is the tiered feedback protocol and the weighted heavy-op
+pool, both recorded in `AGENTS.md` (issue `#1679`).
+
+The tiers classify work by blast radius (T1 docs/test-only, T2 gated seam
+with the Python fallback intact, T3 default-ON flip or wire/identity
+change, T4 wave level). Local corpora are now a T4 wave-level step, not a
+per-lane step: CI runs the full corpus on every production PR, so lanes
+restore only their own suite file, the gate-off/on differential, and
+engagement counters. The heavy-op layer is the weighted pool
+`/private/tmp/mypy-rs-sem.sh` (3 slots; build = 1, corpus = 2), which
+replaced the flat `/private/tmp/mypy-rs-heavy.lock`; under the flat mutex a
+release kernel build queued behind an entire corpus run (measured: 1m14s
+build at load 86 versus a corpus of many minutes). Per-lane tier and
+measurements are appended below as the coordinator reports each landing.
+
+- `#1676` (`271175175`, PR #1676) — docs: archive this ledger out of
+  `AGENTS.md`. Tier T1. `AGENTS.md` 4,937 -> 232 lines: 4,764 removed,
+  59 inserted. Lossless audit before commit: of 4,708 nonblank removed
+  lines, 4,628 are byte-identical in
+  `docs/plans/type-kernel-seam-ledger.md`, 80 are preserved in
+  `docs/native-build-reference.md` (the rationale/history behind the
+  build and parity rules), 0 unaccounted; the two large removed blocks
+  (`AGENTS.md` old lines 274-1485 and 1486-4930) are contiguous
+  byte-identical substrings of the archive. The same commit lands four
+  plan docs that were untracked (`2026-09-15-wave3-mass-migration.md`,
+  `2026-09-15-wave3-perf-sweep-audit.md`,
+  `2026-09-15-wave4-mass-migration.md`,
+  `2026-09-15-solve-pass1-split-spike.md`). Gates: CI `pr-gate` pass
+  (run 35022390403, 266s), `ocr-review` skipped; local
+  `ocr review --from origin/main --to docs/ledger-archive-wave5` selected
+  0 items (docs-only diff), 0 blocking.
+- `#1668` (`618c2b196`, PR #1669) — perf: retire residual scalar-only wire
+  seams (slice of `#1624`, from the `#1637` sweep audit). Tier T3 by the
+  table (seams that answered in production were deleted). Five gates
+  deleted: `rust_descriptor_has_get_set` (`checkmember.py`, 22,809 calls /
+  512,396 bytes -> 0/0), `rust_is_singleton_identity_type` (7,550 / 41,796
+  -> 0/0), `rust_is_singleton_equality_type` (10,577 / 277,110 -> 0/0),
+  `rust_is_recursive_pair` (1,972 / 118,288 -> 0/0),
+  `rust_analyze_none_member_access` (1,001 / 4,004 -> 0/0); total
+  43,909 calls / 953,594 bytes -> 0. Figures are as reported by that lane
+  on PR #1669, measured on the cold self-check with an env-gated
+  sitecustomize wrapper, and are not re-derived here. Gates reported:
+  testtypes 3,905/7 (`TEST_NATIVE_TYPE_KERNEL=1`), testcheck 8,144/69/7
+  (`-n2`), cold self-check 0 errors / 353 files,
+  `cargo test -p mypy-type-kernel` 2,838/0/11, `cargo fmt --check` and
+  `clippy -D warnings` clean.
+
