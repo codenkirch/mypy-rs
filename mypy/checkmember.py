@@ -102,9 +102,9 @@ from mypy.types import (
 #
 # Import the buffer + read_type helpers and the 12 pre-existing checkmember
 
-# kernels. Issue-#476 adds five new kernels; four of them (check_self_arg,
-# expand_without_binding, expand_and_bind_callable, add_class_tvars) have a
-# known parity gap: the wire round-trip drops the CallableType.definition
+# kernels. Issue-#476 adds four new kernels (check_self_arg,
+# expand_without_binding, expand_and_bind_callable, add_class_tvars); all
+# four have a known parity gap: the wire round-trip drops the
 
 # link used by error-message rendering and Self-typevar solving, so their
 # gates defer to Python via `is not None` checks. They import real when
@@ -121,27 +121,20 @@ try:
         rust_analyze_instance_member_dispatch as _rust_analyze_instance_member_dispatch,
         rust_analyze_member_access as _rust_analyze_member_access,
         rust_analyze_member_method as _rust_analyze_member_method,
-        rust_analyze_typeddict_access as _rust_analyze_typeddict_access,
         rust_analyze_union_member_access as _rust_analyze_union_member_access,
-        rust_bind_self_fast as _rust_bind_self_fast,
         rust_check_final_member as _rust_check_final_member,
         rust_classify_analyze_var as _rust_classify_analyze_var,
         rust_classify_type_type_member_access as _rust_classify_type_type_member_access,
         rust_defined_in_superclass as _rust_defined_in_superclass,
         rust_has_operator as _rust_has_operator,
-        rust_instance_fallback as _rust_instance_fallback,
         rust_is_instance_var as _rust_is_instance_var,
-        rust_meta_has_operator as _rust_meta_has_operator,
     )
 
     from mypy.types import read_type as _checkmember_read_type
 
     _HAS_TYPE_KERNEL = True
 except ImportError:
-    _rust_bind_self_fast = None  # type: ignore[assignment]
-    _rust_instance_fallback = None  # type: ignore[assignment]
     _rust_has_operator = None  # type: ignore[assignment]
-    _rust_meta_has_operator = None  # type: ignore[assignment]
     _rust_is_instance_var = None  # type: ignore[assignment]
     _rust_check_final_member = None  # type: ignore[assignment]
     _rust_defined_in_superclass = None  # type: ignore[assignment]
@@ -152,7 +145,6 @@ except ImportError:
     _rust_analyze_instance_member_access = None  # type: ignore[assignment]
     _rust_analyze_instance_member_dispatch = None  # type: ignore[assignment]
     _rust_analyze_union_member_access = None  # type: ignore[assignment]
-    _rust_analyze_typeddict_access = None  # type: ignore[assignment]
     _rust_analyze_enum_class_attribute_access = None  # type: ignore[assignment]
     _rust_analyze_descriptor_access = None  # type: ignore[assignment]
     _CheckMemberReadBuffer = None  # type: ignore[assignment,misc]
@@ -160,7 +152,7 @@ except ImportError:
     _checkmember_read_type = None  # type: ignore[assignment]
     _HAS_TYPE_KERNEL = False
 
-# Issue-#476 kernels. The other four were deferred in #484 because the
+# Issue-#476 kernels. The four below were deferred in #484 because the
 # wire format drops CallableType.definition; wirefixup now re-links
 # definition by name + arity
 
@@ -2437,33 +2429,6 @@ def analyze_enum_class_attribute_access(
 def analyze_typeddict_access(
     name: str, typ: TypedDictType, mx: MemberContext, override_info: TypeInfo | None
 ) -> Type:
-    # M20: gate the __delitem__ branch through Rust (pure CallableType).
-    # __setitem__ needs checker state; the fallback branch recurses on an
-    # Instance (defers). Both defer to Python.
-    if (
-        _HAS_TYPE_KERNEL
-        and _native_checkmember_active
-        and _native_checkmember_resolver is not None
-        and _rust_analyze_typeddict_access is not None
-    ):
-        try:
-            result = _rust_analyze_typeddict_access(
-                _native_checkmember_resolver,
-                name,
-                _serialize_type_for_checkmember(typ),
-                state.state.strict_optional,
-            )
-            if result is not None:
-                decoded = _deserialize_type_for_checkmember(bytes(result))
-                if decoded is not None:
-                    if isinstance(decoded, ProperType):
-                        decoded.line = typ.line
-                        decoded.column = typ.column
-                        if isinstance(decoded, CallableType):
-                            decoded.fallback.line = decoded.line
-                    return decoded
-        except (AssertionError, NotImplementedError):
-            pass
     if name == "__setitem__":
         if isinstance(mx.context, IndexExpr):
             # Since we can get this during `a['key'] = ...`
@@ -2647,48 +2612,6 @@ def bind_self_fast(method: F, original_type: Type | None = None) -> F:
     This is a faster version of mypy.typeops.bind_self() that can be used for methods
     with trivial self/cls annotations.
     """
-    if _HAS_TYPE_KERNEL and _native_checkmember_active and _rust_bind_self_fast is not None:
-        # Rust path is a pure handled decision; its strip rebuild is
-        # deterministic from Python attrs, so skip the round-trip and reuse
-        # the Python body directly. Overloaded recursion stays native.
-        if isinstance(method, CallableType):
-            if not method.arg_types:
-                return method
-            if method.arg_kinds[0] in (ARG_STAR, ARG_STAR2):
-                return method
-            return cast(
-                F,
-                method.copy_modified(
-                    arg_types=method.arg_types[1:],
-                    arg_kinds=method.arg_kinds[1:],
-                    arg_names=method.arg_names[1:],
-                    is_bound=True,
-                ),
-            )
-        result = _rust_bind_self_fast(_serialize_type_for_checkmember(method))
-        if result is not None:
-            decoded = _deserialize_type_for_checkmember(bytes(result))
-            if decoded is not None:
-                if isinstance(method, CallableType) and isinstance(decoded, CallableType):
-                    if not method.arg_types or method.arg_kinds[0] in (ARG_STAR, ARG_STAR2):
-                        return method
-                    return cast(
-                        F,
-                        method.copy_modified(
-                            arg_types=method.arg_types[1:],
-                            arg_kinds=method.arg_kinds[1:],
-                            arg_names=method.arg_names[1:],
-                            is_bound=True,
-                        ),
-                    )
-                elif isinstance(method, Overloaded) and isinstance(decoded, Overloaded):
-                    if not method.items:
-                        return method
-                    items: list[CallableType] = []
-                    for c in method.items:
-                        bound = bind_self_fast(c, original_type)
-                        items.append(bound)
-                    return cast(F, Overloaded(items))
     if isinstance(method, Overloaded):
         items = [bind_self_fast(c, original_type) for c in method.items]
         return cast(F, Overloaded(items))
@@ -2765,18 +2688,6 @@ def has_operator(typ: Type, op_method: str) -> bool:
 
 
 def instance_fallback(typ: ProperType) -> Instance:
-    if _HAS_TYPE_KERNEL and _native_checkmember_active and _rust_instance_fallback is not None:
-        try:
-            result = _rust_instance_fallback(_serialize_type_for_checkmember(typ))
-            if result is not None:
-                decoded = _deserialize_type_for_checkmember(bytes(result))
-                # Rust mirrors Python: Literal/TypedDict return their fallback
-                # (always an Instance); a TupleType whose partial fallback is
-                # not an Instance already deferred. Only trust an Instance.
-                if decoded is not None and isinstance(decoded, Instance):
-                    return decoded
-        except (AssertionError, NotImplementedError):
-            pass
     if isinstance(typ, Instance):
         return typ
     if isinstance(typ, TupleType):
@@ -2791,20 +2702,6 @@ def instance_fallback(typ: ProperType) -> Instance:
 
 def meta_has_operator(item: Type, op_method: str) -> bool:
     item = get_proper_type(item)
-    if (
-        _HAS_TYPE_KERNEL
-        and _native_checkmember_active
-        and _native_checkmember_resolver is not None
-        and _rust_meta_has_operator is not None
-    ):
-        try:
-            result = _rust_meta_has_operator(
-                _native_checkmember_resolver, _serialize_type_for_checkmember(item), op_method
-            )
-            if result is not None:
-                return result
-        except (AssertionError, NotImplementedError):
-            pass
     if isinstance(item, AnyType):
         return True
     item = instance_fallback(item)

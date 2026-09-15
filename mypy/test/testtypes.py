@@ -65875,3 +65875,203 @@ class NativeCheckCallableCallWireGateSuite(Suite):
             [self._plugin],
         )
         assert raw is not None, "the accepted shape must be decided by Rust"
+class NativeResidualScalarTypeopsSeamsRetiredSuite(Suite):
+    """Pin the #1668 residual sweep of the scalar-only typeops seams.
+
+    `simple_literal_type` (audit rank 6), `erase_to_bound` (rank 11) and
+    `is_simple_literal` (zero engagement on the self-check) each serialized
+    the type tree so Rust could read one field. The Python bodies are
+    isinstance chains over live objects, so the wire round-trip cost more
+    than the decision. The native shims are retired; the Rust pyfunctions
+    stay registered for direct-seam tests. This suite fails if any of these
+    paths serializes again.
+    """
+
+    _SEAMS = {
+        "erase_to_bound": "rust_erase_to_bound",
+        "simple_literal_type": "rust_simple_literal_type",
+        "is_simple_literal": "rust_is_simple_literal",
+    }
+
+    def setUp(self) -> None:
+        self.fx = TypeFixture()
+
+    def test_native_shims_removed(self) -> None:
+        import inspect
+
+        from mypy import typeops
+
+        for func_name, seam_name in self._SEAMS.items():
+            src = inspect.getsource(getattr(typeops, func_name))
+            assert seam_name not in src, f"{func_name} should not call {seam_name}"
+
+    def test_no_wire_serialization(self) -> None:
+        from mypy import typeops
+        from mypy.typeops import erase_to_bound, is_simple_literal, simple_literal_type
+
+        calls: list[str] = []
+        orig = typeops._serialize_type
+
+        def spy(t: Any) -> bytes:
+            calls.append("serialize")
+            return orig(t)
+
+        typeops._serialize_type = spy
+        try:
+            assert erase_to_bound(self.fx.t) is self.fx.o
+            assert simple_literal_type(self.fx.lit_str1) is self.fx.str_type
+            assert is_simple_literal(self.fx.lit_str1) is True
+        finally:
+            typeops._serialize_type = orig
+        assert calls == [], f"retired typeops seams serialized: {len(calls)} calls"
+
+    def test_values_match_python(self) -> None:
+        from mypy.typeops import erase_to_bound, is_simple_literal, simple_literal_type
+
+        assert erase_to_bound(self.fx.a) is self.fx.a
+        assert erase_to_bound(self.fx.t) is self.fx.o
+        assert erase_to_bound(TypeType(self.fx.t)) == TypeType.make_normalized(self.fx.o)
+        assert simple_literal_type(self.fx.lit_str1) is self.fx.str_type
+        assert simple_literal_type(self.fx.lit_str1_inst) is self.fx.str_type
+        assert simple_literal_type(self.fx.lit1) is self.fx.a
+        assert simple_literal_type(self.fx.a) is None
+        assert simple_literal_type(None) is None
+        assert is_simple_literal(self.fx.lit_str1) is True
+        assert is_simple_literal(self.fx.lit_str1_inst) is True
+        assert is_simple_literal(self.fx.lit1) is False
+        assert is_simple_literal(self.fx.a) is False
+
+
+class NativeResidualScalarCheckmemberSeamsRetiredSuite(Suite):
+    """Pin the #1668 residual sweep of the scalar-only checkmember seams.
+
+    Four seams serialized the type tree to read a tag or a single field:
+    `analyze_typeddict_access` (audit rank 10, `__delitem__` returns a fixed
+    CallableType), `bind_self_fast` (rank 9, its shim rebuilt the live method
+    anyway), `instance_fallback` and `meta_has_operator` (both zero
+    engagement on the self-check). The Python bodies read live objects; the
+    native shims are retired and the Rust pyfunctions stay registered for
+    direct-seam tests.
+    """
+
+    _SEAMS = {
+        "bind_self_fast": "rust_bind_self_fast",
+        "instance_fallback": "rust_instance_fallback",
+        "meta_has_operator": "rust_meta_has_operator",
+    }
+
+    def setUp(self) -> None:
+        self.fx = TypeFixture()
+
+    def _make_mx(self) -> Any:
+        from mypy.checkmember import MemberContext
+        from mypy.options import Options
+
+        def named_type(name: str) -> Instance:
+            if name == "builtins.str":
+                return self.fx.str_type
+            return self.fx.function
+
+        chk = SimpleNamespace(
+            msg=SimpleNamespace(fail=lambda *a, **kw: None, options=Options()),
+            named_type=named_type,
+        )
+        return MemberContext(
+            is_lvalue=False,
+            is_super=False,
+            is_operator=False,
+            original_type=self.fx.o,
+            context=NameExpr("x"),
+            chk=cast(Any, chk),
+        )
+
+    def _typeddict(self) -> TypedDictType:
+        return TypedDictType({}, set(), set(), self.fx.o)
+
+    def _method(self) -> CallableType:
+        return CallableType(
+            [self.fx.a, self.fx.b],
+            [ARG_POS, ARG_POS],
+            [None, None],
+            self.fx.o,
+            self.fx.function,
+        )
+
+    def _meta_instance(self) -> Instance:
+        meta_info = self.fx.make_type_info("mod.Meta", mro=[self.fx.oi])
+        base_info = self.fx.make_type_info("mod.Base", mro=[self.fx.oi])
+        inst = Instance(base_info, [])
+        inst.type.metaclass_type = Instance(meta_info, [])
+        return inst
+
+    def test_native_shims_removed(self) -> None:
+        import inspect
+
+        from mypy import checkmember
+
+        for func_name, seam_name in self._SEAMS.items():
+            src = inspect.getsource(getattr(checkmember, func_name))
+            assert seam_name not in src, f"{func_name} should not call {seam_name}"
+        td_src = inspect.getsource(checkmember.analyze_typeddict_access)
+        assert "rust_" not in td_src, "analyze_typeddict_access should be pure Python"
+        for shim in (
+            "_rust_analyze_typeddict_access",
+            "_rust_bind_self_fast",
+            "_rust_instance_fallback",
+            "_rust_meta_has_operator",
+        ):
+            assert not hasattr(checkmember, shim), f"{shim} should be gone"
+
+    def test_no_wire_serialization(self) -> None:
+        from mypy import checkmember
+        from mypy.checkmember import (
+            analyze_typeddict_access,
+            bind_self_fast,
+            instance_fallback,
+            meta_has_operator,
+        )
+
+        calls: list[str] = []
+        orig = checkmember._serialize_type_for_checkmember
+
+        def spy(t: Any) -> bytes:
+            calls.append("serialize")
+            return orig(t)
+
+        checkmember._serialize_type_for_checkmember = spy
+        try:
+            deleted = analyze_typeddict_access(
+                "__delitem__", self._typeddict(), self._make_mx(), None
+            )
+            assert isinstance(deleted, CallableType)
+            assert deleted.name == "__delitem__"
+            assert bind_self_fast(self._method()).is_bound is True
+            assert instance_fallback(self.fx.lit_str1) is self.fx.str_type
+            assert meta_has_operator(AnyType(TypeOfAny.special_form), "__add__") is True
+        finally:
+            checkmember._serialize_type_for_checkmember = orig
+        assert calls == [], f"retired checkmember seams serialized: {len(calls)} calls"
+
+    def test_values_match_python(self) -> None:
+        from mypy.checkmember import (
+            analyze_typeddict_access,
+            bind_self_fast,
+            instance_fallback,
+            meta_has_operator,
+        )
+
+        deleted = analyze_typeddict_access(
+            "__delitem__", self._typeddict(), self._make_mx(), None
+        )
+        assert isinstance(deleted, CallableType)
+        assert [str(a) for a in deleted.arg_types] == ["builtins.str"]
+        assert str(deleted.ret_type) == "None"
+        assert str(deleted.fallback) == "builtins.function"
+        bound = bind_self_fast(self._method())
+        assert isinstance(bound, CallableType)
+        assert bound.arg_types == [self.fx.b]
+        assert bound.is_bound is True
+        assert instance_fallback(self.fx.a) is self.fx.a
+        assert instance_fallback(self._typeddict()) is self.fx.o
+        assert meta_has_operator(AnyType(TypeOfAny.special_form), "__add__") is True
+        assert meta_has_operator(self._meta_instance(), "__add__") is False

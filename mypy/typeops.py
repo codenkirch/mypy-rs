@@ -1175,15 +1175,6 @@ def bind_self(
 def erase_to_bound(t: Type) -> Type:
     # TODO: use value restrictions to produce a union?
     t = get_proper_type(t)
-    if _HAS_TYPE_KERNEL and _native_typeops_active:
-        try:
-            result = _type_kernel.rust_erase_to_bound(_serialize_type(t))
-            if result is not None:
-                decoded = _deserialize_type(bytes(result))
-                if decoded is not None:
-                    return decoded
-        except (AssertionError, NotImplementedError, ValueError):
-            pass
     if isinstance(t, TypeVarType):
         return t.upper_bound
     if isinstance(t, TypeType):
@@ -1231,27 +1222,6 @@ def callable_corresponding_argument(
 
 def simple_literal_type(t: ProperType | None) -> Instance | None:
     """Extract the underlying fallback Instance type for a simple Literal"""
-    if (
-        _HAS_TYPE_KERNEL
-        and _native_typeops_active
-        and _native_typeops_resolver is not None
-        and t is not None
-    ):
-        try:
-            # (decided, value) wire answer (issue #1101 protocol, #1295): a
-            # decided not-a-literal answer skips the body below; only an
-            # exception (undecodable blob / stale extension) falls through.
-            decided, result = _type_kernel.rust_simple_literal_type(_serialize_type(t))
-            if decided:
-                if result is None:
-                    return None
-                decoded = _deserialize_type(bytes(result))
-                if isinstance(decoded, Instance):
-                    return decoded
-                # Unreachable: the fallback of a wire literal is always an
-                # Instance blob; fall through defensively.
-        except (AssertionError, NotImplementedError):
-            pass
     if isinstance(t, Instance) and t.last_known_value is not None:
         t = t.last_known_value
     if isinstance(t, LiteralType):
@@ -1260,15 +1230,6 @@ def simple_literal_type(t: ProperType | None) -> Instance | None:
 
 
 def is_simple_literal(t: ProperType) -> bool:
-    if _HAS_TYPE_KERNEL and _native_typeops_active and _native_typeops_resolver is not None:
-        try:
-            result = _type_kernel.rust_is_simple_literal(
-                _serialize_type(t), _native_typeops_resolver
-            )
-            if result is not None:
-                return result
-        except (AssertionError, NotImplementedError):
-            pass
     if isinstance(t, LiteralType):
         return t.fallback.type.is_enum or t.fallback.type.fullname == "builtins.str"
     if isinstance(t, Instance):
