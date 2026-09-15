@@ -4847,4 +4847,39 @@ measurements are appended below as the coordinator reports each landing.
   about why the retry failed (the exact ambiguity the change exists to
   resolve), and `while IFS= read -r f` dropped an unterminated final line, a
   fail-closed path inside a gate documented to fail open.
+- `#1672` (`a7329c5d4`, PR #1690) — feat: the H1d cluster, four live-object
+  PyO3 decision heads, each keeping the pure-Python body as the fallback so a
+  `None` return (or an unreadable attribute) re-runs the unchanged decision:
+  `rust_should_report_unreachable_issues` (`mypy/checker.py:4702`),
+  `rust_flatten_lvalues` (`:5950`), `rust_refers_to_different_scope` (`:6761`,
+  call site `:6722`) and `rust_literal_int_expr` (`:9760`). The issue's own
+  candidate list was audited first and found stale, so the four heads were
+  found by scanning every `TypeChecker` method body for a missing `_rust_`
+  reference and keeping the pure reads. 72 suite tests across the four
+  `Native*Suite`s, each with direct seam assertions and gate-off vs gate-on
+  differentials through the real `TypeChecker` method. Suite-level engagement
+  as reported by that lane (`MYPY_SERIALIZE_STATS=1`, gate on):
+  `13/12/1`, `22/21/1`, `16/15/1`, `41/29/12` calls/decided/deferred, with
+  `wire_delta=0` on all four; a 2-module corpus probe gave 52, 1360, 1429 and
+  0, the last because its only call site (`check_simple_assignment`'s widening
+  block) was not reached by that sample. The lane states plainly that the
+  corpus gate for the PR is CI's `parity` job, which is the T2 discipline, so
+  tier T2. Gates reported: `cargo test` 2838/0/11 in 0.11s, the four suites
+  `72 passed, 3906 deselected in 5.26s`, comment-block hook clean. Two caveats
+  were stated rather than hidden: the source-tree hazard (an intermediate run
+  resolved `import mypy` to the main checkout, reported all-zero counts and was
+  discarded) and the sample-zero above. Its CI landed under the new
+  `parity-ast` gate with `parity-ast: skipped` and `changes: success`, and the
+  rollup went green 5 pass / 2 skipped (`parity` 12m5s, `parity-mirror` 6m27s,
+  `parity-typeops` 6m0s, `pr-gate` 4m11s, `changes` 12s; skips are
+  `parity-ast` and `ocr-review`). That is the AST-gate saving observed on a
+  real kernel PR. The 0 above is the same sample-coverage artifact recorded for
+  this seam in the #1679 entry earlier in this section: the suite counts, not
+  the sample, are what prove the head.
+- `#1682` (`ba762f12a`, PR #1682) — docs: this wave's protocol record, the
+  tier table plus the weighted pool and source-tree pre-flight in `AGENTS.md`,
+  the wave-5 section of this ledger, and the handoff resume point. Tier T1.
+  Gates: CI `pr-gate` pass (268s), `ocr-review` skipped; local
+  `ocr review --from origin/main --to docs/wave5-tiers-ledger` selected 0 items
+  (docs-only diff), 0 blocking.
 

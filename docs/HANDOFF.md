@@ -10,12 +10,14 @@ mutex. The seam ledger itself moved out of `AGENTS.md` into
 
 ### Where `main` stands
 
-`main` = `08ef56f57` (`fix(ci): match parity AST paths with POSIX globs`, PR
-`#1691`), on top of `3d5ace300` (seam-split planner, PR `#1692`),
-`e531197d3` (zero-call correction, PR `#1686`), `a0f6150a7` (evidence
-convention, PR `#1684`), `e9017bf46` (worktree pool, PR `#1683`),
-`3329850ac` (`parity-ast` path gate, PR `#1681`), `271175175` (the ledger
-archive, PR `#1676`) and `618c2b196` (#1669). Wave 5 branched from `506aa7e4c`.
+`main` = `ba762f12a` (the tier protocol and this handoff, PR `#1682`), on top of
+`a7329c5d4` (H1d live-object decision heads, PR `#1690`), `08ef56f57` (POSIX
+glob for the `parity-ast` path gate, PR `#1691`), `3d5ace300` (seam-split
+planner, PR `#1692`), `e531197d3` (zero-call correction, PR `#1686`),
+`a0f6150a7` (evidence convention, PR `#1684`), `e9017bf46` (worktree pool, PR
+`#1683`), `3329850ac` (`parity-ast` path gate, PR `#1681`), `271175175` (the
+ledger archive, PR `#1676`) and `618c2b196` (#1669). Wave 5 branched from
+`506aa7e4c`.
 
 Landed this wave, in merge order:
 
@@ -43,6 +45,19 @@ Landed this wave, in merge order:
 - `08ef56f57` **POSIX glob for the `parity-ast` path gate (#1681, PR #1691)** —
   the previous regex had been verified with BSD `grep` while CI runs GNU
   `grep`; the skip is now verified on a real kernel PR (#1690). CI tier.
+- `a7329c5d4` **H1d cluster: four live-object decision heads (#1672, PR
+  #1690)** — `rust_should_report_unreachable_issues`, `rust_flatten_lvalues`,
+  `rust_refers_to_different_scope`, `rust_literal_int_expr`, each keeping the
+  pure-Python body as the fallback; 72 suite tests with gate-off/on
+  differentials, `wire_delta=0` on all four, and the corpus gate delegated to
+  CI's `parity` job. Tier T2. It landed **with `parity-ast: skipped`** under the
+  new gate, `changes: success`, and its rollup went green 5 pass / 2 skipped
+  (`parity` 12m5s, `parity-mirror` 6m27s, `parity-typeops` 6m0s, `pr-gate`
+  4m11s, `changes` 12s; the skips are `parity-ast` and `ocr-review`), which is
+  the AST-gate saving observed on a real kernel PR.
+- `ba762f12a` **the tier protocol, the wave-5 ledger section and this handoff
+  (PR #1682)** — tier table plus the weighted pool and the source-tree pre-flight
+  in `AGENTS.md`, seven wave-5 entries in the ledger, this resume point. Tier T1.
 
 ### T4 baseline (lane A8), measured at `271175175`
 
@@ -62,12 +77,15 @@ and the source-tree guard printed the worktree path for `mypy`.
 - cold self-check `-n0 --no-incremental -p mypy -p mypyc` -> `Success: no
   issues found in 353 source files`
 
-**`main` moved three times after that measurement** (`271175175` ->
-`e531197d3` -> `3d5ace300` -> `08ef56f57`), all docs, CI and scripts, so the
-battery above is a statement about the code at `271175175` and not about those
-later commits. The wall-clock figure is provisional: `uptime` was recorded
-alongside the run, but the host was under external load (load average 34-48),
-not quiet.
+**`main` moved five times after that measurement** (`271175175` ->
+`e531197d3` -> `3d5ace300` -> `08ef56f57` -> `a7329c5d4` -> `ba762f12a`): four
+of those are docs, CI or scripts, but `a7329c5d4` changes production seams
+(`mypy/checker.py` plus Rust), so this battery describes the code at
+`271175175` only and is not a statement about the later commits. It was
+nevertheless clean at the pinned head, and it is the wave-level T4 run that
+frees the individual lanes from re-running the corpus. The wall-clock figure is
+provisional: `uptime` was recorded alongside the run, but the host was under
+external load (load average 34-48), not quiet.
 
 ### Process change: tiers, the weighted pool, the source-tree guard
 
@@ -131,8 +149,10 @@ not quiet.
 3. Remaining wave-5 lane landings are appended to
    `docs/plans/type-kernel-seam-ledger.md` as the coordinator reports each
    merged PR with its measurements.
-4. Open at handoff time: PR #1682 (this handoff, the tier text and the wave-5
-   ledger entries).
+4. Open PRs at handoff time: `#1687` (G3.1 symtable read flip, the blocked one
+   above), `#1695` (G1.2 node-shadow audit and first expression-node read
+   flip), `#1694` (F reopening measurement), `#1685` (residual scalar-seam
+   sweep).
 
 ## RESUME POINT — 2026-09-14, night (second parallel wave landed)
 
