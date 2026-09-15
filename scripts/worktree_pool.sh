@@ -3,7 +3,8 @@
 # Rationale, measurements and the why behind per-slot target dirs: see PR body.
 set -euo pipefail
 
-REPO=$(cd "$(dirname "$0")/.." && pwd)
+SCRIPT_REPO=$(cd "$(dirname "$0")/.." && pwd)
+MAIN=$(cd "$(git -C "$SCRIPT_REPO" rev-parse --git-common-dir)/.." && pwd)
 POOL_ROOT="${POOL_ROOT:-/private/tmp/mypy-rs-pool}"
 STATE="$POOL_ROOT/.state"
 
@@ -17,8 +18,8 @@ cmd_init() {
         s="w$i"
         p="$(slot_path "$s")"
         if [ ! -d "$p" ]; then
-            git -C "$REPO" worktree add --detach "$p" origin/main >/dev/null
-            ln -sfn "$REPO/.venv" "$p/.venv"
+            git -C "$MAIN" worktree add --detach "$p" origin/main >/dev/null
+            ln -sfn "$MAIN/.venv" "$p/.venv"
             echo "created $s -> $p"
         else
             echo "exists  $s -> $p"
@@ -42,6 +43,7 @@ cmd_claim() {
     git -C "$p" fetch origin -q
     git -C "$p" checkout -B "$branch" origin/main >/dev/null 2>&1
     git -C "$p" clean -xdfq -e target -e .venv
+    ln -sfn "$MAIN/.venv" "$p/.venv"
     printf '%s\n' "$branch" > "$STATE/$slot.branch"
     echo "$p"
 }
@@ -97,10 +99,10 @@ cmd_prune() {
             echo "skipping $(basename "$d"): uncommitted changes" >&2
             continue
         fi
-        git -C "$REPO" worktree remove --force "$d"
+        git -C "$MAIN" worktree remove --force "$d"
         echo "removed $(basename "$d")"
     done
-    git -C "$REPO" worktree prune
+    git -C "$MAIN" worktree prune
     rm -rf "$STATE"
     echo "pool pruned (POOL_ROOT kept: $POOL_ROOT)"
 }
