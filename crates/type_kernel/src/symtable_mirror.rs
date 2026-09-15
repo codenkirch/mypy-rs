@@ -31,7 +31,7 @@
 //!    never-adopted table) never answers a read.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
@@ -64,6 +64,11 @@ pub(crate) enum ShadowGap {
     NoHandle,
     /// The candidate has no `len()` at all, so the size gate cannot run.
     NotSized,
+    /// The owner already held keys when the store first saw it in this
+    /// build, so its name order predates the store's ordinals and cannot
+    /// be reproduced (`mypy/server/aststrip.py` keeps `@`-named keys
+    /// across builds; a loaded cache table starts populated).
+    Inherited,
     /// Fewer records than live entries: a write bypassed the capture.
     LenShort,
     /// More records than live entries: a delete bypassed the capture.
@@ -86,6 +91,7 @@ pub(crate) struct FlipCounts {
     pub(crate) entries_mirrored: u64,
     pub(crate) defer_no_handle: u64,
     pub(crate) defer_not_sized: u64,
+    pub(crate) defer_inherited: u64,
     pub(crate) defer_len_short: u64,
     pub(crate) defer_len_long: u64,
     pub(crate) defer_no_pin: u64,
@@ -130,6 +136,9 @@ struct SymStore {
     /// Owner handle -> the names recorded for it, so serving one
     /// namespace costs its own entries instead of a scan of the store.
     by_owner: HashMap<u64, Vec<String>>,
+    /// Owners whose namespace already held keys when the store first saw
+    /// it in this build: their name order predates the store's ordinals.
+    inherited: HashSet<u64>,
     /// Strong pins: handles key on raw `id()`s, so each stored object
     /// stays alive until its entry is dropped or the store resets.
     pins: HashMap<u64, Py<PyAny>>,
@@ -151,6 +160,7 @@ impl SymStore {
             generations: HashMap::new(),
             by_node: HashMap::new(),
             by_owner: HashMap::new(),
+            inherited: HashSet::new(),
             pins: HashMap::new(),
             meta: HashMap::new(),
             flip: FlipCounts::default(),
@@ -200,7 +210,15 @@ pub(crate) fn put(
 ) -> PyResult<(u64, u64, u64, u64)> {
     let owner_handle = handle_or_error(owner)?;
     let node_handle = handle_or_error(symbol)?;
+    // The ordering claim holds only for a namespace the store saw from
+    // empty: keys present on the first recorded write of this build
+    // predate these ordinals, so the owner is marked unservable.
+    let table_len = owner.len().unwrap_or(0);
     Ok(with_store(|store| {
+        let first_write = !store.by_owner.contains_key(&owner_handle);
+        if first_write && table_len > 1 {
+            store.inherited.insert(owner_handle);
+        }
         let generation = store.generation_for(owner_handle);
         store.next_seq += 1;
         let seq = store.next_seq;
@@ -326,6 +344,7 @@ pub(crate) fn reset() -> usize {
         store.generations.clear();
         store.by_node.clear();
         store.by_owner.clear();
+        store.inherited.clear();
         store.meta.clear();
         store.next_generation = 0;
         store.next_seq = 0;
@@ -368,12 +387,14 @@ fn bump_flip(f: impl FnOnce(&mut FlipCounts)) {
 /// for `table`, in the namespace's insertion order, or the reason the
 /// store cannot stand in for the live table.
 ///
-/// **The gate**: the record count must equal the live namespace size
-/// (`entry_count(owner) == len(owner.names)`, the invariant the G3 brief
-/// pins), the owner must have been adopted, and every record's symbol must
-/// still be pinned. Anything else returns the `ShadowGap` reason and the
-/// caller walks the live table, so a read flip never serves a namespace
-/// the capture could not see.
+/// **The gate**: the store must have seen the namespace from empty in this
+/// build (an owner whose first recorded write already found keys is
+/// `Inherited` and never served), the record count must equal the live
+/// namespace size (`entry_count(owner) == len(owner.names)`, the invariant
+/// the G3 brief pins), the owner must have been adopted, and every record's
+/// symbol must still be pinned. Anything else returns the `ShadowGap` reason
+/// and the caller walks the live table, so a read flip never serves a
+/// namespace the capture could not see or whose order it cannot reproduce.
 ///
 /// **What the gate does not prove**: it compares cardinality, not content.
 /// A C-level same-key replace on an adopted table (`dict` C paths, a Rust
@@ -400,6 +421,10 @@ pub(crate) fn entries_if_mirrored(
         bump_flip(|c| c.defer_not_sized += 1);
         return Err(ShadowGap::NotSized);
     };
+    if with_store(|store| store.inherited.contains(&handle)) {
+        bump_flip(|c| c.defer_inherited += 1);
+        return Err(ShadowGap::Inherited);
+    }
     // One store acquisition: order this owner's entries and resolve each
     // pin while the borrow is held.
     let (count, out, lost) = with_store(|store| {
@@ -658,6 +683,7 @@ pub(crate) fn rust_symtable_mirror_flip_counts<'py>(py: Python<'py>) -> PyResult
     dict.set_item("entries_mirrored", counts.entries_mirrored)?;
     dict.set_item("defer_no_handle", counts.defer_no_handle)?;
     dict.set_item("defer_not_sized", counts.defer_not_sized)?;
+    dict.set_item("defer_inherited", counts.defer_inherited)?;
     dict.set_item("defer_len_short", counts.defer_len_short)?;
     dict.set_item("defer_len_long", counts.defer_len_long)?;
     dict.set_item("defer_no_pin", counts.defer_no_pin)?;

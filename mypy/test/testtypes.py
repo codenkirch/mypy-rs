@@ -65668,6 +65668,23 @@ class NativeSymtableReadFlipSuite(Suite):
         assert self._stats() == {"calls": 1, "deferred": 1}
         assert self._m.flip_report()["defer_no_handle"] == 1
 
+    def test_inherited_namespace_defers(self) -> None:
+        # A namespace holding a key when the store first saw it cannot be
+        # served: that position predates the store's ordinals (aststrip
+        # survivors, loaded cache). Counts match; only the rule catches it.
+        from mypy.symtable_access import put_names_entry
+
+        table: SymbolTable = SymbolTable()
+        dict.__setitem__(table, "a", self._sym("a", "mod.a"))
+        put_names_entry(table, "b", self._sym("b", "mod.b"))
+        put_names_entry(table, "a", self._sym("a", "mod.a"))
+        assert self._m.entry_count(table) == len(table) == 2
+        flipped = self._snapshot(table, 1)
+        assert flipped == self._snapshot(table, 0)
+        assert list(flipped) == list(table) == ["a", "b"]
+        assert self._stats() == {"calls": 1, "deferred": 1}
+        assert self._m.flip_report()["defer_inherited"] == 1
+
     # ---- verify mode: the differential ----
 
     def test_verify_mode_matches_and_counts(self) -> None:

@@ -381,9 +381,34 @@ jobs:
           echo "SCRATCH=$SCRATCH" >> "$GITHUB_ENV"
           echo "EXT_SUFFIX=$EXT_SUFFIX" >> "$GITHUB_ENV"
 
+      - name: Build ast_serialize + module_resolver extensions
+        # The daemon and fine-grained suites force native_parser on, and
+        # pyproject.toml declares the PyPI `ast-serialize` stub: without these
+        # builds the suite dies on a `parse()` TypeError, not on the flip.
+        run: |
+          for crate in mypy-ast-serialize mypy-module-resolver; do
+            cargo rustc -p "$crate" --features extension-module \
+              --lib --crate-type cdylib --release
+            NAME="${crate#mypy-}"
+            NAME="${NAME//-/_}"
+            EXT_SUFFIX=$(uv run python -c "import sysconfig; print(sysconfig.get_config_var('EXT_SUFFIX'))")
+            cp "target/release/lib${NAME}.so" "${{ env.SCRATCH }}/${NAME}${EXT_SUFFIX}" 2>/dev/null || cp "target/release/lib${NAME}.dylib" "${{ env.SCRATCH }}/${NAME}${EXT_SUFFIX}"
+          done
+
+      - name: Build in-repo librt (F3 wire cache)
+        # Same as the parity job: the PyPI wheel omits write_raw_bytes, so
+        # the wire-cache splice stays inert and the mirror suites skip it.
+        run: |
+          LIBSO=/tmp/librt-ext
+          mkdir -p "$LIBSO"
+          (cd mypyc/lib-rt && uv run python setup.py build_ext \
+            --build-lib "$LIBSO" --build-temp /tmp/librt-build)
+          PYTHONPATH="$LIBSO" uv run python -c "from librt.internal import write_raw_bytes; print('in-repo librt: write_raw_bytes OK')"
+          echo "LIBRT_SCRATCH=$LIBSO" >> "$GITHUB_ENV"
+
       - name: Shadow + read-flip verify (seam suite)
         env:
-          PYTHONPATH: ${{ env.SCRATCH }}
+          PYTHONPATH: ${{ env.LIBRT_SCRATCH }}:${{ env.SCRATCH }}
           TEST_NATIVE_TYPE_KERNEL: "1"
           TEST_NATIVE_SYMTABLE_MIRROR: "1"
           TEST_NATIVE_SYMTABLE_READ_FLIP_VERIFY: "1"
@@ -394,7 +419,7 @@ jobs:
 
       - name: Read-flip differential (astdiff + cache data)
         env:
-          PYTHONPATH: ${{ env.SCRATCH }}
+          PYTHONPATH: ${{ env.LIBRT_SCRATCH }}:${{ env.SCRATCH }}
           TEST_NATIVE_TYPE_KERNEL: "1"
           TEST_NATIVE_SYMTABLE_MIRROR: "1"
           TEST_NATIVE_SYMTABLE_READ_FLIP_VERIFY: "1"
@@ -405,7 +430,7 @@ jobs:
 
       - name: Read-flip differential (fine-grained + daemon)
         env:
-          PYTHONPATH: ${{ env.SCRATCH }}
+          PYTHONPATH: ${{ env.LIBRT_SCRATCH }}:${{ env.SCRATCH }}
           TEST_NATIVE_TYPE_KERNEL: "1"
           TEST_NATIVE_SYMTABLE_MIRROR: "1"
           TEST_NATIVE_SYMTABLE_READ_FLIP_VERIFY: "1"
@@ -476,7 +501,7 @@ jobs:
 
       - name: Parity testcheck (typeops resolvers installed)
         env:
-          PYTHONPATH: ${{ env.SCRATCH }}
+          PYTHONPATH: ${{ env.LIBRT_SCRATCH }}:${{ env.SCRATCH }}
           TEST_NATIVE_TYPE_KERNEL: "1"
           TEST_NATIVE_PARSER: "1"
           TEST_NATIVE_RESOLVER: "1"
@@ -536,17 +561,17 @@ jobs:
 
       - name: AST parity (native parser)
         env:
-          PYTHONPATH: ${{ env.SCRATCH }}
+          PYTHONPATH: ${{ env.LIBRT_SCRATCH }}:${{ env.SCRATCH }}
           TEST_NATIVE_PARSER: "1"
         run: uv run python -m pytest mypy/test/test_nativeparse.py mypy/test/testparse.py mypy/test/teststubgen.py -q -n4 --timeout=30 --timeout-method=thread
 
       - name: Cache data writer parity (G0.5)
         env:
-          PYTHONPATH: ${{ env.SCRATCH }}
+          PYTHONPATH: ${{ env.LIBRT_SCRATCH }}:${{ env.SCRATCH }}
         run: uv run python -m pytest mypy/test/testcachedata.py -q -n4 --timeout=120 --timeout-method=thread
 
       - name: AST fastparse differential (Python parser)
         env:
-          PYTHONPATH: ${{ env.SCRATCH }}
+          PYTHONPATH: ${{ env.LIBRT_SCRATCH }}:${{ env.SCRATCH }}
           TEST_NATIVE_PARSER: "0"
         run: uv run python -m pytest mypy/test/testparse.py -q -n4 --timeout=30 --timeout-method=thread
