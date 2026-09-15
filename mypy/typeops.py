@@ -1938,18 +1938,6 @@ def is_literal_type_like(t: Type | None) -> bool:
     """Returns 'true' if the given type context is potentially either a LiteralType,
     a Union of LiteralType, or something similar.
     """
-    if _HAS_TYPE_KERNEL and _native_typeops_active and t is not None:
-        # Expand before the seam: Python's canonical entry expands at the
-        # top of every recursive call, and the wire form cannot carry an
-        # unexpanded TypeAliasType (Rust would defer on it).
-        try:
-            result = _type_kernel.rust_is_literal_type_like(
-                _serialize_type(get_proper_type(t)), _native_typeops_resolver
-            )
-            if result is not None:
-                return result
-        except (AssertionError, NotImplementedError):
-            pass
     t = get_proper_type(t)
     if t is None:
         return False

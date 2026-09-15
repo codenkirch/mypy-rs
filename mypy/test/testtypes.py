@@ -64514,3 +64514,65 @@ class NativeWireRemainderSuite(Suite):
         assert isinstance(off_ct, CallableType)
         assert on_ct.definition_ref == off_ct.definition_ref
         assert str(on) == str(off)
+
+
+class NativeIsLiteralTypeLikeRetiredSuite(Suite):
+    """Pin the #1661 retirement of the is_literal_type_like wire seam.
+
+    `is_literal_type_like` (typeops.py) serialized the whole type tree
+    so Rust could read one scalar bool (LiteralType/Union/TypeVar walk).
+    At 248k calls / 100% native share on the cold self-check the wire
+    round-trip cost more than the decision was worth (shape d, #1624
+    audit rank #10, 0.32s proxy). The native shim is now retired; the
+    Rust pyfunction stays registered for direct-seam tests. This suite
+    fails if any native call returns when is_literal_type_like runs.
+    """
+
+    def setUp(self) -> None:
+        self.fx = TypeFixture()
+
+    def test_native_shim_removed(self) -> None:
+        import inspect
+
+        from mypy import typeops
+
+        src = inspect.getsource(typeops.is_literal_type_like)
+        assert "rust_is_literal_type_like" not in src, (
+            "is_literal_type_like should not call the native seam"
+        )
+
+    def test_no_wire_serialization(self) -> None:
+        from mypy import typeops
+        from mypy.typeops import is_literal_type_like
+
+        calls: list[str] = []
+        orig = typeops._serialize_type
+
+        def spy(t: Any) -> bytes:
+            calls.append("serialize")
+            return orig(t)
+
+        typeops._serialize_type = spy
+        try:
+            assert is_literal_type_like(self.fx.lit_str1) is True
+            from mypy.types import UnionType
+
+            u = UnionType([self.fx.lit_str1, self.fx.a])
+            assert is_literal_type_like(u) is True
+            assert is_literal_type_like(self.fx.a) is False
+            assert is_literal_type_like(None) is False
+        finally:
+            typeops._serialize_type = orig
+        assert calls == [], f"is_literal_type_like serialized: {len(calls)} calls"
+
+    def test_values_match(self) -> None:
+        from mypy.types import UnionType
+        from mypy.typeops import is_literal_type_like
+
+        assert is_literal_type_like(self.fx.lit_str1) is True
+        assert is_literal_type_like(self.fx.a) is False
+        assert is_literal_type_like(None) is False
+        u = UnionType([self.fx.lit_str1, self.fx.a])
+        assert is_literal_type_like(u) is True
+        u2 = UnionType([self.fx.a, self.fx.b])
+        assert is_literal_type_like(u2) is False
