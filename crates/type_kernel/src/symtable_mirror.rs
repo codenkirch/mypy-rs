@@ -432,10 +432,11 @@ pub(crate) fn entries_if_mirrored(
         bump_flip(|c| c.defer_inherited += 1);
         return Err(ShadowGap::Inherited);
     }
-    // One store acquisition: order this owner's entries and resolve each
-    // pin while the borrow is held.
+    // One store acquisition: resolve each pin while the borrow is held.
+    // No sort: `by_owner` is ascending by construction (push/retain/replace
+    // preserve it), verified by the debug_assert below (#1715).
     let (count, out, lost) = with_store(|store| {
-        let mut triples: Vec<(u64, String, u64)> = store
+        let triples: Vec<(u64, String, u64)> = store
             .by_owner
             .get(&handle)
             .map(|names| {
@@ -450,7 +451,10 @@ pub(crate) fn entries_if_mirrored(
                     .collect()
             })
             .unwrap_or_default();
-        triples.sort_by_key(|(order, _, _)| *order);
+        debug_assert!(
+            triples.windows(2).all(|w| w[0].0 <= w[1].0),
+            "by_owner order drifted from namespace order"
+        );
         let count = triples.len();
         let mut out: Vec<(String, Py<PyAny>)> = Vec::with_capacity(count);
         let mut lost = 0usize;

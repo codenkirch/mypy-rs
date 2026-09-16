@@ -7291,6 +7291,12 @@ fn flatten_lvalues_inner(
     Ok(())
 }
 
+/// Resolve a `mypy.types` class for an `isinstance` probe; a missing
+/// module or attribute defers the seam instead of raising (#1715).
+fn class_of<'a>(types_mod: &'a PyAny, name: &str) -> Option<&'a PyType> {
+    types_mod.getattr(name).ok()?.downcast().ok()
+}
+
 /// `TypeChecker.literal_int_expr` (`mypy/checker.py:9712`): a pure
 /// classification over the live `_type_maps` stack.
 ///
@@ -7352,24 +7358,44 @@ pub(crate) fn rust_literal_int_expr(
         // `not self.has_type(expr)`
         return Ok(Some((0, py.None())));
     };
-    let types_mod = py.import("mypy.types")?;
+    // Class probes defer instead of propagating: an ImportError or
+    // AttributeError here would crash past the shim's except set (#1715).
+    let types_mod = match py.import("mypy.types") {
+        Ok(m) => m,
+        Err(_) => return Ok(None),
+    };
     // `get_proper_type` is identity for anything that is not an alias or a
     // guarded type (mypy/types.py:4210), so those two defer and the rest is
     // read directly. No Python call is made from this seam.
-    let alias_cls: &PyType = types_mod.getattr("TypeAliasType")?.downcast()?;
-    let guarded_cls: &PyType = types_mod.getattr("TypeGuardedType")?.downcast()?;
+    let alias_cls = match class_of(types_mod, "TypeAliasType") {
+        Some(c) => c,
+        None => return Ok(None),
+    };
+    let guarded_cls = match class_of(types_mod, "TypeGuardedType") {
+        Some(c) => c,
+        None => return Ok(None),
+    };
     if typ.is_instance(alias_cls)? || typ.is_instance(guarded_cls)? {
         return Ok(None);
     }
-    let literal_cls: &PyType = types_mod.getattr("LiteralType")?.downcast()?;
-    let union_cls: &PyType = types_mod.getattr("UnionType")?.downcast()?;
+    let literal_cls = match class_of(types_mod, "LiteralType") {
+        Some(c) => c,
+        None => return Ok(None),
+    };
+    let union_cls = match class_of(types_mod, "UnionType") {
+        Some(c) => c,
+        None => return Ok(None),
+    };
     if typ.is_instance(union_cls)? {
         return Ok(None);
     }
     let literal = if typ.is_instance(literal_cls)? {
         typ
     } else {
-        let instance_cls: &PyType = types_mod.getattr("Instance")?.downcast()?;
+        let instance_cls = match class_of(types_mod, "Instance") {
+            Some(c) => c,
+            None => return Ok(None),
+        };
         if !typ.is_instance(instance_cls)? {
             return Ok(Some((0, py.None())));
         }

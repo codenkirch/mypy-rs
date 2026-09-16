@@ -88,6 +88,11 @@ _tracked_blobs: dict[int, Any] = {}
 # id(blob) -> nbytes, kept for every blob ever serialized (incl. wire-cache
 # hits) so per-call payload bytes can be attributed to the consuming seam.
 blob_lens: dict[int, int] = {}
+# High-water mark of pinned blob bytes (pins are never released, so a
+# full-repo audit grows them unboundedly): warn once past it (#1715).
+_TRACKED_WARN_BYTES = 1 << 30
+_tracked_bytes = 0
+_tracked_warned = False
 
 useful: collections.Counter = collections.Counter()  # caller -> events
 deferred: collections.Counter = collections.Counter()
@@ -160,10 +165,21 @@ def register_serializer_result(result: Any, caller: str) -> None:
         blobs = [b for b in result if isinstance(b, (bytes, bytearray, memoryview))]
     else:
         return
+    global _tracked_bytes, _tracked_warned
     for b in blobs:
         key = id(b)
+        if key not in _tracked_blobs:
+            _tracked_bytes += len(b)
         _tracked_blobs[key] = b
         blob_lens[key] = len(b)
+        if not _tracked_warned and _tracked_bytes >= _TRACKED_WARN_BYTES:
+            _tracked_warned = True
+            print(
+                f"audit_wire_traffic: pinned blob bytes passed "
+                f"{_TRACKED_WARN_BYTES // (1 << 20)} MiB "
+                f"({_tracked_bytes} B); the audit may OOM before report()",
+                file=sys.stderr,
+            )
         if key in consumed_ids:
             # A wire-cache hit returns an already-consumed blob; not a new event.
             continue
