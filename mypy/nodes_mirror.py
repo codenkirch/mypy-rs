@@ -651,7 +651,7 @@ def _reset_meta() -> None:
     _META_HANDLES.clear()
 
 
-def activate(*, audit: bool = False) -> None:
+def activate(*, audit: bool = False) -> bool:
     """Enable node-shadow capture; a missing extension leaves it off.
 
     Activation is one-shot (un-patching mid-run would desync live
