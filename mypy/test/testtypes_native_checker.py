@@ -3,14 +3,19 @@
 from __future__ import annotations
 
 try:
-    from librt.internal import WriteBuffer as _WriteBuffer
     import type_kernel as _type_kernel
+    from librt.internal import WriteBuffer as _WriteBuffer
 except ImportError:
     _WriteBuffer = None  # type: ignore[assignment,misc]
     _type_kernel = None  # type: ignore[assignment]
 
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
+from types import SimpleNamespace
+from typing import Any, cast
+from unittest import skipUnless
+
+import mypy.expandtype
 from mypy.checker import TypeChecker, TypeMap
 from mypy.checker_shared import TypeRange
 from mypy.checkexpr import ExpressionChecker
@@ -23,13 +28,16 @@ from mypy.nodes import (
     ARG_POS,
     ARG_STAR,
     ARG_STAR2,
+    COVARIANT,
+    GDEF,
+    INVARIANT,
+    MDEF,
     ArgKind,
     Argument,
     AssertStmt,
     AssignmentStmt,
     Block,
     BytesExpr,
-    COVARIANT,
     CallExpr,
     ClassDef,
     ComparisonExpr,
@@ -42,14 +50,11 @@ from mypy.nodes import (
     FuncBase,
     FuncDef,
     FuncItem,
-    GDEF,
-    INVARIANT,
     ImportFrom,
     IndexExpr,
     IntExpr,
     ListExpr,
     Lvalue,
-    MDEF,
     MemberExpr,
     MypyFile,
     NameExpr,
@@ -78,8 +83,8 @@ from mypy.options import Options
 from mypy.patterns import ClassPattern
 from mypy.state import state
 from mypy.subtypes import (
-    IS_CLASSVAR,
     IS_CLASS_OR_STATIC,
+    IS_CLASSVAR,
     IS_EXPLICIT_SETTER,
     IS_SETTABLE,
     IS_VAR,
@@ -87,6 +92,32 @@ from mypy.subtypes import (
     is_subtype,
 )
 from mypy.test.helpers import Suite, assert_equal
+from mypy.test.testtypes import (
+    _FIND_MEMBER_TAIL,
+    _HAS_TYPE_KERNEL,
+    _NATIVE_STRFORMAT_ENABLED,
+    _NATIVE_WIRE_ENABLED,
+    T,
+    _base_infos,
+    _BrokenAttrInfo,
+    _BrokenFinalValueVar,
+    _BrokenFinalVar,
+    _chk,
+    _FakeScope,
+    _FindMemberTailMsg,
+    _FindMemberTailReached,
+    _h1d_module,
+    _h1d_names,
+    _H1dBinderStub,
+    _H1dCheckerStub,
+    _H1dScopeCheckerStub,
+    _is_type_info,
+    _make_getattr_sig,
+    _rru_flags_blob,
+    _run_check,
+    _ValidVarArgStubChk,
+    expect_fail_check,
+)
 from mypy.test.typefixture import TypeFixture
 from mypy.typeanal import _set_native_typeanal_active
 from mypy.typeops import make_simplified_union
@@ -107,50 +138,19 @@ from mypy.types import (
     TupleType,
     Type,
     TypeAliasType,
+    TypedDictType,
     TypeOfAny,
     TypeType,
     TypeVarId,
     TypeVarLikeType,
     TypeVarTupleType,
     TypeVarType,
-    TypedDictType,
     UninhabitedType,
     UnionType,
     UnpackType,
     get_proper_type,
     get_proper_types,
     has_recursive_types,
-)
-from types import SimpleNamespace
-from typing import Any, cast
-from unittest import skipUnless
-import mypy.expandtype
-
-from mypy.test.testtypes import (
-    T,
-    _BrokenAttrInfo,
-    _BrokenFinalValueVar,
-    _BrokenFinalVar,
-    _FIND_MEMBER_TAIL,
-    _FakeScope,
-    _FindMemberTailMsg,
-    _FindMemberTailReached,
-    _H1dBinderStub,
-    _H1dCheckerStub,
-    _H1dScopeCheckerStub,
-    _HAS_TYPE_KERNEL,
-    _NATIVE_STRFORMAT_ENABLED,
-    _NATIVE_WIRE_ENABLED,
-    _ValidVarArgStubChk,
-    _base_infos,
-    _chk,
-    _h1d_module,
-    _h1d_names,
-    _is_type_info,
-    _make_getattr_sig,
-    _rru_flags_blob,
-    _run_check,
-    expect_fail_check,
 )
 
 
@@ -261,6 +261,7 @@ class NativeMethodFullnameSuite(Suite):
         # None. The Rust side returns None and Python re-runs.
         self.assert_fullname_par(self.fx.nonet, "foo")
         self.assert_fullname_par(self.fx.anyt, "foo")
+
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeJoinTypeListSuite(Suite):
@@ -445,6 +446,7 @@ class NativeJoinTypeListSuite(Suite):
         # pair: [B, A, A] -> A.
         assert self._assert_parity([self.fx.b, self.fx.a, self.fx.a]) == self.fx.a
 
+
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeTypeTypeContextSuite(Suite):
     """Parity suite for the Rust `is_type_type_context` port (Phase B3a, #591).
@@ -548,6 +550,7 @@ class NativeTypeTypeContextSuite(Suite):
         alias_b = TypeAlias(TypeAliasType(alias_a, []), "mod.TB", "mod", -1, -1)
         self._rebuild_with_aliases([alias_a, alias_b])
         self.assert_par(TypeAliasType(alias_b, []), True)
+
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeCheckexprFunctionsDeferralSuite(Suite):
@@ -709,6 +712,7 @@ class NativeCheckexprFunctionsDeferralSuite(Suite):
             is None
         )
         assert self._differential(lambda: allow_fast_container_literal(typ)) is True
+
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeRemoveRedundantUnionItemsSuite(Suite):
@@ -939,6 +943,7 @@ class NativeRemoveRedundantUnionItemsSuite(Suite):
         assert r is not None, "seam deferred on a surviving ErasedType"
         assert len(r[0]) > 0
 
+
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeTryGettingLiteralSuite(Suite):
     """Parity for the Rust `try_getting_literal` port (mypy.checkexpr).
@@ -1051,6 +1056,7 @@ class NativeTryGettingLiteralSuite(Suite):
     def test_uninhabited(self) -> None:
         self._assert_par(self.fx.uninhabited)
         self._assert_engages(self.fx.uninhabited)
+
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeRevealImportedSuite(Suite):
@@ -1192,6 +1198,7 @@ class NativeRevealImportedSuite(Suite):
         off = self._run_and_capture(expr, False)
         on = self._run_and_capture(expr, True)
         assert off == on == [], f"imported reveal_type must emit nothing: {off}/{on}"
+
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeSuperArgTypesSuite(Suite):
@@ -1402,6 +1409,7 @@ class NativeSuperArgTypesSuite(Suite):
         assert off == on, f"too_many: off={off} on={on}"
         assert off[1], f"expected fail: {off}"
 
+
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeInferArgContextSuite(Suite):
     """Parity for `rust_compute_arg_context_indices` (issue #1064).
@@ -1540,6 +1548,7 @@ class NativeInferArgContextSuite(Suite):
         assert off == on, f"no_context: off={off} on={on}"
         assert all("ctx=None" in s for s in on[len(args) :]), f"{on}"
 
+
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeVisitOpExprSuite(Suite):
     """Parity for `rust_classify_visit_op_expr` (issue #959).
@@ -1620,6 +1629,7 @@ class NativeVisitOpExprSuite(Suite):
         # "*" with BytesExpr left goes to check_op, not list multiply.
         e = OpExpr("*", BytesExpr("x"), NameExpr("Y"))
         assert self._tag(e) == 4
+
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeProtocolImplementationSuite(Suite):
@@ -2046,6 +2056,7 @@ class NativeProtocolImplementationSuite(Suite):
         result = self._seam_call(Instance(p1, []), Instance(p2, []))
         assert result is None, f"undecidable member fetch must defer, got {result!r}"
 
+
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeProtocolMemberDeferSuite(Suite):
     """Engagement for the `get_protocol_member_inner` defer closures
@@ -2277,6 +2288,7 @@ class NativeProtocolMemberDeferSuite(Suite):
         result = self._seam_call(Instance(i, []), Instance(p_info, []))
         assert result is True, f"inherited member must be decided True, got {result!r}"
 
+
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeAliasExpansionSuite(Suite):
     """Parity suite for TypeAliasType expansion in kernel seams (alias slice).
@@ -2397,7 +2409,7 @@ class NativeAliasExpansionSuite(Suite):
     def test_union_simplify_alias_of_a(self) -> None:
         # A = A, then Union[A-alias, A]: the alias item expands to A, which
         # dedups against the second A, collapsing the union to A.
-        from mypy.typeops import _serialize_type_list, make_simplified_union
+        from mypy.typeops import _serialize_type_list
 
         alias = self._make_alias("mod.TA", self.fx.a)
         self._rebuild_resolver([alias])
@@ -2423,7 +2435,7 @@ class NativeAliasExpansionSuite(Suite):
         # Sub = A (proper subclass via MRO), then B = Sub: the alias item
         # expands to `Sub`, which is a proper subtype of A, so
         # Union[B-alias, A] must collapse to A exactly like Python.
-        from mypy.typeops import _serialize_type_list, make_simplified_union
+        from mypy.typeops import _serialize_type_list
 
         sub = self.fx.make_type_info(
             "mod.Sub", mro=[self.fx.ai, self.fx.oi], bases=[Instance(self.fx.ai, [])]
@@ -2450,7 +2462,7 @@ class NativeAliasExpansionSuite(Suite):
     def test_union_simplify_nested_alias_flatten(self) -> None:
         # B = A, A = list[A]: the chain must resolve to list[A], which
         # stays as the union's single item (no duplicate to collapse).
-        from mypy.typeops import _serialize_type_list, make_simplified_union
+        from mypy.typeops import _serialize_type_list
 
         alias_a = self._make_alias("mod.TA", self.fx.a)
         alias_b = self._make_alias("mod.TB", Instance(self.fx.std_listi, [self.fx.a]))
@@ -2560,6 +2572,7 @@ class NativeAliasExpansionSuite(Suite):
             _serialize_type_for_checker(self._alias_type(alias)), self._resolver
         )
         assert rusted is not None, "Rust deferred on alias to Coroutine"
+
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeCustomSpecialMethodSuite(Suite):
@@ -2843,6 +2856,7 @@ class NativeCustomSpecialMethodSuite(Suite):
             _set_native_checker_active(False)
             _set_native_checker_resolver(None)
 
+
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeCheckArgumentTypesPlanSuite(Suite):
     """Parity for the Rust `check_argument_types` plan port (mypy.checkexpr).
@@ -3059,7 +3073,13 @@ class NativeCheckArgumentTypesPlanSuite(Suite):
         # ARG_STAR formal is not UnpackType, so the seam skips.
         fx = self.fx
         callee = self._callee([fx.a], [ARG_STAR])
-        self._run([fx.a, fx.b, fx.a], [ARG_POS, ARG_POS, ARG_POS], callee, [[0, 1, 2]], assert_engages=False)
+        self._run(
+            [fx.a, fx.b, fx.a],
+            [ARG_POS, ARG_POS, ARG_POS],
+            callee,
+            [[0, 1, 2]],
+            assert_engages=False,
+        )
 
     def test_too_many_arguments(self) -> None:
         # def f(x: tuple[A, B]); caller passes 3 positional actuals.
@@ -3126,6 +3146,7 @@ class NativeCheckArgumentTypesPlanSuite(Suite):
             _serialize_type_for_checkexpr(callee),
         )
         assert result is None, "expected Rust to defer on a TypeAliasType formal"
+
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeEqualityValueInfoSuite(Suite):
@@ -3283,6 +3304,7 @@ class NativeEqualityValueInfoSuite(Suite):
         self._assert_par(self.fx.a)
         self._assert_engages(self.fx.a)
 
+
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeSupportedSelfTypeSuite(Suite):
     """Parity for the Rust `supported_self_type` port (mypy.typeops).
@@ -3435,6 +3457,7 @@ class NativeSupportedSelfTypeSuite(Suite):
             self._with_gate(True, lambda: self._call(TypeType(ct), allow_callable=False)) is True
         )
 
+
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeGetPropertyTypeSuite(Suite):
     """Parity for the Rust `get_property_type` port (mypy.checker).
@@ -3495,6 +3518,7 @@ class NativeGetPropertyTypeSuite(Suite):
         plain = self.fx.a
         self._assert_par(plain, "A")
         self._assert_engages(plain)
+
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeOverloadNeverSuite(Suite):
@@ -3694,6 +3718,7 @@ class NativeOverloadNeverSuite(Suite):
             self.resolver,
         )
         assert result is not None, "Rust is_more_general_arg_prefix did not engage"
+
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeHasAnyTypeSuite(Suite):
@@ -3970,6 +3995,7 @@ class NativeHasAnyTypeSuite(Suite):
         )
         self.assert_rust_decides(tv, True)
 
+
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeTupleExpandAndJoinSuite(Suite):
     """Parity suite for the `rust_build_tuple_type` seen_unpack reduce and
@@ -4114,6 +4140,7 @@ class NativeTupleExpandAndJoinSuite(Suite):
             return fn(*args)
         finally:
             set_active(True)
+
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeUninhabitedSuite(Suite):
@@ -4293,6 +4320,7 @@ class NativeUninhabitedSuite(Suite):
         self.assert_uninhabited_defers(alias)
         self.assert_ambiguous_defers(alias)
 
+
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeHasErasedComponentSuite(Suite):
     """Parity suite for the Rust `has_erased_component` port (slice 48).
@@ -4408,6 +4436,7 @@ class NativeHasErasedComponentSuite(Suite):
         alias = TypeAliasType(self._make_alias("mod.Missing", self.fx.a), [])
         self.assert_erased_defers(alias)
 
+
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeJoinOverloadedSuite(Suite):
     """Parity suite for the Rust `visit_overloaded` fallback join
@@ -4486,7 +4515,6 @@ class NativeJoinOverloadedSuite(Suite):
         # same-type path -> SameS -> outer SameS (shim returns
 
         # s=function). Fires the Rust SameS path.
-        from mypy.join import join_types
 
         ov = self.overloaded(self.callable(self.fx.a, self.fx.b))
         assert join_types(ov, self.fx.function) == self.fx.function
@@ -4498,7 +4526,6 @@ class NativeJoinOverloadedSuite(Suite):
 
         # join_instances_nominal(object, object) -> Left ->
         # Ancestor("builtins.object"). Fires the Rust Ancestor path.
-        from mypy.join import join_types
 
         ov = self.overloaded(self.callable(self.fx.a, self.fx.b))
         assert join_types(ov, self.fx.o) == self.fx.o
@@ -4512,7 +4539,6 @@ class NativeJoinOverloadedSuite(Suite):
         # via_supertype(function, object) -> Ancestor("builtins.object").
 
         # Fires the Rust Ancestor path.
-        from mypy.join import join_types
 
         ov = self.overloaded(self.callable(self.fx.a, self.fx.b))
         assert join_types(ov, self.fx.a) == self.fx.o
@@ -4524,7 +4550,6 @@ class NativeJoinOverloadedSuite(Suite):
 
         # function, s=function) -> SameS. Fires the Rust SameS path
         # (shim returns s=function).
-        from mypy.join import join_types
 
         ov = self.overloaded(self.callable(self.fx.a, self.fx.b))
         assert join_types(self.fx.function, ov) == self.fx.function
@@ -4536,7 +4561,6 @@ class NativeJoinOverloadedSuite(Suite):
         # The outer overloaded fallback passes Ancestor through; the
         # shim returns Instance(object_typeinfo, []) = object = s.
         # Fires the Rust Ancestor path.
-        from mypy.join import join_types
 
         ov = self.overloaded(self.callable(self.fx.a, self.fx.b))
         assert join_types(self.fx.o, ov) == self.fx.o
@@ -4547,7 +4571,6 @@ class NativeJoinOverloadedSuite(Suite):
         # shape as test_overloaded_with_unrelated_instance_returns_object
 
         # but with s/t swapped. Fires the Rust Ancestor path.
-        from mypy.join import join_types
 
         ov = self.overloaded(self.callable(self.fx.a, self.fx.b))
         assert join_types(self.fx.a, ov) == self.fx.o
@@ -4558,7 +4581,6 @@ class NativeJoinOverloadedSuite(Suite):
         # the both-FunctionLike case (is_similar_callables walk). The
 
         # result is identical regardless of which path computed it.
-        from mypy.join import join_types
 
         ov = self.overloaded(
             self.callable(self.fx.a, self.fx.b), self.callable(self.fx.b, self.fx.a)
@@ -4573,12 +4595,12 @@ class NativeJoinOverloadedSuite(Suite):
 
         # computes the result. The result is identical regardless of
         # which path computed it.
-        from mypy.join import join_types
 
         c1 = self.callable(self.fx.a, self.fx.a)
         c2 = self.callable(self.fx.b, self.fx.b)
         ov = self.overloaded(c1, c2)
         assert join_types(ov, ov) == ov
+
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativePluginHookSuite(Suite):
@@ -4723,6 +4745,7 @@ class NativePluginHookSuite(Suite):
                 next(iter(self._by_kind[kind]))
             ), f"{kind} names must not widen the call union"
 
+
 @skipUnless(_NATIVE_STRFORMAT_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeStrFormatSuite(Suite):
     """Parity tests for Rust format-string parsing (Stage 6b).
@@ -4734,7 +4757,6 @@ class NativeStrFormatSuite(Suite):
 
     def setUp(self) -> None:
         from mypy.checkstrformat import (
-            _set_native_strformat_active,
             find_non_escaped_targets,
             parse_conversion_specifiers,
             parse_format_value,
@@ -4916,6 +4938,7 @@ class NativeStrFormatSuite(Suite):
             self._set_active(True)
             rs = self._parse_fmt(s, ctx, self._msg)
             assert_equal(rs, py, f"mismatch for {s!r}")
+
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeCheckPatternSuite(Suite):
@@ -5197,6 +5220,7 @@ class NativeCheckPatternSuite(Suite):
         )
         assert result is True
 
+
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeCheckCallSuite(Suite):
     """Parity suite for M25: check_call decision helpers ported to Rust.
@@ -5455,6 +5479,7 @@ class NativeCheckCallSuite(Suite):
         py = self._py_overlap([arg], [target1, target2])
         assert rust == py
         assert rust is True
+
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeOverloadCallSuite(Suite):
@@ -5725,6 +5750,7 @@ class NativeOverloadCallSuite(Suite):
         target = self.fx.callable(formal, self.fx.str_type)
         assert self._call([target], [self.fx.b]) is None
 
+
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeServerDepsSuite(Suite):
     """Parity tests for the Rust `get_type_triggers` port (M28).
@@ -5843,6 +5869,7 @@ class NativeServerDepsSuite(Suite):
         ov = Overloaded([c1, c2])
         triggers = self._triggers(ov)
         assert_equal(triggers, [self.make_trigger("A"), self.make_trigger("B")])
+
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeCheckMemberSuite(Suite):
@@ -6642,6 +6669,7 @@ class NativeCheckMemberSuite(Suite):
             set_wire_alias_map(None)
             self._set_resolver(self.resolver)
 
+
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeMemberAccessDispatchSuite(Suite):
     """Parity tests for the #805 method-branch dispatch seam.
@@ -7121,9 +7149,7 @@ class NativeMemberAccessDispatchSuite(Suite):
             named_type=lambda n: (
                 self.fx.bool_type
                 if n == "builtins.bool"
-                else self.fx.function
-                if n == "builtins.function"
-                else Instance(self.fx.oi, [])
+                else self.fx.function if n == "builtins.function" else Instance(self.fx.oi, [])
             ),
             msg=SimpleNamespace(
                 filter_errors=lambda *a, **kw: _NoopCtx(),
@@ -7158,6 +7184,7 @@ class NativeMemberAccessDispatchSuite(Suite):
         second_ret = get_proper_type(second.ret_type)
         assert isinstance(second_ret, LiteralType)
         assert second_ret.value is False
+
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeCheckmemberDeferralSuite(Suite):
@@ -7311,6 +7338,7 @@ class NativeCheckmemberDeferralSuite(Suite):
 
         tup = TupleType([self.fx.a], self.fx.a)
         assert self._general(tup, "missing_name")[2] is None
+
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeCheckexprSuite(Suite):
@@ -7528,6 +7556,7 @@ class NativeCheckexprSuite(Suite):
         assert isinstance(decoded, UnionType)  # type: ignore[misc]
         self.assertEqual(len(decoded.items), 2)
 
+
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeCombineSignaturesSuite(Suite):
     """Differential parity for issue #489: native `combine_function_signatures`.
@@ -7702,6 +7731,7 @@ class NativeCombineSignaturesSuite(Suite):
         )
         assert res is None
 
+
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeMergeTypevarsSuite(Suite):
     """Differential parity for `merge_typevars_in_callables_by_name`.
@@ -7875,6 +7905,7 @@ class NativeMergeTypevarsSuite(Suite):
         )
         assert res is None
 
+
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeGetMemberFlagsSuite(Suite):
     """Parity tests for `rust_get_member_flags` (mypy.subtypes.get_member_flags).
@@ -7911,7 +7942,7 @@ class NativeGetMemberFlagsSuite(Suite):
         return infos
 
     def _build_info(self, name: str) -> TypeInfo:
-        from mypy.nodes import Block, ClassDef, SymbolTable
+        from mypy.nodes import Block, SymbolTable
 
         defn = ClassDef(name, Block([]), None, [])
         defn.fullname = name
@@ -8056,6 +8087,7 @@ class NativeGetMemberFlagsSuite(Suite):
         assert raw is not None, "rust_get_member_flags returned None (deferred)"
         assert sorted(raw) == [IS_CLASS_OR_STATIC]
 
+
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeAnyCausesOverloadAmbiguitySuite(Suite):
     """Parity tests for `rust_any_causes_overload_ambiguity`.
@@ -8183,6 +8215,7 @@ class NativeAnyCausesOverloadAmbiguitySuite(Suite):
         item1 = self._callable([self.fx.a], self.fx.a)
         item2 = self._callable([self.fx.b], self.fx.b)
         self.assert_par([item1, item2], [self.fx.a, self.fx.b], [type_obj], [ARG_POS], None)
+
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
@@ -8370,6 +8403,7 @@ class NativeCoversAtRuntimeSuite(Suite):
             is None
         )
 
+
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeRestrictSubtypeAwaySuite(Suite):
     """Parity for `rust_restrict_subtype_away` (mypy.subtypes.restrict_subtype_away).
@@ -8484,6 +8518,7 @@ class NativeRestrictSubtypeAwaySuite(Suite):
             is None
         )
 
+
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeCheckerHelpersDeferralSuite(Suite):
     """Parity for the `restrict_subtype_away` erase_instances check (#885).
@@ -8596,6 +8631,7 @@ class NativeCheckerHelpersDeferralSuite(Suite):
         seam = self.seam_result(self.fx.a, self.fx.gt)
         assert seam is not None
         assert _deserialize_type(seam) == self.fx.a
+
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeClassmethodStaticSuite(Suite):
@@ -8741,6 +8777,7 @@ class NativeClassmethodStaticSuite(Suite):
         self._assert_par(None)
         assert_equal(self._with_gate(True, lambda: is_classmethod_node(None)), None)
         assert_equal(self._with_gate(True, lambda: is_node_static(None)), None)
+
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeGroupComparisonOperandsSuite(Suite):
@@ -8891,6 +8928,7 @@ class NativeGroupComparisonOperandsSuite(Suite):
             [("==", 0, 1), ("<", 1, 2), ("==", 2, 3)], {0: 0, 3: 0}, ["=="]
         )
         assert_equal(result, [("==", [0, 1, 2, 3]), ("<", [1, 2])])
+
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeUnsafeOverlappingOverloadSuite(Suite):
@@ -9117,6 +9155,7 @@ class NativeUnsafeOverlappingOverloadSuite(Suite):
         )
         assert result is None, "Rust should defer on a non-callable signature"
 
+
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeOverloadingOverloadsSuite(Suite):
     """Parity for the Rust `check_overlapping_overloads` screening-loop port.
@@ -9339,6 +9378,7 @@ class NativeOverloadingOverloadsSuite(Suite):
         self._assert_parity(sigs, [], strict_optional=True)
         self._assert_parity(sigs, [], strict_optional=False)
         assert_equal(self._native_decisions(sigs, [], False, True), [])
+
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeAndOrConditionalMapsSuite(Suite):
@@ -9613,6 +9653,7 @@ class NativeAndOrConditionalMapsSuite(Suite):
         self._assert_or_parity(m1, m2)
         result = self._with_gate(True, lambda: or_conditional_maps(m1, m2))
         assert_equal(self._normalize(result), {("NameExpr(x)", "Any | B")})
+
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
@@ -9985,6 +10026,7 @@ class NativeConditionalTypesSuite(Suite):
         assert_equal((str(yes), str(no)), ("A", "Any"))
         self._assert_engages(current, ranges, None)
 
+
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeEqualityAmbiguitySuite(Suite):
     """Parity for `partition_equality_ambiguous_types` and
@@ -10182,6 +10224,7 @@ class NativeEqualityAmbiguitySuite(Suite):
         b = Instance(self.bytese_info, [])
         self._assert_ambiguity_par(self.fx.o, b)
         self._assert_engages(self.fx.o, b)
+
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeDangerousComparisonSuite(Suite):
@@ -10465,6 +10508,7 @@ class NativeDangerousComparisonSuite(Suite):
         self._assert_par(da, da)
         self._assert_engages(da, da)
 
+
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeEnumProtocolClassifierSuite(Suite):
     """Direct-seam tests for the enum-callable base and protocol-test
@@ -10534,6 +10578,7 @@ class NativeEnumProtocolClassifierSuite(Suite):
     def test_protocol_callee_non_ref_expr(self) -> None:
         c = CallExpr(NameExpr("f"), [], [], [])
         assert self._tk.rust_classify_protocol_test_callee(c, 2) is None
+
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeFinalSuperSuite(Suite):
@@ -10804,6 +10849,7 @@ class NativeFinalSuperSuite(Suite):
         assert isinstance(on, RuntimeError), f"gate-on expected RuntimeError: {on!r}"
         assert str(off) == str(on), f"raise messages differ: {off!r} != {on!r}"
 
+
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeCheckLvalueSuite(Suite):
     """Parity for the Rust `check_lvalue` dispatch port.
@@ -10973,6 +11019,7 @@ class NativeCheckLvalueSuite(Suite):
     def test_parity_else(self) -> None:
         self._assert_par(IntExpr(1))
 
+
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeUntypedDecoratorSuite(Suite):
     """Parity for the Rust `check_for_untyped_decorator` conjunction port.
@@ -11096,7 +11143,7 @@ class NativeUntypedDecoratorSuite(Suite):
         return Instance(info, [])
 
     def _fixture_info(self) -> TypeInfo:
-        from mypy.nodes import Block, ClassDef, SymbolTable
+        from mypy.nodes import Block, SymbolTable
 
         defn = ClassDef("Callable", Block([]), None, [])
         defn.fullname = "mod.HasCall"
@@ -11217,6 +11264,7 @@ class NativeUntypedDecoratorSuite(Suite):
         alias = self.fx.non_rec_alias(self._untyped_callable())
         self._assert_par(True, self._typed_callable(), alias, False)
 
+
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeExplicitOverrideDecoratorSuite(Suite):
     """Parity for the Rust `check_explicit_override_decorator` conjunction port.
@@ -11252,7 +11300,7 @@ class NativeExplicitOverrideDecoratorSuite(Suite):
             self._set_active(True)
 
     def _info(self, name: str = "A") -> TypeInfo:
-        from mypy.nodes import Block, ClassDef, SymbolTable
+        from mypy.nodes import Block, SymbolTable
 
         defn = ClassDef(name, Block([]), None, [])
         defn.fullname = f"mod.{name}"
@@ -11356,6 +11404,7 @@ class NativeExplicitOverrideDecoratorSuite(Suite):
         # Suppress: single-underscore name (not private by mypy's def,
         # so this should emit, confirming the boundary).
         self._assert_par(self._defn("_single", None), self._bases())
+
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeCompatibilityClassvarSuperSuite(Suite):
@@ -11469,6 +11518,7 @@ class NativeCompatibilityClassvarSuperSuite(Suite):
         # node instance var, base classvar: class-var violation.
         self._assert_par(node_iv, base, self._var("base_attr", True))
 
+
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeNewSignatureSuite(Suite):
     """Parity for the Rust `check___new___signature` 3-way dispatch port.
@@ -11507,7 +11557,7 @@ class NativeNewSignatureSuite(Suite):
         return _type_kernel.rust_classify_new_signature(is_metaclass, is_instance_ret)
 
     def _info(self, *, metaclass: bool = False) -> TypeInfo:
-        from mypy.nodes import Block, ClassDef, SymbolTable
+        from mypy.nodes import Block, SymbolTable
 
         defn = ClassDef("A", Block([]), None, [])
         defn.fullname = "abc.ABCMeta" if metaclass else "mod.A"
@@ -11597,6 +11647,7 @@ class NativeNewSignatureSuite(Suite):
     def test_parity_literal(self) -> None:
         fx = TypeFixture()
         self._assert_par(False, LiteralType("x", fx.str_type))
+
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeFuncDefOverrideSuite(Suite):
@@ -11732,7 +11783,6 @@ class NativeFuncDefOverrideSuite(Suite):
         self._assert_par(self._orig_none)
 
     def _fill_partial(self) -> tuple[FuncDef, Any]:
-        from mypy.types import PartialType
 
         orig = Var("v")
         orig.type = PartialType(None, orig)
@@ -11744,7 +11794,6 @@ class NativeFuncDefOverrideSuite(Suite):
         self._assert_par(self._fill_partial)
 
     def _partial_invalid(self) -> tuple[FuncDef, Any]:
-        from mypy.types import PartialType
 
         orig = Var("v")
         info = self._fake_info()
@@ -11779,7 +11828,6 @@ class NativeFuncDefOverrideSuite(Suite):
         self._assert_par(self._no_op)
 
     def _fill_partial_decorator(self) -> tuple[FuncDef, Any]:
-        from mypy.types import PartialType
 
         inner = FuncDef("old")
         var = Var("v")
@@ -11793,12 +11841,13 @@ class NativeFuncDefOverrideSuite(Suite):
         self._assert_par(self._fill_partial_decorator)
 
     def _fake_info(self) -> Any:
-        from mypy.nodes import Block, ClassDef, SymbolTable, TypeInfo as _TypeInfo
+        from mypy.nodes import Block, SymbolTable, TypeInfo as _TypeInfo
 
         defn = ClassDef("List", Block([]), None, [])
         defn.fullname = "builtins.list"
         info = _TypeInfo(SymbolTable(), defn, "builtins")
         return info
+
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeEnumNewSuite(Suite):
@@ -11915,6 +11964,7 @@ class NativeEnumNewSuite(Suite):
         off, on = self._run([Instance(enum, [])])
         assert_equal(on, off, "enum base with mixin in mro")
 
+
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeEnumBasesSuite(Suite):
     """Parity for the Rust `check_enum_bases` fold port.
@@ -12024,6 +12074,7 @@ class NativeEnumBasesSuite(Suite):
         m2 = self._base("mod.Mixin2", is_enum=False)
         off, on = self._run([m1, e, m2])
         assert_equal(on, off, "non-enum, enum, non-enum")
+
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeIsFinalEnumValueSuite(Suite):
@@ -12146,6 +12197,7 @@ class NativeIsFinalEnumValueSuite(Suite):
         self._assert_par(self._var("attr", self.fx.nonet, True), False)
         # No value, not stub -> False.
         self._assert_par(self._var("attr", self.fx.nonet), False)
+
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeCanBeNarrowedWithLenSuite(Suite):
@@ -12318,6 +12370,7 @@ class NativeCanBeNarrowedWithLenSuite(Suite):
         alias = TypeAlias(self.fx.std_tuple, "mod.Alias", "mod", -1, -1)
         self._assert_par(TypeAliasType(alias, []), True, defers=True)
 
+
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeTypedDictCallSuite(Suite):
     """Parity for the Rust `check_typeddict_call` dispatch classifier.
@@ -12404,6 +12457,7 @@ class NativeTypedDictCallSuite(Suite):
         ]
         for args, arg_kinds in shapes:
             self._assert_engages(args, arg_kinds)
+
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeHasAbstractTypeSuite(Suite):
@@ -12583,6 +12637,7 @@ class NativeHasAbstractTypeSuite(Suite):
         assert off is False, f"gate-off tuple {off} != False"
         assert on is False, f"gate-on tuple {on} != False"
 
+
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeFreshenFunctionTypeVarsSuite(Suite):
     """Parity for the Rust `freshen_function_type_vars` port
@@ -12734,6 +12789,7 @@ class NativeFreshenFunctionTypeVarsSuite(Suite):
         off = str(self._with_gate(False, lambda: freshen_function_type_vars(ov)))
         on = str(self._with_gate(True, lambda: freshen_function_type_vars(ov)))
         assert_equal(on, off, f"freshen non-generic overloaded parity {ov}")
+
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeFindMatchingOverloadSuite(Suite):
@@ -12993,6 +13049,7 @@ class NativeFindMatchingOverloadSuite(Suite):
         result = self._native_indices(items, self._callable([self.fx.a]))
         assert result is None
 
+
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeTypeRequiresUsageSuite(Suite):
     """Parity for the `rust_type_requires_usage` __await__ branch port.
@@ -13147,6 +13204,7 @@ class NativeTypeRequiresUsageSuite(Suite):
         type_infos.extend(extra)
         return type_infos
 
+
 class NativeTypeRequiresUsageTailSuite(NativeTypeRequiresUsageSuite):
     """Parity for the ported non-Instance tail of `rust_type_requires_usage`.
 
@@ -13180,6 +13238,7 @@ class NativeTypeRequiresUsageTailSuite(NativeTypeRequiresUsageSuite):
         typ = self.fx.callable(self.fx.anyt, self.fx.nonet)
         self._assert_par(typ, "CallableType")
         self._assert_engages(typ, 2)
+
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeCheckexprJoinAndTupleSuite(Suite):
@@ -13337,6 +13396,7 @@ class NativeCheckexprJoinAndTupleSuite(Suite):
     def test_no_unpack_plain_tuple(self) -> None:
         self._assert_tuple_parity([self.fx.a, self.fx.b], seen_unpack=False, engage=True)
 
+
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeCheckcallSetopsDeferSuite(Suite):
     """Parity for the checkcall.rs defer sites audited in issue #844.
@@ -13484,6 +13544,7 @@ class NativeCheckcallSetopsDeferSuite(Suite):
         )
         assert result is not None and result is False
 
+
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeMetaclassCompatibilitySuite(Suite):
     """Parity for the Rust `check_metaclass_compatibility` decision-head port.
@@ -13530,7 +13591,7 @@ class NativeMetaclassCompatibilitySuite(Suite):
         metaclass_type: object = None,
         bases: list[Any] | None = None,
     ) -> TypeInfo:
-        from mypy.nodes import Block, ClassDef, SymbolTable, TypeInfo
+        from mypy.nodes import Block, SymbolTable, TypeInfo
 
         defn = ClassDef(fullname.rsplit(".", 1)[-1], Block([]), None, [])
         defn.fullname = fullname
@@ -13677,6 +13738,7 @@ class NativeMetaclassCompatibilitySuite(Suite):
         t = self._typeinfo(metaclass_type=mc, bases=[base])
         self._assert_par(t)
 
+
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeTypeinfoMetaclassMemoSuite(Suite):
     """Parity + memo semantics for the Rust `is_metaclass` verdict memo (#1137).
@@ -13708,7 +13770,7 @@ class NativeTypeinfoMetaclassMemoSuite(Suite):
         _clear_native_metaclass_memo()
 
     def _typeinfo(self, *, fullname: str = "mod.A", fallback_to_any: bool = False) -> TypeInfo:
-        from mypy.nodes import Block, ClassDef, SymbolTable, TypeInfo
+        from mypy.nodes import Block, SymbolTable, TypeInfo
 
         defn = ClassDef(fullname.rsplit(".", 1)[-1], Block([]), None, [])
         defn.fullname = fullname
@@ -13848,6 +13910,7 @@ class NativeTypeinfoMetaclassMemoSuite(Suite):
             assert_equal(len(calls), 2, "empty-MRO queries always recompute")
 
         self._with_counting_delegate(run)
+
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeTypeTypeMemberAccessSuite(Suite):
@@ -14079,6 +14142,7 @@ class NativeTypeTypeMemberAccessSuite(Suite):
     def test_par_none(self) -> None:
         self._assert_par(TypeType(NoneType()))
 
+
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeMatchArgsSuite(Suite):
     """Parity for the Rust `check_match_args` predicate port (#986).
@@ -14123,7 +14187,7 @@ class NativeMatchArgsSuite(Suite):
 
     def _class_scope(self) -> Any:
         from mypy.checker_shared import CheckerScope
-        from mypy.nodes import Block, ClassDef, SymbolTable
+        from mypy.nodes import Block, SymbolTable
 
         info = TypeInfo(SymbolTable(), ClassDef("C", Block([]), None, []), "mod")
         scope = CheckerScope.__new__(CheckerScope)
@@ -14233,6 +14297,7 @@ class NativeMatchArgsSuite(Suite):
         alias = TypeAlias(fx.str_type, "mod.A", "mod", -1, -1)
         tup = TupleType([TypeAliasType(alias, [])], fx.std_tuple)
         self._assert_par(self._class_scope(), tup)
+
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeFindIsinstanceHeadSuite(Suite):
@@ -14444,6 +14509,7 @@ class NativeFindIsinstanceHeadSuite(Suite):
         assert_equal(run(true_ref), ({}, {true_ref: UninhabitedType()}))
         false_ref = self._builtin_ref("builtins.False")
         assert_equal(run(false_ref), ({false_ref: UninhabitedType()}, {}))
+
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeDescriptorHeadSuite(Suite):
@@ -14663,6 +14729,7 @@ class NativeDescriptorHeadSuite(Suite):
         assert self._with_gate(False, run)
         assert self._with_gate(True, run)
 
+
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeIsInstanceVarSuite(Suite):
     """Parity for the Rust `is_instance_var` port (mypy.checkmember).
@@ -14694,7 +14761,7 @@ class NativeIsInstanceVarSuite(Suite):
             self._set_active(True)
 
     def _typeinfo(self, fullname: str = "mod.A") -> TypeInfo:
-        from mypy.nodes import Block, ClassDef, SymbolTable
+        from mypy.nodes import Block, SymbolTable
 
         defn = ClassDef(fullname.rsplit(".", 1)[-1], Block([]), None, [])
         defn.fullname = fullname
@@ -14770,6 +14837,7 @@ class NativeIsInstanceVarSuite(Suite):
         result = _type_kernel.rust_is_instance_var(var)
         assert result is None, f"expected defer, got {result}"
 
+
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeCheckFinalMemberSuite(Suite):
     """Parity for the Rust `check_final_member` MRO fold (mypy.checkmember).
@@ -14808,7 +14876,7 @@ class NativeCheckFinalMemberSuite(Suite):
             self._set_active(True)
 
     def _typeinfo(self, fullname: str = "mod.A") -> TypeInfo:
-        from mypy.nodes import Block, ClassDef, SymbolTable
+        from mypy.nodes import Block, SymbolTable
 
         defn = ClassDef(fullname.rsplit(".", 1)[-1], Block([]), None, [])
         defn.fullname = fullname
@@ -14914,6 +14982,7 @@ class NativeCheckFinalMemberSuite(Suite):
         result = _type_kernel.rust_check_final_member(cast(TypeInfo, Var("x")), "x")
         assert result is None, f"expected defer, got {result}"
 
+
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeAnalyzeVarSuite(Suite):
     """Parity tests for `rust_classify_analyze_var` (mypy.checkmember.analyze_var).
@@ -14967,7 +15036,7 @@ class NativeAnalyzeVarSuite(Suite):
             self._set_active(True)
 
     def _typeinfo(self, fullname: str = "mod.A") -> TypeInfo:
-        from mypy.nodes import Block, ClassDef, SymbolTable
+        from mypy.nodes import Block, SymbolTable
 
         defn = ClassDef(fullname.rsplit(".", 1)[-1], Block([]), None, [])
         defn.fullname = fullname
@@ -15097,14 +15166,12 @@ class NativeAnalyzeVarSuite(Suite):
         assert self._seam(var, Instance(self.info, []), is_lvalue=True) == 0
 
     def test_seam_partial(self) -> None:
-        from mypy.types import PartialType
 
         inner = Var("x")
         var = self._make_var("x", typ=PartialType(None, inner))
         assert self._seam(var, Instance(self.info, [])) == 2
 
     def test_seam_partial_beats_enum(self) -> None:
-        from mypy.types import PartialType
 
         inner = Var("RED")
         var = Var("RED", PartialType(None, inner))
@@ -15180,7 +15247,6 @@ class NativeAnalyzeVarSuite(Suite):
         self._assert_differential("x", var, Instance(self.info, []), is_lvalue=True)
 
     def test_differential_partial(self) -> None:
-        from mypy.types import PartialType
 
         inner = Var("x")
         var = Var("x", PartialType(None, inner))
@@ -15217,6 +15283,7 @@ class NativeAnalyzeVarSuite(Suite):
         var.has_explicit_value = True
         self.enum_info.names["RED"] = SymbolTableNode(MDEF, var)
         self._assert_differential("RED", var, Instance(self.enum_info, []))
+
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeMemberVarDispatchSuite(Suite):
@@ -15287,7 +15354,7 @@ class NativeMemberVarDispatchSuite(Suite):
             self._set_active(True)
 
     def _typeinfo(self, fullname: str = "mod.A") -> TypeInfo:
-        from mypy.nodes import Block, ClassDef, SymbolTable
+        from mypy.nodes import Block, SymbolTable
 
         defn = ClassDef(fullname.rsplit(".", 1)[-1], Block([]), None, [])
         defn.fullname = fullname
@@ -15676,6 +15743,7 @@ class NativeMemberVarDispatchSuite(Suite):
         union = UnionType([Instance(self.info, []), Instance(self.base, [])])
         self._assert_union_differential(union, "x")
 
+
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeEnumCheckSuite(Suite):
     """Parity for the Rust `check_enum` multi-arm classifier port.
@@ -15893,6 +15961,7 @@ class NativeEnumCheckSuite(Suite):
         off, on = self._run(info, is_stub=True)
         assert_equal(on, off, "all three arms")
 
+
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeClassPatternRangesSuite(Suite):
     """Parity for the Rust class-pattern type-range dispatch (issue #987).
@@ -16083,6 +16152,7 @@ class NativeClassPatternRangesSuite(Suite):
         on = self._assert_par(typ)
         assert on is None
 
+
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeRefersToTypedDictSuite(Suite):
     """Parity for `rust_refers_to_typeddict` (issue #980).
@@ -16114,7 +16184,7 @@ class NativeRefersToTypedDictSuite(Suite):
             self._set_active(True)
 
     def _typeinfo(self, fullname: str = "mod.Movie") -> TypeInfo:
-        from mypy.nodes import Block, ClassDef, SymbolTable
+        from mypy.nodes import Block, SymbolTable
 
         defn = ClassDef(fullname.rsplit(".", 1)[-1], Block([]), None, [])
         defn.fullname = fullname
@@ -16240,6 +16310,7 @@ class NativeRefersToTypedDictSuite(Suite):
             pass
         else:
             raise AssertionError("expected ValueError for missing alias bytes")
+
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeValidVarArgSuite(Suite):
@@ -16388,6 +16459,7 @@ class NativeValidVarArgSuite(Suite):
         a, _ = self.fx.def_alias_1(self.fx.a)
         assert self._seam_var(a, True) is None
         assert self._seam_kwarg(a, False, True, True) is None
+
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeRvalueCountSuite(Suite):
@@ -16541,6 +16613,7 @@ class NativeRvalueCountSuite(Suite):
         off, on = self._run(self._lv(3), 2, None)
         assert_equal(on, off, "exact count message")
         assert on[1] == [("wrong_number", "2:3")]
+
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeIndexWithTypeSuite(Suite):
@@ -16781,6 +16854,7 @@ class NativeIndexWithTypeSuite(Suite):
     def test_par_type_obj_fallthrough(self) -> None:
         self._assert_par(self.fx.callable_type(self.fx.a), NameExpr("k"))
 
+
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeGetattrMethodSuite(Suite):
     """Parity for the Rust `check_getattr_method` 4-way dispatch head.
@@ -16886,6 +16960,7 @@ class NativeGetattrMethodSuite(Suite):
 
     def test_parity_other_scope_noop(self) -> None:
         self._assert_par(module=False, cls=False, name="__getattr__", ok=True)
+
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeCheckUnpacksInListSuite(Suite):
@@ -17015,6 +17090,7 @@ class NativeCheckUnpacksInListSuite(Suite):
         assert keep == [0]
         assert final_unpack_idx == 1
 
+
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeCheckWarnDeprecatedSuite(Suite):
     """Parity for the Rust `check_and_warn_deprecated` arbitration head.
@@ -17137,13 +17213,11 @@ class NativeCheckWarnDeprecatedSuite(Suite):
         assert_equal(captured, [("note", "use mod.B instead")])
 
     def test_import_from_suppresses_warning(self) -> None:
-        from mypy.nodes import ImportFrom
 
         captured = self._assert_par(imports=[ImportFrom("mod", 0, [("Dep", None)])])
         assert_equal(captured, [])
 
     def test_import_from_other_name_warns(self) -> None:
-        from mypy.nodes import ImportFrom
 
         captured = self._assert_par(imports=[ImportFrom("other", 0, [("X", None)])])
         assert_equal(captured, [("note", "use mod.B instead")])
@@ -17180,6 +17254,7 @@ class NativeCheckWarnDeprecatedSuite(Suite):
 
         self._assert_direct(_DEPRECATED_TAG_NOTE, report_note=True)
         self._assert_direct(_DEPRECATED_TAG_FAIL, report_note=False)
+
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeArgInferPassesSuite(Suite):
@@ -17449,6 +17524,7 @@ class NativeArgInferPassesSuite(Suite):
         )
         assert result == [1], f"expected skip result [1], got {result}"
 
+
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeTruthyTypeSuite(Suite):
     """Gate-off vs gate-on parity for check_for_truthy_type (issue #1010).
@@ -17623,6 +17699,7 @@ class NativeTruthyTypeSuite(Suite):
 
         call = CallExpr(NameExpr("f"), [], [ARG_POS], [None])
         self._assert_par(self.fx.callable(self.fx.o, self.fx.nonet), call)
+
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeCheckFinalSuite(Suite):
@@ -17893,6 +17970,7 @@ class NativeCheckFinalSuite(Suite):
         self._assert_par(
             [self._ref(v)], True, self._cls(), is_stub=True, s_type=AnyType(TypeOfAny.explicit)
         )
+
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeMissingAnnotationsSuite(Suite):
@@ -18331,6 +18409,7 @@ class NativeMissingAnnotationsSuite(Suite):
             is_typeshed_stub=True,
             warn_incomplete_stub=True,
         )
+
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeReturnStmtSuite(Suite):
@@ -18810,6 +18889,7 @@ class NativeReturnStmtSuite(Suite):
         msgs = self._run(self._defn(), self.fx.str_type, expr_type=self.fx.a)
         assert len(msgs) == 1 and msgs[0][0] == "subtype"
 
+
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeCheckArgSuite(Suite):
     """Parity for `rust_classify_check_arg` (issue #1048).
@@ -18994,6 +19074,7 @@ class NativeCheckArgSuite(Suite):
         on = self._run_check_arg(fx.a, fx.a, ARG_POS, True)
         assert off == on, f"pass: off={off} on={on}"
         assert off == [], f"expected no messages: {off}"
+
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeCheckArgCountSuite(Suite):
@@ -19498,6 +19579,7 @@ class NativeCheckArgCountSuite(Suite):
         off = self._parity(callee, [t], [ARG_POS], [None], [[]])
         assert any(o[0] == "too_few" for o in off), off
 
+
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeTypeCheckRaiseSuite(Suite):
     """Parity for the Rust `type_check_raise` decision-head port (#1050).
@@ -19537,7 +19619,7 @@ class NativeTypeCheckRaiseSuite(Suite):
         return _serialize_type_for_checker(t)
 
     def _notimpl_info(self, name: str, module: str) -> Any:
-        from mypy.nodes import Block, ClassDef, SymbolTable, TypeInfo
+        from mypy.nodes import Block, SymbolTable, TypeInfo
 
         class_def = ClassDef(name, Block([]), None, [])
         class_def.fullname = f"{module}.{name}"
@@ -19712,6 +19794,7 @@ class NativeTypeCheckRaiseSuite(Suite):
         on = self._run(fx.str_type, True, e=e)
         assert off == on, f"callee: off={off} on={on}"
         assert len([r for r in off if r[0] == "fail"]) == 1, f"expected fail: {off}"
+
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeCheckBooleanOpSuite(Suite):
@@ -19986,6 +20069,7 @@ class NativeCheckBooleanOpSuite(Suite):
         off = self._run(False, e, make)
         on = self._run(True, e, make)
         assert off == on, f"union-left: off={off} on={on}"
+
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeSimpleAssignmentSuite(Suite):
@@ -20292,6 +20376,7 @@ class NativeSimpleAssignmentSuite(Suite):
         assert ("set_inferred", str(UnionType([int_inst, unrel_inst]))) in off, off
         assert ("subtype", str(UnionType([int_inst, unrel_inst]))) in off, off
 
+
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeAllSupersGateSuite(Suite):
     """Parity for the Rust `check_compatibility_all_supers` gate-head port.
@@ -20329,7 +20414,7 @@ class NativeAllSupersGateSuite(Suite):
             self._set_active(True)
 
     def _class_info(self, fullname: str, name: str) -> TypeInfo:
-        from mypy.nodes import Block, ClassDef
+        from mypy.nodes import Block
 
         cdef = ClassDef(name=name, defs=Block([]))
         cdef.fullname = fullname
@@ -20539,6 +20624,7 @@ class NativeAllSupersGateSuite(Suite):
     def test_parity_super_incompatible_breaks(self) -> None:
         self._assert_par(self._lvalue(), super_ok=False)
 
+
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeIsWritableAttributeSuite(Suite):
     """Parity for the Rust `is_writable_attribute` pure-predicate port (#1071).
@@ -20656,6 +20742,7 @@ class NativeIsWritableAttributeSuite(Suite):
     def test_parity_non_node(self) -> None:
         self._assert_par(self.fx.oi)
 
+
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeIsDefinedInBaseClassSuite(Suite):
     """Parity for the Rust `is_defined_in_base_class` pure-predicate port (#1601).
@@ -20687,7 +20774,7 @@ class NativeIsDefinedInBaseClassSuite(Suite):
             self._set_active(True)
 
     def _make_typeinfo(self, name: str = "mod.X") -> TypeInfo:
-        from mypy.nodes import Block, ClassDef
+        from mypy.nodes import Block
 
         defn = ClassDef(name, Block([]))
         info = TypeInfo(SymbolTable(), defn, name)
@@ -20787,6 +20874,7 @@ class NativeIsDefinedInBaseClassSuite(Suite):
         base = self._make_typeinfo("mod.Base")
         self._add_base(info, base, member_name="other")
         self._assert_par(self._make_var("attr", info))
+
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeIsDefinitionSuite(Suite):
@@ -20893,6 +20981,7 @@ class NativeIsDefinitionSuite(Suite):
     def test_parity_member_expr_not_inferred(self) -> None:
         self._assert_par(self._member_expr("attr"))
 
+
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeCheckExitReturnTypeSuite(Suite):
     """Parity for `rust_check_exit_return_type` (issue #1597).
@@ -20940,9 +21029,7 @@ class NativeCheckExitReturnTypeSuite(Suite):
         n.fullname = "builtins.True"
         return n
 
-    def _func(
-        self, ret_type: Type, returns: list[Any]
-    ) -> Any:
+    def _func(self, ret_type: Type, returns: list[Any]) -> Any:
         from mypy.nodes import Block, FuncDef, ReturnStmt
 
         stmts: list[Statement] = [ReturnStmt(expr) for expr in returns]
@@ -20964,7 +21051,10 @@ class NativeCheckExitReturnTypeSuite(Suite):
             chk.msg = SimpleNamespace(  # type: ignore[assignment]
                 fail=lambda msg, ctx, **kw: msgs.append(("fail", str(msg))),
                 incorrect__exit__return=lambda ctx: msgs.append(
-                    ("fail", '"bool" is invalid as return type for "__exit__" that always returns False')
+                    (
+                        "fail",
+                        '"bool" is invalid as return type for "__exit__" that always returns False',
+                    )
                 ),
             )
             chk.check__exit__return_type(defn)
@@ -21019,7 +21109,9 @@ class NativeCheckExitReturnTypeSuite(Suite):
     def test_parity_all_false(self) -> None:
         fd = self._func(self.fx.bool_type, [self._false_name()])
         msgs = self._run(fd)
-        assert msgs == [("fail", '"bool" is invalid as return type for "__exit__" that always returns False')]
+        assert msgs == [
+            ("fail", '"bool" is invalid as return type for "__exit__" that always returns False')
+        ]
 
     def test_parity_mixed(self) -> None:
         fd = self._func(self.fx.bool_type, [self._false_name(), self._true_name()])
@@ -21052,6 +21144,7 @@ class NativeCheckExitReturnTypeSuite(Suite):
         msgs = self._run(fd)
         assert msgs == []
 
+
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeCheckFinalDeletableSuite(Suite):
     """Parity for the Rust `check_final_deletable` port (H1d).
@@ -21083,11 +21176,9 @@ class NativeCheckFinalDeletableSuite(Suite):
             self._set_active(True)
 
     def _make_info(
-        self,
-        deletable: list[str],
-        names: dict[str, SymbolTableNode] | None = None,
+        self, deletable: list[str], names: dict[str, SymbolTableNode] | None = None
     ) -> TypeInfo:
-        from mypy.nodes import Block, ClassDef, SymbolTable, TypeInfo
+        from mypy.nodes import Block, SymbolTable, TypeInfo
 
         table = SymbolTable()
         info = TypeInfo(table, ClassDef("X", Block([])), "mod.X")
@@ -21115,9 +21206,7 @@ class NativeCheckFinalDeletableSuite(Suite):
         fails: list[Any] = []
 
         class _StubChecker(TypeChecker):
-            def fail(
-                self, msg: Any, context: Any, *, code: Any = None
-            ) -> Any:
+            def fail(self, msg: Any, context: Any, *, code: Any = None) -> Any:
                 fails.append((str(msg), context))
 
         def check_one() -> list[Any]:
@@ -21199,6 +21288,7 @@ class NativeCheckFinalDeletableSuite(Suite):
         )
         self._assert_par(info)
 
+
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeAlwaysReturnsNoneSuite(Suite):
     """Parity for `rust_always_returns_none` (issue #1070).
@@ -21233,7 +21323,7 @@ class NativeAlwaysReturnsNoneSuite(Suite):
             self._set_active(True)
 
     def _info(self, fullname: str = "mod.C") -> TypeInfo:
-        from mypy.nodes import Block, ClassDef
+        from mypy.nodes import Block
 
         defn = ClassDef(fullname.rsplit(".", 1)[-1], Block([]), None, [])
         defn.fullname = fullname
@@ -21402,6 +21492,7 @@ class NativeAlwaysReturnsNoneSuite(Suite):
         expr = MemberExpr(NameExpr("obj"), "attr")
         result = _type_kernel.rust_always_returns_none(expr, None)
         assert result is None, f"seam: {result} is not None"
+
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeFindMemberPreludeSuite(Suite):
@@ -21612,6 +21703,7 @@ class NativeFindMemberPreludeSuite(Suite):
         self._add_method(info, "__getattr__")
         self._assert_par("__setattr__", self._instance(info))
 
+
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeInferOperatorAssignmentSuite(Suite):
     """Parity for the Rust `infer_operator_assignment_method` port (#1079).
@@ -21645,7 +21737,7 @@ class NativeInferOperatorAssignmentSuite(Suite):
             self._set_active(True)
 
     def _info(self, name: str, members: tuple[str, ...] = ()) -> TypeInfo:
-        from mypy.nodes import Block, ClassDef
+        from mypy.nodes import Block
 
         defn = ClassDef(name, Block([]), None, [])
         defn.fullname = "mod." + name
@@ -21736,6 +21828,7 @@ class NativeInferOperatorAssignmentSuite(Suite):
         )
         self._assert_par(Instance(self._info("C"), []), "==", (False, "__eq__"))
 
+
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeComparisonNarrowingSuite(Suite):
     """Parity for the Rust comparison_type_narrowing operand front (#1087).
@@ -21812,7 +21905,6 @@ class NativeComparisonNarrowingSuite(Suite):
         return expr
 
     def _comparison(self, operators: list[str], operands: list[Any]) -> Any:
-        from mypy.nodes import ComparisonExpr
 
         return ComparisonExpr(operators, operands)
 
@@ -22018,6 +22110,7 @@ class NativeComparisonNarrowingSuite(Suite):
         types = {e0: fx.str_type, e1: TypeAliasType(alias, [])}
         self._assert_par(node, types, "alias operand with snapshot")
 
+
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeNarrowIdentityEqualitySuite(Suite):
     """Parity for the identity/equality narrowing seam (#387, #1126).
@@ -22193,6 +22286,7 @@ class NativeNarrowIdentityEqualitySuite(Suite):
         alias = TypeAliasType(TypeAlias(Instance(fx.ai, []), "mod.AAlias", "mod", -1, -1), [])
         self._assert_par("==", [alias, fx.a], "alias operand", defers=True)
 
+
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeCheckAssignmentHeadSuite(Suite):
     """Parity for `rust_classify_check_assignment` (issue #1090).
@@ -22310,7 +22404,6 @@ class NativeCheckAssignmentHeadSuite(Suite):
             NATIVE_CA_SPECIAL_NONE,
         )
         from mypy.nodes import GDEF
-        from mypy.types import PartialType
 
         # No lvalue type -> NO_TYPE.
         tags = self._seam(self._name("x"), None, False, False)
@@ -22491,19 +22584,18 @@ class NativeCheckAssignmentHeadSuite(Suite):
         )
 
     def test_parity_partial_none_return(self) -> None:
-        from mypy.types import PartialType
 
         self._assert_par(
             self._name("x"), PartialType(None, Var("x"), None), None, None, rvalue_type=NoneType()
         )
 
     def test_parity_partial_none_infer(self) -> None:
-        from mypy.types import PartialType
 
         self._assert_par(self._name("x"), PartialType(None, Var("x"), None), None, None)
 
     def test_parity_tuple(self) -> None:
         self._assert_par(TupleExpr([NameExpr("a")]), None, None, None)
+
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeProtocolMemberMissSuite(Suite):
@@ -22733,6 +22825,7 @@ class NativeProtocolMemberMissSuite(Suite):
         result = self._loop_call(Instance(i, []), Instance(p, []))
         assert result is False, f"missing member must be False, got {result!r}"
         self._restore()
+
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeProtocolMemberSelfGateSuite(Suite):
@@ -22996,6 +23089,7 @@ class NativeProtocolMemberSelfGateSuite(Suite):
             assert raw is not None and len(raw) > 0, f"expected found bytes, got {raw!r}"
         finally:
             self._checker_state.type_checker = self._saved_checker
+
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeSolveGenericCallSuite(Suite):
@@ -23289,6 +23383,7 @@ class NativeSolveGenericCallSuite(Suite):
             py
         ), f"solve parity: native={raw!r} python={py!r}"
 
+
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeStarExpansionSuite(Suite):
     """Parity for the ArgTypeExpander star-expansion port (piece 1, #1343).
@@ -23540,6 +23635,7 @@ class NativeStarExpansionSuite(Suite):
         td = TypedDictType({"a": self.fx.a}, {"a"}, set(), Instance(self.fx.ai, []))
         assert self._seam(callee, [td], [ARG_STAR2], [[0]]) is None
 
+
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeConditionalStructuralFalseSuite(Suite):
     """Wave 46 (#1450): the structural-subtype fall-through in the Rust
@@ -23659,6 +23755,7 @@ class NativeConditionalStructuralFalseSuite(Suite):
             f"structural-False callable parity {current} vs {proposed}",
         )
 
+
 @skipUnless(_HAS_TYPE_KERNEL, "requires the type_kernel extension")
 class NativeAmaResidualSuite(Suite):
     """Wave 46a residual deferrals on the ama seam (#1449).
@@ -23749,7 +23846,7 @@ class NativeAmaResidualSuite(Suite):
             self._set_active(True)
 
     def _typeinfo(self, fullname: str = "mod.A") -> TypeInfo:
-        from mypy.nodes import Block, ClassDef, SymbolTable
+        from mypy.nodes import Block, SymbolTable
 
         defn = ClassDef(fullname.rsplit(".", 1)[-1], Block([]), None, [])
         defn.fullname = fullname
@@ -23950,6 +24047,7 @@ class NativeAmaResidualSuite(Suite):
         assert off == on, f"enum member gate mismatch: off={off!r} on={on!r}"
         assert "RED" in off
 
+
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeTypeRangeSuite(Suite):
     """Gate-off vs gate-on parity for get_type_range_of_type (issue #1464 C1).
@@ -24144,6 +24242,7 @@ class NativeTypeRangeSuite(Suite):
     def test_par_none_type(self) -> None:
         self._par(self.fx.nonet)
 
+
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeTypeobjGateSuite(Suite):
     """Gate-off vs gate-on parity for the check_callable_call typeobj-fail
@@ -24311,6 +24410,7 @@ class NativeTypeobjGateSuite(Suite):
     def test_par_protocol_exempt(self) -> None:
         self._par(self._type_object_callable(self._protocol_info(), from_type_type=True))
 
+
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeArgApproxAliasSuite(Suite):
     """Wave-61B: alias expansion for `arg_approximate_similarity` (#1512).
@@ -24388,6 +24488,7 @@ class NativeArgApproxAliasSuite(Suite):
         off, on = self._run(alias_t, self.fx.a)
         assert on == off
         assert off is True
+
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeNarrowWithLenAliasSuite(Suite):
@@ -24502,6 +24603,7 @@ class NativeNarrowWithLenAliasSuite(Suite):
         assert str(on[1]) == str(off[1])
         assert str(off[0]) == str(self.tup)
 
+
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeAddClassTvarsFreeSuite(Suite):
     """Wave-61B: free-result expansion in `add_class_tvars` (#1512).
@@ -24602,7 +24704,10 @@ class NativeAddClassTvarsFreeSuite(Suite):
         from mypy.typeops import freeze_all_type_vars
 
         expected = self._with_gate(
-            False, lambda: add_class_tvars(self.method, self.isuper, True, self._mx(), is_trivial_self=True)
+            False,
+            lambda: add_class_tvars(
+                self.method, self.isuper, True, self._mx(), is_trivial_self=True
+            ),
         )
         result = _type_kernel.rust_add_class_tvars(
             self._resolver,
@@ -24628,13 +24733,12 @@ class NativeAddClassTvarsFreeSuite(Suite):
         mx = self._mx()
 
         def run() -> Type:
-            return add_class_tvars(
-                self.method, self.isuper, True, mx, is_trivial_self=True
-            )
+            return add_class_tvars(self.method, self.isuper, True, mx, is_trivial_self=True)
 
         off = self._with_gate(False, run)
         on = self._with_gate(True, run)
         assert str(on) == str(off), f"add_class_tvars parity: {off!r} vs {on!r}"
+
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeIsValidDefaultDictPartialValueTypeSuite(Suite):
@@ -24766,6 +24870,7 @@ class NativeIsValidDefaultDictPartialValueTypeSuite(Suite):
     def test_parity_non_instance(self) -> None:
         self._assert_par(self.fx.nonet)
 
+
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeIsLenOfTupleSuite(Suite):
     """Parity for the Rust `is_len_of_tuple` AST-shape front (H1h).
@@ -24874,6 +24979,7 @@ class NativeIsLenOfTupleSuite(Suite):
         off = self._with_gate(False, check)
         on = self._with_gate(True, check)
         assert_equal(on, off, "is_len_of_tuple parity: wrong arg count")
+
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeIsAssignableSlotSuite(Suite):
@@ -24999,6 +25105,7 @@ class NativeIsAssignableSlotSuite(Suite):
     def test_parity_other(self) -> None:
         lv = self._make_lvalue()
         self._assert_par(lv, self.fx.nonet)
+
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeIsNoopForReachabilitySuite(Suite):
@@ -25136,6 +25243,7 @@ class NativeIsNoopForReachabilitySuite(Suite):
         on = self._with_gate(True, check_one)
         assert_equal(on, off)
 
+
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeIsLiteralEnumSuite(Suite):
     """Parity for the Rust `is_literal_enum` port (checker.py:10586).
@@ -25176,8 +25284,7 @@ class NativeIsLiteralEnumSuite(Suite):
         meta_info.fallback_to_any = True
         enum_inst = Instance(enum_info, [])
         return CallableType(
-            [], [], [], enum_inst, Instance(meta_info, []),
-            instance_type=enum_inst,
+            [], [], [], enum_inst, Instance(meta_info, []), instance_type=enum_inst
         )
 
     def _seam(self, parent: Any, member: Any) -> Any:
@@ -25186,7 +25293,6 @@ class NativeIsLiteralEnumSuite(Suite):
     def _run(self, parent_type: Type, member_type: Type) -> tuple[bool, bool]:
         from mypy.checker import TypeChecker
 
-        enum_info = self._make_enum_info()
         parent_expr = NameExpr("Foo")
         member_expr = MemberExpr(parent_expr, "A")
         chk = TypeChecker.__new__(TypeChecker)
@@ -25219,9 +25325,7 @@ class NativeIsLiteralEnumSuite(Suite):
 
     def test_seam_false_not_type_obj(self) -> None:
         enum_info = self._make_enum_info()
-        non_type_callable = CallableType(
-            [], [], [], Instance(enum_info, []), self.fx.function
-        )
+        non_type_callable = CallableType([], [], [], Instance(enum_info, []), self.fx.function)
         member = LiteralType(1, Instance(enum_info, []))
         assert self._seam(non_type_callable, member) is False
 
@@ -25277,6 +25381,7 @@ class NativeIsLiteralEnumSuite(Suite):
         off = self._with_gate(False, check)
         on = self._with_gate(True, check)
         assert_equal(on, off, "is_literal_enum parity: None types")
+
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeUnboundReturnTypevarSuite(Suite):
@@ -25342,8 +25447,7 @@ class NativeUnboundReturnTypevarSuite(Suite):
 
     def _make_tvar(self, name: str = "T", uid: int = -1) -> TypeVarType:
         return TypeVarType(
-            name, name, TypeVarId(uid), [], self.fx.o,
-            AnyType(TypeOfAny.from_omitted_generics),
+            name, name, TypeVarId(uid), [], self.fx.o, AnyType(TypeOfAny.from_omitted_generics)
         )
 
     def _make_callable(
@@ -25377,9 +25481,7 @@ class NativeUnboundReturnTypevarSuite(Suite):
 
     def test_seam_pass_tvar_nested_in_args(self) -> None:
         t = self._make_tvar()
-        ct = self._make_callable(
-            t, [Instance(self.fx.oi, [t])], [t]
-        )
+        ct = self._make_callable(t, [Instance(self.fx.oi, [t])], [t])
         assert self._seam(ct) == 0
 
     def test_seam_fail_object_bound(self) -> None:
@@ -25389,8 +25491,7 @@ class NativeUnboundReturnTypevarSuite(Suite):
 
     def test_seam_fail_non_object_bound(self) -> None:
         t = TypeVarType(
-            "T", "T", TypeVarId(-1), [], self.fx.str_type,
-            AnyType(TypeOfAny.from_omitted_generics),
+            "T", "T", TypeVarId(-1), [], self.fx.str_type, AnyType(TypeOfAny.from_omitted_generics)
         )
         ct = self._make_callable(t, [self.fx.a], [t])
         assert self._seam(ct) == 2
@@ -25430,8 +25531,7 @@ class NativeUnboundReturnTypevarSuite(Suite):
 
     def test_parity_fail_non_object_bound(self) -> None:
         t = TypeVarType(
-            "T", "T", TypeVarId(-1), [], self.fx.str_type,
-            AnyType(TypeOfAny.from_omitted_generics),
+            "T", "T", TypeVarId(-1), [], self.fx.str_type, AnyType(TypeOfAny.from_omitted_generics)
         )
         ct = self._make_callable(t, [self.fx.a], [t])
         off, on = self._run(ct)
@@ -25442,12 +25542,11 @@ class NativeUnboundReturnTypevarSuite(Suite):
 
     def test_parity_pass_tvar_nested_in_args(self) -> None:
         t = self._make_tvar()
-        ct = self._make_callable(
-            t, [Instance(self.fx.oi, [t])], [t]
-        )
+        ct = self._make_callable(t, [Instance(self.fx.oi, [t])], [t])
         off, on = self._run(ct)
         assert_equal(on, off, "parity: tvar nested in args")
         assert off == []
+
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeCheckUntypedAfterDecoratorSuite(Suite):
@@ -25536,14 +25635,8 @@ class NativeCheckUntypedAfterDecoratorSuite(Suite):
         is_stub: bool = False,
         current_node_deferred: bool = False,
     ) -> None:
-        off, on = self._run(
-            typ, disallow_any_decorated, is_stub, current_node_deferred
-        )
-        assert_equal(
-            on,
-            off,
-            f"check_untyped_after_decorator parity for typ={typ!r}",
-        )
+        off, on = self._run(typ, disallow_any_decorated, is_stub, current_node_deferred)
+        assert_equal(on, off, f"check_untyped_after_decorator parity for typ={typ!r}")
 
     # --- direct seam tests ---
 
@@ -25567,9 +25660,7 @@ class NativeCheckUntypedAfterDecoratorSuite(Suite):
 
     def test_seam_callable_with_any_fires(self) -> None:
         any_unannotated = AnyType(TypeOfAny.unannotated)
-        ct = CallableType(
-            [any_unannotated], [ARG_POS], [None], any_unannotated, self.fx.function
-        )
+        ct = CallableType([any_unannotated], [ARG_POS], [None], any_unannotated, self.fx.function)
         assert self._seam(ct) is True
 
     def test_seam_typed_callable_does_not_fire(self) -> None:
@@ -25602,10 +25693,9 @@ class NativeCheckUntypedAfterDecoratorSuite(Suite):
 
     def test_parity_callable_with_any(self) -> None:
         any_unannotated = AnyType(TypeOfAny.unannotated)
-        ct = CallableType(
-            [any_unannotated], [ARG_POS], [None], any_unannotated, self.fx.function
-        )
+        ct = CallableType([any_unannotated], [ARG_POS], [None], any_unannotated, self.fx.function)
         self._assert_par(ct)
+
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeIncompatiblePropertyOverrideSuite(Suite):
@@ -25639,9 +25729,7 @@ class NativeIncompatiblePropertyOverrideSuite(Suite):
     def _make_info(self, name: str, mro: list[TypeInfo] | None = None) -> TypeInfo:
         return self.fx.make_type_info(name, mro=mro)
 
-    def _put_property(
-        self, info: TypeInfo, name: str, is_settable: bool
-    ) -> None:
+    def _put_property(self, info: TypeInfo, name: str, is_settable: bool) -> None:
         v = Var(name)
         v.is_property = True
         v.is_settable_property = is_settable
@@ -25650,9 +25738,7 @@ class NativeIncompatiblePropertyOverrideSuite(Suite):
         ofd.is_property = True
         info.names[name] = SymbolTableNode(MDEF, ofd)
 
-    def _decorator(
-        self, name: str, info: TypeInfo, is_settable: bool = False
-    ) -> Decorator:
+    def _decorator(self, name: str, info: TypeInfo, is_settable: bool = False) -> Decorator:
         v = Var(name)
         v.is_property = True
         v.is_settable_property = is_settable
@@ -25750,6 +25836,7 @@ class NativeIncompatiblePropertyOverrideSuite(Suite):
         sub = self._make_info("Sub", mro=[base, self.fx.oi])
         e = self._decorator("prop", sub, is_settable=False)
         self._assert_par(e)
+
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeCanWidenInScopeSuite(Suite):
@@ -25876,6 +25963,7 @@ class NativeCanWidenInScopeSuite(Suite):
         scope = self._scope(in_function=True)
         self._assert_par(name, self.fx.anyt, scope)
 
+
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeIsBaseClassSuite(Suite):
     """Parity for `rust_is_base_class` (H1p).
@@ -25905,9 +25993,7 @@ class NativeIsBaseClassSuite(Suite):
     def _make_info(self, name: str, bases: list[TypeInfo] | None = None) -> TypeInfo:
         if bases:
             base_instances = [Instance(b, []) for b in bases]
-            return self.fx.make_type_info(
-                name, mro=[*bases, self.fx.oi], bases=base_instances
-            )
+            return self.fx.make_type_info(name, mro=[*bases, self.fx.oi], bases=base_instances)
         return self.fx.make_type_info(name)
 
     def _seam(self, t: TypeInfo, s: TypeInfo) -> bool | None:
@@ -25973,6 +26059,7 @@ class NativeIsBaseClassSuite(Suite):
     def test_parity_self(self) -> None:
         t = self._make_info("Self")
         self._assert_par(t, t)
+
 
 @skipUnless(_HAS_TYPE_KERNEL, "requires the type_kernel extension")
 class NativeIsOverloadedItemSuite(Suite):
@@ -26088,6 +26175,7 @@ class NativeIsOverloadedItemSuite(Suite):
     def test_parity_not_overloaded(self) -> None:
         f = self._make_func("f")
         self._assert_par(f, f)
+
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeIsSelfMemberRefSuite(Suite):
@@ -26206,6 +26294,7 @@ class NativeIsSelfMemberRefSuite(Suite):
         me = self._make_member_expr(ne, "x")
         self._assert_par(me)
 
+
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeIsTypeLikeSuite(Suite):
     """Parity for `rust_is_type_like` (H1s).
@@ -26285,6 +26374,7 @@ class NativeIsTypeLikeSuite(Suite):
     def test_parity_var(self) -> None:
         self._assert_par(Var("x"))
 
+
 class NativeHotSeamsRetiredSuite(Suite):
     """Pin the #1640 retirement of hot short-call seams in mypy/types.py.
 
@@ -26327,7 +26417,7 @@ class NativeHotSeamsRetiredSuite(Suite):
             assert not hasattr(self._tmod, name), f"{name} should be retired"
 
     def test_hot_reads_serialize_nothing(self) -> None:
-        from mypy.types import TupleType, UnionType, has_recursive_types
+        from mypy.types import TupleType, UnionType
 
         calls: list[str] = []
         orig = self._tmod._serialize_type_for_visitor
@@ -26359,11 +26449,7 @@ class NativeHotSeamsRetiredSuite(Suite):
         from mypy.types import CallableType, TupleType, UnionType
 
         c = CallableType(
-            [self.fx.a, self.fx.b],
-            [ARG_POS, ARG_STAR],
-            [None, None],
-            self.fx.b,
-            self.fx.function,
+            [self.fx.a, self.fx.b], [ARG_POS, ARG_STAR], [None, None], self.fx.b, self.fx.function
         )
         assert c.min_args == 1
         assert c.is_var_arg is True
@@ -26377,11 +26463,10 @@ class NativeHotSeamsRetiredSuite(Suite):
         u = UnionType([self.fx.a, self.fx.nonet])
         assert u.can_be_true is True
         assert u.can_be_false is True
-        kw = CallableType(
-            [self.fx.a], [ARG_STAR2], [None], self.fx.b, self.fx.function
-        )
+        kw = CallableType([self.fx.a], [ARG_STAR2], [None], self.fx.b, self.fx.function)
         assert kw.is_kw_arg is True
         assert kw.max_possible_positional_args() == 2**63 - 1
+
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativePatternCheckDriverSuite(Suite):
@@ -26499,7 +26584,6 @@ class NativePatternCheckDriverSuite(Suite):
         return pc
 
     def _type_is_iterable(self, t: Type) -> bool:
-        from mypy.subtypes import is_subtype
 
         return bool(is_subtype(t, Instance(self.iter_info, [self._any()])))
 
@@ -26559,8 +26643,7 @@ class NativePatternCheckDriverSuite(Suite):
         from mypy.checkpattern import _SEQ_FIXED_TOO_FEW, _SEQ_FIXED_TOO_MANY
 
         assert_equal(
-            self._assert_seq_head_par(self._seq_tuple([self.fx.a]), None, 2),
-            _SEQ_FIXED_TOO_FEW,
+            self._assert_seq_head_par(self._seq_tuple([self.fx.a]), None, 2), _SEQ_FIXED_TOO_FEW
         )
         assert_equal(
             self._assert_seq_head_par(self._seq_tuple([self.fx.a, self.fx.a]), None, 1),
@@ -26570,8 +26653,7 @@ class NativePatternCheckDriverSuite(Suite):
         from mypy.checkpattern import _SEQ_FIXED_OK
 
         assert_equal(
-            self._assert_seq_head_par(self._seq_tuple([self.fx.a, self.fx.a]), 0, 1),
-            _SEQ_FIXED_OK,
+            self._assert_seq_head_par(self._seq_tuple([self.fx.a, self.fx.a]), 0, 1), _SEQ_FIXED_OK
         )
 
     def test_seq_head_variadic(self) -> None:
@@ -26777,8 +26859,7 @@ class NativePatternCheckDriverSuite(Suite):
         from mypy.checkpattern import _CLS_KW_MATCHES_POSITIONAL
 
         assert_equal(
-            self._assert_kw_par(["x", "y"], 2, ["y", "a"]),
-            [(_CLS_KW_MATCHES_POSITIONAL, 0)],
+            self._assert_kw_par(["x", "y"], 2, ["y", "a"]), [(_CLS_KW_MATCHES_POSITIONAL, 0)]
         )
 
     def test_kw_duplicate(self) -> None:
@@ -26926,6 +27007,7 @@ class NativePatternCheckDriverSuite(Suite):
         assert_equal(self._triple(on), self._triple(off), "singleton-visit triple parity")
         assert_equal(self._triple(on), ("A", "A", []))
 
+
 @skipUnless(_HAS_TYPE_KERNEL, "requires the type_kernel extension")
 class NativeStmtDriverSuite(Suite):
     """Parity for `rust_classify_range_int_gate` and
@@ -26977,7 +27059,7 @@ class NativeStmtDriverSuite(Suite):
     def _call_expr(
         self, fullname: str | None, args: list[Any], kinds: list[Any] | None = None
     ) -> Any:
-        from mypy.nodes import ARG_POS, CallExpr, RefExpr
+        from mypy.nodes import ARG_POS, CallExpr
 
         callee = RefExpr()
         if fullname is not None:
@@ -27011,9 +27093,7 @@ class NativeStmtDriverSuite(Suite):
     def test_seam_range_four_args(self) -> None:
         from mypy.nodes import IntExpr
 
-        ce = self._call_expr(
-            "builtins.range", [IntExpr(0), IntExpr(1), IntExpr(2), IntExpr(3)]
-        )
+        ce = self._call_expr("builtins.range", [IntExpr(0), IntExpr(1), IntExpr(2), IntExpr(3)])
         assert self._seam_range(ce) == 0
 
     def test_seam_range_one_arg_pos(self) -> None:
@@ -27035,7 +27115,7 @@ class NativeStmtDriverSuite(Suite):
         assert self._seam_range(ce) == 0
 
     def test_seam_range_none_fullname(self) -> None:
-        from mypy.nodes import ARG_POS, CallExpr, IntExpr, RefExpr
+        from mypy.nodes import ARG_POS, CallExpr, IntExpr
 
         callee = RefExpr()
         ce = CallExpr(callee, [IntExpr(0)], [ARG_POS], [None])
@@ -27094,9 +27174,7 @@ class NativeStmtDriverSuite(Suite):
     # ------------------------------------------------------------------
 
     def _seam_match(self, subject: Any, subject_dummy_is_none: bool) -> Any:
-        return _type_kernel.rust_classify_match_subject_head(
-            subject, subject_dummy_is_none
-        )
+        return _type_kernel.rust_classify_match_subject_head(subject, subject_dummy_is_none)
 
     def test_seam_match_nameexpr_literal_yes(self) -> None:
         from mypy.nodes import NameExpr, Var
@@ -27148,7 +27226,7 @@ class NativeStmtDriverSuite(Suite):
         assert self._seam_match(ie, True) == 0
 
     def test_seam_match_indexexpr_non_literal_index(self) -> None:
-        from mypy.nodes import CallExpr, IndexExpr, NameExpr, RefExpr
+        from mypy.nodes import CallExpr, IndexExpr, NameExpr
 
         base = NameExpr("x")
         base.node = None
@@ -27157,13 +27235,13 @@ class NativeStmtDriverSuite(Suite):
         assert self._seam_match(ie, True) == 2
 
     def test_seam_match_non_direct_expr(self) -> None:
-        from mypy.nodes import CallExpr, RefExpr
+        from mypy.nodes import CallExpr
 
         ce = CallExpr(RefExpr(), [], [], [])
         assert self._seam_match(ce, True) == 2
 
     def test_seam_match_has_dummy(self) -> None:
-        from mypy.nodes import CallExpr, RefExpr
+        from mypy.nodes import CallExpr
 
         ce = CallExpr(RefExpr(), [], [], [])
         assert self._seam_match(ce, False) == 1
@@ -27191,9 +27269,10 @@ class NativeStmtDriverSuite(Suite):
                     from mypy.literals import literal
                     from mypy.nodes import LITERAL_NO, IndexExpr, MemberExpr, NameExpr
 
-                    return isinstance(
-                        expr, (IndexExpr, MemberExpr, NameExpr)
-                    ) and literal(expr) > LITERAL_NO
+                    return (
+                        isinstance(expr, (IndexExpr, MemberExpr, NameExpr))
+                        and literal(expr) > LITERAL_NO
+                    )
 
             chk.binder = _Binder()  # type: ignore[assignment]
             chk._unique_dummy_names = {}  # type: ignore[attr-defined]
@@ -27240,14 +27319,14 @@ class NativeStmtDriverSuite(Suite):
         assert result is m
 
     def test_parity_match_non_direct_make_dummy(self) -> None:
-        from mypy.nodes import CallExpr, RefExpr
+        from mypy.nodes import CallExpr
 
         ce = CallExpr(RefExpr(), [], [], [])
         result = self._run_match(ce, has_dummy=False)
         assert type(result).__name__ == "NameExpr"
 
     def test_parity_match_non_direct_has_dummy(self) -> None:
-        from mypy.nodes import CallExpr, RefExpr
+        from mypy.nodes import CallExpr
 
         ce = CallExpr(RefExpr(), [], [], [])
         result = self._run_match(ce, has_dummy=True)
@@ -27258,6 +27337,7 @@ class NativeStmtDriverSuite(Suite):
 
         result = self._run_match(IntExpr(1), has_dummy=False)
         assert type(result).__name__ == "NameExpr"
+
 
 @skipUnless(_HAS_TYPE_KERNEL, "requires the type_kernel extension")
 class NativePluginHookDeclareSuite(Suite):
@@ -27272,11 +27352,7 @@ class NativePluginHookDeclareSuite(Suite):
 
     def setUp(self) -> None:
         from mypy.options import Options
-        from mypy.plugin import ChainedPlugin, Plugin
-        from mypy.plugins.default import (
-            DEFAULT_HOOK_FULLNAMES_BY_KIND,
-            DefaultPlugin,
-        )
+        from mypy.plugins.default import DEFAULT_HOOK_FULLNAMES_BY_KIND, DefaultPlugin
         from mypy.plugins.proper_plugin import ProperTypePlugin
 
         self._options = Options()
@@ -27329,9 +27405,7 @@ class NativePluginHookDeclareSuite(Suite):
         class NonEnumerablePlugin(Plugin):
             pass  # inherits Plugin.declare_hook_fullnames -> None
 
-        chained = ChainedPlugin(
-            self._options, [NonEnumerablePlugin(self._options), self._default]
-        )
+        chained = ChainedPlugin(self._options, [NonEnumerablePlugin(self._options), self._default])
         assert chained.declare_hook_fullnames() is None
 
     def test_registry_includes_proper_plugin_names(self) -> None:
@@ -27355,6 +27429,7 @@ class NativePluginHookDeclareSuite(Suite):
             assert plugin_hook_known_absent("get_function_hook", "builtins.print")
         finally:
             _set_native_plugin_hook_registry(None, False)
+
 
 class NativeScalarCheckmemberSeamsRetiredSuite(Suite):
     """Pin the #1668 retirement of the scalar-only checkmember wire seams.
@@ -27437,6 +27512,7 @@ class NativeScalarCheckmemberSeamsRetiredSuite(Suite):
         plain = self._plain_instance()
         assert analyze_descriptor_access(plain, mx) is plain
         assert analyze_descriptor_access(plain, self._make_mx(is_lvalue=True)) is plain
+
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeShouldReportUnreachableIssuesSuite(Suite):
@@ -27558,6 +27634,7 @@ class NativeShouldReportUnreachableIssuesSuite(Suite):
     def test_parity_warnings_suppressed(self) -> None:
         self._assert_par(self._stub(suppressed=True))
 
+
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeRefersToDifferentScopeSuite(Suite):
     """Parity for `rust_refers_to_different_scope` (H1d, #1672).
@@ -27586,9 +27663,7 @@ class NativeRefersToDifferentScopeSuite(Suite):
         finally:
             self._set_active(True)
 
-    def _name(
-        self, kind: int | None, fullname: str = "x", *, readable: bool = True
-    ) -> Any:
+    def _name(self, kind: int | None, fullname: str = "x", *, readable: bool = True) -> Any:
         if not readable:
             return object()
         name = NameExpr("x")
@@ -27691,6 +27766,7 @@ class NativeRefersToDifferentScopeSuite(Suite):
 
     def test_parity_unbound_kind_outside_function(self) -> None:
         self._assert_par(self._name(None), self._checker("m", in_function=False))
+
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeFlattenLvaluesSuite(Suite):
@@ -27805,6 +27881,7 @@ class NativeFlattenLvaluesSuite(Suite):
     def test_parity_star_expr_inside_tuple(self) -> None:
         tup = TupleExpr([StarExpr(NameExpr("a")), NameExpr("b")])
         self._assert_par([tup])
+
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeLiteralIntExprSuite(Suite):
@@ -28005,6 +28082,7 @@ class NativeLiteralIntExprSuite(Suite):
         self._assert_par_deferring([{expr: UnionType([self._literal(3)])}], expr)
         assert self._run([{expr: UnionType([self._literal(3)])}], expr) == (3, 3)
 
+
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeCheckCallableCallWireGateSuite(Suite):
     """#1673: the check_callable_call tail seam crosses only on shapes it
@@ -28064,13 +28142,13 @@ class NativeCheckCallableCallWireGateSuite(Suite):
         import mypy.checkexpr as _ce
 
         seen: list[bytes] = []
-        orig = getattr(_ce, "_rust_check_callable_call")
+        orig = _ce._rust_check_callable_call
 
         def wrapper(*args: Any, **kwargs: Any) -> Any:
             seen.append(args[1])
             return orig(*args, **kwargs)
 
-        setattr(_ce, "_rust_check_callable_call", wrapper)
+        _ce._rust_check_callable_call = wrapper
         self.addCleanup(setattr, _ce, "_rust_check_callable_call", orig)
         return seen
 
@@ -28078,9 +28156,7 @@ class NativeCheckCallableCallWireGateSuite(Suite):
         """A callable with `builtins.type` as both fallback and return, so
         `get_instance_type()` is `builtins.type` when the tail can fire."""
         n = len(a) - 1
-        return CallableType(
-            list(a[:-1]), [ARG_POS] * n, [None] * n, a[-1], self.fx.type_type
-        )
+        return CallableType(list(a[:-1]), [ARG_POS] * n, [None] * n, a[-1], self.fx.type_type)
 
     def _rejected_shapes(self) -> list[tuple[str, CallableType, list[Type]]]:
         """Shapes the gate must reject, each one declared un-calibratable."""
@@ -28157,6 +28233,7 @@ class NativeCheckCallableCallWireGateSuite(Suite):
         )
         assert raw is not None, "the accepted shape must be decided by Rust"
 
+
 class NativeResidualScalarCheckmemberSeamsRetiredSuite(Suite):
     """Pin the #1668 residual sweep of the scalar-only checkmember seams.
 
@@ -28205,11 +28282,7 @@ class NativeResidualScalarCheckmemberSeamsRetiredSuite(Suite):
 
     def _method(self) -> CallableType:
         return CallableType(
-            [self.fx.a, self.fx.b],
-            [ARG_POS, ARG_POS],
-            [None, None],
-            self.fx.o,
-            self.fx.function,
+            [self.fx.a, self.fx.b], [ARG_POS, ARG_POS], [None, None], self.fx.o, self.fx.function
         )
 
     def _meta_instance(self) -> Instance:

@@ -255,6 +255,7 @@ try:
         rust_callable_type as _rust_callable_type,
         rust_check_argument_count as _rust_check_argument_count,
         rust_check_argument_types_plan as _rust_check_argument_types_plan,
+        rust_check_call_head as _rust_check_call_head,
         rust_check_callable_call as _rust_check_callable_call,
         rust_check_operator as _rust_check_operator,
         rust_check_overload_call as _rust_check_overload_call,
@@ -267,7 +268,6 @@ try:
         rust_classify_super_arg_types as _rust_classify_super_arg_types,
         rust_classify_typeddict_call as _rust_classify_typeddict_call,
         rust_classify_typeobj_gate as _rust_classify_typeobj_gate,
-        rust_check_call_head as _rust_check_call_head,
         rust_classify_visit_op_expr as _rust_classify_visit_op_expr,
         rust_combine_function_signatures as _rust_combine_function_signatures,
         rust_compute_arg_context_indices as _rust_compute_arg_context_indices,
@@ -2954,18 +2954,14 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
             # Issue #1642: batch enum_callable_base + typeobj_gate into
             # one FFI crossing (saves ~183k crossings on cold self-check).
             try:
-                enum_hit, tag = _rust_check_call_head(
-                    callable_node, callee, ENUM_BASES
-                )
+                enum_hit, tag = _rust_check_call_head(callable_node, callee, ENUM_BASES)
             except (AssertionError, NotImplementedError, ValueError, TypeError):
                 enum_hit, tag = None, None
         if enum_hit is None:
             # Fallback: individual seams or pure-Python paths.
             if _CHECKEXPR_HAS_TYPE_KERNEL and _native_checkexpr_active:
                 try:
-                    enum_hit = _rust_is_enum_callable_base(
-                        callable_node, ENUM_BASES
-                    )
+                    enum_hit = _rust_is_enum_callable_base(callable_node, ENUM_BASES)
                 except (AssertionError, NotImplementedError):
                     enum_hit = None
             if (
@@ -4358,9 +4354,7 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
 
         # Rust planner only adds value for UnpackType formals; skip
         # wire serialization for plain callees (trivial Python loop).
-        has_unpack = any(
-            isinstance(get_proper_type(t), UnpackType) for t in callee.arg_types
-        )
+        has_unpack = any(isinstance(get_proper_type(t), UnpackType) for t in callee.arg_types)
         if (
             has_unpack
             and _CHECKEXPR_HAS_TYPE_KERNEL
