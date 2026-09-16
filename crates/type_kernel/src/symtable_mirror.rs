@@ -302,8 +302,9 @@ fn unlink_owner(store: &mut SymStore, owner_handle: u64, name: &str) {
 
 /// Refresh the flags of every record referencing `node`; returns whether
 /// any record was updated (false for a node the store never adopted).
+/// Non-minting lookup: minting would plant the stale-handle source of #1708.
 pub(crate) fn refresh_flags(node: &PyAny, flags: SymFlags) -> PyResult<bool> {
-    let node_handle = match identity::handle_for(node) {
+    let node_handle = match identity::handle_of(node) {
         Some(handle) => handle,
         None => return Ok(false),
     };
@@ -417,6 +418,12 @@ pub(crate) fn entries_if_mirrored(
         bump_flip(|c| c.defer_no_handle += 1);
         return Err(ShadowGap::NoHandle);
     };
+    if !with_store(|store| store.pins.contains_key(&handle)) {
+        // Recycled address from a dead registration (#1708): no live
+        // shadow state, so this is a no-handle defer, not length drift.
+        bump_flip(|c| c.defer_no_handle += 1);
+        return Err(ShadowGap::NoHandle);
+    }
     let Ok(table_len) = table.len() else {
         bump_flip(|c| c.defer_not_sized += 1);
         return Err(ShadowGap::NotSized);
@@ -666,9 +673,13 @@ pub(crate) fn rust_symtable_mirror_reset() -> usize {
 }
 
 /// Non-minting identity handle lookup; None when never registered.
+/// Answers only while this store holds the adoption pin: the raw identity
+/// layer outlives resets by design, so a recycled address could otherwise
+/// read back a dead table's handle (#1708).
 #[pyfunction]
 pub(crate) fn rust_symtable_mirror_handle_of(obj: &PyAny) -> Option<u64> {
-    identity::handle_of(obj)
+    let handle = identity::handle_of(obj)?;
+    with_store(|store| store.pins.contains_key(&handle).then_some(handle))
 }
 
 /// G3.1 read-flip evidence counters: tables consulted / mirrored from
@@ -955,6 +966,23 @@ mod symtable_mirror_tests {
             delete(owner, "a").unwrap();
             assert!(refresh_flags(node, flags(8)).unwrap());
             assert_eq!(lookup_raw(owner, "b").unwrap().0, 8);
+        });
+    }
+
+    #[test]
+    fn test_handle_of_forgets_reset_state() {
+        // #1708: reset() drops the pins, so even the same live objects
+        // stop answering until re-adopted (no address games needed).
+        with_py(|py| {
+            reset();
+            let owner = fresh_object(py);
+            let node = fresh_object(py);
+            let (handle, node_handle, _, _) = put(owner, "x", node, flags(1)).unwrap();
+            assert_eq!(rust_symtable_mirror_handle_of(owner), Some(handle));
+            assert_eq!(rust_symtable_mirror_handle_of(node), Some(node_handle));
+            assert_eq!(reset(), 1);
+            assert_eq!(rust_symtable_mirror_handle_of(owner), None);
+            assert_eq!(rust_symtable_mirror_handle_of(node), None);
         });
     }
 
@@ -1247,9 +1275,11 @@ mod symtable_mirror_tests {
             assert_eq!(read_names(py, table), vec!["a"]);
             assert_eq!(reset(), 1);
             assert_eq!(flip_counts().tables_mirrored, 1);
+            // Post-reset the table is unadopted (pins gone): no-handle
+            // defer, not length drift (#1708).
             assert!(matches!(
                 entries_if_mirrored(py, table),
-                Err(ShadowGap::LenShort)
+                Err(ShadowGap::NoHandle)
             ));
         });
     }
