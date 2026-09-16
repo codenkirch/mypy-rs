@@ -1,110 +1,134 @@
 # Handoff: strangler-fig Rust migration loop (seam-deferral reduction)
 
-## RESUME POINT — 2026-09-16, evening (wave 6: seam-retirement slices 1-3 + the lint gate)
+## RESUME POINT — 2026-09-16, night (wave 6 close: retirements, lint gate, and a 73.5%-unmeasured inventory)
 
-Wave 6 finished #1739's slice 1-3 retirements and added a CI lint gate. Gates
-were kept light per the tier protocol: local work was the lane's own suites plus
-one targeted `-k` slice, with the corpus delegated to CI's `parity` job. The
-session's scratch notes live in the git-ignored `docs/HANDOFF-2026-09-16.md`;
-**this file is the tracked resume point.**
+Wave 6 finished #1739's slices 1-3, added a per-file CI lint gate, cleared the
+repo-wide lint debt, and — most consequentially — produced a full seam inventory
+that **falsified the previous "the perf axis is nearly exhausted" framing**. Five
+lane-6.5 lanes are in flight as this is written; see the queue.
 
 ### Where `main` stands
 
-`main` = `fc7e39f51` (seam retirement log at the top of the ledger, PR #1749,
-closes #1748), on top of `ce615df84` (retire the argmap mapping seams and
-`check_argument_count`, PR #1747), `cb9430c5a` (retire `rust_fill_typevars`, PR
-#1744), `b3fc0e526` (`lint-changed` CI gate, PR #1743), `8c1b0c6c3` (retire
-`rust_copy_modified` + `rust_flatten_nested_unions`, PR #1741), `10762e5a5`
-(retire six predicate seams, PR #1740), `809b53b90` (#1738), `b06ad64ef`
-(#1737), `0a6bfe978` (#1736), then the wave-5 head `5b012830e`. Wave 6 branched
-from `b3fc0e526`.
+`main` = `a52f8a166` (repo-wide ruff/black debt cleared, PR #1752, closes #1742),
+on top of `e52dde80c` (retired-seam pins moved into
+`testtypes_native_retired.py`, PR #1751, closes #1746), `bc5482bf5` (this
+file's previous resume point, PR #1750), `fc7e39f51` (seam retirement log in
+the ledger, PR #1749, closes #1748), `ce615df84` (argmap mapping seams +
+`check_argument_count` retired, PR #1747), `cb9430c5a` (`rust_fill_typevars`
+retired, PR #1744), `b3fc0e526` (`lint-changed` CI gate, PR #1743),
+`8c1b0c6c3` (`rust_copy_modified` + `rust_flatten_nested_unions` retired, PR
+#1741), `10762e5a5` (six predicate seams retired, PR #1740), then the wave-5
+head `5b012830e`.
 
-### Landed this wave
+### The inventory changes the plan (issue #1739, lane M1's comment)
 
-- **Slice 1 (#1740)** — `func_has_self_or_cls_argument`, `has_abstract_type`,
-  `is_true_literal`, `is_false_literal`, `refers_to_typeddict`,
-  `has_placeholder`: each measured 2.4x-35.7x slower than its Python body
-  (min-of-7 ns/call, both arms in one process, FFI ticket spied).
-- **Slice 2 (#1741)** — `rust_copy_modified` (15.8x-71.8x) and
-  `rust_flatten_nested_unions` (14.4x/25.7x); `mypy/types.py` -727 lines
-  including every helper reachable only from those seams. `rust_expand_type`
-  measured the other way (0.43x-0.61x) and **keeps its interface**.
-- **Slice 3 (#1747)** — the argmap mapping family (`rust_map_actuals_to_formals`,
-  `_with_types`, `rust_map_formals_to_actuals`) and `rust_check_argument_count`:
-  1.71x-6.40x over eight shapes. `rust_expand_actual_type` (0.43x-0.61x) kept.
-- **#1744** — `rust_fill_typevars` (2.57x-6.82x warm, 12.5x-22x cache-cold); its
-  retired-suite pin was negative-controlled and its no-extension run confirms
-  the suites still skip cleanly.
-- **#1743** — `lint-changed`: pinned `ruff@0.14.3 check --no-fix --force-exclude`
-  plus `black@26.1.0 --check` on the `*.py` files a PR touches. Per-file, so a
-  PR touching a pre-existing-dirty file carries a mechanical first commit
-  (already the pattern in #1744/#1747).
-- **#1749** — the ledger now opens with a retirement log (retired-in, commit,
-  seams) so a retired seam is not re-measured as live; see #1748 for why.
+804 registered seams, 4,204,642 calls on a cold self-check. Disposition:
 
-Corpus effect of the retirements: **~1.31M fewer FFI crossings and 19.6MB less
-wire traffic** per cold self-check (counters x per-call delta, not wall clock).
+| disposition | seams | calls | share |
+|---|---|---|---|
+| measured keep | 5 | 526,129 | 12.5% |
+| retire queued | 3 | 235,735 | 5.6% |
+| **unmeasured, >=10k calls** | **86** | **3,089,332** | **73.5%** |
+| unmeasured, 1k-10k | 76 | 319,225 | 7.6% |
+| already retired (0 calls) | 18 | 0 | — |
 
-### Decision rule (measured; do not re-derive per seam)
+Class split at >=10k: O(1) read 42 seams / 1,572,105 calls; O(n) scan 12 /
+345,886; recursive visitor 31 / 1,140,678; unclassified 1 / 30,663. The
+retirement-favourable O(1)/O(n) subset is 54 seams / 1,917,991 calls, bounded at
+**<=4.17s** of exposure (whole set <=6.75s) — both are bounds from the audit's
+own constants, not wall clocks.
+
+Two measurement defects that hid this are filed as **#1754**: #1739's table
+header filters "0 defers", which **excluded the single highest-call seam on
+`main`** (`rust_is_duplicate_mapping`, 342,101 calls, 24% defers — measured and
+retired today in #1753), and `MYPY_ENABLE_NATIVE_SEMANAL` gates a family the
+pinned census command never arms (114 call sites + 67 `rust_visit_*` seams), so
+4.2M is a lower bound.
+
+### Landed this wave (the retirements, with their measured ratios)
+
+Slice 1 (#1740, six predicates 2.4x-35.7x), slice 2 (#1741, `copy_modified`
+15.8x-71.8x + `flatten_nested_unions` 14.4x/25.7x), slice 3 (#1747, the argmap
+mapping family + `check_argument_count` 1.71x-6.40x), #1744
+(`rust_fill_typevars` 2.57x-6.82x warm, 12.5x-22x cold), #1753
+(`is_duplicate_mapping` 2.9x-8.6x, 342k calls), plus #1743's gate, #1749's
+retirement log (#1748) and #1752's lint clearance (#1742). Corpus effect so far:
+**~1.31M fewer FFI crossings and 19.6MB less wire** per cold self-check from
+slices 1-2 alone, plus the later retirements.
+
+### Decision rule, extended
 
 The wire interface **loses** when the Python body is an O(1)/O(n) rebuild, list
-scan or scalar read, and **wins** when the body is a recursive visitor
-(`rust_expand_type`, `rust_expand_actual_type`). Per-seam tables are in #1739.
+scan or scalar read, and **wins** when the body is a recursive visitor —
+`rust_expand_type` and `rust_expand_actual_type` (0.43x-0.61x) are the standing
+keeps. Measured keeps not to re-open: `rust_analyze_instance_member_dispatch`
+(1.10x), `rust_classify_special_unbound` (0.78x on its common shape),
+`rust_compute_arg_context_indices` (1.38x but 98ns/call).
 
-Measured **keeps**, so they are not re-opened: `rust_analyze_instance_member_dispatch`
-(1.10x, 0.92x-1.14x over five runs), `rust_classify_special_unbound` (native
-wins 0.78x on the common non-special shape; the special rows are +478..+534ns
-on 24.1% of calls), `rust_compute_arg_context_indices` (1.38x but 98ns/call).
+**Operational corollary discovered today (this is what unlocks 3-wide lane
+fan-out):** a retirement usually needs **no edit to the area engagement suite**,
+because those suites assert gate-off == gate-on parity plus direct-seam
+engagement, and both survive a retirement. So a retirement lane puts its pin in
+its own `testtypes_native_retired_<area>.py` and touches no shared file. Two
+lanes proving it today: #1753 and the R-A/R-B/R-C/R-D set.
 
-### Method traps added this wave (all cost a cycle or nearly did)
+### G3 ownership track (issue #1755)
 
-- **A scratch `.so` is stale if `main` moved past crates commits.** Compare its
-  mtime against `git log --since=<build time> -- crates/`. It still imports and
-  still passes parity, so nothing errors; only a marginal ratio reveals it.
-  Verdicts >=2x are version-immune, <=1.5x must be re-measured on a fresh build.
-  The fresh one this wave was `/private/tmp/mypy-rs-audit-tk`.
-- **`agent-wait` can print a stale run's failure** (and a CONFLICTING PR runs no
-  CI, so a wait returns "0 checks passed", which is not a pass). Bind any tally
-  to `gh pr view N --json headRefOid` before acting on it.
-- **Ruff B009/B010 vs the self-check's `implicit_reexport=False`**: the autofix
-  converts the one typeable form into the form `pr-gate` rejects. Keep dynamic
-  access plus a per-site `noqa` (6 sites repo-wide, all load-bearing).
-- **A measurement lane's gate-OFF first pass prints a plausible 1.00x**; the
-  harness must hard-assert the FFI ticket was reached (`calls == 200`).
+The wave-5 framing of the read flip's residual was **wrong** and the correction
+shrinks it: a cache-loaded table (`SymbolTable.deserialize`) *is* captured from
+empty and served, and the aststrip-survivor defer is minted in Rust `put()` on
+`first_write && table_len > 1`, so it was never a build-boundary problem. The
+chosen mechanism is a **write-time seed** (T2, default-off, fallback intact):
+read `owner.items()` once at the first recorded write of a non-empty owner, mint
+ordinals in live order. Mandatory differential additions, because the existing
+values/order assertions **pass vacuously today**: non-vacuity
+(`defer_inherited == 0`, `tables_mirrored` advanced), the `@`-key value pinned,
+and **provenance counters** separating write-log from seeded entries — the only
+falsifier for a bulk `dict.update` flip, which no value assertion can catch.
+
+### In flight as this was written (five lanes, disjoint modules)
+
+| lane | scope |
+|---|---|
+| G3.2 | `#1755` write-time seed (`mypy/build.py`, `crates/type_kernel/src/symtable_mirror.rs`, a `sessionfinish` counter report) |
+| R-A | `mypy/checker.py`: `is_definition` 73k, `classify_check_lvalue` 73k, `classify_check_assignment` 67k, `is_empty_generator_function` 32k |
+| R-B | `mypy/typeanal.py`: `validate_instance` 86k, `classify_type_with_info` 82k |
+| R-C | `mypy/checkmember.py`: `classify_analyze_var` 100k, `is_instance_var` 44k |
+| R-D | `mypy/types.py` + `mypy/nodes.py`: `flatten_nested_tuples` 95k, `func_item_is_dynamic` 101k |
 
 ### Queue for the next wave
 
-1. **#1746 first** — `mypy/test/testtypes_native_checker.py` (28,292 lines) is
-   the only file holding coverage for the next three candidates, so every
-   retirement serializes on it. Move the `...RetiredSuite` pins into
-   `testtypes_native_retired.py`. Lane R1 was launched for this on 2026-09-16 and
-   **aborted before writing any code**: the token-plan weekly quota was exhausted
-   (it resets 2026-09-21 17:52 UTC), so **no lanes can run until then** — plan
-   waves around that reset, not around host load alone. R1 did leave the
-   acceptance baseline, `/private/tmp/r1-before.txt` (392KB: the sorted
-   `pytest --collect-only` test-id list from `main` @ `fc7e39f51`, taken 19:35
-   with the native gate on), which is the "before" side of the pure-rename
-   proof; regenerate it only if the base has moved.
-2. **Then the three measured retirements, one at a time**, since each also
-   reworks an engagement suite in that same file: `rust_check_unpacks_in_list`
-   (`mypy/typeanal.py`, 5.5x-10.2x, >=0.20s) -> `rust_analyze_member_access`
-   (`mypy/checkmember.py`, 1.9x-9.1x, weighted ~0.047s) ->
-   `rust_classify_protocol_test_callee` (`mypy/checkexpr.py`, 2.8x-3.7x, and
-   0/200 decided on its two common shapes, so the crossing is doomed work).
-3. **The quiet-host leg** — #1723's 3-pair protocol and #1624's wall clock.
-   Blocked all of 2026-09-16: load read 7.98 at best and 21-43 through the
-   waves; do not start it in the same hour as a wave, and do not accept wall
-   clocks from a contended host as evidence.
-4. **#1742** — repo-wide lint debt (572 ruff findings, 45 black-dirty files at
-   `b3fc0e526`), now paid down file-by-file by the new gate; `*.pyi` is not in
-   the gate's pathspec yet.
-5. **#1745** — `main` has no branch protection or ruleset, so every gate is
-   advisory-only. Needs an owner decision on the context set: QWEN.md's snippet
-   names a check this repo does not have, and `required_approving_review_count:
-   1` would make every lane PR unmergeable (there are no human reviewers here).
-6. **The G track is unchanged and independent** — the G3.1 read flip
-   (`ac68f0eaf`, default-off) and its G3.2 residual (aststrip survivors and
-   cache-loaded tables still defer) are in the wave-5 resume point below.
+1. **The rest of the 86** (M1's comment has the full ranked table): `check_call_head`
+   (180k, needs the corpus differential because its fallback crosses other
+   seams), `get_declaration` (`mypy/binder.py`, 91k), `special_function_elide_names`
+   (`mypy/sharedparse.py`, 31k), then the 1k-10k band (76 seams, 319k calls).
+   Retire only measured losers; the visitor-class 31 seams are the likely keeps.
+2. **The quiet-host leg** — #1723's 3-pair protocol and #1624's wall clock, the
+   only check that these retirements moved the end-to-end number. A bounded
+   background watcher exits when 1-minute load drops below 5; load ran 50-103
+   all evening, so it has not fired.
+3. **#1745** — `main` has no branch protection or ruleset, so every gate is
+   advisory-only; needs an owner decision on the context set (do not paste
+   QWEN.md's snippet: it names a check this repo does not have, and
+   `required_approving_review_count: 1` would make every lane PR unmergeable).
+4. **#1754** — fix the census so its table cannot hide deferring seams again, and
+   state which gates the run arms.
+
+### Method traps added today (all cost a cycle or nearly did)
+
+- A scratch `.so` is **stale** if `main` moved past crates commits: it still
+  imports and still passes parity, so only a marginal ratio reveals it. Compare
+  its mtime against `git log --since=<build time> -- crates/`; verdicts >=2x are
+  version-immune, <=1.5x must be re-measured.
+- `agent-wait` can print a **stale run's failure**; a CONFLICTING PR runs no CI,
+  so a wait returns "0 checks passed" and reads like a pass. Bind any tally to
+  `gh pr view N --json headRefOid`.
+- Ruff B009/B010's autofix produces the form the self-check rejects
+  (`implicit_reexport=False`); keep dynamic access with a per-site `noqa`.
+- A measurement harness whose gate is OFF prints a plausible 1.00x; assert the
+  FFI ticket was reached (`calls == 200`) in the harness itself.
+- A retirement comment longer than 3 consecutive lines is rejected by the
+  pre-commit hook.
 
 ## RESUME POINT — 2026-09-15, night (wave 5: tiered feedback, ledger archived out of AGENTS.md)
 
