@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import ast
 import atexit
 import os
+from pathlib import Path
 from unittest import TestCase, mock
 
 from mypy.inspections import parse_location
@@ -155,3 +157,80 @@ class TestHardExit(TestCase):
                 f.close()
         finally:
             os.unlink(path)
+
+
+class TestCollectionGuard(TestCase):
+    """No test module may silently collect zero tests (#1701).
+
+    `python_classes`/`python_functions` are empty and the custom collector
+    only handles DataSuite subclasses, so a module-level zero-arg
+    `def test_*` or a plain `class Test*` with test methods collects
+    nothing while pytest still exits 0. This guard fails loudly instead.
+    """
+
+    def test_no_silent_zero_collection(self) -> None:
+        test_dir = Path(__file__).resolve().parent
+        roots = [test_dir, test_dir.parent.parent / "mypyc" / "test"]
+        offenders: list[str] = []
+        for root in roots:
+            for path in sorted(root.glob("test*.py")):
+                tree = ast.parse(path.read_text())
+                names = {n.name: n for n in tree.body if isinstance(n, ast.ClassDef)}
+                for node in tree.body:
+                    if isinstance(node, ast.FunctionDef) and node.name.startswith("test_"):
+                        args = node.args
+                        if (
+                            not args.args
+                            and not args.posonlyargs
+                            and not args.kwonlyargs
+                            and args.vararg is None
+                            and args.kwarg is None
+                        ):
+                            offenders.append(f"{path.name}:{node.lineno} {node.name}")
+                    elif isinstance(node, ast.ClassDef) and node.name.startswith("Test"):
+                        bases = [
+                            b.id if isinstance(b, ast.Name) else getattr(b, "attr", "?")
+                            for b in node.bases
+                        ]
+                        collected = self._collectable(node.name, bases, names)
+                        if not collected:
+                            methods = [
+                                m.name
+                                for m in node.body
+                                if isinstance(m, ast.FunctionDef)
+                                and m.name.startswith("test")
+                            ]
+                            if methods:
+                                offenders.append(
+                                    f"{path.name}:{node.lineno} {node.name}"
+                                )
+        assert not offenders, (
+            "test-looking definitions that pytest will not collect "
+            "(convert to TestCase/DataSuite or remove): "
+            + ", ".join(offenders)
+        )
+
+    @staticmethod
+    def _collectable(
+        name: str, bases: list[str], names: dict[str, ast.ClassDef]
+    ) -> bool:
+        """Whether a Test* class is picked up by a collector."""
+        if any(
+            b in ("TestCase", "DataSuite", "DataDrivenTestCase", "Suite", "MypycDataSuite")
+            for b in bases
+        ):
+            return True
+        return any(
+            TestCollectionGuard._collectable(base, TestCollectionGuard._bases(names.get(base)), names)
+            for base in bases
+            if base in names
+        )
+
+    @staticmethod
+    def _bases(node: ast.ClassDef | None) -> list[str]:
+        if node is None:
+            return []
+        return [
+            b.id if isinstance(b, ast.Name) else getattr(b, "attr", "?")
+            for b in node.bases
+        ]

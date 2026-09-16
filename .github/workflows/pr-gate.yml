@@ -128,6 +128,9 @@ jobs:
           TEST_NATIVE_TYPE_KERNEL: "1"
         run: uv run python -m pytest mypy/test/testtypes*.py -q
 
+      - name: Test collection guard (#1701)
+        run: uv run python -m pytest mypy/test/testutil.py -q
+
       - name: Python subtypes baseline (pre-Stage-3c)
         run: uv run python -m pytest mypy/test/testsubtypes.py -q
 
