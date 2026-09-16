@@ -33,6 +33,10 @@ from mypy.types import CallableType, Instance, ProperType, TupleType, Type, Type
 T = TypeVar("T")
 
 
+
+# Phase G3.0a (#1581): namespace dual-write capture shadow. One record
+# per (owner table handle, name) with generation + seq; `refresh_flags`
+# updates every record referencing an adopted node.
 def rust_symtable_mirror_put(
     owner: Any,
     name: str,
@@ -75,6 +79,7 @@ def rust_symtable_mirror_reset() -> int: ...
 
 def rust_symtable_mirror_handle_of(obj: Any) -> int | None: ...
 
+# Phase G3.1 (#1670): read-flip evidence counters for the mirror gate.
 def rust_symtable_mirror_flip_counts() -> dict[str, int]: ...
 
 def rust_symtable_mirror_flip_counts_reset() -> int: ...

@@ -32,6 +32,8 @@ from mypy.types import CallableType, Instance, ProperType, TupleType, Type, Type
 
 T = TypeVar("T")
 
+from type_kernel_types import NativeTypeResolver
+
 
 class PluginHookRegistry:
     def __init__(self, hooks: dict[str, list[str]]) -> None: ...
@@ -398,6 +400,10 @@ def rust_refers_to_typeddict(base: Any, target_bytes: bytes | None = None) -> bo
 
 def rust_classify_super_arg_types(chk: Any, super_expr: Any) -> int | None: ...
 
+
+# Issue #1064: infer_arg_types_in_context index decision. Returns the
+# formal index per actual arg (-1 = no context, star args skipped), or
+# None on malformed input (length mismatch / out-of-bounds indices).
 def rust_compute_arg_context_indices(
     arg_kinds: list[int],
     formal_to_actual: list[list[int]],
@@ -411,6 +417,9 @@ def rust_classify_check_arg(
     caller_type_bytes: bytes, is_subtype: bool, has_abstract_type_part: bool
 ) -> int | None: ...
 
+
+# Issue #1055: check_simple_assignment decision head. Returns
+# (STUB / DIRECT / FALLBACK + preferred/fallback selector tag) or None.
 def rust_classify_simple_assignment(
     lvalue_type_bytes: bytes | None,
     is_stub: bool,
@@ -420,10 +429,16 @@ def rust_classify_simple_assignment(
     simple_rvalue: bool,
 ) -> int | None: ...
 
+
+# Issue #1090: check_assignment decision front. Returns
+# (special_tag, branch_tag) or None.
 def rust_classify_check_assignment(
     lvalue: Any, lvalue_type: Any | None, has_inferred: bool, active_class: bool
 ) -> tuple[int, int] | None: ...
 
+
+# Issue #1049: check_boolean_op decision head. Returns
+# (map_tag, left_unreachable, right_unreachable, result_tag) or None.
 def rust_classify_check_boolean_op(
     op_is_and: bool,
     right_always: bool,
@@ -704,6 +719,8 @@ def rust_dataclass_post_init_transform(
 
 def rust_find_shallow_matching_overload_item(overload: Any, call: Any) -> int | None: ...
 
+
+# Issue #574: reachability functions (live PyO3 objects)
 def rust_infer_condition_value(expr: Expression, options: Any) -> int: ...
 
 def rust_infer_pattern_value(pattern: Any) -> int: ...
@@ -724,6 +741,11 @@ def rust_contains_int_or_tuple_of_ints(expr: Expression) -> None | int | tuple[i
 
 def rust_fixed_comparison(left: Any, op: str, right: Any) -> int: ...
 
+# Phase D (self-check repair): the 73 functions whose Python call sites were
+# discovered missing from this stub, sorted by Python consumption module; the
+# Rust `py: Python` GIL token is injected by PyO3, not part of the signature.
+
+# mypy/checkmember.py — member-access resolution (resolver is first).
 def rust_analyze_member_access(
     resolver: NativeTypeResolver,
     name: str,
@@ -783,8 +805,14 @@ def rust_classify_type_type_member_access(typ: Any) -> int | None: ...
 
 def rust_is_instance_var(var: Var) -> bool | None: ...
 
+
+# Issue #1078: check_final_member MRO fold. True when any base of the
+# live `info` declares `name` final; None defers to the pure body.
 def rust_check_final_member(info: TypeInfo, name: str) -> bool | None: ...
 
+
+# Issue #1056: analyze_var decision head. Returns one ANALYZE_VAR tag
+# (SETTER/GETTER/PARTIAL/NOT_READY/ENUM_LITERAL/UNBOUND_ANY) or None.
 def rust_classify_analyze_var(
     name: str,
     var: Var,
@@ -838,6 +866,9 @@ def rust_add_class_tvars(
     strict_optional: bool,
 ) -> tuple[int, bool, bytes] | None: ...
 
+
+# mypy/checkexpr.py — check_argument_count, overload merge, arg similarity,
+# tuple index/slice helpers, int-literal extraction.
 def rust_check_argument_count(
     formal_kinds: list[int],
     has_param_spec: bool,
@@ -898,6 +929,9 @@ def rust_visit_type_var_tuple_expr() -> bytes: ...
 
 def rust_visit_newtype_expr() -> bytes: ...
 
+
+# mypy/checker.py — conditional maps, generator/coroutine return helpers,
+# valid-inferred-type query, custom-eq query.
 def rust_and_conditional_maps(
     keys1: list[int],
     values1: list[bytes],
@@ -936,6 +970,8 @@ def rust_has_custom_eq_checks(typ_bytes: bytes, resolver: NativeTypeResolver) ->
 
 def rust_copy_modified(typ_bytes: bytes, field: str, value_bytes: bytes) -> bytes | None: ...
 
+
+# mypy/nodes.py — live-node classification queries (PyO3 objects).
 def rust_decorator_is_dynamic(dec: Any) -> bool: ...
 
 def rust_func_has_self_or_cls_argument(func: Any) -> bool: ...
@@ -1085,6 +1121,9 @@ def rust_supported_self_type(
     type_bytes: bytes, resolver: NativeTypeResolver, allow_callable: bool, allow_instances: bool
 ) -> bool | None: ...
 
+
+# Entries missing from earlier merges, recovered from the built extension
+# (self-check attr-defined failures, 2026-08-27).
 def rust_analyze_instance_member_dispatch(
     resolver: NativeTypeResolver,
     instance_bytes: bytes,
@@ -1128,12 +1167,18 @@ def rust_classify_enum(
 
 def rust_always_returns_none(node: Expression, info: TypeInfo | None) -> bool | None: ...
 
+
+# Issue #1079: infer_operator_assignment_method decision. Returns the
+# (is_inplace, method_name) pair, or None on an unreadable attribute.
 def rust_infer_operator_assignment_method(
     typ: Any, method: str, in_ops: bool
 ) -> tuple[bool, str] | None: ...
 
 def rust_is_type_like(node: Any) -> bool | None: ...
 
+
+# H1d cluster (#1672): live-object decision heads, zero wire bytes. Each
+# returns None to defer to the unchanged pure-Python body.
 def rust_should_report_unreachable_issues(chk: Any) -> bool | None: ...
 
 def rust_refers_to_different_scope(name: Any, scope: Any, tree: Any) -> bool | None: ...

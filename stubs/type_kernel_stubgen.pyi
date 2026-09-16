@@ -32,6 +32,8 @@ from mypy.types import CallableType, Instance, ProperType, TupleType, Type, Type
 
 T = TypeVar("T")
 
+from type_kernel_types import NativeTypeResolver
+
 
 def rust_stubgen_render(expr: Expression) -> str | None: ...
 

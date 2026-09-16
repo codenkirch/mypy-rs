@@ -33,6 +33,8 @@ from mypy.types import CallableType, Instance, ProperType, TupleType, Type, Type
 T = TypeVar("T")
 
 
+
+# Issue #533: pure utility functions from util.py
 def rust_is_dunder(name: str, exclude_special: bool = ...) -> bool: ...
 
 def rust_is_sunder(name: str) -> bool: ...

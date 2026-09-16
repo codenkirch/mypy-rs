@@ -32,6 +32,8 @@ from mypy.types import CallableType, Instance, ProperType, TupleType, Type, Type
 
 T = TypeVar("T")
 
+from type_kernel_types import NativeTypeResolver
+
 
 def rust_has_type_vars(type_bytes: bytes) -> bool: ...
 
@@ -107,6 +109,10 @@ def rust_is_global_expr(node_bytes: bytes) -> bool: ...
 
 def rust_has_await_in_generator(node_bytes: bytes) -> bool: ...
 
+
+# Phase G1.0a (#1572): expression dual-write node shadow. `capture_*`
+# mint (or reuse) the shared identity handle and return it; reads return
+# None for an object with no record.
 def rust_node_mirror_capture_ref(
     obj: Any,
     kind: int | None,
@@ -134,6 +140,10 @@ def rust_node_mirror_entry_count() -> int: ...
 
 def rust_node_mirror_handle_of(obj: Any) -> int | None: ...
 
+
+# Phase G1.0b (#1576) per-field records. `capture_*` mint (or reuse) the
+# shared identity handle; `rust_node_mirror_field` answers a tagged tuple
+# ("kind" | "flag" | "name" | "kinds", value) or None when not captured.
 def rust_node_mirror_capture_field_kind(obj: Any, field: str, kind: str | None) -> int: ...
 
 def rust_node_mirror_capture_flag(obj: Any, field: str, value: bool) -> int: ...
@@ -150,6 +160,8 @@ def rust_node_mirror_fields(handle: int) -> list[str] | None: ...
 
 def rust_node_mirror_field_captures(handle: int) -> int | None: ...
 
+# Phase G1.1: wire bytes for type-valued fields.  Capture stores the
+# class name plus serialized Type bytes; read returns (kind, bytes).
 def rust_node_mirror_capture_field_wire(
     obj: Any, field: str, kind: str | None, wire: bytes
 ) -> int: ...
@@ -158,6 +170,9 @@ def rust_node_mirror_field_wire(
     handle: int, field: str
 ) -> tuple[str | None, bytes] | None: ...
 
+# Phase G2.0 (#1577): statement/def metadata shadow. `capture_meta`
+# stores one tagged field value (kind in none/bool/int/str/obj/list);
+# `meta` reads the record as {field: (kind, text, num, items)}.
 def rust_node_mirror_capture_meta(
     obj: Any,
     field: str,
@@ -179,6 +194,9 @@ def rust_node_mirror_meta_reset() -> int: ...
 
 def rust_node_mirror_meta_entry_count() -> int: ...
 
+
+# The proxy suite pins the shared identity namespace by comparing the
+# proxy handle with the mirror's non-minting lookup.
 def rust_mirror_handle_of(obj: Any) -> int | None: ...
 
 def rust_get_subexpressions(root: Any) -> list[Any] | None: ...

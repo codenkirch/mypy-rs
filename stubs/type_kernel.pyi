@@ -2,9 +2,8 @@
 
 The extension is built from ``crates/type_kernel`` and loaded as a bare
 ``.so`` (no PyPI package, no ``py.typed``), so mypy's self-check cannot
-discover its types. This stub mirrors the ``#[pyfunction]`` surface defined across
-``crates/type_kernel/src`` (each module registers its own seams; see
-``scripts/plan_seam_split.py``) and is found via ``mypy_path``.
+discover its types. This stub mirrors the ``#[pyfunction]`` surface defined
+in ``crates/type_kernel/src/lib.rs`` and is found via ``mypy_path``.
 
 Most functions exchange serialized ``mypy.types.Type`` values as opaque
 ``bytes`` blobs; None signals the Python caller to fall back to the

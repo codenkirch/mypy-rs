@@ -594,6 +594,8 @@ def rust_is_singleton_equality_type(
     type_bytes: bytes, resolver: NativeTypeResolver
 ) -> bool | None: ...
 
+
+# Issue #578: typeanal_queries functions (live PyO3 objects)
 def rust_validate_instance(t: Any, fail: Any, indexed: bool) -> bool | None: ...
 
 def rust_detect_diverging_alias(node: Any, target: Any) -> bool | None: ...
@@ -608,6 +610,8 @@ def rust_check_vec_type_args(args: Any, ctx: Any, api: Any) -> bool | None: ...
 
 def rust_check_unpacks_in_list(items: Any) -> tuple[list[int], int | None] | None: ...
 
+
+# mypy/types.py — callable formal-arg introspection + copy_modified.
 def rust_callable_formal_arguments(
     typ_bytes: bytes,
 ) -> list[tuple[str | None, int | None, bool]] | None: ...
@@ -646,6 +650,8 @@ def rust_tuple_length(typ_bytes: bytes) -> int | None: ...
 
 def rust_union_length(typ_bytes: bytes) -> int | None: ...
 
+
+# mypy/typeanal.py — wire round-trip analysis.
 def rust_type_analyze(
     typ_bytes: bytes,
     allow_tuple_literal: bool = False,
@@ -879,6 +885,10 @@ def rust_match_generic_callables(
     num_vars: int, start_raw_id: int, t_bytes: bytes, s_bytes: bytes
 ) -> tuple[int, bytes, bytes] | None: ...
 
+
+# F reopening experiment (#1671): Rust-owned `Instance` field storage.
+# Handles are minted by rust_view_put through the shared identity service;
+# an encode is served only while its stamp still matches the caller's.
 def rust_view_put(
     obj: Any,
     fullname: str,

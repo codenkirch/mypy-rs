@@ -32,6 +32,8 @@ from mypy.types import CallableType, Instance, ProperType, TupleType, Type, Type
 
 T = TypeVar("T")
 
+from type_kernel_types import NativeTypeResolver
+
 
 def rust_classify_lvalue_validity(node: Any) -> int: ...
 
@@ -309,6 +311,8 @@ def rust_calculate_tuple_fallback(typ: TupleType) -> Type | None: ...
 
 def rust_find_dataclass_transform_spec(node: Node | None) -> DataclassTransformSpec | None: ...
 
+
+# Issue #568: semanal_classprop functions (live PyO3 objects)
 def rust_calculate_class_abstract_status(
     typ: TypeInfo, is_stub_file: bool, errors: Any
 ) -> None: ...
@@ -321,8 +325,13 @@ def rust_add_type_promotion(
     info: TypeInfo, module_names: SymbolTable, options: Any, builtin_names: SymbolTable | None
 ) -> None: ...
 
+
+# Issue #572: binder.get_declaration (live PyO3 object). Issue #1101:
+# (decided, value) wire answer; decided=None is a genuine no-declaration.
 def rust_get_declaration(expr: Expression) -> tuple[bool, Type | None]: ...
 
+
+# H1b (wave 74): native binder frame-stack store
 def rust_binder_new() -> None: ...
 
 def rust_binder_reset() -> None: ...
@@ -343,6 +352,8 @@ def rust_binder_suppress_unreachable_warnings() -> None: ...
 
 def rust_binder_frame_count() -> int: ...
 
+
+# Issue #576: semanal_typeddict/namedtuple functions (live PyO3 objects)
 def rust_primary_source(sources: list[Any]) -> Any: ...
 
 def rust_check_namedtuple_field_name(field: str, seen_names: Any) -> str | None: ...
@@ -355,6 +366,8 @@ def rust_verify_field_against_closed_bases(
     field_name: str, closed_bases: Any, primary_source_base: Any
 ) -> list[str]: ...
 
+
+# mypy/semanal.py — decorator/semanal-visitor helpers.
 def rust_erase_func_annotations(func: Any) -> None: ...
 
 def rust_get_deprecated(expression: Any) -> str | None: ...

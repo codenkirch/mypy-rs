@@ -53,6 +53,8 @@ def rust_walk_dependency_target(
     module_id: str, module_tree: Any, target: Any, type_map: dict[Any, Any]
 ) -> dict[str, set[str]] | None: ...
 
+
+# Issue #570: fixup functions (live PyO3 objects)
 def rust_fixup_type(typ: Any, modules: dict[str, MypyFile], allow_missing: bool) -> bool: ...
 
 def rust_fixup_type_info(
@@ -75,6 +77,8 @@ def rust_fixup_decorator(
     d: Decorator, modules: dict[str, MypyFile], allow_missing: bool
 ) -> bool: ...
 
+
+# mypy/server/deps.py — D2-style import-graph triggers.
 def rust_compute_wildcard_triggers(
     changed_names: list[str], package_nesting_level: int
 ) -> list[str] | None: ...
@@ -86,6 +90,8 @@ def rust_compute_target_modules(
     module_ids: list[str],
 ) -> list[str]: ...
 
+
+# mypy/server/update.py — daemon update helpers.
 def rust_dedupe_modules(modules: list[tuple[str, str]]) -> list[tuple[str, str]]: ...
 
 def rust_get_module_to_path_map(graph: Any) -> list[tuple[str, str]]: ...
@@ -126,6 +132,8 @@ def rust_snapshot_symbol_table(
     name_prefix: str, table: SymbolTable
 ) -> dict[str, Any] | None: ...
 
+# Phase G3.1 (#1670): read flip — the same builder over Rust-owned
+# namespace storage, `None` when the store cannot mirror the table.
 def rust_snapshot_symbol_table_shadow(
     name_prefix: str, table: SymbolTable
 ) -> dict[str, Any] | None: ...
@@ -134,6 +142,8 @@ def rust_is_expr_literal_type(node: Any) -> bool | None: ...
 
 def rust_get_partial_instance_type(node: Any) -> Any | None: ...
 
+
+# mypy/dmypy_server.py — daemon server helpers.
 def rust_ignore_suppressed_imports(module: str) -> bool | None: ...
 
 def rust_get_meminfo() -> dict[str, Any] | None: ...
@@ -150,6 +160,8 @@ def rust_filter_out_missing_top_level_packages(
     packages: Any, search_paths: Any, fscache: Any
 ) -> set[str] | None: ...
 
+
+# Issue #540: pure helpers from mypy/modulefinder.py
 def rust_is_init_file(path: str) -> bool: ...
 
 def rust_parse_version(version: str) -> tuple[int, int]: ...

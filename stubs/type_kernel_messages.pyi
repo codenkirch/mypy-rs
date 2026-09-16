@@ -32,7 +32,13 @@ from mypy.types import CallableType, Instance, ProperType, TupleType, Type, Type
 
 T = TypeVar("T")
 
+from type_kernel_types import NativeTypeResolver
 
+
+
+# Issue #1101: (decided, value) wire answer. decided=True means Rust
+# answered (value may be None = a genuine no-result); Python only falls
+# back on an exception.
 def rust_constant_fold_expr(
     expr: Expression, cur_mod_id: str
 ) -> tuple[bool, int | bool | float | complex | str | None]: ...
