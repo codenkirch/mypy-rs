@@ -41,14 +41,12 @@ def resolve_root(explicit: str | None) -> Path:
         return Path(explicit)
     try:
         out = subprocess.run(
-            ["git", "rev-parse", "--show-toplevel"],
-            capture_output=True,
-            text=True,
-            check=True,
+            ["git", "rev-parse", "--show-toplevel"], capture_output=True, text=True, check=True
         )
         return Path(out.stdout.strip())
     except (subprocess.CalledProcessError, FileNotFoundError, OSError):
         return Path(__file__).resolve().parent.parent
+
 
 REGISTER_FN = re.compile(r"pub\(crate\)\s+fn\s+register_registry\s*\(", re.S)
 REGISTRATION = re.compile(r"wrap_pyfunction!\(\s*(?P<fn>[A-Za-z0-9_]+)\s*,", re.S)
@@ -99,9 +97,7 @@ def verify(regs: list[tuple[str, str, str]]) -> list[str]:
         in_block = len(REGISTRATION.findall(split_block(text)))
         total = len(REGISTRATION.findall(text))
         if total != in_block:
-            problems.append(
-                f"{path.name}: {total - in_block} site(s) outside register_registry"
-            )
+            problems.append(f"{path.name}: {total - in_block} site(s) outside register_registry")
         if "#[pyfunction" in text and in_block == 0 and path.name != "lib.rs":
             problems.append(f"{path.name}: defines #[pyfunction]s but registers none")
     return problems
@@ -139,7 +135,7 @@ def main() -> int:
     dupes = [fn for fn, n in Counter(fn for _, _, fn in regs).items() if n > 1]
     print(f"file:            {SRC}/*.rs")
     print(f"registered:      {len(regs)} sites across {len(per_module)} defining modules")
-    print(f"unique pyfns:    {len(set(f for _, _, f in regs))}")
+    print(f"unique pyfns:    {len({f for _, _, f in regs})}")
     if dupes:
         print(f"note: pyfunction names registered more than once: {sorted(dupes)}")
 
