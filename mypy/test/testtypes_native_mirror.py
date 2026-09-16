@@ -3,15 +3,19 @@
 from __future__ import annotations
 
 try:
-    from librt.internal import WriteBuffer as _WriteBuffer
     import type_kernel as _splice_kernel
     import type_kernel as _type_kernel
+    from librt.internal import WriteBuffer as _WriteBuffer
 except ImportError:
     _WriteBuffer = None  # type: ignore[assignment,misc]
     _splice_kernel = None  # type: ignore[assignment]
     _type_kernel = None  # type: ignore[assignment]
 
+import sys
 from collections.abc import Callable, Iterator
+from typing import Any, cast
+from unittest import skipIf, skipUnless
+
 from mypy.nodes import (
     ARG_NAMED,
     ARG_NAMED_OPT,
@@ -19,11 +23,15 @@ from mypy.nodes import (
     ARG_POS,
     ARG_STAR,
     ARG_STAR2,
+    CONTRAVARIANT,
+    GDEF,
+    INVARIANT,
+    LDEF,
+    MDEF,
     ArgKind,
     Argument,
     AssignmentStmt,
     Block,
-    CONTRAVARIANT,
     CallExpr,
     CastExpr,
     ClassDef,
@@ -32,13 +40,9 @@ from mypy.nodes import (
     ExpressionStmt,
     FuncDef,
     FuncItem,
-    GDEF,
-    INVARIANT,
     IndexExpr,
     IntExpr,
-    LDEF,
     ListExpr,
-    MDEF,
     MemberExpr,
     MypyFile,
     NameExpr,
@@ -58,6 +62,13 @@ from mypy.nodes import (
 )
 from mypy.options import Options
 from mypy.test.helpers import Suite, assert_equal
+from mypy.test.testtypes import (
+    _HAS_TYPE_KERNEL,
+    _NATIVE_WIRE_ENABLED,
+    _SPLICE_ACTIVE,
+    _base_infos,
+    _is_type_info,
+)
 from mypy.test.typefixture import TypeFixture
 from mypy.traverser import (
     all_name_and_member_expressions,
@@ -96,17 +107,6 @@ from mypy.types import (
     UnpackType,
     get_proper_type,
     has_recursive_types,
-)
-from typing import Any, cast
-from unittest import skipIf, skipUnless
-import sys
-
-from mypy.test.testtypes import (
-    _HAS_TYPE_KERNEL,
-    _NATIVE_WIRE_ENABLED,
-    _SPLICE_ACTIVE,
-    _base_infos,
-    _is_type_info,
 )
 
 
@@ -395,6 +395,7 @@ class NativeTypeWireSuite(Suite):
         # unexpected-tag error or a truncated member; pin the rendering.
         assert _type_kernel.read_type_to_str(self._bytes_of(u)) is not None
 
+
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeRemoveDupsSuite(Suite):
     """Parity for the alias-bearing `remove_dups` native path (#1518).
@@ -492,9 +493,7 @@ class NativeRemoveDupsSuite(Suite):
         # Python's `TypeAliasType.__eq__` compares the alias OBJECT; two
         # distinct objects sharing a fullname are unequal, so the shim's
         # structural-key precondition must route to the pure-Python body.
-        other = TypeAlias(
-            Instance(self.fx.std_listi, [self.fx.t]), "mod.DupAlias", "mod", -1, -1
-        )
+        other = TypeAlias(Instance(self.fx.std_listi, [self.fx.t]), "mod.DupAlias", "mod", -1, -1)
         first = TypeAliasType(self.alias, [])
         second = TypeAliasType(other, [])
         from mypy.types import _dedup_alias_identity_sound
@@ -523,6 +522,7 @@ class NativeRemoveDupsSuite(Suite):
         row2 = Instance(self.fx.gi, [TypeAliasType(self.alias, [self.fx.a])])
         result = self._assert_par([row1, row2, self.fx.a])
         assert len(result) == 2 and result[0] is row1
+
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeHasRecursiveTypesFlattenSuite(Suite):
@@ -574,7 +574,6 @@ class NativeHasRecursiveTypesFlattenSuite(Suite):
         _set_native_visitor_types_active(types)
 
     def _hrt_par(self, t: Type, expected: bool) -> None:
-        from mypy.types import has_recursive_types
 
         self._set_gates(False, self._orig_types_gate)
         off = has_recursive_types(t)
@@ -801,7 +800,9 @@ class NativeTraverserSuite(Suite):
         options.python_version = (3, 12)
         options.native_parser = True
         errors = Errors(options)
-        return parse(source, fnam="<test>", module="<test>", errors=errors, options=options, eager=True)
+        return parse(
+            source, fnam="<test>", module="<test>", errors=errors, options=options, eager=True
+        )
 
     def _find_func(self, tree: MypyFile, name: str) -> FuncDef:
         for stmt in tree.defs:
@@ -837,7 +838,7 @@ class NativeTraverserSuite(Suite):
         # (None) instead of silently answering False. (#1030)
         import pytest
 
-        from mypy.nodes import ARG_POS, Argument, Block, FuncItem, ReturnStmt, StrExpr, Var
+        from mypy.nodes import ARG_POS, Block, ReturnStmt, StrExpr, Var
         from mypy.traverser import (  # type: ignore[attr-defined]
             _rust_has_return_statement,
             _serialize_ast_node,
@@ -1298,6 +1299,7 @@ class NativeTraverserSuite(Suite):
         rust_count = rust_count_non_literal_handlers(buf.getvalue())
         assert rust_count == len(find_non_literal_handlers(tree))
 
+
 @skipUnless(_splice_kernel is not None, "requires the type_kernel extension")
 class NativeMirrorSpliceSuite(Suite):
     """Unit tests for the wire-cache splice funnel of the F1 mirror.
@@ -1493,11 +1495,7 @@ class NativeMirrorSpliceSuite(Suite):
         from librt.internal import WriteBuffer
 
         import mypy.types as types_mod
-        from mypy.types import (
-            _serialize_with_taint_check,
-            _type_wire_cache,
-            _write_type_cached,
-        )
+        from mypy.types import _serialize_with_taint_check, _type_wire_cache, _write_type_cached
 
         c = self._callable()
 
@@ -1514,6 +1512,7 @@ class NativeMirrorSpliceSuite(Suite):
         _write_type_cached(c, WriteBuffer())
         assert id(c) in _type_wire_cache
         assert types_mod._type_wire_cache_session_depth == 0
+
 
 @skipUnless(_HAS_TYPE_KERNEL, "requires the type_kernel extension")
 class NativeMirrorTypeVarIdSuite(Suite):
@@ -1654,6 +1653,7 @@ class NativeMirrorTypeVarIdSuite(Suite):
         finally:
             self._m._strict = False
 
+
 @skipUnless(_HAS_TYPE_KERNEL, "requires the type_kernel extension")
 class NativeMirrorTypeAliasFlagSuite(Suite):
     """Unit tests for the TypeAlias._is_recursive capture shim of the F1 mirror.
@@ -1782,6 +1782,7 @@ class NativeMirrorTypeAliasFlagSuite(Suite):
         finally:
             self._m._strict = False
 
+
 @skipUnless(_HAS_TYPE_KERNEL, "requires the type_kernel extension")
 class NativeMirrorAdoptStrikeSuite(Suite):
     """Unit tests for the adoption-strike lifecycle of the F1 mirror.
@@ -1859,6 +1860,7 @@ class NativeMirrorAdoptStrikeSuite(Suite):
         assert "setattr_captured.instance.args" not in delta, delta
         assert delta.get("strike_captured_late") is None, delta
 
+
 class NativeMirrorIdFifoSuite(Suite):
     """Unit tests for the O(1) strike FIFO (_IdFifo).
 
@@ -1934,6 +1936,7 @@ class NativeMirrorIdFifoSuite(Suite):
             q.remove(i)
         assert len(q._log) <= 64, len(q._log)
         assert not q._members
+
 
 @skipUnless(_HAS_TYPE_KERNEL, "requires the type_kernel extension")
 class NativeMirrorHiddenParentSuite(Suite):
@@ -2080,6 +2083,7 @@ class NativeMirrorHiddenParentSuite(Suite):
         delta = self._delta(before)
         assert delta.get("assert_skip.tvar.write") == 1, delta
         assert not any(k.startswith("mismatch.") for k in delta), delta
+
 
 @skipUnless(_HAS_TYPE_KERNEL, "requires the type_kernel extension")
 class NativeWriteFunnelSkipSuite(Suite):
@@ -2294,6 +2298,7 @@ class NativeWriteFunnelSkipSuite(Suite):
         delta = self._delta(before)
         assert any(k.startswith("assert_skip.") for k in delta), delta
         assert not any(k.startswith(("mismatch.", "assert_ok.")) for k in delta), delta
+
 
 class NativeMirrorWalkIndicesSuite(Suite):
     """Differential tests for the fused F3 slice-5 tree walk.
@@ -2575,6 +2580,7 @@ class NativeMirrorWalkIndicesSuite(Suite):
             new_embeds,
         )
 
+
 @skipUnless(_splice_kernel is not None, "requires the type_kernel extension")
 class NativeMirrorWalkIndicesRustSuite(Suite):
     """Unit tests for the Rust port of `_walk_indices` (Slice 7).
@@ -2744,6 +2750,7 @@ class NativeMirrorWalkIndicesRustSuite(Suite):
                 assert [id(x) for x in got[3]] == [id(x) for x in py[3]], (key, "children")
         finally:
             self._m._kernel_mod = saved
+
 
 @skipUnless(_HAS_TYPE_KERNEL, "requires the type_kernel extension")
 class NativeMirrorReadSuite(Suite):
@@ -3072,6 +3079,7 @@ class NativeMirrorReadSuite(Suite):
         # Never written: no handle. The funnel serializes exactly as before.
         assert _serialize_type_join(ct) == self._m._fresh_bytes(ct)
 
+
 @skipUnless(_HAS_TYPE_KERNEL, "requires the type_kernel extension")
 class NativeInstanceWriteSuite(Suite):
     """Unit tests for the Phase F3 (#1397) instance-write splice of the mirror.
@@ -3309,6 +3317,7 @@ class NativeInstanceWriteSuite(Suite):
         assert "setattr_spliced.instance.extra_attrs" not in delta, delta
         self._blob_matches_fresh(inst)
 
+
 @skipUnless(_HAS_TYPE_KERNEL, "requires the type_kernel extension")
 class NativeInvisibleFieldSuite(Suite):
     """Wire-invisible field writes stay outside the mirror capture funnel.
@@ -3407,6 +3416,7 @@ class NativeInvisibleFieldSuite(Suite):
         delta = self._delta(before)
         assert delta.get("setattr_spliced.instance.args") == 1, delta
         self._blob_matches_fresh(inst)
+
 
 @skipUnless(_HAS_TYPE_KERNEL, "requires the type_kernel extension")
 class NativeMirrorCallableWriteSuite(Suite):
@@ -3640,6 +3650,7 @@ class NativeMirrorCallableWriteSuite(Suite):
         assert delta == {}, delta
         self._blob_matches_fresh(cb)
 
+
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeMirrorUnionPlainDataSuite(Suite):
     """UnionType plain-data writes (is_evaluated, original_str_*) skip capture.
@@ -3721,6 +3732,7 @@ class NativeMirrorUnionPlainDataSuite(Suite):
         assert u.is_evaluated is False
         assert u.original_str_expr == "A | B"
         assert u.original_str_fallback == "builtins.int"
+
 
 @skipUnless(_HAS_TYPE_KERNEL, "requires the type_kernel extension")
 class NativeMirrorAdoptionFastPathSuite(Suite):
@@ -3906,6 +3918,7 @@ class NativeMirrorAdoptionFastPathSuite(Suite):
         assert delta.get("strike_cleared_on_adopt") == 1, delta
         assert self._m._handle_of(inst) is not None
 
+
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeMirrorStableIdentitySuite(Suite):
     """Daemon-stable identity handles (issue #1528).
@@ -3929,9 +3942,7 @@ class NativeMirrorStableIdentitySuite(Suite):
         self._m.reset(clear_counts=True)
 
     def _callable(self) -> CallableType:
-        return CallableType(
-            [self.fx.o], [ARG_POS], [None], self.fx.o, self.fx.function, name="f"
-        )
+        return CallableType([self.fx.o], [ARG_POS], [None], self.fx.o, self.fx.function, name="f")
 
     def test_preserving_reset_keeps_stable_identity(self) -> None:
         c = self._callable()
@@ -3978,6 +3989,7 @@ class NativeMirrorStableIdentitySuite(Suite):
         self._m.reset(preserve_stable=True)
         assert self._m._kernel_mod.rust_mirror_stable_alive(h)
         assert self._m._kernel_mod.rust_mirror_handle_of(c) == h
+
 
 class NativeIftaDefinitionRestoreSuite(Suite):
     """Wave 47 (#1455): ifta solution `definition` restoration.
@@ -4108,6 +4120,7 @@ class NativeIftaDefinitionRestoreSuite(Suite):
         c1 = self._call("f1", "x", FuncDef("f1"))
         assert self._seam([], [c1], [ARG_POS], [[0]]) is None
 
+
 @skipUnless(_HAS_TYPE_KERNEL, "requires the type_kernel extension")
 class NativeCtorBlobGatesSuite(Suite):
     """`_native_ctor_blob` must clear the expand/maptype gates too (#1484).
@@ -4207,6 +4220,7 @@ class NativeCtorBlobGatesSuite(Suite):
         assert expandtype._native_expand_type_resolver is self._resolver
         assert maptype._native_map_active is True
         assert maptype._native_map_resolver is self._resolver
+
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeAstMirrorSuite(Suite):
@@ -4379,6 +4393,7 @@ class NativeAstMirrorSuite(Suite):
         assert Options().native_ast_mirror is False
         assert "native_ast_mirror" not in OPTIONS_AFFECTING_CACHE
 
+
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeAstMirrorFieldSuite(Suite):
     """Unit tests for the G1.0b remaining expression fields (#1576).
@@ -4511,11 +4526,7 @@ class NativeAstMirrorFieldSuite(Suite):
         expr.type_guard = self.fx.a
         handle = self._handle(expr)
         assert self._k.rust_node_mirror_ref(handle) == (GDEF, None, "", False, False)
-        assert self._k.rust_node_mirror_fields(handle) == [
-            "is_alias_rvalue",
-            "name",
-            "type_guard",
-        ]
+        assert self._k.rust_node_mirror_fields(handle) == ["is_alias_rvalue", "name", "type_guard"]
         assert self._k.rust_node_mirror_captures(handle) == (1, 0)
         # G1.2 (#1674) seeds the node's own `name` at adoption, so the
         # two explicit field writes plus that seed are counted here.
@@ -4591,6 +4602,7 @@ class NativeAstMirrorFieldSuite(Suite):
         finally:
             self._k.rust_node_mirror_capture_field_wire = original_wire
 
+
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeAstMirrorWireSuite(Suite):
     """G1.1 wire-bytes round-trip tests for type-valued expression fields.
@@ -4633,6 +4645,7 @@ class NativeAstMirrorWireSuite(Suite):
         assert len(wire) > 0
         # Verify the wire bytes start with the INSTANCE tag (first byte).
         from mypy.types import INSTANCE
+
         assert wire[0] == INSTANCE
 
     def test_as_type_wire_roundtrip(self) -> None:
@@ -4663,6 +4676,7 @@ class NativeAstMirrorWireSuite(Suite):
         assert kind == "AnyType"
         assert len(wire) > 0
         from mypy.types import ANY_TYPE
+
         assert wire[0] == ANY_TYPE
 
     def test_cleared_type_routes_through_kind_not_wire(self) -> None:
@@ -4730,6 +4744,7 @@ class NativeAstMirrorWireSuite(Suite):
         op = OpExpr("+", NameExpr("a"), NameExpr("b"))
         op.method_type = self.fx.a
         assert self._m.report().get("capture_method_type", 0) >= 1
+
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeStmtDefMirrorSuite(Suite):
@@ -4971,9 +4986,7 @@ class NativeStmtDefMirrorSuite(Suite):
         # `func` and `var` are non-baseline, adopting the node; the
         # baseline `decorators=[]` and `is_overload=False` are captured
         # because the node is already adopted.
-        assert set(record) == {
-            "func", "var", "is_overload", "decorators", "original_decorators",
-        }
+        assert set(record) == {"func", "var", "is_overload", "decorators", "original_decorators"}
         assert record["func"] == ("obj", "FuncDef", None, None)
         assert record["var"] == ("obj", "Var", None, None)
         assert record["is_overload"] == ("bool", None, 0, None)
@@ -5152,7 +5165,9 @@ class NativeStmtDefMirrorSuite(Suite):
         imp.is_unreachable_dependency = True
         record = self._meta(imp)
         assert set(record) == {
-            "is_top_level", "is_unreachable", "is_mypy_only",
+            "is_top_level",
+            "is_unreachable",
+            "is_mypy_only",
             "is_unreachable_dependency",
         }
         assert record["is_top_level"] == ("bool", None, 1, None)
@@ -5223,9 +5238,7 @@ class NativeStmtDefMirrorSuite(Suite):
         dec.is_overload = True
         dec.decorators = [nodes_mod.NameExpr("decorator1")]
         record = self._meta(dec)
-        assert set(record) == {
-            "func", "var", "is_overload", "decorators", "original_decorators",
-        }
+        assert set(record) == {"func", "var", "is_overload", "decorators", "original_decorators"}
         assert record["is_overload"] == ("bool", None, 1, None)
         assert record["decorators"] == ("list", None, None, ["NameExpr"])
 
@@ -5264,8 +5277,12 @@ class NativeStmtDefMirrorSuite(Suite):
         cls._fullname = "mod.C"
         cls.type_vars = [
             TypeVarType(
-                "T", "mod.T", TypeVarId(1), [],
-                AnyType(TypeOfAny.special_form), AnyType(TypeOfAny.special_form),
+                "T",
+                "mod.T",
+                TypeVarId(1),
+                [],
+                AnyType(TypeOfAny.special_form),
+                AnyType(TypeOfAny.special_form),
             )
         ]
         record = self._meta(cls)
@@ -5278,13 +5295,9 @@ class NativeStmtDefMirrorSuite(Suite):
         cls = nodes_mod.ClassDef("C", nodes_mod.Block([]))
         cls.removed_base_type_exprs = [nodes_mod.NameExpr("Generic")]
         record = self._meta(cls)
-        assert record["removed_base_type_exprs"] == (
-            "list", None, None, ["NameExpr"],
-        )
+        assert record["removed_base_type_exprs"] == ("list", None, None, ["NameExpr"])
         cls.removed_base_type_exprs = []
-        assert self._meta(cls)["removed_base_type_exprs"] == (
-            "list", None, None, [],
-        )
+        assert self._meta(cls)["removed_base_type_exprs"] == ("list", None, None, [])
 
     def test_func_def_info(self) -> None:
         from mypy import nodes as nodes_mod
@@ -5354,6 +5367,7 @@ class NativeStmtDefMirrorSuite(Suite):
         # and the type mirror all answer the same handle.
         assert self._k.rust_node_mirror_handle_of(var) == handle
         assert self._k.rust_mirror_handle_of(var) == handle
+
 
 class NativeResolverSigSuite(Suite):
     """Dirty-driven resolver upkeep (#1641).
@@ -5475,6 +5489,7 @@ class NativeResolverSigSuite(Suite):
         finally:
             sc._HAS_RUST_CLASSPROP = old
         assert _native_builtins_sig(int_info) != before
+
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeSubexprAststripSuite(Suite):
@@ -5647,6 +5662,7 @@ class NativeSubexprAststripSuite(Suite):
         visitor.strip_ref_expr(m_on)
         self._assert_stripped(m_on)
         self._set_aststrip(False)
+
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeNodeShadowReadFlipSuite(Suite):

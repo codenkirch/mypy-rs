@@ -54,7 +54,6 @@ from mypy.typeops import (
     supported_self_type,
     tuple_fallback,
 )
-from mypy.typestate import type_state
 from mypy.types import (
     AnyType,
     CallableType,
@@ -89,6 +88,7 @@ from mypy.types import (
     get_proper_type,
     instance_cache,
 )
+from mypy.typestate import type_state
 
 # M20: type-kernel seam for checkmember. When the `type_kernel` Rust
 # extension is importable and `Options.native_type_kernel` is set,

@@ -3,23 +3,26 @@
 from __future__ import annotations
 
 try:
-    from librt.internal import WriteBuffer as _WriteBuffer
     import type_kernel as _type_kernel
+    from librt.internal import WriteBuffer as _WriteBuffer
 except ImportError:
     _WriteBuffer = None  # type: ignore[assignment,misc]
     _type_kernel = None  # type: ignore[assignment]
 
 from collections.abc import Callable
+from typing import Any
+from unittest import skipUnless
+
 from mypy.nodes import (
     ARG_NAMED,
     ARG_POS,
+    MDEF,
     Argument,
     Block,
     ClassDef,
     Context,
     FuncDef,
     IntExpr,
-    MDEF,
     NameExpr,
     ReturnStmt,
     SymbolTable,
@@ -30,6 +33,7 @@ from mypy.nodes import (
 )
 from mypy.options import Options
 from mypy.test.helpers import Suite, assert_equal
+from mypy.test.testtypes import _NATIVE_WIRE_ENABLED, T, _is_type_info
 from mypy.test.typefixture import TypeFixture
 from mypy.types import (
     AnyType,
@@ -40,21 +44,13 @@ from mypy.types import (
     TupleType,
     Type,
     TypeAliasType,
+    TypedDictType,
     TypeOfAny,
     TypeVarId,
     TypeVarType,
-    TypedDictType,
     UninhabitedType,
     UnionType,
     UnpackType,
-)
-from typing import Any
-from unittest import skipUnless
-
-from mypy.test.testtypes import (
-    T,
-    _NATIVE_WIRE_ENABLED,
-    _is_type_info,
 )
 
 
@@ -141,6 +137,7 @@ class NativeSuggestionsSuite(Suite):
 
     def test_pretty_seq_and_conjunction(self) -> None:
         self._check_pretty_seq(["x", "y", "z"], "and")
+
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeMessagesSuite(Suite):
@@ -326,7 +323,6 @@ class NativeMessagesSuite(Suite):
         self.assert_format_par(u)
 
     def test_typeddict_anonymous(self) -> None:
-        from mypy.types import TypedDictType
 
         # Create a TypeInfo for typing._TypedDict so the anonymity check
         # treats the fallback as anonymous.
@@ -336,7 +332,6 @@ class NativeMessagesSuite(Suite):
         self.assert_format_par(t)
 
     def test_deleted_type(self) -> None:
-        from mypy.types import DeletedType
 
         t = DeletedType("var")
         self.assert_format_par(t)
@@ -427,6 +422,7 @@ class NativeMessagesSuite(Suite):
         )
         self.assertIsNotNone(actual, "rust pretty_callable deferred on a plain callable")
         assert_equal(actual, expected, "pretty_callable mismatch")
+
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeMessagesDeferralSuite(Suite):
@@ -545,7 +541,7 @@ class NativeMessagesDeferralSuite(Suite):
         # wire cannot carry it, so the shim marks the tree unsafe and Rust
         # keeps deferring (parity through the pure-Python formatter).
         from mypy.messages import _pretty_wire_safe, format_type_bare
-        from mypy.nodes import ARG_POS, Argument, Block, FuncDef, Var
+        from mypy.nodes import ARG_POS, Var
 
         fdef = FuncDef("f", [Argument(Var("x"), None, None, ARG_POS)], Block([]))
         c = self._named_arg_callable()
@@ -564,7 +560,7 @@ class NativeMessagesDeferralSuite(Suite):
         # the definition is irrelevant to pretty_callable, so the native
         # pretty path stays parity-safe and engages.
         from mypy.messages import _pretty_wire_safe
-        from mypy.nodes import ARG_POS, Argument, Block, FuncDef, Var
+        from mypy.nodes import ARG_POS, Var
 
         fdef = FuncDef("f", [Argument(Var("x"), None, None, ARG_POS)], Block([]))
         c = self._named_arg_callable()
@@ -576,12 +572,12 @@ class NativeMessagesDeferralSuite(Suite):
         )
         assert raw is not None, "Rust pretty path did not engage for a safe definition"
 
-    def _def_dependent(self, name: str, arg_names: list[str], call_name: str | None) -> CallableType:
-        from mypy.nodes import ARG_POS, Argument, Block, FuncDef, Var
+    def _def_dependent(
+        self, name: str, arg_names: list[str], call_name: str | None
+    ) -> CallableType:
+        from mypy.nodes import ARG_POS, Var
 
-        fdef = FuncDef(
-            name, [Argument(Var(a), None, None, ARG_POS) for a in arg_names], Block([])
-        )
+        fdef = FuncDef(name, [Argument(Var(a), None, None, ARG_POS) for a in arg_names], Block([]))
         c = self._named_arg_callable()
         c.name = call_name
         c.definition = fdef
@@ -699,6 +695,7 @@ class NativeMessagesDeferralSuite(Suite):
             self._set_resolver(self.resolver)
         assert_equal(on, off, "recursive alias format parity")
 
+
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeFindTypeOverlapsSuite(Suite):
     """Parity tests for the Rust find_type_overlaps port (mypy.messages).
@@ -733,7 +730,7 @@ class NativeFindTypeOverlapsSuite(Suite):
         # A realistic TypeInfo for class A in module other: defn.name "A"
         # (short name), fullname "other.A". make_type_info("other.A") cannot
         # produce this shape, so build the TypeInfo directly.
-        from mypy.nodes import Block, ClassDef, SymbolTable, TypeInfo
+        from mypy.nodes import SymbolTable, TypeInfo
 
         class_def = ClassDef("A", Block([]), None, [])
         class_def.fullname = "other.A"
@@ -782,7 +779,7 @@ class NativeFindTypeOverlapsSuite(Suite):
     def test_typing_injection(self) -> None:
         # `List` also in TYPES_FOR_UNIMPORTED_HINTS: typing.List is injected
         # into the short-name group when a user List collides.
-        from mypy.nodes import Block, ClassDef, SymbolTable, TypeInfo
+        from mypy.nodes import SymbolTable, TypeInfo
 
         class_def = ClassDef("List", Block([]), None, [])
         class_def.fullname = "m.List"
@@ -825,6 +822,7 @@ class NativeFindTypeOverlapsSuite(Suite):
         on = self._with_gate(True, lambda: find_type_overlaps(alias_type))
         assert_equal(on, off, "alias find_type_overlaps parity")
 
+
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeInferredTypeNoteSuite(Suite):
     """Gate-on/off differential for the make_inferred_type_note port (#982).
@@ -856,7 +854,6 @@ class NativeInferredTypeNoteSuite(Suite):
 
     @staticmethod
     def _return_ctx(name: str = "x", inferred: bool = True) -> Context:
-        from mypy.nodes import ReturnStmt
 
         expr = NameExpr(name)
         var = Var(name)
@@ -892,12 +889,10 @@ class NativeInferredTypeNoteSuite(Suite):
         self._assert_par(NameExpr("x"), self.fx.lstb, self.fx.lsta)
 
     def test_expr_not_name_expr(self) -> None:
-        from mypy.nodes import ReturnStmt
 
         self._assert_par(ReturnStmt(IntExpr(1)), self.fx.lstb, self.fx.lsta)
 
     def test_node_not_var(self) -> None:
-        from mypy.nodes import ReturnStmt
 
         expr = NameExpr("x")
         expr.node = self.fx.a  # type: ignore[assignment]
@@ -937,6 +932,7 @@ class NativeInferredTypeNoteSuite(Suite):
             _type_kernel.rust_make_inferred_type_note(sub_bytes, sup_bytes, [True], NameExpr("y")),
             "seam should decide False for a non-ReturnStmt context",
         )
+
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeHasNoAttrSuite(Suite):
@@ -1035,7 +1031,6 @@ class NativeHasNoAttrSuite(Suite):
 
     def _info(self, fullname: str, names: dict[str, str]) -> Instance:
         # Build a live TypeInfo with the given member names (all Vars).
-        from mypy.nodes import Block, ClassDef
 
         short = fullname.split(".")[-1]
         class_def = ClassDef(short, Block([]), None, [])
@@ -1280,6 +1275,7 @@ class NativeHasNoAttrSuite(Suite):
         code, captured = self._assert_par(inst, inst, "add", disable_type_names=True)
         assert code is not None and code.code == "attr-defined"
         assert captured[0][0] == '"C" has no attribute "add"'
+
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeFormatAliasTopSuite(Suite):

@@ -55,6 +55,9 @@ from __future__ import annotations
 from collections.abc import Sequence
 from typing import TypeAlias as _TypeAlias, Union
 
+# Phase G3.1 (#1670): the read flip reads its mode from the namespace
+# shadow that owns the storage; the import is a leaf (no server imports).
+from mypy import symtables_mirror
 from mypy.expandtype import expand_type
 from mypy.nodes import (
     SYMBOL_FUNCBASE_TYPES,
@@ -103,10 +106,6 @@ from mypy.types import (
     UnpackType,
 )
 from mypy.util import get_prefix
-
-# Phase G3.1 (#1670): the read flip reads its mode from the namespace
-# shadow that owns the storage; the import is a leaf (no server imports).
-from mypy import symtables_mirror
 
 # M388: native snapshot comparator seam (mirrors the deps.py/update.py gate).
 try:

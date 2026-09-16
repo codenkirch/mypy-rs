@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+from typing import Any
+from unittest import skipUnless
+
 from mypy.nodes import (
+    GDEF,
+    MDEF,
     Block,
     ClassDef,
     FuncDef,
-    GDEF,
-    MDEF,
     PlaceholderNode,
     SymbolTable,
     SymbolTableNode,
@@ -15,12 +18,7 @@ from mypy.nodes import (
     Var,
 )
 from mypy.test.helpers import Suite
-from typing import Any
-from unittest import skipUnless
-
-from mypy.test.testtypes import (
-    _HAS_TYPE_KERNEL,
-)
+from mypy.test.testtypes import _HAS_TYPE_KERNEL
 
 
 @skipUnless(_HAS_TYPE_KERNEL, "requires the type_kernel extension")
@@ -451,6 +449,7 @@ class NativeSymtableMirrorSuite(Suite):
         info.mro[1] = replacement
         # The shadow is stale until _capture_meta re-runs
         from mypy import symtables_mirror
+
         symtables_mirror._capture_meta(info, "astmerge_fixup")
         record_after = self._k.rust_symtable_mirror_meta_lookup(info)
         assert record_after is not None
@@ -502,6 +501,7 @@ class NativeSymtableMirrorSuite(Suite):
         record_after = self._m.lookup(table, "x")
         assert record_after is not None
         assert record_after["node_fullname"] == "mod.y"
+
 
 @skipUnless(_HAS_TYPE_KERNEL, "requires the type_kernel extension")
 class NativeSymtableMetaExtraSuite(Suite):
@@ -623,6 +623,7 @@ class NativeSymtableMetaExtraSuite(Suite):
             assert self._k.rust_symtable_mirror_meta_entry_count() == before
         finally:
             self._m._active = True
+
 
 @skipUnless(_HAS_TYPE_KERNEL, "requires the type_kernel extension")
 class NativeSymtableReadFlipSuite(Suite):

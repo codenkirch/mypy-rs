@@ -3,19 +3,26 @@
 from __future__ import annotations
 
 try:
-    from librt.internal import WriteBuffer as _WriteBuffer
     import type_kernel as _type_kernel
+    from librt.internal import WriteBuffer as _WriteBuffer
 except ImportError:
     _WriteBuffer = None  # type: ignore[assignment,misc]
     _type_kernel = None  # type: ignore[assignment]
 
+from types import SimpleNamespace
+from typing import Any, cast
+from unittest import skipUnless
+
 from mypy.nodes import (
     ARG_POS,
     ARG_STAR,
+    COVARIANT,
+    GDEF,
+    INVARIANT,
+    MDEF,
     Argument,
     AssignmentStmt,
     Block,
-    COVARIANT,
     CallExpr,
     ClassDef,
     Decorator,
@@ -24,13 +31,10 @@ from mypy.nodes import (
     ExpressionStmt,
     ForStmt,
     FuncDef,
-    GDEF,
-    INVARIANT,
     Import,
     ImportAll,
     ImportFrom,
     IndexExpr,
-    MDEF,
     MemberExpr,
     MypyFile,
     NameExpr,
@@ -48,6 +52,7 @@ from mypy.nodes import (
 )
 from mypy.options import Options
 from mypy.test.helpers import Suite, assert_equal
+from mypy.test.testtypes import _HAS_TYPE_KERNEL, _NATIVE_WIRE_ENABLED
 from mypy.test.typefixture import TypeFixture
 from mypy.types import (
     AnyType,
@@ -57,30 +62,22 @@ from mypy.types import (
     Instance,
     NoneType,
     Overloaded,
+    Parameters,
     ParamSpecFlavor,
     ParamSpecType,
-    Parameters,
     PartialType,
     TupleType,
     Type,
     TypeAliasType,
+    TypedDictType,
     TypeOfAny,
     TypeType,
     TypeVarId,
     TypeVarType,
-    TypedDictType,
     UnboundType,
     UninhabitedType,
     UnionType,
     UnpackType,
-)
-from types import SimpleNamespace
-from typing import Any, cast
-from unittest import skipUnless
-
-from mypy.test.testtypes import (
-    _HAS_TYPE_KERNEL,
-    _NATIVE_WIRE_ENABLED,
 )
 
 
@@ -197,6 +194,7 @@ class NativeAttributeTriggersSuite(Suite):
         self._set_active(True)
         self.assertEqual(triggers, [self.make_trigger("A.x")])
 
+
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeAstdiffSnapshotSuite(Suite):
     """Issue #1497 (B7 slice 1): native `astdiff.snapshot_type` port.
@@ -234,9 +232,7 @@ class NativeAstdiffSnapshotSuite(Suite):
         return on
 
     def _alias(self) -> TypeAlias:
-        return TypeAlias(
-            Instance(self.fx.std_listi, [self.fx.t]), "mod.SnapAlias", "mod", -1, -1
-        )
+        return TypeAlias(Instance(self.fx.std_listi, [self.fx.t]), "mod.SnapAlias", "mod", -1, -1)
 
     def _callable(self, *, generic: bool = False) -> CallableType:
         return CallableType(
@@ -273,9 +269,7 @@ class NativeAstdiffSnapshotSuite(Suite):
             ("Instance-lkv", fx.lit1_inst),
             (
                 "Instance-extra-attrs",
-                Instance(
-                    fx.ai, [], extra_attrs=ExtraAttrs({"y": fx.b, "x": fx.a}, {"x"})
-                ),
+                Instance(fx.ai, [], extra_attrs=ExtraAttrs({"y": fx.b, "x": fx.a}, {"x"})),
             ),
             ("TypeVarType", fx.t),
             (
@@ -317,8 +311,7 @@ class NativeAstdiffSnapshotSuite(Suite):
     def test_optional_and_sequence_helpers_route_through_seam(self) -> None:
         assert_equal(self.astdiff.snapshot_optional_type(None), ("<not set>",))
         assert_equal(
-            self.astdiff.snapshot_optional_type(self.fx.a),
-            self._snapshot(self.fx.a, True),
+            self.astdiff.snapshot_optional_type(self.fx.a), self._snapshot(self.fx.a, True)
         )
         assert_equal(
             self.astdiff.snapshot_types([self.fx.a, self.fx.b]),
@@ -334,9 +327,7 @@ class NativeAstdiffSnapshotSuite(Suite):
         assert len(items) == 2, "duplicate union items must be removed"
 
     def test_typed_dict_item_order_and_sorted_keys(self) -> None:
-        td = TypedDictType(
-            {"b": self.fx.b, "a": self.fx.a}, {"b", "a"}, {"b"}, self.fx.o
-        )
+        td = TypedDictType({"b": self.fx.b, "a": self.fx.a}, {"b", "a"}, {"b"}, self.fx.o)
         snap = self._assert_parity("typeddict", td)
         assert [key for key, _ in snap[1]] == ["b", "a"], "items preserve dict order"
         assert snap[2] == ("a", "b"), "required keys are sorted"
@@ -363,7 +354,6 @@ class NativeAstdiffSnapshotSuite(Suite):
         assert snap[7][0][3] == -1
 
     def test_partial_type_defers(self) -> None:
-        from mypy.types import PartialType
 
         partial = PartialType(None, Var("x"))
         assert _type_kernel.rust_snapshot_type(partial) is None
@@ -378,6 +368,7 @@ class NativeAstdiffSnapshotSuite(Suite):
         assert _type_kernel.rust_snapshot_type(42) is None
         with self.assertRaises(AttributeError):
             self._snapshot(42, True)
+
 
 @skipUnless(_HAS_TYPE_KERNEL, "requires the type_kernel extension")
 class NativeAstdiffSymbolSnapshotSuite(Suite):
@@ -446,12 +437,7 @@ class NativeAstdiffSymbolSnapshotSuite(Suite):
         from mypy.types import CallableType
 
         return CallableType(
-            [self.fx.a],
-            [ARG_POS],
-            ["x"],
-            self.fx.b,
-            self.fx.function,
-            variables=[self.fx.t],
+            [self.fx.a], [ARG_POS], ["x"], self.fx.b, self.fx.function, variables=[self.fx.t]
         )
 
     def _type_info(self) -> TypeInfo:
@@ -477,9 +463,7 @@ class NativeAstdiffSymbolSnapshotSuite(Suite):
         # Generic signature: the slice-1 type walk defers and the shim
         # must fall back to Python's snapshot_type for this node only.
         nested["g"] = SymbolTableNode(MDEF, self._func("g", "mod.C.g", self._generic_callable()))
-        decorated = Decorator(
-            self._func("d", "mod.C.d"), [], self._var("d", "mod.C.d", self.fx.a)
-        )
+        decorated = Decorator(self._func("d", "mod.C.d"), [], self._var("d", "mod.C.d", self.fx.a))
         nested["d"] = SymbolTableNode(MDEF, decorated)
 
         cdef = ClassDef("C", Block([]))
@@ -494,18 +478,11 @@ class NativeAstdiffSymbolSnapshotSuite(Suite):
         return info
 
     def _table(self) -> SymbolTable:
-        from mypy.nodes import (
-            DataclassTransformSpec,
-            ParamSpecExpr,
-            TypeAlias,
-            TypeVarTupleExpr,
-        )
+        from mypy.nodes import DataclassTransformSpec, ParamSpecExpr, TypeAlias, TypeVarTupleExpr
         from mypy.types import Instance
 
         table = SymbolTable()
-        table["f"] = SymbolTableNode(
-            GDEF, self._func("f", "mod.f", self._generic_callable())
-        )
+        table["f"] = SymbolTableNode(GDEF, self._func("f", "mod.f", self._generic_callable()))
         untyped = self._func("uf", "mod.uf", is_trivial_body=True, deprecated="d")
         untyped.dataclass_transform_spec = DataclassTransformSpec(order_default=True)
         table["uf"] = SymbolTableNode(GDEF, untyped)
@@ -589,7 +566,6 @@ class NativeAstdiffSymbolSnapshotSuite(Suite):
         assert self._snapshot("mod", table, True) == {}
 
     def test_unknown_node_defers(self) -> None:
-        from mypy.nodes import PlaceholderNode
 
         table = SymbolTable()
         table["p"] = SymbolTableNode(GDEF, PlaceholderNode("mod.p", Var("dummy"), -1))
@@ -605,6 +581,7 @@ class NativeAstdiffSymbolSnapshotSuite(Suite):
         assert _type_kernel.rust_snapshot_symbol_table("mod", table) is None
         with self.assertRaises(AssertionError):
             self._snapshot("mod", table, True)
+
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeCacheMetaWriterSuite(Suite):
@@ -705,8 +682,7 @@ class NativeCacheMetaWriterSuite(Suite):
 
     def test_meta_full_fixture_parity_and_roundtrip(self) -> None:
         meta = self._meta(
-            ignore_all=True,
-            plugin_data={"mypyc": True, "n": 5, "f": 1.5, "none": None},
+            ignore_all=True, plugin_data={"mypyc": True, "n": 5, "f": 1.5, "none": None}
         )
         rust = self._assert_parity(meta)
         decoded = _type_kernel.rust_read_cache_meta(rust)
@@ -819,7 +795,7 @@ class NativeCacheMetaWriterSuite(Suite):
             error_lines=[
                 (None, 1, 2, 3, 4, "error", "msg", None),
                 ("/tmp/x.py", 2**40, 0, 2**40, 8, "note", "m2", "code"),
-            ],
+            ]
         )
         rust = self._assert_parity(meta_ex, ex=True)
         decoded = _type_kernel.rust_read_cache_meta_ex(rust)
@@ -887,6 +863,7 @@ class NativeCacheMetaWriterSuite(Suite):
         # Gate off vs gate on produce identical files.
         assert_equal([(p, d) for p, d in rust_writes], [(p, d) for p, d in python_writes])
 
+
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeServerDepsWalkSuite(Suite):
     """Parity tests for the native DependencyVisitor walk (#1632).
@@ -913,10 +890,7 @@ class NativeServerDepsWalkSuite(Suite):
         return tree
 
     def _maps(
-        self,
-        tree: MypyFile,
-        type_map: dict[Expression, Type] | None = None,
-        logical: bool = False,
+        self, tree: MypyFile, type_map: dict[Expression, Type] | None = None, logical: bool = False
     ) -> dict[str, set[str]]:
         from type_kernel import rust_walk_dependency_visitor
 
@@ -982,11 +956,7 @@ class NativeServerDepsWalkSuite(Suite):
         fdef._fullname = "main.f"
         tree = self._tree([fdef])
         assert_equal(
-            self._maps(tree),
-            {
-                "<A>": {"main.f", "<main.f>"},
-                "<B>": {"main.f", "<main.f>"},
-            },
+            self._maps(tree), {"<A>": {"main.f", "<main.f>"}, "<B>": {"main.f", "<main.f>"}}
         )
 
     def test_class_def(self) -> None:
@@ -1023,9 +993,7 @@ class NativeServerDepsWalkSuite(Suite):
         func = FuncDef("h", [], Block([]))
         func._fullname = "main.h"
         tree = self._tree([Decorator(func, [self._ref("dec", "main.dec")], Var("h"))])
-        assert_equal(
-            self._maps(tree, logical=True), {"<main.dec>": {"main", "<main.h>"}}
-        )
+        assert_equal(self._maps(tree, logical=True), {"<main.dec>": {"main", "<main.h>"}})
 
     def test_logical_assignment_tail(self) -> None:
         callee = self._ref("f", "main.f")
@@ -1090,8 +1058,7 @@ class NativeServerDepsWalkSuite(Suite):
             ]
         )
         assert_equal(
-            self._maps(tree),
-            {"<main.c>": {"main"}, "<main.t>": {"main"}, "<main.e>": {"main"}},
+            self._maps(tree), {"<main.c>": {"main"}, "<main.t>": {"main"}, "<main.e>": {"main"}}
         )
 
     def test_target_driver(self) -> None:
@@ -1109,9 +1076,7 @@ class NativeServerDepsWalkSuite(Suite):
             assert native is not None, "native target walk deferred"
             assert_equal({k: set(v) for k, v in native.items()}, off)
             self._set_active(True)
-            assert_equal(
-                get_dependencies_of_target("main", tree, target, {}, (3, 13)), off
-            )
+            assert_equal(get_dependencies_of_target("main", tree, target, {}, (3, 13)), off)
 
     def test_defer_unknown_node(self) -> None:
         from type_kernel import rust_walk_dependency_visitor

@@ -23,8 +23,8 @@ from __future__ import annotations
 import unittest
 from typing import Any
 
-import mypy.typeview as typeview
 import mypy.types as types
+import mypy.typeview as typeview
 from mypy.nodes import ARG_POS, TypeInfo
 from mypy.test.typefixture import TypeFixture
 from mypy.types import Instance, Type, TypeVarType
@@ -89,7 +89,9 @@ class TypeViewSuite(unittest.TestCase):
         """An unactivated gate installs nothing on `Instance`."""
         self.assertFalse(typeview.active())
         self.assertIsNone(types._native_type_view_encode)
-        self.assertIs(Instance.__dict__.get("__setattr__", object.__setattr__), self.setattr_before)
+        self.assertIs(
+            Instance.__dict__.get("__setattr__", object.__setattr__), self.setattr_before
+        )
         # `args` is still the `__slots__` member descriptor, not a property.
         self.assertNotIsInstance(Instance.__dict__["args"], property)
         self.assertIn("args", Instance.__slots__)
@@ -102,7 +104,9 @@ class TypeViewSuite(unittest.TestCase):
         typeview.deactivate()
         self.assertFalse(typeview.active())
         self.assertIsNone(types._native_type_view_encode)
-        self.assertIs(Instance.__dict__.get("__setattr__", object.__setattr__), self.setattr_before)
+        self.assertIs(
+            Instance.__dict__.get("__setattr__", object.__setattr__), self.setattr_before
+        )
         self.assertNotIsInstance(Instance.__dict__["args"], property)
 
     def test_chains_and_restores_a_pre_existing_setattr(self) -> None:
@@ -135,7 +139,9 @@ class TypeViewSuite(unittest.TestCase):
         self._activate()
         typeview.deactivate()
         typeview.deactivate()
-        self.assertIs(Instance.__dict__.get("__setattr__", object.__setattr__), self.setattr_before)
+        self.assertIs(
+            Instance.__dict__.get("__setattr__", object.__setattr__), self.setattr_before
+        )
 
     def test_read_arm_installs_and_restores_the_args_descriptor(self) -> None:
         self._activate(read_route=True)
@@ -391,9 +397,7 @@ class TypeViewSuite(unittest.TestCase):
         self.assertEqual(after - first, 2)
         # The memoized part: two more calls must not pay the registration scan
         # again. Only a register-side counter can tell memoized from not.
-        self.assertEqual(
-            typeview.report().get("a_register.unregistered_arg", 0) - first_scan, 0
-        )
+        self.assertEqual(typeview.report().get("a_register.unregistered_arg", 0) - first_scan, 0)
         # A successful registration clears the memo.
         self._register(self.fx.a, inst)
         self.assertIsNotNone(typeview.encode(inst))

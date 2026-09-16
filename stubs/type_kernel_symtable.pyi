@@ -2,37 +2,9 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Sized
-from typing import Any, Literal, TypeVar
-
-from mypy.nodes import (
-    AssignmentStmt,
-    Block,
-    CallExpr,
-    DataclassTransformSpec,
-    Decorator,
-    Expression,
-    FuncDef,
-    Lvalue,
-    MemberExpr,
-    MypyFile,
-    NameExpr,
-    Node,
-    OverloadedFuncDef,
-    RefExpr,
-    SymbolNode,
-    SymbolTable,
-    SymbolTableNode,
-    TypeAlias,
-    TypeInfo,
-    Var,
-)
-from mypy.types import CallableType, Instance, ProperType, TupleType, Type, TypeVarLikeType
-
+from typing import Any, TypeVar
 
 T = TypeVar("T")
-
-
 
 # Phase G3.0a (#1581): namespace dual-write capture shadow. One record
 # per (owner table handle, name) with generation + seq; `refresh_flags`
@@ -50,9 +22,7 @@ def rust_symtable_mirror_put(
     no_serialize: bool,
     cross_ref: str | None,
 ) -> tuple[int, int, int, int]: ...
-
 def rust_symtable_mirror_delete(owner: Any, name: str) -> bool: ...
-
 def rust_symtable_mirror_refresh_flags(
     node: Any,
     kind: int,
@@ -64,26 +34,17 @@ def rust_symtable_mirror_refresh_flags(
     no_serialize: bool,
     cross_ref: str | None,
 ) -> bool: ...
-
 def rust_symtable_mirror_lookup(owner: Any, name: str) -> dict[str, Any] | None: ...
-
 def rust_symtable_mirror_entry_count(owner: Any) -> int: ...
-
 def rust_symtable_mirror_total_entry_count() -> int: ...
-
 def rust_symtable_mirror_names(owner: Any) -> list[str]: ...
-
 def rust_symtable_mirror_generation(owner: Any) -> int | None: ...
-
 def rust_symtable_mirror_reset() -> int: ...
-
 def rust_symtable_mirror_handle_of(obj: Any) -> int | None: ...
 
 # Phase G3.1 (#1670): read-flip evidence counters for the mirror gate.
 def rust_symtable_mirror_flip_counts() -> dict[str, int]: ...
-
 def rust_symtable_mirror_flip_counts_reset() -> int: ...
-
 def rust_symtable_mirror_meta_put(
     info: Any,
     bases_count: int,
@@ -92,19 +53,10 @@ def rust_symtable_mirror_meta_put(
     fullname: str | None,
     names_table: Any,
 ) -> int: ...
-
-def rust_symtable_mirror_meta_put_field(
-    info: Any,
-    field: str,
-    value: str,
-) -> int: ...
-
+def rust_symtable_mirror_meta_put_field(info: Any, field: str, value: str) -> int: ...
 def rust_symtable_mirror_meta_lookup(info: Any) -> dict[str, Any] | None: ...
-
 def rust_symtable_mirror_meta_delete(info: Any) -> bool: ...
-
 def rust_symtable_mirror_meta_entry_count() -> int: ...
-
 
 __all__ = [
     "rust_symtable_mirror_put",

@@ -384,11 +384,11 @@ _MULTIPLE_WORDS_NONTYPE_RE = re.compile(r'\s*[^\s.\'"|\[]+\s+[^\s.\'"|\[]')
 try:
     from librt.internal import ReadBuffer as _SemanalReadBuffer, WriteBuffer as _SemanalWriteBuffer
     from type_kernel import (
-        rust_make_any_non_explicit as _rust_make_any_non_explicit,
-        rust_make_any_non_unimported as _rust_make_any_non_unimported,
         rust_is_overloaded_item as _rust_is_overloaded_item,
         rust_is_self_member_ref as _rust_is_self_member_ref,
         rust_is_type_like as _rust_is_type_like,
+        rust_make_any_non_explicit as _rust_make_any_non_explicit,
+        rust_make_any_non_unimported as _rust_make_any_non_unimported,
     )
 
     from mypy.types import read_type as _semanal_read_type
@@ -3836,11 +3836,7 @@ class SemanticAnalyzer(
 
     def is_base_class(self, t: TypeInfo, s: TypeInfo) -> bool:
         """Determine if t is a base class of s (but do not use mro)."""
-        if (
-            _SEMANAL_HAS_KERNEL
-            and _native_semanal_active
-            and _rust_is_base_class is not None
-        ):
+        if _SEMANAL_HAS_KERNEL and _native_semanal_active and _rust_is_base_class is not None:
             try:
                 result = _rust_is_base_class(t, s)
             except (AssertionError, NotImplementedError, ValueError, TypeError):
@@ -6003,11 +5999,7 @@ class SemanticAnalyzer(
 
     def is_self_member_ref(self, memberexpr: MemberExpr) -> bool:
         """Does memberexpr to refer to an attribute of self?"""
-        if (
-            _SEMANAL_HAS_KERNEL
-            and _native_semanal_active
-            and _rust_is_self_member_ref is not None
-        ):
+        if _SEMANAL_HAS_KERNEL and _native_semanal_active and _rust_is_self_member_ref is not None:
             try:
                 result = _rust_is_self_member_ref(memberexpr)
             except (AssertionError, NotImplementedError, ValueError, TypeError):
@@ -8215,11 +8207,7 @@ class SemanticAnalyzer(
         return False
 
     def is_type_like(self, node: SymbolNode | None) -> bool:
-        if (
-            _SEMANAL_HAS_KERNEL
-            and _native_semanal_active
-            and _rust_is_type_like is not None
-        ):
+        if _SEMANAL_HAS_KERNEL and _native_semanal_active and _rust_is_type_like is not None:
             try:
                 result = _rust_is_type_like(node)
             except (AssertionError, NotImplementedError, ValueError, TypeError):
@@ -8258,11 +8246,7 @@ class SemanticAnalyzer(
 
     def is_overloaded_item(self, node: SymbolNode, statement: Statement) -> bool:
         """Check whether the function belongs to the overloaded variants"""
-        if (
-            _SEMANAL_HAS_KERNEL
-            and _native_semanal_active
-            and _rust_is_overloaded_item is not None
-        ):
+        if _SEMANAL_HAS_KERNEL and _native_semanal_active and _rust_is_overloaded_item is not None:
             try:
                 result = _rust_is_overloaded_item(node, statement)
             except (AssertionError, NotImplementedError, ValueError, TypeError):

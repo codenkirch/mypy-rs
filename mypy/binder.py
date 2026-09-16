@@ -49,16 +49,16 @@ except ImportError:
 
 try:
     from type_kernel import (
-        rust_binder_new as _rust_binder_new,
-        rust_binder_reset as _rust_binder_reset,
-        rust_binder_push_frame as _rust_binder_push_frame,
-        rust_binder_pop_frame as _rust_binder_pop_frame,
+        rust_binder_frame_count as _rust_binder_frame_count,
         rust_binder_is_unreachable as _rust_binder_is_unreachable,
         rust_binder_is_unreachable_warning_suppressed as _rust_binder_is_suppressed,
-        rust_binder_set_unreachable as _rust_binder_set_unreachable,
+        rust_binder_new as _rust_binder_new,
+        rust_binder_pop_frame as _rust_binder_pop_frame,
+        rust_binder_push_frame as _rust_binder_push_frame,
+        rust_binder_reset as _rust_binder_reset,
         rust_binder_set_top_unreachable as _rust_binder_set_top_unreachable,
+        rust_binder_set_unreachable as _rust_binder_set_unreachable,
         rust_binder_suppress_unreachable_warnings as _rust_binder_suppress,
-        rust_binder_frame_count as _rust_binder_frame_count,
     )
 
     _HAS_RUST_BINDER_STORE = True

@@ -8,11 +8,14 @@ except ImportError:
     _type_kernel = None  # type: ignore[assignment]
 
 from collections.abc import Callable
+from typing import Any
+from unittest import skipUnless
+
 from mypy.checker import TypeChecker
 from mypy.nodes import (
+    COVARIANT,
     ArgKind,
     BytesExpr,
-    COVARIANT,
     CallExpr,
     DictExpr,
     EllipsisExpr,
@@ -34,15 +37,9 @@ from mypy.nodes import (
 )
 from mypy.state import state
 from mypy.test.helpers import Suite, assert_equal
+from mypy.test.testtypes import _NATIVE_WIRE_ENABLED, T
 from mypy.test.typefixture import TypeFixture
 from mypy.types import Instance, Type, UnionType
-from typing import Any
-from unittest import skipUnless
-
-from mypy.test.testtypes import (
-    T,
-    _NATIVE_WIRE_ENABLED,
-)
 
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
@@ -243,6 +240,7 @@ class NativeStubgenRenderSuite(Suite):
 
     def test_template_str(self) -> None:
         self._assert_render(self._tmpl("test"))
+
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeGeneratorReturnTypeSuite(Suite):
@@ -542,6 +540,7 @@ class NativeGeneratorReturnTypeSuite(Suite):
         self._assert_par_coroutine(typ, "coroutine-return")
         self._assert_engages_type("rust_get_coroutine_return_type", typ, True, str(self.fx.a))
 
+
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeStubgenPrinterSuite(Suite):
     """Parity for the stubgen printer/collector seams (#1636).
@@ -615,12 +614,8 @@ class NativeStubgenPrinterSuite(Suite):
         nested = UnaryExpr("-", UnaryExpr("-", IntExpr(5)))
         assert_equal(tk.rust_stubgen_str_type_tag(nested, True), 0)
         assert_equal(tk.rust_stubgen_str_type_tag(UnaryExpr("~", IntExpr(5)), True), 6)
-        assert_equal(
-            tk.rust_stubgen_str_type_tag(UnaryExpr("not", NameExpr("True")), True), 5
-        )
-        assert_equal(
-            tk.rust_stubgen_str_type_tag(UnaryExpr("not", NameExpr("x")), True), 6
-        )
+        assert_equal(tk.rust_stubgen_str_type_tag(UnaryExpr("not", NameExpr("True")), True), 5)
+        assert_equal(tk.rust_stubgen_str_type_tag(UnaryExpr("not", NameExpr("x")), True), 6)
         # Two-phase unwrap: `not` never falls into the math phase.
         not_plus = UnaryExpr("not", UnaryExpr("+", IntExpr(1)))
         assert_equal(tk.rust_stubgen_str_type_tag(not_plus, True), 6)

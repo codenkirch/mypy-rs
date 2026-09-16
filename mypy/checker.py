@@ -218,12 +218,7 @@ from mypy.patterns import AsPattern, StarredPattern
 from mypy.plugin import Plugin
 from mypy.plugins import dataclasses as dataclasses_plugin
 from mypy.scope import Scope
-from mypy.semanal import (
-    flatten_lvalues,
-    is_trivial_body,
-    refers_to_fullname,
-    set_callable_name,
-)
+from mypy.semanal import flatten_lvalues, is_trivial_body, refers_to_fullname, set_callable_name
 from mypy.semanal_enum import ENUM_BASES, ENUM_SPECIAL_PROPS
 from mypy.semanal_shared import SemanticAnalyzerCoreInterface
 from mypy.sharedparse import BINARY_MAGIC_METHODS
@@ -338,12 +333,15 @@ try:
         rust_are_argument_counts_overlapping as _rust_are_argument_counts_overlapping,
         rust_builtin_item_type as _rust_builtin_item_type,
         rust_can_be_narrowed_with_len as _rust_can_be_narrowed_with_len,
+        rust_can_widen_in_scope as _rust_can_widen_in_scope,
         rust_check_exit_return_type as _rust_check_exit_return_type,
         rust_check_explicit_override_decorator as _rust_check_explicit_override_decorator,
         rust_check_final_deletable as _rust_check_final_deletable,
         rust_check_for_untyped_decorator as _rust_check_for_untyped_decorator,
+        rust_check_incompatible_property_override as _rust_check_incompatible_property_override,
         rust_check_match_args as _rust_check_match_args,
         rust_check_overlapping_overloads as _rust_check_overlapping_overloads,
+        rust_check_untyped_after_decorator as _rust_check_untyped_after_decorator,
         rust_classify_all_supers_gate as _rust_classify_all_supers_gate,
         rust_classify_check_assignment as _rust_classify_check_assignment,
         rust_classify_check_final as _rust_classify_check_final,
@@ -371,10 +369,12 @@ try:
         rust_classify_truthy_type as _rust_classify_truthy_type,
         rust_classify_type_check_raise as _rust_classify_type_check_raise,
         rust_classify_type_range as _rust_classify_type_range,
+        rust_classify_unbound_return_typevar as _rust_classify_unbound_return_typevar,
         rust_conditional_types as _rust_conditional_types,
         rust_detach_callable as _rust_detach_callable,
         rust_equality_value_info as _rust_equality_value_info,
         rust_expand_callable_variants as _rust_expand_callable_variants,
+        rust_flatten_lvalues as _rust_flatten_lvalues,
         rust_get_coroutine_return_type as _rust_get_coroutine_return_type,
         rust_get_generator_receive_type as _rust_get_generator_receive_type,
         rust_get_generator_return_type as _rust_get_generator_return_type,
@@ -384,18 +384,24 @@ try:
         rust_has_bool_item as _rust_has_bool_item,
         rust_has_custom_eq_checks as _rust_has_custom_eq_checks,
         rust_infer_operator_assignment_method as _rust_infer_operator_assignment_method,
+        rust_is_assignable_slot as _rust_is_assignable_slot,
         rust_is_async_generator_return_type as _rust_is_async_generator_return_type,
         rust_is_classmethod_node as _rust_is_classmethod_node,
         rust_is_custom_settable_property as _rust_is_custom_settable_property,
+        rust_is_defined_in_base_class as _rust_is_defined_in_base_class,
+        rust_is_definition as _rust_is_definition,
         rust_is_empty_generator_function as _rust_is_empty_generator_function,
         rust_is_equality_ambiguous_for_narrowing as _rust_is_equality_ambiguous_for_narrowing,
         rust_is_final_enum_value as _rust_is_final_enum_value,
         rust_is_generator_return_type as _rust_is_generator_return_type,
+        rust_is_len_of_tuple as _rust_is_len_of_tuple,
+        rust_is_literal_enum as _rust_is_literal_enum,
         rust_is_literal_none as _rust_is_literal_none,
         rust_is_literal_not_implemented as _rust_is_literal_not_implemented,
         rust_is_method as _rust_is_method,
         rust_is_more_general_arg_prefix as _rust_is_more_general_arg_prefix,
         rust_is_node_static as _rust_is_node_static,
+        rust_is_noop_for_reachability as _rust_is_noop_for_reachability,
         rust_is_private as _rust_is_private,
         rust_is_property as _rust_is_property,
         rust_is_settable_property as _rust_is_settable_property,
@@ -406,28 +412,17 @@ try:
         rust_is_unreachable_map as _rust_is_unreachable_map,
         rust_is_unsafe_overlapping_overload_signatures as _rust_is_unsafe_overlapping_overload_signatures,
         rust_is_untyped_decorator as _rust_is_untyped_decorator,
+        rust_is_valid_defaultdict_partial_value_type as _rust_is_valid_defaultdict_partial_value_type,
         rust_is_valid_inferred_type as _rust_is_valid_inferred_type,
         rust_is_writable_attribute as _rust_is_writable_attribute,
-        rust_is_defined_in_base_class as _rust_is_defined_in_base_class,
-        rust_is_definition as _rust_is_definition,
-        rust_can_widen_in_scope as _rust_can_widen_in_scope,
-        rust_is_valid_defaultdict_partial_value_type as _rust_is_valid_defaultdict_partial_value_type,
-        rust_is_len_of_tuple as _rust_is_len_of_tuple,
-        rust_is_assignable_slot as _rust_is_assignable_slot,
-        rust_is_noop_for_reachability as _rust_is_noop_for_reachability,
-        rust_is_literal_enum as _rust_is_literal_enum,
-        rust_classify_unbound_return_typevar as _rust_classify_unbound_return_typevar,
-        rust_check_untyped_after_decorator as _rust_check_untyped_after_decorator,
-        rust_check_incompatible_property_override as _rust_check_incompatible_property_override,
-        rust_should_report_unreachable_issues as _rust_should_report_unreachable_issues,
-        rust_refers_to_different_scope as _rust_refers_to_different_scope,
-        rust_flatten_lvalues as _rust_flatten_lvalues,
         rust_literal_int_expr as _rust_literal_int_expr,
         rust_narrow_type_by_identity_equality as _rust_narrow_type_by_identity_equality,
         rust_narrow_with_len as _rust_narrow_with_len,
         rust_or_conditional_maps as _rust_or_conditional_maps,
         rust_overload_can_never_match as _rust_overload_can_never_match,
         rust_partition_equality_ambiguous_types as _rust_partition_equality_ambiguous_types,
+        rust_refers_to_different_scope as _rust_refers_to_different_scope,
+        rust_should_report_unreachable_issues as _rust_should_report_unreachable_issues,
         rust_stmt_outcome as _rust_stmt_outcome,
         rust_try_handler_union as _rust_try_handler_union,
         rust_type_requires_usage as _rust_type_requires_usage,
@@ -2855,9 +2850,7 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
             and _rust_classify_unbound_return_typevar is not None
         ):
             try:
-                tag = _rust_classify_unbound_return_typevar(
-                    _serialize_type_for_checker(typ)
-                )
+                tag = _rust_classify_unbound_return_typevar(_serialize_type_for_checker(typ))
                 if tag is not None:
                     if tag == 0:
                         return
@@ -4017,7 +4010,11 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
         exceptions even though this is not the case, resulting in
         invalid reachability inference.
         """
-        if _CHECKER_HAS_TYPE_KERNEL and _native_checker_active and _rust_check_exit_return_type is not None:
+        if (
+            _CHECKER_HAS_TYPE_KERNEL
+            and _native_checker_active
+            and _rust_check_exit_return_type is not None
+        ):
             try:
                 result = _rust_check_exit_return_type(defn)
                 if result is True:
@@ -4125,7 +4122,11 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
     def check_final_deletable(self, typ: TypeInfo) -> None:
         # These checks are only for mypyc. Only perform some checks that are easier
         # to implement here than in mypyc.
-        if _CHECKER_HAS_TYPE_KERNEL and _native_checker_active and _rust_check_final_deletable is not None:
+        if (
+            _CHECKER_HAS_TYPE_KERNEL
+            and _native_checker_active
+            and _rust_check_final_deletable is not None
+        ):
             result = _rust_check_final_deletable(typ)
             if result is not None:
                 for name in result:
@@ -6405,8 +6406,7 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
         if _rust_is_valid_defaultdict_partial_value_type is not None:
             try:
                 result = _rust_is_valid_defaultdict_partial_value_type(
-                    _serialize_type_for_checker(t),
-                    self.options.old_type_inference,
+                    _serialize_type_for_checker(t), self.options.old_type_inference
                 )
                 if result is not None:
                     return result
@@ -7681,7 +7681,11 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
 
         Return None if unsuccessful.
         """
-        if _CHECKER_HAS_TYPE_KERNEL and _native_checker_active and _rust_classify_range_int_gate is not None:
+        if (
+            _CHECKER_HAS_TYPE_KERNEL
+            and _native_checker_active
+            and _rust_classify_range_int_gate is not None
+        ):
             try:
                 result = _rust_classify_range_int_gate(expr)
             except (AssertionError, NotImplementedError):
@@ -8139,7 +8143,11 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
 
     def _make_named_statement_for_match(self, s: MatchStmt, subject: Expression) -> Expression:
         """Construct a fake NameExpr for inference if a match clause is complex."""
-        if _CHECKER_HAS_TYPE_KERNEL and _native_checker_active and _rust_classify_match_subject_head is not None:
+        if (
+            _CHECKER_HAS_TYPE_KERNEL
+            and _native_checker_active
+            and _rust_classify_match_subject_head is not None
+        ):
             try:
                 tag = _rust_classify_match_subject_head(subject, s.subject_dummy is None)
             except (AssertionError, NotImplementedError):
@@ -8383,7 +8391,9 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
             errors.append((pretty_names_list, "would have incompatible method signatures"))
             return None
 
-        _put_names_entry(curr_module.names, full_name, SymbolTableNode(GDEF, info, False, module_hidden=True))
+        _put_names_entry(
+            curr_module.names, full_name, SymbolTableNode(GDEF, info, False, module_hidden=True)
+        )
         return Instance(info, [], extra_attrs=instances[0].extra_attrs or instances[1].extra_attrs)
 
     def intersect_instance_callable(self, typ: Instance, callable_type: CallableType) -> Instance:
@@ -9693,7 +9703,11 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
 
     def is_len_of_tuple(self, expr: Expression) -> bool:
         """Is this expression a `len(x)` call where x is a tuple or union of tuples?"""
-        if _CHECKER_HAS_TYPE_KERNEL and _native_checker_active and _rust_is_len_of_tuple is not None:
+        if (
+            _CHECKER_HAS_TYPE_KERNEL
+            and _native_checker_active
+            and _rust_is_len_of_tuple is not None
+        ):
             try:
                 result = _rust_is_len_of_tuple(expr)
                 if result is not None:
@@ -10408,7 +10422,11 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
             return fixup_partial_type(typ)
 
     def is_defined_in_base_class(self, var: Var) -> bool:
-        if _CHECKER_HAS_TYPE_KERNEL and _native_checker_active and _rust_is_defined_in_base_class is not None:
+        if (
+            _CHECKER_HAS_TYPE_KERNEL
+            and _native_checker_active
+            and _rust_is_defined_in_base_class is not None
+        ):
             try:
                 result = _rust_is_defined_in_base_class(var)
                 if result is not None:
@@ -10719,11 +10737,7 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
             # Pure-Python leaf derivation (Rust deferred or gate off): mirrors
             # classify_type_range's branch order in type_range.rs.
             if isinstance(typ, FunctionLike):
-                tag = (
-                    NATIVE_TYPE_RANGE_FN_TYPEOBJ
-                    if typ.is_type_obj()
-                    else NATIVE_TYPE_RANGE_REST
-                )
+                tag = NATIVE_TYPE_RANGE_FN_TYPEOBJ if typ.is_type_obj() else NATIVE_TYPE_RANGE_REST
             elif isinstance(typ, TypeType):
                 upper = True
                 if isinstance(typ.item, NoneType):
@@ -10810,7 +10824,11 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
 
         parent_type = get_proper_type(parent_type)
         member_type = get_proper_type(coerce_to_literal(member_type))
-        if _CHECKER_HAS_TYPE_KERNEL and _native_checker_active and _rust_is_literal_enum is not None:
+        if (
+            _CHECKER_HAS_TYPE_KERNEL
+            and _native_checker_active
+            and _rust_is_literal_enum is not None
+        ):
             try:
                 result = _rust_is_literal_enum(parent_type, member_type)
                 if result is not None:

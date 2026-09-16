@@ -4,12 +4,10 @@ from __future__ import annotations
 
 import os
 import re
-import sys
-from collections.abc import Callable, Iterator, Mapping, Sequence
-from contextlib import contextmanager
+from collections.abc import Sequence
 from types import SimpleNamespace
-from typing import Any, TypeVar, cast
-from unittest import TestCase, skipIf, skipUnless
+from typing import Any, TypeVar
+from unittest import TestCase, skipUnless
 
 from mypy.erasetype import _set_native_erase_active, erase_type, remove_instance_last_known_values
 from mypy.test.helpers import _env_gate
@@ -25,183 +23,62 @@ from mypy.checkstrformat import _set_native_strformat_active
 
 _set_native_strformat_active(_env_gate("TEST_NATIVE_TYPE_KERNEL"))
 T = TypeVar("T")
-from mypy.constraints import SUBTYPE_OF, SUPERTYPE_OF
 from mypy.indirection import TypeIndirectionVisitor
 from mypy.join import join_types
 from mypy.meet import is_overlapping_types, meet_types, narrow_declared_type
 from mypy.nodes import (
     ARG_NAMED,
-    ARG_NAMED_OPT,
     ARG_OPT,
     ARG_POS,
     ARG_STAR,
     ARG_STAR2,
     CONTRAVARIANT,
     COVARIANT,
-    GDEF,
     INVARIANT,
-    LDEF,
-    MDEF,
     ArgKind,
-    Argument,
-    AssertStmt,
-    AssignmentStmt,
     Block,
-    BytesExpr,
     CallExpr,
-    CastExpr,
     ClassDef,
-    ComparisonExpr,
-    ConditionalExpr,
-    Context,
-    Decorator,
-    DelStmt,
-    DictExpr,
-    EllipsisExpr,
     Expression,
-    ExpressionStmt,
-    ForStmt,
-    FuncBase,
-    FuncDef,
-    FuncItem,
-    Import,
-    ImportAll,
-    ImportFrom,
-    IndexExpr,
-    IntExpr,
-    ListExpr,
-    MemberExpr,
     MypyFile,
     NameExpr,
-    NotParsed,
-    OpExpr,
-    OverloadedFuncDef,
-    PassStmt,
-    PlaceholderNode,
-    RaiseStmt,
-    RefExpr,
-    ReturnStmt,
-    RevealExpr,
-    SetExpr,
-    SliceExpr,
-    StarExpr,
-    Statement,
-    StrExpr,
-    SymbolNode,
     SymbolTable,
-    SymbolTableNode,
-    TemplateStrExpr,
-    TupleExpr,
     TypeInfo,
-    TypeVarExpr,
-    UnaryExpr,
     Var,
-    WithStmt,
 )
 from mypy.options import Options
 from mypy.plugins.common import find_shallow_matching_overload_item
 from mypy.state import state
-from mypy.subtypes import (
-    IS_CLASS_OR_STATIC,
-    IS_CLASSVAR,
-    IS_EXPLICIT_SETTER,
-    IS_SETTABLE,
-    IS_VAR,
-    get_member_flags,
-    is_more_precise,
-    is_proper_subtype,
-    is_same_type,
-    is_subtype,
-)
+from mypy.subtypes import is_more_precise, is_proper_subtype, is_same_type, is_subtype
 from mypy.test.helpers import Suite, _env_gate, assert_equal, assert_type, skip
 from mypy.test.typefixture import InterfaceTypeFixture, TypeFixture
-from mypy.traverser import (
-    all_name_and_member_expressions,
-    all_return_statements,
-    all_return_statements_and_flags,
-    all_yield_expressions,
-    all_yield_from_expressions,
-    count_returns,
-    find_non_extension_handlers,
-    find_non_literal_handlers,
-    has_await_expression,
-    has_complex_slice,
-    has_return_statement,
-    has_str_expression,
-    has_yield_expression,
-    has_yield_from_expression,
-    has_yield_return,
-    is_global_expr,
-)
-from mypy.typeanal import (
-    _TYPE_WITH_INFO_TAG_INSTANCE,
-    _TYPE_WITH_INFO_TAG_NONE_TYPE,
-    _TYPE_WITH_INFO_TAG_TUPLE,
-    _TYPE_WITH_INFO_TAG_VEC,
-    _set_native_typeanal_active,
-    collect_all_inner_types,
-    has_any_from_unimported_type,
-    has_explicit_any,
-    make_optional_type,
-    native_analyze_type,
-)
-from mypy.typeops import (
-    coerce_to_literal,
-    false_only,
-    is_singleton_equality_type,
-    is_singleton_identity_type,
-    make_simplified_union,
-    true_only,
-    try_contracting_literals_in_union,
-    try_getting_instance_fallback,
-)
+from mypy.typeops import false_only, make_simplified_union, true_only
 from mypy.types import (
     AnyType,
     CallableType,
-    DeletedType,
-    EllipsisType,
-    ErasedType,
-    FormalArgument,
-    FunctionLike,
     Instance,
     LiteralType,
     NoneType,
-    NormalizedCallableType,
     Overloaded,
-    Parameters,
-    ParamSpecFlavor,
-    ParamSpecType,
-    PartialType,
     ProperType,
     TupleType,
     Type,
-    TypeAliasType,
     TypedDictType,
     TypeOfAny,
     TypeType,
     TypeVarId,
-    TypeVarLikeType,
-    TypeVarTupleType,
     TypeVarType,
     UnboundType,
     UninhabitedType,
     UnionType,
     UnpackType,
     get_proper_type,
-    get_proper_types,
     has_recursive_types,
 )
 
 # Solving the import cycle:
 import mypy.expandtype  # ruff: isort: skip
-from mypy.checker import TypeChecker, TypeMap
-from mypy.checker_shared import TypeRange
-from mypy.checkexpr import ExpressionChecker
-from mypy.checkstrformat import ConversionSpecifier
-from mypy.constraints import Constraint
-from mypy.errorcodes import ErrorCode
-from mypy.nodes import Lvalue, SuperExpr, TypeAlias
-from mypy.patterns import ClassPattern
+from mypy.checker import TypeChecker
 
 
 class TypesSuite(Suite):
@@ -2115,7 +1992,6 @@ class _FakeChecker:
     """Wires the real `check_getattr_method` onto fake scope/msg state."""
 
     def __init__(self, scope: _FakeScope, fx: TypeFixture) -> None:
-        from mypy.checker import TypeChecker
 
         self.scope = scope
         self.msg = _FakeMsg()
@@ -2136,7 +2012,6 @@ def _run_check(
     scope: _FakeScope, typ: object, name: str
 ) -> tuple[list[str], list[tuple[str, object]]]:
     """Call the real `check_getattr_method` body against a fake checker."""
-    from mypy.checker import TypeChecker
 
     chk = _FakeChecker(scope, TypeFixture())
     TypeChecker.check_getattr_method(chk, typ, context=None, name=name)  # type: ignore[arg-type]
@@ -2221,7 +2096,6 @@ class _BrokenAttrInfo(TypeInfo):
     def __init__(
         self, fullname: str, broken_attr: str, exc: type[Exception] = AttributeError
     ) -> None:
-        from mypy.nodes import Block, ClassDef
 
         cd = ClassDef(fullname.rsplit(".", 1)[-1], Block([]), None, [])
         cd.fullname = fullname
@@ -2244,6 +2118,7 @@ class _BrokenAttrInfo(TypeInfo):
 # H1d cluster (#1672): live-object decision heads on the checker gate.
 # Each suite pins the seam payload directly, then drives the real method
 # gate-off vs gate-on. None of the four seams serializes anything.
+
 
 class _H1dBinderStub:
     """`ConditionalTypeBinder` stand-in: only the suppression query is read."""

@@ -2,87 +2,54 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Sized
-from typing import Any, Literal, TypeVar
+from typing import Any, TypeVar
 
 from mypy.nodes import (
-    AssignmentStmt,
-    Block,
-    CallExpr,
-    DataclassTransformSpec,
     Decorator,
-    Expression,
-    FuncDef,
-    Lvalue,
-    MemberExpr,
     MypyFile,
-    NameExpr,
-    Node,
     OverloadedFuncDef,
-    RefExpr,
-    SymbolNode,
     SymbolTable,
     SymbolTableNode,
-    TypeAlias,
     TypeInfo,
-    Var,
 )
-from mypy.types import CallableType, Instance, ProperType, TupleType, Type, TypeVarLikeType
-
 
 T = TypeVar("T")
 
-
 def rust_read_cache_meta(blob: bytes) -> dict[str, Any] | None: ...
-
 def rust_read_cache_meta_ex(blob: bytes) -> dict[str, Any] | None: ...
-
 def rust_write_cache_meta(meta: Any) -> bytes | None: ...
-
 def rust_write_cache_meta_ex(meta_ex: Any) -> bytes | None: ...
-
 def rust_get_type_triggers(typ: Any, use_logical_deps: bool) -> list[str] | None: ...
-
 def rust_attribute_triggers(typ: Any, name: str) -> list[str] | None: ...
-
 def rust_walk_dependency_visitor(
     root: Any, type_map: dict[Any, Any], alias_deps: Any, use_logical_deps: bool
 ) -> dict[str, set[str]] | None: ...
-
 def rust_walk_dependency_target(
     module_id: str, module_tree: Any, target: Any, type_map: dict[Any, Any]
 ) -> dict[str, set[str]] | None: ...
 
-
 # Issue #570: fixup functions (live PyO3 objects)
 def rust_fixup_type(typ: Any, modules: dict[str, MypyFile], allow_missing: bool) -> bool: ...
-
 def rust_fixup_type_info(
     info: TypeInfo, modules: dict[str, MypyFile], allow_missing: bool
 ) -> bool: ...
-
 def rust_resolve_cross_ref(
     value: SymbolTableNode, modules: dict[str, MypyFile], allow_missing: bool
 ) -> bool: ...
-
 def rust_fixup_symbol_table(
     symtab: SymbolTable, modules: dict[str, MypyFile], allow_missing: bool
 ) -> bool: ...
-
 def rust_fixup_overloaded_func_def(
     o: OverloadedFuncDef, modules: dict[str, MypyFile], allow_missing: bool
 ) -> bool: ...
-
 def rust_fixup_decorator(
     d: Decorator, modules: dict[str, MypyFile], allow_missing: bool
 ) -> bool: ...
-
 
 # mypy/server/deps.py — D2-style import-graph triggers.
 def rust_compute_wildcard_triggers(
     changed_names: list[str], package_nesting_level: int
 ) -> list[str] | None: ...
-
 def rust_compute_target_modules(
     triggers: list[str],
     deps: list[tuple[str, list[str]]],
@@ -90,100 +57,65 @@ def rust_compute_target_modules(
     module_ids: list[str],
 ) -> list[str]: ...
 
-
 # mypy/server/update.py — daemon update helpers.
 def rust_dedupe_modules(modules: list[tuple[str, str]]) -> list[tuple[str, str]]: ...
-
 def rust_get_module_to_path_map(graph: Any) -> list[tuple[str, str]]: ...
-
 def rust_get_sources(changed_modules: list[tuple[str, str]], followed: bool) -> list[Any]: ...
-
 def rust_extract_fnam_from_message(message: str) -> str | None: ...
-
 def rust_extract_possible_fnam_from_message(message: str) -> str: ...
-
 def rust_sort_messages_preserving_file_order(
     messages: list[str], prev_messages: list[str]
 ) -> list[str]: ...
-
 def rust_find_relative_leaf_module(
     modules: list[tuple[str, str]], deps: dict[str, list[str]]
 ) -> tuple[str, str] | None: ...
-
 def rust_find_unloaded_deps(
     initial: list[str], graph: dict[str, tuple[list[str], list[str]]], loaded: set[str]
 ) -> list[str] | None: ...
-
 def rust_target_from_node(module: str, node: Any) -> str | None: ...
-
 def rust_merge_dependencies(new_deps: dict[str, set[str]], deps: dict[str, set[str]]) -> None: ...
-
 def rust_non_trivial_bases(info: Any) -> list[Any]: ...
-
 def rust_has_user_bases(info: Any) -> bool: ...
-
 def rust_compare_symbol_table_snapshots(
     name_prefix: str, snapshot1: dict[str, Any], snapshot2: dict[str, Any]
 ) -> set[str]: ...
-
 def rust_snapshot_type(typ: Any) -> tuple[Any, ...] | None: ...
-
-def rust_snapshot_symbol_table(
-    name_prefix: str, table: SymbolTable
-) -> dict[str, Any] | None: ...
+def rust_snapshot_symbol_table(name_prefix: str, table: SymbolTable) -> dict[str, Any] | None: ...
 
 # Phase G3.1 (#1670): read flip — the same builder over Rust-owned
 # namespace storage, `None` when the store cannot mirror the table.
 def rust_snapshot_symbol_table_shadow(
     name_prefix: str, table: SymbolTable
 ) -> dict[str, Any] | None: ...
-
 def rust_is_expr_literal_type(node: Any) -> bool | None: ...
-
 def rust_get_partial_instance_type(node: Any) -> Any | None: ...
-
 
 # mypy/dmypy_server.py — daemon server helpers.
 def rust_ignore_suppressed_imports(module: str) -> bool | None: ...
-
 def rust_get_meminfo() -> dict[str, Any] | None: ...
-
 def rust_response_metadata(options: Any) -> dict[str, str] | None: ...
-
 def rust_find_all_sources_in_build(graph: Any, extra: Any) -> list[Any] | None: ...
-
 def rust_add_all_sources_to_changed(sources: Any, changed: Any) -> None: ...
-
 def rust_fix_module_deps(graph: Any) -> None: ...
-
 def rust_filter_out_missing_top_level_packages(
     packages: Any, search_paths: Any, fscache: Any
 ) -> set[str] | None: ...
 
-
 # Issue #540: pure helpers from mypy/modulefinder.py
 def rust_is_init_file(path: str) -> bool: ...
-
 def rust_parse_version(version: str) -> tuple[int, int]: ...
-
 def rust_mypy_path() -> list[str]: ...
-
 def rust_typeshed_py_version(options: Any) -> tuple[int, int]: ...
-
 def rust_default_lib_path(
     data_dir: str, pyversion: tuple[int, int], custom_typeshed_dir: str | None
 ) -> list[str]: ...
-
 def rust_load_stdlib_py_versions(
     custom_typeshed_dir: str | None,
 ) -> dict[str, tuple[tuple[int, int], tuple[int, int] | None]]: ...
-
 def rust_matches_exclude(
     subpath: str, excludes: list[str], fscache: Any, verbose: bool
 ) -> bool: ...
-
 def rust_get_search_dirs(python_executable: str | None) -> tuple[list[str], list[str]]: ...
-
 def rust_compute_search_paths(
     sources: Any, options: Any, data_dir: str, alt_lib_path: str | None
 ) -> RustSearchPaths: ...
@@ -255,7 +187,6 @@ class RustBuildSourceSet:
     def is_source(self, file: Any) -> bool: ...
 
 def rust_process_start_options(flags: Any, allow_sources: bool) -> Any: ...
-
 
 __all__ = [
     "rust_read_cache_meta",

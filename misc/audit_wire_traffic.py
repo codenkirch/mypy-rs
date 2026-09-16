@@ -44,6 +44,7 @@ if _AUDIT_ROOT:
         if "editable" in _mod or "editable" in repr(_f):
             _sys0.meta_path.remove(_f)
     import mypy as _mypy_pre
+
     assert _mypy_pre.__file__.startswith(_AUDIT_ROOT), _mypy_pre.__file__
 
 
@@ -51,7 +52,8 @@ import collections
 import os
 import sys
 import types
-from typing import Any, Callable
+from collections.abc import Callable
+from typing import Any
 
 # rust_* classifier seams whose None is a decided negative, not a deferral.
 CLASSIFIER_NEGATIVE_SEAMS: frozenset[str] = frozenset(
@@ -365,7 +367,9 @@ def report() -> None:
     print(f"serialization events: {tot}", file=out)
     print(f"  useful:      {sum(useful.values())} ({sum(useful_bytes.values())} B)", file=out)
     print(f"  deferred:    {sum(deferred.values())} ({sum(deferred_bytes.values())} B)", file=out)
-    print(f"  unconsumed:  {sum(unconsumed.values())} ({sum(unconsumed_bytes.values())} B)", file=out)
+    print(
+        f"  unconsumed:  {sum(unconsumed.values())} ({sum(unconsumed_bytes.values())} B)", file=out
+    )
 
     print("\n--- A. serialized then SEAM DEFERRED (top 25 call sites) ---", file=out)
     for site_, cnt in deferred.most_common(25):
@@ -391,7 +395,10 @@ def report() -> None:
     # Ranked cost proxy: calls * fixed FFI + per-call payload bytes (re-decoded
     # on every wire call) + first-consumed bytes. The constants and their
     # calibration are documented in the 2026-09-14 wire-traffic audit doc.
-    print("\n--- RANKED proxy: calls*0.63us + call_bytes*0.04us/B + encode_bytes*0.04us/B ---", file=out)
+    print(
+        "\n--- RANKED proxy: calls*0.63us + call_bytes*0.04us/B + encode_bytes*0.04us/B ---",
+        file=out,
+    )
     print(
         "  proxy_us   seam                                      calls  callMB  encMB  B/call  wire?",
         file=out,
@@ -428,7 +435,7 @@ def report() -> None:
             f"  plugin instances = {len(plugins) if plugins is not None else None}",
             file=out,
         )
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         print(f"  plugin-state probe failed: {exc!r}", file=out)
 
 
@@ -442,8 +449,7 @@ def main() -> int:
     n_ser = patch_serializers()
     n_probe = patch_probes()
     print(
-        f"[audit] patched {n_seams} seams, {n_ser} serializers, {n_probe} probes",
-        file=sys.stderr,
+        f"[audit] patched {n_seams} seams, {n_ser} serializers, {n_probe} probes", file=sys.stderr
     )
     extra = os.environ.get("MYPY_AUDIT_ARGS")
     if extra:
@@ -471,10 +477,7 @@ def main() -> int:
         traceback.print_exc()
     finally:
         total_run_s = _time.perf_counter() - _t0
-        print(
-            f"\n[audit] total run wall {total_run_s:.1f}s (load-contaminated)",
-            file=sys.stderr,
-        )
+        print(f"\n[audit] total run wall {total_run_s:.1f}s (load-contaminated)", file=sys.stderr)
         report()
     return 0
 
