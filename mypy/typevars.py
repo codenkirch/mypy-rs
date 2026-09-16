@@ -19,9 +19,9 @@ from mypy.types import (
 )
 from mypy.typevartuples import erased_vars
 
-# Stage 6c type-kernel seam: when type_kernel is importable and the gate
-# is active, has_no_typevars and fill_typevars route through Rust. Rust
-# returns None for unsupported cases; we fall back to Python.
+# Stage 6c type-kernel seam: with the gate active, has_no_typevars and
+# fill_typevars_with_any route through Rust (None = unsupported, fall back).
+# fill_typevars is pure Python again: #1739 retired its losing shim.
 try:
     import type_kernel as _type_kernel
     from librt.internal import ReadBuffer as _ReadBuffer, WriteBuffer as _WriteBuffer
@@ -88,22 +88,8 @@ def fill_typevars(typ: TypeInfo) -> Instance | TupleType:
 
     For a generic G type with parameters T1, .., Tn, return G[T1, ..., Tn].
     """
-    # Native seam: Rust yields only the rebuilt tvar-arg list via the
-    # wire round-trip; the root Instance (and named-tuple wrapper) are
-    # rebuilt on the live `typ` so a stale wire-map entry cannot leak.
-    if _HAS_TYPE_KERNEL and _native_typevars_active:
-        try:
-            result = _type_kernel.rust_fill_typevars(typ)
-            if result is not None:
-                decoded = _native_decode_well_formed(bytes(result))
-                if decoded is not None and isinstance(decoded, (Instance, TupleType)):
-                    root = decoded if isinstance(decoded, Instance) else decoded.partial_fallback
-                    inst = Instance(typ, root.args)
-                    if typ.tuple_type is None:
-                        return inst
-                    return typ.tuple_type.copy_modified(fallback=inst)
-        except (AssertionError, NotImplementedError, ValueError):
-            pass
+    # Native seam retired (#1739): 2.6-6.8x loss to a 250ns body, because
+    # Rust re-serializes every tvar and Python re-decodes the whole Instance.
     tvs: list[Type] = []
     # TODO: why do we need to keep both typ.type_vars and typ.defn.type_vars?
     for i in range(len(typ.defn.type_vars)):

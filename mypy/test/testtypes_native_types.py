@@ -21596,3 +21596,140 @@ class NativeWireRoundTripSeamsRetiredSuite(Suite):
         flat = flatten_nested_unions([UnionType([self.fx.a, self.fx.b])])
         assert [str(x) for x in flat] == [str(self.fx.a), str(self.fx.b)]
         assert flat[0] is self.fx.a and flat[1] is self.fx.b
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeFillTypevarsRetiredSuite(Suite):
+    """Pin the #1739 retirement of the fill_typevars wire seam.
+
+    `fill_typevars` had Rust re-serialize every class type parameter and
+    wrap it in an encoded Instance, then re-decoded that Instance in
+    Python to read `root.args`. Measured min-of-7 ns/call, both arms in
+    one process, gate flag the only variable, decode cache warm, against
+    type_kernel built 2026-09-16 16:42 (/private/tmp/mypy-rs-audit-tk):
+
+      shape                      python   native   ratio
+      non-generic (0 tvars)       250.3    736.1   2.94x
+      G[T] (1 tvar)               909.1   2970.2   3.27x
+      H[S,T] (2 tvars)           1486.1   5231.6   3.52x
+      W8 (8 tvars)               4773.4  16547.6   3.47x
+      named tuple                 519.9   3547.2   6.82x
+      V[T, *Ts]                  1629.5   6917.5   4.25x
+      P[**P] (ParamSpec)         1356.9   3492.9   2.57x
+
+    With the decode cache cold the loss widens to 12.5-22x. `fill_typevars`
+    now runs pure Python; `rust_fill_typevars` stays registered for
+    direct-seam tests (`NativeFillTypevarsSuite`). This suite fails if a
+    wire crossing returns on this path.
+    """
+
+    def setUp(self) -> None:
+        from mypy.typevars import _set_native_typevars_active
+
+        self.fx = TypeFixture()
+        self._set_gate = _set_native_typevars_active
+        self._set_gate(True)
+
+    def tearDown(self) -> None:
+        self._set_gate(False)
+
+    def test_native_shim_removed(self) -> None:
+        import inspect
+
+        from mypy.typevars import fill_typevars
+
+        src = inspect.getsource(fill_typevars)
+        assert "rust_fill_typevars" not in src, "fill_typevars must not call the seam"
+        assert "_native_decode_well_formed" not in src, "decode helper is unreachable now"
+
+    def test_pyfunction_still_registered(self) -> None:
+        assert hasattr(_type_kernel, "rust_fill_typevars"), "seam must stay callable"
+
+    def test_no_wire_crossing(self) -> None:
+        from mypy import typevars as _typevars_mod
+        from mypy.typevars import fill_typevars
+
+        real_mod = _typevars_mod._type_kernel  # type: ignore[attr-defined]
+        seen: list[str] = []
+
+        class _Counter:
+            def __getattr__(self, name: str) -> Any:
+                return getattr(real_mod, name)
+
+            def rust_fill_typevars(self, *args: Any, **kw: Any) -> Any:
+                seen.append("rust_fill_typevars")
+                return real_mod.rust_fill_typevars(*args, **kw)
+
+            def rust_fill_typevars_with_any(self, *args: Any, **kw: Any) -> Any:
+                seen.append("rust_fill_typevars_with_any")
+                return real_mod.rust_fill_typevars_with_any(*args, **kw)
+
+        _typevars_mod._type_kernel = _Counter()  # type: ignore[attr-defined, assignment]
+        try:
+            assert _typevars_mod._native_typevars_active, "pin requires the gate on"
+            for info in (self.fx.ai, self.fx.gi, self.fx.hi):
+                fill_typevars(info)
+        finally:
+            _typevars_mod._type_kernel = real_mod  # type: ignore[attr-defined]
+        assert seen == [], f"fill_typevars crossed the wire: {seen}"
+
+    def test_values_match_python(self) -> None:
+        from mypy.typevars import fill_typevars
+
+        plain = fill_typevars(self.fx.ai)
+        assert isinstance(plain, Instance)
+        assert plain.type is self.fx.ai and list(plain.args) == []
+
+        one = fill_typevars(self.fx.gi)
+        assert isinstance(one, Instance) and one.type is self.fx.gi
+        source_tv = cast(TypeVarType, self.fx.gi.defn.type_vars[0])
+        assert list(one.args) == [source_tv.copy_modified(line=-1, column=-1)]
+        assert one.args[0].line == -1 and one.args[0].column == -1
+
+        two = fill_typevars(self.fx.hi)
+        assert isinstance(two, Instance) and two.type is self.fx.hi
+        assert [a.line for a in two.args] == [-1, -1]
+        assert [a.column for a in two.args] == [-1, -1]
+
+        variadic = self.fx.make_type_info(
+            "V", mro=[self.fx.oi], typevars=["T", "Ts"], typevar_tuple_index=1
+        )
+        unpacked = fill_typevars(variadic)
+        assert isinstance(unpacked, Instance) and unpacked.type is variadic
+        assert isinstance(unpacked.args[1], UnpackType)
+        assert unpacked.args[1].from_star_syntax is False
+        assert isinstance(unpacked.args[1].type, TypeVarTupleType)
+        assert unpacked.args[1].type.name == "Ts"
+        assert unpacked.args[1].type.line == -1 and unpacked.args[1].type.column == -1
+
+        paramspec = self.fx.make_type_info("P", mro=[self.fx.oi])
+        paramspec.defn.type_vars = [
+            ParamSpecType(
+                "P",
+                "P",
+                TypeVarId(1),
+                ParamSpecFlavor.BARE,
+                Instance(self.fx.oi, [], -1),
+                NoneType(),
+            )
+        ]
+        ps = fill_typevars(paramspec)
+        assert isinstance(ps, Instance) and ps.type is paramspec
+        assert isinstance(ps.args[0], ParamSpecType) and ps.args[0].line == -1
+
+        named = self.fx.make_type_info(
+            "NT",
+            mro=[self.fx.oi, self.fx.std_tuplei],
+            bases=[Instance(self.fx.std_tuplei, [self.fx.a])],
+        )
+        named.tuple_type = TupleType(
+            [self.fx.a, self.fx.b], Instance(self.fx.std_tuplei, [self.fx.o])
+        )
+        nt = fill_typevars(named)
+        assert isinstance(nt, TupleType)
+        assert nt.partial_fallback.type is named
+        assert [str(i) for i in nt.items] == [str(self.fx.a), str(self.fx.b)]
+        # The source tuple_type keeps its own fallback: copy_modified, not mutation.
+        source = named.tuple_type
+        assert isinstance(source, TupleType)
+        assert source.partial_fallback.type is self.fx.std_tuplei
