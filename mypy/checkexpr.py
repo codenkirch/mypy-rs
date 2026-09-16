@@ -283,7 +283,6 @@ try:
         rust_has_uninhabited_component as _rust_has_uninhabited_component,
         rust_infer_function_type_arguments as _rust_infer_function_type_arguments,
         rust_is_async_def as _rust_is_async_def,
-        rust_is_duplicate_mapping as _rust_is_duplicate_mapping,
         rust_is_enum_callable_base as _rust_is_enum_callable_base,
         rust_is_expr_literal_type as _rust_is_expr_literal_type,
         rust_is_non_empty_tuple as _rust_is_non_empty_tuple,
@@ -332,7 +331,6 @@ except ImportError:
     _rust_has_bytes_component = None  # type: ignore[assignment]
     _rust_is_non_empty_tuple = None  # type: ignore[assignment]
     _rust_is_async_def = None  # type: ignore[assignment]
-    _rust_is_duplicate_mapping = None  # type: ignore[assignment]
     _rust_is_enum_callable_base = None  # type: ignore[assignment]
     _rust_is_expr_literal_type = None  # type: ignore[assignment]
     _rust_get_partial_instance_type = None  # type: ignore[assignment]
@@ -9075,23 +9073,9 @@ def is_non_empty_tuple(t: Type) -> bool:
 def is_duplicate_mapping(
     mapping: list[int], actual_types: list[Type], actual_kinds: list[ArgKind]
 ) -> bool:
-    if (
-        _CHECKEXPR_HAS_TYPE_KERNEL
-        and _native_checkexpr_active
-        and _native_checkexpr_resolver is not None
-    ):
-        try:
-            type_bytes = [_serialize_type_for_checkexpr(actual_types[m]) for m in mapping]
-            result = _rust_is_duplicate_mapping(
-                mapping,
-                type_bytes,
-                [int(k.value) for k in actual_kinds],
-                _native_checkexpr_resolver,
-            )
-            if result is not None:
-                return result
-        except (AssertionError, NotImplementedError):
-            pass
+    # Native seam retired (#1739): 342,101 calls/corpus, Python body is a
+    # len>1 guard plus two exemptions, shim serialized every mapped type and
+    # crossed the FFI. Measured 2.9x-8.6x over five shapes. See PR body.
     return (
         len(mapping) > 1
         # Multiple actuals can map to the same formal if they both come from
