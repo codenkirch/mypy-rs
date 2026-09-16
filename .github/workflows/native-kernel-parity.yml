@@ -424,9 +424,15 @@ jobs:
           TEST_NATIVE_SYMTABLE_MIRROR: "1"
           TEST_NATIVE_SYMTABLE_READ_FLIP_VERIFY: "1"
           MYPY_NATIVE_TYPE_KERNEL_REQUIRED: "1"
+          # #1765: `{pid}` expands per xdist worker, so every process that
+          # builds writes its own cumulative session dump.
+          MYPY_TK_SYMTABLE_SESSIONFINISH_OUT: ${{ runner.temp }}/symtable-flip-{pid}.json
         run: |
           uv run python -m pytest mypy/test/testdiff.py mypy/test/testcachedata.py -q -n4 \
             --timeout=120 --timeout-method=thread
+          # The suites assert engagement themselves; this is the step-level
+          # evidence, so the leg cannot pass with the flip switched off.
+          uv run python misc/symtable_flip_report.py '${{ runner.temp }}/symtable-flip-*.json'
 
       - name: Read-flip differential (fine-grained + daemon)
         env:

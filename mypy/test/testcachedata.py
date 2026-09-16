@@ -21,7 +21,7 @@ import tempfile
 import unittest
 from unittest import mock, skipUnless
 
-from mypy import build
+from mypy import build, symtables_mirror
 from mypy.cache import WriteBuffer
 from mypy.cache_data import (
     _HAS_AST_SERIALIZE,
@@ -31,7 +31,12 @@ from mypy.cache_data import (
 from mypy.modulefinder import BuildSource
 from mypy.nodes import GDEF, MypyFile, PlaceholderNode, SymbolTable, SymbolTableNode
 from mypy.options import Options
-from mypy.server.astdiff import compare_symbol_table_snapshots, snapshot_symbol_table
+from mypy.server.astdiff import (
+    compare_symbol_table_snapshots,
+    read_flip_stats,
+    snapshot_symbol_table,
+)
+from mypy.test.helpers import _env_gate
 
 _BASE = """\
 from __future__ import annotations
@@ -137,6 +142,30 @@ def _table_without_builtins(tree: MypyFile) -> SymbolTable:
     return table
 
 
+# Issue #1765: this suite builds `Options()` directly, so it never picked
+# up the `TEST_NATIVE_SYMTABLE_*` corpus gates `parse_options` arms for the
+# data-driven suites. Decode them with the same helper here.
+_SYMTABLE_MIRROR = _env_gate("TEST_NATIVE_SYMTABLE_MIRROR")
+_SYMTABLE_FLIP_VERIFY = _env_gate("TEST_NATIVE_SYMTABLE_READ_FLIP_VERIFY")
+_SYMTABLE_FLIP = _env_gate("TEST_NATIVE_SYMTABLE_READ_FLIP") or _SYMTABLE_FLIP_VERIFY
+# The two cache-loaded trees of the corpus; run 2 rechecks `main` and
+# loads these two from the cache written by run 1.
+_CACHED_MODULES = ("pkg.base", "pkg.use")
+
+
+def _flip_state() -> tuple[dict[str, int], dict[str, int]]:
+    """Consumer-side (`astdiff`) and store-side (`Rust`) flip counters."""
+    return dict(read_flip_stats()), symtables_mirror.flip_report()
+
+
+def _counter_delta(before: dict[str, int], after: dict[str, int]) -> dict[str, int]:
+    return {
+        key: after.get(key, 0) - before.get(key, 0)
+        for key in set(after) | set(before)
+        if after.get(key, 0) != before.get(key, 0)
+    }
+
+
 @skipUnless(_HAS_AST_SERIALIZE, "requires the ast_serialize extension")
 class CacheDataWriterSuite(unittest.TestCase):
     def setUp(self) -> None:
@@ -153,16 +182,25 @@ class CacheDataWriterSuite(unittest.TestCase):
         # is testable without a prior build in the same process.
         _set_native_cache_data_active(True)
 
-    def _options(self) -> Options:
+    def _options(
+        self, *, cache_dir: str | None = None, fixed_format_cache: bool = True
+    ) -> Options:
         options = Options()
         options.show_traceback = True
         options.incremental = True
-        options.cache_dir = self.cache_dir
+        options.cache_dir = cache_dir or self.cache_dir
         options.native_type_kernel = True
         # The write-cache dispatch activates from this opt-in option; a
         # build would otherwise reset the module gate set in setUp.
         options.native_cache_data = True
         options.allow_empty_bodies = True
+        options.fixed_format_cache = fixed_format_cache
+        # G3.0a/G3.1 gates, armed exactly as `parse_options` arms them for
+        # the data-driven suites (#1765): capture first, then the read flip
+        # (verify implies it).
+        options.native_symtable_mirror = _SYMTABLE_MIRROR
+        options.native_symtable_read_flip_verify = _SYMTABLE_FLIP_VERIFY
+        options.native_symtable_read_flip = _SYMTABLE_FLIP
         return options
 
     def _sources(self, source_texts: bool) -> list[BuildSource]:
@@ -175,8 +213,13 @@ class CacheDataWriterSuite(unittest.TestCase):
             )
         return out
 
-    def _build(self, source_texts: bool) -> build.BuildResult:
-        return build.build(sources=self._sources(source_texts), options=self._options())
+    def _build(
+        self, source_texts: bool, *, cache_dir: str | None = None, fixed_format_cache: bool = True
+    ) -> build.BuildResult:
+        return build.build(
+            sources=self._sources(source_texts),
+            options=self._options(cache_dir=cache_dir, fixed_format_cache=fixed_format_cache),
+        )
 
     def test_live_tree_byte_parity(self) -> None:
         result = self._build(source_texts=True)
@@ -237,9 +280,7 @@ class CacheDataWriterSuite(unittest.TestCase):
             self.assertIsNotNone(native, f"native writer deferred for cached {module_id}")
             assert native is not None
             self.assertEqual(
-                native,
-                legacy,
-                f"cached {module_id} byte mismatch: {_first_diff(legacy, native)}",
+                native, legacy, f"cached {module_id} byte mismatch: {_first_diff(legacy, native)}"
             )
             if module_id in ("pkg.base", "pkg.use"):
                 # Dependencies of the rechecked entry module come from the
@@ -250,6 +291,101 @@ class CacheDataWriterSuite(unittest.TestCase):
                 self.assertFalse(diff, f"{module_id} symbol table diff: {sorted(diff)[:10]}")
                 checked += 1
         self.assertEqual(checked, 2)
+
+    def _cache_load_round_trip(self, *, fixed_format_cache: bool) -> dict[str, MypyFile]:
+        """Run 1 from source, then return run 2's trees loaded from the cache."""
+        cache_dir = os.path.join(self.root, f".cache-{'ff' if fixed_format_cache else 'json'}")
+        self._build(source_texts=True, cache_dir=cache_dir, fixed_format_cache=fixed_format_cache)
+        with open(os.path.join(self.root, "main.py"), "a", encoding="utf8") as file:
+            file.write("\n# run 2\n")
+        second = self._build(
+            source_texts=False, cache_dir=cache_dir, fixed_format_cache=fixed_format_cache
+        )
+        trees = {module_id: second.manager.modules[module_id] for module_id in _CACHED_MODULES}
+        for module_id, tree in trees.items():
+            self.assertTrue(tree.is_cache_skeleton, f"{module_id} was not cache-loaded")
+        return trees
+
+    @skipUnless(_SYMTABLE_FLIP, "requires TEST_NATIVE_SYMTABLE_READ_FLIP(_VERIFY)")
+    def test_cached_json_trees_serve_the_read_flip(self) -> None:
+        """The JSON cache reader records load writes, so the flip serves.
+
+        `SymbolTable.deserialize` populates through `dict.__setitem__`, so
+        the G3.0a capture sees every load write and the shadow is complete.
+        This is the cache-load case where the flip's claim is falsifiable:
+        a capture regression here empties the counters and fails the test.
+        """
+        trees = self._cache_load_round_trip(fixed_format_cache=False)
+        for module_id, tree in trees.items():
+            self.assertIsNotNone(
+                symtables_mirror.handle_of(tree.names),
+                f"{module_id}: the shadow never adopted the loaded namespace; "
+                "is the symtable mirror armed and the type_kernel extension loaded?",
+            )
+            self.assertEqual(
+                symtables_mirror.entry_count(tree.names),
+                len(tree.names),
+                f"{module_id}: shadow is not the loaded namespace",
+            )
+
+        before = _flip_state()
+        for module_id, tree in trees.items():
+            snapshot_symbol_table(module_id, tree.names)
+        stats = _counter_delta(before[0], _flip_state()[0])
+        counts = _counter_delta(before[1], _flip_state()[1])
+        self.assertEqual(stats.get("deferred", 0), 0, f"flip deferred: {stats}")
+        self.assertEqual(stats.get("served", 0), len(trees), f"flip served: {stats}")
+        self.assertGreaterEqual(
+            counts.get("tables_mirrored", 0),
+            len(trees),
+            f"loaded namespaces were not mirrored from the store: {counts}",
+        )
+        self.assertGreaterEqual(
+            counts.get("entries_mirrored", 0),
+            sum(len(tree.names) for tree in trees.values()),
+            f"too few entries served from the store: {counts}",
+        )
+        if _SYMTABLE_FLIP_VERIFY:
+            # Mode 2 diffs every served snapshot against the flip-off walk.
+            self.assertEqual(stats.get("verify.ok", 0), len(trees), f"verify: {stats}")
+
+    @skipUnless(_SYMTABLE_FLIP, "requires TEST_NATIVE_SYMTABLE_READ_FLIP(_VERIFY)")
+    def test_cached_fixed_format_trees_defer_the_read_flip(self) -> None:
+        """The fixed-format reader records nothing, so the flip defers.
+
+        `MypyFile.read` builds each namespace with `SymbolTable.read`, a
+        C-level dict-constructor path that never reaches the patched
+        `SymbolTable.__setitem__`, and the G3.2 write-time seed needs a
+        recorded write to run. Every cache-loaded namespace therefore has
+        an empty shadow here, so the flip defers to the live table: the
+        deferred state is pinned so the vacancy is measured evidence, not
+        a silent pass. Closing it needs the reader to seed the store
+        (#1773), not a change to this suite.
+        """
+        trees = self._cache_load_round_trip(fixed_format_cache=True)
+        for module_id, tree in trees.items():
+            self.assertIsNone(
+                symtables_mirror.handle_of(tree.names),
+                f"{module_id}: the fixed-format reader adopted a namespace",
+            )
+            invisible = 0
+            for symbol in tree.names.values():
+                node = symbol.node
+                if node is None or not hasattr(node, "names"):
+                    continue
+                invisible += symtables_mirror.entry_count(node.names) == 0
+            self.assertGreater(invisible, 0, f"{module_id}: no class namespace to check")
+
+        before = _flip_state()
+        for module_id, tree in trees.items():
+            snapshot_symbol_table(module_id, tree.names)
+        stats = _counter_delta(before[0], _flip_state()[0])
+        counts = _counter_delta(before[1], _flip_state()[1])
+        self.assertEqual(stats.get("calls", 0), len(trees), f"flip was not consulted: {stats}")
+        self.assertEqual(stats.get("deferred", 0), len(trees), f"deferrals: {stats}")
+        self.assertEqual(stats.get("served", 0), 0, f"flip served a loaded table: {stats}")
+        self.assertEqual(counts.get("tables_mirrored", 0), 0, f"mirrored: {counts}")
+        self.assertEqual(counts.get("defer_no_handle", 0), len(trees), f"defer reason: {counts}")
 
     def test_unsupported_shape_defers(self) -> None:
         tree = MypyFile([], [])
