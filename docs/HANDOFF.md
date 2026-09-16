@@ -1,5 +1,110 @@
 # Handoff: strangler-fig Rust migration loop (seam-deferral reduction)
 
+## RESUME POINT — 2026-09-16, late (wave 7 close: 16 PRs today, G3.2 read-flip coverage landed)
+
+Wave 7 ran five lanes against the wave-6 inventory: four retirement lanes
+(disjoint modules, per-area pin files) plus the G3.2 ownership step. All landed.
+`main` = `33c7a5b79`. No open PRs, no lane worktrees, no stashes.
+
+### Landed in wave 7
+
+| PR | what |
+|---|---|
+| `33c7a5b79` (#1764) | **G3.2**: write-time seed for pre-populated symtable owners (#1755) — the read flip now covers owners whose dict was already non-empty at first recorded write |
+| `a3919bbec` (#1762) | typeanal: `validate_instance` (3.48x-4.76x), `classify_type_with_info` (1.92x-2.77x) |
+| `28e59f392` (#1759) | checker: `is_definition` (10.94x), `classify_check_lvalue` (5.60x), `classify_check_assignment` (7.62x), `is_empty_generator_function` (2.95x) |
+| `cbab29443` (#1758) | checkmember: `is_instance_var` (3.73x-5.30x), `classify_analyze_var` (1.72x-4.32x) |
+| `2d80926ca` (#1760) | types/nodes: `flatten_nested_tuples` (24.6x-**59.3x**), `func_item_is_dynamic` (2.7x-7.0x) |
+
+Ten previously-unmeasured seams retired, every one with engagement proven per
+shape, a post-retirement zero-crossing probe, and no edit to the shared
+engagement suites (the per-area pin convention from #1746/#1751 held). Today's
+total: **16 PRs merged**.
+
+### G3.2 in detail (the ownership step, not a perf step)
+
+Mechanism: at the first recorded write of an owner whose dict is already
+non-empty, one `owner.items()` read outside the store borrow, ordinals minted in
+live order, entries pinned and indexed like write-log entries; **fail-closed** —
+any live value without the capture's flag slots leaves the owner `Inherited`.
+Default **not** flipped; no reset/pin/`CACHE_VERSION`/`OPTIONS_AFFECTING_CACHE`
+change.
+
+What its differential now catches that it did not: `astdiff.py:271/:277`'s
+mode-2 `owned != baseline` / `list(owned) != list(baseline)` comparisons
+**previously never ran for these tables** (the flip returned `None` before
+reaching them). Plus non-vacuity counters (`defer_inherited == 0`,
+`tables_mirrored`/`entries_mirrored` advancing, `seed_rejects == 0`), the `@`-key
+pinned explicitly (`func_scoped_name("D", 5)` survivor, order `["D@5", "a"]`),
+and provenance counters separating write-log (`put_entries`) from seeded entries
+— the attempt receipt that `seeded_owners == 0` cannot express.
+
+Negative control, falsified by mutation: on a kernel built with permissive
+`read_flags`, `test_unreadable_namespace_does_not_seed` fails at
+`assert 1 == 0` while the positive test still passes. On the real fine-grained
+slice (36 cases): `deferred 140 -> 124`, `defer_inherited 16 -> 0`,
+`tables_mirrored 213 -> 248`, `seeded_owners 0 -> 11`, `seeded_entries 0 -> 62`.
+
+**The number #1755 asked for:** `defer_no_handle` (124) is now the *whole*
+remaining defer volume, and it is untouched by this change — that is the figure
+that gates whether the optional `NoHandle` read-time seed is worth building.
+
+**Honest caveat, unfalsified and stated in the PR:** the change *widens* the
+documented mode-1 assumption — any owner with one captured write now serves, so
+a length-preserving uncaptured mutation after the seed would be served where it
+used to defer. No production path emitting one could be constructed (the
+C-level deletes are paired with captured re-adds -> `LenLong`), so it is a
+widened accepted assumption, not a demonstrated wrong serve. Also: the counters
+count mint events, not which absorbed key was uncaptured; and only mode 2's
+verify catches post-seed order/value drift.
+
+### The lesson that repeated three times today
+
+CI was green while a new assertion **could not fail** — in three separate lanes:
+a missing-vs-superfluous `type: ignore` pair, a tautology (`api.errors == []`
+that could never grow), and a negative control that never triggered the code path
+it named (`table_len == 1` making the `table_len > 1` gate false). Each was
+caught by the operative local `ocr review`, never by CI. Treat the review pass as
+the gate and CI as necessary but insufficient; track the third as the
+`parity-symtable-flip` vacancy in **#1765**.
+
+### Other findings filed this wave
+
+- **#1761** — `rust_unknown_unpack` (measured 5.81x loss) became load-bearing when
+  #1762's retirement shifted calls onto it; net ratio recomputed 4.76x -> 4.3x.
+- **#1763** — two retirement leftovers: `_native_visitor_resolver` is now
+  write-only (its docstring still describes the retired flatten seam), and a dead
+  `info.names` registration in a pin.
+- **#1765** — `parity-symtable-flip` runs `testcachedata.py`, which builds
+  `Options()` directly and therefore cannot engage the flip at all (measured: no
+  dump written, 0 mirrored), so the one gate step covering cache-loaded tables
+  cannot detect a regression there.
+- **#1624** comment — the per-call import mechanism behind the live-object seam
+  losses: `checker_functions.rs:42-47` calls `nodes_class` per class per seam
+  call and `:5117-5120` does `py.import("mypy.types")` on every call. Caching
+  those handles is the first lever here that *fixes* rather than deletes, and
+  `rust_analyze_instance_member_dispatch` (kept at 1.10x) should be re-measured
+  after it.
+
+### Queue for the next wave
+
+1. **`#1624`'s handle caching** — the one mechanism fix that could flip a
+   measured *keep* into a win, and it applies to every live-object seam.
+2. **The rest of the 86** (M1's table on #1739): `check_call_head` (180k, needs
+   the corpus differential), `get_declaration` (binder, 91k),
+   `special_function_elide_names` (sharedparse, 31k), then the 1k-10k band
+   (76 seams, 319k calls). R-D flagged two sub-10k lookalikes of the seam it
+   retired (`nodes.py:1028`, `:1487`).
+3. **#1757** — split the engagement suites per area; that is what makes a
+   retirement lane's test footprint entirely its own and removes the last
+   serialization point.
+4. **The wall-clock leg** (#1723 3-pair, #1624 wall clock) — still unmeasured.
+   Host load fell to ~15 late in the session (its lowest), still above the
+   documented `< 5` bar, so nothing was published from it. Everything shipped
+   today is counters and per-call ns, not elapsed time.
+5. **#1745** — `main` still has no branch protection or ruleset; every gate
+   remains advisory. Owner decision.
+
 ## RESUME POINT — 2026-09-16, night (wave 6 close: retirements, lint gate, and a 73.5%-unmeasured inventory)
 
 Wave 6 finished #1739's slices 1-3, added a per-file CI lint gate, cleared the
