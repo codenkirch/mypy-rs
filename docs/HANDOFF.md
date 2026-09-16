@@ -77,8 +77,14 @@ on 24.1% of calls), `rust_compute_arg_context_indices` (1.38x but 98ns/call).
 1. **#1746 first** — `mypy/test/testtypes_native_checker.py` (28,292 lines) is
    the only file holding coverage for the next three candidates, so every
    retirement serializes on it. Move the `...RetiredSuite` pins into
-   `testtypes_native_retired.py` (lane R1 in flight as this was written; verify
-   whether it landed before starting anything else).
+   `testtypes_native_retired.py`. Lane R1 was launched for this on 2026-09-16 and
+   **aborted before writing any code**: the token-plan weekly quota was exhausted
+   (it resets 2026-09-21 17:52 UTC), so **no lanes can run until then** — plan
+   waves around that reset, not around host load alone. R1 did leave the
+   acceptance baseline, `/private/tmp/r1-before.txt` (392KB: the sorted
+   `pytest --collect-only` test-id list from `main` @ `fc7e39f51`, taken 19:35
+   with the native gate on), which is the "before" side of the pure-rename
+   proof; regenerate it only if the base has moved.
 2. **Then the three measured retirements, one at a time**, since each also
    reworks an engagement suite in that same file: `rust_check_unpacks_in_list`
    (`mypy/typeanal.py`, 5.5x-10.2x, >=0.20s) -> `rust_analyze_member_access`
