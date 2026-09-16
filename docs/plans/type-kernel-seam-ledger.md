@@ -9,6 +9,40 @@ parity baselines) stays in AGENTS.md; per-wave plans live in
 
 Append new ledger entries here instead of re-inflating AGENTS.md.
 
+### Retirement log (check this before treating an entry below as live)
+
+A retired seam has no Python shim: `mypy/<module>` calls the pure-Python body
+directly. The Rust pyfunction stays registered, so direct-seam tests still call
+it. The per-seam entries further down describe the *pre-retirement* design; a
+seam listed there as live may since have been retired, so check this table
+first. Three sessions in a row (a lane, a measurement brief, and an issue body)
+spent effort on seams that were already retired here.
+
+| retired in | commit | seams |
+|---|---|---|
+| #1741 | `8c1b0c6c3` | `rust_copy_modified`, `rust_flatten_nested_unions` |
+| #1740 | `10762e5a5` | `func_has_self_or_cls_argument`, `has_abstract_type`, `is_true_literal`, `is_false_literal`, `refers_to_typeddict`, `has_placeholder` |
+| #1738 | `809b53b90` | `classify_member_resolution` |
+| #1737 | `b06ad64ef` | `visit_name_expr`, `should_wait_rhs` |
+| #1736 | `0a6bfe978` | `rust_lookup` (`_rust_lookup_qualified` is still live) |
+| #1685, #1669 | `0046062a1`, `618c2b196` | residual scalar-only wire seams |
+| #1664 | `032caceee` | `is_literal_type_like` |
+| #1648 (#1640) | `ad8783e97` | hot short-call reads in `mypy/types.py`: `is_generic`, `has_recursive_types`, truthiness defaults, `is_var_arg`/`is_kw_arg`, min/max args, tuple/union length |
+| #1514, #1492 | `530919b65`, `83f0b6706` | wave-61A decidable leftovers; symtable find_member/unpack/apply-report defers |
+
+In flight when this log was written: `rust_fill_typevars` (#1744),
+`rust_map_actuals_to_formals`, `rust_map_actuals_to_formals_with_types`,
+`rust_map_formals_to_actuals` and `rust_check_argument_count` (#1747).
+
+The decision rule behind these, measured as min-of-7 ns/call with both arms in
+one process and the FFI ticket spied for engagement: **the wire interface loses
+when the Python body is an O(1)/O(n) rebuild or scan, and wins when the body is
+a recursive visitor.** `rust_expand_type` (0.43-0.61x) is the standing example
+of a port that pays and keeps its interface. Per-seam numbers and the ranked
+remainder are in #1739; `rust_analyze_instance_member_dispatch` (1.10x) and
+`rust_classify_special_unbound` (0.78x on its common shape) measured as
+keeps, not retirements.
+
 ### Native-parser parity
 
 `Options.native_parser` defaults to `True` (Phase 1). The native parser
