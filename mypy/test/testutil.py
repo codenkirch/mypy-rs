@@ -123,3 +123,35 @@ class TestHardExit(TestCase):
             hard_exit(0)
         assert seen == [1]
         fake_exit.assert_called_once_with(0)
+
+    def test_hard_exit_flushes_handler_output(self) -> None:
+        # End-to-end #1706 repro: a handler writing to block-buffered
+        # stdout loses its output unless hard_exit flushes after the
+        # handlers run. Read back via a separate fd (closing would flush).
+        import os
+        import sys
+        import tempfile
+
+        fd, path = tempfile.mkstemp()
+        os.close(fd)
+        try:
+            f = open(path, "w", buffering=8192)
+            try:
+
+                def handler() -> None:
+                    if not f.closed:
+                        f.write("diagnostic\n")
+
+                atexit.register(handler)
+                with (
+                    mock.patch("os._exit") as fake_exit,
+                    mock.patch.object(sys, "stdout", f),
+                ):
+                    hard_exit(0)
+                with open(path, "rb") as reader:
+                    assert reader.read() == b"diagnostic\n"
+                fake_exit.assert_called_once_with(0)
+            finally:
+                f.close()
+        finally:
+            os.unlink(path)

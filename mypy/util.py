@@ -570,11 +570,15 @@ def hard_exit(status: int = 0) -> None:
 
     This can be quite a bit faster than a normal exit() since objects are not freed.
     """
-    sys.stdout.flush()
-    sys.stderr.flush()
-    # os._exit skips atexit handlers, silently dropping diagnostics that
-    # instrumentation registered to dump on interpreter exit (#1061).
-    atexit._run_exitfuncs()
+    try:
+        # os._exit skips atexit handlers, silently dropping diagnostics that
+        # instrumentation registered to dump on interpreter exit (#1061).
+        atexit._run_exitfuncs()
+    finally:
+        # Flush after the handlers: their writes may sit in a block buffer
+        # (redirected stdout), which os._exit would otherwise discard (#1706).
+        sys.stdout.flush()
+        sys.stderr.flush()
     os._exit(status)
 
 
