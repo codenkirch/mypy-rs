@@ -35,10 +35,15 @@ Design notes (see docs/plans/2026-09-11-g3-symbol-table-brief.md):
   `identity::reset` (the proxy contract).
 - Capture failures never propagate into the write path: the write has
   already been applied, and a failure only increments an audit counter.
+- Write-time seed (#1755): the first recorded write of an already
+  populated namespace takes its ordinals from the live dict (Rust `put`),
+  so aststrip survivors and loaded tables serve instead of deferring.
+  `sessionfinish` reports the seeded vs write-log provenance split.
 """
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 from typing import Any, Final
@@ -495,6 +500,44 @@ def flip_report() -> dict[str, int]:
         return {}
     counts = _kernel_mod.rust_symtable_mirror_flip_counts()
     return {key: int(value) for key, value in counts.items()}
+
+
+def sessionfinish() -> dict[str, dict[str, int]]:
+    """G3.2 (#1755): the read-flip evidence of one finished session.
+
+    Three sections: `flip` (the Rust store counters, including the
+    write-log vs seeded-entry provenance split and the per-reason defer
+    volumes), `astdiff` (served/deferred/verify on the consumer side) and
+    `capture` (the Python audit counters, non-empty only in audit mode).
+    The defer-reason volumes are otherwise unmeasured in a real
+    fine-grained or daemon run; `sessionfinish_dump` is the writer.
+    """
+    from mypy.server import astdiff
+
+    return {"flip": flip_report(), "astdiff": dict(astdiff.read_flip_stats()), "capture": report()}
+
+
+def sessionfinish_dump() -> None:
+    """Write the `sessionfinish` report where the environment asks for it.
+
+    Called at the end of `mypy.build.build`, so a running daemon keeps
+    rewriting the process-lifetime totals after every build rather than
+    reporting only at exit (the Rust counters are cumulative: `reset`
+    keeps them). No-op without `MYPY_TK_SYMTABLE_SESSIONFINISH_OUT`
+    (`{pid}` expands to the process id) and without an activated shadow.
+    Never raises: the call site sits in a `finally` whose job is to
+    preserve the in-flight build exception.
+    """
+    out = os.environ.get("MYPY_TK_SYMTABLE_SESSIONFINISH_OUT")
+    if not out or _kernel_mod is None:
+        return
+    out = out.replace("{pid}", str(os.getpid()))
+    try:
+        with open(out, "w") as f:
+            json.dump(sessionfinish(), f, indent=1, sort_keys=True)
+    except Exception as err:
+        # Same convention as the capture failures: account, never raise.
+        print(f"native-symtable-mirror: sessionfinish dump failed: {err}", file=sys.stderr)
 
 
 def entry_count(owner: Any) -> int:

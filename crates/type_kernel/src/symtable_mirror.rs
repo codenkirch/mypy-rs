@@ -29,13 +29,17 @@
 //!    `entries_if_mirrored` returns the `ShadowGap` reason otherwise, so a
 //!    namespace the capture could not see (a C-level `dict` write, a
 //!    never-adopted table) never answers a read.
+//! 7. **Write-time seed (#1755).** A namespace the store first sees
+//!    already populated is seeded from one `owner.items()` read, so the
+//!    live order becomes the store's ordinals and the namespace serves.
+//!    A namespace the seed cannot read atomically stays `Inherited`.
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
-use pyo3::types::PyDict;
+use pyo3::types::{PyDict, PyTuple};
 
 use crate::identity;
 
@@ -65,9 +69,10 @@ pub(crate) enum ShadowGap {
     /// The candidate has no `len()` at all, so the size gate cannot run.
     NotSized,
     /// The owner already held keys when the store first saw it in this
-    /// build, so its name order predates the store's ordinals and cannot
-    /// be reproduced (`mypy/server/aststrip.py` keeps `@`-named keys
-    /// across builds; a loaded cache table starts populated).
+    /// build and the write-time seed (#1755) could not take the whole
+    /// namespace, so its name order predates the store's ordinals and
+    /// cannot be reproduced (`mypy/server/aststrip.py` keeps `@`-named
+    /// keys across builds; a loaded cache table starts populated).
     Inherited,
     /// Fewer records than live entries: a write bypassed the capture.
     LenShort,
@@ -95,6 +100,22 @@ pub(crate) struct FlipCounts {
     pub(crate) defer_len_short: u64,
     pub(crate) defer_len_long: u64,
     pub(crate) defer_no_pin: u64,
+    /// Entries first minted by a recorded write (the write log).
+    pub(crate) put_entries: u64,
+    /// Entries minted by the write-time seed (#1755). The provenance
+    /// split: a served namespace is provably either write-log captured
+    /// or seeded, and a seed that silently served an uncapturable shape
+    /// shows up here instead of hiding behind a value assertion.
+    pub(crate) seeded_entries: u64,
+    /// Owners the write-time seed took (#1755). Zero means every served
+    /// namespace came from the write log, so a test that claims seed
+    /// coverage is vacuous.
+    pub(crate) seeded_owners: u64,
+    /// Owners the seed was attempted on and refused, because a live value
+    /// had no readable flag slots (#1755). This is the only evidence that
+    /// the attempt happened: it separates "the seed declined" from "the
+    /// seed never ran", which `seeded_owners == 0` cannot.
+    pub(crate) seed_rejects: u64,
 }
 
 /// The ref flags passed on every put/refresh.
@@ -200,6 +221,110 @@ fn unlink_node(store: &mut SymStore, node_handle: u64, owner: u64, name: &str) {
     }
 }
 
+/// One live namespace pair read for the write-time seed (#1755).
+struct SeedPair {
+    name: String,
+    node_handle: u64,
+    symbol: Py<PyAny>,
+    flags: SymFlags,
+}
+
+fn bool_flag(symbol: &PyAny, field: &str) -> Option<bool> {
+    symbol.getattr(field).ok()?.is_true().ok()
+}
+
+/// The flag snapshot a seed records for one live symbol: the same slots
+/// `_capture` passes on a write, read here because a seeded key has no
+/// write to borrow them from. Any unreadable slot means "not a symbol".
+fn read_flags(symbol: &PyAny) -> Option<SymFlags> {
+    let kind = symbol.getattr("kind").ok()?.extract::<i64>().ok()?;
+    let node_fullname = symbol
+        .getattr("_node")
+        .ok()
+        .filter(|node| !node.is_none())
+        .and_then(|node| node.getattr("fullname").ok())
+        .and_then(|fullname| fullname.extract::<String>().ok());
+    let cross_ref = symbol
+        .getattr("cross_ref")
+        .ok()
+        .and_then(|value| value.extract::<String>().ok());
+    Some(SymFlags {
+        kind,
+        node_fullname,
+        module_public: bool_flag(symbol, "module_public")?,
+        module_hidden: bool_flag(symbol, "module_hidden")?,
+        implicit: bool_flag(symbol, "implicit")?,
+        plugin_generated: bool_flag(symbol, "plugin_generated")?,
+        no_serialize: bool_flag(symbol, "no_serialize")?,
+        cross_ref,
+    })
+}
+
+/// Read the live namespace once for the write-time seed. `None` when the
+/// owner is not a mapping of readable symbols (or is empty), so the
+/// caller fails closed to `Inherited`. Called outside the store borrow:
+/// a slot read that runs Python code must not re-enter the store.
+fn prepare_seed(owner: &PyAny) -> Option<Vec<SeedPair>> {
+    let items = owner.call_method0("items").ok()?;
+    let mut pairs: Vec<SeedPair> = Vec::with_capacity(owner.len().unwrap_or(0));
+    for pair in items.iter().ok()? {
+        let pair = pair.ok()?;
+        let pair = pair.downcast::<PyTuple>().ok()?;
+        let name: String = pair.get_item(0).ok()?.extract().ok()?;
+        let symbol = pair.get_item(1).ok()?;
+        pairs.push(SeedPair {
+            name,
+            node_handle: identity::handle_for(symbol)?,
+            flags: read_flags(symbol)?,
+            symbol: Py::from(symbol),
+        });
+    }
+    (!pairs.is_empty()).then_some(pairs)
+}
+
+/// Mint the seeded entries in live order. Ordinals ascend with the push
+/// order, which is the ascending `by_owner` invariant the gate asserts.
+fn seed_entries(store: &mut SymStore, owner: &PyAny, owner_handle: u64, pairs: Vec<SeedPair>) {
+    let generation = store.generation_for(owner_handle);
+    store.pins.insert(owner_handle, Py::from(owner));
+    for pair in pairs {
+        store.next_seq += 1;
+        store.next_order += 1;
+        let entry = SymEntry {
+            generation,
+            seq: store.next_seq,
+            order: store.next_order,
+            node_handle: pair.node_handle,
+            kind: pair.flags.kind,
+            node_fullname: pair.flags.node_fullname,
+            module_public: pair.flags.module_public,
+            module_hidden: pair.flags.module_hidden,
+            implicit: pair.flags.implicit,
+            plugin_generated: pair.flags.plugin_generated,
+            no_serialize: pair.flags.no_serialize,
+            cross_ref: pair.flags.cross_ref,
+        };
+        store
+            .entries
+            .insert((owner_handle, pair.name.clone()), entry);
+        store
+            .by_owner
+            .entry(owner_handle)
+            .or_default()
+            .push(pair.name.clone());
+        let refs = store.by_node.entry(pair.node_handle).or_default();
+        if !refs
+            .iter()
+            .any(|(o, n)| *o == owner_handle && n == &pair.name)
+        {
+            refs.push((owner_handle, pair.name));
+        }
+        store.pins.insert(pair.node_handle, pair.symbol);
+        store.flip.seeded_entries += 1;
+    }
+    store.flip.seeded_owners += 1;
+}
+
 /// Record (or replace) the entry for `(owner, name)`; returns
 /// `(owner_handle, node_handle, seq, generation)`.
 pub(crate) fn put(
@@ -210,14 +335,25 @@ pub(crate) fn put(
 ) -> PyResult<(u64, u64, u64, u64)> {
     let owner_handle = handle_or_error(owner)?;
     let node_handle = handle_or_error(symbol)?;
-    // The ordering claim holds only for a namespace the store saw from
-    // empty: keys present on the first recorded write of this build
-    // predate these ordinals, so the owner is marked unservable.
     let table_len = owner.len().unwrap_or(0);
+    let first_write = with_store(|store| !store.by_owner.contains_key(&owner_handle));
+    // Write-time seed (#1755): keys present on the first recorded write of
+    // this build predate the store's ordinals, so the store takes its
+    // ordinals from the live order instead of declaring the owner dead.
+    let seed = (first_write && table_len > 1).then(|| prepare_seed(owner));
     Ok(with_store(|store| {
-        let first_write = !store.by_owner.contains_key(&owner_handle);
-        if first_write && table_len > 1 {
-            store.inherited.insert(owner_handle);
+        // The store's own view decides at the moment of the mutation: a
+        // re-entrant put between the two acquisitions must not be seeded
+        // over (`prepare_seed` reads plain slots only, so none can run).
+        if first_write && table_len > 1 && !store.by_owner.contains_key(&owner_handle) {
+            match seed {
+                Some(Some(pairs)) => seed_entries(store, owner, owner_handle, pairs),
+                // Not a readable namespace: the order claim cannot hold.
+                _ => {
+                    store.inherited.insert(owner_handle);
+                    store.flip.seed_rejects += 1;
+                }
+            }
         }
         let generation = store.generation_for(owner_handle);
         store.next_seq += 1;
@@ -256,6 +392,7 @@ pub(crate) fn put(
         };
         let is_new = store.entries.insert(key, entry).is_none();
         if is_new {
+            store.flip.put_entries += 1;
             store
                 .by_owner
                 .entry(owner_handle)
@@ -388,9 +525,10 @@ fn bump_flip(f: impl FnOnce(&mut FlipCounts)) {
 /// for `table`, in the namespace's insertion order, or the reason the
 /// store cannot stand in for the live table.
 ///
-/// **The gate**: the store must have seen the namespace from empty in this
-/// build (an owner whose first recorded write already found keys is
-/// `Inherited` and never served), the record count must equal the live
+/// **The gate**: the store must hold this namespace in this build's order
+/// (an owner whose first recorded write already found keys is seeded from
+/// `owner.items()` at that write, #1755; an owner the seed could not take
+/// is `Inherited` and never served), the record count must equal the live
 /// namespace size (`entry_count(owner) == len(owner.names)`, the invariant
 /// the G3 brief pins), the owner must have been adopted, and every record's
 /// symbol must still be pinned. Anything else returns the `ShadowGap` reason
@@ -702,6 +840,12 @@ pub(crate) fn rust_symtable_mirror_flip_counts<'py>(py: Python<'py>) -> PyResult
     dict.set_item("defer_len_short", counts.defer_len_short)?;
     dict.set_item("defer_len_long", counts.defer_len_long)?;
     dict.set_item("defer_no_pin", counts.defer_no_pin)?;
+    // G3.2 (#1755) provenance: write-log entries vs seeded entries, and
+    // the owner count that makes a seed-coverage claim non-vacuous.
+    dict.set_item("put_entries", counts.put_entries)?;
+    dict.set_item("seeded_entries", counts.seeded_entries)?;
+    dict.set_item("seeded_owners", counts.seeded_owners)?;
+    dict.set_item("seed_rejects", counts.seed_rejects)?;
     Ok(dict)
 }
 
@@ -1143,6 +1287,18 @@ mod symtable_mirror_tests {
             .collect()
     }
 
+    /// A live symbol carrying the capture's flag slots. A bare `object()`
+    /// cannot be seeded (no readable flags), which the fail-closed test
+    /// below relies on.
+    fn symbol_object<'py>(py: Python<'py>, fullname: &str) -> &'py PyAny {
+        let code = format!(
+            "type('S', (), {{'kind': 1, 'module_public': True, 'module_hidden': False, \
+             'implicit': False, 'plugin_generated': False, 'no_serialize': False, \
+             'cross_ref': None, '_node': type('N', (), {{'fullname': '{fullname}'}})()}})()"
+        );
+        py.eval(&code, None, None).unwrap()
+    }
+
     #[test]
     fn test_order_follows_dict_insert_replace_delete() {
         with_py(|py| {
@@ -1167,28 +1323,71 @@ mod symtable_mirror_tests {
             let counts = flip_counts();
             assert_eq!(counts.tables_mirrored, 6);
             assert_eq!(counts.defer_inherited, 0);
+            // The write log mints three inserts, a replace that does not
+            // mint, and the re-inserted `a`: four write-log entries.
+            assert_eq!(counts.put_entries, 4);
+            assert_eq!(counts.seeded_entries, 0);
+            assert_eq!(counts.seeded_owners, 0);
         });
     }
 
     #[test]
-    fn test_inherited_namespace_is_not_served() {
+    fn test_prepopulated_namespace_is_seeded_and_served() {
         with_py(|py| {
             reset();
             flip_counts_reset();
-            // A key in the dict before the store's first write in a build:
-            // its position predates the store's ordinals (aststrip keeps
-            // `@`-named keys, a loaded cache table starts populated).
+            // Keys in the dict before the store's first write in a build:
+            // `mypy/server/aststrip.py` keeps `@`-named keys across a
+            // strip, so the next build's first write finds them there.
+            let table = py.eval("{}", None, None).unwrap();
+            let d5 = symbol_object(py, "mod.D@5");
+            let b = symbol_object(py, "mod.b");
+            table.set_item("D@5", d5).unwrap();
+            table.set_item("b", b).unwrap();
+            put(table, "b", b, flags(1)).unwrap();
+            // The store took the live order, so the namespace serves.
+            assert_eq!(read_names(py, table), dict_order(table));
+            assert_eq!(read_names(py, table), vec!["D@5", "b"]);
+            // The seed records the live flag snapshot, not defaults.
+            assert_eq!(
+                lookup_raw(table, "D@5"),
+                Some((1, Some("mod.D@5".to_string())))
+            );
+            let counts = flip_counts();
+            assert_eq!(counts.tables_mirrored, 2);
+            assert_eq!(counts.defer_inherited, 0);
+            assert_eq!(counts.seeded_entries, 2);
+            assert_eq!(counts.seeded_owners, 1);
+            assert_eq!(counts.seed_rejects, 0);
+            assert_eq!(counts.put_entries, 0);
+        });
+    }
+
+    #[test]
+    fn test_unseedable_namespace_fails_closed() {
+        with_py(|py| {
+            reset();
+            flip_counts_reset();
+            // A live value that is not a symbol: the seed cannot take the
+            // whole namespace atomically, so the owner stays unservable.
             let table = py.eval("{}", None, None).unwrap();
             table
                 .set_item("a", py.eval("object()", None, None).unwrap())
                 .unwrap();
             write(py, table, "b");
-            write(py, table, "a");
             assert!(matches!(
                 entries_if_mirrored(py, table),
                 Err(ShadowGap::Inherited)
             ));
-            assert_eq!(flip_counts().defer_inherited, 1);
+            let counts = flip_counts();
+            assert_eq!(counts.defer_inherited, 1);
+            assert_eq!(counts.seeded_owners, 0);
+            assert_eq!(counts.seeded_entries, 0);
+            // The attempt is observable: it ran and refused, which is what
+            // `seeded_owners == 0` alone cannot say.
+            assert_eq!(counts.seed_rejects, 1);
+            // The write still records: only the seed refused.
+            assert_eq!(counts.put_entries, 1);
             // The mark is per build: after a reset, a namespace the store
             // sees from empty is servable again.
             reset();

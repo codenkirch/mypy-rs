@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, cast
 from unittest import skipUnless
 
 from mypy.nodes import (
@@ -836,22 +836,126 @@ class NativeSymtableReadFlipSuite(Suite):
         assert self._stats() == {"calls": 1, "deferred": 1}
         assert self._m.flip_report()["defer_no_handle"] == 1
 
-    def test_inherited_namespace_defers(self) -> None:
-        # A namespace holding a key when the store first saw it cannot be
-        # served: that position predates the store's ordinals (aststrip
-        # survivors, loaded cache). Counts match; only the rule catches it.
+    def test_prepopulated_namespace_is_seeded_and_served(self) -> None:
+        # G3.2 (#1755): a namespace holding keys when the store first sees
+        # it is seeded from `owner.items()` at that write, so the live
+        # order becomes the store's ordinals and it serves.
+        from mypy.nodes import func_scoped_name
         from mypy.symtable_access import put_names_entry
 
         table: SymbolTable = SymbolTable()
-        dict.__setitem__(table, "a", self._sym("a", "mod.a"))
-        put_names_entry(table, "b", self._sym("b", "mod.b"))
+        key = func_scoped_name("D", 5)  # the aststrip survivor shape
+        dict.__setitem__(table, key, self._sym(key, f"mod.{key}"))
         put_names_entry(table, "a", self._sym("a", "mod.a"))
+        assert list(table) == [key, "a"]
         assert self._m.entry_count(table) == len(table) == 2
-        flipped = self._snapshot(table, 1)
+        # Verify mode now runs astdiff's value and order differential for
+        # this table (`owned != baseline` / `list(owned) != list(baseline)`)
+        # instead of skipping it behind a defer, so both assertions bite.
+        flipped = self._snapshot(table, 2)
+        # Non-vacuity: served, not deferred. A kernel without the seed reads
+        # `defer_inherited == 1` with no mirrored table here.
+        counters = self._m.flip_report()
+        assert counters["defer_inherited"] == 0
+        assert counters["tables_mirrored"] == 1
+        assert counters["entries_mirrored"] == 2
+        assert self._stats() == {"calls": 1, "served": 1, "verify.ok": 1}
         assert flipped == self._snapshot(table, 0)
-        assert list(flipped) == list(table) == ["a", "b"]
-        assert self._stats() == {"calls": 1, "deferred": 1}
+        assert list(flipped) == list(table) == [key, "a"]
+        # The `@`-key value, pinned explicitly: `D@5` held the position
+        # that surfaced the original parity-symtable-flip order failure.
+        assert flipped[key] == ("Var", (f"mod.{key}", GDEF, True), ("<not set>",), False)
+        # Provenance: both entries came from the seed, none from the log.
+        assert counters["seeded_owners"] == 1
+        assert counters["seeded_entries"] == 2
+        assert counters["put_entries"] == 0
+        assert counters["seed_rejects"] == 0
+
+    def test_seed_provenance_splits_log_from_seeded(self) -> None:
+        # The provenance counter is the seed's only receipt: a served
+        # namespace the seed took matches the live walk by construction,
+        # so no value assertion can carry that provenance.
+        from mypy.symtable_access import put_names_entry
+
+        table: SymbolTable = SymbolTable()
+        dict.__setitem__(table, "s", self._sym("s", "mod.s"))
+        put_names_entry(table, "a", self._sym("a", "mod.a"))
+        counters = self._m.flip_report()
+        assert counters["seeded_owners"] == 1
+        assert counters["seeded_entries"] == 2
+        assert counters["put_entries"] == 0
+        assert counters["seed_rejects"] == 0
+        # A write after the seed is a write-log entry.
+        put_names_entry(table, "b", self._sym("b", "mod.b"))
+        counters = self._m.flip_report()
+        assert counters["seeded_entries"] == 2
+        assert counters["put_entries"] == 1
+        # A replace of a seeded key keeps its ordinal and stays seeded.
+        put_names_entry(table, "s", self._sym("s", "mod.s2"))
+        counters = self._m.flip_report()
+        assert counters["seeded_entries"] == 2
+        assert counters["put_entries"] == 1
+        flipped = self._snapshot(table, 1)
+        assert list(flipped) == ["s", "a", "b"] == list(table)
+        assert flipped == self._snapshot(table, 0)
+
+    def test_unreadable_namespace_does_not_seed(self) -> None:
+        # Negative control for the seed's eligibility rule: a live value
+        # without the capture's flag slots rejects the whole seed, and the
+        # fallback walk still serves the table.
+        class PartialSymbol:
+            """Carries the slots the walk reads and no others."""
+
+            def __init__(self, node: Var) -> None:
+                self.node = node
+                self.kind = MDEF
+                self.module_public = True
+
+        table: SymbolTable = SymbolTable()
+        # Deliberately not a SymbolTableNode: the dict type is a lie here.
+        partial = cast(Any, PartialSymbol(self._var("p", "mod.p")))
+        dict.__setitem__(table, "p", partial)
+        dict.__setitem__(table, "q", self._sym("q", "mod.q"))
+        self._record(table, "b", "mod.b")
+        counters = self._m.flip_report()
+        assert counters["seeded_owners"] == 0
+        # The attempt is observable, and this is the control: without the
+        # eligibility rule the seed takes both keys (`seeded_owners == 1`,
+        # `seed_rejects == 0`) and `defer_inherited` stays 0.
+        assert counters["seeded_entries"] == 0
+        assert counters["seed_rejects"] == 1
+        assert counters["put_entries"] == 1
+        # The read defers and the live walk answers, as before the seed.
+        flipped = self._snapshot(table, 1)
         assert self._m.flip_report()["defer_inherited"] == 1
+        assert flipped == self._snapshot(table, 0)
+        assert list(flipped) == list(table) == ["p", "q"]
+
+    def test_sessionfinish_report_carries_the_counters(self) -> None:
+        # G3.2 (#1755): the sessionfinish report is the hook that measures
+        # the defer-reason volumes of a real run (written at the end of
+        # `mypy.build.build`), and the receipt for the provenance counters.
+        import json
+        import os
+        import tempfile
+        from unittest import mock
+
+        table = self._table({"a": "mod.a"})
+        self._snapshot(table, 1)
+        report = self._m.sessionfinish()
+        assert set(report) == {"flip", "astdiff", "capture"}
+        assert report["flip"]["put_entries"] == 1
+        assert report["flip"]["tables_mirrored"] == 1
+        assert report["astdiff"] == {"calls": 1, "served": 1}
+        with tempfile.TemporaryDirectory() as tmp:
+            template = os.path.join(tmp, "session-{pid}.json")
+            env = {"MYPY_TK_SYMTABLE_SESSIONFINISH_OUT": template}
+            with mock.patch.dict(os.environ, env):
+                self._m.sessionfinish_dump()
+            with open(os.path.join(tmp, f"session-{os.getpid()}.json")) as f:
+                dumped = json.load(f)
+        assert dumped["flip"]["put_entries"] == 1
+        assert dumped["astdiff"] == {"calls": 1, "served": 1}
 
     # ---- verify mode: the differential ----
 

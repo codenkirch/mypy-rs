@@ -467,6 +467,12 @@ def build(
                 pass
         for worker in workers:
             worker.close()
+        # G3.2 (#1755): the read-flip evidence of this session. Env-gated,
+        # and a no-op when the namespace shadow was never activated.
+        if os.environ.get("MYPY_TK_SYMTABLE_SESSIONFINISH_OUT"):
+            from mypy import symtables_mirror
+
+            symtables_mirror.sessionfinish_dump()
 
 
 def build_inner(
@@ -793,9 +799,7 @@ def find_config_file_line_number(path: str, section: str, setting_name: str) -> 
     return -1
 
 
-def _native_builtins_sig(
-    info: TypeInfo,
-) -> tuple[tuple[str, ...], str | None, tuple[Any, ...]]:
+def _native_builtins_sig(info: TypeInfo) -> tuple[tuple[str, ...], str | None, tuple[Any, ...]]:
     """Content signature over a `builtins.*` snapshot's post-seal fields.
 
     Dirty-driven resolver upkeep (#1641): every other snapshot field is
@@ -1411,9 +1415,7 @@ class BuildManager:
             _set_native_shadow_read_active as _set_aststrip_shadow_read_active,
         )
 
-        _set_aststrip_shadow_read_active(
-            capture_active and self.options.native_ast_mirror_read
-        )
+        _set_aststrip_shadow_read_active(capture_active and self.options.native_ast_mirror_read)
         # Phase G3.0a (#1581): activate the namespace dual-write capture
         # shadow (capture-only; no consumer reads it). Independent of the
         # type-kernel gate: it wraps live SymbolTable classes.
@@ -2143,9 +2145,7 @@ class BuildManager:
         set_wire_alias_map(self._native_alias_map)
         set_wire_symbol_map(self._native_symbol_map)
 
-    def _collect_symbol_nodes(
-        self, module: MypyFile, infos: list[TypeInfo]
-    ) -> None:
+    def _collect_symbol_nodes(self, module: MypyFile, infos: list[TypeInfo]) -> None:
         """Collect FuncDef/OverloadedFuncDef/Decorator nodes into the symbol map.
 
         Walks the module symbol table and each TypeInfo's symbol table so
