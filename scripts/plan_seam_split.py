@@ -21,13 +21,34 @@ from __future__ import annotations
 
 import argparse
 import re
+import subprocess
 import sys
 from collections import Counter
 from pathlib import Path
 
-REPO = Path(__file__).resolve().parent.parent
-SRC = REPO / "crates" / "type_kernel" / "src"
-LIB_RS = SRC / "lib.rs"
+SRC: Path
+LIB_RS: Path
+
+
+def resolve_root(explicit: str | None) -> Path:
+    """Locate the mypy-rs checkout this script audits.
+
+    Explicit --root wins. Otherwise prefer the enclosing git checkout (so a
+    copy of this script run from anywhere still finds the tree), falling back
+    to the script's own location for non-git checkouts.
+    """
+    if explicit:
+        return Path(explicit)
+    try:
+        out = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        return Path(out.stdout.strip())
+    except (subprocess.CalledProcessError, FileNotFoundError, OSError):
+        return Path(__file__).resolve().parent.parent
 
 REGISTER_FN = re.compile(r"pub\(crate\)\s+fn\s+register_registry\s*\(", re.S)
 REGISTRATION = re.compile(r"wrap_pyfunction!\(\s*(?P<fn>[A-Za-z0-9_]+)\s*,", re.S)
@@ -90,7 +111,21 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--verify", action="store_true", help="fail on layout violations")
     ap.add_argument("--module", help="show only this defining module's functions")
+    ap.add_argument("--root", help="mypy-rs checkout root (default: enclosing git checkout)")
     args = ap.parse_args()
+
+    global SRC, LIB_RS
+    root = resolve_root(args.root)
+    SRC = root / "crates" / "type_kernel" / "src"
+    if not SRC.is_dir():
+        print(
+            f"error: expected mypy-rs layout absent under {root} "
+            "(no crates/type_kernel/src); run from a mypy-rs checkout "
+            "or pass --root <path>",
+            file=sys.stderr,
+        )
+        return 2
+    LIB_RS = SRC / "lib.rs"
 
     regs = parse()
     if args.module:
