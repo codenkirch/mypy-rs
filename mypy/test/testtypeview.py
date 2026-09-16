@@ -154,14 +154,24 @@ class TypeViewSuite(unittest.TestCase):
             object.__setattr__(inst, name, value)
 
         Instance.__setattr__ = foreign  # type: ignore[method-assign]
-        # Already active, so this path must re-assert rather than assume.
-        self._activate()
-        self.assertIs(Instance.__dict__["__setattr__"], typeview._inst_setattr)
-        # And the stolen hook is now the chain link, so neither mechanism is
-        # silently inert.
-        inst = Instance(self.fx.std_listi, [self.fx.a])
-        self.assertIn("args", stolen)
-        del inst
+        try:
+            # Already active, so this path must re-assert rather than assume.
+            self._activate()
+            self.assertIs(Instance.__dict__["__setattr__"], typeview._inst_setattr)
+            # And the stolen hook is now the chain link, so neither mechanism is
+            # silently inert.
+            inst = Instance(self.fx.std_listi, [self.fx.a])
+            self.assertIn("args", stolen)
+            del inst
+        finally:
+            # deactivate() restores the stolen hook; drop the thief and
+            # restore the pre-test shape, or foreign leaks process-wide.
+            typeview.deactivate()
+            if self.setattr_before is object.__setattr__:
+                if "__setattr__" in Instance.__dict__:
+                    del Instance.__setattr__
+            else:
+                Instance.__setattr__ = self.setattr_before  # type: ignore[method-assign]
 
     def test_arm_switch_two_to_one_uninstalls_the_route(self) -> None:
         """2 -> 1 must undo the routed property, or `_slot_get` recurses."""
