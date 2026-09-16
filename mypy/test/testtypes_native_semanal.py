@@ -28,6 +28,7 @@ from mypy.nodes import (
     GDEF,
     IndexExpr,
     IntExpr,
+    ListExpr,
     MDEF,
     MemberExpr,
     MypyFile,
@@ -35,9 +36,11 @@ from mypy.nodes import (
     OpExpr,
     PassStmt,
     PlaceholderNode,
+    StarExpr,
     StrExpr,
     SymbolTable,
     SymbolTableNode,
+    TupleExpr,
     TypeAlias,
     TypeInfo,
     TypeVarExpr,
@@ -67,7 +70,7 @@ from mypy.types import (
 )
 from types import SimpleNamespace
 from typing import Any, cast
-from unittest import skipUnless
+from unittest import TestCase, skipUnless
 
 from mypy.test.testtypes import (
     T,
@@ -4463,3 +4466,35 @@ class NativeReplaceImplicitFirstTypeRetiredSuite(Suite):
         first = get_proper_type(decoded.arg_types[0])
         assert isinstance(first, Instance)
         assert first.type_ref == "builtins.object"
+
+
+class FlattenLvaluesContractTestCase(TestCase):
+    """Pins the semanal contract of the shared flattener (#1688).
+
+    Unlike the checker variant (parity-pinned in NativeFlattenLvaluesSuite),
+    the semanal variant drops TupleExpr/ListExpr containers and keeps
+    StarExpr nodes as-is.
+    """
+
+    def test_semanal_drops_containers(self) -> None:
+        from mypy.semanal import flatten_lvalues
+
+        a, b = NameExpr("a"), NameExpr("b")
+        tup = TupleExpr([a, b])
+        assert flatten_lvalues([tup], unwrap_star=False) == [a, b]
+
+    def test_semanal_keeps_star_expr(self) -> None:
+        from mypy.semanal import flatten_lvalues
+
+        a = NameExpr("a")
+        star = StarExpr(a)
+        assert flatten_lvalues([star], unwrap_star=False) == [star]
+
+    def test_semanal_method_delegates(self) -> None:
+        from mypy.semanal import SemanticAnalyzer, flatten_lvalues
+
+        a, b = NameExpr("a"), NameExpr("b")
+        sa = SemanticAnalyzer.__new__(SemanticAnalyzer)
+        assert sa.flatten_lvalues([TupleExpr([a, b])]) == flatten_lvalues(
+            [TupleExpr([a, b])], unwrap_star=False
+        )

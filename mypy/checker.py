@@ -218,7 +218,12 @@ from mypy.patterns import AsPattern, StarredPattern
 from mypy.plugin import Plugin
 from mypy.plugins import dataclasses as dataclasses_plugin
 from mypy.scope import Scope
-from mypy.semanal import is_trivial_body, refers_to_fullname, set_callable_name
+from mypy.semanal import (
+    flatten_lvalues,
+    is_trivial_body,
+    refers_to_fullname,
+    set_callable_name,
+)
 from mypy.semanal_enum import ENUM_BASES, ENUM_SPECIAL_PROPS
 from mypy.semanal_shared import SemanticAnalyzerCoreInterface
 from mypy.sharedparse import BINARY_MAGIC_METHODS
@@ -5961,15 +5966,9 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
                     return result
             except (AssertionError, NotImplementedError, ValueError, TypeError):
                 pass
-        res: list[Expression] = []
-        for lv in lvalues:
-            if isinstance(lv, (TupleExpr, ListExpr)):
-                res.extend(self.flatten_lvalues(lv.items))
-            if isinstance(lv, StarExpr):
-                # Unwrap StarExpr, since it is unwrapped by other helpers.
-                lv = lv.expr
-            res.append(lv)
-        return res
+        # Shared body with SemanticAnalyzer (#1688); results identical to
+        # the old self-recursion (the seam and the body agree by parity).
+        return flatten_lvalues(lvalues, unwrap_star=True)
 
     def check_multi_assignment_from_tuple(
         self,

@@ -822,6 +822,28 @@ def _serialize_semanal_type(t: Type) -> bytes:
     return buf.getvalue()
 
 
+def flatten_lvalues(lvalues: list[Expression], *, unwrap_star: bool) -> list[Expression]:
+    """Shared lvalue flattener for SemanticAnalyzer and TypeChecker (#1688).
+
+    One body so the two copies cannot drift. The callers differ in two
+    correlated spots: the checker appends a TupleExpr/ListExpr itself after
+    extending with its items and unwraps StarExpr (other helpers do), while
+    semanal drops containers and keeps StarExpr nodes. The flag preserves
+    both contracts.
+    """
+    res: list[Expression] = []
+    for lv in lvalues:
+        if isinstance(lv, (TupleExpr, ListExpr)):
+            res.extend(flatten_lvalues(lv.items, unwrap_star=unwrap_star))
+            if not unwrap_star:
+                continue
+        if unwrap_star and isinstance(lv, StarExpr):
+            # Unwrap StarExpr, since it is unwrapped by other helpers.
+            lv = lv.expr
+        res.append(lv)
+    return res
+
+
 class SemanticAnalyzer(
     NodeVisitor[None], SemanticAnalyzerInterface, SemanticAnalyzerPluginInterface, SplittingVisitor
 ):
@@ -5109,13 +5131,7 @@ class SemanticAnalyzer(
                             s.is_final_def = True
 
     def flatten_lvalues(self, lvalues: list[Expression]) -> list[Expression]:
-        res: list[Expression] = []
-        for lv in lvalues:
-            if isinstance(lv, (TupleExpr, ListExpr)):
-                res.extend(self.flatten_lvalues(lv.items))
-            else:
-                res.append(lv)
-        return res
+        return flatten_lvalues(lvalues, unwrap_star=False)
 
     def process_type_annotation(self, s: AssignmentStmt) -> None:
         """Analyze type annotation or infer simple literal type."""
