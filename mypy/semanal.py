@@ -476,7 +476,6 @@ try:
         rust_names_modified_in_lvalue as _rust_names_modified_in_lvalue,
         rust_parse_bool as _rust_parse_bool,
         rust_remove_imported_names_from_symtable as _rust_remove_imported_names_from_symtable,
-        rust_should_wait_rhs as _rust_should_wait_rhs,
         rust_var_is_typing_special_form as _rust_var_is_typing_special_form,
         rust_visit_as_pattern as _rust_visit_as_pattern,
         rust_visit_assert_stmt as _rust_visit_assert_stmt,
@@ -512,7 +511,6 @@ try:
         rust_visit_list_set_expr as _rust_visit_list_set_expr,
         rust_visit_mapping_pattern as _rust_visit_mapping_pattern,
         rust_visit_match_stmt as _rust_visit_match_stmt,
-        rust_visit_name_expr as _rust_visit_name_expr,
         rust_visit_nonlocal_decl as _rust_visit_nonlocal_decl,
         rust_visit_op_expr as _rust_visit_op_expr,
         rust_visit_operator_assignment_stmt as _rust_visit_operator_assignment_stmt,
@@ -567,7 +565,7 @@ except ImportError:
     _rust_classify_simple_literal_type = None  # type: ignore[assignment]
     _rust_classify_setup_type_vars = None  # type: ignore[assignment]
     _rust_classify_type_expression = None  # type: ignore[assignment]
-    _rust_should_wait_rhs = None  # type: ignore[assignment]
+
     _rust_lookup_qualified = None  # type: ignore[assignment]
     _rust_is_init_only = None  # type: ignore[assignment]
     _rust_erase_func_annotations = None  # type: ignore[assignment]
@@ -614,7 +612,6 @@ except ImportError:
     _rust_visit_block_maybe = None  # type: ignore[assignment]
     _rust_visit_return_stmt = None  # type: ignore[assignment]
     _rust_visit_while_stmt = None  # type: ignore[assignment]
-    _rust_visit_name_expr = None  # type: ignore[assignment]
     _rust_visit_star_expr = None  # type: ignore[assignment]
     _rust_visit_as_pattern = None  # type: ignore[assignment]
     _rust_visit_or_pattern = None  # type: ignore[assignment]
@@ -4619,20 +4616,8 @@ class SemanticAnalyzer(
         Always return False if this is a final iteration. This will typically cause
         the lvalue to be classified as a variable plus emit an error.
         """
-        # Native type_kernel seam (issue #1008): Rust walks the rvalue
-        # node chain; the symbol lookups ride the real lookup methods.
-        # None defers to the pure-Python body below.
-        if (
-            _SEMANAL_VISITOR_HAS_KERNEL
-            and _native_semanal_active
-            and _rust_should_wait_rhs is not None
-        ):
-            try:
-                wait = _rust_should_wait_rhs(self, rv)
-            except (AssertionError, NotImplementedError, ValueError, TypeError):
-                wait = None
-            if wait is not None:
-                return wait
+        # Native seam retired (#1723): rust_should_wait_rhs only calls back
+        # into lookup/lookup_qualified (64k corpus calls, strictly additive).
         if self.final_iteration:
             # No chance, nothing has changed.
             return False
@@ -7270,9 +7255,8 @@ class SemanticAnalyzer(
     #
 
     def visit_name_expr(self, expr: NameExpr) -> None:
-        if _SEMANAL_VISITOR_HAS_KERNEL and _native_semanal_visitor_active:
-            if _rust_visit_name_expr(expr, self):
-                return
+        # Native seam retired (#1723): rust_visit_name_expr only calls back
+        # into lookup/bind_name_expr (357k corpus calls, strictly additive).
         n = self.lookup(expr.name, expr)
         if n:
             self.bind_name_expr(expr, n)
