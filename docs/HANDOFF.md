@@ -53,9 +53,47 @@ in #1769. Do not re-open without a new mechanism.
 | N2 | #1765: the flip gate's cache-data step cannot engage the flip |
 | T1 | #1757: split the engagement suites per area |
 | W1 | end-to-end counters + the wall-clock leg never yet run |
-| G0V | is G0's writer complete for the statement family? |
+| G0V | **done** — G0 is partial; see the verdict below |
 
 F1 and H1 completed; their deliverables are issues #1769 and #1770.
+
+### Settled: G0 is *partial*, and G4's criterion 2 needs retargeting (G0V, #1767)
+
+G0V audited the writer against the fields Python-only paths mutate and the answer
+is **no**, on three independent layers:
+
+1. **The store is a per-write delta, not a snapshot.** `capture_meta`
+   (`node_mirror.rs:392-406`) stores one field per write and lazy adoption
+   (`nodes_mirror.py:607-619`) skips baseline-only writes, so no mirror registers
+   `line/column/end_line/end_column` at all while `Context.set_line`
+   (`nodes.py:180-191`) has **120** call sites outside tests. Structural statement
+   fields (`expr`, `body`, `rvalue`, `target`, `patterns`, `arguments`, ...) are
+   absent.
+2. **No store consumer exists.** `rg rust_node_mirror_meta` outside tests finds
+   only `_reset_meta` (`nodes_mirror.py:655`): G0.5 moved the cache-payload
+   *format* to Rust, not its *source* — the cache writer still reads the live
+   Python tree (`sym_node.rs:515-537`, 65 `getattr`).
+3. **Def-family cache-payload fields are unregistered**: `FuncDef._name`,
+   `arg_names`, `arg_kinds`, `original_first_arg`; `Var._name`; `ClassDef.name`.
+   Plus post-construction mutations on unregistered fields
+   (`IfStmt.else_body` `reachability.py:101`, `FuncDef.type_args`
+   `semanal.py:10076`, `Block.body` `astmerge.py:216`, `ClassDef.decorators`
+   `treetransform.py:278`, ...) and two blind channels
+   (`replace_object_state`'s dynamic descriptor copy with no `__delattr__` hook,
+   and `Decorator.decorators.remove` at `plugins/attrs.py:893` with no `touch`).
+
+**Detection limits, stated by the lane:** attribution is by name + annotation and
+is not type-checked, so **2,589 of 8,687 sites (30%) are unattributed** and the
+missing-field list is a **lower bound**.
+
+**Consequence for G4:** criterion 2 is **blocked for both sub-families** until the
+issue says whether the parse-wire blob stays parser-produced or the store owns
+parse-time fields; criterion 3 is adjacent, since aststrip's reset and astmerge's
+dynamic copy act on unregistered fields — a store-sourced def family would be
+stale exactly where G3.2's aststrip hazard lived. The lane's proposed rewrite:
+make criterion 2 target the **cache-payload field set derived from the Python
+writers**, not the unbounded "fields Python-only paths mutate". G1 is clean by
+comparison: no post-construction mutation field is missing from its registration.
 
 ### Queue
 
