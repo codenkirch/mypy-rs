@@ -2089,18 +2089,8 @@ class Instance(ProperType):
         args: Bogus[list[Type]] = _dummy,
         last_known_value: Bogus[LiteralType | None] = _dummy,
     ) -> Instance:
-        changes: dict[str, Any] = {}
-        if args is not _dummy:
-            changes["args"] = args
-        if last_known_value is not _dummy:
-            changes["last_known_value"] = last_known_value
-        native = _native_copy_modified(self, changes)
-        if native is not None:
-            # Python copies the truthiness flags from the original (the
-            # type is unchanged, so the effective flags stay the same).
-            native.can_be_true = self.can_be_true
-            native.can_be_false = self.can_be_false
-            return cast(Instance, native)
+        # Native seam retired (#1739): the Python body is an O(1) rebuild,
+        # the wire round trip was 17x that (whole-tree codec).
         new = Instance(
             typ=self.type,
             args=args if args is not _dummy else self.args,
@@ -2566,58 +2556,8 @@ class CallableType(FunctionLike):
         unpack_kwargs: Bogus[bool] = _dummy,
         instance_type: Bogus[ProperType | None] = _dummy,
     ) -> CT:
-        changes: dict[str, Any] = {}
-        if arg_types is not _dummy:
-            changes["arg_types"] = arg_types
-        if arg_kinds is not _dummy:
-            changes["arg_kinds"] = arg_kinds
-        if arg_names is not _dummy:
-            changes["arg_names"] = arg_names
-        if ret_type is not _dummy:
-            changes["ret_type"] = ret_type
-        if fallback is not _dummy:
-            changes["fallback"] = fallback
-        if type_guard is not _dummy:
-            changes["type_guard"] = type_guard
-        if type_is is not _dummy:
-            changes["type_is"] = type_is
-        # Every changed field must land in `changes`, even fields the native
-        # #475 seam does not serialize (`variables`, `name`, scalars, ...).
-
-        # The seam engages only on one supported change; recording the rest
-        # makes multi-field copies defer to the Python body instead of
-        # silently dropping the extra writes (Unpack-kwargs bug).
-        if name is not _dummy:
-            changes["name"] = name
-        if definition is not _dummy:
-            changes["definition"] = definition
-        if variables is not _dummy:
-            changes["variables"] = variables
-        if line != _dummy_int:
-            changes["line"] = line
-        if column != _dummy_int:
-            changes["column"] = column
-        if is_ellipsis_args is not _dummy:
-            changes["is_ellipsis_args"] = is_ellipsis_args
-        if implicit is not _dummy:
-            changes["implicit"] = implicit
-        if special_sig is not _dummy:
-            changes["special_sig"] = special_sig
-        if from_type_type is not _dummy:
-            changes["from_type_type"] = from_type_type
-        if is_bound is not _dummy:
-            changes["is_bound"] = is_bound
-        if from_concatenate is not _dummy:
-            changes["from_concatenate"] = from_concatenate
-        if imprecise_arg_kinds is not _dummy:
-            changes["imprecise_arg_kinds"] = imprecise_arg_kinds
-        if unpack_kwargs is not _dummy:
-            changes["unpack_kwargs"] = unpack_kwargs
-        if instance_type is not _dummy:
-            changes["instance_type"] = instance_type
-        native = _native_copy_modified(self, changes)
-        if native is not None:
-            return cast(CT, native)
+        # Native seam retired (#1739): the Python body already assembles
+        # every field, so the `changes` bookkeeping only fed the seam.
         modified = CallableType(
             arg_types=arg_types if arg_types is not _dummy else self.arg_types,
             arg_kinds=arg_kinds if arg_kinds is not _dummy else self.arg_kinds,
@@ -3333,18 +3273,7 @@ class TupleType(ProperType):
     def copy_modified(
         self, *, fallback: Instance | None = None, items: list[Type] | None = None
     ) -> TupleType:
-        changes: dict[str, Any] = {}
-        if fallback is not None:
-            changes["fallback"] = fallback
-        if items is not None:
-            changes["items"] = items
-        native = _native_copy_modified(self, changes)
-        if native is not None:
-            # Python's TupleType(...) constructor always resets implicit
-            # to False, but the wire round-trip preserves the original
-            # value; reset it to match Python's behavior.
-            native.implicit = False  # type: ignore[attr-defined]
-            return cast(TupleType, native)
+        # Native seam retired (#1739): the Python body is an O(1) rebuild.
         if fallback is None:
             fallback = self.partial_fallback
         if items is None:
@@ -3586,23 +3515,8 @@ class TypedDictType(ProperType):
         readonly_keys: set[str] | None = None,
         is_closed: bool | None = None,
     ) -> TypedDictType:
-        # item_names filtering is only supported on the Python path: the
-        # Rust seam cannot express the intersection semantics.
-        if item_names is None:
-            changes: dict[str, Any] = {}
-            if fallback is not None:
-                changes["fallback"] = fallback
-            if item_types is not None:
-                changes["items"] = dict(zip(self.items, item_types))
-            if required_keys is not None:
-                changes["required_keys"] = required_keys
-            if readonly_keys is not None:
-                changes["readonly_keys"] = readonly_keys
-            if is_closed is not None:
-                changes["is_closed"] = is_closed
-            native = _native_copy_modified(self, changes)
-            if native is not None:
-                return cast(TypedDictType, native)
+        # Native seam retired (#1739): the Python body is an O(1) rebuild
+        # and it is the only path that can express `item_names`.
         if fallback is None:
             fallback = self.fallback
         if item_types is None:
@@ -4711,11 +4625,9 @@ try:
         rust_callable_argument_by_position as _rust_callable_argument_by_position,
         rust_callable_formal_arguments as _rust_callable_formal_arguments,
         rust_callable_with_ellipsis as _rust_callable_with_ellipsis,
-        rust_copy_modified as _rust_copy_modified,
         rust_copy_type as _rust_copy_type,
         rust_find_unpack_in_list as _rust_find_unpack_in_list,
         rust_flatten_nested_tuples as _rust_flatten_nested_tuples,
-        rust_flatten_nested_unions as _rust_flatten_nested_unions,
         rust_has_type_vars as _rust_has_type_vars,
         rust_is_literal_type as _rust_is_literal_type,
         rust_is_unannotated_any as _rust_is_unannotated_any,
@@ -4732,13 +4644,11 @@ except ImportError:
     _rust_has_type_vars = None  # type: ignore[assignment]
     _rust_is_literal_type = None  # type: ignore[assignment]
     _rust_is_unannotated_any = None  # type: ignore[assignment]
-    _rust_copy_modified = None  # type: ignore[assignment]
     _rust_remove_dups = None  # type: ignore[assignment]
     _rust_type_vars_as_args = None  # type: ignore[assignment]
     _rust_callable_with_ellipsis = None  # type: ignore[assignment]
     _rust_find_unpack_in_list = None  # type: ignore[assignment]
     _rust_split_with_prefix_and_suffix = None  # type: ignore[assignment]
-    _rust_flatten_nested_unions = None  # type: ignore[assignment]
     _rust_flatten_nested_tuples = None  # type: ignore[assignment]
     _rust_copy_type = None  # type: ignore[assignment]
     _rust_callable_formal_arguments = None  # type: ignore[assignment]
@@ -4751,7 +4661,6 @@ except ImportError:
 
 _native_visitor_active: bool = False
 _native_visitor_types_active: bool = False
-_native_truthiness_in_flight: bool = False
 _native_truthiness_resolver: Any = None
 _native_visitor_resolver: Any = None
 
@@ -4765,10 +4674,10 @@ def _set_native_visitor_active(active: bool) -> None:
 def _set_native_visitor_resolver(resolver: Any) -> None:
     """Install the `NativeTypeResolver` for the alias-aware flatten seam.
 
-    `flatten_nested_unions` (issue #1418) expands zero-argument alias
-    rows through this resolver's alias snapshot, mirroring Python's
-    `get_proper_type` union-shape decision. With no resolver installed
-    the seam defers on any alias input, as before.
+    `flatten_nested_tuples` expands zero-argument alias items through
+    this resolver's alias snapshot, mirroring Python's union-shape
+    decision. With no resolver installed the seam defers on any alias
+    input, as before.
     """
     global _native_visitor_resolver
     _native_visitor_resolver = resolver
@@ -4977,550 +4886,6 @@ def _native_callable_argument_by_position(
         return None
 
 
-class _WireMetaCollector(TypeQuery[None]):
-    """Live-side snapshot: (raw_id, namespace) -> meta_level (applytype pattern).
-
-    Marks a conflict with -1 when the same id appears at two meta levels.
-    """
-
-    def __init__(self) -> None:
-        super().__init__()
-        # The decoded tree is wire-shaped: TypeAliasType has no target, so
-        # any tvar it references arrives via alias args, never via the
-        # expanded target.
-
-        # Walking live alias targets here would fork fresh alias objects
-        # per level (InstantiateAliasVisitor -> ExpandTypeVisitor ->
-
-        # copy_modified -> _restore_wire_meta) and recurse forever on
-        # recursive aliases; args-only is exact for the wire-shaped decode.
-        self.skip_alias_target = True
-        self.meta: dict[tuple[int, str], int] = {}
-
-    def strategy(self, items: list[None]) -> None:
-        return None
-
-    def _record(self, t: TypeVarLikeType) -> None:
-        k = (t.id.raw_id, t.id.namespace)
-        old = self.meta.get(k)
-        if old is not None and old != t.id.meta_level:
-            self.meta[k] = -1
-        else:
-            self.meta[k] = t.id.meta_level
-
-    def visit_type_var(self, t: TypeVarType, /) -> None:
-        self._record(t)
-        super().visit_type_var(t)
-
-    def visit_param_spec(self, t: ParamSpecType, /) -> None:
-        self._record(t)
-        super().visit_param_spec(t)
-
-    def visit_type_var_tuple(self, t: TypeVarTupleType, /) -> None:
-        self._record(t)
-        super().visit_type_var_tuple(t)
-
-    def visit_callable_type(self, t: CallableType, /) -> None:
-        # Base TypeQuery skips variables, type_guard, type_is and
-        # instance_type, so walk them explicitly.
-        super().visit_callable_type(t)
-        for v in t.variables:
-            v.accept(self)
-        for extra in (t.type_guard, t.type_is, t.instance_type):
-            if extra is not None:
-                extra.accept(self)
-
-
-class _WireMetaFixer(TypeQuery[None]):
-    """Decoded-side: restore meta_level; flag unknown ids or conflicts."""
-
-    def __init__(self, meta: dict[tuple[int, str], int]) -> None:
-        super().__init__()
-        self.meta = meta
-        self.missing = False
-
-    def strategy(self, items: list[None]) -> None:
-        return None
-
-    def _fix(self, t: TypeVarLikeType) -> None:
-        m = self.meta.get((t.id.raw_id, t.id.namespace))
-        if m is None or m == -1:
-            self.missing = True
-            return
-        t.id.meta_level = m
-
-    def visit_type_var(self, t: TypeVarType, /) -> None:
-        self._fix(t)
-        super().visit_type_var(t)
-
-    def visit_param_spec(self, t: ParamSpecType, /) -> None:
-        self._fix(t)
-        super().visit_param_spec(t)
-
-    def visit_type_var_tuple(self, t: TypeVarTupleType, /) -> None:
-        self._fix(t)
-        super().visit_type_var_tuple(t)
-
-    def visit_callable_type(self, t: CallableType, /) -> None:
-        super().visit_callable_type(t)
-        for v in t.variables:
-            v.accept(self)
-        for extra in (t.type_guard, t.type_is, t.instance_type):
-            if extra is not None:
-                extra.accept(self)
-
-
-def _collect_wire_meta_types(t: Type, changes: dict[str, Any]) -> list[Type]:
-    """Gather every live Type reachable from the copy_modified inputs."""
-    types = [t]
-    for v in changes.values():
-        if isinstance(v, Type):
-            types.append(v)
-        elif isinstance(v, list):
-            types.extend(x for x in v if isinstance(x, Type))
-        elif isinstance(v, dict):
-            types.extend(x for x in v.values() if isinstance(x, Type))
-    return types
-
-
-def _restore_wire_meta(fixed: Type, live_types: list[Type]) -> bool:
-    """Patch TypeVarId.meta_level dropped by the wire codec.
-
-    Snapshots meta_level from the live inputs (applytype seam pattern) and
-    rewrites it onto the freshly decoded tree. Returns False when an
-    invariant cannot hold (conflicting meta levels for one id, or an id
-    unknown to the live map); the caller defers to the pure-Python copy.
-    """
-    meta: dict[tuple[int, str], int] = {}
-    for lt in live_types:
-        collector = _WireMetaCollector()
-        lt.accept(collector)
-        for k, v in collector.meta.items():
-            if k in meta and meta[k] != v:
-                return False
-            meta[k] = v
-    fixer = _WireMetaFixer(meta)
-    fixed.accept(fixer)
-    return not fixer.missing
-
-
-class _WireVarCanonCollector(TypeQuery[None]):
-    """Live-side snapshot: key -> the canonical TypeVarLikeType object.
-
-    Key is (raw_id, namespace, meta_level): one canonical object per
-    variable identity/level pair, picked from the live inputs of a native
-    copy_modified. Sets conflict=True when two value-different objects
-    share a key (then identity is not restorable; caller defers).
-    """
-
-    def __init__(self) -> None:
-        super().__init__()
-        # See _WireMetaCollector: live alias targets must not be expanded
-        # here: the wire-shaped decode references tvars only through alias
-        # args, and expanding targets recurses through native copy_modified
-
-        # on recursive-alias graphs.
-        self.skip_alias_target = True
-        self.canon: dict[tuple[int, str, int], TypeVarLikeType] = {}
-        self.conflict = False
-
-    def strategy(self, items: list[None]) -> None:
-        return None
-
-    def _record(self, t: TypeVarLikeType) -> None:
-        k = (t.id.raw_id, t.id.namespace, t.id.meta_level)
-        old = self.canon.get(k)
-        if old is None:
-            self.canon[k] = t
-        elif old != t:
-            self.conflict = True
-
-    def visit_type_var(self, t: TypeVarType, /) -> None:
-        self._record(t)
-        super().visit_type_var(t)
-
-    def visit_param_spec(self, t: ParamSpecType, /) -> None:
-        self._record(t)
-        super().visit_param_spec(t)
-
-    def visit_type_var_tuple(self, t: TypeVarTupleType, /) -> None:
-        self._record(t)
-        super().visit_type_var_tuple(t)
-
-    def visit_callable_type(self, t: CallableType, /) -> None:
-        super().visit_callable_type(t)
-        for v in t.variables:
-            v.accept(self)
-
-
-class _WireVarCanonizer(TypeTranslator):
-    """Decoded-side rewrite: point every occurrence at the canon object.
-
-    Rebuilds the decoded tree with each TypeVarLikeType occurrence replaced
-    by the live canon object for its (raw_id, namespace, meta_level) key.
-    visit_parameters is overridden with a bare construction because
-    Parameters.copy_modified(arg_types=...) would itself route through the
-    native path and re-decode the leaves we just canonized.
-    """
-
-    def __init__(self, canon: dict[tuple[int, str, int], TypeVarLikeType]) -> None:
-        super().__init__()
-        self.canon = canon
-
-    def _canon(self, t: TypeVarLikeType) -> TypeVarLikeType:
-        r = self.canon.get((t.id.raw_id, t.id.namespace, t.id.meta_level))
-        if r is None or r is t:
-            return t
-        return r
-
-    def visit_type_var(self, t: TypeVarType, /) -> Type:
-        return self._canon(t)
-
-    def visit_param_spec(self, t: ParamSpecType, /) -> Type:
-        return self._canon(t)
-
-    def visit_type_var_tuple(self, t: TypeVarTupleType, /) -> Type:
-        return self._canon(t)
-
-    def visit_type_alias_type(self, t: TypeAliasType, /) -> Type:
-        # The decoded tree is wire-shaped: an alias's target lives in the
-        # TypeAlias node (not a Type), so only the alias ARGS can embed var
-        # leaves; translate them and keep the alias object otherwise.
-        return t.copy_modified(args=self.translate_type_list(t.args))
-
-    def translate_variables(
-        self, variables: Sequence[TypeVarLikeType]
-    ) -> Sequence[TypeVarLikeType]:
-        return [self._canon(t) for t in variables]
-
-    def visit_parameters(self, t: Parameters, /) -> Type:
-        # visit_parameters keeps its arg_kinds/arg_names object identity;
-        # only the arg_types (which may embed var leaves from the wire) are
-        # translated, mirroring the bare-native-avoiding Python copy path.
-        return Parameters(
-            arg_types=self.translate_type_list(t.arg_types),
-            arg_kinds=t.arg_kinds,
-            arg_names=t.arg_names,
-            is_ellipsis_args=t.is_ellipsis_args,
-            variables=list(self.translate_variables(t.variables)),
-            imprecise_arg_kinds=t.imprecise_arg_kinds,
-            line=t.line,
-            column=t.column,
-        )
-
-
-def _restore_wire_var_identity(fixed: Type, live_types: list[Type]) -> Type | None:
-    """Restore occurrence identity lost by the wire round-trip (#475).
-
-    The native copy_modified decodes one fresh object per var occurrence,
-    but Python copies share one object per (identity, meta_level) across a
-    whole tree; seams like apply_poly + freeze_all_type_vars mutate through
-    the `variables` list and rely on that sharing. This rebuilds the
-    decoded tree so each decoded leaf points at the value-equal live
-    object. Returns None on canon conflicts so the caller defers to the
-    (identity-complete) pure-Python copy.
-    """
-    collector = _WireVarCanonCollector()
-    for lt in live_types:
-        lt.accept(collector)
-    if collector.conflict:
-        return None
-    if not collector.canon:
-        return fixed
-    return fixed.accept(_WireVarCanonizer(collector.canon))
-
-
-def _restore_wire_lines(fixed: Any, live: Any, changed: tuple[str, Any] | None = None) -> None:
-    """Sync line/column of a wire-decoded copy_modified result back to live positions.
-
-    The wire codec has no line/column fields, so every decoded node lands
-    at -1. A single-field copy_modified is a structural mirror of the live
-    inputs (the changed field's subtree mirrors the replacement value
-    instead), so pairing the two trees positionally recovers every lost
-    position. A kind mismatch stops the walk: that shape keeps its decoded
-    -1 positions and the failure mode is identical to pre-fix behavior.
-
-    Args are Any because callers feed mixed containers (lists/dicts from
-    copy_modified mirrors) as well as Types; the container handling lives
-    here and the typed core is dispatched from `_restore_wire_type_lines`.
-    """
-    if isinstance(fixed, (list, tuple)) and isinstance(live, (list, tuple)):
-        for f, l in zip(fixed, live):
-            _restore_wire_lines(f, l, changed)
-        return
-    if isinstance(fixed, dict) and isinstance(live, dict):
-        for k, f_val in fixed.items():
-            if k in live:
-                _restore_wire_lines(f_val, live[k], changed)
-        return
-    if not isinstance(fixed, Type) or not isinstance(live, Type):
-        return
-    _restore_wire_type_lines(fixed, live, changed)
-
-
-# (field, mode) spec table for `_restore_wire_type_lines` below. It replaces
-# the earlier per-class branch chain: the self-check config's proper-plugin
-# defeats `type(x) is C` refinement on this file's shape (the chain lost
-
-# narrowing no matter the surrounding body), while every value from
-# `getattr` reads as Any and needs no refinement at all. mode "opt" mirrors
-# the both-not-None guards (skip when either side is None); values inside
-
-# tuple-typed fields still walk via `_restore_wire_lines`' container layer.
-# Field order per class matches the dispatch order of the chain it
-# replaces; scalar mirrors live in the walker epilogues, keyed the same way.
-_WIRE_LINE_FIELDS: Final[dict[type[Any], list[tuple[str, str]]]] = {
-    Instance: [("args", "req"), ("last_known_value", "opt")],
-    CallableType: [
-        ("arg_types", "req"),
-        ("ret_type", "req"),
-        ("fallback", "req"),
-        ("variables", "req"),
-        ("type_guard", "opt"),
-        ("type_is", "opt"),
-        ("instance_type", "opt"),
-    ],
-    UnionType: [("items", "req")],
-    TupleType: [("items", "req"), ("partial_fallback", "req")],
-    TypedDictType: [("items", "req"), ("fallback", "req")],
-    TypeType: [("item", "req")],
-    TypeAliasType: [("args", "req")],
-    UnboundType: [("args", "req")],
-    UnpackType: [("type", "req")],
-    LiteralType: [("fallback", "req")],
-    Overloaded: [("items", "req")],
-    TypeVarType: [("upper_bound", "req"), ("default", "req"), ("values", "req")],
-    TypeVarTupleType: [("upper_bound", "req"), ("default", "req"), ("tuple_fallback", "req")],
-    ParamSpecType: [("upper_bound", "req"), ("default", "req"), ("prefix", "req")],
-    Parameters: [("arg_types", "req"), ("variables", "req")],
-}
-
-
-def _restore_wire_type_lines(
-    fixed: Type, live: Type, changed: tuple[str, Any] | None = None
-) -> None:
-    """Typed core of `_restore_wire_lines`.
-
-    Identity dispatch `type(x) is` is used where it remains only because
-    none of these classes have runtime subclasses (and the proper-plugin
-    flags isinstance against Type-derived classes); its result is never
-    relied upon for attribute narrowing.
-
-    The changed-field subtree mirrors the replacement value instead of
-    the live field, matching the positional mirror property of a
-    single-field copy_modified.
-    """
-    cls = type(fixed)
-    if cls is not type(live):
-        return
-    fixed.line = live.line
-    fixed.column = live.column
-    if cls is CallableType:
-        # Python copy_modified preserves `name`/`definition` from `self`
-        # unless that exact field is the change input; the codec drops
-        # both, so mirror them the same way as line/column.
-        ct_fixed = cast(CallableType, fixed)
-        ct_live = cast(CallableType, live)
-        if changed is None or changed[0] != "name":
-            ct_fixed.name = ct_live.name
-        if changed is None or changed[0] != "definition":
-            ct_fixed.definition = ct_live.definition
-    spec = _WIRE_LINE_FIELDS.get(cls)
-    if spec is None:
-        return
-    for field, mode in spec:
-        fval = getattr(fixed, field)
-        lval = getattr(live, field)
-        if mode == "opt" and (fval is None or lval is None):
-            continue
-        _restore_wire_lines(
-            fval, changed[1] if changed is not None and changed[0] == field else lval, None
-        )
-    if cls is Instance:
-        # Plugin- or module-synthesized attr types (e.g. the
-        # functools.partial `__mypy_partial` callable) are nested in the
-        # wire blob of any outer copy; mirror them by attr key so their
-
-        # name/definition/line parity survives the decode like the rest
-        # of the tree. Attr keys are not copy_modified field names, so no
-        # changed-field redirection applies.
-        ins_fixed = cast(Instance, fixed)
-        ins_live = cast(Instance, live)
-        f_attrs = ins_fixed.extra_attrs
-        l_attrs = ins_live.extra_attrs
-        if f_attrs is not None and l_attrs is not None:
-            for k, fattr in f_attrs.attrs.items():
-                lattr = l_attrs.attrs.get(k)
-                if lattr is not None and fattr is not None:
-                    _restore_wire_lines(fattr, lattr, None)
-
-
-def _native_copy_modified(t: Type, changes: dict[str, Any]) -> Type | None:
-    """Native fast path for `Type.copy_modified(**changes)` (#475).
-
-    Mirrors a single field swap on the wire-format Type in Rust. The
-    replacement fields travel as wire blobs built by
-    `_serialize_copy_modified_value`. Returns None (defer to Python) for
-    multi-field changes, unsupported classes/fields, or when the decoded
-    result cannot be fixed up (no typeinfo map / unresolved type_ref).
-    """
-    if not (_VISITOR_HAS_TYPE_KERNEL and _native_visitor_active):
-        return None
-    if len(changes) != 1:
-        return None
-    try:
-        ((field, value),) = changes.items()
-    except ValueError:
-        return None
-    # Recursive-alias deferral: the fresh decode forks a new object per
-    # occurrence, so TypeQuery walks over the live inputs cannot keep the
-    # seen_aliases identity the alias-expansion guard relies on;
-
-    # the walk then expands a recursive alias-default chain forever. Defer
-    # any copy that touches a recursive alias to the pure-Python body.
-    #
-
-    # The may-be-recursive walk reads TypeAliasType.is_recursive, whose
-    # lazy evaluation caches `_is_recursive` on the underlying TypeAlias
-    # node. Holding that cache while a forward-referenced alias's target
-
-    # is not self-containing yet (e.g. mutually recursive NamedTuples
-    # during semanal) would freeze a bogus False; pure-Python
-    # copy_modified never evaluates the flag at all.
-
-    # Suppress the cache here so each later real evaluation sees the
-    # settled truth.
-    global _REC_CACHE_SUPPRESSED
-    prev_suppressed = _REC_CACHE_SUPPRESSED
-    _REC_CACHE_SUPPRESSED = True
-    try:
-        if has_recursive_types(t) or (isinstance(value, Type) and has_recursive_types(value)):
-            return None
-    except (AssertionError, NotImplementedError):
-        pass
-    finally:
-        _REC_CACHE_SUPPRESSED = prev_suppressed
-    # The in-flight guard stops recursion: `_serialize_type_for_visitor`
-    # calls Type.write, and UnionType.write reads can_be_true / can_be_false
-    # which route through the native default → re-serialize → infinite loop.
-    global _native_truthiness_in_flight
-    _native_truthiness_in_flight = True
-    try:
-        value_bytes = _serialize_copy_modified_value(field, value)
-        if value_bytes is None:
-            return None
-        result = _rust_copy_modified(_serialize_type_for_visitor(t), field, value_bytes)
-    except (AssertionError, NotImplementedError, ValueError, TypeError):
-        return None
-    finally:
-        _native_truthiness_in_flight = False
-    if result is None:
-        return None
-    try:
-        fixed = _deserialize_type_from_visitor(bytes(result))
-    except (AssertionError, NotImplementedError, ValueError, TypeError):
-        # Tag-122 (ErasedType) cannot round-trip through Python's read_type
-        # by design (#1412 invariant; see has_erased_component): defer.
-        return None
-    if fixed is None:
-        return None
-    # The wire codec drops TypeVarId.meta_level (freshened metavariables);
-    # restore it from the live inputs or defer. Then restore occurrence
-    # identity (the decode forks one object per occurrence; Python copies
-
-    # share one), or defer when canon conflicts make that impossible.
-    live_types = _collect_wire_meta_types(t, changes)
-    if not _restore_wire_meta(fixed, live_types):
-        return None
-    fixed = _restore_wire_var_identity(fixed, live_types)
-    if fixed is None:
-        return None
-    # The codec also drops line/column on every decoded node; the result is
-    # a positional mirror of the live inputs (the changed field mirrors the
-    # replacement value), so recover the lost positions in one walk.
-    _restore_wire_lines(fixed, t, (field, value))
-    # CallableType copies that were never a change input (they fail
-    # _serialize_copy_modified_value above) live only on the live type:
-
-    # special_sig (the check_argument_count paramspec arm reads "partial") and
-    # the error-context trio that the codec does not serialize. Restore them.
-
-    # Identity checks, not isinstance: parity with Python copy_modified
-    # requires the fixup NOT to fire through a type alias unwrapping to a
-    # callable, and CallableType/Instance have no runtime subclasses.
-    if type(t) is CallableType and type(fixed) is CallableType:
-        ct = t
-        cf = fixed
-        cf.special_sig = ct.special_sig
-        cf.definition = ct.definition
-        cf.line = ct.line
-        cf.column = ct.column
-    return fixed
-
-
-def _serialize_copy_modified_value(field: str, value: Any) -> bytes | None:
-    """Serialize a single copy_modified field value to the wire format.
-
-    Each value uses the same wire layout as the field inside the enclosing
-    type's write(). Returns None for unsupported field shapes.
-    """
-    if field in ("args", "arg_types", "items"):
-        # items is a list for TupleType/UnionType and a dict for
-        # TypedDictType; the blob layout differs, so branch on the value.
-        try:
-            buf = _VisitorWriteBuffer()
-            if isinstance(value, dict):
-                write_type_map(buf, value)
-            else:
-                write_type_list(buf, value)
-            return buf.getvalue()
-        except (AssertionError, NotImplementedError, TypeError):
-            return None
-    if field in ("last_known_value", "instance_type", "type_guard", "type_is"):
-        try:
-            buf = _VisitorWriteBuffer()
-            write_type_opt(buf, value)
-            return buf.getvalue()
-        except (AssertionError, NotImplementedError, TypeError):
-            return None
-    if field == "ret_type" or field == "fallback" or field == "item":
-        try:
-            buf = _VisitorWriteBuffer()
-            value.write(buf)
-            return buf.getvalue()
-        except (AssertionError, NotImplementedError, AttributeError):
-            return None
-    if field == "arg_kinds":
-        try:
-            buf = _VisitorWriteBuffer()
-            write_int_list(buf, [int(k.value) for k in value])
-            return buf.getvalue()
-        except (AssertionError, NotImplementedError, AttributeError, ValueError):
-            return None
-    if field == "arg_names":
-        try:
-            buf = _VisitorWriteBuffer()
-            write_str_opt_list(buf, value)
-            return buf.getvalue()
-        except (AssertionError, NotImplementedError, TypeError):
-            return None
-    if field in ("required_keys", "readonly_keys"):
-        try:
-            buf = _VisitorWriteBuffer()
-            write_str_list(buf, sorted(value))
-            return buf.getvalue()
-        except (AssertionError, NotImplementedError, TypeError):
-            return None
-    if field == "is_closed" or field == "implicit":
-        try:
-            buf = _VisitorWriteBuffer()
-            write_bool(buf, bool(value))
-            return buf.getvalue()
-        except (AssertionError, NotImplementedError):
-            return None
-    return None
-
-
 def _serialize_type_list_for_visitor(types: Iterable[Type]) -> list[bytes]:
     return [_serialize_type_for_visitor(t) for t in types]
 
@@ -5666,34 +5031,6 @@ def _restore_list_identity(
     if any(s is None for s in src):
         return None
     return cast("list[Type]", src)
-
-
-def _restore_flat_row_flags(
-    types: Sequence[Type], input_bytes: list[bytes], decoded: list[Type]
-) -> None:
-    """Copy identity-bearing scalars from live input rows onto decoded rows.
-
-    List seams keep pass-through rows structurally identical to the input,
-    but the wire decode forks them with line/column and the truthiness
-    flags reset. For each decoded row whose canonical bytes match a live
-    input row, mirror line/column and can_be_true/can_be_false; genuinely
-    new rows (flattening products) keep the decoded defaults. Unlike
-    _restore_list_identity this is per-row, so it also applies when the
-    operation added rows that exist in no live source.
-    """
-    for row in decoded:
-        row_bytes = _serialize_type_list_for_visitor([row])
-        if not row_bytes:
-            continue
-        key = row_bytes[0]
-        for i, b in enumerate(input_bytes):
-            if b == key:
-                src = types[i]
-                row.line = src.line
-                row.column = src.column
-                row.can_be_true = src.can_be_true
-                row.can_be_false = src.can_be_false
-                break
 
 
 def _restore_dedup_identity(
@@ -5883,46 +5220,8 @@ def flatten_nested_unions(
     types: Sequence[Type], *, handle_type_alias_type: bool = True, handle_recursive: bool = True
 ) -> list[Type]:
     """Flatten nested unions in a type list."""
-    if _VISITOR_HAS_TYPE_KERNEL and _native_visitor_types_active:
-        try:
-            type_bytes_list = _serialize_type_list_for_visitor(types)
-            row_expansions: list[bytes | None] = []
-            if _native_visitor_resolver is None:
-                # No alias snapshot yet: alias rows expand via the live
-                # get_proper_type. Recursive rows defer to the pure-Python
-                # body (issue #1532); `None` means whole-call deferral.
-                for t in types:
-                    if handle_type_alias_type and isinstance(t, TypeAliasType):
-                        if t.is_recursive:
-                            row_expansions.append(None)
-                        else:
-                            row_expansions.append(_serialize_type_for_visitor(get_proper_type(t)))
-                    else:
-                        row_expansions.append(None)
-            result = _rust_flatten_nested_unions(
-                type_bytes_list,
-                handle_type_alias_type,
-                handle_recursive,
-                _native_visitor_resolver,
-                row_expansions,
-            )
-            if result is not None:
-                flat = _deserialize_type_list_from_visitor(result)
-                if flat is not None:
-                    # Copy before _restore_list_identity consumes entries.
-                    input_bytes = list(type_bytes_list)
-                    restored = _restore_list_identity(types, type_bytes_list, flat)
-                    if restored is not None:
-                        return restored
-                    # Flattening may add rows with no live source, in which
-                    # case identity restore is all-or-nothing; fall back to
-
-                    # a per-row flag mirror so pass-through rows keep their
-                    # truthiness and positions.
-                    _restore_flat_row_flags(types, input_bytes, flat)
-                    return flat
-        except (AssertionError, NotImplementedError):
-            pass
+    # Native seam retired (#1739): Python scans the list for flattens to
+    # do, the wire path serialized every tree to reach the same O(n) scan.
     if not isinstance(types, list):
         typelist = list(types)
     else:

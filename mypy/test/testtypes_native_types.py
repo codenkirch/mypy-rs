@@ -21388,3 +21388,170 @@ class NativeResidualScalarTypeopsSeamsRetiredSuite(Suite):
         assert is_simple_literal(self.fx.lit_str1_inst) is True
         assert is_simple_literal(self.fx.lit1) is False
         assert is_simple_literal(self.fx.a) is False
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeWireRoundTripSeamsRetiredSuite(Suite):
+    """Pin the #1739 retirement of the copy_modified / flatten seams.
+
+    `copy_modified` and `flatten_nested_unions` serialized a whole type
+    tree to reach an O(1)/O(n) Python body. Measured min-of-7 ns/call on
+    the live seam, with both arms in one process: the wire path cost
+    17x the Python body for an Instance arg swap, 72x for a TupleType
+    item swap, 16x for a callable return-type swap, and 26x/14x for
+    flatten with nothing / one union row to flatten. Both now run pure
+    Python; the Rust pyfunctions stay registered for direct-seam tests.
+    `rust_expand_type` is deliberately untouched: its Python body is a
+    full recursive visitor and the port measured 2.3x faster.
+
+    This suite fails if a wire crossing returns on either path.
+    """
+
+    _RETIRED = (
+        "_native_copy_modified",
+        "_serialize_copy_modified_value",
+        "_collect_wire_meta_types",
+        "_restore_wire_meta",
+        "_restore_wire_var_identity",
+        "_restore_wire_lines",
+        "_restore_wire_type_lines",
+        "_restore_flat_row_flags",
+        "_WireMetaCollector",
+        "_WireMetaFixer",
+        "_WireVarCanonCollector",
+        "_WireVarCanonizer",
+    )
+
+    def setUp(self) -> None:
+        import mypy.types as _types_mod
+        from mypy.types import _set_native_visitor_active, _set_native_visitor_types_active
+
+        self._types_mod = _types_mod
+        self._orig_visitor_gate = _types_mod._native_visitor_active
+        self._orig_types_gate = _types_mod._native_visitor_types_active
+        _set_native_visitor_active(True)
+        _set_native_visitor_types_active(True)
+        self.fx = TypeFixture()
+
+    def tearDown(self) -> None:
+        from mypy.types import _set_native_visitor_active, _set_native_visitor_types_active
+
+        _set_native_visitor_active(self._orig_visitor_gate)
+        _set_native_visitor_types_active(self._orig_types_gate)
+
+    def test_helpers_removed(self) -> None:
+        for name in self._RETIRED:
+            assert not hasattr(self._types_mod, name), f"{name} should be retired"
+
+    def test_native_shims_removed(self) -> None:
+        import inspect
+
+        from mypy.types import (
+            CallableType,
+            Instance,
+            TupleType,
+            TypedDictType,
+            flatten_nested_unions,
+        )
+
+        seams = ("_rust_copy_modified", "_native_copy_modified", "_rust_flatten_nested_unions")
+        funcs = (
+            flatten_nested_unions,
+            Instance.copy_modified,
+            TupleType.copy_modified,
+            CallableType.copy_modified,
+            TypedDictType.copy_modified,
+        )
+        for func in funcs:
+            src = inspect.getsource(func)
+            for seam in seams:
+                assert seam not in src, f"{func.__qualname__} must not consult {seam}"
+
+    def test_pyfunctions_still_registered(self) -> None:
+        for name in ("rust_copy_modified", "rust_flatten_nested_unions"):
+            assert hasattr(_type_kernel, name), f"{name} must stay callable"
+        assert hasattr(_type_kernel, "rust_expand_type"), "expand_type port must stay"
+
+    def test_no_wire_serialization(self) -> None:
+        from mypy.types import Instance, TupleType, TypedDictType, flatten_nested_unions
+
+        calls: list[str] = []
+        orig_one = self._types_mod._serialize_type_for_visitor
+        orig_many = self._types_mod._serialize_type_list_for_visitor
+
+        def spy_one(t: Any) -> bytes:
+            calls.append("type")
+            return orig_one(t)
+
+        def spy_many(rows: Any) -> list[bytes]:
+            calls.append("list")
+            return orig_many(rows)
+
+        self._types_mod._serialize_type_for_visitor = spy_one
+        self._types_mod._serialize_type_list_for_visitor = spy_many  # type: ignore[assignment]
+        try:
+            inst = Instance(self.fx.ai, [self.fx.a])
+            assert [str(x) for x in inst.copy_modified(args=[self.fx.b]).args] == [str(self.fx.b)]
+            tup = TupleType([self.fx.a, self.fx.b], self.fx.std_tuple)
+            assert [str(x) for x in tup.copy_modified(items=[self.fx.c]).items] == [str(self.fx.c)]
+            cb = self.fx.callable(self.fx.a, self.fx.b)
+            assert str(cb.copy_modified(ret_type=self.fx.c).ret_type) == str(self.fx.c)
+            td = TypedDictType({"x": self.fx.a}, {"x"}, set(), self.fx.a)
+            assert [str(x) for x in td.copy_modified(item_types=[self.fx.b]).items.values()] == [
+                str(self.fx.b)
+            ]
+            assert [str(x) for x in flatten_nested_unions([self.fx.a, self.fx.b])] == [
+                str(self.fx.a),
+                str(self.fx.b),
+            ]
+        finally:
+            self._types_mod._serialize_type_for_visitor = orig_one
+            self._types_mod._serialize_type_list_for_visitor = orig_many
+        assert calls == [], f"retired copy_modified/flatten seam serialized: {calls}"
+
+    def test_values_match_python(self) -> None:
+        from mypy.types import (
+            CallableType,
+            Instance,
+            TupleType,
+            TypedDictType,
+            UnionType,
+            flatten_nested_unions,
+        )
+
+        inst = Instance(self.fx.ai, [self.fx.a], last_known_value=self.fx.lit1)
+        inst.can_be_true = False
+        inst.can_be_false = True
+        inst_copy = inst.copy_modified(args=[self.fx.b])
+        assert [str(x) for x in inst_copy.args] == [str(self.fx.b)]
+        assert inst_copy.last_known_value is self.fx.lit1
+        assert inst_copy.can_be_true is False and inst_copy.can_be_false is True
+
+        tup = TupleType([self.fx.a, self.fx.b], self.fx.std_tuple, implicit=True)
+        assert tup.implicit is True
+        new_tup = tup.copy_modified(items=[self.fx.c])
+        assert [str(x) for x in new_tup.items] == [str(self.fx.c)]
+        # Python's constructor resets implicit; the wire path had to patch
+        # this back to match.
+        assert new_tup.implicit is False
+
+        cb: CallableType = self.fx.callable(self.fx.a, self.fx.b)
+        modified_cb = cb.copy_modified(ret_type=self.fx.c)
+        assert isinstance(modified_cb, CallableType)
+        assert str(modified_cb.ret_type) == str(self.fx.c)
+        assert modified_cb.arg_types == cb.arg_types
+        assert modified_cb.fallback is cb.fallback
+
+        td = TypedDictType({"x": self.fx.a, "y": self.fx.b}, {"x", "y"}, set(), self.fx.a)
+        assert [
+            str(x) for x in td.copy_modified(item_types=[self.fx.c, self.fx.c]).items.values()
+        ] == [str(self.fx.c), str(self.fx.c)]
+        # item_names filtering exists only on the Python path.
+        filtered = td.copy_modified(item_types=[self.fx.c, self.fx.c], item_names=["x"])
+        assert set(filtered.items) == {"x"}
+
+        rows = flatten_nested_unions([self.fx.a, self.fx.b])
+        assert rows[0] is self.fx.a and rows[1] is self.fx.b
+        flat = flatten_nested_unions([UnionType([self.fx.a, self.fx.b])])
+        assert [str(x) for x in flat] == [str(self.fx.a), str(self.fx.b)]
+        assert flat[0] is self.fx.a and flat[1] is self.fx.b

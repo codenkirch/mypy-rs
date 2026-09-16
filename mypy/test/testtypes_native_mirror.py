@@ -528,15 +528,12 @@ class NativeRemoveDupsSuite(Suite):
 class NativeHasRecursiveTypesFlattenSuite(Suite):
     """Parity for the issue #1418 ports in `mypy.types`.
 
-    `has_recursive_types` is now total: the wire carries the alias
-    `is_recursive` flag and the Rust port mirrors
-    `HasRecursiveType`/`BoolTypeQuery` at the exact visitor positions,
-    so every well-formed blob decides natively (gate-on == gate-off).
-    `flatten_nested_unions` expands zero-argument alias rows through the
-    alias snapshot installed on the resolver (mirroring Python's
-    `get_proper_type` union-shape decision, cycle cut per issue #1149);
-    applied aliases and missing snapshots defer to the Python body.
-    Direct seam calls prove engagement.
+    Both seams are retired: `has_recursive_types` in #1640 and
+    `flatten_nested_unions` in #1739 (the wire round trip serialized
+    every input tree to reach the same list scan, ~26x the Python body).
+    The gate-on/gate-off differentials below now pin the Python body,
+    and `_spy_flatten_serialize` pins zero wire crossings; the retired
+    pyfunctions are pinned by direct calls.
     """
 
     def setUp(self) -> None:
@@ -545,11 +542,8 @@ class NativeHasRecursiveTypesFlattenSuite(Suite):
         import mypy.types as _types_mod
 
         self._types_mod = _types_mod
-        # Bind the seam names the module-level try would have bound.
         _types_mod._VisitorWriteBuffer = WriteBuffer  # type: ignore[attr-defined]
         _types_mod._ReadBuffer = ReadBuffer  # type: ignore[attr-defined]
-        for n in ("flatten_nested_unions", "has_recursive_types"):
-            _types_mod.__dict__["_rust_" + n] = getattr(_type_kernel, "rust_" + n)
         self._orig_kernel_flag = _types_mod._VISITOR_HAS_TYPE_KERNEL
         _types_mod._VISITOR_HAS_TYPE_KERNEL = True
         # Save the process-global gates other suites (the conftest parity
@@ -706,39 +700,37 @@ class NativeHasRecursiveTypesFlattenSuite(Suite):
             is not None
         )
 
-    def _spy_flatten(self) -> tuple[list[list[bytes | None]], Callable[[], None]]:
-        """Install a spy around the Rust flatten seam, returning its rows.
+    def _spy_flatten_serialize(self) -> tuple[list[int], Callable[[], None]]:
+        """Count wire serializations taken by `flatten_nested_unions`.
 
-        The spy records the `row_expansions` argument of every call and
-        then defers to the real seam.
+        The retired seam serialized every input row here; the pure-Python
+        body must take zero crossings even with both gates on.
         """
         import mypy.types as _types_mod
 
-        seen: list[list[bytes | None]] = []
-        real = _types_mod._rust_flatten_nested_unions  # type: ignore[attr-defined]
+        seen: list[int] = []
+        real = _types_mod._serialize_type_list_for_visitor
 
-        def spy(
-            blobs: list[bytes], hat: bool, hr: bool, resolver: Any, expansions: list[bytes | None]
-        ) -> Any:
-            seen.append(list(expansions))
-            return real(blobs, hat, hr, resolver, expansions)
+        def spy(rows: Any) -> Any:
+            seen.append(1)
+            return real(rows)
 
-        _types_mod._rust_flatten_nested_unions = spy  # type: ignore[attr-defined, assignment]
+        _types_mod._serialize_type_list_for_visitor = spy  # type: ignore[assignment]
 
         def restore() -> None:
-            _types_mod._rust_flatten_nested_unions = real  # type: ignore[attr-defined]
+            _types_mod._serialize_type_list_for_visitor = real
 
         return seen, restore
 
-    def test_flatten_recursive_alias_no_resolver_defers_row(self) -> None:
-        # Issue #1532: recursive alias rows defer (`[None]`) instead of
-        # expanding through the live callback; both `handle_recursive`
-        # values must match the pure-Python body.
+    def test_flatten_recursive_alias_no_resolver_matches_python(self) -> None:
+        # Issue #1532 / #1739: the pure-Python body expands one union
+        # target step for hr=True and keeps the alias row for hr=False,
+        # with no wire crossing in either gate state.
         from mypy.types import _set_native_visitor_resolver, flatten_nested_unions
 
         A, _target = self.fx.def_alias_2(self.fx.a)
         assert A.is_recursive
-        seen, restore = self._spy_flatten()
+        seen, restore = self._spy_flatten_serialize()
         _set_native_visitor_resolver(None)
         try:
             self._set_gates(True, False)
@@ -755,19 +747,16 @@ class NativeHasRecursiveTypesFlattenSuite(Suite):
         # hr=False keeps the alias row.
         assert len(on_true) == 2
         assert on_false == [str(A)]
-        # No call ever asked the live callback to expand an alias row.
-        assert seen
-        assert all(x is None for rows in seen for x in rows), seen
+        assert not seen, f"retired flatten seam serialized {len(seen)} time(s)"
 
-    def test_flatten_nonrecursive_alias_no_resolver_callback_engages(self) -> None:
-        # The #1532 guard is scoped to recursive rows: a non-recursive
-        # alias row still expands through the live callback and engages
-        # the Rust seam with the expanded blob.
+    def test_flatten_nonrecursive_alias_expands_in_python(self) -> None:
+        # A non-recursive alias row expands through the Python body; the
+        # result carries the union members and no wire crossing happens.
         from mypy.types import _set_native_visitor_resolver, flatten_nested_unions
         from mypy.wirefixup import set_wire_typeinfo_map
 
         _node, alias = self._def_union_alias("F", UnionType([self.fx.a, self.fx.str_type]))
-        seen, restore = self._spy_flatten()
+        seen, restore = self._spy_flatten_serialize()
         _set_native_visitor_resolver(None)
         set_wire_typeinfo_map({info.fullname: info for info in self.type_infos})
         try:
@@ -776,9 +765,9 @@ class NativeHasRecursiveTypesFlattenSuite(Suite):
         finally:
             restore()
             set_wire_typeinfo_map(None)
-        expanded = [rows for rows in seen if rows and rows[0] is not None]
-        assert len(expanded) == 1, f"non-recursive row did not expand: {seen}"
         assert [str(x) for x in on] == [str(self.fx.a), str(self.fx.str_type)]
+        assert not seen, f"retired flatten seam serialized {len(seen)} time(s)"
+
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeTraverserSuite(Suite):
