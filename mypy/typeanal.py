@@ -1514,30 +1514,9 @@ class TypeAnalyser(SyntheticTypeVisitor[Type], TypeAnalyzerPluginInterface):
         This handles simple cases like 'int', 'modname.UserClass[str]', etc.
         """
 
-        if _TYPEANAL_HAS_KERNEL and _native_typeanal_active:
-            try:
-                tag = _rust_classify_type_with_info(
-                    info.fullname,
-                    len(args),
-                    info.tuple_type is not None,
-                    info.special_alias is not None,
-                    info.typeddict_type is not None,
-                )
-            except (AssertionError, NotImplementedError):
-                tag = None
-            if tag == _TYPE_WITH_INFO_TAG_TUPLE:
-                self.check_and_warn_deprecated(info, ctx)
-                fallback = Instance(info, [AnyType(TypeOfAny.special_form)], ctx.line)
-                return TupleType(self.anal_array(args, allow_unpack=True), fallback, ctx.line)
-            if tag == _TYPE_WITH_INFO_TAG_NONE_TYPE:
-                self.check_and_warn_deprecated(info, ctx)
-                self.fail(
-                    "NoneType should not be used as a type, please use None instead",
-                    ctx,
-                    code=codes.NONETYPE_TYPE,
-                )
-                return NoneType(ctx.line, ctx.column)
-
+        # The Rust branch classifier was retired in #1739: the five-fact
+        # chain was 1.92x-2.77x cheaper in Python on every shape, and on its
+        # dominant tag it displaced no work, since it re-ran this same body.
         self.check_and_warn_deprecated(info, ctx)
 
         if len(args) > 0 and info.fullname == "builtins.tuple":
@@ -3857,7 +3836,6 @@ try:
         rust_classify_special_unbound as _rust_classify_special_unbound,
         rust_classify_tuple_type_implicit as _rust_classify_tuple_type_implicit,
         rust_classify_type_guard_arg as _rust_classify_type_guard_arg,
-        rust_classify_type_with_info as _rust_classify_type_with_info,
         rust_classify_unbound_front as _rust_classify_unbound_front,
         rust_collect_all_inner_types as _rust_collect_all_inner_types,
         rust_collect_all_inner_types_live as _rust_collect_all_inner_types_live,
@@ -3876,7 +3854,6 @@ try:
         rust_type_analyze as _rust_type_analyze,
         rust_unknown_unpack as _rust_unknown_unpack,
         rust_unknown_unpack_live as _rust_unknown_unpack_live,
-        rust_validate_instance as _rust_validate_instance,
     )
 
     from mypy.types import read_type as _typeanal_read_type
@@ -3896,7 +3873,6 @@ except ImportError:
     _rust_type_analyze = None  # type: ignore[assignment]
     _rust_unknown_unpack = None  # type: ignore[assignment]
     _rust_unknown_unpack_live = None  # type: ignore[assignment]
-    _rust_validate_instance = None  # type: ignore[assignment]
     _rust_detect_diverging_alias = None  # type: ignore[assignment]
     _rust_find_self_type = None  # type: ignore[assignment]
     _rust_find_self_type_live = None  # type: ignore[assignment]
@@ -3905,7 +3881,6 @@ except ImportError:
     _rust_instantiate_type_alias = None  # type: ignore[assignment]
     _rust_analyze_unbound_without_info = None  # type: ignore[assignment]
     _rust_check_unpacks_in_list = None  # type: ignore[assignment]
-    _rust_classify_type_with_info = None  # type: ignore[assignment]
     _rust_classify_unbound_front = None  # type: ignore[assignment]
     _rust_classify_special_unbound = None  # type: ignore[assignment]
     _rust_classify_tuple_type_implicit = None  # type: ignore[assignment]
@@ -4421,13 +4396,8 @@ def make_optional_type(t: Type) -> Type:
 
 def validate_instance(t: Instance, fail: MsgCallback, indexed: bool) -> bool:
     """Check if this is a well-formed instance with respect to argument count/positions."""
-    if _TYPEANAL_HAS_KERNEL and _native_typeanal_active:
-        try:
-            result = _rust_validate_instance(t, fail, indexed)
-            if result is not None:
-                return result
-        except (AssertionError, NotImplementedError):
-            pass
+    # Rust shim retired in #1739: a live-object crossing cost 3.5x-4.8x the
+    # Python body, an O(n) scan over `t.args` that needs no round-trip.
     # TODO: combine logic with instantiate_type_alias().
     if any(unknown_unpack(a) for a in t.args):
         # This type is not ready to be validated, because of unknown total count.

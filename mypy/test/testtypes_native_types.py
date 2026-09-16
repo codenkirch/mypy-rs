@@ -8088,7 +8088,7 @@ class NativeAnalyzeTypeWithInfoSuite(Suite):
         assert_equal(on[1], off[1], f"analyze_type_with_type_info errors {info.fullname}")
 
     def _assert_engages(self, expected: int, **facts: Any) -> None:
-        from mypy.typeanal import _rust_classify_type_with_info  # type: ignore[attr-defined]
+        from type_kernel import rust_classify_type_with_info as _rust_classify_type_with_info
 
         defaults: dict[str, Any] = {
             "fullname": "mod.UserClass",
