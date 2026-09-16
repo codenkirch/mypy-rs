@@ -8,13 +8,12 @@ except ImportError:
     _type_kernel = None  # type: ignore[assignment]
 
 from collections.abc import Callable
-from mypy.nodes import (
-    ARG_POS,
-    Context,
-    INVARIANT,
-    TypeInfo,
-)
+from typing import Any
+from unittest import skipUnless
+
+from mypy.nodes import ARG_POS, INVARIANT, Context, TypeInfo
 from mypy.test.helpers import Suite, assert_equal
+from mypy.test.testtypes import _NATIVE_WIRE_ENABLED, T, _is_type_info
 from mypy.test.typefixture import TypeFixture
 from mypy.typeanal import _set_native_typeanal_active
 from mypy.types import (
@@ -25,15 +24,6 @@ from mypy.types import (
     TypeOfAny,
     TypeVarId,
     TypeVarType,
-)
-from typing import Any
-from unittest import skipUnless
-import mypy.expandtype
-
-from mypy.test.testtypes import (
-    T,
-    _NATIVE_WIRE_ENABLED,
-    _is_type_info,
 )
 
 
@@ -190,6 +180,7 @@ class NativeMatchGenericCallablesSuite(Suite):
         assert_equal(str(on[0]), str(off[0]))
         assert_equal(str(on[1]), str(off[1]))
 
+
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeRawExpressionTypeSuite(Suite):
     """Parity for the Rust `visit_raw_expression_type` message classifier.
@@ -209,7 +200,6 @@ class NativeRawExpressionTypeSuite(Suite):
     """
 
     def setUp(self) -> None:
-        from mypy.typeanal import _set_native_typeanal_active
 
         self._set_active = _set_native_typeanal_active
         self._set_active(True)

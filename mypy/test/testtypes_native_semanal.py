@@ -3,13 +3,17 @@
 from __future__ import annotations
 
 try:
-    from librt.internal import WriteBuffer as _WriteBuffer
     import type_kernel as _type_kernel
+    from librt.internal import WriteBuffer as _WriteBuffer
 except ImportError:
     _WriteBuffer = None  # type: ignore[assignment,misc]
     _type_kernel = None  # type: ignore[assignment]
 
 from collections.abc import Callable
+from types import SimpleNamespace
+from typing import Any, cast
+from unittest import TestCase, skipUnless
+
 from mypy.checker import TypeChecker
 from mypy.checkexpr import ExpressionChecker
 from mypy.nodes import (
@@ -17,6 +21,8 @@ from mypy.nodes import (
     ARG_POS,
     ARG_STAR,
     ARG_STAR2,
+    GDEF,
+    MDEF,
     ArgKind,
     Argument,
     AssignmentStmt,
@@ -25,11 +31,8 @@ from mypy.nodes import (
     ClassDef,
     Expression,
     FuncDef,
-    GDEF,
     IndexExpr,
     IntExpr,
-    ListExpr,
-    MDEF,
     MemberExpr,
     MypyFile,
     NameExpr,
@@ -49,6 +52,13 @@ from mypy.nodes import (
 )
 from mypy.options import Options
 from mypy.test.helpers import Suite, assert_equal, assert_type
+from mypy.test.testtypes import (
+    _NATIVE_SEMANAL_LOOKUP_ENABLED,
+    _NATIVE_WIRE_ENABLED,
+    T,
+    _FakeNode,
+    _FakeTypeInfo,
+)
 from mypy.test.typefixture import TypeFixture
 from mypy.types import (
     AnyType,
@@ -61,23 +71,12 @@ from mypy.types import (
     TupleType,
     Type,
     TypeAliasType,
+    TypedDictType,
     TypeOfAny,
     TypeType,
-    TypedDictType,
     UnboundType,
     UnpackType,
     get_proper_type,
-)
-from types import SimpleNamespace
-from typing import Any, cast
-from unittest import TestCase, skipUnless
-
-from mypy.test.testtypes import (
-    T,
-    _FakeNode,
-    _FakeTypeInfo,
-    _NATIVE_SEMANAL_LOOKUP_ENABLED,
-    _NATIVE_WIRE_ENABLED,
 )
 
 
@@ -148,6 +147,7 @@ class NativeSemanalClassPropSuite(Suite):
         _type_kernel.rust_add_type_promotion(nativ, SymbolTable(), None, builtin_names)
         assert int_info._promote, "int should gain the i64 promotion"
         assert nativ.alt_promote is not None, "i64 should get alt_promote = int"
+
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeTypeExpressionClassifySuite(Suite):
@@ -374,6 +374,7 @@ class NativeTypeExpressionClassifySuite(Suite):
             ((), None, False, False, False, False, False, 0, False, False, False, False), None
         )
 
+
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeCanPossiblyBeTypeFormSuite(Suite):
     """Parity for the Rust `rust_can_possibly_be_type_form` port.
@@ -481,6 +482,7 @@ class NativeCanPossiblyBeTypeFormSuite(Suite):
 
         self._assert_par(make)
         self._assert_engages(make(), False, False)
+
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeDecoratorClassifySuite(Suite):
@@ -660,6 +662,7 @@ class NativeDecoratorClassifySuite(Suite):
             "type_check_only",
         ]
         self._assert_tags(decorators, expected)
+
 
 @skipUnless(
     _NATIVE_SEMANAL_LOOKUP_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext"
@@ -854,6 +857,7 @@ class NativeLookupSuite(Suite):
         )
         assert r == ("not_found", None)
 
+
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeMypyFileLookupSuite(Suite):
     """Parity tests for the MypyFile branch of `rust_lookup_qualified`.
@@ -942,6 +946,7 @@ class NativeMypyFileLookupSuite(Suite):
         r = self._call({"a": a, "other.ns": other}, "a.ns.x")
         assert r == (-1, "")
 
+
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeLookupQualifiedVarSuite(Suite):
     """Parity tests for the non-Any Var branch of `rust_lookup_qualified`.
@@ -1007,6 +1012,7 @@ class NativeLookupQualifiedVarSuite(Suite):
         r = self._call("P.args", 5, "mod.P", False)
         assert r is None
 
+
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeLookupQualifiedNestedSuite(Suite):
     """Parity tests for nested-TypeInfo dot-chains in `rust_lookup_qualified`.
@@ -1067,6 +1073,7 @@ class NativeLookupQualifiedNestedSuite(Suite):
         r = self._call("out.I.missing", 0, "out", False)
         assert r is not None
         assert r[0] == -1
+
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeBinderSuite(Suite):
@@ -1140,7 +1147,6 @@ class NativeBinderSuite(Suite):
     # --- Var with PartialType ---
 
     def test_var_partial_type(self) -> None:
-        from mypy.types import PartialType
 
         # A PartialType is what get_declaration must refuse to return.
         v = Var("p")
@@ -1172,6 +1178,7 @@ class NativeBinderSuite(Suite):
         e = NameExpr("f")
         e.node = fn
         self._check(e, "FuncDef node")
+
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeCleanUpBasesSuite(Suite):
@@ -1223,6 +1230,7 @@ class NativeCleanUpBasesSuite(Suite):
 
     def test_non_protocol_name_kept(self) -> None:
         assert self._classify("mod.NotProtocol", False, True) == 1  # KEEP
+
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeClassDecoratorCommonSuite(Suite):
@@ -1305,7 +1313,7 @@ class NativeClassDecoratorCommonSuite(Suite):
         self, decorator: Expression, *, is_protocol: bool = False, typeddict: bool = False
     ) -> tuple[bool, bool, bool, str | None, list[str]]:
         from mypy import semanal
-        from mypy.nodes import Block, ClassDef, SymbolTable, TypeInfo
+        from mypy.nodes import Block, SymbolTable, TypeInfo
 
         class _Analyzer:
             def __init__(self) -> None:
@@ -1368,6 +1376,7 @@ class NativeClassDecoratorCommonSuite(Suite):
 
     def test_method_none_parity(self) -> None:
         self._assert_method_parity(self._name("some.random.decorator"))
+
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeCompatMetaclassHelperSuite(Suite):
@@ -1460,7 +1469,7 @@ class NativeCompatMetaclassHelperSuite(Suite):
         self, base_expr: CallExpr | None = None, decorators: list[Expression] | None = None
     ) -> tuple[list[str | None], str | None, list[str]]:
         from mypy import semanal
-        from mypy.nodes import Block, ClassDef, SymbolTable, TypeInfo
+        from mypy.nodes import Block, SymbolTable, TypeInfo
 
         class _Analyzer:
             def __init__(self) -> None:
@@ -1537,6 +1546,7 @@ class NativeCompatMetaclassHelperSuite(Suite):
         decorator = self._decorator("six.add_metaclass", [self._name("mod.M")], [ARG_NAMED])
         self._assert_method_parity(decorators=[decorator])
 
+
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeMagicBaseSuite(Suite):
     """Parity for the magic-base skip and core-builtin gate classifiers
@@ -1589,6 +1599,7 @@ class NativeMagicBaseSuite(Suite):
         assert (
             self._tk.rust_is_core_builtin_class("builtins", "Foo", CORE_BUILTIN_CLASSES) is False
         )
+
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeFunctionSignatureSuite(Suite):
@@ -1693,6 +1704,7 @@ class NativeFunctionSignatureSuite(Suite):
     def test_parity_zero_zero(self) -> None:
         self._assert_par(0, [])
 
+
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeFixedArgsSuite(Suite):
     """Parity for the Rust `check_fixed_args` arbitration port.
@@ -1790,6 +1802,7 @@ class NativeFixedArgsSuite(Suite):
     def test_parity_wrong_kinds(self) -> None:
         self._assert_par(2, [ARG_POS, ARG_NAMED], 2)
         self._assert_par(2, [ARG_STAR, ARG_POS], 2)
+
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeSemanalVisitorAuditSuite(Suite):
@@ -2146,6 +2159,7 @@ class NativeSemanalVisitorAuditSuite(Suite):
     def test_retired_refers_to_class_or_function_direct(self) -> None:
         assert self._tk.rust_refers_to_class_or_function(self._name("x")) is False
 
+
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeDecoratedFunctionIsMethodSuite(Suite):
     """Parity for the Rust `check_decorated_function_is_method` predicate port.
@@ -2242,6 +2256,7 @@ class NativeDecoratedFunctionIsMethodSuite(Suite):
     def test_parity_both_fail(self) -> None:
         self._assert_par(has_type=False, func_scope=True)
 
+
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeLvalueValiditySuite(Suite):
     """Parity for the Rust `check_lvalue_validity` dispatch-head port.
@@ -2278,7 +2293,7 @@ class NativeLvalueValiditySuite(Suite):
         return _type_kernel.rust_classify_lvalue_validity(node)
 
     def _typeinfo(self) -> TypeInfo:
-        from mypy.nodes import Block, ClassDef, SymbolTable
+        from mypy.nodes import Block, SymbolTable
 
         class_def = ClassDef("C", Block([]), None, [])
         class_def.fullname = "mod.C"
@@ -2333,6 +2348,7 @@ class NativeLvalueValiditySuite(Suite):
 
     def test_parity_none(self) -> None:
         self._assert_par(None)
+
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeShouldWaitRhsSuite(Suite):
@@ -2546,6 +2562,7 @@ class NativeShouldWaitRhsSuite(Suite):
         off, on = self._run("index", sym=None)
         assert on[1] == [("lookup", "x", False)]
 
+
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeConfigureBasesSuite(Suite):
     """Parity for the Rust `configure_base_classes` classifier + MRO tail port.
@@ -2674,7 +2691,7 @@ class NativeConfigureBasesSuite(Suite):
     # Movement (b)/(c): gate-off vs gate-on differential via the shim.
 
     def _info(self, name: str = "A") -> TypeInfo:
-        from mypy.nodes import Block, ClassDef
+        from mypy.nodes import Block
 
         defn = ClassDef(name, Block([]), None, [])
         defn.fullname = f"mod.{name}"
@@ -2873,6 +2890,7 @@ class NativeConfigureBasesSuite(Suite):
             semanal_mod._serialize_semanal_type = saved
         assert_equal(on, off)
 
+
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeDeclaredMetaclassSuite(Suite):
     """Parity for the Rust metaclass resolution decision heads (issue #1037).
@@ -2907,7 +2925,7 @@ class NativeDeclaredMetaclassSuite(Suite):
             self._set_active(True)
 
     def _bare_info(self, fullname: str) -> TypeInfo:
-        from mypy.nodes import Block, ClassDef, SymbolTable
+        from mypy.nodes import Block, SymbolTable
 
         name = fullname.rsplit(".", 1)[-1]
         defn = ClassDef(name, Block([]), None, [])
@@ -3227,6 +3245,7 @@ class NativeDeclaredMetaclassSuite(Suite):
         assert calls == [], f"get_declared_metaclass serialized {len(calls)} types"
         assert_equal(on, off)
 
+
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativePrepareMethodSignatureSuite(Suite):
     """Parity for the Rust `prepare_method_signature` dispatch-head port.
@@ -3265,7 +3284,7 @@ class NativePrepareMethodSignatureSuite(Suite):
             self._set_active(True)
 
     def _info(self) -> TypeInfo:
-        from mypy.nodes import Block, ClassDef
+        from mypy.nodes import Block
 
         defn = ClassDef("C", Block([]), None, [])
         defn.fullname = "mod.C"
@@ -3377,20 +3396,12 @@ class NativePrepareMethodSignatureSuite(Suite):
     def test_seam_any_self_trivial(self) -> None:
         fdef = self._fdef("m", [AnyType(TypeOfAny.unannotated)])
 
-        assert self._tag(fdef, AnyType(TypeOfAny.unannotated), 0, None, False) == (
-            False,
-            False,
-            1,
-        )
+        assert self._tag(fdef, AnyType(TypeOfAny.unannotated), 0, None, False) == (False, False, 1)
 
     def test_seam_any_self_replace(self) -> None:
         fdef = self._fdef("m", [AnyType(TypeOfAny.unannotated)])
 
-        assert self._tag(fdef, AnyType(TypeOfAny.unannotated), 0, None, True) == (
-            False,
-            False,
-            0,
-        )
+        assert self._tag(fdef, AnyType(TypeOfAny.unannotated), 0, None, True) == (False, False, 0)
 
     def test_seam_new_static(self) -> None:
         static_fdef = self._fdef("__new__", [])
@@ -3400,11 +3411,7 @@ class NativePrepareMethodSignatureSuite(Suite):
     def test_seam_new_with_any_self(self) -> None:
         fdef = self._fdef("__new__", [AnyType(TypeOfAny.unannotated)])
 
-        assert self._tag(fdef, AnyType(TypeOfAny.unannotated), 0, None, False) == (
-            True,
-            False,
-            1,
-        )
+        assert self._tag(fdef, AnyType(TypeOfAny.unannotated), 0, None, False) == (True, False, 1)
 
     def test_seam_class_special_write(self) -> None:
         fx = TypeFixture()
@@ -3514,6 +3521,7 @@ class NativePrepareMethodSignatureSuite(Suite):
         off = self._with_gate(False, check_one)
         on = self._with_gate(True, check_one)
         assert_equal(on, off, "prepare_method_signature deferral parity")
+
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeRemoveUnpackKwargsSuite(Suite):
@@ -3679,6 +3687,7 @@ class NativeRemoveUnpackKwargsSuite(Suite):
         assert ret.unpack_kwargs
         assert isinstance(get_proper_type(ret.arg_types[-1]), TypedDictType)
 
+
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeLookupDefinerSuite(Suite):
     """Parity for `rust_lookup_definer` (issue #1075).
@@ -3710,7 +3719,7 @@ class NativeLookupDefinerSuite(Suite):
             self._set_active(True)
 
     def _info(self, fullname: str, mro: list[TypeInfo] | None = None) -> TypeInfo:
-        from mypy.nodes import Block, ClassDef
+        from mypy.nodes import Block
 
         defn = ClassDef(fullname.rsplit(".", 1)[-1], Block([]), None, [])
         defn.fullname = fullname
@@ -3730,7 +3739,6 @@ class NativeLookupDefinerSuite(Suite):
         return info
 
     def _checker(self) -> Any:
-        from mypy.checker import TypeChecker
         from mypy.errors import Errors
         from mypy.nodes import MypyFile
         from mypy.plugin import Plugin
@@ -3744,7 +3752,6 @@ class NativeLookupDefinerSuite(Suite):
         return TypeChecker(errors, modules, options, tree, "", Plugin(options), {})
 
     def _ec(self) -> Any:
-        from mypy.checkexpr import ExpressionChecker
 
         return ExpressionChecker(self._checker(), None, None, None)  # type: ignore[arg-type]
 
@@ -3813,6 +3820,7 @@ class NativeLookupDefinerSuite(Suite):
         b = self._subclass("mod.B", [])
         self._assert_par(Instance(b, []), "foo", None)
 
+
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeDecidedNoneSuite(Suite):
     """Issue #1101: the binder/constant_fold seams return a (decided, value)
@@ -3839,7 +3847,6 @@ class NativeDecidedNoneSuite(Suite):
 
     def _decided_none_exprs(self) -> list[tuple[str, Expression]]:
         """Live expressions whose get_declaration answer is None."""
-        from mypy.types import PartialType
 
         exprs: list[tuple[str, Expression]] = []
         # Non-RefExpr.
@@ -3980,6 +3987,7 @@ class NativeDecidedNoneSuite(Suite):
         decided, val = self._tk.rust_constant_fold_expr(NameExpr("True"), "mod")
         assert decided is True and val is True
 
+
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeSetCallableNameSuite(Suite):
     """Parity for `rust_set_callable_name` (issue #1100).
@@ -4014,7 +4022,7 @@ class NativeSetCallableNameSuite(Suite):
             self._set_active(True)
 
     def _info(self, fullname: str) -> Any:
-        from mypy.nodes import Block, ClassDef, SymbolTable, TypeInfo
+        from mypy.nodes import Block, SymbolTable, TypeInfo
 
         defn = ClassDef(fullname.rsplit(".", 1)[-1], Block([]), None, [])
         defn.fullname = fullname
@@ -4098,7 +4106,6 @@ class NativeSetCallableNameSuite(Suite):
         assert result.name == "m of TypedDict"
 
     def test_parity_overloaded_sig(self) -> None:
-        from mypy.types import Overloaded
 
         info = self._info("mod.C")
         fdef = self._fdef("m", info)
@@ -4106,6 +4113,7 @@ class NativeSetCallableNameSuite(Suite):
         assert isinstance(sig, Overloaded)
         result = self._assert_par(sig, fdef)
         assert result.get_name() == "m of C"
+
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeBinderFrameSuite(Suite):
@@ -4246,8 +4254,10 @@ class NativeBinderFrameSuite(Suite):
             # update_from_options with a non-empty frames list clears it:
             # frames[-1].unreachable = not frames = not [frame] = False
             from mypy.binder import Frame
+
             b.update_from_options([Frame(99)])
             assert b.is_unreachable() is False
+
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeRemoveUnpackKwargsLiveSuite(Suite):
@@ -4367,13 +4377,15 @@ class NativeRemoveUnpackKwargsLiveSuite(Suite):
         from mypy import semanal
 
         calls: list[object] = []
-        orig = getattr(semanal, "_rust_classify_remove_unpack_kwargs_live")
+        # Dynamic form: the alias is private to semanal and not re-exported,
+        # so the self-check (implicit_reexport=False) rejects direct access.
+        orig = getattr(semanal, "_rust_classify_remove_unpack_kwargs_live")  # noqa: B009
 
         def spy(typ: CallableType) -> Any:
             calls.append(typ)
             return orig(typ)
 
-        setattr(semanal, "_rust_classify_remove_unpack_kwargs_live", spy)
+        setattr(semanal, "_rust_classify_remove_unpack_kwargs_live", spy)  # noqa: B010
         try:
             plain = self._callable(["x", "kw"], self.fx.a, [ARG_POS, ARG_POS])
             ret_plain, _ = self._run_shim(plain)
@@ -4382,11 +4394,12 @@ class NativeRemoveUnpackKwargsLiveSuite(Suite):
             unpack = self._callable(["x", "kw"], UnpackType(self._td(["y"])))
             ret_unpack, _ = self._run_shim(unpack)
         finally:
-            setattr(semanal, "_rust_classify_remove_unpack_kwargs_live", orig)
+            setattr(semanal, "_rust_classify_remove_unpack_kwargs_live", orig)  # noqa: B010
         assert calls == [unpack]
         assert ret_plain is plain
         assert ret_empty is empty
         assert ret_unpack.unpack_kwargs is True
+
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeReplaceImplicitFirstTypeRetiredSuite(Suite):
@@ -4408,9 +4421,9 @@ class NativeReplaceImplicitFirstTypeRetiredSuite(Suite):
         from mypy import semanal
 
         src = inspect.getsource(semanal.replace_implicit_first_type)
-        assert "rust_replace_implicit_first_type" not in src, (
-            "replace_implicit_first_type should not call the native seam"
-        )
+        assert (
+            "rust_replace_implicit_first_type" not in src
+        ), "replace_implicit_first_type should not call the native seam"
 
     def test_no_wire_serialization(self) -> None:
         from mypy import semanal
@@ -4514,7 +4527,7 @@ class NativeClassifyMemberResolutionSuite(Suite):
         self._tk = _tk
 
     def _info(self, name: str = "C") -> TypeInfo:
-        from mypy.nodes import Block, ClassDef, SymbolTable
+        from mypy.nodes import Block, SymbolTable
 
         class_def = ClassDef(name, Block([]), None, [])
         class_def.fullname = f"mod.{name}"
