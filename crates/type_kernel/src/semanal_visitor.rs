@@ -30,10 +30,9 @@
 //! - `get_name_repr_of_expr` — simplified textual representation of an expression
 //!   (Issue #391).
 
-use std::collections::HashSet;
-
 use pyo3::basic::CompareOp;
 use pyo3::prelude::*;
+use pyo3::sync::GILOnceCell;
 use pyo3::types::{PyDict, PyList, PySet, PyString, PyTuple, PyType};
 
 // ---------------------------------------------------------------------------
@@ -59,26 +58,50 @@ pub(crate) fn rust_refers_to_fullname(
     node: &PyAny,
     fullnames: &PyAny,
 ) -> PyResult<bool> {
-    let fullname_set = normalize_fullnames(fullnames)?;
+    let fullname_set = FullnameSet::from_py(fullnames)?;
     refers_to_fullname(node, &fullname_set)
 }
 
-/// Normalize the `fullnames` argument (str or tuple of str) into a HashSet.
-fn normalize_fullnames(fullnames: &PyAny) -> PyResult<HashSet<String>> {
-    if let Ok(s) = fullnames.downcast::<PyString>() {
-        return Ok([s.to_str()?.to_string()].into_iter().collect());
-    }
-    if let Ok(tup) = fullnames.downcast::<PyTuple>() {
-        let mut result = HashSet::with_capacity(tup.len());
-        for item in tup.iter() {
-            let s = item.downcast::<PyString>()?;
-            result.insert(s.to_str()?.to_string());
+/// Membership test over the `fullnames` argument (str or tuple of str)
+/// without copying it: the hot callers pass 1-3 short names, so building a
+/// `HashSet<String>` per call (UTF-8 copy + SipHash per name) dominated the
+/// seam cost. The borrowed forms compare in place; only the rare
+/// non-str/tuple fallback materializes one owned `String`, exactly like the
+/// old one-element set did.
+enum FullnameSet<'py> {
+    /// A single `str`.
+    One(&'py str),
+    /// A `tuple[str, ...]` compared item by item.
+    Tuple(&'py PyTuple),
+    /// The non-str/tuple fallback: the `str()` of the argument.
+    Owned(String),
+}
+
+impl FullnameSet<'_> {
+    fn from_py(fullnames: &PyAny) -> PyResult<FullnameSet<'_>> {
+        if let Ok(s) = fullnames.downcast::<PyString>() {
+            return Ok(FullnameSet::One(s.to_str()?));
         }
-        return Ok(result);
+        if let Ok(tup) = fullnames.downcast::<PyTuple>() {
+            return Ok(FullnameSet::Tuple(tup));
+        }
+        Ok(FullnameSet::Owned(fullnames.str()?.to_str()?.to_string()))
     }
-    Ok([fullnames.str()?.to_str()?.to_string()]
-        .into_iter()
-        .collect())
+
+    fn contains(&self, name: &str) -> PyResult<bool> {
+        match self {
+            FullnameSet::One(s) => Ok(*s == name),
+            FullnameSet::Tuple(tup) => {
+                for item in tup.iter() {
+                    if item.downcast::<PyString>()?.to_str()? == name {
+                        return Ok(true);
+                    }
+                }
+                Ok(false)
+            }
+            FullnameSet::Owned(s) => Ok(s == name),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -90,11 +113,38 @@ fn normalize_fullnames(fullnames: &PyAny) -> PyResult<HashSet<String>> {
 ///
 /// Mirrors semanal.py:8322-8326. Returns `True` when `node` is a `RefExpr` and
 /// `node.node` is a `TypeInfo`, `FuncDef`, or `OverloadedFuncDef`.
+///
+/// The four classes are resolved once per process: re-importing `mypy.nodes`
+/// and re-fetching the attributes on every call cost ~500ns against a ~100ns
+/// Python body, and the classes never change within a process.
+struct NodeClasses {
+    ref_expr: Py<PyType>,
+    type_info: Py<PyType>,
+    func_def: Py<PyType>,
+    overloaded: Py<PyType>,
+}
+
+static NODE_CLASSES: GILOnceCell<NodeClasses> = GILOnceCell::new();
+
+fn node_classes(py: Python<'_>) -> PyResult<&NodeClasses> {
+    NODE_CLASSES.get_or_try_init(py, || {
+        let nodes_mod = py.import("mypy.nodes")?;
+        let get = |name: &str| -> PyResult<Py<PyType>> {
+            Ok(nodes_mod.getattr(name)?.downcast::<PyType>()?.into())
+        };
+        Ok(NodeClasses {
+            ref_expr: get("RefExpr")?,
+            type_info: get("TypeInfo")?,
+            func_def: get("FuncDef")?,
+            overloaded: get("OverloadedFuncDef")?,
+        })
+    })
+}
+
 #[pyfunction]
 pub(crate) fn rust_refers_to_class_or_function(py: Python<'_>, node: &PyAny) -> PyResult<bool> {
-    let nodes_mod = py.import("mypy.nodes")?;
-    let ref_expr_cls: &PyType = nodes_mod.getattr("RefExpr")?.downcast()?;
-    if !node.is_instance(ref_expr_cls)? {
+    let cls = node_classes(py)?;
+    if !node.is_instance(cls.ref_expr.as_ref(py))? {
         return Ok(false);
     }
 
@@ -103,13 +153,9 @@ pub(crate) fn rust_refers_to_class_or_function(py: Python<'_>, node: &PyAny) -> 
         return Ok(false);
     }
 
-    let type_info_cls: &PyType = nodes_mod.getattr("TypeInfo")?.downcast()?;
-    let func_def_cls: &PyType = nodes_mod.getattr("FuncDef")?.downcast()?;
-    let overloaded_cls: &PyType = nodes_mod.getattr("OverloadedFuncDef")?.downcast()?;
-
-    Ok(node_attr.is_instance(type_info_cls)?
-        || node_attr.is_instance(func_def_cls)?
-        || node_attr.is_instance(overloaded_cls)?)
+    Ok(node_attr.is_instance(cls.type_info.as_ref(py))?
+        || node_attr.is_instance(cls.func_def.as_ref(py))?
+        || node_attr.is_instance(cls.overloaded.as_ref(py))?)
 }
 
 // ---------------------------------------------------------------------------
@@ -669,9 +715,9 @@ pub(crate) fn rust_classify_decorators(
 
     // Each entry is a single name (str) or a tuple of names
     // (tuple[str, ...]); index order mirrors the branch order below.
-    let mut fullname_sets: Vec<HashSet<String>> = Vec::with_capacity(name_sets.len());
+    let mut fullname_sets: Vec<FullnameSet> = Vec::with_capacity(name_sets.len());
     for item in name_sets.iter() {
-        fullname_sets.push(normalize_fullnames(item)?);
+        fullname_sets.push(FullnameSet::from_py(item)?);
     }
     if fullname_sets.len() != 13 {
         return Ok(None);
@@ -734,7 +780,7 @@ pub(crate) fn rust_classify_decorators(
 /// Factors the body of `rust_refers_to_fullname` so the decorator classifier
 /// reuses the exact same match semantics, including the `TypeAlias` target
 /// resolution to a named `Instance` when `python_3_12_type_alias` is False.
-fn refers_to_fullname(node: &PyAny, fullname_set: &HashSet<String>) -> PyResult<bool> {
+fn refers_to_fullname(node: &PyAny, fullname_set: &FullnameSet) -> PyResult<bool> {
     let py = node.py();
     let nodes_mod = py.import("mypy.nodes")?;
     let ref_expr_cls: &PyType = nodes_mod.getattr("RefExpr")?.downcast()?;
@@ -745,7 +791,7 @@ fn refers_to_fullname(node: &PyAny, fullname_set: &HashSet<String>) -> PyResult<
 
     let node_fullname = node.getattr("fullname")?;
     let node_fullname_str: &str = node_fullname.downcast::<PyString>()?.to_str()?;
-    if fullname_set.contains(node_fullname_str) {
+    if fullname_set.contains(node_fullname_str)? {
         return Ok(true);
     }
 
@@ -779,7 +825,7 @@ fn refers_to_fullname(node: &PyAny, fullname_set: &HashSet<String>) -> PyResult<
     let typ = proper.getattr("type")?;
     let typ_fullname = typ.getattr("fullname")?;
     let typ_fullname_str: &str = typ_fullname.downcast::<PyString>()?.to_str()?;
-    Ok(fullname_set.contains(typ_fullname_str))
+    fullname_set.contains(typ_fullname_str)
 }
 
 /// Whether a decorator expression is a deprecation call
@@ -793,7 +839,7 @@ fn refers_to_fullname(node: &PyAny, fullname_set: &HashSet<String>) -> PyResult<
 fn is_deprecated_call(
     py: Python<'_>,
     expression: &PyAny,
-    deprecated_names: &HashSet<String>,
+    deprecated_names: &FullnameSet,
 ) -> PyResult<bool> {
     let nodes_mod = py.import("mypy.nodes")?;
     let call_expr_cls: &PyType = nodes_mod.getattr("CallExpr")?.downcast()?;
@@ -827,7 +873,7 @@ fn is_deprecated_call(
 fn extract_deprecated_message(
     py: Python<'_>,
     expression: &PyAny,
-    deprecated_names: &HashSet<String>,
+    deprecated_names: &FullnameSet,
 ) -> PyResult<Option<String>> {
     let nodes_mod = py.import("mypy.nodes")?;
     let call_expr_cls: &PyType = nodes_mod.getattr("CallExpr")?.downcast()?;
@@ -895,10 +941,10 @@ pub(crate) fn rust_classify_class_decorator(
     if name_sets.len() != 4 {
         return Ok(None);
     }
-    let final_names = normalize_fullnames(name_sets.get_item(0)?)?;
-    let disjoint_names = normalize_fullnames(name_sets.get_item(1)?)?;
-    let tco_names = normalize_fullnames(name_sets.get_item(2)?)?;
-    let deprecated_names = normalize_fullnames(name_sets.get_item(3)?)?;
+    let final_names = FullnameSet::from_py(name_sets.get_item(0)?)?;
+    let disjoint_names = FullnameSet::from_py(name_sets.get_item(1)?)?;
+    let tco_names = FullnameSet::from_py(name_sets.get_item(2)?)?;
+    let deprecated_names = FullnameSet::from_py(name_sets.get_item(3)?)?;
 
     // Branch order mirrors semanal.py:2741-2752 exactly: each set is only
     // consulted when the earlier ones missed, and the deprecated call is
@@ -1273,21 +1319,20 @@ pub(crate) fn rust_lookup(
     locals: &PyAny,
     type_names: &PyAny,
     is_func_scope: bool,
-) -> PyResult<Option<(String, Option<PyObject>)>> {
-    let name = name.to_string();
+) -> PyResult<Option<(&'static str, Option<PyObject>)>> {
     let type_names = type_names.downcast::<PyDict>().ok();
 
     // 1a. Name declared using 'global x' takes precedence.
-    if global_decls.contains(name.as_str())? {
-        if let Some(node) = globals.get_item(name.as_str())?.map(Into::into) {
-            return Ok(Some(("found".to_string(), Some(node))));
+    if global_decls.contains(name)? {
+        if let Some(node) = globals.get_item(name)?.map(Into::into) {
+            return Ok(Some(("found", Some(node))));
         }
-        return Ok(Some(("global_undeclared".to_string(), None)));
+        return Ok(Some(("global_undeclared", None)));
     }
 
     // 1b. Name declared using 'nonlocal x' takes precedence: walk the
     // enclosing function scopes only (reversed(self.locals[:-1])).
-    if nonlocal_decls.contains(name.as_str())? {
+    if nonlocal_decls.contains(name)? {
         let locals_list = match locals.downcast::<PyList>() {
             Ok(l) => l,
             Err(_) => return Ok(None),
@@ -1302,12 +1347,12 @@ pub(crate) fn rust_lookup(
                 Ok(d) => d,
                 Err(_) => return Ok(None),
             };
-            if table.contains(name.as_str())? {
-                let node = table.get_item(name.as_str())?.map(Into::into);
-                return Ok(Some(("found".to_string(), node)));
+            if table.contains(name)? {
+                let node = table.get_item(name)?.map(Into::into);
+                return Ok(Some(("found", node)));
             }
         }
-        return Ok(Some(("nonlocal_undeclared".to_string(), None)));
+        return Ok(Some(("nonlocal_undeclared", None)));
     }
 
     // 2a/2b only apply at class scope (type_names is Some, not a function
@@ -1319,7 +1364,7 @@ pub(crate) fn rust_lookup(
             // `is_active_symbol_in_class_body` (and the `implicit_name`
 
             // self.x-assignment fallback).
-            if type_names.contains(name.as_str())? {
+            if type_names.contains(name)? {
                 return Ok(None);
             }
             // 2b. Class attributes __qualname__ and __module__ are
@@ -1328,7 +1373,7 @@ pub(crate) fn rust_lookup(
 
             // class namespace (2a would have fallen back).
             if name == "__qualname__" || name == "__module__" {
-                return Ok(Some(("synthesize_qualname".to_string(), None)));
+                return Ok(Some(("synthesize_qualname", None)));
             }
         }
     }
@@ -1347,16 +1392,16 @@ pub(crate) fn rust_lookup(
             Ok(d) => d,
             Err(_) => return Ok(None),
         };
-        if table.contains(name.as_str())? {
-            let node = table.get_item(name.as_str())?.map(Into::into);
-            return Ok(Some(("found".to_string(), node)));
+        if table.contains(name)? {
+            let node = table.get_item(name)?.map(Into::into);
+            return Ok(Some(("found", node)));
         }
     }
 
     // 4. Current file global scope.
-    if globals.contains(name.as_str())? {
-        let node = globals.get_item(name.as_str())?.map(Into::into);
-        return Ok(Some(("found".to_string(), node)));
+    if globals.contains(name)? {
+        let node = globals.get_item(name)?.map(Into::into);
+        return Ok(Some(("found", node)));
     }
 
     // 5. Builtins, with the single-underscore privacy filter.
@@ -1368,7 +1413,7 @@ pub(crate) fn rust_lookup(
         if builtin_node.is_none() {
             // Python: `b` truthy but the assert fails only on a corrupt
             // builtins entry; treat as give-up (unreachable in practice).
-            return Ok(Some(("not_found".to_string(), None)));
+            return Ok(Some(("not_found", None)));
         }
         let names_table = match builtin_node.getattr("names") {
             Ok(n) => n,
@@ -1378,20 +1423,20 @@ pub(crate) fn rust_lookup(
             Ok(d) => d,
             Err(_) => return Ok(None),
         };
-        if table.contains(name.as_str())? {
+        if table.contains(name)? {
             let name_bytes = name.as_bytes();
             if name_bytes.len() > 1 && name_bytes[0] == b'_' && name_bytes[1] != b'_' {
-                return Ok(Some(("builtin_private".to_string(), None)));
+                return Ok(Some(("builtin_private", None)));
             }
-            let node = table.get_item(name.as_str())?.map(Into::into);
-            return Ok(Some(("found".to_string(), node)));
+            let node = table.get_item(name)?.map(Into::into);
+            return Ok(Some(("found", node)));
         }
     }
 
     // Give up. The give-up path returns `not_found` (no implicit class attr
     // was seen — that case fell back at 2a), so Python's `implicit_name`
     // variable is always False here.
-    Ok(Some(("not_found".to_string(), None)))
+    Ok(Some(("not_found", None)))
 }
 
 // ---------------------------------------------------------------------------
@@ -1547,8 +1592,8 @@ pub(crate) fn rust_get_typevarlike_declaration(
         Ok(s) => s.to_str()?,
         Err(_) => return Ok(None),
     };
-    let target_set = normalize_fullnames(typevarlike_types)?;
-    if target_set.contains(callee_str) {
+    let target_set = FullnameSet::from_py(typevarlike_types)?;
+    if target_set.contains(callee_str)? {
         Ok(Some(rvalue.into_py(py)))
     } else {
         Ok(None)
