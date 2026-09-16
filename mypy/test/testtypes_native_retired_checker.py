@@ -3,8 +3,8 @@
 `...RetiredSuite` pins live in one file per area so that retirement lanes never
 collide on a shared suite file. A retired seam has no Python shim (the module
 calls the pure-Python body directly) while the Rust pyfunction stays registered
-for the direct-seam tests in `testtypes_native_checker.py`. See the retirement
-log at the top of `docs/plans/type-kernel-seam-ledger.md`.
+for the direct-seam tests in `testtypes_native_engagement_checker.py`. See the
+retirement log at the top of `docs/plans/type-kernel-seam-ledger.md`.
 """
 
 from __future__ import annotations

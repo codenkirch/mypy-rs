@@ -1,4 +1,14 @@
-"""Native seam suites for the semanal area (split from testtypes.py, #1677)."""
+"""Native engagement suites for the semanal area (`mypy/semanal.py` and `mypy/symtable.py`).
+
+Engagement suites (a `Native...Suite` without `Retired` in the name) live in
+one file per area so that a lane changing one area's seam tests touches that
+area's file only; retired-seam pins live in `testtypes_native_retired_*.py`.
+
+The area of a suite is the module that hosts the seam it exercises, taken from
+the `rust_*` shim it references (else the `mypy` module its docstring names), so
+a new suite belongs in the file for the module it tests. Split out of the four
+28k-line per-area files in #1757; see the collect-only and AST proof in that PR.
+"""
 
 from __future__ import annotations
 
@@ -14,14 +24,13 @@ from types import SimpleNamespace
 from typing import Any, cast
 from unittest import TestCase, skipUnless
 
-from mypy.checker import TypeChecker
-from mypy.checkexpr import ExpressionChecker
 from mypy.nodes import (
     ARG_NAMED,
     ARG_POS,
     ARG_STAR,
     ARG_STAR2,
     GDEF,
+    INVARIANT,
     MDEF,
     ArgKind,
     Argument,
@@ -29,14 +38,15 @@ from mypy.nodes import (
     Block,
     CallExpr,
     ClassDef,
+    Decorator,
     Expression,
     FuncDef,
     IndexExpr,
     IntExpr,
     MemberExpr,
-    MypyFile,
     NameExpr,
     OpExpr,
+    OverloadedFuncDef,
     PassStmt,
     PlaceholderNode,
     StarExpr,
@@ -51,21 +61,30 @@ from mypy.nodes import (
     Var,
 )
 from mypy.options import Options
-from mypy.test.helpers import Suite, assert_equal, assert_type
+from mypy.test.helpers import Suite, assert_equal
 from mypy.test.testtypes import (
+    _HAS_TYPE_KERNEL,
     _NATIVE_SEMANAL_LOOKUP_ENABLED,
     _NATIVE_WIRE_ENABLED,
     T,
     _FakeNode,
     _FakeTypeInfo,
+    _is_type_info,
 )
 from mypy.test.typefixture import TypeFixture
+from mypy.typeanal import (
+    collect_all_inner_types,
+    has_any_from_unimported_type,
+    has_explicit_any,
+    make_optional_type,
+)
+from mypy.typeops import make_simplified_union, true_only
 from mypy.types import (
     AnyType,
     CallableType,
+    ErasedType,
     Instance,
     NoneType,
-    Overloaded,
     PartialType,
     ProperType,
     TupleType,
@@ -74,81 +93,972 @@ from mypy.types import (
     TypedDictType,
     TypeOfAny,
     TypeType,
+    TypeVarId,
+    TypeVarType,
     UnboundType,
+    UnionType,
     UnpackType,
     get_proper_type,
 )
 
 
+# Moved from mypy/test/testtypes_native_checker.py.
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
-class NativeSemanalClassPropSuite(Suite):
-    """Parity for the Rust `semanal_classprop` ports (Issue #538).
+class NativeIsBaseClassSuite(Suite):
+    """Parity for `rust_is_base_class` (H1p).
 
-    These four seams (`calculate_class_abstract_status`,
-    `check_protocol_status`, `calculate_class_vars`,
-    `add_type_promotion`) run under the `_HAS_RUST_CLASSPROP` import gate
-    rather than a toggled option, so a gate-off/on differential is not
-    applicable. Each test calls the seam directly on freshly-built
-    `TypeInfo`s and asserts the Rust call does not raise and produces the
-    same side effects the pure-Python implementation would: abstract
-    status/attributes, protocol-base errors, inferred class vars, and the
-    `_promote` / `alt_promote` edges for the hardcoded TYPE_PROMOTIONS and
-    the mypyc native-int special case.
-
-    The native-int special case is the regression for the PySet->tuple
-    fix: `MYPYC_NATIVE_INT_NAMES` is a tuple, and a `downcast::<PySet>()`
-    raised on every call, silently falling through the shim's
-    `except: pass`. The `_promote` append must actually land.
+    `SemanticAnalyzer.is_base_class` (semanal.py:3831-3844) is a pure
+    graph walk on `TypeInfo.bases` — no wire bytes. Returns True if `t`
+    is reachable from `s` via the base-class graph (excluding MRO).
     """
 
     def setUp(self) -> None:
+        from mypy.semanal import _set_native_semanal_active
+
+        self._set_active = _set_native_semanal_active
+        self._set_active(True)
         self.fx = TypeFixture()
 
-    def test_abstract_status_sets_flags(self) -> None:
-        assert _type_kernel is not None
-        info = self.fx.make_type_info("builtins.A", mro=[self.fx.oi])
-        _type_kernel.rust_calculate_class_abstract_status(info, False, None)
-        assert not info.is_abstract
+    def tearDown(self) -> None:
+        self._set_active(False)
 
-    def test_calculate_class_vars_no_raise(self) -> None:
-        assert _type_kernel is not None
-        info = self.fx.make_type_info("builtins.A", mro=[self.fx.oi])
-        _type_kernel.rust_calculate_class_vars(info)
+    def _with_gate(self, active: bool, fn: Callable[[], T]) -> T:
+        self._set_active(active)
+        try:
+            return fn()
+        finally:
+            self._set_active(True)
 
-    def test_check_protocol_status_no_raise(self) -> None:
-        assert _type_kernel is not None
-        info = self.fx.make_type_info("builtins.A", mro=[self.fx.oi])
-        _type_kernel.rust_check_protocol_status(info, None)
+    def _make_info(self, name: str, bases: list[TypeInfo] | None = None) -> TypeInfo:
+        if bases:
+            base_instances = [Instance(b, []) for b in bases]
+            return self.fx.make_type_info(name, mro=[*bases, self.fx.oi], bases=base_instances)
+        return self.fx.make_type_info(name)
 
-    def test_add_type_promotion_hardcoded(self) -> None:
-        assert _type_kernel is not None
-        # builtins.int -> builtins.float.
-        float_info = self.fx.make_type_info("builtins.float")
-        int_info = self.fx.make_type_info("builtins.int")
-        int_info.defn.info = int_info  # semanal normally wires this
-        # add_type_promotion reads defn.fullname, defn.decorators, defn.info
-        names = SymbolTable()
-        names["float"] = SymbolTableNode(MDEF, float_info)
-        _type_kernel.rust_add_type_promotion(int_info, names, None, None)
-        assert int_info._promote, "int should gain a float promotion"
+    def _seam(self, t: TypeInfo, s: TypeInfo) -> bool | None:
+        return _type_kernel.rust_is_base_class(t, s)
 
-    def test_add_type_promotion_native_int(self) -> None:
-        assert _type_kernel is not None
-        # mypyc native int: int._promote gains the native type, and the
-        # native type gets alt_promote = int. Regression for the
-        # PySet->tuple bug (MYPYC_NATIVE_INT_NAMES is a tuple).
-        int_info = self.fx.make_type_info("builtins.int")
-        int_info.defn.info = int_info
-        nativ = self.fx.make_type_info("mypy_extensions.i64")
-        nativ.defn.fullname = "mypy_extensions.i64"
-        nativ.defn.info = nativ
-        builtin_names = SymbolTable()
-        builtin_names["int"] = SymbolTableNode(MDEF, int_info)
-        _type_kernel.rust_add_type_promotion(nativ, SymbolTable(), None, builtin_names)
-        assert int_info._promote, "int should gain the i64 promotion"
-        assert nativ.alt_promote is not None, "i64 should get alt_promote = int"
+    def _run(self, t: TypeInfo, s: TypeInfo) -> tuple[bool, bool]:
+        from mypy.semanal import SemanticAnalyzer
+
+        def check_one() -> bool:
+            sa = SemanticAnalyzer.__new__(SemanticAnalyzer)
+            return sa.is_base_class(t, s)
+
+        off = self._with_gate(False, check_one)
+        on = self._with_gate(True, check_one)
+        return off, on
+
+    def _assert_par(self, t: TypeInfo, s: TypeInfo) -> None:
+        off, on = self._run(t, s)
+        assert_equal(on, off, f"is_base_class parity for t={t.fullname} s={s.fullname}")
+
+    def test_seam_direct_base(self) -> None:
+        t = self._make_info("Base")
+        s = self._make_info("Sub", bases=[t])
+        assert self._seam(t, s) is True
+
+    def test_seam_transitive_base(self) -> None:
+        t = self._make_info("Grandparent")
+        mid = self._make_info("Parent", bases=[t])
+        s = self._make_info("Child", bases=[mid])
+        assert self._seam(t, s) is True
+
+    def test_seam_not_base(self) -> None:
+        t = self._make_info("A")
+        s = self._make_info("B")
+        assert self._seam(t, s) is False
+
+    def test_seam_self_is_base(self) -> None:
+        t = self._make_info("Self")
+        assert self._seam(t, t) is True
+
+    def test_seam_cycle_safe(self) -> None:
+        a = self._make_info("A")
+        b = self._make_info("B", bases=[a])
+        a.bases.append(Instance(b, []))
+        assert self._seam(b, a) is True
+
+    def test_parity_direct_base(self) -> None:
+        t = self._make_info("Base")
+        s = self._make_info("Sub", bases=[t])
+        self._assert_par(t, s)
+
+    def test_parity_transitive_base(self) -> None:
+        t = self._make_info("Grandparent")
+        mid = self._make_info("Parent", bases=[t])
+        s = self._make_info("Child", bases=[mid])
+        self._assert_par(t, s)
+
+    def test_parity_not_base(self) -> None:
+        t = self._make_info("A")
+        s = self._make_info("B")
+        self._assert_par(t, s)
+
+    def test_parity_self(self) -> None:
+        t = self._make_info("Self")
+        self._assert_par(t, t)
 
 
+@skipUnless(_HAS_TYPE_KERNEL, "requires the type_kernel extension")
+class NativeIsOverloadedItemSuite(Suite):
+    """Parity for `rust_is_overloaded_item` (H1q).
+
+    `SemanticAnalyzer.is_overloaded_item` (semanal.py:8328-8339) is a pure
+    isinstance + identity check, no wire bytes.
+    """
+
+    def setUp(self) -> None:
+        from mypy.semanal import _set_native_semanal_active
+
+        self._set_active = _set_native_semanal_active
+        self._set_active(True)
+        self.fx = TypeFixture()
+
+    def tearDown(self) -> None:
+        self._set_active(False)
+
+    def _with_gate(self, active: bool, fn: Callable[[], T]) -> T:
+        self._set_active(active)
+        try:
+            return fn()
+        finally:
+            self._set_active(True)
+
+    def _make_overload(self, funcs: list[FuncDef]) -> OverloadedFuncDef:
+        ovl = OverloadedFuncDef(funcs)  # type: ignore[arg-type]
+        return ovl
+
+    def _make_func(self, name: str = "f") -> FuncDef:
+        from mypy.nodes import Block
+
+        return FuncDef(name, [], Block([]))
+
+    def _make_decorator(self, name: str = "f") -> Decorator:
+        func = self._make_func(name)
+        var = Var(name)
+        return Decorator(func, [], var)
+
+    def _seam(self, node: Any, statement: Any) -> bool | None:
+        return _type_kernel.rust_is_overloaded_item(node, statement)
+
+    def _run(self, node: Any, statement: Any) -> tuple[bool, bool]:
+        from mypy.semanal import SemanticAnalyzer
+
+        def check_one() -> bool:
+            sa = SemanticAnalyzer.__new__(SemanticAnalyzer)
+            return sa.is_overloaded_item(node, statement)
+
+        off = self._with_gate(False, check_one)
+        on = self._with_gate(True, check_one)
+        return off, on
+
+    def _assert_par(self, node: Any, statement: Any) -> None:
+        off, on = self._run(node, statement)
+        assert_equal(on, off, "is_overloaded_item parity")
+
+    def test_seam_item_match(self) -> None:
+        f = self._make_func("f")
+        ovl = self._make_overload([f])
+        assert self._seam(ovl, f) is True
+
+    def test_seam_item_no_match(self) -> None:
+        f1 = self._make_func("f")
+        f2 = self._make_func("g")
+        ovl = self._make_overload([f1])
+        assert self._seam(ovl, f2) is False
+
+    def test_seam_decorator_item_match(self) -> None:
+        dec = self._make_decorator("f")
+        ovl = OverloadedFuncDef([dec])
+        assert self._seam(ovl, dec.func) is True
+
+    def test_seam_impl_match(self) -> None:
+        f = self._make_func("f")
+        ovl = OverloadedFuncDef([])
+        ovl.impl = f
+        assert self._seam(ovl, f) is True
+
+    def test_seam_impl_decorator_match(self) -> None:
+        dec = self._make_decorator("f")
+        ovl = OverloadedFuncDef([])
+        ovl.impl = dec
+        assert self._seam(ovl, dec.func) is True
+
+    def test_seam_not_overloaded(self) -> None:
+        f = self._make_func("f")
+        assert self._seam(f, f) is False
+
+    def test_seam_not_funcdef(self) -> None:
+        f = self._make_func("f")
+        ovl = self._make_overload([f])
+        assert self._seam(ovl, ovl) is False
+
+    def test_parity_item_match(self) -> None:
+        f = self._make_func("f")
+        ovl = self._make_overload([f])
+        self._assert_par(ovl, f)
+
+    def test_parity_no_match(self) -> None:
+        f1 = self._make_func("f")
+        f2 = self._make_func("g")
+        ovl = self._make_overload([f1])
+        self._assert_par(ovl, f2)
+
+    def test_parity_impl(self) -> None:
+        f = self._make_func("f")
+        ovl = OverloadedFuncDef([])
+        ovl.impl = f
+        self._assert_par(ovl, f)
+
+    def test_parity_not_overloaded(self) -> None:
+        f = self._make_func("f")
+        self._assert_par(f, f)
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeIsSelfMemberRefSuite(Suite):
+    """Parity for `rust_is_self_member_ref` (H1r).
+
+    `SemanticAnalyzer.is_self_member_ref` (semanal.py:6007) is a pure
+    isinstance + attribute check: returns True when memberexpr.expr is a
+    NameExpr whose .node is a Var with is_self=True.
+    """
+
+    def setUp(self) -> None:
+        from mypy.semanal import _set_native_semanal_active
+
+        self._set_active = _set_native_semanal_active
+        self._set_active(True)
+        self.fx = TypeFixture()
+
+    def tearDown(self) -> None:
+        self._set_active(False)
+
+    def _with_gate(self, active: bool, fn: Callable[[], T]) -> T:
+        self._set_active(active)
+        try:
+            return fn()
+        finally:
+            self._set_active(True)
+
+    def _make_name_expr(self, name: str = "self") -> NameExpr:
+        return NameExpr(name)
+
+    def _make_self_var(self) -> Var:
+        var = Var("self")
+        var.is_self = True
+        return var
+
+    def _make_member_expr(self, expr: Expression, name: str = "attr") -> MemberExpr:
+        return MemberExpr(expr, name)
+
+    def _seam(self, memberexpr: MemberExpr) -> bool | None:
+        return _type_kernel.rust_is_self_member_ref(memberexpr)
+
+    def _run(self, memberexpr: MemberExpr) -> tuple[bool, bool]:
+        from mypy.semanal import SemanticAnalyzer
+
+        def check_one() -> bool:
+            sa = SemanticAnalyzer.__new__(SemanticAnalyzer)
+            return sa.is_self_member_ref(memberexpr)
+
+        off = self._with_gate(False, check_one)
+        on = self._with_gate(True, check_one)
+        return off, on
+
+    def _assert_par(self, memberexpr: MemberExpr) -> None:
+        off, on = self._run(memberexpr)
+        assert_equal(on, off, "is_self_member_ref parity")
+
+    def test_seam_self_var(self) -> None:
+        ne = self._make_name_expr("self")
+        ne.node = self._make_self_var()
+        me = self._make_member_expr(ne, "x")
+        assert self._seam(me) is True
+
+    def test_seam_non_self_var(self) -> None:
+        ne = self._make_name_expr("other")
+        v = Var("other")
+        v.is_self = False
+        ne.node = v
+        me = self._make_member_expr(ne, "x")
+        assert self._seam(me) is False
+
+    def test_seam_node_none(self) -> None:
+        ne = self._make_name_expr("self")
+        ne.node = None
+        me = self._make_member_expr(ne, "x")
+        assert self._seam(me) is False
+
+    def test_seam_node_not_var(self) -> None:
+        ne = self._make_name_expr("self")
+        ne.node = self.fx.oi  # TypeInfo, not Var
+        me = self._make_member_expr(ne, "x")
+        assert self._seam(me) is False
+
+    def test_seam_expr_not_nameexpr(self) -> None:
+        inner = MemberExpr(NameExpr("x"), "y")
+        me = self._make_member_expr(inner, "z")
+        assert self._seam(me) is False
+
+    def test_parity_self_var(self) -> None:
+        ne = self._make_name_expr("self")
+        ne.node = self._make_self_var()
+        me = self._make_member_expr(ne, "x")
+        self._assert_par(me)
+
+    def test_parity_non_self_var(self) -> None:
+        ne = self._make_name_expr("other")
+        v = Var("other")
+        v.is_self = False
+        ne.node = v
+        me = self._make_member_expr(ne, "x")
+        self._assert_par(me)
+
+    def test_parity_node_none(self) -> None:
+        ne = self._make_name_expr("self")
+        ne.node = None
+        me = self._make_member_expr(ne, "x")
+        self._assert_par(me)
+
+    def test_parity_expr_not_nameexpr(self) -> None:
+        inner = MemberExpr(NameExpr("x"), "y")
+        me = self._make_member_expr(inner, "z")
+        self._assert_par(me)
+
+    def test_parity_node_not_var(self) -> None:
+        ne = self._make_name_expr("self")
+        ne.node = self.fx.oi
+        me = self._make_member_expr(ne, "x")
+        self._assert_par(me)
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeIsTypeLikeSuite(Suite):
+    """Parity for `rust_is_type_like` (H1s).
+
+    `SemanticAnalyzer.is_type_like` (semanal.py:8310) is a pure
+    isinstance check: True for TypeInfo, TypeAlias, or PlaceholderNode
+    with becomes_typeinfo=True.
+    """
+
+    def setUp(self) -> None:
+        from mypy.semanal import _set_native_semanal_active
+
+        self._set_active = _set_native_semanal_active
+        self._set_active(True)
+        self.fx = TypeFixture()
+
+    def tearDown(self) -> None:
+        self._set_active(False)
+
+    def _with_gate(self, active: bool, fn: Callable[[], T]) -> T:
+        self._set_active(active)
+        try:
+            return fn()
+        finally:
+            self._set_active(True)
+
+    def _seam(self, node: Any) -> bool | None:
+        return _type_kernel.rust_is_type_like(node)
+
+    def _run(self, node: Any) -> tuple[bool, bool]:
+        from mypy.semanal import SemanticAnalyzer
+
+        def check_one() -> bool:
+            sa = SemanticAnalyzer.__new__(SemanticAnalyzer)
+            return sa.is_type_like(node)
+
+        off = self._with_gate(False, check_one)
+        on = self._with_gate(True, check_one)
+        return off, on
+
+    def _assert_par(self, node: Any) -> None:
+        off, on = self._run(node)
+        assert_equal(on, off, "is_type_like parity")
+
+    def test_seam_typeinfo(self) -> None:
+        assert self._seam(self.fx.oi) is True
+
+    def test_seam_typealias(self) -> None:
+        alias = TypeAlias(self.fx.a, "mod.A", "mod", -1, -1)
+        assert self._seam(alias) is True
+
+    def test_seam_placeholder_becomes(self) -> None:
+        ph = PlaceholderNode("mod.C", Var("C"), 1, becomes_typeinfo=True)
+        assert self._seam(ph) is True
+
+    def test_seam_placeholder_not_becomes(self) -> None:
+        ph = PlaceholderNode("mod.C", Var("C"), 1, becomes_typeinfo=False)
+        assert self._seam(ph) is False
+
+    def test_seam_var(self) -> None:
+        assert self._seam(Var("x")) is False
+
+    def test_seam_none(self) -> None:
+        assert self._seam(None) is False
+
+    def test_parity_typeinfo(self) -> None:
+        self._assert_par(self.fx.oi)
+
+    def test_parity_typealias(self) -> None:
+        alias = TypeAlias(self.fx.a, "mod.A", "mod", -1, -1)
+        self._assert_par(alias)
+
+    def test_parity_placeholder_becomes(self) -> None:
+        ph = PlaceholderNode("mod.C", Var("C"), 1, becomes_typeinfo=True)
+        self._assert_par(ph)
+
+    def test_parity_var(self) -> None:
+        self._assert_par(Var("x"))
+
+
+# Moved from mypy/test/testtypes_native_types.py.
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeWireFixupSuite(Suite):
+    """Parity suite for the wire round-trip fixup (#156).
+
+    Serialization to wire format loses live TypeInfo references: decoded
+    Instances carry only a type_ref fullname string and a FakeInfo
+    placeholder. Every kernel returning a wire-decoded Type must run it
+    through mypy.wirefixup before it re-enters the type graph. The four
+    gates re-enabled here (typeops, semanal, erase_typevars, copy_type)
+    were disabled in #155 because unfixed decode crashed production.
+    """
+
+    def setUp(self) -> None:
+        from mypy.applytype import _set_native_applytype_typeinfo_map
+        from mypy.copytype import _set_native_copy_active
+        from mypy.erasetype import _set_native_erase_typevars_active
+        from mypy.semanal import _set_native_semanal_active
+        from mypy.typeops import _set_native_typeops_active
+
+        self.fx = TypeFixture(INVARIANT)
+        typeinfos = []
+        for name in dir(self.fx):
+            if name.endswith("i"):
+                value = getattr(self.fx, name)
+                if _is_type_info(value):
+                    typeinfos.append(value)
+        typeinfo_map = {info.fullname: info for info in typeinfos}
+        # Installs the shared wirefixup map as well.
+        _set_native_applytype_typeinfo_map(typeinfo_map)
+        self._py: list[tuple[str, Any]] = [
+            ("typeops", _set_native_typeops_active),
+            ("semanal", _set_native_semanal_active),
+            ("erase", _set_native_erase_typevars_active),
+            ("copy", _set_native_copy_active),
+        ]
+        for _, setter in self._py:
+            setter(True)
+
+    def tearDown(self) -> None:
+        from mypy.applytype import _set_native_applytype_typeinfo_map
+
+        for _, setter in self._py:
+            setter(False)
+        _set_native_applytype_typeinfo_map(None)
+
+    def _assert_no_fake_info(self, t: Type) -> None:
+        from mypy.wirefixup import check_no_fake_info
+
+        assert check_no_fake_info(t), "wire decode leaked a FakeInfo-bearing Type"
+
+    def test_make_simplified_union_fixes_up_instances(self) -> None:
+        from mypy.typeops import _set_native_typeops_active
+
+        _set_native_typeops_active(False)
+        expected = make_simplified_union([self.fx.b, self.fx.c])
+        _set_native_typeops_active(True)
+        actual = make_simplified_union([self.fx.b, self.fx.c])
+        self._assert_no_fake_info(actual)
+        assert_equal(actual, expected)
+        assert isinstance(actual, UnionType)
+
+    def test_true_only_fixes_up_literal_fallback(self) -> None:
+        from mypy.typeops import _set_native_typeops_active
+
+        _set_native_typeops_active(False)
+        expected = true_only(self.fx.a)
+        _set_native_typeops_active(True)
+        actual = true_only(self.fx.a)
+        self._assert_no_fake_info(actual)
+        assert_equal(actual, expected)
+
+    def test_make_any_non_explicit_fixes_up(self) -> None:
+        from mypy.semanal import _set_native_semanal_active, make_any_non_explicit
+
+        _set_native_semanal_active(False)
+        expected = make_any_non_explicit(AnyType(TypeOfAny.explicit))
+        _set_native_semanal_active(True)
+        actual = make_any_non_explicit(AnyType(TypeOfAny.explicit))
+        self._assert_no_fake_info(actual)
+        assert_equal(actual, expected)
+        assert isinstance(actual, AnyType)  # type: ignore[misc]
+        assert actual.type_of_any == TypeOfAny.special_form
+
+    def test_replace_implicit_first_type_fixes_up(self) -> None:
+        from mypy.semanal import _set_native_semanal_active, replace_implicit_first_type
+
+        sig = CallableType(
+            [self.fx.a, self.fx.b],
+            [ARG_POS, ARG_POS],
+            [None, None],
+            self.fx.anyt,
+            self.fx.function,
+        )
+        _set_native_semanal_active(False)
+        expected = replace_implicit_first_type(sig, self.fx.o)
+        _set_native_semanal_active(True)
+        actual = replace_implicit_first_type(sig, self.fx.o)
+        self._assert_no_fake_info(actual)
+        assert_equal(actual, expected)
+        assert isinstance(actual, CallableType)
+        assert_equal(actual.arg_types, [self.fx.o, self.fx.b])
+
+    def test_erase_typevars_fixes_up_typevars_in_instance(self) -> None:
+        from mypy.erasetype import _set_native_erase_typevars_active, erase_typevars
+
+        generic = Instance(self.fx.gi, [self.fx.s1])
+        _set_native_erase_typevars_active(False)
+        expected = erase_typevars(generic)
+        _set_native_erase_typevars_active(True)
+        actual = erase_typevars(generic)
+        self._assert_no_fake_info(actual)
+        assert_equal(actual, expected)
+        assert isinstance(actual, Instance)  # type: ignore[misc]
+
+    def test_replace_meta_vars_erased_type_target(self) -> None:
+        # replace_meta_vars round-trips an ErasedType replacement (checkexpr
+        # passes ErasedType() as the target during inference). A meta-var
+        # TypeVar must be replaced by the target; a class typevar untouched.
+        from mypy.erasetype import _set_native_erase_typevars_active, replace_meta_vars
+        from mypy.types import TypeVarId
+
+        meta = TypeVarType(
+            "T",
+            "T",
+            TypeVarId(-1, meta_level=1),
+            [],
+            self.fx.o,
+            AnyType(TypeOfAny.from_omitted_generics),
+        )
+        target = ErasedType()
+        typ = Instance(self.fx.gi, [meta])
+
+        _set_native_erase_typevars_active(False)
+        expected = replace_meta_vars(typ, target)
+        _set_native_erase_typevars_active(True)
+        actual = replace_meta_vars(typ, target)
+        self._assert_no_fake_info(actual)
+        # ErasedType has no __eq__ (identity), and the native path returns a
+        # fresh wire-decoded instance, so compare the semantic content.
+        assert_equal(actual.serialize(), expected.serialize())
+        assert isinstance(actual, Instance)  # type: ignore[misc]
+        assert isinstance(actual.args[0], ErasedType)
+
+    def test_replace_meta_vars_fixes_up_alias_args(self) -> None:
+        # Issue #1298: replace_meta_vars round-trips literals nested in a
+        # TypeAliasType. The Rust kernel recurses into the alias args and keeps
+        # the alias node; Python decode re-links it to the live TypeAlias.
+        from mypy.erasetype import _set_native_erase_typevars_active, replace_meta_vars
+        from mypy.wirefixup import set_wire_alias_map
+
+        meta = TypeVarType(
+            "T",
+            "T",
+            TypeVarId(-1, meta_level=1),
+            [],
+            self.fx.o,
+            AnyType(TypeOfAny.from_omitted_generics),
+        )
+        alias = TypeAlias(Instance(self.fx.std_listi, [self.fx.a]), "mod.A", "mod", -1, -1)
+        target = self.fx.a
+        typ = TypeAliasType(alias, [meta])
+        set_wire_alias_map({alias.fullname: alias})
+        try:
+            _set_native_erase_typevars_active(False)
+            expected = replace_meta_vars(typ, target)
+            _set_native_erase_typevars_active(True)
+            actual = replace_meta_vars(typ, target)
+            self._assert_no_fake_info(actual)
+            assert_equal(actual, expected)
+            assert isinstance(actual, TypeAliasType)
+            assert actual.alias is alias, "decoded alias node not re-linked"
+            assert isinstance(get_proper_type(actual.args[0]), Instance)
+        finally:
+            set_wire_alias_map(None)
+
+    def test_erase_typevars_fixes_up_alias_args(self) -> None:
+        # Issue #1298: erase_typevars now recurses into TypeAliasType args
+        # too (the meta var is erased to Any and the alias node survives,
+        # re-linked to the live node on decode).
+        from mypy.erasetype import _set_native_erase_typevars_active, erase_typevars
+        from mypy.wirefixup import set_wire_alias_map
+
+        meta = TypeVarType(
+            "T",
+            "T",
+            TypeVarId(-1, meta_level=1),
+            [],
+            self.fx.o,
+            AnyType(TypeOfAny.from_omitted_generics),
+        )
+        alias = TypeAlias(Instance(self.fx.std_listi, [self.fx.a]), "mod.A", "mod", -1, -1)
+        typ = TypeAliasType(alias, [meta])
+        set_wire_alias_map({alias.fullname: alias})
+        try:
+            _set_native_erase_typevars_active(False)
+            expected = erase_typevars(typ)
+            _set_native_erase_typevars_active(True)
+            actual = erase_typevars(typ)
+            self._assert_no_fake_info(actual)
+            assert_equal(actual, expected)
+            assert isinstance(actual, TypeAliasType)
+            assert actual.alias is alias, "decoded alias node not re-linked"
+            assert isinstance(get_proper_type(actual.args[0]), AnyType)
+        finally:
+            set_wire_alias_map(None)
+
+    def test_copy_type_fixes_up_instance(self) -> None:
+        from mypy.copytype import _set_native_copy_active, copy_type
+
+        _set_native_copy_active(False)
+        expected = copy_type(self.fx.b)
+        _set_native_copy_active(True)
+        actual = copy_type(self.fx.b)
+        self._assert_no_fake_info(actual)
+        assert_equal(actual, expected)
+        assert actual is not self.fx.b
+
+    def test_has_explicit_any_fixes_up(self) -> None:
+        from mypy.typeanal import _set_native_typeanal_active
+
+        _set_native_typeanal_active(False)
+        expected = has_explicit_any(AnyType(TypeOfAny.explicit))
+        _set_native_typeanal_active(True)
+        actual = has_explicit_any(AnyType(TypeOfAny.explicit))
+        assert_equal(actual, expected)
+        assert actual is True
+
+    def test_has_explicit_any_nested_in_instance(self) -> None:
+        from mypy.typeanal import _set_native_typeanal_active, has_explicit_any
+
+        t = Instance(self.fx.std_listi, [AnyType(TypeOfAny.explicit)])
+        _set_native_typeanal_active(False)
+        expected = has_explicit_any(t)
+        _set_native_typeanal_active(True)
+        actual = has_explicit_any(t)
+        assert_equal(actual, expected)
+        assert actual is True
+
+    def test_has_explicit_any_false_for_unimported(self) -> None:
+        from mypy.typeanal import _set_native_typeanal_active, has_explicit_any
+
+        t = AnyType(TypeOfAny.from_unimported_type)
+        _set_native_typeanal_active(False)
+        expected = has_explicit_any(t)
+        _set_native_typeanal_active(True)
+        actual = has_explicit_any(t)
+        assert_equal(actual, expected)
+        assert actual is False
+
+    def test_has_explicit_any_false_for_typeddict(self) -> None:
+        from mypy.typeanal import _set_native_typeanal_active, has_explicit_any
+
+        td = TypedDictType({"x": self.fx.a}, {"x"}, set(), Instance(self.fx.std_listi, []))
+        _set_native_typeanal_active(False)
+        expected = has_explicit_any(td)
+        _set_native_typeanal_active(True)
+        actual = has_explicit_any(td)
+        assert_equal(actual, expected)
+        assert actual is False
+
+    def test_has_any_from_unimported_type_fixes_up(self) -> None:
+        from mypy.typeanal import _set_native_typeanal_active
+
+        _set_native_typeanal_active(False)
+        expected = has_any_from_unimported_type(AnyType(TypeOfAny.from_unimported_type))
+        _set_native_typeanal_active(True)
+        actual = has_any_from_unimported_type(AnyType(TypeOfAny.from_unimported_type))
+        assert_equal(actual, expected)
+        assert actual is True
+
+    def test_collect_all_inner_types_fixes_up(self) -> None:
+        from mypy.typeanal import _set_native_typeanal_active
+
+        t = make_simplified_union([self.fx.b, self.fx.c])
+        _set_native_typeanal_active(False)
+        expected = collect_all_inner_types(t)
+        _set_native_typeanal_active(True)
+        actual = collect_all_inner_types(t)
+        for item in actual:
+            self._assert_no_fake_info(item)
+        assert_equal(actual, expected)
+        assert_equal(actual, [self.fx.b, self.fx.c])
+
+    def test_collect_all_inner_types_instance_args(self) -> None:
+        from mypy.typeanal import _set_native_typeanal_active
+
+        t = Instance(self.fx.std_listi, [self.fx.b])
+        _set_native_typeanal_active(False)
+        expected = collect_all_inner_types(t)
+        _set_native_typeanal_active(True)
+        actual = collect_all_inner_types(t)
+        for item in actual:
+            self._assert_no_fake_info(item)
+        assert_equal(actual, expected)
+        assert_equal(actual, [self.fx.b])
+
+    def test_collect_all_inner_types_leaf_is_empty(self) -> None:
+        from mypy.typeanal import _set_native_typeanal_active
+
+        _set_native_typeanal_active(False)
+        expected = collect_all_inner_types(self.fx.b)
+        _set_native_typeanal_active(True)
+        actual = collect_all_inner_types(self.fx.b)
+        assert_equal(actual, expected)
+        assert_equal(actual, [])
+
+    def test_make_optional_type_fixes_up(self) -> None:
+        from mypy.typeanal import _set_native_typeanal_active
+
+        _set_native_typeanal_active(False)
+        expected = make_optional_type(self.fx.b)
+        _set_native_typeanal_active(True)
+        actual = make_optional_type(self.fx.b)
+        self._assert_no_fake_info(actual)
+        assert_equal(actual, expected)
+        assert isinstance(actual, UnionType)  # type: ignore[misc]
+        assert_equal(actual.items, [self.fx.b, NoneType()], f"got {actual.items!r}")
+
+    def test_make_optional_type_union_strips_none(self) -> None:
+        from mypy.typeanal import _set_native_typeanal_active
+
+        t = make_simplified_union([self.fx.b, self.fx.c])
+        union_none = UnionType([t, NoneType()])
+        _set_native_typeanal_active(False)
+        expected = make_optional_type(union_none)
+        _set_native_typeanal_active(True)
+        actual = make_optional_type(union_none)
+        self._assert_no_fake_info(actual)
+        assert_equal(actual, expected)
+        assert isinstance(actual, UnionType)  # type: ignore[misc]
+        assert NoneType() in actual.items
+        # Optional[B|C] == B|C|None, and None is absorbed.
+        assert_equal(actual.items, [self.fx.b, self.fx.c, NoneType()], f"got {actual.items!r}")
+
+    def test_unknown_unpack_false_for_plain_instance(self) -> None:
+        from mypy.typeanal import _set_native_typeanal_active, unknown_unpack
+
+        _set_native_typeanal_active(False)
+        expected = unknown_unpack(Instance(self.fx.std_listi, [self.fx.a]))
+        _set_native_typeanal_active(True)
+        actual = unknown_unpack(Instance(self.fx.std_listi, [self.fx.a]))
+        assert_equal(actual, expected)
+        assert actual is False
+
+    def test_unknown_unpack_true_for_special_form_any(self) -> None:
+        from mypy.typeanal import _set_native_typeanal_active, unknown_unpack
+
+        t = UnpackType(AnyType(TypeOfAny.special_form))
+        _set_native_typeanal_active(False)
+        expected = unknown_unpack(t)
+        _set_native_typeanal_active(True)
+        actual = unknown_unpack(t)
+        assert_equal(actual, expected)
+        assert actual is True
+
+    def test_unknown_unpack_false_for_other_any(self) -> None:
+        from mypy.typeanal import _set_native_typeanal_active, unknown_unpack
+
+        t = UnpackType(AnyType(TypeOfAny.unannotated))
+        _set_native_typeanal_active(False)
+        expected = unknown_unpack(t)
+        _set_native_typeanal_active(True)
+        actual = unknown_unpack(t)
+        assert_equal(actual, expected)
+        assert actual is False
+
+    def test_unknown_unpack_falls_back_to_python_on_alias(self) -> None:
+        # The Rust kernel defers on a TypeAliasType unpack target (its
+        # proper expansion is not on the wire); both paths must agree.
+        from mypy.nodes import TypeAlias
+        from mypy.typeanal import _set_native_typeanal_active, unknown_unpack
+        from mypy.types import TypeAliasType
+
+        alias = TypeAlias(AnyType(TypeOfAny.special_form), "m.A", "m", -1, -1)
+        t = UnpackType(TypeAliasType(alias, []))
+        _set_native_typeanal_active(False)
+        expected = unknown_unpack(t)
+        _set_native_typeanal_active(True)
+        actual = unknown_unpack(t)
+        assert_equal(actual, expected)
+        assert actual is True
+
+    def test_erase_typevars_replacement_any_is_special_form(self) -> None:
+        # Native erase_typevars replaces an erased TypeVar with a wire Any;
+        # its type_of_any must decode as TypeOfAny.special_form (#1262).
+        from mypy.erasetype import _set_native_erase_typevars_active, erase_typevars
+
+        _set_native_erase_typevars_active(False)
+        expected = erase_typevars(self.fx.t)
+        _set_native_erase_typevars_active(True)
+        actual = erase_typevars(self.fx.t)
+        self._assert_no_fake_info(actual)
+        assert_equal(actual, expected)
+        assert isinstance(actual, AnyType)  # type: ignore[misc]
+        assert actual.type_of_any == TypeOfAny.special_form
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeSimpleLiteralTypeSuite(Suite):
+    """Parity for the Rust `analyze_simple_literal_type` dispatch port.
+
+    The 5-way dispatch head (semanal.py:4720-4749) decides the type-name
+    tag from function_stack truthiness and the constant-fold value kind;
+    the Python shim folds via the already-native constant_fold_expr, then
+    applies named_type_or_none and, when is_final, the LiteralType
+    last_known_value construction.
+
+    Direct seam calls assert the exact tag (and the unknown-kind deferral);
+    the gate-off vs gate-on differential drives the real SemanticAnalyzer
+    method through a stub named_type_or_none and asserts identical results.
+    """
+
+    def setUp(self) -> None:
+        from mypy.semanal import _set_native_semanal_visitor_active
+
+        self.fx = TypeFixture()
+        self._set_active = _set_native_semanal_visitor_active
+        self._set_active(True)
+
+    def tearDown(self) -> None:
+        self._set_active(False)
+
+    def _with_gate(self, active: bool, fn: Callable[[], T]) -> T:
+        self._set_active(active)
+        try:
+            return fn()
+        finally:
+            self._set_active(True)
+
+    def _tag(self, function_stack: bool, kind: int, is_final: bool = False) -> int | None:
+        from mypy.semanal import _rust_classify_simple_literal_type  # type: ignore[attr-defined]
+
+        return _rust_classify_simple_literal_type(function_stack, kind, "__main__", is_final)
+
+    def _analyzer(self, function_stack: list[object] | None = None) -> object:
+        from mypy.semanal import SemanticAnalyzer
+
+        fx = self.fx
+        infos = {
+            "builtins.bool": fx.bool_type_info,
+            "builtins.int": fx.make_type_info("builtins.int"),
+            "builtins.str": fx.str_type_info,
+            "builtins.float": fx.make_type_info("builtins.float"),
+        }
+
+        def named_type_or_none(name: str) -> Instance | None:
+            info = infos.get(name)
+            return Instance(info, []) if info is not None else None
+
+        sa = SemanticAnalyzer.__new__(SemanticAnalyzer)
+        sa.function_stack = function_stack if function_stack is not None else []  # type: ignore[assignment]
+        sa.cur_mod_id = "__main__"
+        sa.named_type_or_none = named_type_or_none  # type: ignore[method-assign, assignment]
+        return sa
+
+    def _call(self, sa: Any, rvalue: Expression, is_final: bool) -> str:
+        result = sa.analyze_simple_literal_type(rvalue, is_final)
+        if result is None:
+            return "None"
+        return str(result)
+
+    def _assert_par(self, rvalue: Expression, is_final: bool, expected: str | None = None) -> None:
+        off_sa = self._analyzer()
+        off = self._with_gate(False, lambda: self._call(off_sa, rvalue, is_final))
+        self._set_active(True)
+        on_sa = self._analyzer()
+        on = self._with_gate(True, lambda: self._call(on_sa, rvalue, is_final))
+        assert_equal(on, off, f"simple_literal_type parity {rvalue!r} final={is_final}")
+        if expected is not None:
+            assert_equal(on, expected, f"simple_literal_type result {rvalue!r}")
+
+    def _final_var_ref(self, fullname: str) -> NameExpr:
+        v = Var("X")
+        v.is_final = True
+        v._fullname = fullname
+        v.final_value = 5
+        e = NameExpr("X")
+        e.node = v
+        return e
+
+    def test_seam_tags(self) -> None:
+        assert self._tag(True, 0) == 0
+        assert self._tag(False, 0) == 0  # fold returned None
+        assert self._tag(False, 1) == 0  # complex
+        assert self._tag(False, 2) == 1  # builtins.bool
+        assert self._tag(False, 3) == 2  # builtins.int
+        assert self._tag(False, 4) == 3  # builtins.str
+        assert self._tag(False, 5) == 4  # builtins.float
+
+    def test_seam_unknown_kind_defers(self) -> None:
+        assert self._tag(False, 99) is None
+        assert self._tag(False, -1) is None
+
+    def test_parity_int(self) -> None:
+        self._assert_par(IntExpr(42), False, "builtins.int")
+
+    def test_parity_int_final(self) -> None:
+        self._assert_par(IntExpr(42), True)
+
+    def test_parity_str(self) -> None:
+        self._assert_par(StrExpr("x"), False, "builtins.str")
+
+    def test_parity_str_final(self) -> None:
+        self._assert_par(StrExpr("x"), True)
+
+    def test_parity_float(self) -> None:
+        from mypy.nodes import FloatExpr
+
+        self._assert_par(FloatExpr(1.5), False, "builtins.float")
+
+    def test_parity_complex_returns_none(self) -> None:
+        from mypy.nodes import ComplexExpr
+
+        self._assert_par(ComplexExpr(1j), False, "None")
+
+    def test_parity_bool(self) -> None:
+        self._assert_par(NameExpr("True"), False, "builtins.bool")
+
+    def test_parity_bool_final(self) -> None:
+        self._assert_par(NameExpr("True"), True)
+
+    def test_parity_fold_failure_returns_none(self) -> None:
+        self._assert_par(OpExpr("+", IntExpr(1), StrExpr("x")), False, "None")
+
+    def test_parity_folded_op_final(self) -> None:
+        self._assert_par(OpExpr("+", IntExpr(1), IntExpr(2)), True)
+
+    def test_parity_final_var_ref_current_module(self) -> None:
+        self._assert_par(self._final_var_ref("__main__.X"), False, "builtins.int")
+
+    def test_parity_final_var_ref_other_module(self) -> None:
+        self._assert_par(self._final_var_ref("other.X"), False, "None")
+
+    def test_parity_inside_function(self) -> None:
+        off_sa = self._analyzer(function_stack=[object()])
+        off = self._with_gate(False, lambda: self._call(off_sa, IntExpr(42), False))
+        self._set_active(True)
+        on_sa = self._analyzer(function_stack=[object()])
+        on = self._with_gate(True, lambda: self._call(on_sa, IntExpr(42), False))
+        assert_equal(on, off, "simple_literal_type parity inside function")
+        assert_equal(on, "None", "simple_literal_type inside function")
+
+
+# Moved from mypy/test/testtypes_native_semanal.py.
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeTypeExpressionClassifySuite(Suite):
     """Parity for the Rust `try_parse_as_type_expression` classifier port.
@@ -859,95 +1769,6 @@ class NativeLookupSuite(Suite):
 
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
-class NativeMypyFileLookupSuite(Suite):
-    """Parity tests for the MypyFile branch of `rust_lookup_qualified`.
-
-    Drives `type_kernel.rust_lookup_qualified` on a resolver built from
-    constructed `MypyFile` modules and asserts the returned
-    `(kind, fullname)` decision matches what `SemanticAnalyzer.
-    lookup_qualified` + `get_module_symbol` (semanal.py) would produce.
-    The Rust side answers only direct non-hidden name hits in snapshotted
-    modules; absent names, unresolved submodule chains, and non-module
-    mid-chain members defer (None) to the Python loop.
-    """
-
-    def setUp(self) -> None:
-        import type_kernel as _tk
-
-        from mypy.nodes import MypyFile, SymbolTable, SymbolTableNode, Var
-
-        self._tk = _tk
-        self._MypyFile = MypyFile
-        self._SymbolTable = SymbolTable
-        self._SymbolTableNode = SymbolTableNode
-        self._Var = Var
-
-    def _module(self, fullname: str, names: dict[str, Any]) -> MypyFile:
-        m = self._MypyFile([], [])
-        m._fullname = fullname
-        m.names = self._SymbolTable(names)
-        return m
-
-    def _var(self, fullname: str, hidden: bool = False) -> SymbolTableNode:
-        v = self._Var(fullname.rsplit(".", 1)[-1])
-        v._fullname = fullname
-        return self._SymbolTableNode(0, v, module_hidden=hidden)
-
-    def _module_sym(self, fullname: str, node: MypyFile, hidden: bool = False) -> SymbolTableNode:
-        return self._SymbolTableNode(0, node, module_hidden=hidden)
-
-    def _call(self, modules: dict[str, MypyFile], name: str) -> Any:
-        resolver = self._tk.build_native_resolver([], [], modules)
-        return self._tk.rust_lookup_qualified(resolver, name, 1, name.split(".")[0], False)
-
-    def test_direct_name_hit(self) -> None:
-        a = self._module("a", {"x": self._var("a.x")})
-        r = self._call({"a": a}, "a.x")
-        assert r == (0, "a")
-
-    def test_missing_module_defers(self) -> None:
-        # Module absent: the module currently being analyzed may not be
-        # sealed yet, so the native side defers to Python.
-        a = self._module("a", {"x": self._var("a.x")})
-        r = self._call({"a": a}, "b.x")
-        assert r is None
-
-    def test_absent_name_defers(self) -> None:
-        # Absent from `names`: could be a submodule via import_map, an
-        # incomplete namespace, `__getattr__`, or a missing module.
-        a = self._module("a", {})
-        r = self._call({"a": a}, "a.x")
-        assert r is None
-
-    def test_hidden_name_not_found(self) -> None:
-        # `module_hidden` names are positively not found.
-        a = self._module("a", {"x": self._var("a.x", hidden=True)})
-        r = self._call({"a": a}, "a.x")
-        assert r == (-1, "")
-
-    def test_mid_chain_module_descent(self) -> None:
-        # `a.ns` aliases module `other.ns`; descent uses the node's exact
-        # fullname, so `a.ns.x` resolves to the `other.ns` namespace.
-        other = self._module("other.ns", {"x": self._var("other.ns.x")})
-        a = self._module("a", {"ns": self._module_sym("a.ns", other)})
-        r = self._call({"a": a, "other.ns": other}, "a.ns.x")
-        assert r == (0, "other.ns")
-
-    def test_mid_chain_non_module_defers(self) -> None:
-        a = self._module("a", {"x": self._var("a.x")})
-        r = self._call({"a": a}, "a.x.y")
-        assert r is None
-
-    def test_mid_chain_hidden_not_found(self) -> None:
-        # Hidden mid-chain: the hidden check runs before descent, on every
-        # part. `ns` hidden -> positively not found.
-        other = self._module("other.ns", {"x": self._var("other.ns.x")})
-        a = self._module("a", {"ns": self._module_sym("a.ns", other, hidden=True)})
-        r = self._call({"a": a, "other.ns": other}, "a.ns.x")
-        assert r == (-1, "")
-
-
-@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeLookupQualifiedVarSuite(Suite):
     """Parity tests for the non-Any Var branch of `rust_lookup_qualified`.
 
@@ -1073,111 +1894,6 @@ class NativeLookupQualifiedNestedSuite(Suite):
         r = self._call("out.I.missing", 0, "out", False)
         assert r is not None
         assert r[0] == -1
-
-
-@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
-class NativeBinderSuite(Suite):
-    """Parity tests for the Rust `get_declaration` (Issue #527).
-
-    Each test builds a live mypy AST expression (`NameExpr`/`MemberExpr`/
-    other), calls `type_kernel.rust_get_declaration(node)` and compares it
-    to `mypy.binder.get_declaration(node)`. The two must agree on:
-
-    * non-`RefExpr` nodes -> None
-    * `RefExpr` with no node -> None
-    * `Var` with a declared/inferred type -> that type
-    * `Var` with a `PartialType` -> None
-    * `Var` with `type=None` -> None
-    * `TypeInfo` node -> `TypeType(fill_typevars_with_any(info))`
-    * node that is neither `Var` nor `TypeInfo` -> None
-    """
-
-    def setUp(self) -> None:
-        import type_kernel as _tk
-
-        self._tk = _tk
-        from mypy.binder import get_declaration as _py_get_declaration
-
-        self._ref = _py_get_declaration
-        self.fx = TypeFixture()
-
-    def _check(self, expr: Expression, label: str) -> None:
-        py = self._ref(expr)  # type: ignore[arg-type]
-        decided, rust = self._tk.rust_get_declaration(expr)
-        assert decided is True, f"{label}: Rust did not decide ({decided!r})"
-        if py is None:
-            assert rust is None, f"{label}: Rust returned {rust!r}, Python None"
-        else:
-            assert rust is not None, f"{label}: Rust returned None, Python {py!r}"
-            assert_equal(str(rust), str(py), f"{label}: type mismatch")
-            assert_type(type(py), rust)
-
-    # --- non-RefExpr ---
-
-    def test_non_ref_expr(self) -> None:
-        e = IntExpr(42)
-        self._check(e, "IntExpr")
-
-    def test_index_expr(self) -> None:
-        # IndexExpr is not a RefExpr.
-        e = IndexExpr(NameExpr("base"), IntExpr(0))
-        self._check(e, "IndexExpr")
-
-    # --- RefExpr with no node ---
-
-    def test_name_expr_no_node(self) -> None:
-        e = NameExpr("x")
-        self._check(e, "NameExpr without node")
-
-    # --- Var with declared type ---
-
-    def test_var_with_type(self) -> None:
-        v = Var("x", self.fx.a)
-        e = NameExpr("x")
-        e.node = v
-        self._check(e, "Var[int]")
-
-    def test_var_none_type_fallback(self) -> None:
-        # get_declaration returns None when the Var has no type yet.
-        v = Var("y")
-        e = NameExpr("y")
-        e.node = v
-        self._check(e, "Var without type")
-
-    # --- Var with PartialType ---
-
-    def test_var_partial_type(self) -> None:
-
-        # A PartialType is what get_declaration must refuse to return.
-        v = Var("p")
-        v.type = PartialType(None, v)
-        e = NameExpr("p")
-        e.node = v
-        self._check(e, "Var with PartialType")
-
-    # --- TypeInfo node ---
-
-    def test_type_info(self) -> None:
-        info = self.fx.ai  # TypeInfo for builtins.A
-        e = NameExpr("A")
-        e.node = info
-        self._check(e, "TypeInfo A")
-
-    def test_type_info_alt(self) -> None:
-        info = self.fx.oi  # second TypeInfo
-        e = MemberExpr(NameExpr("mod"), "O")
-        e.node = info
-        self._check(e, "TypeInfo O via MemberExpr")
-
-    # --- node neither Var nor TypeInfo ---
-
-    def test_other_node(self) -> None:
-        from mypy.nodes import FuncDef
-
-        fn = FuncDef("f")
-        e = NameExpr("f")
-        e.node = fn
-        self._check(e, "FuncDef node")
 
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
@@ -3689,139 +4405,6 @@ class NativeRemoveUnpackKwargsSuite(Suite):
 
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
-class NativeLookupDefinerSuite(Suite):
-    """Parity for `rust_lookup_definer` (issue #1075).
-
-    `ExpressionChecker.lookup_definer` (checkexpr.py:5862-5876) walks
-    `typ.type.mro` and returns the fullname of the first class that
-    defines `attr_name`. The Rust seam is a live-PyO3-object port (zero
-    wire bytes) that defers on any unreadable fact. Direct seam calls
-    assert the expected fullname (and the deferral); toggling the
-    checkexpr gate off vs on drives the real ExpressionChecker method
-    and must agree on both.
-    """
-
-    def setUp(self) -> None:
-        from mypy.checkexpr import _set_native_checkexpr_active
-
-        self.fx = TypeFixture()
-        self._set_active = _set_native_checkexpr_active
-        self._set_active(True)
-
-    def tearDown(self) -> None:
-        self._set_active(False)
-
-    def _with_gate(self, active: bool, fn: Callable[[], T]) -> T:
-        self._set_active(active)
-        try:
-            return fn()
-        finally:
-            self._set_active(True)
-
-    def _info(self, fullname: str, mro: list[TypeInfo] | None = None) -> TypeInfo:
-        from mypy.nodes import Block
-
-        defn = ClassDef(fullname.rsplit(".", 1)[-1], Block([]), None, [])
-        defn.fullname = fullname
-        info = TypeInfo(SymbolTable(), defn, "mod")
-        defn.info = info
-        info.mro = mro if mro is not None else [info]
-        return info
-
-    def _definer(self, fullname: str, attr: str = "foo") -> TypeInfo:
-        info = self._info(fullname)
-        info.names[attr] = SymbolTableNode(GDEF, Var(attr))
-        return info
-
-    def _subclass(self, fullname: str, bases: list[TypeInfo]) -> TypeInfo:
-        info = self._info(fullname)
-        info.mro = [info, *bases]
-        return info
-
-    def _checker(self) -> Any:
-        from mypy.errors import Errors
-        from mypy.nodes import MypyFile
-        from mypy.plugin import Plugin
-
-        options = Options()
-        errors = Errors(options)
-        tree = MypyFile([], [])
-        tree.is_stub = True
-        tree.names = SymbolTable()
-        modules: dict[str, MypyFile] = {}
-        return TypeChecker(errors, modules, options, tree, "", Plugin(options), {})
-
-    def _ec(self) -> Any:
-
-        return ExpressionChecker(self._checker(), None, None, None)  # type: ignore[arg-type]
-
-    def _assert_seam(self, typ: Instance, attr: str, expected: str | None) -> None:
-        result = _type_kernel.rust_lookup_definer(typ, attr)
-        assert result == expected, f"seam: {result} != {expected}"
-
-    def _assert_par(self, typ: Instance, attr: str, expected: str | None) -> None:
-        ec = self._ec()
-        off = self._with_gate(False, lambda: ec.lookup_definer(typ, attr))
-        on = self._with_gate(True, lambda: ec.lookup_definer(typ, attr))
-        assert off == expected, f"gate-off: {off} != {expected}"
-        assert on == expected, f"gate-on: {on} != {expected}"
-
-    def test_seam_defined_in_base(self) -> None:
-        a = self._definer("mod.A")
-        b = self._subclass("mod.B", [a])
-        self._assert_seam(Instance(b, []), "foo", "mod.A")
-
-    def test_seam_overridden_in_subclass(self) -> None:
-        a = self._definer("mod.A")
-        b = self._subclass("mod.B", [a])
-        b.names["foo"] = SymbolTableNode(GDEF, Var("foo"))
-        self._assert_seam(Instance(b, []), "foo", "mod.B")
-
-    def test_seam_not_in_mro(self) -> None:
-        a = self._info("mod.A")
-        b = self._subclass("mod.B", [a])
-        self._assert_seam(Instance(b, []), "foo", None)
-
-    def test_seam_multiple_bases_first_mro_wins(self) -> None:
-        a = self._definer("mod.A")
-        b = self._definer("mod.B")
-        c = self._subclass("mod.C", [b, a])
-        self._assert_seam(Instance(c, []), "foo", "mod.B")
-
-    def test_seam_unreadable_type_defers(self) -> None:
-        # A non-Instance has no readable .type: the seam defers (None).
-        result = _type_kernel.rust_lookup_definer(cast(Any, IntExpr(3)), "foo")
-        assert result is None
-
-    def test_parity_defined_in_base(self) -> None:
-        a = self._definer("mod.A")
-        b = self._subclass("mod.B", [a])
-        self._assert_par(Instance(b, []), "foo", "mod.A")
-
-    def test_parity_overridden_in_subclass(self) -> None:
-        a = self._definer("mod.A")
-        b = self._subclass("mod.B", [a])
-        b.names["foo"] = SymbolTableNode(GDEF, Var("foo"))
-        self._assert_par(Instance(b, []), "foo", "mod.B")
-
-    def test_parity_not_in_mro(self) -> None:
-        a = self._info("mod.A")
-        b = self._subclass("mod.B", [a])
-        self._assert_par(Instance(b, []), "foo", None)
-
-    def test_parity_multiple_bases_first_mro_wins(self) -> None:
-        a = self._definer("mod.A")
-        b = self._definer("mod.B")
-        c = self._subclass("mod.C", [b, a])
-        self._assert_par(Instance(c, []), "foo", "mod.B")
-
-    def test_parity_empty_mro(self) -> None:
-        # An MRO listing nothing but the class itself, no defs: None.
-        b = self._subclass("mod.B", [])
-        self._assert_par(Instance(b, []), "foo", None)
-
-
-@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeDecidedNoneSuite(Suite):
     """Issue #1101: the binder/constant_fold seams return a (decided, value)
     wire answer so a genuine no-result answer skips the Python walk.
@@ -3986,133 +4569,6 @@ class NativeDecidedNoneSuite(Suite):
         assert decided is True and val == 7
         decided, val = self._tk.rust_constant_fold_expr(NameExpr("True"), "mod")
         assert decided is True and val is True
-
-
-@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
-class NativeSetCallableNameSuite(Suite):
-    """Parity for `rust_set_callable_name` (issue #1100).
-
-    `mypy.semanal_shared.set_callable_name` (semanal_shared.py:290-310)
-    resolves a callable's display name from the defining `FuncDef`. The
-    Rust seam is a live-PyO3-object port. Its class-context test mirrors
-    Python's `if fdef.info:` truthiness: non-method FuncDefs carry a
-    FakeInfo placeholder (FUNC_NO_INFO) whose `__getattribute__` raises,
-    and `TypeInfo.__bool__` returns False for it. Direct seam calls assert
-    the composed name (and the non-FunctionLike passthrough); toggling the
-    semanal_shared gate off vs on drives the real `set_callable_name` and
-    must agree on both.
-    """
-
-    def setUp(self) -> None:
-        from mypy.semanal_shared import _set_native_semanal_shared_active, set_callable_name
-
-        self.fx = TypeFixture()
-        self._set_callable_name = set_callable_name
-        self._set_active = _set_native_semanal_shared_active
-        self._set_active(True)
-
-    def tearDown(self) -> None:
-        self._set_active(False)
-
-    def _with_gate(self, active: bool, fn: Callable[[], Any]) -> Any:
-        self._set_active(active)
-        try:
-            return fn()
-        finally:
-            self._set_active(True)
-
-    def _info(self, fullname: str) -> Any:
-        from mypy.nodes import Block, SymbolTable, TypeInfo
-
-        defn = ClassDef(fullname.rsplit(".", 1)[-1], Block([]), None, [])
-        defn.fullname = fullname
-        info = TypeInfo(SymbolTable(), defn, "mod")
-        defn.info = info
-        info.mro = [info]
-        return info
-
-    def _fdef(self, name: str, info: Any = None) -> Any:
-        from mypy.nodes import Block, FuncDef
-
-        fdef = FuncDef(name, [], Block([]))
-        # FuncBase.__init__ sets info = FUNC_NO_INFO (a FakeInfo); replace
-        # it only when a real class context is requested.
-        if info is not None:
-            fdef.info = info
-        return fdef
-
-    def _callable(self) -> Any:
-        return CallableType([self.fx.anyt], [ARG_POS], [None], self.fx.anyt, self.fx.function)
-
-    def _assert_seam(self, sig: Any, fdef: Any, expected_name: str | None) -> None:
-        result = _type_kernel.rust_set_callable_name(sig, fdef)
-        if expected_name is None:
-            # Non-FunctionLike passthrough: the proper type comes back.
-            assert result is sig, f"seam passthrough: {result!r} is not {sig!r}"
-            return
-        assert result is not None, "seam deferred; expected a renamed callable"
-        renamed = cast(Any, result)
-        assert renamed.name == expected_name, f"seam: {renamed.name!r} != {expected_name!r}"
-
-    def _assert_par(self, sig: Any, fdef: Any) -> Any:
-        off = self._with_gate(False, lambda: self._set_callable_name(sig, fdef))
-        on = self._with_gate(True, lambda: self._set_callable_name(sig, fdef))
-        assert str(off) == str(on), f"gate mismatch: {off!r} != {on!r}"
-        return on
-
-    def test_seam_method_class_name(self) -> None:
-        info = self._info("mod.C")
-        fdef = self._fdef("m", info)
-        self._assert_seam(self._callable(), fdef, "m of C")
-
-    def test_seam_typeddict_fallback_name(self) -> None:
-        info = self._info("typing._TypedDict")
-        fdef = self._fdef("m", info)
-        self._assert_seam(self._callable(), fdef, "m of TypedDict")
-
-    def test_seam_fakeinfo_uses_bare_name(self) -> None:
-        # The closed shape (issue #1100): a fresh FuncDef carries
-        # FUNC_NO_INFO; the seam must name it "m", not defer.
-        fdef = self._fdef("m")
-        from mypy.nodes import FakeInfo
-
-        assert isinstance(fdef.info, FakeInfo)
-        self._assert_seam(self._callable(), fdef, "m")
-
-    def test_seam_none_info_uses_bare_name(self) -> None:
-        fdef = self._fdef("m", info=None)
-        fdef.info = None
-        self._assert_seam(self._callable(), fdef, "m")
-
-    def test_seam_non_functionlike_passthrough(self) -> None:
-        fdef = self._fdef("m")
-        self._assert_seam(self.fx.anyt, fdef, None)
-
-    def test_parity_method_class_name(self) -> None:
-        info = self._info("mod.C")
-        fdef = self._fdef("m", info)
-        result = self._assert_par(self._callable(), fdef)
-        assert result.name == "m of C"
-
-    def test_parity_fakeinfo_uses_bare_name(self) -> None:
-        fdef = self._fdef("m")
-        result = self._assert_par(self._callable(), fdef)
-        assert result.name == "m"
-
-    def test_parity_typeddict_fallback_name(self) -> None:
-        info = self._info("typing._TypedDict")
-        fdef = self._fdef("m", info)
-        result = self._assert_par(self._callable(), fdef)
-        assert result.name == "m of TypedDict"
-
-    def test_parity_overloaded_sig(self) -> None:
-
-        info = self._info("mod.C")
-        fdef = self._fdef("m", info)
-        sig = Overloaded([self._callable(), self._callable()])
-        assert isinstance(sig, Overloaded)
-        result = self._assert_par(sig, fdef)
-        assert result.get_name() == "m of C"
 
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")

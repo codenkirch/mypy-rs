@@ -2,13 +2,13 @@
 
 A retired seam's pin asserts the shim is gone, no wire crossing comes back, and the
 values still match the Python body. Those pins are self-contained `Suite` subclasses
-that never touch the area suites, so they live here instead of being appended to
-`testtypes_native_{checker,types,semanal,misc}.py`, where every retirement lane had to
-patch the same 28k-line file and serialize against the others (#1746).
+that never touch the area suites, so they live here instead of being appended to the
+engagement files, where every retirement lane had to patch the same file and serialize
+against the others (#1746, #1757).
 
 Keep new pins here. Engagement suites (a `Native...Suite` without `Retired` in the name)
-stay in their area file. If this file becomes a hotspot, split it by area into
-`testtypes_native_retired_<area>.py`.
+live in `testtypes_native_engagement_<area>.py`. If this file becomes a hotspot, split it
+by area into `testtypes_native_retired_<area>.py`.
 """
 
 from __future__ import annotations
@@ -22,9 +22,11 @@ from types import SimpleNamespace
 from typing import Any, cast
 from unittest import skipUnless
 
+from mypy.argmap import _set_native_argmap_active
 from mypy.checkexpr import ExpressionChecker
-from mypy.nodes import ARG_POS, NameExpr
+from mypy.nodes import ARG_NAMED, ARG_POS, ARG_STAR, NameExpr
 from mypy.test.helpers import Suite, assert_equal
+from mypy.test.testinfer import _NATIVE_ARGMAP_ENABLED
 from mypy.test.testtypes import _NATIVE_WIRE_ENABLED
 from mypy.test.typefixture import TypeFixture
 from mypy.types import (
@@ -1079,3 +1081,102 @@ class NativeReplaceImplicitFirstTypeRetiredSuite(Suite):
         first = get_proper_type(decoded.arg_types[0])
         assert isinstance(first, Instance)
         assert first.type_ref == "builtins.object"
+
+
+# Moved from mypy/test/testinfer.py.
+
+
+@skipUnless(_NATIVE_ARGMAP_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeArgMapSeamsRetiredSuite(Suite):
+    """Pin the #1739 retirement of the argmap mapping seams.
+
+    Retired: `rust_map_actuals_to_formals` (3.13x-4.15x slower), the
+    star-actual `rust_map_actuals_to_formals_with_types` (4.25x-6.35x),
+    `rust_map_formals_to_actuals` (2.25x), and `_serialize_actual_type`,
+    the helper reachable only from the star path. Shadows like these paid
+    list conversions plus a whole-tree type serialization to answer a
+    pure-Python list walk over live objects.
+
+    Kept: `rust_expand_actual_type`, whose Python body is a recursive
+    visitor and which measured 0.43-0.61x (up to 2.3x faster).
+
+    Values are pinned by `MapActualsToFormalsSuite`,
+    `MapActualsToFormalsStarSuite` and `MapFormalsToActualsSuite`, which run
+    with the gate ON (module-level env flip). This suite pins the structure:
+    the shim names are gone from `mypy.argmap` and the retired bodies load
+    no `rust_*` global, which is zero crossings with the gate on. The Rust
+    pyfunctions stay registered for direct-seam calls.
+    """
+
+    _GONE = (
+        "_rust_map_actuals_to_formals",
+        "_rust_map_actuals_to_formals_with_types",
+        "_rust_map_formals_to_actuals",
+        "_serialize_actual_type",
+    )
+
+    def setUp(self) -> None:
+        # Zero-crossing claims below are made with the production gate ON.
+        _set_native_argmap_active(True)
+
+    def test_retired_shim_names_gone(self) -> None:
+        from mypy import argmap
+
+        for name in self._GONE:
+            assert not hasattr(argmap, name), f"{name} should be gone"
+
+    def test_surviving_seam_still_registered(self) -> None:
+        from mypy import argmap
+
+        assert argmap._HAS_TYPE_KERNEL, "expand_actual_type seam must stay live"
+        # The alias is private inside `mypy.argmap` (not a re-export), so it
+        # is read by string. Direct access trips the self-check's
+        # implicit_reexport=False; ruff's B009 fix would reintroduce it.
+        assert getattr(argmap, "_rust_expand_actual_type") is not None  # noqa: B009
+        assert argmap._HAS_LIBRT
+
+    def test_retired_bodies_load_no_rust_name(self) -> None:
+        from mypy.argmap import map_actuals_to_formals, map_formals_to_actuals
+
+        for fn in (map_actuals_to_formals, map_formals_to_actuals):
+            loaded = [n for n in fn.__code__.co_names if "rust_" in n]
+            assert loaded == [], f"{fn.__name__} still loads {loaded}"
+
+    def test_pyfunctions_stay_callable(self) -> None:
+        # Rule 5 of the retirement method: the Rust entry points remain
+        # registered even though production no longer calls them.
+        import type_kernel
+
+        for name in (
+            "rust_map_actuals_to_formals",
+            "rust_map_actuals_to_formals_with_types",
+            "rust_map_formals_to_actuals",
+        ):
+            assert callable(getattr(type_kernel, name)), f"{name} should stay registered"
+        assert type_kernel.rust_map_actuals_to_formals(
+            [int(ARG_POS.value)], [None], [int(ARG_POS.value)], [None]
+        ) == [[0]]
+        assert (
+            type_kernel.rust_map_actuals_to_formals(
+                [int(ARG_STAR.value)], [None], [int(ARG_STAR.value)], [None]
+            )
+            is None
+        ), "the plain ticket must still defer on star actuals"
+
+    def test_values_match_python_with_gate_on(self) -> None:
+        from mypy.argmap import map_actuals_to_formals
+
+        fixture = TypeFixture()
+        # The production gate is ON here; the values must be the Python ones.
+        result = map_actuals_to_formals(
+            [ARG_POS, ARG_NAMED],
+            [None, "y"],
+            [ARG_POS, ARG_POS],
+            ["x", "y"],
+            lambda i: fixture.anyt,
+        )
+        assert_equal(result, [[0], [1]])
+        star = map_actuals_to_formals(
+            [ARG_STAR], [None], [ARG_POS, ARG_POS], [None, None], lambda i: fixture.std_tuple
+        )
+        assert_equal(star, [[0], [0]])
