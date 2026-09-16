@@ -1,0 +1,589 @@
+"""Native seam stubs for the semanal area (split from type_kernel.pyi, #1677)."""
+
+from __future__ import annotations
+
+from collections.abc import Callable, Sized
+from typing import Any, Literal, TypeVar
+
+from mypy.nodes import (
+    AssignmentStmt,
+    Block,
+    CallExpr,
+    DataclassTransformSpec,
+    Decorator,
+    Expression,
+    FuncDef,
+    Lvalue,
+    MemberExpr,
+    MypyFile,
+    NameExpr,
+    Node,
+    OverloadedFuncDef,
+    RefExpr,
+    SymbolNode,
+    SymbolTable,
+    SymbolTableNode,
+    TypeAlias,
+    TypeInfo,
+    Var,
+)
+from mypy.types import CallableType, Instance, ProperType, TupleType, Type, TypeVarLikeType
+
+
+T = TypeVar("T")
+
+
+def rust_classify_lvalue_validity(node: Any) -> int: ...
+
+def rust_make_any_non_explicit(type_bytes: bytes) -> bytes | None: ...
+
+def rust_make_any_non_unimported(type_bytes: bytes) -> bytes | None: ...
+
+def rust_replace_implicit_first_type(sig_bytes: bytes, new_type_bytes: bytes) -> bytes | None: ...
+
+def rust_refers_to_fullname(node: Expression, fullnames: str | tuple[str, ...]) -> bool: ...
+
+def rust_refers_to_class_or_function(node: Expression) -> bool: ...
+
+def rust_is_trivial_body(block: Block) -> bool: ...
+
+def rust_find_duplicate(list: list[T]) -> T | None: ...
+
+def rust_is_valid_replacement(old: SymbolTableNode, new: SymbolTableNode) -> bool: ...
+
+def rust_is_same_symbol(a: SymbolNode | None, b: SymbolNode | None) -> bool: ...
+
+def rust_names_modified_in_lvalue(lvalue: Lvalue) -> list[NameExpr]: ...
+
+def rust_names_modified_by_assignment(s: AssignmentStmt) -> list[NameExpr]: ...
+
+def rust_remove_imported_names_from_symtable(names: SymbolTable, module: str) -> None: ...
+
+def rust_should_wait_rhs(semanal: Any, rv: Expression) -> bool | None: ...
+
+def rust_apply_semantic_analyzer_patches(
+    patches: list[tuple[int, Callable[[], None]]],
+) -> None: ...
+
+def rust_classify_decorators(
+    decorators: list[Expression],
+    name_sets: tuple[
+        str | tuple[str, ...],
+        str | tuple[str, ...],
+        str | tuple[str, ...],
+        str | tuple[str, ...],
+        str | tuple[str, ...],
+        str | tuple[str, ...],
+        str | tuple[str, ...],
+        str | tuple[str, ...],
+        str | tuple[str, ...],
+        str | tuple[str, ...],
+        str | tuple[str, ...],
+        str | tuple[str, ...],
+        str | tuple[str, ...],
+    ],
+) -> list[str] | None: ...
+
+def rust_classify_class_decorator(
+    decorator: Expression,
+    name_sets: tuple[
+        str | tuple[str, ...], str | tuple[str, ...], str | tuple[str, ...], str | tuple[str, ...]
+    ],
+) -> tuple[str, str | None] | None: ...
+
+def rust_classify_imports(
+    ids: list[tuple[str, str | None]],
+    is_stub_file: bool,
+    implicit_reexport: bool,
+    modules: dict[str, MypyFile],
+    scope_stack: list[int],
+    self_type: TypeInfo | None,
+) -> list[tuple[str, str, bool, int | None]] | None: ...
+
+def rust_classify_member_resolution(
+    expr: Expression,
+    member_expr_cls: type[MemberExpr],
+    ref_expr_cls: type[RefExpr],
+    mypy_file_cls: type[MypyFile],
+    type_info_cls: type[TypeInfo],
+    type_alias_cls: type[TypeAlias],
+) -> tuple[str | None, SymbolTableNode | None]: ...
+
+def rust_lookup(
+    name: str,
+    global_decls: set[str],
+    globals: SymbolTable,
+    nonlocal_decls: set[str],
+    locals: list[SymbolTable | None],
+    type_names: SymbolTable | None,
+    is_func_scope: bool,
+) -> tuple[str, SymbolTableNode | None] | None: ...
+
+def rust_var_is_typing_special_form(node: Any) -> bool: ...
+
+def rust_get_typevarlike_declaration(
+    s: AssignmentStmt, typevarlike_types: tuple[str, ...]
+) -> CallExpr | None: ...
+
+def rust_parse_bool(expr: Expression) -> bool | None: ...
+
+def rust_is_mangled_global(name: str, globals: dict[str, Any]) -> bool: ...
+
+def rust_is_initial_mangled_global(name: str) -> bool: ...
+
+def rust_is_final_redefinition(
+    kind: int, name: str, globals: dict[str, Any], type_names: Any
+) -> bool: ...
+
+def rust_is_same_var_from_getattr(a: Any, b: Any) -> bool: ...
+
+def rust_can_possibly_be_typevarlike_declaration(s: AssignmentStmt) -> bool: ...
+
+def rust_can_possibly_be_type_form(s: AssignmentStmt, is_pep_613_annot: bool) -> bool | None: ...
+
+def rust_is_type_ref(rv: Expression, bare: bool) -> bool | None: ...
+
+def rust_can_be_type_alias(
+    rv: Expression, allow_none: bool, is_stub_file: bool
+) -> bool | None: ...
+
+def rust_check_typevarlike_name(call: CallExpr, name: str) -> tuple[bool, str | None] | None: ...
+
+def rust_check_decorated_function_is_method(semanal: Any) -> bool | None: ...
+
+def rust_classify_method_signature(
+    func: Any,
+    self_type: Any,
+    unanalyzed_kind: int,
+    expected_self: bool | None,
+    has_self_type: bool,
+) -> tuple[bool, bool, int] | None: ...
+
+def rust_classify_remove_unpack_kwargs(
+    typ: CallableType, last_type_wire: bytes | None
+) -> tuple[int, list[str]] | None: ...
+
+def rust_classify_remove_unpack_kwargs_live(
+    typ: CallableType,
+) -> tuple[int, list[str]] | None: ...
+
+def rust_extract_typevarlike_name(s: AssignmentStmt, call: CallExpr) -> str | None: ...
+
+def rust_is_defined_type_param(locals: list[SymbolTable | None], name: str) -> bool: ...
+
+def rust_classify_setup_type_vars(
+    tvar_defs: list[TypeVarLikeType], has_defaults: list[bool]
+) -> list[int] | None: ...
+
+def rust_visit_list_set_expr(expr: Expression, semanal: object) -> bool: ...
+
+def rust_visit_dict_expr(expr: Expression, semanal: object) -> bool: ...
+
+def rust_visit_template_str_expr(expr: Expression, semanal: object) -> bool: ...
+
+def rust_visit_unary_expr(expr: Expression, semanal: object) -> bool: ...
+
+def rust_visit_comparison_expr(expr: Expression, semanal: object) -> bool: ...
+
+def rust_visit_slice_expr(expr: Expression, semanal: object) -> bool: ...
+
+def rust_visit_conditional_expr(expr: Expression, semanal: object) -> bool: ...
+
+def rust_visit_super_expr(expr: Expression, semanal: object, the_type: object) -> bool: ...
+
+def rust_visit_raise_stmt(stmt: Node, semanal: object) -> bool: ...
+
+def rust_visit_assert_stmt(stmt: Node, semanal: object) -> bool: ...
+
+def rust_visit_operator_assignment_stmt(stmt: Node, semanal: object) -> bool: ...
+
+def rust_visit_block(block: Block, semanal: object) -> bool: ...
+
+def rust_visit_if_stmt(stmt: Node, semanal: object) -> bool: ...
+
+def rust_is_valid_del_target(expr: Expression) -> bool: ...
+
+def rust_visit_del_stmt(stmt: Node, semanal: object) -> bool: ...
+
+def rust_visit_expression_stmt(stmt: Node, semanal: object) -> bool: ...
+
+def rust_visit_break_stmt(stmt: Node, semanal: object) -> bool: ...
+
+def rust_visit_continue_stmt(stmt: Node, semanal: object) -> bool: ...
+
+def rust_visit_global_decl(stmt: Node, semanal: object) -> bool: ...
+
+def rust_visit_match_stmt(stmt: Node, semanal: object) -> bool: ...
+
+def rust_visit_return_stmt(stmt: Node, semanal: object) -> bool: ...
+
+def rust_visit_block_maybe(block: Block | None, semanal: object) -> bool: ...
+
+def rust_visit_while_stmt(stmt: Node, semanal: object) -> bool: ...
+
+def rust_visit_name_expr(expr: Node, semanal: object) -> bool: ...
+
+def rust_visit_star_expr(expr: Node, semanal: object) -> bool: ...
+
+def rust_visit_as_pattern(pattern: Node, semanal: object) -> bool: ...
+
+def rust_visit_or_pattern(pattern: Node, semanal: object) -> bool: ...
+
+def rust_visit_value_pattern(pattern: Node, semanal: object) -> bool: ...
+
+def rust_visit_sequence_pattern(pattern: Node, semanal: object) -> bool: ...
+
+def rust_visit_starred_pattern(pattern: Node, semanal: object) -> bool: ...
+
+def rust_visit_mapping_pattern(pattern: Node, semanal: object) -> bool: ...
+
+def rust_visit_class_pattern(pattern: Node, semanal: object) -> bool: ...
+
+def rust_visit_yield_expr(expr: Node, semanal: object) -> bool: ...
+
+def rust_visit_yield_from_expr(expr: Node, semanal: object) -> bool: ...
+
+def rust_visit_await_expr(expr: Node, semanal: object) -> bool: ...
+
+def rust_visit_try_stmt(stmt: Node, semanal: object) -> bool: ...
+
+def rust_visit_op_expr(expr: Node, semanal: object) -> bool: ...
+
+def rust_visit_index_expr(expr: Node, semanal: object) -> bool: ...
+
+def rust_visit_cast_expr(expr: Node, semanal: object) -> bool: ...
+
+def rust_visit_type_form_expr(expr: Node, semanal: object) -> bool: ...
+
+def rust_visit_assert_type_expr(expr: Node, semanal: object) -> bool: ...
+
+def rust_visit_reveal_expr(expr: Node, semanal: object) -> bool: ...
+
+def rust_visit_type_application(expr: Node, semanal: object) -> bool: ...
+
+def rust_visit_list_comprehension(expr: Node, semanal: object) -> bool: ...
+
+def rust_visit_set_comprehension(expr: Node, semanal: object) -> bool: ...
+
+def rust_visit_dictionary_comprehension(expr: Node, semanal: object) -> bool: ...
+
+def rust_visit_generator_expr(expr: Node, semanal: object) -> bool: ...
+
+def rust_visit_lambda_expr(expr: Node, semanal: object) -> bool: ...
+
+def rust_visit_overloaded_func_def(defn: Node, semanal: object) -> bool: ...
+
+def rust_visit_class_def(defn: Node, semanal: object) -> bool: ...
+
+def rust_visit_func_def(defn: Node, semanal: object) -> bool: ...
+
+def rust_visit_nonlocal_decl(d: Node, semanal: object) -> bool: ...
+
+def rust_visit_for_stmt(s: Node, semanal: object) -> bool: ...
+
+def rust_visit_with_stmt(s: Node, semanal: object) -> bool: ...
+
+def rust_visit_assignment_expr(s: Node, semanal: object) -> bool: ...
+
+def rust_visit_import_all(i: Node, semanal: object) -> bool: ...
+
+def rust_visit_import_from(imp: Node, semanal: object) -> bool: ...
+
+def rust_visit_assignment_stmt(s: Node, semanal: object) -> bool: ...
+
+def rust_visit_import(i: Node, semanal: object) -> bool: ...
+
+def rust_visit_call_expr(expr: Node, semanal: object) -> bool: ...
+
+def rust_visit_type_alias_stmt(s: Node, semanal: object) -> bool: ...
+
+def rust_special_function_elide_names(name: str) -> bool: ...
+
+def rust_argument_elide_name(name: str | None) -> bool: ...
+
+def rust_set_callable_name(sig: Type, fdef: FuncDef) -> ProperType | None: ...
+
+def rust_has_placeholder(typ: Type) -> bool | None: ...
+
+def rust_calculate_tuple_fallback(typ: TupleType) -> Type | None: ...
+
+def rust_find_dataclass_transform_spec(node: Node | None) -> DataclassTransformSpec | None: ...
+
+def rust_calculate_class_abstract_status(
+    typ: TypeInfo, is_stub_file: bool, errors: Any
+) -> None: ...
+
+def rust_check_protocol_status(info: TypeInfo, errors: Any) -> None: ...
+
+def rust_calculate_class_vars(info: TypeInfo) -> None: ...
+
+def rust_add_type_promotion(
+    info: TypeInfo, module_names: SymbolTable, options: Any, builtin_names: SymbolTable | None
+) -> None: ...
+
+def rust_get_declaration(expr: Expression) -> tuple[bool, Type | None]: ...
+
+def rust_binder_new() -> None: ...
+
+def rust_binder_reset() -> None: ...
+
+def rust_binder_push_frame() -> None: ...
+
+def rust_binder_pop_frame() -> None: ...
+
+def rust_binder_is_unreachable() -> bool: ...
+
+def rust_binder_is_unreachable_warning_suppressed() -> bool: ...
+
+def rust_binder_set_unreachable() -> None: ...
+
+def rust_binder_set_top_unreachable(v: bool) -> None: ...
+
+def rust_binder_suppress_unreachable_warnings() -> None: ...
+
+def rust_binder_frame_count() -> int: ...
+
+def rust_primary_source(sources: list[Any]) -> Any: ...
+
+def rust_check_namedtuple_field_name(field: str, seen_names: Any) -> str | None: ...
+
+def rust_verify_requiredness_compatibility(
+    field_name: str, source: Any, is_required: bool, primary_source_base: Any
+) -> str | None: ...
+
+def rust_verify_field_against_closed_bases(
+    field_name: str, closed_bases: Any, primary_source_base: Any
+) -> list[str]: ...
+
+def rust_erase_func_annotations(func: Any) -> None: ...
+
+def rust_get_deprecated(expression: Any) -> str | None: ...
+
+def rust_get_name_repr_of_expr(expr: Any) -> str | None: ...
+
+def rust_is_init_only(node: Any) -> bool: ...
+
+def rust_lookup_qualified(
+    resolver: NativeTypeResolver,
+    name: str,
+    first_sym_kind: int,
+    first_sym_fullname: str,
+    first_sym_is_any: bool,
+) -> tuple[int, str] | None: ...
+
+def rust_classify_type_expression(
+    node_tags: Any,
+    str_value: Any,
+    str_isidentifier: Any,
+    str_has_quotes: Any,
+    str_has_open_bracket: Any,
+    str_is_whitespace: Any,
+    str_nontype_regex_match: Any,
+    index_base_kind: Any,
+    index_leftmost_is_name: Any,
+    index_node_is_var: Any,
+    index_var_is_special: Any,
+    op_is_pipe: Any,
+) -> int | None: ...
+
+def rust_clean_up_bases(fullname: Any, in_protocol_names: Any, has_args: bool) -> int: ...
+
+def rust_is_magic_base(
+    base_expr: Expression, namedtuple_names: tuple[str, ...], tpdict_names: tuple[str, ...]
+) -> bool: ...
+
+def rust_is_core_builtin_class(
+    cur_mod_id: str, class_name: str, core_names: list[str]
+) -> bool: ...
+
+def rust_classify_with_metaclass(
+    fullname: str | None, args_len: int, all_positional: bool
+) -> int: ...
+
+def rust_classify_add_metaclass(
+    fullname: str | None, args_len: int, arg_kind_0_positional: bool
+) -> int: ...
+
+def rust_classify_configure_bases(
+    bases_wire: list[bytes],
+    is_newtypes: list[bool],
+    disallow_subclassing_any: bool,
+    disallow_any_unimported: bool,
+    disallow_any_explicit: bool,
+    is_typeshed_stub_file: bool,
+) -> list[tuple[int, bool, bool]] | None: ...
+
+def rust_classify_configure_mro(info: TypeInfo) -> tuple[int, list[int], str | None] | None: ...
+
+def rust_classify_declared_metaclass(
+    mc_name: str | None, sym_node: Any, var_type: Any, meta_info: Any
+) -> int | None: ...
+
+def rust_classify_recalculate_metaclass(defn: Any) -> int | None: ...
+
+def rust_classify_function_signature(sig_arg_types_len: int, arguments_len: int) -> int: ...
+
+def rust_classify_fixed_args(args_len: int, arg_kinds: list[int], numargs: int) -> int | None: ...
+
+def rust_classify_simple_literal_type(
+    function_stack: bool, value_kind: int, cur_mod_id: str, is_final: bool
+) -> int | None: ...
+
+def rust_extract_meta_info(typ: Any) -> Any: ...
+
+def rust_namedtuple_prohibited_names() -> Any: ...
+
+def rust_transform_copy(node: Any) -> Any: ...
+
+def rust_lookup_definer(typ: Instance, attr_name: str) -> str | None: ...
+
+
+__all__ = [
+    "rust_classify_lvalue_validity",
+    "rust_make_any_non_explicit",
+    "rust_make_any_non_unimported",
+    "rust_replace_implicit_first_type",
+    "rust_refers_to_fullname",
+    "rust_refers_to_class_or_function",
+    "rust_is_trivial_body",
+    "rust_find_duplicate",
+    "rust_is_valid_replacement",
+    "rust_is_same_symbol",
+    "rust_names_modified_in_lvalue",
+    "rust_names_modified_by_assignment",
+    "rust_remove_imported_names_from_symtable",
+    "rust_should_wait_rhs",
+    "rust_apply_semantic_analyzer_patches",
+    "rust_classify_decorators",
+    "rust_classify_class_decorator",
+    "rust_classify_imports",
+    "rust_classify_member_resolution",
+    "rust_lookup",
+    "rust_var_is_typing_special_form",
+    "rust_get_typevarlike_declaration",
+    "rust_parse_bool",
+    "rust_is_mangled_global",
+    "rust_is_initial_mangled_global",
+    "rust_is_final_redefinition",
+    "rust_is_same_var_from_getattr",
+    "rust_can_possibly_be_typevarlike_declaration",
+    "rust_can_possibly_be_type_form",
+    "rust_is_type_ref",
+    "rust_can_be_type_alias",
+    "rust_check_typevarlike_name",
+    "rust_check_decorated_function_is_method",
+    "rust_classify_method_signature",
+    "rust_classify_remove_unpack_kwargs",
+    "rust_classify_remove_unpack_kwargs_live",
+    "rust_extract_typevarlike_name",
+    "rust_is_defined_type_param",
+    "rust_classify_setup_type_vars",
+    "rust_visit_list_set_expr",
+    "rust_visit_dict_expr",
+    "rust_visit_template_str_expr",
+    "rust_visit_unary_expr",
+    "rust_visit_comparison_expr",
+    "rust_visit_slice_expr",
+    "rust_visit_conditional_expr",
+    "rust_visit_super_expr",
+    "rust_visit_raise_stmt",
+    "rust_visit_assert_stmt",
+    "rust_visit_operator_assignment_stmt",
+    "rust_visit_block",
+    "rust_visit_if_stmt",
+    "rust_is_valid_del_target",
+    "rust_visit_del_stmt",
+    "rust_visit_expression_stmt",
+    "rust_visit_break_stmt",
+    "rust_visit_continue_stmt",
+    "rust_visit_global_decl",
+    "rust_visit_match_stmt",
+    "rust_visit_return_stmt",
+    "rust_visit_block_maybe",
+    "rust_visit_while_stmt",
+    "rust_visit_name_expr",
+    "rust_visit_star_expr",
+    "rust_visit_as_pattern",
+    "rust_visit_or_pattern",
+    "rust_visit_value_pattern",
+    "rust_visit_sequence_pattern",
+    "rust_visit_starred_pattern",
+    "rust_visit_mapping_pattern",
+    "rust_visit_class_pattern",
+    "rust_visit_yield_expr",
+    "rust_visit_yield_from_expr",
+    "rust_visit_await_expr",
+    "rust_visit_try_stmt",
+    "rust_visit_op_expr",
+    "rust_visit_index_expr",
+    "rust_visit_cast_expr",
+    "rust_visit_type_form_expr",
+    "rust_visit_assert_type_expr",
+    "rust_visit_reveal_expr",
+    "rust_visit_type_application",
+    "rust_visit_list_comprehension",
+    "rust_visit_set_comprehension",
+    "rust_visit_dictionary_comprehension",
+    "rust_visit_generator_expr",
+    "rust_visit_lambda_expr",
+    "rust_visit_overloaded_func_def",
+    "rust_visit_class_def",
+    "rust_visit_func_def",
+    "rust_visit_nonlocal_decl",
+    "rust_visit_for_stmt",
+    "rust_visit_with_stmt",
+    "rust_visit_assignment_expr",
+    "rust_visit_import_all",
+    "rust_visit_import_from",
+    "rust_visit_assignment_stmt",
+    "rust_visit_import",
+    "rust_visit_call_expr",
+    "rust_visit_type_alias_stmt",
+    "rust_special_function_elide_names",
+    "rust_argument_elide_name",
+    "rust_set_callable_name",
+    "rust_has_placeholder",
+    "rust_calculate_tuple_fallback",
+    "rust_find_dataclass_transform_spec",
+    "rust_calculate_class_abstract_status",
+    "rust_check_protocol_status",
+    "rust_calculate_class_vars",
+    "rust_add_type_promotion",
+    "rust_get_declaration",
+    "rust_binder_new",
+    "rust_binder_reset",
+    "rust_binder_push_frame",
+    "rust_binder_pop_frame",
+    "rust_binder_is_unreachable",
+    "rust_binder_is_unreachable_warning_suppressed",
+    "rust_binder_set_unreachable",
+    "rust_binder_set_top_unreachable",
+    "rust_binder_suppress_unreachable_warnings",
+    "rust_binder_frame_count",
+    "rust_primary_source",
+    "rust_check_namedtuple_field_name",
+    "rust_verify_requiredness_compatibility",
+    "rust_verify_field_against_closed_bases",
+    "rust_erase_func_annotations",
+    "rust_get_deprecated",
+    "rust_get_name_repr_of_expr",
+    "rust_is_init_only",
+    "rust_lookup_qualified",
+    "rust_classify_type_expression",
+    "rust_clean_up_bases",
+    "rust_is_magic_base",
+    "rust_is_core_builtin_class",
+    "rust_classify_with_metaclass",
+    "rust_classify_add_metaclass",
+    "rust_classify_configure_bases",
+    "rust_classify_configure_mro",
+    "rust_classify_declared_metaclass",
+    "rust_classify_recalculate_metaclass",
+    "rust_classify_function_signature",
+    "rust_classify_fixed_args",
+    "rust_classify_simple_literal_type",
+    "rust_extract_meta_info",
+    "rust_namedtuple_prohibited_names",
+    "rust_transform_copy",
+    "rust_lookup_definer",
+]
