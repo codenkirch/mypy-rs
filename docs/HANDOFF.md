@@ -10,9 +10,11 @@ mutex. The seam ledger itself moved out of `AGENTS.md` into
 
 ### Where `main` stands
 
-`main` = `a5bb83244` (G1.2 node-shadow audit and first expression-node read
-flip, PR `#1695`), on top of `58d32ab24` (F reopening one-family view, PR
-`#1694`), `cd54ca293` (semanal live-object seams, PR `#1699`), `0046062a1`
+`main` = `5b012830e` (wave-5 ledger entries and the final-head T4 battery, PR
+`#1707`), on top of `a5bb83244` (G1.2 node-shadow audit and first
+expression-node read flip, PR `#1695`), `58d32ab24` (F reopening one-family
+view, PR `#1694`), `cd54ca293` (semanal live-object seams, PR `#1699`),
+`0046062a1`
 (residual scalar-seam retirement, PR `#1685`), `24ddff920` (pool
 checkout and venv fix, PR `#1705`), `9b0f426ca` (`check_callable_call` tail
 seam, PR `#1700`), `d6647b8bc` (this read-flip correction, PR `#1704`),
@@ -113,6 +115,10 @@ Landed this wave, in merge order:
   `deferred` 128; wire delta <=2 events. Tier T2. Merge prep fixed the stale
   `-> None` annotation that failed CI's self-check (8 errors) and filed #1708
   for an inherited identity-layer flake.
+- `5b012830e` **wave-5 ledger entries and the final-head T4 battery (PR #1707)**
+  — the last two entries (`#1671`/`58d32ab24`, `#1674`/`a5bb83244`), the head
+  line and queue brought to the merged state, and the "T4 on the merged wave
+  head" section. Tier T1.
 
 ### T4 baseline (lane A8), measured at `271175175`
 
