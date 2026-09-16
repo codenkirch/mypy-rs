@@ -4,7 +4,10 @@
 set -euo pipefail
 
 SCRIPT_REPO=$(cd "$(dirname "$0")/.." && pwd)
-MAIN=$(cd "$(git -C "$SCRIPT_REPO" rev-parse --git-common-dir)/.." && pwd)
+# Absolute path: rev-parse --git-common-dir prints cwd-relative otherwise
+# (".git" at the repo root), and resolving it against the caller's cwd binds
+# MAIN to the wrong tree when invoked from a subdirectory (#1711).
+MAIN=$(dirname "$(git -C "$SCRIPT_REPO" rev-parse --path-format=absolute --git-common-dir)")
 POOL_ROOT="${POOL_ROOT:-/private/tmp/mypy-rs-pool}"
 STATE="$POOL_ROOT/.state"
 
@@ -31,11 +34,36 @@ cmd_init() {
 
 is_claimed() { [ -f "$STATE/$1.branch" ]; }
 
+# Atomic claim primitive (#1711): mkdir wins or fails, so concurrent claims
+# cannot interleave fetch/checkout/clean. Lock covers the operation only;
+# a dead owner's lock is reaped as stale.
+claim_lock() {
+    slot="$1"
+    lock="$STATE/$slot.lock"
+    if mkdir "$lock" 2>/dev/null; then
+        echo $$ >"$lock/pid"
+        return 0
+    fi
+    owner="$(cat "$lock/pid" 2>/dev/null || echo '?')"
+    if [ "$owner" != "?" ] && [ "$owner" != "$$" ] && ! kill -0 "$owner" 2>/dev/null; then
+        rm -rf "$lock"
+        if mkdir "$lock" 2>/dev/null; then
+            echo $$ >"$lock/pid"
+            return 0
+        fi
+    fi
+    echo "slot $slot is claimed by $(cat "$STATE/$slot.branch" 2>/dev/null || echo '?')" >&2
+    return 1
+}
+
 cmd_claim() {
     slot="${1:?usage: claim <slot> <branch>}"
     branch="${2:?usage: claim <slot> <branch>}"
     p="$(slot_path "$slot")"
     [ -d "$p" ] || { echo "no such slot: $slot" >&2; exit 1; }
+    mkdir -p "$STATE"
+    claim_lock "$slot" || exit 1
+    trap "rm -rf \"$STATE/$slot.lock\"" EXIT
     if is_claimed "$slot" && [ "$(cat "$STATE/$slot.branch")" != "$branch" ]; then
         echo "slot $slot is claimed by $(cat "$STATE/$slot.branch")" >&2
         exit 1
@@ -95,15 +123,21 @@ cmd_status() {
 cmd_prune() {
     for d in "$POOL_ROOT"/w*; do
         [ -d "$d" ] || continue
+        s="$(basename "$d")"
+        if is_claimed "$s"; then
+            echo "skipping $s: claimed by $(cat "$STATE/$s.branch")" >&2
+            continue
+        fi
         if [ -n "$(git -C "$d" status --porcelain)" ]; then
-            echo "skipping $(basename "$d"): uncommitted changes" >&2
+            echo "skipping $s: uncommitted changes" >&2
             continue
         fi
         git -C "$MAIN" worktree remove --force "$d"
-        echo "removed $(basename "$d")"
+        rm -f "$STATE/$s.branch" "$STATE/$s.lock/pid"
+        rmdir "$STATE/$s.lock" 2>/dev/null || true
+        echo "removed $s"
     done
     git -C "$MAIN" worktree prune
-    rm -rf "$STATE"
     echo "pool pruned (POOL_ROOT kept: $POOL_ROOT)"
 }
 
