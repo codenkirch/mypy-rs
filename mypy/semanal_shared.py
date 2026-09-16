@@ -56,14 +56,12 @@ try:
     from type_kernel import (
         rust_calculate_tuple_fallback as _rust_calculate_tuple_fallback,
         rust_find_dataclass_transform_spec as _rust_find_dataclass_transform_spec,
-        rust_has_placeholder as _rust_has_placeholder,
         rust_set_callable_name as _rust_set_callable_name,
     )
 
     _SEMANAL_SHARED_HAS_KERNEL = True
 except ImportError:
     _rust_set_callable_name = None  # type: ignore[assignment]
-    _rust_has_placeholder = None  # type: ignore[assignment]
     _rust_calculate_tuple_fallback = None  # type: ignore[assignment]
     _rust_find_dataclass_transform_spec = None  # type: ignore[assignment]
     _SEMANAL_SHARED_HAS_KERNEL = False
@@ -417,13 +415,7 @@ class HasPlaceholders(BoolTypeQuery):
 
 def has_placeholder(typ: Type) -> bool:
     """Check if a type contains any placeholder types (recursively)."""
-    if _SEMANAL_SHARED_HAS_KERNEL and _native_semanal_shared_active:
-        try:
-            result = _rust_has_placeholder(typ)
-            if result is not None:
-                return result
-        except (AssertionError, NotImplementedError):
-            pass
+    # Native seam retired (#1739): 2.4x loss to a 269ns body (79k calls).
     return typ.accept(HasPlaceholders())
 
 

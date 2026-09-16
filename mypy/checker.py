@@ -389,7 +389,6 @@ try:
         rust_is_custom_settable_property as _rust_is_custom_settable_property,
         rust_is_empty_generator_function as _rust_is_empty_generator_function,
         rust_is_equality_ambiguous_for_narrowing as _rust_is_equality_ambiguous_for_narrowing,
-        rust_is_false_literal as _rust_is_false_literal,
         rust_is_final_enum_value as _rust_is_final_enum_value,
         rust_is_generator_return_type as _rust_is_generator_return_type,
         rust_is_literal_none as _rust_is_literal_none,
@@ -402,7 +401,6 @@ try:
         rust_is_settable_property as _rust_is_settable_property,
         rust_is_static as _rust_is_static,
         rust_is_string_literal as _rust_is_string_literal,
-        rust_is_true_literal as _rust_is_true_literal,
         rust_is_typed_callable as _rust_is_typed_callable,
         rust_is_typeddict_type_context as _rust_is_typeddict_type_context,
         rust_is_unreachable_map as _rust_is_unreachable_map,
@@ -519,8 +517,6 @@ except ImportError:
     _rust_stmt_outcome = None  # type: ignore[assignment]
     _rust_with_exit_suppresses = None  # type: ignore[assignment]
     _rust_try_handler_union = None  # type: ignore[assignment]
-    _rust_is_true_literal = None  # type: ignore[assignment]
-    _rust_is_false_literal = None  # type: ignore[assignment]
     _rust_is_final_enum_value = None  # type: ignore[assignment]
     _rust_is_literal_none = None  # type: ignore[assignment]
     _rust_is_literal_not_implemented = None  # type: ignore[assignment]
@@ -11320,21 +11316,13 @@ def gen_unique_name(base: str, table: SymbolTable) -> str:
 
 def is_true_literal(n: Expression) -> bool:
     """Returns true if this expression is the 'True' literal/keyword."""
-    if _CHECKER_HAS_TYPE_KERNEL and _native_checker_stmts_active:
-        try:
-            return _rust_is_true_literal(n)
-        except (AssertionError, NotImplementedError):
-            pass
+    # Native seam retired (#1739): 3.6x loss to a 110ns body (91k calls).
     return refers_to_fullname(n, "builtins.True") or isinstance(n, IntExpr) and n.value != 0
 
 
 def is_false_literal(n: Expression) -> bool:
     """Returns true if this expression is the 'False' literal/keyword."""
-    if _CHECKER_HAS_TYPE_KERNEL and _native_checker_stmts_active:
-        try:
-            return _rust_is_false_literal(n)
-        except (AssertionError, NotImplementedError):
-            pass
+    # Native seam retired (#1739): 3.8x loss to a 96ns body (98k calls).
     return refers_to_fullname(n, "builtins.False") or isinstance(n, IntExpr) and n.value == 0
 
 

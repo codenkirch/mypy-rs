@@ -276,7 +276,6 @@ try:
         rust_dangerous_comparison as _rust_dangerous_comparison,
         rust_get_arg_infer_passes as _rust_get_arg_infer_passes,
         rust_get_partial_instance_type as _rust_get_partial_instance_type,
-        rust_has_abstract_type as _rust_has_abstract_type,
         rust_has_ambiguous_uninhabited_component as _rust_has_ambiguous_uninhabited_component,
         rust_has_any_type as _rust_has_any_type,
         rust_has_bytes_component as _rust_has_bytes_component,
@@ -299,7 +298,6 @@ try:
         rust_normalize_callable as _rust_normalize_callable,
         rust_possible_none_type_var_overlap as _rust_possible_none_type_var_overlap,
         rust_real_union as _rust_real_union,
-        rust_refers_to_typeddict as _rust_refers_to_typeddict,
         rust_solve_generic_call as _rust_solve_generic_call,
         rust_star_expr as _rust_star_expr,
         rust_try_getting_int_literals as _rust_try_getting_int_literals,
@@ -325,7 +323,6 @@ except ImportError:
     _rust_arg_approximate_similarity = None  # type: ignore[assignment]
     _rust_all_same_types = None  # type: ignore[assignment]
     _rust_always_returns_none = None  # type: ignore[assignment]
-    _rust_has_abstract_type = None  # type: ignore[assignment]
     _rust_has_uninhabited_component = None  # type: ignore[assignment]
     _rust_has_ambiguous_uninhabited_component = None  # type: ignore[assignment]
     _rust_has_erased_component = None  # type: ignore[assignment]
@@ -360,7 +357,6 @@ except ImportError:
     _rust_classify_typeddict_call = None  # type: ignore[assignment]
     _rust_classify_typeobj_gate = None  # type: ignore[assignment]
     _rust_check_call_head = None  # type: ignore[assignment]
-    _rust_refers_to_typeddict = None  # type: ignore[assignment]
     _rust_calibrate_type_obj_return = None  # type: ignore[assignment]
     _rust_normalize_callable = None  # type: ignore[assignment]
     _rust_real_union = None  # type: ignore[assignment]
@@ -1637,18 +1633,8 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
         return self.visit_call_expr_inner(e, allow_none_return=allow_none_return)
 
     def refers_to_typeddict(self, base: Expression) -> bool:
-        if _CHECKEXPR_HAS_TYPE_KERNEL and _native_checkexpr_active:
-            try:
-                # The TypeAlias arm is decided in Rust from the wire bytes
-                # of the target's proper type; serialize it here so the
-                # seam never needs the resolver.
-                target_bytes: bytes | None = None
-                node = getattr(base, "node", None)
-                if isinstance(node, TypeAlias):
-                    target_bytes = _serialize_type_for_checkexpr(get_proper_type(node.target))
-                return _rust_refers_to_typeddict(base, target_bytes)
-            except (AssertionError, NotImplementedError, ValueError):
-                pass
+        # Native seam retired (#1739): 6.6x loss to a 73ns body (112k
+        # calls), plus per-call serialization the shim did up front.
         if not isinstance(base, RefExpr):
             return False
         if isinstance(base.node, TypeInfo) and base.node.typeddict_type is not None:
@@ -8999,15 +8985,7 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
         return self.has_abstract_type(caller_type, callee_type)
 
     def has_abstract_type(self, caller_type: ProperType, callee_type: ProperType) -> bool:
-        if _CHECKEXPR_HAS_TYPE_KERNEL and _native_checkexpr_active:
-            try:
-                result = _rust_has_abstract_type(
-                    caller_type, callee_type, self.chk.allow_abstract_call
-                )
-                if result is not None:
-                    return result
-            except (AssertionError, NotImplementedError):
-                pass
+        # Native seam retired (#1739): 6.2x loss to a 47ns body (247k calls).
         return (
             isinstance(caller_type, FunctionLike)
             and isinstance(callee_type, TypeType)

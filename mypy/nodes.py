@@ -89,7 +89,6 @@ from mypy.visitor import ExpressionVisitor, NodeVisitor, StatementVisitor
 try:
     from type_kernel import (
         rust_decorator_is_dynamic as _rust_decorator_is_dynamic,
-        rust_func_has_self_or_cls_argument as _rust_func_has_self_or_cls_argument,
         rust_func_item_is_dynamic as _rust_func_item_is_dynamic,
         rust_overloaded_is_dynamic as _rust_overloaded_is_dynamic,
         rust_typeinfo_has_base as _rust_typeinfo_has_base,
@@ -99,7 +98,6 @@ try:
 
     _NODES_HAS_TYPE_KERNEL = True
 except ImportError:
-    _rust_func_has_self_or_cls_argument = None  # type: ignore[assignment]
     _rust_func_item_is_dynamic = None  # type: ignore[assignment]
     _rust_decorator_is_dynamic = None  # type: ignore[assignment]
     _rust_overloaded_is_dynamic = None  # type: ignore[assignment]
@@ -863,11 +861,7 @@ class FuncBase(Node):
         This is true for `__new__` even though `__new__` does not undergo method binding,
         because we still usually assume that `cls` corresponds to the enclosing class.
         """
-        if _NODES_HAS_TYPE_KERNEL and _native_nodes_active:
-            try:
-                return _rust_func_has_self_or_cls_argument(self)
-            except (AssertionError, NotImplementedError):
-                pass
+        # Native seam retired (#1739): 35x loss to a 30ns body (141k calls).
         return not self.is_static or self.name == "__new__"
 
 
