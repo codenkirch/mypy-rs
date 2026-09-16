@@ -4982,4 +4982,62 @@ measurements are appended below as the coordinator reports each landing.
   `configure_bases` (206KB) and `make_any_non_explicit` (81KB). Follow-up #1698
   was filed and assigned for the hot net-loss seams plus the quiet-host
   re-measurement that must precede any future flip.
+- `#1671` (`58d32ab24`, PR #1694) — feat: the F reopening experiment, one-family
+  `Instance` replacement view. `crates/type_kernel/src/typeview.rs` stores the
+  `Instance` field set (fullname, argument handles, `fixed_up`, `args_tvar_clean`)
+  per live object, keyed by the shared `identity::handle_for_stable` handle and
+  pinned so a handle cannot outlive its referent; `rust_view_encode` emits the
+  wire bytes straight from the store and refuses (`None`) on a stale stamp, a
+  pre-fixup instance, tvar-tainted arguments, an unregistered argument or a
+  stored fullname that no longer matches the live `TypeInfo`. `mypy/typeview.py`
+  is the Python half (`MYPY_TYPE_VIEW=1` stores and serves, `=2` also routes
+  `Instance.args` reads), default off, no `Options` field, no `CACHE_VERSION`
+  participation; the ADR-0005 proxy scaffold is deleted. Tier T2 (env-gated,
+  default off). Verdict on the close-out's reopening bar: **NO-GO, missed by a
+  measured ~4.7x**. The `Instance` wire funnel is 2.12% of total work on the cold
+  self-check (1.347s of 63.572s parse+semanal+type-check), so a view that removed
+  all of it at zero cost moves 2.12% against a bar of 10%; the prototype serves
+  25.1% of funnel calls and removes 32.4% of the walk's encodes, and routing
+  reads adds no further wire saving while applying a pyO3 round-trip to 17.43M
+  reads (+5.8s over the capture-only arm). All four ADR-0004 contract surfaces
+  (plugins, identity/handles, astmerge, cache/daemon) were exercised and measured
+  satisfiable, so the binding constraint is arithmetic, not contract. ADR-0006 is
+  the draft successor and awaits the maintainer's accept/reject; the wall-clock
+  leg is explicitly deferred, not measured. CI green on the PR (pr-gate plus all
+  four parity jobs), merge `58d32ab24`, lane worktree and branch removed by the
+  coordinator after merge.
+- `#1674` (`a5bb83244`, PR #1695) — feat: the G1.2 node-shadow fidelity audit and
+  the first expression-node read flip. The audit
+  (`docs/plans/2026-09-15-g12-node-shadow-fidelity-audit.md`) is generated from
+  source by `misc/g12_node_shadow_audit.py` (Python slots by `ast` over
+  `mypy/nodes.py`, shadow fields by `ast` over the two mirror modules, Rust
+  records by a text scan) with a `--check` mode that pins the committed tables to
+  the derived state. 213 slot rows: `served` 76, `served (wire)` 8,
+  `partial (marker only)` 42, `partial (class/fullname only)` 6,
+  `AST wire (structural)` 41, `gap` 40. The audit floors the
+  `rust_snapshot_definition` candidate (`Var.type` is `partial (marker only)`,
+  and serving it needs the F-phase type graph this issue forbids) and picks the
+  #1635 aststrip lvalue surgery as the consumer. The flip:
+  `rust_aststrip_process_lvalue` serves `is_new_def` + `name` from the shadow and
+  performs the class-namespace delete through the G3 store, returning `None` for
+  every uncovered shape so the Python tail in `mypy/server/aststrip.py` stays the
+  identical fallback. New gap closed: `FieldValue::Text` +
+  `rust_node_mirror_capture_field_text` for the `name` slot, seeded at adoption
+  (`_seed_name`) and captured for adopted nodes, which is what keeps
+  `mypy/renaming.py`'s in-place rename from staling a record. Gate:
+  `Options.native_ast_mirror_read` (default off, not in
+  `OPTIONS_AFFECTING_CACHE`, wired inside the `native_ast_mirror` branch only),
+  `TEST_NATIVE_AST_MIRROR_READ` in the helpers. Tier T2 (default-off read flip).
+  `testfinegrained` `747 passed, 27 skipped` in all three states (gates off,
+  capture on/read off, capture on/read on); engagement `aststrip.served` 26 /
+  `aststrip.deferred` 128; wire delta <=2 events (the flipped path is a
+  live-object walk). Merge prep by the coordinator: fixed the stale `-> None`
+  annotation on `nodes_mirror.activate` that failed CI's self-check with 8 errors
+  in 3 files, rebased onto `58d32ab24` (one additive `stubs/type_kernel.pyi`
+  conflict), regenerated the audit tables on the new base, and re-verified the
+  rebased tree (cargo `2856 passed / 0 failed / 11 ignored`, testtypes
+  `4013 passed / 7 skipped` with the flip gates on, self-check clean, 354 files).
+  Filed #1708 for an inherited `NativeSymtableReadFlipSuite` flake observed
+  during that verification (raw identity layer answers `handle_of` for a
+  recycled address; reproduces on `main` without this branch's gates).
 
