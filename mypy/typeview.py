@@ -53,6 +53,7 @@ caller runs its own encode, so an unproven entry can only cost a lookup.
 from __future__ import annotations
 
 import os as _os
+import threading as _threading
 from typing import Any
 
 import mypy.types as _types_mod
@@ -72,6 +73,9 @@ _MEMBERS: dict[str, Any] = {}
 _km: Any = None
 _active = False
 _read_route = False
+# Activating thread (#1712): kernel handles are thread-local while these
+# maps are process-global, so entry points degrade to a miss off-thread.
+_OWNER_THREAD: int | None = None
 # Monotonic coherence stamp, bumped by `reset`. An entry recorded at an
 # older stamp is never served.
 _STAMP: int = 1
@@ -114,6 +118,10 @@ def active() -> bool:
     return _active
 
 
+def _on_owner_thread() -> bool:
+    return _OWNER_THREAD is not None and _threading.get_ident() == _OWNER_THREAD
+
+
 def report() -> dict[str, int]:
     """Index-keyed audit counters (empty unless activation asked for them)."""
     return {f"a_{k}": v for k, v in _audit.items()}
@@ -140,7 +148,7 @@ def register(inst: Any) -> None:
     leaves the object absent from the store, which is a serve miss and
     nothing worse.
     """
-    if not _active or _km is None:
+    if not _active or _km is None or not _on_owner_thread():
         return
     try:
         args = _slot_get(inst, "args")
@@ -196,7 +204,7 @@ def encode(t: Any) -> bytes | None:
     The funnel calls this before its own wire-cache probe; a served encode
     is byte-for-byte what the walk would have produced.
     """
-    if not _active or _km is None:
+    if not _active or _km is None or not _on_owner_thread():
         return None
     if type(t) is not Instance:
         _count("encode.not_instance")
@@ -243,6 +251,8 @@ def _inst_setattr(inst: Instance, name: str, value: Any) -> None:
 
 def _get_args_routed(inst: Instance) -> Any:
     """`Instance.args` read from the store (the read arm)."""
+    if not _on_owner_thread():
+        return _slot_get(inst, "args")
     handle = _HANDLES.get(id(inst))
     if handle is not None:
         routed = _km.rust_view_args(handle, _STAMP)
@@ -300,7 +310,7 @@ def activate(*, read_route: bool = False, audit: bool = False) -> bool:
     A missing extension leaves the gate off, so an environment without the
     rebuilt kernel behaves exactly as it did before.
     """
-    global _km, _active, _read_route, _audit_mode
+    global _km, _active, _read_route, _audit_mode, _OWNER_THREAD
     if not _active:
         try:
             import type_kernel as _kernel
@@ -313,6 +323,7 @@ def activate(*, read_route: bool = False, audit: bool = False) -> bool:
             return False
         _km = _kernel
         _active = True
+        _OWNER_THREAD = _threading.get_ident()
     if audit:
         _audit_mode = True
     if read_route != _read_route:
@@ -360,9 +371,10 @@ def deactivate() -> None:
     `__slots__`, `isinstance` and the attribute API return to exactly the
     pre-activation shape.
     """
-    global _active, _read_route, _ORIG_SETATTR
+    global _active, _read_route, _ORIG_SETATTR, _OWNER_THREAD
     if not _active:
         return
+    _OWNER_THREAD = None
     for name, member in _MEMBERS.items():
         setattr(Instance, name, member)
     if Instance.__dict__.get("__setattr__") is _inst_setattr:

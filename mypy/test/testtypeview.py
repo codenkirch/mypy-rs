@@ -163,6 +163,52 @@ class TypeViewSuite(unittest.TestCase):
         self.assertIn("args", stolen)
         del inst
 
+    def test_foreign_thread_degrades_to_miss(self) -> None:
+        """Kernel handles are thread-local: a foreign thread misses (#1712).
+
+        The worker must neither serve bytes (a same-numeric handle in its
+        own registry could name a different object) nor touch the kernel
+        at all; the owner thread keeps serving afterwards.
+        """
+        import threading
+
+        self._activate()
+        self._register(self.fx.a)
+        inst = Instance(self.fx.std_listi, [self.fx.a])
+        self._register(inst)
+        self.assertIsNotNone(typeview.encode(inst))
+        results: list[object] = []
+        kernel_calls: list[str] = []
+        real_km = typeview._km
+
+        class Spy:
+            def __getattr__(self, name: str) -> Any:
+                attr = getattr(real_km, name)
+                if not name.startswith("rust_") or not callable(attr):
+                    return attr
+
+                def call(*args: Any) -> Any:
+                    kernel_calls.append(name)
+                    return attr(*args)
+
+                return call
+
+        def probe() -> None:
+            results.append(typeview.encode(inst))
+            typeview.register(inst)
+
+        typeview._km = Spy()
+        try:
+            worker = threading.Thread(target=probe)
+            worker.start()
+            worker.join()
+        finally:
+            typeview._km = real_km
+        assert results == [None]
+        assert kernel_calls == []
+        # The owner thread still serves afterwards.
+        self.assertIsNotNone(typeview.encode(inst))
+
     def test_arm_switch_two_to_one_uninstalls_the_route(self) -> None:
         """2 -> 1 must undo the routed property, or `_slot_get` recurses."""
         self._activate(read_route=True)
