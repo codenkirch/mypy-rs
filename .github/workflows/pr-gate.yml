@@ -126,7 +126,7 @@ jobs:
         env:
           PYTHONPATH: ${{ env.LIBRT_SCRATCH }}:${{ env.SCRATCH }}
           TEST_NATIVE_TYPE_KERNEL: "1"
-        run: uv run python -m pytest mypy/test/testtypes.py -q
+        run: uv run python -m pytest mypy/test/testtypes*.py -q
 
       - name: Python subtypes baseline (pre-Stage-3c)
         run: uv run python -m pytest mypy/test/testsubtypes.py -q

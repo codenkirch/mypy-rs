@@ -38,7 +38,7 @@ on:
       - mypy/symtable_access.py
       - mypy/symtables_mirror.py
       - mypy/test/testcheck.py
-      - mypy/test/testtypes.py
+      - mypy/test/testtypes*.py
       - mypy/test/testdiff.py
       - mypy/test/testfinegrained.py
       - mypy/test/testfinegrainedcache.py
@@ -225,7 +225,7 @@ jobs:
           MYPY_NATIVE_PARITY_INSTALL_CHECKER_STMTS: "1"
           MYPY_NATIVE_TYPE_KERNEL_REQUIRED: "1"
         run: |
-          uv run python -m pytest mypy/test/testcheck.py mypy/test/testtypes.py -q -k "not slow" -n4 --timeout=30 --timeout-method=thread
+          uv run python -m pytest mypy/test/testcheck.py mypy/test/testtypes*.py -q -k "not slow" -n4 --timeout=30 --timeout-method=thread
 
   parity-mirror:
     # F1/F2 mirror coverage (#1527): TEST_NATIVE_TYPE_MIRROR never ran in
@@ -307,7 +307,7 @@ jobs:
           TEST_NATIVE_TYPE_KERNEL: "1"
           TEST_NATIVE_TYPE_MIRROR: "1"
           MYPY_NATIVE_TYPE_KERNEL_REQUIRED: "1"
-        run: uv run python -m pytest mypy/test/testtypes.py -q -n4 --timeout=30 --timeout-method=thread
+        run: uv run python -m pytest mypy/test/testtypes*.py -q -n4 --timeout=30 --timeout-method=thread
 
       - name: Mirror capture+read testcheck
         env:
@@ -414,7 +414,7 @@ jobs:
           TEST_NATIVE_SYMTABLE_READ_FLIP_VERIFY: "1"
           MYPY_NATIVE_TYPE_KERNEL_REQUIRED: "1"
         run: |
-          uv run python -m pytest mypy/test/testtypes.py -q -n4 \
+          uv run python -m pytest mypy/test/testtypes*.py -q -n4 \
             -k "Symtable or AstdiffSymbol" --timeout=30 --timeout-method=thread
 
       - name: Read-flip differential (astdiff + cache data)
