@@ -81,7 +81,7 @@ from mypy.visitor import ExpressionVisitor, NodeVisitor, StatementVisitor
 
 # Issue #457: Node object-model pure predicates. When the `type_kernel`
 # Rust extension is importable and `Options.native_type_kernel` is set,
-# the pure predicates below (`has_self_or_cls_argument`, `is_dynamic`,
+# the pure predicates below (`has_self_or_cls_argument`,
 
 # `is_generic`, `is_metaclass`, `has_base`) route through Rust. The Rust
 # path raises AssertionError/NotImplementedError for unhandled cases, in
@@ -89,7 +89,6 @@ from mypy.visitor import ExpressionVisitor, NodeVisitor, StatementVisitor
 try:
     from type_kernel import (
         rust_decorator_is_dynamic as _rust_decorator_is_dynamic,
-        rust_func_item_is_dynamic as _rust_func_item_is_dynamic,
         rust_overloaded_is_dynamic as _rust_overloaded_is_dynamic,
         rust_typeinfo_has_base as _rust_typeinfo_has_base,
         rust_typeinfo_is_generic as _rust_typeinfo_is_generic,
@@ -98,7 +97,6 @@ try:
 
     _NODES_HAS_TYPE_KERNEL = True
 except ImportError:
-    _rust_func_item_is_dynamic = None  # type: ignore[assignment]
     _rust_decorator_is_dynamic = None  # type: ignore[assignment]
     _rust_overloaded_is_dynamic = None  # type: ignore[assignment]
     _rust_typeinfo_is_generic = None  # type: ignore[assignment]
@@ -1158,11 +1156,9 @@ class FuncItem(FuncBase):
         return self.max_pos
 
     def is_dynamic(self) -> bool:
-        if _NODES_HAS_TYPE_KERNEL and _native_nodes_active:
-            try:
-                return _rust_func_item_is_dynamic(self)
-            except (AssertionError, NotImplementedError):
-                pass
+        # Retired in #1739: `rust_func_item_is_dynamic` measured 2.7x-7.3x the
+        # O(1) Python body (min-of-7, gate the only variable). The pyfunction
+        # stays registered: `rust_decorator_is_dynamic` folds through it.
         return (
             self.type is None
             or isinstance(self.type, mypy.types.CallableType)

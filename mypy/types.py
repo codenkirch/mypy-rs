@@ -4608,8 +4608,8 @@ class HasTypeVars(BoolTypeQuery):
 # is_unannotated_any, remove_dups, type_vars_as_args,
 # callable_with_ellipsis, find_unpack_in_list,
 
-# split_with_prefix_and_suffix, flatten_nested_unions,
-# flatten_nested_tuples, copy_type through the wire-format Type enum.
+# split_with_prefix_and_suffix, flatten_nested_unions, copy_type
+# through the wire-format Type enum.
 # Rust returns None for TypeAliasType (no alias target on the wire);
 
 # Python falls back to the pure-Python visitor.
@@ -4627,7 +4627,6 @@ try:
         rust_callable_with_ellipsis as _rust_callable_with_ellipsis,
         rust_copy_type as _rust_copy_type,
         rust_find_unpack_in_list as _rust_find_unpack_in_list,
-        rust_flatten_nested_tuples as _rust_flatten_nested_tuples,
         rust_has_type_vars as _rust_has_type_vars,
         rust_is_literal_type as _rust_is_literal_type,
         rust_is_unannotated_any as _rust_is_unannotated_any,
@@ -4649,7 +4648,6 @@ except ImportError:
     _rust_callable_with_ellipsis = None  # type: ignore[assignment]
     _rust_find_unpack_in_list = None  # type: ignore[assignment]
     _rust_split_with_prefix_and_suffix = None  # type: ignore[assignment]
-    _rust_flatten_nested_tuples = None  # type: ignore[assignment]
     _rust_copy_type = None  # type: ignore[assignment]
     _rust_callable_formal_arguments = None  # type: ignore[assignment]
     _rust_callable_argument_by_name = None  # type: ignore[assignment]
@@ -5003,36 +5001,6 @@ def _restore_wire_split_identity(
     return (tuple(final[:prefix]), tuple(final[prefix:]), ())
 
 
-def _restore_list_identity(
-    types: Sequence[Type], type_bytes_list: list[bytes], decoded: list[Type]
-) -> list[Type] | None:
-    """Re-point a decoded list seam result at the live input rows.
-
-    The wire decode forks one fresh object per row with line/column
-    dropped to -1; Python's list seams (flatten, dedup, ...) share identity
-    and positions with the input when the operation is a no-op for that
-    row. Map each decoded row back to its live source by re-serializing it
-    and matching the canonical input bytes (first occurrence, order
-    preserved); None defers to the decoded fork (rows that genuinely
-    changed, e.g. an actual flattening, keep wire values but lose
-    positions only where the live row was not structurally the same).
-    """
-    src: list[Type | None] = []
-    for row in decoded:
-        row_bytes = _serialize_type_list_for_visitor([row])
-        src.append(None)
-        if row_bytes:
-            key = row_bytes[0]
-            for i, b in enumerate(type_bytes_list):
-                if b == key:
-                    src[-1] = types[i]
-                    type_bytes_list[i] = b""  # consume first occurrence
-                    break
-    if any(s is None for s in src):
-        return None
-    return cast("list[Type]", src)
-
-
 def _restore_dedup_identity(
     types: Sequence[Type], type_bytes_list: list[bytes], decoded: list[Type]
 ) -> list[Type] | None:
@@ -5285,21 +5253,9 @@ def flatten_nested_tuples(types: Iterable[Type], handle_recursive: bool = True) 
         Tuple[A, B, C, D]
     """
     res = []
-    if _VISITOR_HAS_TYPE_KERNEL and _native_visitor_types_active:
-        try:
-            type_bytes_list = _serialize_type_list_for_visitor(types)
-            result = _rust_flatten_nested_tuples(
-                type_bytes_list, handle_recursive, _native_visitor_resolver
-            )
-            if result is not None:
-                flat = _deserialize_type_list_from_visitor(result)
-                if flat is not None:
-                    restored = _restore_list_identity(list(types), type_bytes_list, flat)
-                    if restored is not None:
-                        return restored
-                    return flat
-        except (AssertionError, NotImplementedError):
-            pass
+    # Retired in #1739: `rust_flatten_nested_tuples` measured 24.6x-59.3x the
+    # Python body (min-of-7, gate the only variable), since the shim
+    # serialized every input row plus every decoded row. Pyfunction stays.
     for typ in types:
         if not isinstance(typ, UnpackType):
             res.append(typ)
@@ -5418,9 +5374,7 @@ def remove_dups(types: list[T]) -> list[T]:
                     # Alias-bearing rows only decode through the per-build
                     # alias map (#1224/#1309 contract); retry once before
                     # falling back to the pure-Python body.
-                    deduped = _deserialize_type_list_from_visitor(
-                        result, resolve_aliases=True
-                    )
+                    deduped = _deserialize_type_list_from_visitor(result, resolve_aliases=True)
                 if deduped is not None:
                     live = _restore_dedup_identity(types, type_bytes_list, deduped)  # type: ignore[arg-type]
                     if live is not None:
