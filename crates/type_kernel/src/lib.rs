@@ -154,7 +154,6 @@ mod supported_self_type;
 // Phase G3.0a (#1581): namespace dual-write capture shadow store.
 mod symtable_mirror;
 mod traverser;
-mod treetransform;
 mod type_range;
 mod typealias_instantiate;
 mod typeanal_callable;
@@ -277,7 +276,6 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
     util::register_registry(module)?;
     errors_helpers::register_registry(module)?;
     partially_defined::register_registry(module)?;
-    treetransform::register_registry(module)?;
     message_registry::register_registry(module)?;
     semanal_typeddict::register_registry(module)?;
     reachability::register_registry(module)?;

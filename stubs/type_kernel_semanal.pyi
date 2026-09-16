@@ -446,8 +446,6 @@ def rust_extract_meta_info(typ: Any) -> Any: ...
 
 def rust_namedtuple_prohibited_names() -> Any: ...
 
-def rust_transform_copy(node: Any) -> Any: ...
-
 def rust_lookup_definer(typ: Instance, attr_name: str) -> str | None: ...
 
 
@@ -597,6 +595,5 @@ __all__ = [
     "rust_classify_simple_literal_type",
     "rust_extract_meta_info",
     "rust_namedtuple_prohibited_names",
-    "rust_transform_copy",
     "rust_lookup_definer",
 ]
