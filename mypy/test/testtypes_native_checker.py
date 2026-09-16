@@ -19078,18 +19078,16 @@ class NativeCheckArgSuite(Suite):
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeCheckArgCountSuite(Suite):
-    """Parity for `rust_check_argument_count` (issue #1136).
+    """Direct-seam tests for `rust_check_argument_count` (issue #1136).
 
-    `ExpressionChecker.check_argument_count` (checkexpr.py:3855) folds
-    check_for_extra_actual_arguments and the formal loop into one Rust
-    seam with the scalar-fact interface: no wire bytes cross the
-    boundary. The shim classifies each actual's proper type to a shape
-    tag (NATIVE_ARG_SHAPE_*), mirrors the CallableType.param_spec() head
-    into a bool, and the kernel returns (ok, errors,
-    is_unexpected_arg_error) records that the shim translates to
-    messages. Direct seam calls assert the exact decision records for
-    every arm; toggling the checkexpr gate off vs on must produce
-    identical captured messages through the real method.
+    `ExpressionChecker.check_argument_count` (checkexpr.py:3855) folded
+    check_for_extra_actual_arguments and the formal loop into one Rust seam
+    with the scalar-fact interface. That shim was measured and retired in
+    #1739 (1.80x-2.26x slower than the Python body on the no-error,
+    too-many and too-few shapes, because it classified every actual's proper
+    type before crossing), so the `test_seam_*` cases below exercise the
+    registered pyfunction directly and the `test_on_*` cases pin the
+    production method's messages under the checkexpr gate.
     """
 
     def setUp(self) -> None:
@@ -19100,13 +19098,6 @@ class NativeCheckArgCountSuite(Suite):
 
     def tearDown(self) -> None:
         self._set_active(False)
-
-    def _with_gate(self, active: bool, fn: Callable[[], T]) -> T:
-        self._set_active(active)
-        try:
-            return fn()
-        finally:
-            self._set_active(True)
 
     # ---- direct seam tests (scalar interface) ----
 
@@ -19395,7 +19386,7 @@ class NativeCheckArgCountSuite(Suite):
         )
         assert result == (True, [], False), result
 
-    # ---- gate-off vs gate-on differential tests ----
+    # ---- production-path value tests (native shim retired, #1739) ----
 
     def _make_ec(
         self, in_checked_function: bool
@@ -19418,7 +19409,7 @@ class NativeCheckArgCountSuite(Suite):
         ec.msg = msg  # type: ignore[assignment]
         return ec, captured
 
-    def _run(
+    def _messages_on_gate(
         self,
         callee: CallableType,
         actual_types: list[Type],
@@ -19429,109 +19420,106 @@ class NativeCheckArgCountSuite(Suite):
         object_type: Type | None = None,
         callable_name: str | None = None,
         in_checked_function: bool = True,
-    ) -> tuple[tuple[tuple[str, ...], ...], tuple[tuple[str, ...], ...]]:
+    ) -> tuple[tuple[str, ...], ...]:
+        """Run the production method once and return its message record.
+
+        The checkexpr gate is ON (setUp), which is the production
+        configuration. The records were frozen from the pre-retirement
+        pure-Python arm; `NativeCheckArgCountRetiredSuite` pins that the
+        method cannot cross to Rust any more.
+        """
         from mypy.nodes import TempNode
 
         context = TempNode(AnyType(TypeOfAny.special_form))
+        ec, captured = self._make_ec(in_checked_function)
+        ret = ec.check_argument_count(
+            callee,
+            actual_types,
+            actual_kinds,
+            actual_names,
+            formal_to_actual,
+            context,
+            object_type,
+            callable_name,
+        )
+        return tuple(captured) + (("ret", str(ret)),)
 
-        def check_one(active: bool) -> tuple[tuple[str, ...], ...]:
-            ec, captured = self._make_ec(in_checked_function)
-            ret = self._with_gate(
-                active,
-                lambda: ec.check_argument_count(
-                    callee,
-                    actual_types,
-                    actual_kinds,
-                    actual_names,
-                    formal_to_actual,
-                    context,
-                    object_type,
-                    callable_name,
-                ),
-            )
-            return tuple(captured) + (("ret", str(ret)),)
-
-        off = check_one(False)
-        on = check_one(True)
-        return off, on
-
-    def _parity(self, *args: Any, **kwargs: Any) -> tuple[tuple[str, ...], ...]:
-        off, on = self._run(*args, **kwargs)
-        assert off == on, f"off={off} on={on}"
-        return off
-
-    def test_par_ok(self) -> None:
+    def test_on_ok(self) -> None:
         fx = TypeFixture()
         callee = fx.callable(fx.a, fx.a)
-        off = self._parity(callee, [fx.a, fx.a], [ARG_POS, ARG_POS], [None, None], [[0], [1]])
-        assert off == (("ret", "True"),), off
+        got = self._messages_on_gate(
+            callee, [fx.a, fx.a], [ARG_POS, ARG_POS], [None, None], [[0], [1]]
+        )
+        assert got == (("ret", "True"),), got
 
-    def test_par_too_few(self) -> None:
+    def test_on_too_few(self) -> None:
         fx = TypeFixture()
         # fx.callable(*a) treats the last arg as the return type; pass one
         # explicit return to get a two-formal callee.
         callee = fx.callable(fx.a, fx.a, fx.anyt)
-        off = self._parity(
+        got = self._messages_on_gate(
             callee, [fx.a], [ARG_POS], [None], [[0], []], callable_name="mod.A.attr"
         )
-        assert ("too_few",) in off, off
-        # object_type is None, so the note stays silent on both gates.
+        assert ("too_few",) in got, got
+        # object_type is None, so the classvar note stays silent.
 
-    def test_par_extra_named(self) -> None:
+    def test_on_extra_named(self) -> None:
         fx = TypeFixture()
         callee = fx.callable(fx.a)
-        off = self._parity(callee, [fx.a, fx.a], [ARG_POS, ARG_NAMED], [None, "x"], [[0], []])
-        assert ("unexpected_kw", "x") in off, off
+        got = self._messages_on_gate(
+            callee, [fx.a, fx.a], [ARG_POS, ARG_NAMED], [None, "x"], [[0], []]
+        )
+        assert ("unexpected_kw", "x") in got, got
 
-    def test_par_missing_named(self) -> None:
+    def test_on_missing_named(self) -> None:
         fx = TypeFixture()
         callee = CallableType([fx.anyt], [ARG_NAMED], ["a"], fx.anyt, fx.function, name="f")
-        off = self._parity(callee, [fx.a], [ARG_POS], [None], [[]])
-        assert ("missing_named", "a") in off, off
-        assert ("too_many",) in off, off
+        got = self._messages_on_gate(callee, [fx.a], [ARG_POS], [None], [[]])
+        assert ("missing_named", "a") in got, got
+        assert ("too_many",) in got, got
 
-    def test_par_dup_with_typeddict_kwargs(self) -> None:
+    def test_on_dup_with_typeddict_kwargs(self) -> None:
         fx = TypeFixture()
         callee = CallableType([fx.anyt], [ARG_POS], [None], fx.anyt, fx.function, name="f")
         # One plain **kwargs and one TypedDict **kwargs matching the same
         # formal: duplicates are not automatically allowed (the TypedDict
         # mapping is precise), so the duplicate error fires.
         td = TypedDictType({"a": fx.a}, set(), set(), fx.function)
-        off = self._parity(
+        got = self._messages_on_gate(
             callee, [fx.function, td], [ARG_STAR2, ARG_STAR2], [None, None], [[0, 1]]
         )
-        assert ("dup", "0") in off, off
+        assert ("dup", "0") in got, got
 
-    def test_par_dup_plain_kwargs_shared_formal_ok(self) -> None:
+    def test_on_dup_plain_kwargs_shared_formal_ok(self) -> None:
         # Issue #1152 repro through the real method: four **kwargs actuals,
         # only actual 0 is a TypedDict, and the shared formal maps actuals
         # 2 and 3 (both plain dicts), so no duplicate error may fire.
         fx = TypeFixture()
         callee = CallableType([fx.anyt], [ARG_POS], [None], fx.anyt, fx.function, name="f")
         td = TypedDictType({"a": fx.a}, set(), set(), fx.function)
-        off = self._parity(
+        got = self._messages_on_gate(
             callee,
             [td, fx.function, fx.function, fx.function],
             [ARG_STAR2] * 4,
             [None] * 4,
             [[2, 3]],
         )
-        assert ("too_many_td",) in off, off
-        assert not any(m[0] == "dup" for m in off), off
+        assert ("too_many_td",) in got, got
+        assert not any(m[0] == "dup" for m in got), got
 
-    def test_par_star_plus_kwargs_ok(self) -> None:
+    def test_on_star_plus_kwargs_ok(self) -> None:
         fx = TypeFixture()
         callee = CallableType([fx.anyt], [ARG_POS], [None], fx.anyt, fx.function, name="f")
-        off = self._parity(
+        got = self._messages_on_gate(
             callee,
             [TupleType([], fx.std_tuple), TypedDictType({}, set(), set(), fx.function)],
             [ARG_STAR, ARG_STAR2],
             [None, None],
             [[0, 1]],
         )
-        assert off == (("ret", "True"),), off
+        assert got == (("ret", "True"),), got
 
-    def test_par_param_spec_args_once(self) -> None:
+    def test_on_param_spec_args_once(self) -> None:
         fx = TypeFixture()
         ps = ParamSpecType(
             name="P",
@@ -19545,10 +19533,12 @@ class NativeCheckArgCountSuite(Suite):
             [ps, ps], [ARG_STAR, ARG_STAR2], [None, None], fx.anyt, fx.function, name="f"
         )
         assert callee.param_spec() is not None
-        off = self._parity(callee, [ps, ps], [ARG_STAR, ARG_STAR], [None, None], [[0, 1], [0, 1]])
-        assert ("fail", "ParamSpec.args should only be passed once") in off, off
+        got = self._messages_on_gate(
+            callee, [ps, ps], [ARG_STAR, ARG_STAR], [None, None], [[0, 1], [0, 1]]
+        )
+        assert ("fail", "ParamSpec.args should only be passed once") in got, got
 
-    def test_par_classvar_note_fires(self) -> None:
+    def test_on_classvar_note_fires(self) -> None:
         fx = TypeFixture()
         callee = CallableType(
             [fx.anyt, fx.anyt], [ARG_POS, ARG_POS], ["x", "y"], fx.anyt, fx.function, name="f"
@@ -19557,7 +19547,7 @@ class NativeCheckArgCountSuite(Suite):
         var.is_inferred = False
         var.is_classvar = False
         fx.a.type.names["attr"] = SymbolTableNode(GDEF, var)
-        off = self._parity(
+        got = self._messages_on_gate(
             callee,
             [fx.a],
             [ARG_POS],
@@ -19566,18 +19556,101 @@ class NativeCheckArgCountSuite(Suite):
             object_type=fx.a,
             callable_name="mod.A.attr",
         )
-        assert any(o[0] == "note" for o in off), off
+        assert any(o[0] == "note" for o in got), got
 
-    def test_par_alias_actual_parity(self) -> None:
-        # A (proper-expanded) alias actual classifies PLAIN on both gates;
-        # the wire-era deferral condition is moot for the scalar seam.
+    def test_on_alias_actual(self) -> None:
+        # A (proper-expanded) alias actual is PLAIN for the Python body; the
+        # wire-era deferral condition died with the seam.
         fx = TypeFixture()
         alias = TypeAlias(fx.a, "mod.A", "mod", -1, -1)
         t = TypeAliasType(alias, [])
         # One formal, no formals-to-actuals mapping: too_few fires.
         callee = fx.callable(fx.a, fx.a)
-        off = self._parity(callee, [t], [ARG_POS], [None], [[]])
-        assert any(o[0] == "too_few" for o in off), off
+        got = self._messages_on_gate(callee, [t], [ARG_POS], [None], [[]])
+        assert any(o[0] == "too_few" for o in got), got
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeCheckArgCountRetiredSuite(Suite):
+    """Pin the #1739 retirement of `check_argument_count`'s Rust shim.
+
+    `rust_check_argument_count` measured 1.80x (too-many actuals), 1.97x
+    (too-few) and 2.03x (no-error) slower than the Python body, min-of-7
+    ns/call with the gate flag the only variable. The shim classified every
+    actual's proper type to a shape tag before crossing, and the crossing
+    returned records that Python then translated back into messages: the
+    classification alone cost more than the whole Python body.
+
+    Structural evidence: the shim name is gone from the module and the
+    method body loads no `rust_*` global, which is zero crossings with the
+    gate ON. Value evidence: `NativeCheckArgCountSuite.test_on_*` pins the
+    message records. The pyfunction stays registered for the `test_seam_*`
+    direct-seam cases.
+    """
+
+    def test_shim_name_gone(self) -> None:
+        import inspect
+
+        from mypy import checkexpr
+
+        assert not hasattr(checkexpr, "_rust_check_argument_count")
+        src = inspect.getsource(checkexpr.ExpressionChecker.check_argument_count)
+        assert "rust_" not in src, "check_argument_count should be pure Python"
+
+    def test_no_rust_name_loaded_with_gate_on(self) -> None:
+        from mypy.checkexpr import ExpressionChecker, _set_native_checkexpr_active
+
+        _set_native_checkexpr_active(True)
+        code = ExpressionChecker.check_argument_count.__code__
+        loaded = [n for n in code.co_names if "rust_" in n]
+        assert loaded == [], f"check_argument_count still loads {loaded}"
+
+    def test_values_match_python_with_gate_on(self) -> None:
+        from mypy.checkexpr import _set_native_checkexpr_active
+        from mypy.nodes import TempNode
+
+        fx = TypeFixture()
+        captured: list[tuple[str, ...]] = []
+        msg = SimpleNamespace(
+            too_many_arguments=lambda c, ctx: captured.append(("too_many",)),
+            unexpected_keyword_argument=lambda c, n, t, ctx: captured.append(("unexpected_kw", n)),
+            too_many_arguments_from_typed_dict=lambda c, t, ctx: captured.append(("too_many_td",)),
+            too_few_arguments=lambda c, ctx, ns: captured.append(("too_few",)),
+            missing_named_argument=lambda c, ctx, n: captured.append(("missing_named", n)),
+            duplicate_argument_value=lambda c, i, ctx: captured.append(("dup", str(i))),
+            too_many_positional_arguments=lambda c, ctx: captured.append(("too_many_pos",)),
+            fail=lambda m, ctx: captured.append(("fail", str(m))),
+            note=lambda m, ctx: captured.append(("note", str(m))),
+        )
+        chk = SimpleNamespace(in_checked_function=lambda: True)
+        ec = ExpressionChecker.__new__(ExpressionChecker)
+        ec.chk = chk  # type: ignore[assignment]
+        ec.msg = msg  # type: ignore[assignment]
+        _set_native_checkexpr_active(True)
+        context = TempNode(AnyType(TypeOfAny.special_form))
+        callee = fx.callable(fx.a, fx.a, fx.anyt)  # 2 formals -> Any
+        # One positional actual for two formals: too_few fires, return False.
+        ok = ec.check_argument_count(callee, [fx.a], [ARG_POS], [None], [[0], []], context)
+        assert ok is False
+        assert ("too_few",) in captured, captured
+
+    def test_pyfunction_stays_registered(self) -> None:
+        import type_kernel
+
+        result = type_kernel.rust_check_argument_count(
+            [int(ARG_POS.value)],
+            False,
+            None,
+            [int(ARG_POS.value)],
+            [None],
+            [0],
+            [0],
+            [[0]],
+            False,
+            None,
+            True,
+        )
+        assert result == (True, [], False), result
 
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")

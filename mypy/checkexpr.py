@@ -253,7 +253,6 @@ try:
         rust_build_tuple_type as _rust_build_tuple_type,
         rust_calibrate_type_obj_return as _rust_calibrate_type_obj_return,
         rust_callable_type as _rust_callable_type,
-        rust_check_argument_count as _rust_check_argument_count,
         rust_check_argument_types_plan as _rust_check_argument_types_plan,
         rust_check_call_head as _rust_check_call_head,
         rust_check_callable_call as _rust_check_callable_call,
@@ -370,7 +369,6 @@ except ImportError:
     _rust_calibrate_type_obj_return = None  # type: ignore[assignment]
     _rust_check_overload_call = None  # type: ignore[assignment]
     _rust_dangerous_comparison = None  # type: ignore[assignment]
-    _rust_check_argument_count = None  # type: ignore[assignment]
     _rust_callable_type = None  # type: ignore[assignment]
     _rust_check_argument_types_plan = None  # type: ignore[assignment]
     _rust_check_callable_call = None  # type: ignore[assignment]
@@ -417,8 +415,9 @@ NATIVE_CHECK_ARG_ABSTRACT_ONLY = 1
 NATIVE_CHECK_ARG_INCOMPATIBLE = 2
 NATIVE_CHECK_ARG_PASS = 3
 
-# Per-actual shape tags passed to `_rust_check_argument_count`; must match
-# `ACTUAL_*` in crates/type_kernel/src/checkexpr_argcount.rs.
+# Per-actual shape tags formerly passed to the retired
+# `_rust_check_argument_count` seam; kept in lockstep with `ACTUAL_*` in
+# crates/type_kernel/src/checkexpr_argcount.rs for the direct-seam tests.
 NATIVE_ARG_SHAPE_PLAIN = 0
 NATIVE_ARG_SHAPE_TUPLE = 1
 NATIVE_ARG_SHAPE_TYPEDDICT = 2
@@ -4086,101 +4085,6 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
         if context is None:
             # Avoid "is None" checks
             context = TempNode(AnyType(TypeOfAny.special_form))
-
-        # Issue #473: native check_argument_count. Rust computes the full
-        # set of error decisions; Python translates each record to a message.
-        # Returns None to defer to the pure-Python path below.
-        if (
-            _CHECKEXPR_HAS_TYPE_KERNEL
-            and _native_checkexpr_active
-            and _rust_check_argument_count is not None
-        ):
-            # Scalar-fact interface (issue #1136): the shim classifies each
-            # actual's proper type to a shape tag; a TypeAliasType actual
-            # defers via ACTUAL_ALIAS, mirroring the wire-era seam.
-            try:
-                actual_shapes = []
-                actual_item_counts = []
-                for t in actual_types:
-                    p = get_proper_type(t)
-                    if isinstance(p, TypeAliasType):
-                        actual_shapes.append(NATIVE_ARG_SHAPE_ALIAS)
-                        actual_item_counts.append(0)
-                    elif isinstance(p, TupleType):
-                        actual_shapes.append(NATIVE_ARG_SHAPE_TUPLE)
-                        actual_item_counts.append(len(p.items))
-                    elif isinstance(p, TypedDictType):
-                        actual_shapes.append(NATIVE_ARG_SHAPE_TYPEDDICT)
-                        actual_item_counts.append(len(p.items))
-                    elif isinstance(p, ParamSpecType):
-                        actual_shapes.append(NATIVE_ARG_SHAPE_PARAM_SPEC)
-                        actual_item_counts.append(0)
-                    else:
-                        actual_shapes.append(NATIVE_ARG_SHAPE_PLAIN)
-                        actual_item_counts.append(0)
-                # Shim-side mirror of CallableType.param_spec()'s head: the raw
-                # arg_types[-2] must be a ParamSpecType with *args/**kwargs as the
-                # last two kind slots. Rust gets a plain bool.
-                has_param_spec = (
-                    len(callee.arg_types) >= 2
-                    and callee.arg_kinds[-2] == nodes.ARG_STAR
-                    and callee.arg_kinds[-1] == nodes.ARG_STAR2
-                    and isinstance(callee.arg_types[-2], ParamSpecType)
-                )
-                result = _rust_check_argument_count(
-                    [int(k.value) for k in callee.arg_kinds],
-                    has_param_spec,
-                    callee.special_sig,
-                    [int(k.value) for k in actual_kinds],
-                    list(actual_names) if actual_names is not None else [],
-                    actual_shapes,
-                    actual_item_counts,
-                    formal_to_actual,
-                    object_type is not None,
-                    callable_name,
-                    self.chk.in_checked_function(),
-                )
-            except (AssertionError, NotImplementedError, ValueError):
-                result = None
-            if result is not None:
-                ok, errors, _is_unexpected = result
-                for kind, index, _extra in errors:
-                    if kind == 0:  # ERR_EXTRA_UNNAMED
-                        self.msg.too_many_arguments(callee, context)
-                    elif kind == 1:  # ERR_EXTRA_NAMED
-                        assert actual_names is not None
-                        act_name = actual_names[index]
-                        assert act_name is not None
-                        self.msg.unexpected_keyword_argument(
-                            callee, act_name, actual_types[index], context
-                        )
-                    elif kind == 2:  # ERR_TOO_MANY_TUPLE
-                        self.msg.too_many_arguments(callee, context)
-                    elif kind == 3:  # ERR_TOO_MANY_TD
-                        actual_type = get_proper_type(actual_types[index])
-                        assert isinstance(actual_type, TypedDictType)
-                        self.msg.too_many_arguments_from_typed_dict(callee, actual_type, context)
-                    elif kind == 4:  # ERR_TOO_FEW_POSITIONAL
-                        self.msg.too_few_arguments(callee, context, actual_names)
-                    elif kind == 5:  # ERR_MISSING_NAMED
-                        argname = callee.arg_names[index] or "?"
-                        self.msg.missing_named_argument(callee, context, argname)
-                    elif kind == 6:  # ERR_DUPLICATE
-                        self.msg.duplicate_argument_value(callee, index, context)
-                    elif kind == 7:  # ERR_TOO_MANY_POSITIONAL
-                        self.msg.too_many_positional_arguments(callee, context)
-                    elif kind == 8:  # ERR_PARAMSPEC_TOO_FEW
-                        self.msg.too_few_arguments(callee, context, actual_names)
-                    elif kind == 9:  # ERR_PARAMSPEC_ARGS_ONCE
-                        self.msg.fail("ParamSpec.args should only be passed once", context)
-                    elif kind == 10:  # ERR_PARAMSPEC_KWARGS_ONCE
-                        self.msg.fail("ParamSpec.kwargs should only be passed once", context)
-                    elif kind == 11:  # ERR_MISSING_CLASSVAR_NOTE
-                        if object_type and callable_name:
-                            self.missing_classvar_callable_note(
-                                object_type, callable_name, context
-                            )
-                return ok
 
         # TODO(jukka): We could return as soon as we find an error if messages is None.
 
