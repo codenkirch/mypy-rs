@@ -28215,13 +28215,15 @@ class NativeCheckCallableCallWireGateSuite(Suite):
         import mypy.checkexpr as _ce
 
         seen: list[bytes] = []
-        orig = _ce._rust_check_callable_call
+        # B009/B010 are silenced deliberately: direct access trips the
+        # self-check's implicit_reexport=False for this private alias.
+        orig = getattr(_ce, "_rust_check_callable_call")  # noqa: B009
 
         def wrapper(*args: Any, **kwargs: Any) -> Any:
             seen.append(args[1])
             return orig(*args, **kwargs)
 
-        _ce._rust_check_callable_call = wrapper
+        setattr(_ce, "_rust_check_callable_call", wrapper)  # noqa: B010
         self.addCleanup(setattr, _ce, "_rust_check_callable_call", orig)
         return seen
 

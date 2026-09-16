@@ -904,7 +904,10 @@ class NativeArgMapSeamsRetiredSuite(Suite):
         from mypy import argmap
 
         assert argmap._HAS_TYPE_KERNEL, "expand_actual_type seam must stay live"
-        assert argmap._rust_expand_actual_type is not None
+        # The alias is private inside `mypy.argmap` (not a re-export), so it
+        # is read by string. Direct access trips the self-check's
+        # implicit_reexport=False; ruff's B009 fix would reintroduce it.
+        assert getattr(argmap, "_rust_expand_actual_type") is not None  # noqa: B009
         assert argmap._HAS_LIBRT
 
     def test_retired_bodies_load_no_rust_name(self) -> None:
