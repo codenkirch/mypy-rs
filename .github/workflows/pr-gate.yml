@@ -142,3 +142,49 @@ jobs:
 
       - name: Python check_call argmap baseline (native-off)
         run: uv run python -m pytest mypy/test/testinfer.py -q
+
+  # Lint gate for NEW drift only: main carries 572 pre-existing ruff findings
+  # and 45 black-dirty files (#1742), so the pinned tools run on the files the
+  # PR touches instead of the tree. Touching a dirty file means cleaning it.
+  lint-changed:
+    runs-on: ubuntu-latest
+    steps:
+      # fetch-depth 0 keeps the PR merge base reachable for the diff below.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@8d55fbecc275b1c35dbe060458839f8d30439ccf # v3
+        with:
+          version: "0.11.14"
+
+      - name: Lint changed Python files (ruff 0.14.3 + black 26.1.0)
+        env:
+          # Empty on workflow_dispatch, which has no pull-request base.
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          if [ -n "$BASE_SHA" ]; then
+            git diff --name-only --diff-filter=ACMR "$BASE_SHA...HEAD" -- '*.py' \
+              > /tmp/lint-files.txt
+          else
+            git ls-files -- '*.py' > /tmp/lint-files.txt
+          fi
+          FILES=()
+          while IFS= read -r path; do
+            FILES+=("$path")
+          done < /tmp/lint-files.txt
+          if [ "${#FILES[@]}" -eq 0 ]; then
+            echo "No changed Python files; lint gate skipped."
+            exit 0
+          fi
+          printf 'linting %d changed file(s)\n' "${#FILES[@]}"
+          printf '%s\n' "${FILES[@]}"
+          # --no-fix is required: pyproject.toml sets fix = true, so a bare
+          # `ruff check` rewrites the checkout and then exits 0.
+          uvx ruff@0.14.3 check --no-fix --force-exclude "${FILES[@]}"
+          # No --force-exclude here: pyproject's black force-exclude already
+          # applies to explicit paths, and the flag turns an all-excluded list
+          # into a usage error instead of a clean skip.
+          uvx black@26.1.0 --check "${FILES[@]}"
