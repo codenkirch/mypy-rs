@@ -9,7 +9,9 @@ lane-6.5 lanes are in flight as this is written; see the queue.
 
 ### Where `main` stands
 
-`main` = `a52f8a166` (repo-wide ruff/black debt cleared, PR #1752, closes #1742),
+`main` = `4c1ed279c` (`is_duplicate_mapping` retired — the highest-call seam on
+`main`, 342,101 calls, PR #1753), on top of `a52f8a166` (repo-wide ruff/black
+debt cleared, PR #1752, closes #1742),
 on top of `e52dde80c` (retired-seam pins moved into
 `testtypes_native_retired.py`, PR #1751, closes #1746), `bc5482bf5` (this
 file's previous resume point, PR #1750), `fc7e39f51` (seam retirement log in
