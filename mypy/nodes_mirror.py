@@ -254,9 +254,14 @@ def _capture_ref(node: RefExpr) -> None:
         handle = _kernel_mod.rust_node_mirror_capture_ref(
             node, node.kind, node_fullname, node._fullname, node.is_new_def, node.is_inferred_def
         )
+        # Seed the parse-time `name` slot only on first adoption: later
+        # writes to an adopted node re-issue the identical record (#1714),
+        # while adopted-only `_TEXT_FIELDS` capture covers real renames.
+        newly_adopted = id(node) not in _NODE_HANDLES
         _NODE_HANDLES[id(node)] = handle
         _count("capture_ref")
-        _seed_name(node)
+        if newly_adopted:
+            _seed_name(node)
     except Exception:
         _count("capture_fail.ref")
     finally:
