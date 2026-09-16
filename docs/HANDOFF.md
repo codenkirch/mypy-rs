@@ -1,5 +1,105 @@
 # Handoff: strangler-fig Rust migration loop (seam-deferral reduction)
 
+## RESUME POINT — 2026-09-16, evening (wave 6: seam-retirement slices 1-3 + the lint gate)
+
+Wave 6 finished #1739's slice 1-3 retirements and added a CI lint gate. Gates
+were kept light per the tier protocol: local work was the lane's own suites plus
+one targeted `-k` slice, with the corpus delegated to CI's `parity` job. The
+session's scratch notes live in the git-ignored `docs/HANDOFF-2026-09-16.md`;
+**this file is the tracked resume point.**
+
+### Where `main` stands
+
+`main` = `fc7e39f51` (seam retirement log at the top of the ledger, PR #1749,
+closes #1748), on top of `ce615df84` (retire the argmap mapping seams and
+`check_argument_count`, PR #1747), `cb9430c5a` (retire `rust_fill_typevars`, PR
+#1744), `b3fc0e526` (`lint-changed` CI gate, PR #1743), `8c1b0c6c3` (retire
+`rust_copy_modified` + `rust_flatten_nested_unions`, PR #1741), `10762e5a5`
+(retire six predicate seams, PR #1740), `809b53b90` (#1738), `b06ad64ef`
+(#1737), `0a6bfe978` (#1736), then the wave-5 head `5b012830e`. Wave 6 branched
+from `b3fc0e526`.
+
+### Landed this wave
+
+- **Slice 1 (#1740)** — `func_has_self_or_cls_argument`, `has_abstract_type`,
+  `is_true_literal`, `is_false_literal`, `refers_to_typeddict`,
+  `has_placeholder`: each measured 2.4x-35.7x slower than its Python body
+  (min-of-7 ns/call, both arms in one process, FFI ticket spied).
+- **Slice 2 (#1741)** — `rust_copy_modified` (15.8x-71.8x) and
+  `rust_flatten_nested_unions` (14.4x/25.7x); `mypy/types.py` -727 lines
+  including every helper reachable only from those seams. `rust_expand_type`
+  measured the other way (0.43x-0.61x) and **keeps its interface**.
+- **Slice 3 (#1747)** — the argmap mapping family (`rust_map_actuals_to_formals`,
+  `_with_types`, `rust_map_formals_to_actuals`) and `rust_check_argument_count`:
+  1.71x-6.40x over eight shapes. `rust_expand_actual_type` (0.43x-0.61x) kept.
+- **#1744** — `rust_fill_typevars` (2.57x-6.82x warm, 12.5x-22x cache-cold); its
+  retired-suite pin was negative-controlled and its no-extension run confirms
+  the suites still skip cleanly.
+- **#1743** — `lint-changed`: pinned `ruff@0.14.3 check --no-fix --force-exclude`
+  plus `black@26.1.0 --check` on the `*.py` files a PR touches. Per-file, so a
+  PR touching a pre-existing-dirty file carries a mechanical first commit
+  (already the pattern in #1744/#1747).
+- **#1749** — the ledger now opens with a retirement log (retired-in, commit,
+  seams) so a retired seam is not re-measured as live; see #1748 for why.
+
+Corpus effect of the retirements: **~1.31M fewer FFI crossings and 19.6MB less
+wire traffic** per cold self-check (counters x per-call delta, not wall clock).
+
+### Decision rule (measured; do not re-derive per seam)
+
+The wire interface **loses** when the Python body is an O(1)/O(n) rebuild, list
+scan or scalar read, and **wins** when the body is a recursive visitor
+(`rust_expand_type`, `rust_expand_actual_type`). Per-seam tables are in #1739.
+
+Measured **keeps**, so they are not re-opened: `rust_analyze_instance_member_dispatch`
+(1.10x, 0.92x-1.14x over five runs), `rust_classify_special_unbound` (native
+wins 0.78x on the common non-special shape; the special rows are +478..+534ns
+on 24.1% of calls), `rust_compute_arg_context_indices` (1.38x but 98ns/call).
+
+### Method traps added this wave (all cost a cycle or nearly did)
+
+- **A scratch `.so` is stale if `main` moved past crates commits.** Compare its
+  mtime against `git log --since=<build time> -- crates/`. It still imports and
+  still passes parity, so nothing errors; only a marginal ratio reveals it.
+  Verdicts >=2x are version-immune, <=1.5x must be re-measured on a fresh build.
+  The fresh one this wave was `/private/tmp/mypy-rs-audit-tk`.
+- **`agent-wait` can print a stale run's failure** (and a CONFLICTING PR runs no
+  CI, so a wait returns "0 checks passed", which is not a pass). Bind any tally
+  to `gh pr view N --json headRefOid` before acting on it.
+- **Ruff B009/B010 vs the self-check's `implicit_reexport=False`**: the autofix
+  converts the one typeable form into the form `pr-gate` rejects. Keep dynamic
+  access plus a per-site `noqa` (6 sites repo-wide, all load-bearing).
+- **A measurement lane's gate-OFF first pass prints a plausible 1.00x**; the
+  harness must hard-assert the FFI ticket was reached (`calls == 200`).
+
+### Queue for the next wave
+
+1. **#1746 first** — `mypy/test/testtypes_native_checker.py` (28,292 lines) is
+   the only file holding coverage for the next three candidates, so every
+   retirement serializes on it. Move the `...RetiredSuite` pins into
+   `testtypes_native_retired.py` (lane R1 in flight as this was written; verify
+   whether it landed before starting anything else).
+2. **Then the three measured retirements, one at a time**, since each also
+   reworks an engagement suite in that same file: `rust_check_unpacks_in_list`
+   (`mypy/typeanal.py`, 5.5x-10.2x, >=0.20s) -> `rust_analyze_member_access`
+   (`mypy/checkmember.py`, 1.9x-9.1x, weighted ~0.047s) ->
+   `rust_classify_protocol_test_callee` (`mypy/checkexpr.py`, 2.8x-3.7x, and
+   0/200 decided on its two common shapes, so the crossing is doomed work).
+3. **The quiet-host leg** — #1723's 3-pair protocol and #1624's wall clock.
+   Blocked all of 2026-09-16: load read 7.98 at best and 21-43 through the
+   waves; do not start it in the same hour as a wave, and do not accept wall
+   clocks from a contended host as evidence.
+4. **#1742** — repo-wide lint debt (572 ruff findings, 45 black-dirty files at
+   `b3fc0e526`), now paid down file-by-file by the new gate; `*.pyi` is not in
+   the gate's pathspec yet.
+5. **#1745** — `main` has no branch protection or ruleset, so every gate is
+   advisory-only. Needs an owner decision on the context set: QWEN.md's snippet
+   names a check this repo does not have, and `required_approving_review_count:
+   1` would make every lane PR unmergeable (there are no human reviewers here).
+6. **The G track is unchanged and independent** — the G3.1 read flip
+   (`ac68f0eaf`, default-off) and its G3.2 residual (aststrip survivors and
+   cache-loaded tables still defer) are in the wave-5 resume point below.
+
 ## RESUME POINT — 2026-09-15, night (wave 5: tiered feedback, ledger archived out of AGENTS.md)
 
 Eight lanes ran wave 5 under a new feedback protocol: gates are chosen by blast
