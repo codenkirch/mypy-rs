@@ -757,3 +757,26 @@ fn create_dummy_options_with_platform<'a>(
     options.setattr("platform", platform)?;
     Ok(options)
 }
+
+/// Register this module's Python-facing seam surface (#1677).
+pub(crate) fn register_registry(m: &PyModule) -> PyResult<()> {
+    // Issue #560: reachability.py port.
+    m.add_function(wrap_pyfunction!(rust_infer_condition_value, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_infer_pattern_value, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_assert_will_always_fail, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_consider_sys_version_info, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_consider_sys_platform, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_is_sys_attr, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_contains_sys_version_info, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_contains_int_or_tuple_of_ints, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_fixed_comparison, m)?)?;
+    Ok(())
+}

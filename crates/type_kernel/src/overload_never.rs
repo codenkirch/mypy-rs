@@ -177,3 +177,16 @@ pub(crate) fn rust_is_same_arg_prefix(
         res,
     )
 }
+
+/// Register this module's Python-facing seam surface (#1677).
+pub(crate) fn register_registry(m: &PyModule) -> PyResult<()> {
+    // overload_never: overload argument-prefix compatibility per the
+    // Callable-vs-Callable fast paths (mypy.checker). Generic/Overloaded
+    // operands defer to Python.
+    m.add_function(wrap_pyfunction!(rust_overload_can_never_match, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_is_more_general_arg_prefix, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_is_same_arg_prefix, m)?)?;
+    Ok(())
+}

@@ -373,3 +373,15 @@ pub(crate) fn rust_is_unsafe_overlapping_overload_signatures(
         resolver,
     )
 }
+
+/// Register this module's Python-facing seam surface (#1677).
+pub(crate) fn register_registry(m: &PyModule) -> PyResult<()> {
+    // is_unsafe_overlapping_overload_signatures: judge overload-overlap
+    // safety on detached, expanded wire callables (mypy.checker).
+    #[allow(clippy::unsafe_removed_from_name)]
+    m.add_function(wrap_pyfunction!(
+        rust_is_unsafe_overlapping_overload_signatures,
+        m
+    )?)?;
+    Ok(())
+}

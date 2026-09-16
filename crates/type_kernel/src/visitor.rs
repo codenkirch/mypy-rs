@@ -1942,3 +1942,31 @@ mod tests {
         assert!(active.is_empty());
     }
 }
+
+/// Register this module's Python-facing seam surface (#1677).
+pub(crate) fn register_registry(m: &PyModule) -> PyResult<()> {
+    m.add_function(wrap_pyfunction!(rust_has_type_vars, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_has_recursive_types, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_is_literal_type, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_is_unannotated_any, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_remove_dups, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_type_vars_as_args, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_callable_with_ellipsis, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_find_unpack_in_list, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_split_with_prefix_and_suffix, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_flatten_nested_unions, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_flatten_nested_tuples, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_copy_type, m)?)?;
+    Ok(())
+}

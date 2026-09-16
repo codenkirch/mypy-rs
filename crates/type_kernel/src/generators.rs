@@ -1052,3 +1052,20 @@ mod tests {
         );
     }
 }
+
+/// Register this module's Python-facing seam surface (#1677).
+pub(crate) fn register_registry(m: &PyModule) -> PyResult<()> {
+    // Issue #434: generator/coroutine return-type helpers.
+    m.add_function(wrap_pyfunction!(rust_is_generator_return_type, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_is_async_generator_return_type, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_get_generator_yield_type, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_get_generator_receive_type, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_get_generator_return_type, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_get_coroutine_return_type, m)?)?;
+    Ok(())
+}

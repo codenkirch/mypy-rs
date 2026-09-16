@@ -673,3 +673,13 @@ fn lvalue_value<'py>(
     }
     Ok(Some(true))
 }
+
+/// Register this module's Python-facing seam surface (#1677).
+pub(crate) fn register_registry(m: &PyModule) -> PyResult<()> {
+    m.add_function(wrap_pyfunction!(rust_get_subexpressions, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_strip_ref_expr, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_aststrip_process_lvalue, m)?)?;
+    Ok(())
+}

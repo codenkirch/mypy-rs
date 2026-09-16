@@ -164,3 +164,9 @@ fn has_abstract_type(caller: &Type, callee: &Type, resolver: &TypeResolver) -> O
     let snap = resolver.get(t)?;
     Some(snap.is_abstract || snap.is_protocol)
 }
+
+/// Register this module's Python-facing seam surface (#1677).
+pub(crate) fn register_registry(m: &PyModule) -> PyResult<()> {
+    m.add_function(wrap_pyfunction!(rust_check_arguments, m)?)?;
+    Ok(())
+}

@@ -232,3 +232,12 @@ mod tests {
         );
     }
 }
+
+/// Register this module's Python-facing seam surface (#1677).
+pub(crate) fn register_registry(m: &PyModule) -> PyResult<()> {
+    // check_and_warn_deprecated: deprecation-warn arbitration head. Rust
+    // decides silent/note/fail from scalar facts; Python emits the message
+    // via the live info.deprecated string. Never defers.
+    m.add_function(wrap_pyfunction!(rust_classify_check_warn_deprecated, m)?)?;
+    Ok(())
+}

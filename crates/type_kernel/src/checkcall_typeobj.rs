@@ -227,3 +227,16 @@ mod checkcall_typeobj_tests {
         assert_eq!(g(true, true, true, true, true), TYPEOBJ_GATE_NONE);
     }
 }
+
+/// Register this module's Python-facing seam surface (#1677).
+pub(crate) fn register_registry(m: &PyModule) -> PyResult<()> {
+    // Issue #1464 C2: check_callable_call typeobj-fail gate. Rust collapses
+    // the if/elif double-evaluation of is_type_obj()/type_object() into one
+    // arm tag; the two fails and the can_return_none fold stay in Python.
+    m.add_function(wrap_pyfunction!(rust_classify_typeobj_gate, m)?)?;
+
+    // Issue #1642: batched check_callable_call head. Combines the
+    // enum-callable-base and typeobj-gate seams into one FFI crossing.
+    m.add_function(wrap_pyfunction!(rust_check_call_head, m)?)?;
+    Ok(())
+}

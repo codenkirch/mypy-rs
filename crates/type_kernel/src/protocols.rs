@@ -360,3 +360,9 @@ pub(crate) fn rust_is_protocol_implementation(
     );
     is_protocol_implementation_inner(py, &left, &left, &right, &skip, &ctx, resolver.resolver())
 }
+
+/// Register this module's Python-facing seam surface (#1677).
+pub(crate) fn register_registry(m: &PyModule) -> PyResult<()> {
+    m.add_function(wrap_pyfunction!(rust_is_protocol_implementation, m)?)?;
+    Ok(())
+}

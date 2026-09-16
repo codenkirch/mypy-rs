@@ -1234,3 +1234,66 @@ mod node_field_shadow_tests {
         });
     }
 }
+
+/// Register this module's Python-facing seam surface (#1677).
+pub(crate) fn register_registry(m: &PyModule) -> PyResult<()> {
+    // Phase G1.0a (#1572): expression dual-write node shadow. Capture-only
+    // in G1 (no consumer reads an entry), keyed by the shared identity
+    // handles like the type mirror.
+    m.add_function(wrap_pyfunction!(rust_node_mirror_capture_ref, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_node_mirror_capture_analyzed, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_node_mirror_ref, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_node_mirror_analyzed, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_node_mirror_captures, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_node_mirror_drop, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_node_mirror_reset, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_node_mirror_entry_count, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_node_mirror_handle_of, m)?)?;
+
+    // Phase G1.0b (#1576): per-field records for the remaining G1
+    // expression analysis fields. Capture-only, same identity handles.
+    m.add_function(wrap_pyfunction!(rust_node_mirror_capture_field_kind, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_node_mirror_capture_flag, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_node_mirror_capture_field_name, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_node_mirror_capture_field_kinds, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_node_mirror_capture_field_text, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_node_mirror_field, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_node_mirror_fields, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_node_mirror_field_captures, m)?)?;
+
+    // Phase G1.1 (#1576 follow-up): wire bytes for type-valued fields so
+    // Rust can serve reads without crossing back to Python.
+    m.add_function(wrap_pyfunction!(rust_node_mirror_capture_field_wire, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_node_mirror_field_wire, m)?)?;
+
+    // Phase G2.0 (#1577): statement/def metadata shadow store. Record-only
+    // like G1.0a: no consumer reads an entry, same gate and identity base.
+    m.add_function(wrap_pyfunction!(rust_node_mirror_capture_meta, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_node_mirror_meta, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_node_mirror_meta_captures, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_node_mirror_meta_drop, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_node_mirror_meta_reset, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_node_mirror_meta_entry_count, m)?)?;
+    Ok(())
+}

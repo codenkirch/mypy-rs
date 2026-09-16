@@ -793,3 +793,342 @@ str_const!(
     dataclass_post_init_must_be_a_function,
     "\"__post_init__\" method must be an instance method"
 );
+
+/// Register this module's Python-facing seam surface (#1677).
+pub(crate) fn register_registry(m: &PyModule) -> PyResult<()> {
+    // Issue #535: message_registry.py port — ErrorMessage class + factory fns.
+    m.add_class::<ErrorMessage>()?;
+
+    m.add_function(wrap_pyfunction!(invalid_type_raw_enum_value, m)?)?;
+
+    m.add_function(wrap_pyfunction!(no_return_value_expected, m)?)?;
+
+    m.add_function(wrap_pyfunction!(missing_return_statement, m)?)?;
+
+    m.add_function(wrap_pyfunction!(empty_body_abstract, m)?)?;
+
+    m.add_function(wrap_pyfunction!(invalid_implicit_return, m)?)?;
+
+    m.add_function(wrap_pyfunction!(incompatible_return_value_type, m)?)?;
+
+    m.add_function(wrap_pyfunction!(return_value_expected, m)?)?;
+
+    m.add_function(wrap_pyfunction!(no_return_expected, m)?)?;
+
+    m.add_function(wrap_pyfunction!(invalid_exception, m)?)?;
+
+    m.add_function(wrap_pyfunction!(invalid_exception_type, m)?)?;
+
+    m.add_function(wrap_pyfunction!(invalid_exception_group, m)?)?;
+
+    m.add_function(wrap_pyfunction!(return_in_async_generator, m)?)?;
+
+    m.add_function(wrap_pyfunction!(invalid_return_type_for_generator, m)?)?;
+
+    m.add_function(wrap_pyfunction!(
+        invalid_return_type_for_async_generator,
+        m
+    )?)?;
+
+    m.add_function(wrap_pyfunction!(yield_value_expected, m)?)?;
+
+    m.add_function(wrap_pyfunction!(incompatible_types, m)?)?;
+
+    m.add_function(wrap_pyfunction!(incompatible_types_in_assignment, m)?)?;
+
+    m.add_function(wrap_pyfunction!(
+        covariant_override_of_mutable_attribute,
+        m
+    )?)?;
+
+    m.add_function(wrap_pyfunction!(incompatible_types_in_await, m)?)?;
+
+    m.add_function(wrap_pyfunction!(incompatible_redefinition, m)?)?;
+
+    m.add_function(wrap_pyfunction!(incompatible_types_in_yield, m)?)?;
+
+    m.add_function(wrap_pyfunction!(incompatible_types_in_yield_from, m)?)?;
+
+    m.add_function(wrap_pyfunction!(incompatible_types_in_capture, m)?)?;
+
+    m.add_function(wrap_pyfunction!(must_have_none_return_type, m)?)?;
+
+    m.add_function(wrap_pyfunction!(tuple_index_out_of_range, m)?)?;
+
+    m.add_function(wrap_pyfunction!(ambiguous_slice_of_variadic_tuple, m)?)?;
+
+    m.add_function(wrap_pyfunction!(too_many_targets_for_variadic_unpack, m)?)?;
+
+    m.add_function(wrap_pyfunction!(cannot_infer_lambda_type, m)?)?;
+
+    m.add_function(wrap_pyfunction!(non_instance_new_type, m)?)?;
+
+    m.add_function(wrap_pyfunction!(invalid_new_type, m)?)?;
+
+    m.add_function(wrap_pyfunction!(bad_constructor_type, m)?)?;
+
+    m.add_function(wrap_pyfunction!(inconsistent_abstract_overload, m)?)?;
+
+    m.add_function(wrap_pyfunction!(multiple_overloads_required, m)?)?;
+
+    m.add_function(wrap_pyfunction!(
+        read_only_property_overrides_read_write,
+        m
+    )?)?;
+
+    m.add_function(wrap_pyfunction!(return_type_cannot_be_contravariant, m)?)?;
+
+    m.add_function(wrap_pyfunction!(function_parameter_cannot_be_covariant, m)?)?;
+
+    m.add_function(wrap_pyfunction!(incompatible_import_of, m)?)?;
+
+    m.add_function(wrap_pyfunction!(function_type_expected, m)?)?;
+
+    m.add_function(wrap_pyfunction!(only_class_application, m)?)?;
+
+    m.add_function(wrap_pyfunction!(return_type_expected, m)?)?;
+
+    m.add_function(wrap_pyfunction!(param_type_expected, m)?)?;
+
+    m.add_function(wrap_pyfunction!(keyword_argument_requires_str_key_type, m)?)?;
+
+    m.add_function(wrap_pyfunction!(all_must_be_seq_str, m)?)?;
+
+    m.add_function(wrap_pyfunction!(invalid_typeddict_args, m)?)?;
+
+    m.add_function(wrap_pyfunction!(typeddict_key_must_be_string_literal, m)?)?;
+
+    m.add_function(wrap_pyfunction!(malformed_assert, m)?)?;
+
+    m.add_function(wrap_pyfunction!(duplicate_type_signatures, m)?)?;
+
+    m.add_function(wrap_pyfunction!(descriptor_set_not_callable, m)?)?;
+
+    m.add_function(wrap_pyfunction!(module_level_getattribute, m)?)?;
+
+    m.add_function(wrap_pyfunction!(name_not_in_slots, m)?)?;
+
+    m.add_function(wrap_pyfunction!(type_always_true, m)?)?;
+
+    m.add_function(wrap_pyfunction!(type_always_true_uniontype, m)?)?;
+
+    m.add_function(wrap_pyfunction!(function_always_true, m)?)?;
+
+    m.add_function(wrap_pyfunction!(iterable_always_true, m)?)?;
+
+    m.add_function(wrap_pyfunction!(too_many_args_for_super, m)?)?;
+
+    m.add_function(wrap_pyfunction!(super_with_single_arg_not_supported, m)?)?;
+
+    m.add_function(wrap_pyfunction!(unsupported_arg_1_for_super, m)?)?;
+
+    m.add_function(wrap_pyfunction!(unsupported_arg_2_for_super, m)?)?;
+
+    m.add_function(wrap_pyfunction!(super_varargs_not_supported, m)?)?;
+
+    m.add_function(wrap_pyfunction!(super_positional_args_required, m)?)?;
+
+    m.add_function(wrap_pyfunction!(super_arg_2_not_instance_of_arg_1, m)?)?;
+
+    m.add_function(wrap_pyfunction!(target_class_has_no_base_class, m)?)?;
+
+    m.add_function(wrap_pyfunction!(super_outside_of_method_not_supported, m)?)?;
+
+    m.add_function(wrap_pyfunction!(
+        super_enclosing_positional_args_required,
+        m
+    )?)?;
+
+    m.add_function(wrap_pyfunction!(missing_or_invalid_self_type, m)?)?;
+
+    m.add_function(wrap_pyfunction!(erased_self_type_not_supertype, m)?)?;
+
+    m.add_function(wrap_pyfunction!(cannot_inherit_from_final, m)?)?;
+
+    m.add_function(wrap_pyfunction!(dependent_final_in_class_body, m)?)?;
+
+    m.add_function(wrap_pyfunction!(cannot_make_deletable_final, m)?)?;
+
+    m.add_function(wrap_pyfunction!(incompatible_disjoint_bases, m)?)?;
+
+    m.add_function(wrap_pyfunction!(enum_members_attr_will_be_overridden, m)?)?;
+
+    m.add_function(wrap_pyfunction!(cannot_override_instance_var, m)?)?;
+
+    m.add_function(wrap_pyfunction!(cannot_override_class_var, m)?)?;
+
+    m.add_function(wrap_pyfunction!(runtime_protocol_expected, m)?)?;
+
+    m.add_function(wrap_pyfunction!(cannot_instantiate_protocol, m)?)?;
+
+    m.add_function(wrap_pyfunction!(too_many_union_combinations, m)?)?;
+
+    m.add_function(wrap_pyfunction!(contiguous_iterable_expected, m)?)?;
+
+    m.add_function(wrap_pyfunction!(iterable_type_expected, m)?)?;
+
+    m.add_function(wrap_pyfunction!(type_guard_pos_arg_required, m)?)?;
+
+    m.add_function(wrap_pyfunction!(failed_to_merge_overloads, m)?)?;
+
+    m.add_function(wrap_pyfunction!(type_ignore_with_errcode_on_module, m)?)?;
+
+    m.add_function(wrap_pyfunction!(invalid_type_ignore, m)?)?;
+
+    m.add_function(wrap_pyfunction!(type_comment_syntax_error_value, m)?)?;
+
+    m.add_function(wrap_pyfunction!(ellipsis_with_other_typeparams, m)?)?;
+
+    m.add_function(wrap_pyfunction!(type_signature_too_many_params, m)?)?;
+
+    m.add_function(wrap_pyfunction!(type_signature_too_few_params, m)?)?;
+
+    m.add_function(wrap_pyfunction!(arg_constructor_name_expected, m)?)?;
+
+    m.add_function(wrap_pyfunction!(arg_constructor_too_many_args, m)?)?;
+
+    m.add_function(wrap_pyfunction!(multiple_values_for_name_kwarg, m)?)?;
+
+    m.add_function(wrap_pyfunction!(multiple_values_for_type_kwarg, m)?)?;
+
+    m.add_function(wrap_pyfunction!(arg_constructor_unexpected_arg, m)?)?;
+
+    m.add_function(wrap_pyfunction!(arg_name_expected_string_literal, m)?)?;
+
+    m.add_function(wrap_pyfunction!(narrowed_type_not_subtype, m)?)?;
+
+    m.add_function(wrap_pyfunction!(type_var_too_few_constrained_types, m)?)?;
+
+    m.add_function(wrap_pyfunction!(type_var_yield_expression_in_bound, m)?)?;
+
+    m.add_function(wrap_pyfunction!(type_var_named_expression_in_bound, m)?)?;
+
+    m.add_function(wrap_pyfunction!(type_var_await_expression_in_bound, m)?)?;
+
+    m.add_function(wrap_pyfunction!(type_var_generic_constraint_type, m)?)?;
+
+    m.add_function(wrap_pyfunction!(type_var_redeclared_in_nested_class, m)?)?;
+
+    m.add_function(wrap_pyfunction!(type_alias_with_yield_expression, m)?)?;
+
+    m.add_function(wrap_pyfunction!(type_alias_with_named_expression, m)?)?;
+
+    m.add_function(wrap_pyfunction!(type_alias_with_await_expression, m)?)?;
+
+    m.add_function(wrap_pyfunction!(
+        incompatible_types_in_async_with_aenter,
+        m
+    )?)?;
+
+    m.add_function(wrap_pyfunction!(incompatible_types_in_async_with_aexit, m)?)?;
+
+    m.add_function(wrap_pyfunction!(incompatible_types_in_async_for, m)?)?;
+
+    m.add_function(wrap_pyfunction!(invalid_type_for_slots, m)?)?;
+
+    m.add_function(wrap_pyfunction!(async_for_outside_coroutine, m)?)?;
+
+    m.add_function(wrap_pyfunction!(async_with_outside_coroutine, m)?)?;
+
+    m.add_function(wrap_pyfunction!(
+        incompatible_types_in_str_interpolation,
+        m
+    )?)?;
+
+    m.add_function(wrap_pyfunction!(cannot_access_init, m)?)?;
+
+    m.add_function(wrap_pyfunction!(cannot_assign_to_method, m)?)?;
+
+    m.add_function(wrap_pyfunction!(cannot_assign_to_type, m)?)?;
+
+    m.add_function(wrap_pyfunction!(format_requires_mapping, m)?)?;
+
+    m.add_function(wrap_pyfunction!(typeddict_override_merge, m)?)?;
+
+    m.add_function(wrap_pyfunction!(descriptor_get_not_callable, m)?)?;
+
+    m.add_function(wrap_pyfunction!(class_var_conflicts_slots, m)?)?;
+
+    m.add_function(wrap_pyfunction!(not_callable, m)?)?;
+
+    m.add_function(wrap_pyfunction!(type_must_be_used, m)?)?;
+
+    m.add_function(wrap_pyfunction!(generic_instance_var_class_access, m)?)?;
+
+    m.add_function(wrap_pyfunction!(generic_class_var_access, m)?)?;
+
+    m.add_function(wrap_pyfunction!(bare_generic, m)?)?;
+
+    m.add_function(wrap_pyfunction!(implicit_generic_any_builtin, m)?)?;
+
+    m.add_function(wrap_pyfunction!(no_cyclic_default, m)?)?;
+
+    m.add_function(wrap_pyfunction!(no_default_after_typevar_tuple, m)?)?;
+
+    m.add_function(wrap_pyfunction!(invalid_unpack, m)?)?;
+
+    m.add_function(wrap_pyfunction!(invalid_unpack_position, m)?)?;
+
+    m.add_function(wrap_pyfunction!(invalid_param_spec_location, m)?)?;
+
+    m.add_function(wrap_pyfunction!(invalid_param_spec_location_note, m)?)?;
+
+    m.add_function(wrap_pyfunction!(incompatible_typevar_value, m)?)?;
+
+    m.add_function(wrap_pyfunction!(invalid_typevar_as_typearg, m)?)?;
+
+    m.add_function(wrap_pyfunction!(invalid_typevar_arg_bound, m)?)?;
+
+    m.add_function(wrap_pyfunction!(invalid_typevar_arg_value, m)?)?;
+
+    m.add_function(wrap_pyfunction!(typevar_variance_def, m)?)?;
+
+    m.add_function(wrap_pyfunction!(typevar_arg_must_be_type, m)?)?;
+
+    m.add_function(wrap_pyfunction!(typevar_unexpected_argument, m)?)?;
+
+    m.add_function(wrap_pyfunction!(unbound_typevar, m)?)?;
+
+    m.add_function(wrap_pyfunction!(type_parameters_should_be_declared, m)?)?;
+
+    m.add_function(wrap_pyfunction!(cannot_access_final_instance_attr, m)?)?;
+
+    m.add_function(wrap_pyfunction!(cannot_access_instance_only_attr, m)?)?;
+
+    m.add_function(wrap_pyfunction!(class_var_with_generic_self, m)?)?;
+
+    m.add_function(wrap_pyfunction!(class_var_outside_of_class, m)?)?;
+
+    m.add_function(wrap_pyfunction!(missing_match_args, m)?)?;
+
+    m.add_function(wrap_pyfunction!(or_pattern_alternative_names, m)?)?;
+
+    m.add_function(wrap_pyfunction!(class_pattern_generic_type_alias, m)?)?;
+
+    m.add_function(wrap_pyfunction!(class_pattern_type_required, m)?)?;
+
+    m.add_function(wrap_pyfunction!(class_pattern_too_many_positional_args, m)?)?;
+
+    m.add_function(wrap_pyfunction!(
+        class_pattern_keyword_matches_positional,
+        m
+    )?)?;
+
+    m.add_function(wrap_pyfunction!(
+        class_pattern_duplicate_keyword_pattern,
+        m
+    )?)?;
+
+    m.add_function(wrap_pyfunction!(class_pattern_unknown_keyword, m)?)?;
+
+    m.add_function(wrap_pyfunction!(class_pattern_class_or_static_method, m)?)?;
+
+    m.add_function(wrap_pyfunction!(multiple_assignments_in_pattern, m)?)?;
+
+    m.add_function(wrap_pyfunction!(cannot_modify_match_args, m)?)?;
+
+    m.add_function(wrap_pyfunction!(dataclass_field_alias_must_be_literal, m)?)?;
+
+    m.add_function(wrap_pyfunction!(dataclass_post_init_must_be_a_function, m)?)?;
+    Ok(())
+}

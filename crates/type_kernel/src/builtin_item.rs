@@ -323,3 +323,11 @@ mod tests {
         assert_eq!(builtin_item_type_inner(&t, &r, true), Some(None));
     }
 }
+
+/// Register this module's Python-facing seam surface (#1677).
+pub(crate) fn register_registry(m: &PyModule) -> PyResult<()> {
+    // checker.builtin_item_type (parity seam for a builtin container's
+    // element type, optional narrow).
+    m.add_function(wrap_pyfunction!(rust_builtin_item_type, m)?)?;
+    Ok(())
+}

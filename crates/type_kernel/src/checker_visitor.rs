@@ -676,3 +676,46 @@ pub(crate) fn rust_typeinfo_has_base(
     }
     Ok(false)
 }
+
+/// Register this module's Python-facing seam surface (#1677).
+pub(crate) fn register_registry(m: &PyModule) -> PyResult<()> {
+    m.add_function(wrap_pyfunction!(rust_is_true_literal, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_is_false_literal, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_is_literal_none, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_is_literal_not_implemented, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_is_static, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_is_property, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_is_method, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_is_empty_generator_function, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_is_settable_property, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_is_custom_settable_property, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_can_have_shared_disjoint_base, m)?)?;
+
+    // Issue #457: Node object-model pure predicates from mypy/nodes.py.
+    m.add_function(wrap_pyfunction!(rust_func_has_self_or_cls_argument, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_func_item_is_dynamic, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_decorator_is_dynamic, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_overloaded_is_dynamic, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_typeinfo_is_generic, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_typeinfo_is_metaclass, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_typeinfo_has_base, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_get_property_type, m)?)?;
+    Ok(())
+}

@@ -446,3 +446,16 @@ pub(crate) fn rust_add_type_promotion(
 
     Ok(())
 }
+
+/// Register this module's Python-facing seam surface (#1677).
+pub(crate) fn register_registry(m: &PyModule) -> PyResult<()> {
+    // Issue #538: semanal_classprop.py class-property calculators.
+    m.add_function(wrap_pyfunction!(rust_calculate_class_abstract_status, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_check_protocol_status, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_calculate_class_vars, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_add_type_promotion, m)?)?; // Issue #540: pure helpers from mypy/modulefinder.py.
+    Ok(())
+}

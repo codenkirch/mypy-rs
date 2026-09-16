@@ -4523,3 +4523,11 @@ mod tests {
         );
     }
 }
+
+/// Register this module's Python-facing seam surface (#1677).
+pub(crate) fn register_registry(m: &PyModule) -> PyResult<()> {
+    m.add_function(wrap_pyfunction!(read_type_to_str, m)?)?;
+
+    m.add_function(wrap_pyfunction!(read_alias_recursion_flag, m)?)?;
+    Ok(())
+}

@@ -1051,3 +1051,19 @@ mod tests {
         assert_eq!(result, Some((false, true, true)));
     }
 }
+
+/// Register this module's Python-facing seam surface (#1677).
+pub(crate) fn register_registry(m: &PyModule) -> PyResult<()> {
+    m.add_function(wrap_pyfunction!(rust_is_numeric_format_type, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_parse_conversion_specifiers, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_find_non_escaped_targets, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_parse_format_value, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_parse_placeholder_format, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_analyze_conversion_specifiers, m)?)?;
+    Ok(())
+}

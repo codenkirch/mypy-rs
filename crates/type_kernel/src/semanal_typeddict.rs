@@ -285,3 +285,20 @@ pub(crate) fn rust_verify_field_against_closed_bases(
 
     Ok(errors)
 }
+
+/// Register this module's Python-facing seam surface (#1677).
+pub(crate) fn register_registry(m: &PyModule) -> PyResult<()> {
+    // Issue #532: semanal_typeddict + semanal_namedtuple helpers.
+    m.add_function(wrap_pyfunction!(rust_extract_meta_info, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_check_namedtuple_field_name, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_namedtuple_prohibited_names, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_primary_source, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_verify_requiredness_compatibility, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_verify_field_against_closed_bases, m)?)?;
+    Ok(())
+}

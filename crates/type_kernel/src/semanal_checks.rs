@@ -1457,3 +1457,43 @@ mod tests {
         assert!(matches!(wire_last_arg_facts(None), None));
     }
 }
+
+/// Register this module's Python-facing seam surface (#1677).
+pub(crate) fn register_registry(m: &PyModule) -> PyResult<()> {
+    m.add_function(wrap_pyfunction!(rust_classify_function_signature, m)?)?;
+
+    // semanal_checks: check_decorated_function_is_method predicate port.
+    // Rust reads live analyzer state (self.type, is_func_scope()) and
+    // returns the method/non-method decision; the self.fail stays in Python.
+    m.add_function(wrap_pyfunction!(
+        rust_check_decorated_function_is_method,
+        m
+    )?)?;
+
+    // semanal_checks: should_wait_rhs assignment-rvalue wait predicate.
+    // Rust walks the rvalue node chain; lookups ride the real lookup
+    // methods and the pure-Python body is the fallback on None.
+    m.add_function(wrap_pyfunction!(rust_should_wait_rhs, m)?)?;
+
+    // semanal_checks: check_fixed_args arg-count + arg-kinds arbitration.
+    // Rust classifies the two gap checks into a tag; the self.fail
+    // message emission stays in Python.
+    m.add_function(wrap_pyfunction!(rust_classify_fixed_args, m)?)?;
+
+    // semanal_checks: prepare_method_signature method-signature dispatch
+    // head. Rust classifies the branch from live FuncDef facts plus the
+    // wire self type; writes, side effects, and fails stay in Python.
+    m.add_function(wrap_pyfunction!(rust_classify_method_signature, m)?)?;
+
+    // semanal_checks: remove_unpack_kwargs unpack-kwargs arbitration.
+    // Rust classifies the guard chain + overlap set; side effects in Python.
+    m.add_function(wrap_pyfunction!(rust_classify_remove_unpack_kwargs, m)?)?;
+
+    // semanal_checks: live-object remove_unpack_kwargs entry (#1663); no
+    // wire serialization, the unpack target is resolved via get_proper_type.
+    m.add_function(wrap_pyfunction!(
+        rust_classify_remove_unpack_kwargs_live,
+        m
+    )?)?;
+    Ok(())
+}

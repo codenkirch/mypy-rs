@@ -730,3 +730,10 @@ mod tests {
         assert_eq!(prov, vec![1]);
     }
 }
+
+/// Register this module's Python-facing seam surface (#1677).
+pub(crate) fn register_registry(m: &PyModule) -> PyResult<()> {
+    // typeops._remove_redundant_union_items (two-pass union dedup).
+    m.add_function(wrap_pyfunction!(rust_remove_redundant_union_items, m)?)?;
+    Ok(())
+}

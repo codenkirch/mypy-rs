@@ -2339,3 +2339,39 @@ mod tests {
         });
     }
 }
+
+/// Register this module's Python-facing seam surface (#1677).
+pub(crate) fn register_registry(m: &PyModule) -> PyResult<()> {
+    m.add_function(wrap_pyfunction!(rust_type_requires_usage, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_is_unreachable_map, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_stmt_outcome, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_with_exit_suppresses, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_try_handler_union, m)?)?;
+
+    // Issue #347: checker narrowing helpers; narrow_declared_type is already
+    // registered via meet::rust_narrow_declared_type, and the other four
+    // defer (None) as entry-points for the gate.
+    m.add_function(wrap_pyfunction!(rust_narrow_type, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_infer_value_type, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_find_isinstance_join, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_partial_type_inference, m)?)?;
+
+    // Issue #387: identity-equality narrowing. Returns (if, else) type blobs
+    // or None to defer to the pure-Python path.
+    m.add_function(wrap_pyfunction!(rust_narrow_type_by_identity_equality, m)?)?;
+
+    // Issue #609 (Phase C2): except-handler-test classification.
+    // Returns (tag, blob) pairs or None to defer to the pure-Python path.
+    m.add_function(wrap_pyfunction!(rust_classify_except_handler_tests, m)?)?;
+
+    // Issue #445: is_valid_inferred_type pure boolean query.
+    m.add_function(wrap_pyfunction!(rust_is_valid_inferred_type, m)?)?;
+    Ok(())
+}

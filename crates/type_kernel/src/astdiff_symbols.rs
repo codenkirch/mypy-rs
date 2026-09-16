@@ -644,3 +644,14 @@ fn collect_tuple(py: Python<'_>, seq: &PyAny) -> PyResult<PyObject> {
     }
     Ok(PyTuple::new(py, &out).into())
 }
+
+/// Register this module's Python-facing seam surface (#1677).
+pub(crate) fn register_registry(m: &PyModule) -> PyResult<()> {
+    // B7 slice 2 (#1500): native astdiff symbol-table snapshot builder.
+    m.add_function(wrap_pyfunction!(rust_snapshot_symbol_table, m)?)?;
+
+    // G3.1 (#1670): read flip for that builder — the namespace comes from
+    // the G3.0a symtable shadow store instead of the live `dict`.
+    m.add_function(wrap_pyfunction!(rust_snapshot_symbol_table_shadow, m)?)?;
+    Ok(())
+}

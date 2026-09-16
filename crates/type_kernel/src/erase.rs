@@ -469,3 +469,11 @@ expected = str(py_erase(typ))
         });
     }
 }
+
+/// Register this module's Python-facing seam surface (#1677).
+pub(crate) fn register_registry(m: &PyModule) -> PyResult<()> {
+    m.add_function(wrap_pyfunction!(erase_type, m)?)?;
+
+    m.add_function(wrap_pyfunction!(shallow_erase_type_for_equality, m)?)?;
+    Ok(())
+}

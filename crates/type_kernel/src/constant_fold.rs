@@ -407,3 +407,9 @@ pub(crate) fn rust_constant_fold_expr(
     let value = fold_expr(py, expr, cur_mod_id, nodes_mod)?;
     Ok((true, value.unwrap_or_else(|| py.None())))
 }
+
+/// Register this module's Python-facing seam surface (#1677).
+pub(crate) fn register_registry(m: &PyModule) -> PyResult<()> {
+    m.add_function(wrap_pyfunction!(rust_constant_fold_expr, m)?)?;
+    Ok(())
+}

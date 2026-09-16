@@ -338,3 +338,9 @@ pub(crate) fn rust_get_member_flags(
         resolver.resolver(),
     )
 }
+
+/// Register this module's Python-facing seam surface (#1677).
+pub(crate) fn register_registry(m: &PyModule) -> PyResult<()> {
+    m.add_function(wrap_pyfunction!(rust_get_member_flags, m)?)?;
+    Ok(())
+}

@@ -5852,3 +5852,80 @@ mod type_object_head_tests {
         assert!(classify_type_object_head(&f).2);
     }
 }
+
+/// Register this module's Python-facing seam surface (#1677).
+pub(crate) fn register_registry(m: &PyModule) -> PyResult<()> {
+    m.add_function(wrap_pyfunction!(rust_make_simplified_union, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_simple_literal_type, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_is_simple_literal, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_is_literal_type_like, m)?)?;
+
+    m.add_function(wrap_pyfunction!(
+        rust_try_getting_str_literals_from_type,
+        m
+    )?)?;
+
+    m.add_function(wrap_pyfunction!(
+        rust_try_getting_int_literals_from_type,
+        m
+    )?)?;
+
+    m.add_function(wrap_pyfunction!(
+        rust_try_getting_bool_literals_from_type,
+        m
+    )?)?;
+
+    m.add_function(wrap_pyfunction!(rust_try_getting_instance_fallback, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_true_only, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_false_only, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_true_or_false, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_try_expanding_sum_type_to_union, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_separate_union_literals, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_get_type_vars, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_get_type_vars_live, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_erase_to_bound, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_tuple_fallback, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_bind_self, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_fill_typevars, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_fill_typevars_with_any, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_class_callable, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_function_type, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_callable_type, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_type_object_type_from_function, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_map_type_from_supertype, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_coerce_to_literal, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_is_singleton_identity_type, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_is_singleton_equality_type, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_is_valid_constructor, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_classify_type_object_type, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_is_disjoint_base, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_is_recursive_pair, m)?)?;
+    Ok(())
+}

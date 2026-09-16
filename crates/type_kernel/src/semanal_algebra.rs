@@ -837,3 +837,13 @@ mod tests {
         assert!(replace_implicit_first_type_inner(sig, &make_any(SPECIAL_FORM)).is_none());
     }
 }
+
+/// Register this module's Python-facing seam surface (#1677).
+pub(crate) fn register_registry(m: &PyModule) -> PyResult<()> {
+    m.add_function(wrap_pyfunction!(rust_make_any_non_explicit, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_make_any_non_unimported, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_replace_implicit_first_type, m)?)?;
+    Ok(())
+}

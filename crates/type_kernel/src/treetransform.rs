@@ -1803,3 +1803,10 @@ v.set_line(5)
         });
     }
 }
+
+/// Register this module's Python-facing seam surface (#1677).
+pub(crate) fn register_registry(m: &PyModule) -> PyResult<()> {
+    // Issue #536: TransformVisitor identity deep-copy port.
+    m.add_function(wrap_pyfunction!(rust_transform_copy, m)?)?;
+    Ok(())
+}

@@ -594,3 +594,10 @@ mod tests {
         assert!(erase_type(&Type::Overloaded { items: vec![] }, true, &res).is_none());
     }
 }
+
+/// Register this module's Python-facing seam surface (#1677).
+pub(crate) fn register_registry(m: &PyModule) -> PyResult<()> {
+    // Issue #432: overload-ambiguity approximate-similarity.
+    m.add_function(wrap_pyfunction!(rust_arg_approximate_similarity, m)?)?;
+    Ok(())
+}

@@ -242,3 +242,37 @@ pub fn rust_binder_suppress_unreachable_warnings() {
 pub fn rust_binder_frame_count() -> i64 {
     with_store(|s| s.frame_count())
 }
+
+/// Register this module's Python-facing seam surface (#1677).
+pub(crate) fn register_registry(m: &PyModule) -> PyResult<()> {
+    // Issue #527: binder.py pure helper (get_declaration).
+    m.add_function(wrap_pyfunction!(rust_get_declaration, m)?)?;
+
+    // H1b (wave 74): native binder frame-stack metadata store.
+    m.add_function(wrap_pyfunction!(rust_binder_new, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_binder_reset, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_binder_push_frame, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_binder_pop_frame, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_binder_is_unreachable, m)?)?;
+
+    m.add_function(wrap_pyfunction!(
+        rust_binder_is_unreachable_warning_suppressed,
+        m
+    )?)?;
+
+    m.add_function(wrap_pyfunction!(rust_binder_set_unreachable, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_binder_set_top_unreachable, m)?)?;
+
+    m.add_function(wrap_pyfunction!(
+        rust_binder_suppress_unreachable_warnings,
+        m
+    )?)?;
+
+    m.add_function(wrap_pyfunction!(rust_binder_frame_count, m)?)?;
+    Ok(())
+}

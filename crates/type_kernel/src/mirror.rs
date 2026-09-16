@@ -2230,3 +2230,79 @@ mod mirror_tests {
         });
     }
 }
+
+/// Register this module's Python-facing seam surface (#1677).
+pub(crate) fn register_registry(m: &PyModule) -> PyResult<()> {
+    // Phase F1 mirror: dual-write shadow storage + assert surface.
+    m.add_function(wrap_pyfunction!(rust_mirror_register, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_mirror_update, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_mirror_expect, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_mirror_bytes, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_mirror_family, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_mirror_parents, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_mirror_reset, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_mirror_entry_count, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_mirror_stable_alive, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_mirror_handle_of, m)?)?;
+
+    // Phase F3 write flip (#1397): field-granular splice into mirror storage.
+    m.add_function(wrap_pyfunction!(rust_mirror_patch_instance_args, m)?)?;
+
+    // Phase F3 slice 2 (#1397): `type` (type_ref) and `last_known_value`.
+    m.add_function(wrap_pyfunction!(rust_mirror_patch_instance_type, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_mirror_patch_instance_lkv, m)?)?;
+
+    // F3 close-out (#1527): `extra_attrs` (raw-record preserving splice).
+    m.add_function(wrap_pyfunction!(rust_mirror_patch_instance_extra_attrs, m)?)?;
+
+    // Phase F3 slice 6 (#1397): unprotected-write epoch stamps for the
+    // write-funnel assert skip.
+    m.add_function(wrap_pyfunction!(rust_mirror_write_skip, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_mirror_stamp_sync, m)?)?;
+
+    // Slice 7: Rust walk for types_mirror._walk_indices (reverse-index
+    // collection); Python keeps the apply steps.
+    m.add_function(wrap_pyfunction!(rust_mirror_walk_indices, m)?)?;
+
+    // Registration walk: the index lists plus the direct family children
+    // in `_child_types` order (one walk instead of a Python child scan +
+    // a Rust index walk per adopted object).
+    m.add_function(wrap_pyfunction!(rust_mirror_walk_registration, m)?)?;
+
+    // Slice 8: CallableType field-granular splice ops (same protocol as
+    // the Instance ops: stored blob on noop, new blob on change, None defers).
+    m.add_function(wrap_pyfunction!(rust_mirror_patch_callable_ret_type, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_mirror_patch_callable_arg_types, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_mirror_patch_callable_arg_kinds, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_mirror_patch_callable_arg_names, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_mirror_patch_callable_name, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_mirror_patch_callable_variables, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_mirror_patch_callable_opt_field, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_mirror_patch_callable_fallback, m)?)?;
+
+    m.add_function(wrap_pyfunction!(
+        rust_mirror_patch_callable_instance_type,
+        m
+    )?)?;
+
+    m.add_function(wrap_pyfunction!(rust_mirror_patch_callable_flags, m)?)?;
+    Ok(())
+}

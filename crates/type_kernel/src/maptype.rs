@@ -562,3 +562,16 @@ mod tests {
         assert!(subtypes_map("m.B", &left_args, "m.A", &resolver).is_none());
     }
 }
+
+/// Register this module's Python-facing seam surface (#1677).
+pub(crate) fn register_registry(m: &PyModule) -> PyResult<()> {
+    // Issue #425: maptype nominal supertype mapping (M8d).
+    m.add_function(wrap_pyfunction!(rust_map_instance_to_supertype, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_map_instance_to_supertypes, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_class_derivation_paths, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_map_instance_to_direct_supertypes, m)?)?;
+    Ok(())
+}

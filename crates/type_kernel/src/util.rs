@@ -1079,3 +1079,68 @@ mod tests {
         assert!(result.contains("\n"));
     }
 }
+
+/// Register this module's Python-facing seam surface (#1677).
+pub(crate) fn register_registry(m: &PyModule) -> PyResult<()> {
+    // Issue #533: pure utility functions from util.py.
+    m.add_function(wrap_pyfunction!(rust_is_dunder, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_is_sunder, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_split_module_names, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_module_prefix, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_split_target, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_short_type, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_find_python_encoding, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_bytes_to_human_readable_repr, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_decode_python_encoding, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_trim_source_line, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_get_mypy_comments, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_get_prefix, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_correct_relative_import, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_unmangle, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_get_unique_redefinition_name, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_count_stats, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_split_words, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_soft_wrap, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_hash_digest, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_hash_digest_bytes, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_hash_path_stem, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_is_sub_path_normabs, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_is_typeshed_file, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_is_stdlib_file, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_is_stub_package_file, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_unnamed_function, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_time_spent_us, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_plural_s, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_json_dumps, m)?)?;
+
+    m.add_class::<IdMapper>()?;
+    Ok(())
+}

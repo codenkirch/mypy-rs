@@ -3691,3 +3691,61 @@ mod check_unpacks_tests {
         assert_eq!(filter_variadic_unpacks(&[false, false]), (vec![0, 1], None));
     }
 }
+
+/// Register this module's Python-facing seam surface (#1677).
+pub(crate) fn register_registry(m: &PyModule) -> PyResult<()> {
+    // check_unpacks_in_list: filters non-tuple Unpack items from a type-arg
+    // list and reports the final unpack index. Python applies the fail and
+    // rebuilds the item list from the kept indices. None defers.
+    m.add_function(wrap_pyfunction!(rust_check_unpacks_in_list, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_has_explicit_any, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_has_any_from_unimported_type, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_collect_all_inner_types, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_make_optional_type, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_unknown_unpack, m)?)?;
+
+    // Issue #852: resolver-backed variants. TypeAliasType expands through
+    // the NativeTypeResolver alias snapshot instead of deferring; any
+    // undecidable expansion still returns None -> Python fallback.
+    m.add_function(wrap_pyfunction!(rust_has_explicit_any_live, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_has_any_from_unimported_type_live, m)?)?;
+
+    // Issue #1342: no-resolver variant for the pre-first-SCC semanal
+    // window; live-object walk shared with rust_find_self_type.
+    m.add_function(wrap_pyfunction!(
+        rust_has_any_from_unimported_type_live_noresolver,
+        m
+    )?)?;
+
+    m.add_function(wrap_pyfunction!(rust_collect_all_inner_types_live, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_make_optional_type_live, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_unknown_unpack_live, m)?)?;
+
+    // Issue #542: live-object query functions from typeanal.py.
+    m.add_function(wrap_pyfunction!(rust_find_self_type, m)?)?;
+
+    // Issue #1157: resolver-backed find_self_type with alias expansion.
+    m.add_function(wrap_pyfunction!(rust_find_self_type_live, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_validate_instance, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_check_vec_type_args, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_is_typevar_default_recursive, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_detect_diverging_alias, m)?)?;
+
+    // Hot path: mirrors TypeAnalyser.anal_type for already-bound types
+    // (Instance, Callable, TypeVar, Tuple, etc.). Returns None for types
+    // needing semantic context, matching Python's deferral semantics.
+    m.add_function(wrap_pyfunction!(rust_type_analyze, m)?)?;
+    Ok(())
+}

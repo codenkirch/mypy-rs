@@ -11598,3 +11598,26 @@ mod tests {
         }
     }
 }
+
+/// Register this module's Python-facing seam surface (#1677).
+pub(crate) fn register_registry(m: &PyModule) -> PyResult<()> {
+    m.add_function(wrap_pyfunction!(rust_trivial_join, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_trivial_meet, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_join_types, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_is_better, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_join_instances, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_meet_types, m)?)?;
+
+    // Issue #494: variadic-tuple join/meet cores.
+    m.add_function(wrap_pyfunction!(rust_join_tuples, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_meet_tuples, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_try_contracting_literals_in_union, m)?)?;
+    Ok(())
+}

@@ -3575,3 +3575,25 @@ mod tests {
         );
     }
 }
+
+/// Register this module's Python-facing seam surface (#1677).
+pub(crate) fn register_registry(m: &PyModule) -> PyResult<()> {
+    m.add_function(wrap_pyfunction!(rust_solve_one, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_is_trivial_bound, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_find_linear, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_join_sorted_key, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_get_vars, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_is_callable_protocol, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_solve_dependent, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_solve_constraints, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_infer_function_type_arguments, m)?)?;
+    Ok(())
+}

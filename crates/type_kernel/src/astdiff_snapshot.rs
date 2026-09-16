@@ -639,3 +639,10 @@ fn sequence_to_tuple(py: Python<'_>, seq: &PyAny) -> PyResult<PyObject> {
 pub(crate) fn tuple_from(py: Python<'_>, elements: Vec<PyObject>) -> PyObject {
     PyTuple::new(py, &elements).into()
 }
+
+/// Register this module's Python-facing seam surface (#1677).
+pub(crate) fn register_registry(m: &PyModule) -> PyResult<()> {
+    // B7 slice 1 (#1497): native astdiff type-snapshot builder.
+    m.add_function(wrap_pyfunction!(rust_snapshot_type, m)?)?;
+    Ok(())
+}

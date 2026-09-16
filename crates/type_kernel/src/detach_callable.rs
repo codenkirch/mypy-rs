@@ -78,3 +78,11 @@ pub(crate) fn rust_detach_callable(
 ) -> Option<Vec<Vec<u8>>> {
     detach_callable_inner(typ_bytes, class_type_vars_bytes)
 }
+
+/// Register this module's Python-facing seam surface (#1677).
+pub(crate) fn register_registry(m: &PyModule) -> PyResult<()> {
+    // detach_callable: extend a callable's variables with the class type
+    // variables it uses (mypy.checker).
+    m.add_function(wrap_pyfunction!(rust_detach_callable, m)?)?;
+    Ok(())
+}

@@ -620,3 +620,9 @@ mod tests {
         assert_eq!(out, alias);
     }
 }
+
+/// Register this module's Python-facing seam surface (#1677).
+pub(crate) fn register_registry(m: &PyModule) -> PyResult<()> {
+    m.add_function(wrap_pyfunction!(rust_dangerous_comparison, m)?)?;
+    Ok(())
+}

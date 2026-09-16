@@ -797,3 +797,10 @@ mod tests {
         assert!(out.is_none());
     }
 }
+
+/// Register this module's Python-facing seam surface (#1677).
+pub(crate) fn register_registry(m: &PyModule) -> PyResult<()> {
+    // checker.conditional_types (the isinstance/equality narrowing split).
+    m.add_function(wrap_pyfunction!(rust_conditional_types, m)?)?;
+    Ok(())
+}

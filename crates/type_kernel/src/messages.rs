@@ -4070,3 +4070,87 @@ mod tests {
         );
     }
 }
+
+/// Register this module's Python-facing seam surface (#1677).
+pub(crate) fn register_registry(m: &PyModule) -> PyResult<()> {
+    m.add_function(wrap_pyfunction!(rust_format_key_list, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_quote_type_string, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_capitalize, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_pretty_seq, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_format_string_list, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_format_item_name_list, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_wrong_type_arg_count, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_strip_quotes, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_extract_type, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_variance_string, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_format_type, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_format_type_bare, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_format_type_distinctly, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_append_invariance_notes, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_append_invariance_notes_live, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_append_numbers_notes, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_append_numbers_notes_live, m)?)?;
+
+    // Issue #982: make_inferred_type_note decision (messages.py:3770-3800).
+    m.add_function(wrap_pyfunction!(rust_make_inferred_type_note, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_make_inferred_type_note_live, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_append_union_note, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_pretty_callable, m)?)?;
+
+    // Callable name helpers — ports callable_name and for_function.
+    m.add_function(wrap_pyfunction!(rust_callable_name, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_for_function, m)?)?;
+
+    // Issue #358: dmypy server pure helper — count_stats from mypy/util.py
+    m.add_function(wrap_pyfunction!(rust_count_stats, m)?)?;
+
+    // Issue #438: pure string-message generators from mypy/messages.py
+    m.add_function(wrap_pyfunction!(rust_too_few_arguments, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_too_many_arguments, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_too_many_positional_arguments, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_missing_named_argument, m)?)?;
+
+    m.add_function(wrap_pyfunction!(
+        rust_unexpected_keyword_argument_for_function,
+        m
+    )?)?;
+
+    m.add_function(wrap_pyfunction!(rust_invalid_index_type, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_wrong_number_values_to_unpack, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_undefined_in_superclass, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_signatures_incompatible, m)?)?;
+
+    m.add_function(wrap_pyfunction!(
+        rust_signature_incompatible_with_supertype,
+        m
+    )?)?;
+
+    m.add_function(wrap_pyfunction!(rust_classify_has_no_attr, m)?)?;
+    Ok(())
+}

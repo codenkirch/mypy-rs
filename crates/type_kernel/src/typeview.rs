@@ -850,3 +850,22 @@ mod typeview_tests {
         });
     }
 }
+
+/// Register this module's Python-facing seam surface (#1677).
+pub(crate) fn register_registry(m: &PyModule) -> PyResult<()> {
+    // F reopening experiment (#1671): Rust-owned `Instance` field storage.
+    m.add_function(wrap_pyfunction!(rust_view_put, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_view_encode, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_view_args, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_view_touch, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_view_reset, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_view_count, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_view_stats, m)?)?;
+    Ok(())
+}

@@ -1024,3 +1024,29 @@ empty_set = SetExpr([])
         });
     }
 }
+
+/// Register this module's Python-facing seam surface (#1677).
+pub(crate) fn register_registry(m: &PyModule) -> PyResult<()> {
+    m.add_function(wrap_pyfunction!(rust_stubgen_render, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_stubgen_render_type_args, m)?)?;
+
+    // Issue #392: stubgen pure collectors.
+    m.add_function(wrap_pyfunction!(rust_get_assigned_names, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_is_none_expr, m)?)?;
+
+    m.add_function(wrap_pyfunction!(
+        rust_is_pybind11_overloaded_function_docstring,
+        m
+    )?)?;
+
+    m.add_function(wrap_pyfunction!(rust_method_name_sort_key, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_stubgen_get_qualified_name, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_stubgen_str_type_tag, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_stubgen_str_default, m)?)?;
+    Ok(())
+}

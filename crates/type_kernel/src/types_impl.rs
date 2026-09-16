@@ -1730,3 +1730,41 @@ mod tests {
         assert_eq!(chain_resolve_alias_target(&a, &aliases), None);
     }
 }
+
+/// Register this module's Python-facing seam surface (#1677).
+pub(crate) fn register_registry(m: &PyModule) -> PyResult<()> {
+    // Issue #456: pure Type object-model methods (can_be_true/false_default,
+    // CallableType accessors, TupleType/UnionType length).
+    m.add_function(wrap_pyfunction!(rust_can_be_true_default, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_can_be_false_default, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_callable_min_args, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_callable_is_var_arg, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_callable_is_kw_arg, m)?)?;
+
+    m.add_function(wrap_pyfunction!(
+        rust_callable_max_possible_positional_args,
+        m
+    )?)?;
+
+    m.add_function(wrap_pyfunction!(rust_callable_is_generic, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_tuple_length, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_union_length, m)?)?;
+
+    // Issue #854: resolver-enabled truthiness defaults (can_be_any_bool,
+    // alias-target delegation, enum literals).
+    extension_seams::add_seams(m)?;
+
+    // Issue #487: CallableType/Parameters arg-query helpers.
+    m.add_function(wrap_pyfunction!(rust_callable_formal_arguments, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_callable_argument_by_name, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_callable_argument_by_position, m)?)?;
+    Ok(())
+}

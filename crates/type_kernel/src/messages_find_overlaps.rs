@@ -382,3 +382,10 @@ mod tests {
         assert!(got.contains("m.List"));
     }
 }
+
+/// Register this module's Python-facing seam surface (#1677).
+pub(crate) fn register_registry(m: &PyModule) -> PyResult<()> {
+    // Issue #749: find_type_overlaps (messages.py:3055-3079).
+    m.add_function(wrap_pyfunction!(rust_find_type_overlaps, m)?)?;
+    Ok(())
+}

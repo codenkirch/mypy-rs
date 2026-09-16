@@ -1064,3 +1064,20 @@ mod tests {
         // test suite (testtypes.py, testcheck.py) with the gate on.
     }
 }
+
+/// Register this module's Python-facing seam surface (#1677).
+pub(crate) fn register_registry(m: &PyModule) -> PyResult<()> {
+    // Issue #539: fixup.py NodeFixer/TypeFixer port.
+    m.add_function(wrap_pyfunction!(rust_fixup_type, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_fixup_type_info, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_resolve_cross_ref, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_fixup_symbol_table, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_fixup_overloaded_func_def, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_fixup_decorator, m)?)?;
+    Ok(())
+}

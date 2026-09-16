@@ -1470,3 +1470,13 @@ mod tests {
         assert!(matches!(got, Type::UninhabitedType { ambiguous: false }));
     }
 }
+
+/// Register this module's Python-facing seam surface (#1677).
+pub(crate) fn register_registry(m: &PyModule) -> PyResult<()> {
+    m.add_function(wrap_pyfunction!(rust_apply_generic_arguments, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_has_no_typevars, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_get_target_type, m)?)?;
+    Ok(())
+}

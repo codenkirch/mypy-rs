@@ -1216,3 +1216,42 @@ mod tests {
         assert_eq!(count, 0);
     }
 }
+
+/// Register this module's Python-facing seam surface (#1677).
+pub(crate) fn register_registry(m: &PyModule) -> PyResult<()> {
+    m.add_function(wrap_pyfunction!(rust_has_return_statement, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_has_str_expression, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_has_yield_expression, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_has_yield_from_expression, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_has_await_expression, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_has_await_in_generator, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_count_return_statements, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_count_yield_expressions, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_count_yield_from_expressions, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_count_name_and_member_expressions, m)?)?;
+
+    // Issue #541: remaining traverser seekers.
+    m.add_function(wrap_pyfunction!(rust_count_return_statements_and_flags, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_count_all_returns, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_has_yield_return, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_has_complex_slice, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_count_non_extension_handlers, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_is_global_expr, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_count_non_literal_handlers, m)?)?;
+    Ok(())
+}

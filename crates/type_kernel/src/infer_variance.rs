@@ -368,3 +368,12 @@ mod tests {
         assert_eq!(resolver_ref(&mut empty_resolver()).len(), 0);
     }
 }
+
+/// Register this module's Python-facing seam surface (#1677).
+pub(crate) fn register_registry(m: &PyModule) -> PyResult<()> {
+    // infer_variance member-direction analysis (mypy.subtypes). The shim
+    // keeps the variance loop, per-member this computes the co/contra flip
+    // bitmask or defers (None) to the pure-Python member body.
+    m.add_function(wrap_pyfunction!(rust_infer_variance_member, m)?)?;
+    Ok(())
+}

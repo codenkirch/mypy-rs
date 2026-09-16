@@ -424,3 +424,10 @@ mod tests {
         assert_eq!(covers_at_runtime_inner(&item, &sup, true, &res), None);
     }
 }
+
+/// Register this module's Python-facing seam surface (#1677).
+pub(crate) fn register_registry(m: &PyModule) -> PyResult<()> {
+    // Issue #745: subtypes.covers_at_runtime (runtime isinstance coverage).
+    m.add_function(wrap_pyfunction!(rust_covers_at_runtime, m)?)?;
+    Ok(())
+}

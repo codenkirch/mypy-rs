@@ -570,3 +570,11 @@ mod tests {
         );
     }
 }
+
+/// Register this module's Python-facing seam surface (#1677).
+pub(crate) fn register_registry(m: &PyModule) -> PyResult<()> {
+    // #1087: checker.comparison_type_narrowing_helper operand front
+    // (per-operand narrowability classification from wire types).
+    m.add_function(wrap_pyfunction!(rust_classify_comparison_operands, m)?)?;
+    Ok(())
+}

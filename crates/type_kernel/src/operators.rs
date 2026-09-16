@@ -478,3 +478,9 @@ mod tests {
         assert_eq!(neg_op("+"), None);
     }
 }
+
+/// Register this module's Python-facing seam surface (#1677).
+pub(crate) fn register_registry(m: &PyModule) -> PyResult<()> {
+    m.add_function(wrap_pyfunction!(rust_operator_tables, m)?)?;
+    Ok(())
+}

@@ -1110,3 +1110,11 @@ mod tests {
         }
     }
 }
+
+/// Register this module's Python-facing seam surface (#1677).
+pub(crate) fn register_registry(m: &PyModule) -> PyResult<()> {
+    m.add_function(wrap_pyfunction!(rust_erase_typevars, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_replace_meta_vars, m)?)?;
+    Ok(())
+}

@@ -157,3 +157,9 @@ pub(crate) fn rust_classify_type_expression(
         _ => Ok(None),
     }
 }
+
+/// Register this module's Python-facing seam surface (#1677).
+pub(crate) fn register_registry(m: &PyModule) -> PyResult<()> {
+    m.add_function(wrap_pyfunction!(rust_classify_type_expression, m)?)?;
+    Ok(())
+}

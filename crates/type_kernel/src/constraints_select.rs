@@ -841,3 +841,18 @@ mod tests {
         assert_eq!(merged.extra_tvars[0], rep.extra_tvars[0]);
     }
 }
+
+/// Register this module's Python-facing seam surface (#1677).
+pub(crate) fn register_registry(m: &PyModule) -> PyResult<()> {
+    m.add_function(wrap_pyfunction!(rust_any_constraints, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_repack_callable_args, m)?)?;
+
+    // Issue #1001: standalone constraint-list helper seams.
+    m.add_function(wrap_pyfunction!(rust_merge_with_any, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_filter_satisfiable, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_is_same_constraints, m)?)?;
+    Ok(())
+}

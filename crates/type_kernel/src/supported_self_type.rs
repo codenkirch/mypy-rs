@@ -147,3 +147,10 @@ fn instance_supported(
     }
     Some(false)
 }
+
+/// Register this module's Python-facing seam surface (#1677).
+pub(crate) fn register_registry(m: &PyModule) -> PyResult<()> {
+    // Stage 3e: typeops.supported_self_type (explicit self-type predicate).
+    m.add_function(wrap_pyfunction!(rust_supported_self_type, m)?)?;
+    Ok(())
+}

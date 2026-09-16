@@ -4028,3 +4028,18 @@ info.mro = [Cls()]
         }
     }
 }
+
+/// Register this module's Python-facing seam surface (#1677).
+pub(crate) fn register_registry(m: &PyModule) -> PyResult<()> {
+    // Issue #477: checker narrowing + type-validation pure helpers.
+    m.add_function(wrap_pyfunction!(rust_custom_special_method, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_has_custom_eq_checks, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_restrict_subtype_away, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_join_type_list, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_get_protocol_member, m)?)?;
+    Ok(())
+}

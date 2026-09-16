@@ -1271,3 +1271,15 @@ mod tests {
         assert!(result.is_none());
     }
 }
+
+/// Register this module's Python-facing seam surface (#1677).
+pub(crate) fn register_registry(m: &PyModule) -> PyResult<()> {
+    // Issue #473: check_argument_count + check_call_expr_with_callee_type
+    // pure dispatch (decision records, no message emission).
+    m.add_function(wrap_pyfunction!(rust_check_argument_count, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_check_call_expr_callable_name, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_should_dispatch_union_call, m)?)?;
+    Ok(())
+}

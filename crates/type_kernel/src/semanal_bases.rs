@@ -898,3 +898,26 @@ mod tests {
         assert_ne!(MRO_ANY, MRO_PROCEED);
     }
 }
+
+/// Register this module's Python-facing seam surface (#1677).
+pub(crate) fn register_registry(m: &PyModule) -> PyResult<()> {
+    m.add_function(wrap_pyfunction!(rust_clean_up_bases, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_is_magic_base, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_is_core_builtin_class, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_classify_with_metaclass, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_classify_add_metaclass, m)?)?;
+
+    // semanal_bases: configure_base_classes per-base classifier + MRO tail.
+    // Rust owns the wire classification and MRO tag; fails, fallback_to_any,
+    // info.bases, configure_tuple_base_class, and the mro writes stay in Python.
+    m.add_function(wrap_pyfunction!(rust_classify_configure_bases, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_classify_configure_mro, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_classify_lvalue_validity, m)?)?;
+    Ok(())
+}

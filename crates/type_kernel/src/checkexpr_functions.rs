@@ -8605,3 +8605,131 @@ mod compute_arg_context_indices_tests {
         assert_eq!(out, None);
     }
 }
+
+/// Register this module's Python-facing seam surface (#1677).
+pub(crate) fn register_registry(m: &PyModule) -> PyResult<()> {
+    m.add_function(wrap_pyfunction!(rust_has_abstract_type, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_has_any_type, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_has_uninhabited_component, m)?)?;
+
+    m.add_function(wrap_pyfunction!(
+        rust_has_ambiguous_uninhabited_component,
+        m
+    )?)?;
+
+    m.add_function(wrap_pyfunction!(rust_has_erased_component, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_allow_fast_container_literal, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_has_bytes_component, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_has_bool_item, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_is_non_empty_tuple, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_has_coroutine_decorator, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_is_async_def, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_is_duplicate_mapping, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_is_typed_callable, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_is_private, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_is_operator_method, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_are_argument_counts_overlapping, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_is_type_type_context, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_is_valid_var_arg, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_is_valid_keyword_var_arg, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_try_getting_literal, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_is_string_literal, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_is_untyped_decorator, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_is_typeddict_type_context, m)?)?;
+
+    // Issue #980: RefExpr -> TypedDict target predicate; unregistered on
+    // main, which disabled the whole checkexpr kernel block on import.
+    m.add_function(wrap_pyfunction!(rust_refers_to_typeddict, m)?)?;
+
+    // Issue #486: tuple-index / tuple-slice helpers.
+    m.add_function(wrap_pyfunction!(rust_try_getting_int_literals, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_visit_tuple_index_helper, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_visit_tuple_slice_helper, m)?)?;
+
+    // M8c: visit_conditional_expr / visit_star_expr helpers.
+    m.add_function(wrap_pyfunction!(rust_conditional_expr_join, m)?)?;
+
+    // Issue #385: container-literal fast paths.
+    m.add_function(wrap_pyfunction!(rust_container_type, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_tuple_context_matches, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_build_tuple_type, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_analyze_cond_branch, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_star_expr, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_method_fullname, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_is_enum_callable_base, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_classify_protocol_test_callee, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_classify_typeddict_call, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_refers_to_typeddict, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_classify_reveal_imported, m)?)?;
+
+    // Issue #956: _super_arg_types stage-1 dispatch. Rust classifies the
+    // arity + scope gate into a branch tag; the fail / fill_typevars /
+    // accept side effects and stage 2 stay in Python.
+    m.add_function(wrap_pyfunction!(rust_classify_super_arg_types, m)?)?;
+
+    // Issue #1064: infer_arg_types_in_context index decision. Rust returns
+    // the formal-index-per-actual map (star args skipped); the accept
+    // recursion and the infer_unions toggle stay in Python.
+    m.add_function(wrap_pyfunction!(rust_compute_arg_context_indices, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_classify_visit_op_expr, m)?)?;
+
+    // Issue #1048: check_arg decision head. Rust classifies the 4-way
+    // dispatch (DeletedType / abstract-only / incompatible / pass) from
+    // the wire caller type; message emission stays in Python.
+    m.add_function(wrap_pyfunction!(rust_classify_check_arg, m)?)?;
+
+    // Issue #1049: check_boolean_op decision head. Rust classifies the
+    // unreachable-map branch and the result tail; find_isinstance_check,
+    // analyze_cond_branch, the msg emissions, make_simplified_union stay in Python.
+    m.add_function(wrap_pyfunction!(rust_classify_check_boolean_op, m)?)?;
+
+    // Issue #999: visit_index_with_type dispatch head. Rust classifies the
+    // left_type branch from PyO3 facts; the fail/note tails and branch
+    // bodies (incl. the tuple sub-dispatch) stay in Python.
+    m.add_function(wrap_pyfunction!(rust_classify_index_with_type, m)?)?;
+
+    // Issue #458: pure checkexpr visitor identity/constant methods.
+    m.add_function(wrap_pyfunction!(rust_visit_temp_node, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_visit_promote_expr, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_visit_paramspec_expr, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_visit_type_var_tuple_expr, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_visit_newtype_expr, m)?)?;
+    Ok(())
+}

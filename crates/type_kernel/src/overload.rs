@@ -1038,3 +1038,11 @@ mod pair_flip_tests {
         ));
     }
 }
+
+/// Register this module's Python-facing seam surface (#1677).
+pub(crate) fn register_registry(m: &PyModule) -> PyResult<()> {
+    m.add_function(wrap_pyfunction!(rust_check_overload_call, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_find_matching_overload_items, m)?)?;
+    Ok(())
+}

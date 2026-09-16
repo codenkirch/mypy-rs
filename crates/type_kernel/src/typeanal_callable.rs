@@ -134,3 +134,12 @@ mod tests {
         assert_eq!(classify(1, true, true, false), Some(TAG_INVALID_ALLOW));
     }
 }
+
+/// Register this module's Python-facing seam surface (#1677).
+pub(crate) fn register_registry(m: &PyModule) -> PyResult<()> {
+    // analyze_callable_type: two-level dispatch (arity + arg0 kind). Rust
+    // returns a branch tag from scalar facts; Python builds the live
+    // CallableType / enters tvar_scope / emits fail/note.
+    m.add_function(wrap_pyfunction!(rust_classify_analyze_callable_type, m)?)?;
+    Ok(())
+}

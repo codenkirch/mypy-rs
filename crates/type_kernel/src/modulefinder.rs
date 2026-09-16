@@ -820,3 +820,31 @@ impl BuildSourceSet {
         Ok(self.source_text_present)
     }
 }
+
+/// Register this module's Python-facing seam surface (#1677).
+pub(crate) fn register_registry(m: &PyModule) -> PyResult<()> {
+    m.add_function(wrap_pyfunction!(rust_is_init_file, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_parse_version, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_mypy_path, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_typeshed_py_version, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_default_lib_path, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_load_stdlib_py_versions, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_matches_exclude, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_get_search_dirs, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_compute_search_paths, m)?)?;
+
+    m.add_class::<SearchPaths>()?;
+
+    m.add_class::<BuildSource>()?;
+
+    m.add_class::<BuildSourceSet>()?;
+    Ok(())
+}

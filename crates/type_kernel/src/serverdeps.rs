@@ -1842,3 +1842,74 @@ typ = NoneType()
         });
     }
 }
+
+/// Register this module's Python-facing seam surface (#1677).
+pub(crate) fn register_registry(m: &PyModule) -> PyResult<()> {
+    // Issue #1007: attribute_triggers port (member triggers for attribute access)
+    m.add_function(wrap_pyfunction!(rust_attribute_triggers, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_get_type_triggers, m)?)?;
+
+    // M354: pure server trigger/target computation
+    m.add_function(wrap_pyfunction!(rust_compute_wildcard_triggers, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_compute_target_modules, m)?)?;
+
+    // M388: pure server update helpers (dedupe_modules, get_sources, message extraction)
+    m.add_function(wrap_pyfunction!(rust_dedupe_modules, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_get_module_to_path_map, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_get_sources, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_extract_fnam_from_message, m)?)?;
+
+    m.add_function(wrap_pyfunction!(
+        rust_extract_possible_fnam_from_message,
+        m
+    )?)?;
+
+    m.add_function(wrap_pyfunction!(
+        rust_sort_messages_preserving_file_order,
+        m
+    )?)?;
+
+    m.add_function(wrap_pyfunction!(rust_find_relative_leaf_module, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_find_unloaded_deps, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_target_from_node, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_merge_dependencies, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_non_trivial_bases, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_has_user_bases, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_compare_symbol_table_snapshots, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_is_expr_literal_type, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_get_partial_instance_type, m)?)?;
+
+    // Issue #389: dmypy_server pure helpers — plain-record shuffling.
+    m.add_function(wrap_pyfunction!(rust_process_start_options, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_ignore_suppressed_imports, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_get_meminfo, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_response_metadata, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_find_all_sources_in_build, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_add_all_sources_to_changed, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_fix_module_deps, m)?)?;
+
+    m.add_function(wrap_pyfunction!(
+        rust_filter_out_missing_top_level_packages,
+        m
+    )?)?;
+    Ok(())
+}

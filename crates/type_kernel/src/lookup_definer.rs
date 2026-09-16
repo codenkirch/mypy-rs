@@ -146,3 +146,11 @@ mod lookup_definer_tests {
         assert_eq!(lookup_definer_fold(entries.into_iter()), None);
     }
 }
+
+/// Register this module's Python-facing seam surface (#1677).
+pub(crate) fn register_registry(m: &PyModule) -> PyResult<()> {
+    // Issue #1075: lookup_definer live-object MRO walk. Rust reads
+    // typ.type.mro via PyO3 (zero wire bytes); any unreadable fact defers.
+    m.add_function(wrap_pyfunction!(rust_lookup_definer, m)?)?;
+    Ok(())
+}

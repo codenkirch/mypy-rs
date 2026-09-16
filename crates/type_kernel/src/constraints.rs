@@ -5668,3 +5668,17 @@ mod tests {
         assert_eq!(res, Some(vec![]));
     }
 }
+
+/// Register this module's Python-facing seam surface (#1677).
+pub(crate) fn register_registry(m: &PyModule) -> PyResult<()> {
+    m.add_function(wrap_pyfunction!(rust_infer_constraints, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_infer_constraints_full, m)?)?;
+
+    // Issue #490: callable-arguments constraint inference.
+    m.add_function(wrap_pyfunction!(
+        rust_infer_callable_arguments_constraints,
+        m
+    )?)?;
+    Ok(())
+}

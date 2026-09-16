@@ -7396,3 +7396,225 @@ pub(crate) fn rust_literal_int_expr(
     }
     Ok(Some((1, value.into())))
 }
+
+/// Register this module's Python-facing seam surface (#1677).
+pub(crate) fn register_registry(m: &PyModule) -> PyResult<()> {
+    // checker_functions: check_compatibility_final_super decision-head port.
+    // Rust classifies the final-super override into a branch tag; the message
+    // emission and writability side effects stay in Python.
+    m.add_function(wrap_pyfunction!(rust_classify_final_super, m)?)?;
+
+    // checker_functions: check_final decision-head port. Rust classifies
+    // the final_without_value gate and the per-lvalue MRO/is_final
+    // arbitration; the message emissions stay in Python.
+    m.add_function(wrap_pyfunction!(rust_classify_check_final, m)?)?;
+
+    // checker_functions: check_compatibility_classvar_super 2x2 predicate port.
+    // Rust classifies the classvar override into a branch tag; the message
+    // emission stays in Python.
+    m.add_function(wrap_pyfunction!(rust_classify_classvar_super, m)?)?;
+
+    // checker_functions: check_compatibility_all_supers gate-head port.
+    // Rust classifies the entry gate + per-base MRO skip decisions into
+    // tags; the check bodies and message emission stay in Python.
+    m.add_function(wrap_pyfunction!(rust_classify_all_supers_gate, m)?)?;
+
+    // checker_functions: check___new___signature 3-way return-type port.
+    // Rust classifies metaclass / non-instance / instance from two scalar
+    // facts; the check_subtype calls and message emission stay in Python.
+    m.add_function(wrap_pyfunction!(rust_classify_new_signature, m)?)?;
+
+    // checker_functions: check_getattr_method 4-way dispatch-head port.
+    // Rust classifies module/getattribute/class/pass from Scope facts.
+    m.add_function(wrap_pyfunction!(rust_classify_getattr_method, m)?)?;
+
+    // checker_functions: check_func_def_override 5-way dispatch port. Rust
+    // classifies the override into a branch tag from scalar facts; bodies stay
+    // in Python.
+    m.add_function(wrap_pyfunction!(rust_classify_func_def_override, m)?)?;
+
+    // Issue #1634: _make_named_statement_for_match 3-way head. Rust
+    // classifies can_put_directly / has_dummy / make_dummy; the dummy
+    // NameExpr+Var creation stays in Python.
+    m.add_function(wrap_pyfunction!(rust_classify_match_subject_head, m)?)?;
+
+    // checker_functions: check_metaclass_compatibility decision-head port.
+    // Rust classifies the exempt/conflict predicate into a branch tag; the
+    // METACLASS fail + note stay in Python.
+    m.add_function(wrap_pyfunction!(rust_classify_metaclass_compat, m)?)?;
+
+    // Issue #923: check_enum_new per-base fold. Rust classifies each
+    // base into SKIP/ADVANCE/CONFLICT; self.fail and has_new stay Python.
+    m.add_function(wrap_pyfunction!(rust_classify_enum_new, m)?)?;
+
+    // Issue #937: check_enum_bases fold. Rust classifies the first
+    // non-enum base after an enum base; self.fail stays Python.
+    m.add_function(wrap_pyfunction!(rust_classify_enum_bases, m)?)?;
+
+    // Issue #971: check_enum multi-arm classifier. Rust classifies the
+    // three arms (a/b/c) and returns bit flags + offending base names;
+    // self.fail/note stay Python.
+    m.add_function(wrap_pyfunction!(rust_classify_enum, m)?)?;
+
+    // Issue #936: is_final_enum_value pure bool predicate. Rust reads the
+    // live SymbolTableNode via PyO3 and returns the bool directly.
+    m.add_function(wrap_pyfunction!(rust_is_final_enum_value, m)?)?;
+
+    // Issue #1071: is_writable_attribute pure bool predicate. Rust reads
+    // the live node via PyO3 and returns the bool directly.
+    m.add_function(wrap_pyfunction!(rust_is_writable_attribute, m)?)?;
+
+    // Issue #1601: is_defined_in_base_class pure bool predicate. Rust
+    // reads the live Var via PyO3 and returns the bool directly.
+    m.add_function(wrap_pyfunction!(rust_is_defined_in_base_class, m)?)?;
+
+    // Issue #1603: is_definition pure bool predicate. Rust reads the
+    // live Lvalue via PyO3 and returns the bool directly.
+    m.add_function(wrap_pyfunction!(rust_is_definition, m)?)?;
+
+    // H1h: is_len_of_tuple AST-shape front (early-return front, defers to Python).
+    m.add_function(wrap_pyfunction!(rust_is_len_of_tuple, m)?)?;
+
+    // Issue #1597: check__exit__return_type decision. Rust reads the
+    // live FuncItem via PyO3 and returns Some(true) when all returns are
+    // builtins.False; the message emission stays Python-side.
+    m.add_function(wrap_pyfunction!(rust_check_exit_return_type, m)?)?;
+
+    // Issue H1d: check_final_deletable pure fold over deletable_attributes.
+    m.add_function(wrap_pyfunction!(rust_check_final_deletable, m)?)?;
+
+    // H1p: is_base_class pure graph walk on TypeInfo.bases. Rust reads
+    // the live TypeInfo objects via PyO3 and returns the bool directly.
+    m.add_function(wrap_pyfunction!(rust_is_base_class, m)?)?;
+
+    // Issue #1079: infer_operator_assignment_method decision; Rust reads the
+    // live proper type and returns (is_inplace, method). get_proper_type and
+    // the ops_with_inplace_method membership stay shim-side.
+    m.add_function(wrap_pyfunction!(rust_infer_operator_assignment_method, m)?)?;
+
+    // Issue #942: check_for_untyped_decorator conjunction port. Rust folds
+    // the disallow/typed-callback/untyped-decorator/not-deferred bool gate on
+    // the wire format; the message emission stays in Python.
+    m.add_function(wrap_pyfunction!(rust_check_for_untyped_decorator, m)?)?;
+
+    // Issue #939: check_explicit_override_decorator 5-flag conjunction.
+    // Rust evaluates the predicate; message emission stays in Python.
+    m.add_function(wrap_pyfunction!(rust_check_explicit_override_decorator, m)?)?;
+
+    // Issue #955: check_lvalue dispatch port. Rust classifies the lvalue
+    // node kind into a branch tag; the per-branch bodies stay in Python.
+    m.add_function(wrap_pyfunction!(rust_classify_check_lvalue, m)?)?;
+
+    // Issue #986: check_match_args predicate port. Rust reads one wire
+    // Type and returns the TupleType + string-literal bool; the
+    // active_class gate and note emission stay in Python.
+    m.add_function(wrap_pyfunction!(rust_check_match_args, m)?)?;
+
+    // Issue #1606: is_valid_defaultdict_partial_value_type wire-type
+    // seam. Rust decodes the proper type and returns the bool; the
+    // old_type_inference flag is passed from Python.
+    m.add_function(wrap_pyfunction!(
+        rust_is_valid_defaultdict_partial_value_type,
+        m
+    )?)?;
+
+    // H1i: is_assignable_slot live-PyO3 seam. Rust handles the non-Union
+    // cases (definition check, Any, Instance __set__, FunctionLike);
+    // defers on UnionType (Python recurses).
+    m.add_function(wrap_pyfunction!(rust_is_assignable_slot, m)?)?;
+
+    // H1j: is_noop_for_reachability live-PyO3 seam. Rust handles
+    // the pure bool predicate over the AST node kind.
+    m.add_function(wrap_pyfunction!(rust_is_noop_for_reachability, m)?)?;
+
+    // H1m: check_incompatible_property_override live-PyO3 seam. Rust
+    // walks the MRO for a read-only property overriding a settable one.
+    m.add_function(wrap_pyfunction!(
+        rust_check_incompatible_property_override,
+        m
+    )?)?;
+
+    // Issue #1050: type_check_raise decision-head port. Rust classifies
+    // the deleted / not-implemented arbitration into a branch tag; the
+    // fail emissions and the check_call recursion stay in Python.
+    m.add_function(wrap_pyfunction!(rust_classify_type_check_raise, m)?)?;
+
+    // Issue #1003: check_rvalue_count_in_assignment dispatch port. Rust
+    // classifies the arity/star decision into a branch tag; the fail and
+    // wrong-number messages stay in Python.
+    m.add_function(wrap_pyfunction!(rust_classify_rvalue_count, m)?)?;
+
+    // Issue #1634: analyze_range_native_int_type entry gate. Rust
+    // classifies the 5-part conjunction (CallExpr + RefExpr callee +
+    // builtins.range + 1-3 args + all ARG_POS); stays in Python.
+    m.add_function(wrap_pyfunction!(rust_classify_range_int_gate, m)?)?;
+
+    // Issue #1010: check_for_truthy_type decision-head port. Rust
+    // classifies the strict-optional truthiness arbitration into a
+    // branch tag; the format_type messages and fail emission stay in Python.
+    m.add_function(wrap_pyfunction!(rust_classify_truthy_type, m)?)?;
+
+    // Issue #1004: check_return_stmt two-phase decision port; the accept()
+    // call and the fail/note emissions stay in Python.
+    m.add_function(wrap_pyfunction!(rust_classify_return_stmt_variant, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_classify_return_stmt_pre, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_classify_return_stmt_post, m)?)?;
+
+    // Issue #1009: check_for_missing_annotations decision-head port. Rust
+    // arbitrates the annotation-completeness gates; the fail/note emission
+    // stays in Python. Tag contract in checker_functions.rs.
+    m.add_function(wrap_pyfunction!(rust_classify_missing_annotations, m)?)?;
+
+    // Issue #1055: check_simple_assignment decision-head port. Rust
+    // arbitrates the stub / direct / fallback-context dispatch; the accept
+    // recursion and the Python-side blocks stay in Python (see checker_functions.rs).
+    m.add_function(wrap_pyfunction!(rust_classify_simple_assignment, m)?)?;
+
+    // Issue #1090: check_assignment decision-front port. Rust arbitrates
+    // the special-name front and the lvalue_type branch; arm bodies stay
+    // in Python (see checker_functions.rs).
+    m.add_function(wrap_pyfunction!(rust_classify_check_assignment, m)?)?;
+
+    // Issue #1086: find_isinstance_check_helper dispatch head. Rust reads
+    // the live callee via PyO3 (zero wire bytes) and classifies the
+    // builtin-callee arm; arm bodies stay in Python, unreadable facts defer.
+    m.add_function(wrap_pyfunction!(rust_classify_find_isinstance_head, m)?)?;
+
+    // H1k: is_literal_enum decision. Rust reads the two resolved proper
+    // types via PyO3 and returns the bool; the type lookups stay shim-side.
+    m.add_function(wrap_pyfunction!(rust_is_literal_enum, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_classify_unbound_return_typevar, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_check_untyped_after_decorator, m)?)?;
+
+    // H1n: can_widen_in_scope pure bool predicate. Rust reads the live
+    // NameExpr kind, calls scope.top_level_function(), and checks
+    // get_proper_type(orig_type) is NoneType via PyO3.
+    m.add_function(wrap_pyfunction!(rust_can_widen_in_scope, m)?)?;
+
+    // H1q: is_overloaded_item pure isinstance + identity check.
+    m.add_function(wrap_pyfunction!(rust_is_overloaded_item, m)?)?;
+
+    // H1r: is_self_member_ref pure isinstance + attribute check.
+    m.add_function(wrap_pyfunction!(rust_is_self_member_ref, m)?)?;
+
+    // H1s: is_type_like pure isinstance check.
+    m.add_function(wrap_pyfunction!(rust_is_type_like, m)?)?;
+
+    // H1d cluster (#1672): live-object decision heads, zero wire bytes.
+    // should_report_unreachable_issues inlines in_checked_function.
+    m.add_function(wrap_pyfunction!(rust_should_report_unreachable_issues, m)?)?;
+
+    // refers_to_different_scope: live NameExpr + Scope + MypyFile.
+    m.add_function(wrap_pyfunction!(rust_refers_to_different_scope, m)?)?;
+
+    // flatten_lvalues: recursive live read of the lvalue sequence.
+    m.add_function(wrap_pyfunction!(rust_flatten_lvalues, m)?)?;
+
+    // literal_int_expr: live _type_maps scan + literal classification.
+    m.add_function(wrap_pyfunction!(rust_literal_int_expr, m)?)?;
+    Ok(())
+}

@@ -219,3 +219,12 @@ mod findmember_tests {
         );
     }
 }
+
+/// Register this module's Python-facing seam surface (#1677).
+pub(crate) fn register_registry(m: &PyModule) -> PyResult<()> {
+    // Issue #1074: find_member prelude live-object port. Rust classifies
+    // the miss path into PROCEED / ANY_SPECIAL_FORM / EXTRA_ATTR /
+    // NOT_FOUND; Python applies the verdicts, unreadable facts defer.
+    m.add_function(wrap_pyfunction!(rust_classify_find_member, m)?)?;
+    Ok(())
+}

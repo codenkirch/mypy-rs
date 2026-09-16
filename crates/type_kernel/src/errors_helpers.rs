@@ -190,3 +190,10 @@ mod tests {
         assert_eq!(res, vec!["f.py:1: note: msg"]);
     }
 }
+
+/// Register this module's Python-facing seam surface (#1677).
+pub(crate) fn register_registry(m: &PyModule) -> PyResult<()> {
+    // Issue #534: pure helpers from mypy/errors.py.
+    m.add_function(wrap_pyfunction!(rust_format_messages_default_pretty, m)?)?;
+    Ok(())
+}

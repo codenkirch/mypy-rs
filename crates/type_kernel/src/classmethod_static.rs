@@ -71,3 +71,11 @@ pub(crate) fn rust_is_classmethod_node(py: Python<'_>, node: &PyAny) -> PyResult
 pub(crate) fn rust_is_node_static(py: Python<'_>, node: &PyAny) -> PyResult<Option<bool>> {
     node_flag(py, node, "is_static", "is_staticmethod")
 }
+
+/// Register this module's Python-facing seam surface (#1677).
+pub(crate) fn register_registry(m: &PyModule) -> PyResult<()> {
+    m.add_function(wrap_pyfunction!(rust_is_classmethod_node, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_is_node_static, m)?)?;
+    Ok(())
+}

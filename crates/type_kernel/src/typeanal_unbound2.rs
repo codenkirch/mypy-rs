@@ -641,3 +641,12 @@ mod tests {
         assert_eq!(classify(&f), Some(TAG_TVT_OK));
     }
 }
+
+/// Register this module's Python-facing seam surface (#1677).
+pub(crate) fn register_registry(m: &PyModule) -> PyResult<()> {
+    // visit_unbound_type_nonoptional: decision front (placeholder, node-None,
+    // ParamSpec / TypeVar / TypeVarTuple families). Rust returns a branch
+    // tag; Python applies effects, None defers to pure Python.
+    m.add_function(wrap_pyfunction!(rust_classify_unbound_front, m)?)?;
+    Ok(())
+}

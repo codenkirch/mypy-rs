@@ -512,3 +512,15 @@ mod tests {
         assert_eq!(names_kinds.1, vec![0]);
     }
 }
+
+/// Register this module's Python-facing seam surface (#1677).
+pub(crate) fn register_registry(m: &PyModule) -> PyResult<()> {
+    // Stage 30: dataclasses plugin transform seam (Issue #356). Computes
+    // the `__init__` argument names/kinds from serialized field metadata;
+    // Python validates and applies the AST mutation.
+    m.add_function(wrap_pyfunction!(rust_dataclass_transform, m)?)?;
+
+    // Issue #393: sibling seam for `__post_init__` (InitVar fields only).
+    m.add_function(wrap_pyfunction!(rust_dataclass_post_init_transform, m)?)?;
+    Ok(())
+}

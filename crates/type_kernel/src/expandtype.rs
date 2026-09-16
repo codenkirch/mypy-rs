@@ -3159,3 +3159,13 @@ mod tests {
         assert!(matches!(out, Type::AnyType { .. }));
     }
 }
+
+/// Register this module's Python-facing seam surface (#1677).
+pub(crate) fn register_registry(m: &PyModule) -> PyResult<()> {
+    m.add_function(wrap_pyfunction!(rust_expand_type, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_expand_type_by_instance, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_remove_trivial, m)?)?;
+    Ok(())
+}

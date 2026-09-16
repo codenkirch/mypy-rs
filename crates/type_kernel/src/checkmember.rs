@@ -7770,3 +7770,63 @@ mod self_substitution_tests {
         assert_eq!(self_substitution_allowed(&alias), None);
     }
 }
+
+/// Register this module's Python-facing seam surface (#1677).
+pub(crate) fn register_registry(m: &PyModule) -> PyResult<()> {
+    m.add_function(wrap_pyfunction!(rust_bind_self_fast, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_classify_member_access, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_instance_fallback, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_has_operator, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_meta_has_operator, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_defined_in_superclass, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_analyze_instance_member_access, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_analyze_instance_member_dispatch, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_analyze_member_method, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_analyze_member_access, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_analyze_union_member_access, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_analyze_none_member_access, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_analyze_typeddict_access, m)?)?;
+
+    m.add_function(wrap_pyfunction!(
+        rust_analyze_enum_class_attribute_access,
+        m
+    )?)?;
+
+    m.add_function(wrap_pyfunction!(rust_analyze_descriptor_access, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_check_self_arg, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_expand_without_binding, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_expand_and_bind_callable, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_add_class_tvars, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_descriptor_has_get_set, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_is_instance_var, m)?)?;
+
+    // Issue #1078: check_final_member MRO fold. Rust walks the live
+    // `info.mro` and answers "any base declares `name` final"; the
+    // `cant_assign_to_final` message stays in Python.
+    m.add_function(wrap_pyfunction!(rust_check_final_member, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_classify_type_type_member_access, m)?)?;
+
+    // Issue #1056: analyze_var decision head. Rust classifies the
+    // dispatch from live Var scalars; the shim applies side effects.
+    m.add_function(wrap_pyfunction!(rust_classify_analyze_var, m)?)?;
+    Ok(())
+}

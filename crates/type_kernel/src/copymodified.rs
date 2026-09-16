@@ -791,3 +791,10 @@ mod tests {
             .is_none());
     }
 }
+
+/// Register this module's Python-facing seam surface (#1677).
+pub(crate) fn register_registry(m: &PyModule) -> PyResult<()> {
+    // Issue #475: Type.copy_modified field-swap seam.
+    m.add_function(wrap_pyfunction!(rust_copy_modified, m)?)?;
+    Ok(())
+}

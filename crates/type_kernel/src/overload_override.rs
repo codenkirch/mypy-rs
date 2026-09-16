@@ -159,3 +159,12 @@ pub(crate) fn rust_check_overlapping_overloads(
     }
     Ok(Some(records))
 }
+
+/// Register this module's Python-facing seam surface (#1677).
+pub(crate) fn register_registry(m: &PyModule) -> PyResult<()> {
+    // overload_override: check_overlapping_overloads pairwise screening loop
+    // over the three predicates above (mypy.checker). The impl-vs-items tail
+    // and the message emission stay in Python.
+    m.add_function(wrap_pyfunction!(rust_check_overlapping_overloads, m)?)?;
+    Ok(())
+}

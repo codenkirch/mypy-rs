@@ -726,3 +726,15 @@ mod tests {
         );
     }
 }
+
+/// Register this module's Python-facing seam surface (#1677).
+pub(crate) fn register_registry(m: &PyModule) -> PyResult<()> {
+    // Issue #493: len-based tuple narrowing. Returns (yes, no) type blobs
+    // or None to defer to the pure-Python path.
+    m.add_function(wrap_pyfunction!(rust_narrow_with_len, m)?)?;
+
+    // Issue #1065: len-narrowing gate predicate. Returns the bool decision
+    // or None to defer to the pure-Python path.
+    m.add_function(wrap_pyfunction!(rust_can_be_narrowed_with_len, m)?)?;
+    Ok(())
+}

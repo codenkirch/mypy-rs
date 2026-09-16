@@ -129,3 +129,12 @@ mod tests {
         assert_eq!(classify(false, "builtins.int", true), None);
     }
 }
+
+/// Register this module's Python-facing seam surface (#1677).
+pub(crate) fn register_registry(m: &PyModule) -> PyResult<()> {
+    // visit_raw_expression_type: 3-way message head (int/bool, float/
+    // complex, else generic). Rust owns the set-membership branch and
+    // returns a tag; Python formats the message. None defers to Python.
+    m.add_function(wrap_pyfunction!(rust_classify_raw_expression_type, m)?)?;
+    Ok(())
+}

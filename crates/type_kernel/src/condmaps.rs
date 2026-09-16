@@ -426,3 +426,12 @@ mod tests {
         }
     }
 }
+
+/// Register this module's Python-facing seam surface (#1677).
+pub(crate) fn register_registry(m: &PyModule) -> PyResult<()> {
+    // Issue #488: conditional type-map algebra.
+    m.add_function(wrap_pyfunction!(rust_and_conditional_maps, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_or_conditional_maps, m)?)?;
+    Ok(())
+}

@@ -800,3 +800,20 @@ pub(crate) fn rust_any_causes_overload_ambiguity(
     }
     Ok(Some(false))
 }
+
+/// Register this module's Python-facing seam surface (#1677).
+pub(crate) fn register_registry(m: &PyModule) -> PyResult<()> {
+    // Issue #489: overload-result family (combine_function_signatures body).
+    m.add_function(wrap_pyfunction!(rust_combine_function_signatures, m)?)?;
+
+    // Issue #489: merge_typevars_in_callables_by_name (checkexpr.py:8309-8351),
+    // the freshen+rename step shared with combine_function_signatures.
+    m.add_function(wrap_pyfunction!(
+        rust_merge_typevars_in_callables_by_name,
+        m
+    )?)?;
+
+    // Issue #489: overload any-ambiguity detection (any_causes_overload_ambiguity).
+    m.add_function(wrap_pyfunction!(rust_any_causes_overload_ambiguity, m)?)?;
+    Ok(())
+}

@@ -8519,3 +8519,39 @@ mod tests {
         );
     }
 }
+
+/// Register this module's Python-facing seam surface (#1677).
+pub(crate) fn register_registry(m: &PyModule) -> PyResult<()> {
+    m.add_function(wrap_pyfunction!(rust_is_subtype, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_is_subtype_batch, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_subtype_tvar_tuple_right, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_variadic_tuple_subtype, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_all_same_types, m)?)?;
+
+    // Issue #465: pure-computation helpers from subtypes.py.
+    m.add_function(wrap_pyfunction!(rust_has_underscore_prefix, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_is_erased_instance, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_erase_return_self_types, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_try_restrict_literal_union, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_is_more_precise, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_is_equivalent, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_is_same_type, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_is_descriptor, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_are_args_compatible, m)?)?;
+
+    // Issue #998: check_type_parameter variance-dispatch classifier head.
+    m.add_function(wrap_pyfunction!(rust_classify_type_parameter, m)?)?;
+    Ok(())
+}

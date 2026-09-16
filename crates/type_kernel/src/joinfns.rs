@@ -369,3 +369,15 @@ mod tests {
         assert_eq!(object_from_instance_core(&instance("a.Empty"), &r), None);
     }
 }
+
+/// Register this module's Python-facing seam surface (#1677).
+pub(crate) fn register_registry(m: &PyModule) -> PyResult<()> {
+    m.add_function(wrap_pyfunction!(rust_object_or_any_from_type, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_object_from_instance, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_combine_similar_callables, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_object_from_instance, m)?)?;
+    Ok(())
+}

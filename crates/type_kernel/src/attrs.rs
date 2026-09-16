@@ -494,3 +494,12 @@ pub fn rust_serialize_fields(
 fn write_tag(buf: &mut WriteBuffer, tag: u8) {
     buf.push(tag);
 }
+
+/// Register this module's Python-facing seam surface (#1677).
+pub(crate) fn register_registry(m: &PyModule) -> PyResult<()> {
+    // Attrs plugin transform (Issue #357): seam function for class decoration.
+    m.add_function(wrap_pyfunction!(rust_transform_attrs, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_serialize_fields, m)?)?;
+    Ok(())
+}

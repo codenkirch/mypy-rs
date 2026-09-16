@@ -2092,3 +2092,17 @@ mod tests {
         assert!(r.get_module("other").is_none());
     }
 }
+
+/// Register this module's Python-facing seam surface (#1677).
+pub(crate) fn register_registry(m: &PyModule) -> PyResult<()> {
+    m.add_function(wrap_pyfunction!(build_resolver, m)?)?;
+
+    m.add_function(wrap_pyfunction!(read_type_to_str_with_resolver, m)?)?;
+
+    m.add_function(wrap_pyfunction!(build_native_resolver, m)?)?;
+
+    m.add_function(wrap_pyfunction!(read_type_to_str_with_native_resolver, m)?)?;
+
+    m.add_class::<NativeTypeResolver>()?;
+    Ok(())
+}

@@ -2114,3 +2114,12 @@ pub(crate) fn rust_walk_dependency_target(
         Err(_) => Ok(None),
     }
 }
+
+/// Register this module's Python-facing seam surface (#1677).
+pub(crate) fn register_registry(m: &PyModule) -> PyResult<()> {
+    // Issue #1632: native fine-grained dependency walk (DependencyVisitor).
+    m.add_function(wrap_pyfunction!(rust_walk_dependency_visitor, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_walk_dependency_target, m)?)?;
+    Ok(())
+}

@@ -5731,3 +5731,213 @@ mod tests {
         );
     }
 }
+
+/// Register this module's Python-facing seam surface (#1677).
+pub(crate) fn register_registry(m: &PyModule) -> PyResult<()> {
+    m.add_function(wrap_pyfunction!(rust_refers_to_fullname, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_refers_to_class_or_function, m)?)?;
+
+    // Issue #391: additional pure semanal helpers (is_init_only, erase_func_annotations,
+    // get_deprecated, get_name_repr_of_expr) are registered below alongside the
+    // already-existing is_trivial_body, find_duplicate, etc.
+    m.add_function(wrap_pyfunction!(rust_is_trivial_body, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_find_duplicate, m)?)?;
+
+    // Issue #391: additional pure semanal pure helpers.
+    m.add_function(wrap_pyfunction!(rust_is_init_only, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_erase_func_annotations, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_get_deprecated, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_get_name_repr_of_expr, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_is_valid_replacement, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_is_same_symbol, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_names_modified_in_lvalue, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_names_modified_by_assignment, m)?)?;
+
+    m.add_function(wrap_pyfunction!(
+        rust_remove_imported_names_from_symtable,
+        m
+    )?)?;
+
+    m.add_function(wrap_pyfunction!(rust_classify_simple_literal_type, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_is_defined_type_param, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_classify_setup_type_vars, m)?)?;
+
+    // Issue #980 follow-up: Literal classification head; likewise missing
+    // from the registration list, so semanal.py fell back on import.
+    m.add_function(wrap_pyfunction!(rust_classify_simple_literal_type, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_visit_list_set_expr, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_visit_dict_expr, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_visit_template_str_expr, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_visit_unary_expr, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_visit_comparison_expr, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_visit_slice_expr, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_visit_conditional_expr, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_visit_super_expr, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_visit_raise_stmt, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_visit_assert_stmt, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_visit_operator_assignment_stmt, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_visit_block, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_visit_if_stmt, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_is_valid_del_target, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_visit_del_stmt, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_visit_expression_stmt, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_visit_break_stmt, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_visit_continue_stmt, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_visit_global_decl, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_visit_match_stmt, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_visit_return_stmt, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_visit_block_maybe, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_visit_while_stmt, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_visit_name_expr, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_visit_star_expr, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_visit_as_pattern, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_visit_or_pattern, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_visit_value_pattern, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_visit_sequence_pattern, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_visit_starred_pattern, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_visit_mapping_pattern, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_visit_class_pattern, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_visit_yield_expr, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_visit_yield_from_expr, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_visit_await_expr, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_visit_try_stmt, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_visit_op_expr, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_visit_index_expr, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_visit_cast_expr, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_visit_type_form_expr, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_visit_assert_type_expr, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_visit_reveal_expr, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_visit_type_application, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_visit_list_comprehension, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_visit_set_comprehension, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_visit_dictionary_comprehension, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_visit_generator_expr, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_visit_lambda_expr, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_visit_overloaded_func_def, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_visit_class_def, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_visit_func_def, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_visit_nonlocal_decl, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_visit_for_stmt, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_visit_with_stmt, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_visit_assignment_expr, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_visit_import_all, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_visit_import_from, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_visit_assignment_stmt, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_visit_import, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_visit_call_expr, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_visit_type_alias_stmt, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_apply_semantic_analyzer_patches, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_classify_decorators, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_classify_class_decorator, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_lookup, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_classify_imports, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_classify_member_resolution, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_var_is_typing_special_form, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_is_same_var_from_getattr, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_get_typevarlike_declaration, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_parse_bool, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_is_mangled_global, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_is_initial_mangled_global, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_is_final_redefinition, m)?)?;
+
+    m.add_function(wrap_pyfunction!(
+        rust_can_possibly_be_typevarlike_declaration,
+        m
+    )?)?;
+
+    m.add_function(wrap_pyfunction!(rust_can_possibly_be_type_form, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_is_type_ref, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_can_be_type_alias, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_check_typevarlike_name, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_extract_typevarlike_name, m)?)?;
+    Ok(())
+}

@@ -1426,3 +1426,11 @@ mod tests {
         assert!(matches!(got, Err(Defer)));
     }
 }
+
+/// Register this module's Python-facing seam surface (#1677).
+pub(crate) fn register_registry(m: &PyModule) -> PyResult<()> {
+    m.add_function(wrap_pyfunction!(rust_callables_compatible, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_are_parameters_compatible, m)?)?;
+    Ok(())
+}

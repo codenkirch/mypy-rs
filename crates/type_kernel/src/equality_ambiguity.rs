@@ -321,3 +321,17 @@ mod tests {
         assert!(is_equality_ambiguous_for_infos(&left, &right));
     }
 }
+
+/// Register this module's Python-facing seam surface (#1677).
+pub(crate) fn register_registry(m: &PyModule) -> PyResult<()> {
+    m.add_function(wrap_pyfunction!(
+        rust_is_equality_ambiguous_for_narrowing,
+        m
+    )?)?;
+
+    m.add_function(wrap_pyfunction!(
+        rust_partition_equality_ambiguous_types,
+        m
+    )?)?;
+    Ok(())
+}
