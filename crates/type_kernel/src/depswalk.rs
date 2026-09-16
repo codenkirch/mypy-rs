@@ -21,6 +21,7 @@ use std::collections::{HashMap, HashSet};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PySet, PyString, PyTuple, PyType};
 
+use crate::node_mirror;
 use crate::refs::{is_instance, TypeRefs};
 use crate::serverdeps::{
     attribute_triggers_walk, class_name_is, collect_triggers, get_attr_or_defer, AttrTriggerCtx,
@@ -190,6 +191,60 @@ fn opt_int_attr(obj: &PyAny, name: &str) -> Result<Option<i64>, DeferError> {
         return Ok(None);
     }
     Ok(Some(v.extract::<i64>().map_err(|_| DeferError)?))
+}
+
+/// One shaped read of the `RefExpr` binding scalars, answered from the
+/// node shadow when it holds an exact record (G1.1) and from the live
+/// slots otherwise.
+///
+/// One store lookup serves every accessor of a shape, so a shape cannot
+/// mix a served scalar with a live one. Each accessor keeps the live read
+/// (and its `DeferError`) as the fallback, so mode 0 and an unrecorded
+/// node behave exactly as they did before the channel existed.
+struct RefView<'a> {
+    obj: &'a PyAny,
+    served: Option<node_mirror::RefScalars>,
+}
+
+impl<'a> RefView<'a> {
+    fn of(obj: &'a PyAny) -> Self {
+        RefView {
+            obj,
+            served: node_mirror::serve_ref_scalars(obj),
+        }
+    }
+
+    /// `obj.is_new_def` (`truthy_attr` semantics).
+    fn is_new_def(&self) -> Result<bool, DeferError> {
+        match &self.served {
+            Some(served) => Ok(served.is_new_def),
+            None => truthy_attr(self.obj, "is_new_def"),
+        }
+    }
+
+    /// `obj.kind` (`opt_int_attr` semantics).
+    fn kind(&self) -> Result<Option<i64>, DeferError> {
+        match &self.served {
+            Some(served) => Ok(served.kind),
+            None => opt_int_attr(self.obj, "kind"),
+        }
+    }
+
+    /// `obj.fullname` in an f-string (`fstr_attr` semantics).
+    fn fullname(&self) -> Result<String, DeferError> {
+        match &self.served {
+            Some(served) => Ok(served.fullname.clone()),
+            None => fstr_attr(self.obj, "fullname"),
+        }
+    }
+
+    /// `obj.fullname` as an optional string (`opt_str_attr` semantics).
+    fn fullname_opt(&self) -> Result<Option<String>, DeferError> {
+        match &self.served {
+            Some(served) => Ok(Some(served.fullname.clone())),
+            None => opt_str_attr(self.obj, "fullname"),
+        }
+    }
 }
 
 fn str_attr(obj: &PyAny, name: &str) -> Result<String, DeferError> {
@@ -1100,19 +1155,21 @@ impl<'py> DepsWalker<'py> {
                     _ => return Ok(()),
                 };
                 for lv in list_attr(o, "lvalues")?.iter() {
-                    if is_instance(lv, self.refs.ref_expr)
-                        && opt_str_attr(lv, "fullname")?
-                            .map(|s| !s.is_empty())
-                            .unwrap_or(false)
-                        && truthy_attr(lv, "is_new_def")?
-                    {
-                        if opt_int_attr(lv, "kind")? == Some(self.refs.ldef) {
-                            return Ok(());
+                    if is_instance(lv, self.refs.ref_expr) {
+                        // G1.1: `fullname`/`is_new_def`/`kind` come from one
+                        // node-shadow record when it is exact.
+                        let ref_lv = RefView::of(lv);
+                        if matches!(ref_lv.fullname_opt()?, Some(ref s) if !s.is_empty())
+                            && ref_lv.is_new_def()?
+                        {
+                            if ref_lv.kind()? == Some(self.refs.ldef) {
+                                return Ok(());
+                            }
+                            let a = self.make_trigger(&fname)?;
+                            let lvfn = ref_lv.fullname()?;
+                            let b = self.make_trigger(&lvfn)?;
+                            self.add_dependency(a, Some(b))?;
                         }
-                        let a = self.make_trigger(&fname)?;
-                        let lvfn = fstr_attr(lv, "fullname")?;
-                        let b = self.make_trigger(&lvfn)?;
-                        self.add_dependency(a, Some(b))?;
                     }
                 }
             }
@@ -1146,7 +1203,10 @@ impl<'py> DepsWalker<'py> {
                 }
             }
             "MemberExpr" => {
-                if self.is_self_member_ref(lvalue)? && truthy_attr(lvalue, "is_new_def")? {
+                // G1.1: one node-shadow record answers `is_new_def` and
+                // `kind` for this shape.
+                let ref_lvalue = RefView::of(lvalue);
+                if self.is_self_member_ref(lvalue)? && ref_lvalue.is_new_def()? {
                     let node = get_attr_or_defer(lvalue, "node")?;
                     if is_instance(node, self.refs.var) {
                         let info = get_attr_or_defer(node, "info")?;
@@ -1160,7 +1220,7 @@ impl<'py> DepsWalker<'py> {
                         }
                     }
                 }
-                if get_attr_or_defer(lvalue, "kind")?.is_none() {
+                if ref_lvalue.kind()?.is_none() {
                     let obj = get_attr_or_defer(lvalue, "expr")?;
                     let raw = match self.type_map.get_item(obj).map_err(|_| DeferError)? {
                         Some(t) => t,
@@ -1232,7 +1292,9 @@ impl<'py> DepsWalker<'py> {
                         None => return Ok(None),
                     }
                 } else {
-                    if truthy_attr(lvalue, "is_new_def")? {
+                    // G1.1: this read decides the whole walk's deferral, so
+                    // it is the one the mode-2 compare must cover.
+                    if RefView::of(lvalue).is_new_def()? {
                         return Err(DeferError);
                     }
                     return Ok(None);

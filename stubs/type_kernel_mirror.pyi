@@ -90,6 +90,22 @@ def rust_node_mirror_capture_field_wire(
 ) -> int: ...
 def rust_node_mirror_field_wire(handle: int, field: str) -> tuple[str | None, bytes] | None: ...
 
+# Phase G1.1 serving channel: the RefExpr binding scalars.  Mode 0 (the
+# default) serves nothing; mode 1 serves from the record; mode 2 also
+# compares every served read against the live slots.
+
+# `serve_ref` answers (kind, node_fullname, fullname, is_new_def,
+# is_inferred_def) or None when the read must stay live; `verify_ref`
+# answers whether that served read matched the live slots.
+def rust_node_mirror_set_read_mode(mode: int) -> int: ...
+def rust_node_mirror_read_mode() -> int: ...
+def rust_node_mirror_read_counters() -> tuple[int, int, int, int, int, int, int]: ...
+def rust_node_mirror_read_reset() -> None: ...
+def rust_node_mirror_serve_ref(
+    obj: Any,
+) -> tuple[int | None, str | None, str, bool, bool] | None: ...
+def rust_node_mirror_verify_ref(obj: Any) -> bool | None: ...
+
 # Phase G2.0 (#1577): statement/def metadata shadow. `capture_meta`
 # stores one tagged field value (kind in none/bool/int/str/obj/list);
 # `meta` reads the record as {field: (kind, text, num, items)}.
@@ -165,6 +181,12 @@ __all__ = [
     "rust_node_mirror_field_captures",
     "rust_node_mirror_capture_field_wire",
     "rust_node_mirror_field_wire",
+    "rust_node_mirror_set_read_mode",
+    "rust_node_mirror_read_mode",
+    "rust_node_mirror_read_counters",
+    "rust_node_mirror_read_reset",
+    "rust_node_mirror_serve_ref",
+    "rust_node_mirror_verify_ref",
     "rust_node_mirror_capture_meta",
     "rust_node_mirror_meta",
     "rust_node_mirror_meta_captures",

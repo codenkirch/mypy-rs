@@ -19,6 +19,12 @@
 //! 4. **Identity is not owned here.** `reset` clears entries and pins
 //!    only; `identity::reset` stays with `rust_mirror_reset` (mirror.rs)
 //!    so node-shadow state cannot invalidate handles other seams hold.
+//! 5. **Serving reads is opt-in and provable.** `serve_ref_scalars` (G1.1)
+//!    answers a `RefExpr` scalar read from the record when the record is
+//!    provably exact, and returns `None` otherwise so every caller keeps
+//!    its live read. Mode 0 (default) serves nothing; mode 2 additionally
+//!    compares every served read against the live slots and counts the
+//!    mismatches, so the differential cannot pass vacuously.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -572,6 +578,274 @@ pub(crate) fn shadow_field_text(handle: u64, field: &str) -> Option<String> {
             })
         })
     })
+}
+
+// ===========================================================================
+// G1.1 (#1776): first serving read channel, the `RefExpr` binding scalars
+// ===========================================================================
+
+// A read is served only when at least one ref capture ever landed
+// (`ref_captures > 0`): `capture_ref` snapshots the five scalars as one
+// post-write record, so another field's entry holds the `Default`.
+
+// Mode 0 serves nothing, mode 1 serves from the record, mode 2 also runs
+// the differential compare below, which is what makes a corpus run
+// evidence rather than a silent pass.
+
+/// Serving mode: 0 off (default), 1 serve, 2 serve + differential compare.
+///
+/// Thread-local like the store it reads: a mode set on one thread cannot
+/// make another thread's empty store look authoritative, and the unit
+/// tests stay isolated from each other.
+#[derive(Default)]
+struct ReadState {
+    mode: u8,
+    /// Provenance. `consulted`: a store lookup ran. `served`: the record
+    /// answered with an exact snapshot. `deferred_off`: mode 0.
+    /// `deferred_unrecorded`: no exact record, so the live read stayed in
+    /// charge. `compared`/`mismatched`/`compare_errors`: the mode-2
+    /// differential.
+    consulted: u64,
+    served: u64,
+    deferred_off: u64,
+    deferred_unrecorded: u64,
+    compared: u64,
+    mismatched: u64,
+    compare_errors: u64,
+}
+
+thread_local! {
+    static READ_STATE: RefCell<ReadState> = RefCell::new(ReadState::default());
+}
+
+/// One leaf update of the read state. Never called while a read-state
+/// borrow is held: `RefCell` would panic on the second borrow.
+fn bump(update: impl FnOnce(&mut ReadState)) {
+    READ_STATE.with(|cell| update(&mut cell.borrow_mut()));
+}
+
+/// The five `RefExpr` binding scalars of one record, served verbatim.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RefScalars {
+    pub(crate) kind: Option<i64>,
+    pub(crate) node_fullname: Option<String>,
+    pub(crate) fullname: String,
+    pub(crate) is_new_def: bool,
+    pub(crate) is_inferred_def: bool,
+}
+
+/// `rust_node_mirror_serve_ref`'s answer: `(kind, node_fullname, fullname,
+/// is_new_def, is_inferred_def)`.
+pub(crate) type ServedRef = (Option<i64>, Option<String>, String, bool, bool);
+
+/// `rust_node_mirror_read_counters`'s answer: `(consulted, served,
+/// deferred_off, deferred_unrecorded, compared, mismatched,
+/// compare_errors)`.
+pub(crate) type ReadCounters = (u64, u64, u64, u64, u64, u64, u64);
+
+pub(crate) fn read_mode() -> u8 {
+    READ_STATE.with(|cell| cell.borrow().mode)
+}
+
+pub(crate) fn set_read_mode(mode: u8) -> u8 {
+    bump(|state| state.mode = mode);
+    read_mode()
+}
+
+/// `(consulted, served, deferred_off, deferred_unrecorded, compared,
+/// mismatched, compare_errors)`.
+pub(crate) fn read_counters() -> ReadCounters {
+    READ_STATE.with(|cell| {
+        let state = cell.borrow();
+        (
+            state.consulted,
+            state.served,
+            state.deferred_off,
+            state.deferred_unrecorded,
+            state.compared,
+            state.mismatched,
+            state.compare_errors,
+        )
+    })
+}
+
+/// Clear the counters. The mode is deliberately kept: it is set once per
+/// process (or per test) and a reset must not silently stop serving.
+pub(crate) fn reset_read_counters() {
+    bump(|state| {
+        let mode = state.mode;
+        *state = ReadState {
+            mode,
+            ..ReadState::default()
+        };
+    });
+}
+
+/// Serve the five `RefExpr` binding scalars for `obj`, or `None` when the
+/// read must stay live: mode 0, no identity handle, or an entry no ref
+/// capture ever refreshed.
+///
+/// The store borrow is released before the mode-2 compare, which reads
+/// live Python attributes and could re-enter the store.
+pub(crate) fn serve_ref_scalars(obj: &PyAny) -> Option<RefScalars> {
+    let served = read_ref_record(obj)?;
+    if read_mode() >= 2 && !compare_ref_scalars(obj, &served) {
+        bump(|state| state.mismatched += 1);
+    }
+    bump(|state| state.served += 1);
+    Some(served)
+}
+
+/// The differential entry point: serve the record and compare it against
+/// the live slots in any serving mode, counting one comparison. This is
+/// the read the negative control drives, so it must be usable in mode 1
+/// where the production path does not compare by itself.
+pub(crate) fn verify_ref_scalars(obj: &PyAny) -> Option<bool> {
+    let served = read_ref_record(obj)?;
+    let matched = compare_ref_scalars(obj, &served);
+    if !matched {
+        bump(|state| state.mismatched += 1);
+    }
+    bump(|state| state.served += 1);
+    Some(matched)
+}
+
+/// The record's snapshot for `obj`, or `None` when the read must stay
+/// live. Counts provenance only: it neither compares nor counts a serve,
+/// so both read entry points above own those counters.
+fn read_ref_record(obj: &PyAny) -> Option<RefScalars> {
+    if read_mode() == 0 {
+        bump(|state| state.deferred_off += 1);
+        return None;
+    }
+    bump(|state| state.consulted += 1);
+    let handle = match identity::handle_of(obj) {
+        Some(handle) => handle,
+        None => {
+            bump(|state| state.deferred_unrecorded += 1);
+            return None;
+        }
+    };
+    // The store borrow is released here, before any live attribute read.
+    let served = with_store(|store| {
+        store.by_handle.get(&handle).and_then(|entry| {
+            if entry.ref_captures == 0 {
+                return None;
+            }
+            Some(RefScalars {
+                kind: entry.kind,
+                node_fullname: entry.node_fullname.clone(),
+                fullname: entry.fullname.clone(),
+                is_new_def: entry.is_new_def,
+                is_inferred_def: entry.is_inferred_def,
+            })
+        })
+    });
+    if served.is_none() {
+        bump(|state| state.deferred_unrecorded += 1);
+    }
+    served
+}
+
+/// `obj.name` as `Option<i64>`; `Err` when the slot is unreadable.
+fn live_opt_int(obj: &PyAny, name: &str) -> Result<Option<i64>, ()> {
+    let value = obj.getattr(name).map_err(|_| ())?;
+    if value.is_none() {
+        return Ok(None);
+    }
+    value.extract::<i64>().map(Some).map_err(|_| ())
+}
+
+/// `obj.name` as a `str`; `Err` when the slot is unreadable.
+fn live_str(obj: &PyAny, name: &str) -> Result<String, ()> {
+    obj.getattr(name)
+        .map_err(|_| ())?
+        .extract::<String>()
+        .map_err(|_| ())
+}
+
+/// `obj.name` as a `bool`; `Err` when the slot is unreadable.
+fn live_flag(obj: &PyAny, name: &str) -> Result<bool, ()> {
+    obj.getattr(name)
+        .map_err(|_| ())?
+        .extract::<bool>()
+        .map_err(|_| ())
+}
+
+/// `obj.node.fullname` with `_capture_ref`'s own semantics: `None` when the
+/// target is `None` or its `fullname` is not a `str`.
+fn live_node_fullname(obj: &PyAny) -> Result<Option<String>, ()> {
+    let target = obj.getattr("node").map_err(|_| ())?;
+    if target.is_none() {
+        return Ok(None);
+    }
+    let fullname = target.getattr("fullname").map_err(|_| ())?;
+    Ok(fullname.extract::<String>().ok())
+}
+
+/// Mode-2 differential: compare the served snapshot against the live slots
+/// through the conversions the capture hook uses.
+///
+/// Every call is counted, and an unreadable slot counts as a compare error
+/// *and* a mismatch, so a probe that cannot read cannot report success.
+pub(crate) fn compare_ref_scalars(obj: &PyAny, served: &RefScalars) -> bool {
+    bump(|state| state.compared += 1);
+    let checks: [Result<bool, ()>; 5] = [
+        live_opt_int(obj, "kind").map(|v| v == served.kind),
+        live_str(obj, "fullname").map(|v| v == served.fullname),
+        live_flag(obj, "is_new_def").map(|v| v == served.is_new_def),
+        live_flag(obj, "is_inferred_def").map(|v| v == served.is_inferred_def),
+        live_node_fullname(obj).map(|v| v == served.node_fullname),
+    ];
+    let errors = checks.iter().filter(|check| check.is_err()).count() as u64;
+    if errors > 0 {
+        bump(|state| state.compare_errors += errors);
+    }
+    checks.iter().all(|check| *check == Ok(true))
+}
+
+// ---- pyfunctions: mode, counters, and the two read entry points ----
+
+#[pyfunction]
+pub(crate) fn rust_node_mirror_set_read_mode(mode: u8) -> u8 {
+    set_read_mode(mode)
+}
+
+#[pyfunction]
+pub(crate) fn rust_node_mirror_read_mode() -> u8 {
+    read_mode()
+}
+
+#[pyfunction]
+pub(crate) fn rust_node_mirror_read_counters() -> ReadCounters {
+    read_counters()
+}
+
+#[pyfunction]
+pub(crate) fn rust_node_mirror_read_reset() {
+    reset_read_counters();
+}
+
+/// The `RefExpr` record as `(kind, node_fullname, fullname, is_new_def,
+/// is_inferred_def)`; `None` when the read must stay live.
+#[pyfunction]
+pub(crate) fn rust_node_mirror_serve_ref(obj: &PyAny) -> Option<ServedRef> {
+    serve_ref_scalars(obj).map(|s| {
+        (
+            s.kind,
+            s.node_fullname,
+            s.fullname,
+            s.is_new_def,
+            s.is_inferred_def,
+        )
+    })
+}
+
+/// The differential entry point: `Some(matched)` when the store served the
+/// read, `None` when it stayed live. Counts one comparison either way.
+#[pyfunction]
+pub(crate) fn rust_node_mirror_verify_ref(obj: &PyAny) -> Option<bool> {
+    verify_ref_scalars(obj)
 }
 
 /// Drop one metadata entry and its pin. Returns whether one was present.
@@ -1282,6 +1556,21 @@ pub(crate) fn register_registry(m: &PyModule) -> PyResult<()> {
 
     m.add_function(wrap_pyfunction!(rust_node_mirror_field_wire, m)?)?;
 
+    // Phase G1.1 (serving read channel): mode, provenance counters, and
+    // the two `RefExpr` read entry points the deps walker and the
+    // differential suite use.
+    m.add_function(wrap_pyfunction!(rust_node_mirror_set_read_mode, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_node_mirror_read_mode, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_node_mirror_read_counters, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_node_mirror_read_reset, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_node_mirror_serve_ref, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_node_mirror_verify_ref, m)?)?;
+
     // Phase G2.0 (#1577): statement/def metadata shadow store. Record-only
     // like G1.0a: no consumer reads an entry, same gate and identity base.
     m.add_function(wrap_pyfunction!(rust_node_mirror_capture_meta, m)?)?;
@@ -1296,4 +1585,234 @@ pub(crate) fn register_registry(m: &PyModule) -> PyResult<()> {
 
     m.add_function(wrap_pyfunction!(rust_node_mirror_meta_entry_count, m)?)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod g1_serving_tests {
+    use super::*;
+
+    /// Initialize the embedded interpreter, then run with the GIL.
+    fn with_py<T>(f: impl FnOnce(Python<'_>) -> T) -> T {
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(f)
+    }
+
+    /// A stand-in for a `RefExpr`: the serving read inspects the record,
+    /// never the class, and the mode-2 compare reads exactly these slots.
+    fn fresh_ref(py: Python<'_>) -> &PyAny {
+        py.eval(
+            "type('R', (), {'kind': None, 'fullname': '', 'is_new_def': False, \
+             'is_inferred_def': False, 'node': None})()",
+            None,
+            None,
+        )
+        .unwrap()
+    }
+
+    fn start(mode: u8) {
+        reset();
+        reset_read_counters();
+        set_read_mode(mode);
+    }
+
+    fn served_counters() -> (u64, u64, u64, u64, u64, u64, u64) {
+        read_counters()
+    }
+
+    #[test]
+    fn test_mode_zero_serves_nothing_and_counts_the_deferral() {
+        with_py(|py| {
+            start(0);
+            let obj = fresh_ref(py);
+            capture_ref(
+                obj,
+                Some(2),
+                Some("mod.v".into()),
+                "mod.x".into(),
+                true,
+                false,
+            )
+            .unwrap();
+            assert_eq!(serve_ref_scalars(obj), None);
+            let (consulted, served, deferred_off, unrecorded, compared, swapped, errors) =
+                served_counters();
+            assert_eq!(
+                (
+                    consulted,
+                    served,
+                    deferred_off,
+                    unrecorded,
+                    compared,
+                    swapped,
+                    errors
+                ),
+                (0, 0, 1, 0, 0, 0, 0)
+            );
+        });
+    }
+
+    #[test]
+    fn test_a_recorded_ref_is_served_exactly() {
+        with_py(|py| {
+            start(1);
+            let obj = fresh_ref(py);
+            obj.setattr("kind", 2i64).unwrap();
+            obj.setattr("fullname", "mod.x").unwrap();
+            obj.setattr("is_new_def", true).unwrap();
+            capture_ref(
+                obj,
+                Some(2),
+                Some("mod.v".into()),
+                "mod.x".into(),
+                true,
+                false,
+            )
+            .unwrap();
+            let served = serve_ref_scalars(obj).expect("a recorded ref must serve");
+            assert_eq!(served.kind, Some(2));
+            assert_eq!(served.node_fullname.as_deref(), Some("mod.v"));
+            assert_eq!(served.fullname, "mod.x");
+            assert!(served.is_new_def);
+            assert!(!served.is_inferred_def);
+            let (consulted, served_n, deferred_off, unrecorded, compared, swapped, errors) =
+                served_counters();
+            assert_eq!(
+                (
+                    consulted,
+                    served_n,
+                    deferred_off,
+                    unrecorded,
+                    compared,
+                    swapped,
+                    errors
+                ),
+                (1, 1, 0, 0, 0, 0, 0)
+            );
+        });
+    }
+
+    #[test]
+    fn test_an_unrecorded_ref_defers() {
+        with_py(|py| {
+            start(1);
+            let obj = fresh_ref(py);
+            assert_eq!(serve_ref_scalars(obj), None);
+            let (consulted, served, _, unrecorded, _, _, _) = served_counters();
+            assert_eq!((consulted, served, unrecorded), (1, 0, 1));
+        });
+    }
+
+    #[test]
+    fn test_an_entry_without_a_ref_capture_is_not_served() {
+        with_py(|py| {
+            start(1);
+            let obj = fresh_ref(py);
+            obj.setattr("fullname", "mod.x").unwrap();
+            // Another field's record mints the entry; the five scalars stay
+            // `Default`, which must never be served as if recorded.
+            capture_field_value(obj, "name".into(), FieldValue::Text("x".into())).unwrap();
+            assert_eq!(serve_ref_scalars(obj), None);
+            let (_, served, _, unrecorded, _, _, _) = served_counters();
+            assert_eq!((served, unrecorded), (0, 1));
+        });
+    }
+
+    #[test]
+    fn test_a_later_ref_capture_refreshes_the_record() {
+        with_py(|py| {
+            start(1);
+            let obj = fresh_ref(py);
+            capture_ref(obj, None, None, "".into(), false, false).unwrap();
+            assert!(!serve_ref_scalars(obj).unwrap().is_new_def);
+            obj.setattr("is_new_def", true).unwrap();
+            capture_ref(obj, Some(2), None, "mod.x".into(), true, false).unwrap();
+            let served = serve_ref_scalars(obj).unwrap();
+            assert!(
+                served.is_new_def,
+                "the second capture must refresh the record"
+            );
+            assert_eq!(served.fullname, "mod.x");
+        });
+    }
+
+    #[test]
+    fn test_serving_does_not_mutate_the_record() {
+        with_py(|py| {
+            start(1);
+            let obj = fresh_ref(py);
+            capture_ref(obj, None, None, "".into(), false, false).unwrap();
+            for _ in 0..5 {
+                assert!(serve_ref_scalars(obj).is_some());
+            }
+            let (captures, _) = rust_node_mirror_captures(rust_node_mirror_handle_of(obj).unwrap())
+                .expect("entry present");
+            assert_eq!(captures, 1, "reads must not write the record");
+            assert_eq!(entry_count(), 1, "reads must not mint entries");
+        });
+    }
+
+    #[test]
+    fn test_mode_two_compares_and_passes_in_sync() {
+        with_py(|py| {
+            start(2);
+            let obj = fresh_ref(py);
+            obj.setattr("kind", 1i64).unwrap();
+            obj.setattr("fullname", "mod.x").unwrap();
+            capture_ref(obj, Some(1), None, "mod.x".into(), false, false).unwrap();
+            assert_eq!(serve_ref_scalars(obj).is_some(), true);
+            let (_, served, _, _, compared, swapped, errors) = served_counters();
+            assert_eq!((served, compared, swapped, errors), (1, 1, 0, 0));
+        });
+    }
+
+    #[test]
+    fn test_mode_two_compare_detects_a_desync() {
+        with_py(|py| {
+            start(2);
+            let obj = fresh_ref(py);
+            obj.setattr("fullname", "mod.x").unwrap();
+            capture_ref(obj, None, None, "mod.x".into(), false, false).unwrap();
+            // A live write no ref capture saw: the record is now stale, and
+            // the compare must say so instead of passing.
+            obj.setattr("is_new_def", true).unwrap();
+            assert_eq!(verify_ref_scalars(obj), Some(false));
+            let (_, _, _, _, compared, swapped, errors) = served_counters();
+            assert_eq!((compared, swapped, errors), (1, 1, 0));
+            // And the serving path answers from the record, still stale.
+            assert!(!serve_ref_scalars(obj).unwrap().is_new_def);
+        });
+    }
+
+    #[test]
+    fn test_an_unreadable_slot_counts_as_a_mismatch_not_a_skip() {
+        with_py(|py| {
+            start(1);
+            // The class has no `kind` slot at all, so the compare cannot
+            // read the live side: that must read as a failure, not a skip.
+            let obj = py
+                .eval(
+                    "type('R_no_kind', (), {'fullname': '', 'is_new_def': False, \
+                     'is_inferred_def': False, 'node': None})()",
+                    None,
+                    None,
+                )
+                .unwrap();
+            capture_ref(obj, Some(1), None, "".into(), false, false).unwrap();
+            assert_eq!(verify_ref_scalars(obj), Some(false));
+            let (_, _, _, _, compared, swapped, errors) = served_counters();
+            assert_eq!((compared, swapped, errors), (1, 1, 1));
+        });
+    }
+
+    #[test]
+    fn test_verify_requires_the_serving_mode() {
+        with_py(|py| {
+            start(0);
+            let obj = fresh_ref(py);
+            capture_ref(obj, None, None, "".into(), false, false).unwrap();
+            assert_eq!(verify_ref_scalars(obj), None);
+            let (_, _, deferred_off, _, compared, _, _) = served_counters();
+            assert_eq!((deferred_off, compared), (1, 0));
+        });
+    }
 }

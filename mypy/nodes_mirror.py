@@ -21,6 +21,15 @@ aststrip lvalue read (`mypy/server/aststrip.py`, gated by
 `is_new_def` and `name` slots, and falls back to the live slots for
 everything the records do not cover.
 
+G1.1 adds the store's first *mode-gated* serving read channel:
+`set_read_flip` selects a mode (0 off, 1 serve, 2 serve + differential
+compare) that the native dependency walker obeys when it reads the
+`RefExpr` binding scalars, so those reads are answered from the record
+instead of crossing to the live slots. Mode 0 is the default and leaves
+every read live, and `read_counters` reports the channel's provenance
+(served, deferred, compared, mismatched), which is what makes a run's
+evidence checkable rather than assumed.
+
 Design notes:
 - Capture is via class-level monkeypatching of ``__setattr__`` on
   ``RefExpr``, ``CallExpr``, ``IndexExpr`` and ``OpExpr``. These classes
@@ -153,11 +162,75 @@ _ORIG_SETATTR: Any = object.__setattr__
 _NODE_HANDLES: dict[int, int] = {}
 _audit: dict[str, int] = {}
 
+# G1.1: the serving-read gate. The mode lives in Rust storage, so
+# `set_read_flip` is a delegate and never a second source of truth.
+# `activate` reads this env var, so a run can enable it without an option.
+_READ_FLIP_ENV: Final = "MYPY_TK_NODE_READ_FLIP"
+_READ_MODES: Final[frozenset[int]] = frozenset({0, 1, 2})
+
 
 def _count(key: str, n: int = 1) -> None:
     if not _audit_mode:
         return
     _audit[key] = _audit.get(key, 0) + n
+
+
+def set_read_flip(mode: int) -> int:
+    """Set the node-shadow serving mode and return the mode now in force.
+
+    Modes: 0 off (default), 1 serve, 2 serve + differential compare. A
+    missing extension leaves the mode at 0, which is the same state as an
+    inert channel, so no caller can be misled into thinking it served.
+    """
+    if mode not in _READ_MODES:
+        raise ValueError(f"node read flip mode must be 0, 1 or 2, got {mode!r}")
+    kernel = _kernel_mod
+    if kernel is None:
+        try:
+            import type_kernel as kernel
+        except ImportError:
+            _count("read_flip.no_type_kernel")
+            return 0
+    return int(kernel.rust_node_mirror_set_read_mode(mode))
+
+
+def read_flip() -> int:
+    """The serving mode now in force (0 when the extension is absent)."""
+    kernel = _kernel_mod
+    if kernel is None:
+        return 0
+    return int(kernel.rust_node_mirror_read_mode())
+
+
+def read_counters() -> dict[str, int]:
+    """Provenance counters for the serving channel.
+
+    `served` counts reads the record answered, `deferred_off` the mode-0
+    deferrals, `deferred_unrecorded` the reads no exact record covered,
+    and `compared`/`mismatched` the differential. A run whose `compared`
+    is 0 proves nothing about the served values.
+    """
+    kernel = _kernel_mod
+    if kernel is None:
+        return {}
+    (
+        consulted,
+        served,
+        deferred_off,
+        deferred_unrecorded,
+        compared,
+        mismatched,
+        compare_errors,
+    ) = kernel.rust_node_mirror_read_counters()
+    return {
+        "consulted": int(consulted),
+        "served": int(served),
+        "deferred_off": int(deferred_off),
+        "deferred_unrecorded": int(deferred_unrecorded),
+        "compared": int(compared),
+        "mismatched": int(mismatched),
+        "compare_errors": int(compare_errors),
+    }
 
 
 def count(key: str, n: int = 1) -> None:
@@ -178,6 +251,7 @@ def _serialize_type_wire(t: MypyType) -> bytes:
     """
     try:
         from mypy.types_mirror import _fresh_bytes
+
         return _fresh_bytes(t)
     except Exception:
         _count("wire_serialize_fail")
@@ -201,6 +275,7 @@ def read_field_type(handle: int, field: str) -> MypyType | None:
     try:
         from mypy.cache import ReadBuffer
         from mypy.types import read_type
+
         data = ReadBuffer(wire)
         return read_type(data)
     except Exception:
@@ -310,13 +385,9 @@ def _capture_field(node: Any, name: str) -> None:
             kind = None if value is None else type(value).__name__
             if isinstance(value, MypyType):
                 wire = _serialize_type_wire(value)
-                handle = _kernel_mod.rust_node_mirror_capture_field_wire(
-                    node, name, kind, wire
-                )
+                handle = _kernel_mod.rust_node_mirror_capture_field_wire(node, name, kind, wire)
             else:
-                handle = _kernel_mod.rust_node_mirror_capture_field_kind(
-                    node, name, kind
-                )
+                handle = _kernel_mod.rust_node_mirror_capture_field_kind(node, name, kind)
         elif name in _FLAG_FIELDS:
             handle = _kernel_mod.rust_node_mirror_capture_flag(node, name, bool(value))
         elif name in _TEXT_FIELDS:
@@ -514,9 +585,7 @@ _G2_TRACKED: Final[dict[type, frozenset[str]]] = {
         {"items", "unanalyzed_items", "impl", "deprecated", "setter_index", "_is_trivial_self"}
     )
     | _G2_FUNC_BASE,
-    Decorator: frozenset(
-        {"func", "var", "is_overload", "decorators", "original_decorators"}
-    ),
+    Decorator: frozenset({"func", "var", "is_overload", "decorators", "original_decorators"}),
     ClassDef: frozenset(
         {
             "info",
@@ -681,15 +750,7 @@ def activate(*, audit: bool = False) -> bool:
     _audit_mode = audit
     # G1.0b adds ComparisonExpr / StrExpr / UnaryExpr; NameExpr and
     # MemberExpr already route through the RefExpr patch.
-    for cls in (
-        RefExpr,
-        CallExpr,
-        IndexExpr,
-        OpExpr,
-        ComparisonExpr,
-        StrExpr,
-        UnaryExpr,
-    ):
+    for cls in (RefExpr, CallExpr, IndexExpr, OpExpr, ComparisonExpr, StrExpr, UnaryExpr):
         try:
             cls.__setattr__ = _node_setattr  # type: ignore[method-assign]
         except Exception:
@@ -701,9 +762,19 @@ def activate(*, audit: bool = False) -> bool:
     _count("activate")
     # G2.0 (#1577): patch the statement/def family (separate section).
     _activate_meta()
+    # G1.1: the serving mode is set only once capture is live, so the
+    # channel can never answer from an empty store. The env var is the
+    # measurement gate (see `_READ_FLIP_ENV`).
+    import os as _os_read_flip
+
+    raw_mode = _os_read_flip.environ.get(_READ_FLIP_ENV, "0")
+    try:
+        env_mode = int(raw_mode)
+    except ValueError:
+        raise ValueError(f"{_READ_FLIP_ENV} must be 0, 1 or 2, got {raw_mode!r}") from None
+    set_read_flip(env_mode)
+    _count(f"read_flip.mode{read_flip()}")
     return True
-
-
 
 
 def reset(*, clear_counts: bool = False) -> None:
@@ -711,10 +782,19 @@ def reset(*, clear_counts: bool = False) -> None:
 
     Deliberately does not touch ``identity``: ``rust_mirror_reset`` alone
     owns the raw handle registry, so other seams' handles survive a node
-    reset. Activation is one-shot and kept across reset, like the mirror.
+    reset. Activation is one-shot and kept across reset, like the mirror,
+    and so is the serving mode: a reset must not silently stop serving.
+
+    The serving counters follow the audit counters, not the store: a
+    plain reset keeps them accumulating across builds, and only
+    ``clear_counts`` zeroes them. Clearing them per build would make a
+    whole-run reading come from the last build alone, which reads as "the
+    channel never engaged" whenever the last build is a small one.
     """
     if _kernel_mod is not None:
         _kernel_mod.rust_node_mirror_reset()
+        if clear_counts:
+            _kernel_mod.rust_node_mirror_read_reset()
     _NODE_HANDLES.clear()
     # G2.0 (#1577): drop the statement/def metadata store too.
     _reset_meta()
