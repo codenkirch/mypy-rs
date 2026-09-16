@@ -258,3 +258,28 @@ the binder's dict operations are a measured bottleneck. Otherwise,
 H is not startable until the storage-flip graduation bar is met, and
 the next productive work is G3.1 (symbol table read flip) or the
 performance bottleneck (per-SCC resolver cost).
+
+
+## Corrections (appended 2026-09-17, from the wave-8 Phase-H design lane, #1770)
+
+Five statements in the body above are wrong or unverified, each with evidence in
+#1770. Read that issue before using this brief; the summary is kept here only so
+the wrong claims are not reused:
+
+1. **A Rust binder already exists** — `crates/type_kernel/src/binder.rs` with
+   `mypy/binder.py:248` and `Options.native_binder` — so the binder is not a
+   greenfield step.
+2. **It is metadata-only**: types stay Python-side.
+3. **It has no recorded ratio anywhere** in the tracked record.
+4. **"The checker never mutates AST nodes" is false**: there are 42 node/`Var`
+   write sites (e.g. `var.is_inferred` at `mypy/checker.py:6337`, `defn.type` at
+   `:1783`, `lvalue_node.type` at `:4980`). A designer relying on the old claim
+   would build the wrong differential.
+5. **"`visit_decorator` calls class-decorator hooks" is false**: `self.plugin`
+   appears three times in `checker.py` with zero hook calls; every such hook is in
+   semanal.
+
+Sequencing also changed: H1 is **not** next. It waits on a `Var` handle scheme
+from the G-family read flips, because `mypy/literals.py:204` keys narrowing on
+the live `Var` object. See #1770 for the order, the cross-run differential shape,
+the counters and the negative control.
