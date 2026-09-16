@@ -343,9 +343,7 @@ try:
         rust_check_overlapping_overloads as _rust_check_overlapping_overloads,
         rust_check_untyped_after_decorator as _rust_check_untyped_after_decorator,
         rust_classify_all_supers_gate as _rust_classify_all_supers_gate,
-        rust_classify_check_assignment as _rust_classify_check_assignment,
         rust_classify_check_final as _rust_classify_check_final,
-        rust_classify_check_lvalue as _rust_classify_check_lvalue,
         rust_classify_classvar_super as _rust_classify_classvar_super,
         rust_classify_comparison_operands as _rust_classify_comparison_operands,
         rust_classify_enum as _rust_classify_enum,
@@ -389,8 +387,6 @@ try:
         rust_is_classmethod_node as _rust_is_classmethod_node,
         rust_is_custom_settable_property as _rust_is_custom_settable_property,
         rust_is_defined_in_base_class as _rust_is_defined_in_base_class,
-        rust_is_definition as _rust_is_definition,
-        rust_is_empty_generator_function as _rust_is_empty_generator_function,
         rust_is_equality_ambiguous_for_narrowing as _rust_is_equality_ambiguous_for_narrowing,
         rust_is_final_enum_value as _rust_is_final_enum_value,
         rust_is_generator_return_type as _rust_is_generator_return_type,
@@ -455,8 +451,6 @@ except ImportError:
     _rust_classify_classvar_super = None  # type: ignore[assignment]
     _rust_classify_all_supers_gate = None  # type: ignore[assignment]
     _rust_classify_check_final = None  # type: ignore[assignment]
-    _rust_classify_check_assignment = None  # type: ignore[assignment]
-    _rust_classify_check_lvalue = None  # type: ignore[assignment]
     _rust_classify_new_signature = None  # type: ignore[assignment]
     _rust_classify_return_stmt_post = None  # type: ignore[assignment]
     _rust_classify_return_stmt_pre = None  # type: ignore[assignment]
@@ -489,7 +483,6 @@ except ImportError:
     _rust_is_valid_inferred_type = None  # type: ignore[assignment]
     _rust_is_writable_attribute = None  # type: ignore[assignment]
     _rust_is_defined_in_base_class = None  # type: ignore[assignment]
-    _rust_is_definition = None  # type: ignore[assignment]
     _rust_can_widen_in_scope = None  # type: ignore[assignment]
     _rust_is_valid_defaultdict_partial_value_type = None  # type: ignore[assignment]
     _rust_is_len_of_tuple = None  # type: ignore[assignment]
@@ -515,7 +508,6 @@ except ImportError:
     _rust_is_final_enum_value = None  # type: ignore[assignment]
     _rust_is_literal_none = None  # type: ignore[assignment]
     _rust_is_literal_not_implemented = None  # type: ignore[assignment]
-    _rust_is_empty_generator_function = None  # type: ignore[assignment]
     _rust_is_static = None  # type: ignore[assignment]
     _rust_is_method = None  # type: ignore[assignment]
     _rust_is_node_static = None  # type: ignore[assignment]
@@ -594,17 +586,6 @@ NATIVE_ENUM_NEW_CONFLICT = 2
 # `ENUM_CHECK_*` in crates/type_kernel/src/checker_functions.rs.
 NATIVE_ENUM_CHECK_MEMBERS_OVERRIDE = 1
 NATIVE_ENUM_CHECK_STUB_EMPTY = 2
-
-# Decision tags returned by `_rust_classify_check_lvalue`; must match
-# `KIND_LVALUE_*` in crates/type_kernel/src/checker_functions.rs.
-NATIVE_LVALUE_NAME_DEF = 0
-NATIVE_LVALUE_MEMBER_DEF = 1
-NATIVE_LVALUE_INDEX = 2
-NATIVE_LVALUE_MEMBER = 3
-NATIVE_LVALUE_NAME = 4
-NATIVE_LVALUE_TUPLE_LIST = 5
-NATIVE_LVALUE_STAR = 6
-NATIVE_LVALUE_ELSE = 7
 
 # Decision tags returned by `_rust_classify_rvalue_count`; must match
 # `RVALUE_COUNT_*` in crates/type_kernel/src/checker_functions.rs.
@@ -4828,52 +4809,32 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
             self.try_infer_partial_generic_type_from_assignment(lvalue, rvalue, "=")
             lvalue_type, index_lvalue, inferred = self.check_lvalue(lvalue, rvalue)
 
-            # Native type_kernel seam: classify the special-name front and
-            # the lvalue_type branch in Rust (checker_functions.rs); None
-            # falls through to the pure-Python classification below.
+            # Native seam retired (#1739): 67,098 calls/corpus; the PyO3 walk
+            # over a live node plus a PartialType class lookup cost 6.2x-10.5x
+            # the pure-Python classification. See the PR body.
             special: int | None = None
             branch: int | None = None
-            if (
-                _CHECKER_HAS_TYPE_KERNEL
-                and _native_checker_active
-                and _rust_classify_check_assignment is not None
-            ):
-                try:
-                    tags = _rust_classify_check_assignment(
-                        lvalue,
-                        lvalue_type if lvalue_type else None,
-                        inferred is not None,
-                        self.scope.active_class() is not None,
-                    )
-                except (AssertionError, NotImplementedError, ValueError, TypeError):
-                    tags = None
-                if tags is not None:
-                    special, branch = tags
-            if special is None or branch is None:
-                # Pure-Python classification (gate off or seam deferral).
-                if special is None:
-                    if isinstance(lvalue, NameExpr) and lvalue.node:
-                        name = lvalue.node.name
-                        if name in ("__setattr__", "__getattribute__", "__getattr__"):
-                            special = NATIVE_CA_SPECIAL_SETATTR_SIG
-                        elif name == "__slots__" and self.scope.active_class() is not None:
-                            special = NATIVE_CA_SPECIAL_SLOTS
-                        elif name == "__match_args__" and inferred is not None:
-                            special = NATIVE_CA_SPECIAL_MATCH_ARGS
-                        elif name == "__post_init__":
-                            special = NATIVE_CA_SPECIAL_POST_INIT
-                    elif isinstance(lvalue, MemberExpr) and lvalue.name == "__match_args__":
-                        special = NATIVE_CA_SPECIAL_MEMBER_MATCH_ARGS
-                if branch is None:
-                    if lvalue_type:
-                        if isinstance(lvalue_type, PartialType) and lvalue_type.type is None:
-                            branch = NATIVE_CA_BRANCH_PARTIAL_NONE
-                        elif isinstance(lvalue, MemberExpr) and lvalue.kind is None:
-                            branch = NATIVE_CA_BRANCH_MEMBER
-                        else:
-                            branch = NATIVE_CA_BRANCH_SIMPLE
-                    else:
-                        branch = NATIVE_CA_BRANCH_NO_TYPE
+            if isinstance(lvalue, NameExpr) and lvalue.node:
+                name = lvalue.node.name
+                if name in ("__setattr__", "__getattribute__", "__getattr__"):
+                    special = NATIVE_CA_SPECIAL_SETATTR_SIG
+                elif name == "__slots__" and self.scope.active_class() is not None:
+                    special = NATIVE_CA_SPECIAL_SLOTS
+                elif name == "__match_args__" and inferred is not None:
+                    special = NATIVE_CA_SPECIAL_MATCH_ARGS
+                elif name == "__post_init__":
+                    special = NATIVE_CA_SPECIAL_POST_INIT
+            elif isinstance(lvalue, MemberExpr) and lvalue.name == "__match_args__":
+                special = NATIVE_CA_SPECIAL_MEMBER_MATCH_ARGS
+            if lvalue_type:
+                if isinstance(lvalue_type, PartialType) and lvalue_type.type is None:
+                    branch = NATIVE_CA_BRANCH_PARTIAL_NONE
+                elif isinstance(lvalue, MemberExpr) and lvalue.kind is None:
+                    branch = NATIVE_CA_BRANCH_MEMBER
+                else:
+                    branch = NATIVE_CA_BRANCH_SIMPLE
+            else:
+                branch = NATIVE_CA_BRANCH_NO_TYPE
 
             if special == NATIVE_CA_SPECIAL_SETATTR_SIG:
                 # If we're assigning to __getattr__ or similar methods, check that the signature is
@@ -6153,67 +6114,9 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
         index_lvalue = None
         inferred = None
 
-        # Native type_kernel seam: classify the lvalue node kind into a
-        # branch tag in Rust (checker_functions.rs); branch bodies stay
-        # here. None falls through to the pure-Python body below.
-        if (
-            _CHECKER_HAS_TYPE_KERNEL
-            and _native_checker_active
-            and _rust_classify_check_lvalue is not None
-        ):
-            try:
-                tag = _rust_classify_check_lvalue(
-                    lvalue, self.options.allow_redefinition, self.is_definition(lvalue)
-                )
-            except (AssertionError, NotImplementedError, ValueError, TypeError):
-                tag = None
-            if tag is not None:
-                if tag == NATIVE_LVALUE_NAME_DEF:
-                    assert isinstance(lvalue, NameExpr)
-                    assert isinstance(lvalue.node, Var)
-                    inferred = lvalue.node
-                elif tag == NATIVE_LVALUE_MEMBER_DEF:
-                    assert isinstance(lvalue, MemberExpr)
-                    self.expr_checker.accept(lvalue.expr)
-                    inferred = lvalue.def_var
-                elif tag == NATIVE_LVALUE_INDEX:
-                    assert isinstance(lvalue, IndexExpr)
-                    index_lvalue = lvalue
-                elif tag == NATIVE_LVALUE_MEMBER:
-                    assert isinstance(lvalue, MemberExpr)
-                    lvalue_type = self.expr_checker.analyze_ordinary_member_access(
-                        lvalue, True, rvalue
-                    )
-                    self.store_type(lvalue, lvalue_type)
-                elif tag == NATIVE_LVALUE_NAME:
-                    assert isinstance(lvalue, NameExpr)
-                    lvalue_type = self.expr_checker.analyze_ref_expr(lvalue, lvalue=True)
-                    if (
-                        self.options.allow_redefinition
-                        and isinstance(lvalue.node, Var)
-                        # We allow redefinition for function arguments inside function body.
-                        # Although we normally do this for variables without annotation, users
-                        # don't have a choice to leave a function argument without annotation.
-                        and (lvalue.node.is_inferred or lvalue.node.is_argument)
-                    ):
-                        inferred = lvalue.node
-                    self.store_type(lvalue, lvalue_type)
-                elif tag == NATIVE_LVALUE_TUPLE_LIST:
-                    assert isinstance(lvalue, (TupleExpr, ListExpr))
-                    types = [
-                        self.check_lvalue(sub_expr)[0] or
-                        # This type will be used as a context for further inference of rvalue,
-                        # we put Uninhabited if there is no information available from lvalue.
-                        UninhabitedType(ambiguous=True)
-                        for sub_expr in lvalue.items
-                    ]
-                    lvalue_type = TupleType(types, self.named_type("builtins.tuple"))
-                elif tag == NATIVE_LVALUE_STAR:
-                    assert isinstance(lvalue, StarExpr)
-                    lvalue_type, _, _ = self.check_lvalue(lvalue.expr)
-                else:
-                    lvalue_type = self.expr_checker.accept(lvalue)
-                return lvalue_type, index_lvalue, inferred
+        # Native seam retired (#1739): 73,298 calls/corpus; the PyO3 walk
+        # (seven mypy.nodes class lookups plus a mypy.types import per call)
+        # cost 5.0x-6.2x the pure-Python classification. See the PR body.
 
         # When revisiting the initial assignment (for example in a loop),
         # treat is as regular if redefinitions are allowed.
@@ -6275,13 +6178,9 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
         return lvalue_type, index_lvalue, inferred
 
     def is_definition(self, s: Lvalue) -> bool:
-        if _CHECKER_HAS_TYPE_KERNEL and _native_checker_active and _rust_is_definition is not None:
-            try:
-                result = _rust_is_definition(s)
-                if result is not None:
-                    return result
-            except (AssertionError, NotImplementedError, ValueError, TypeError):
-                pass
+        # Native seam retired (#1739): 73,298 calls/corpus; two isinstance
+        # checks over live attributes cost 6.3x-10.9x less than the PyO3 walk.
+        # See the PR body for the per-shape table.
         if isinstance(s, NameExpr):
             if s.is_inferred_def:
                 return True
@@ -11368,11 +11267,9 @@ def _is_empty_generator_function(func: FuncItem) -> bool:
     Checks whether a function's body is 'return; yield' (the yield being added only
     to promote the function into a generator function).
     """
-    if _CHECKER_HAS_TYPE_KERNEL and _native_checker_stmts_active:
-        try:
-            return _rust_is_empty_generator_function(func)
-        except (AssertionError, NotImplementedError):
-            pass
+    # Native seam retired (#1739): 31,630 calls/corpus; the PyO3 walk cost
+    # 2.9x-8.8x the pure-Python shape test across three shapes. See the PR
+    # body for the table.
     body = func.body.body
     return (
         len(body) == 2
