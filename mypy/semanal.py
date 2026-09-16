@@ -468,19 +468,14 @@ try:
         rust_is_initial_mangled_global as _rust_is_initial_mangled_global,
         rust_is_magic_base as _rust_is_magic_base,
         rust_is_mangled_global as _rust_is_mangled_global,
-        rust_is_same_symbol as _rust_is_same_symbol,
         rust_is_same_var_from_getattr as _rust_is_same_var_from_getattr,
-        rust_is_trivial_body as _rust_is_trivial_body,
         rust_is_type_ref as _rust_is_type_ref,
         rust_is_valid_del_target as _rust_is_valid_del_target,
-        rust_is_valid_replacement as _rust_is_valid_replacement,
         rust_lookup as _rust_lookup,
         rust_lookup_qualified as _rust_lookup_qualified,
         rust_names_modified_by_assignment as _rust_names_modified_by_assignment,
         rust_names_modified_in_lvalue as _rust_names_modified_in_lvalue,
         rust_parse_bool as _rust_parse_bool,
-        rust_refers_to_class_or_function as _rust_refers_to_class_or_function,
-        rust_refers_to_fullname as _rust_refers_to_fullname,
         rust_remove_imported_names_from_symtable as _rust_remove_imported_names_from_symtable,
         rust_should_wait_rhs as _rust_should_wait_rhs,
         rust_var_is_typing_special_form as _rust_var_is_typing_special_form,
@@ -548,13 +543,8 @@ try:
 
     _SEMANAL_VISITOR_HAS_KERNEL = True
 except ImportError:
-    _rust_refers_to_fullname = None  # type: ignore[assignment]
-    _rust_refers_to_class_or_function = None  # type: ignore[assignment]
-    _rust_is_trivial_body = None  # type: ignore[assignment]
     _rust_find_duplicate = None  # type: ignore[assignment]
-    _rust_is_valid_replacement = None  # type: ignore[assignment]
     _rust_is_base_class = None  # type: ignore[assignment]
-    _rust_is_same_symbol = None  # type: ignore[assignment]
     _rust_names_modified_in_lvalue = None  # type: ignore[assignment]
     _rust_names_modified_by_assignment = None  # type: ignore[assignment]
     _rust_remove_imported_names_from_symtable = None  # type: ignore[assignment]
@@ -10128,11 +10118,9 @@ def replace_implicit_first_type(sig: FunctionLike, new: Type) -> FunctionLike:
 
 def refers_to_fullname(node: Expression, fullnames: str | tuple[str, ...]) -> bool:
     """Is node a name or member expression with the given full name?"""
-    if _SEMANAL_VISITOR_HAS_KERNEL and _native_semanal_visitor_active:
-        try:
-            return _rust_refers_to_fullname(node, fullnames)
-        except (AssertionError, NotImplementedError):
-            pass
+    # Native seam retired (#1698): the port loses ~540ns/call to a ~95ns
+    # Python body (992k calls on the self-check corpus). The pyfunction stays
+    # registered for direct-seam tests.
     if not isinstance(fullnames, tuple):
         fullnames = (fullnames,)
 
@@ -10147,11 +10135,8 @@ def refers_to_fullname(node: Expression, fullnames: str | tuple[str, ...]) -> bo
 
 def refers_to_class_or_function(node: Expression) -> bool:
     """Does semantically analyzed node refer to a class?"""
-    if _SEMANAL_VISITOR_HAS_KERNEL and _native_semanal_visitor_active:
-        try:
-            return _rust_refers_to_class_or_function(node)
-        except (AssertionError, NotImplementedError):
-            pass
+    # Native seam retired (#1698): the port loses ~430ns/call to a ~65ns
+    # Python body. The pyfunction stays registered for direct-seam tests.
     return isinstance(node, RefExpr) and isinstance(
         node.node, (TypeInfo, FuncDef, OverloadedFuncDef)
     )
@@ -10417,11 +10402,8 @@ def is_valid_replacement(old: SymbolTableNode, new: SymbolTableNode) -> bool:
     2. Placeholder that isn't known to become type replaced with a
        placeholder that can become a type
     """
-    if _SEMANAL_VISITOR_HAS_KERNEL and _native_semanal_visitor_active:
-        try:
-            return _rust_is_valid_replacement(old, new)
-        except (AssertionError, NotImplementedError):
-            pass
+    # Native seam retired (#1698): the port loses ~280ns/call to a ~65ns
+    # Python body. The pyfunction stays registered for direct-seam tests.
     if isinstance(old.node, PlaceholderNode):
         if isinstance(new.node, PlaceholderNode):
             return not old.node.becomes_typeinfo and new.node.becomes_typeinfo
@@ -10431,11 +10413,8 @@ def is_valid_replacement(old: SymbolTableNode, new: SymbolTableNode) -> bool:
 
 
 def is_same_symbol(a: SymbolNode | None, b: SymbolNode | None) -> bool:
-    if _SEMANAL_VISITOR_HAS_KERNEL and _native_semanal_visitor_active:
-        try:
-            return _rust_is_same_symbol(a, b)
-        except (AssertionError, NotImplementedError):
-            pass
+    # Native seam retired (#1698): the port loses ~300ns/call to a ~70ns
+    # Python body. The pyfunction stays registered for direct-seam tests.
     return (
         a == b
         or (isinstance(a, PlaceholderNode) and isinstance(b, PlaceholderNode))
@@ -10462,11 +10441,8 @@ def is_trivial_body(block: Block) -> bool:
     Note: If you update this, you may also need to update
     mypy.fastparse.is_possible_trivial_body!
     """
-    if _SEMANAL_VISITOR_HAS_KERNEL and _native_semanal_visitor_active:
-        try:
-            return _rust_is_trivial_body(block)
-        except (AssertionError, NotImplementedError):
-            pass
+    # Native seam retired (#1698): the port loses ~320ns/call to a ~80ns
+    # Python body. The pyfunction stays registered for direct-seam tests.
     body = block.body
     if not body:
         # Functions have empty bodies only if the body is stripped or the function is

@@ -33,6 +33,7 @@ from mypy.nodes import (
     MypyFile,
     NameExpr,
     OpExpr,
+    PassStmt,
     PlaceholderNode,
     StrExpr,
     SymbolTable,
@@ -2114,6 +2115,33 @@ class NativeSemanalVisitorAuditSuite(Suite):
 
         # Non-RefExprs: both paths return False.
         self._par(lambda: refers_to_fullname(IntExpr(1), "builtins.int"), "refers_to_fullname-int")
+
+    # --- retired-predicate direct seams (#1698): shims retired, pyfunctions
+    # stay registered, and these direct tests keep them exercised. ---
+
+    def test_retired_is_trivial_body_direct(self) -> None:
+        assert self._tk.rust_is_trivial_body(Block([PassStmt()])) is True
+        assign = self._assign([NameExpr("x")], IntExpr(1))
+        assert self._tk.rust_is_trivial_body(Block([assign])) is False
+
+    def test_retired_is_valid_replacement_direct(self) -> None:
+        old = SymbolTableNode(GDEF, PlaceholderNode("mod.x", Var("t"), 1))
+        new = SymbolTableNode(GDEF, Var("y"))
+        assert self._tk.rust_is_valid_replacement(old, new) is True
+        assert self._tk.rust_is_valid_replacement(new, old) is False
+
+    def test_retired_is_same_symbol_direct(self) -> None:
+        v = Var("a")
+        assert self._tk.rust_is_same_symbol(v, v) is True
+        assert self._tk.rust_is_same_symbol(Var("a"), Var("b")) is False
+
+    def test_retired_refers_to_fullname_direct(self) -> None:
+        n = self._name("builtins.int")
+        assert self._tk.rust_refers_to_fullname(n, "builtins.int") is True
+        assert self._tk.rust_refers_to_fullname(n, "builtins.str") is False
+
+    def test_retired_refers_to_class_or_function_direct(self) -> None:
+        assert self._tk.rust_refers_to_class_or_function(self._name("x")) is False
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeDecoratedFunctionIsMethodSuite(Suite):
