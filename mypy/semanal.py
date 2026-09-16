@@ -445,7 +445,6 @@ try:
         rust_classify_function_signature as _rust_classify_function_signature,
         rust_classify_imports as _rust_classify_imports,
         rust_classify_lvalue_validity as _rust_classify_lvalue_validity,
-        rust_classify_member_resolution as _rust_classify_member_resolution,
         rust_classify_method_signature as _rust_classify_method_signature,
         rust_classify_recalculate_metaclass as _rust_classify_recalculate_metaclass,
         rust_classify_remove_unpack_kwargs_live as _rust_classify_remove_unpack_kwargs_live,
@@ -557,7 +556,6 @@ except ImportError:
     _rust_classify_imports = None  # type: ignore[assignment]
     _rust_classify_lvalue_validity = None  # type: ignore[assignment]
     _rust_clean_up_bases = None  # type: ignore[assignment]
-    _rust_classify_member_resolution = None  # type: ignore[assignment]
     _rust_classify_method_signature = None  # type: ignore[assignment]
     _rust_classify_declared_metaclass = None  # type: ignore[assignment]
     _rust_classify_recalculate_metaclass = None  # type: ignore[assignment]
@@ -7598,97 +7596,52 @@ class SemanticAnalyzer(
     def visit_member_expr(self, expr: MemberExpr) -> None:
         base = expr.expr
         base.accept(self)
-        # Issue #421: native resolution-branch classification (strangler-fig).
-        # Rust decides which resolution branch applies and returns the symbol
-        # it resolves to; the AST assignments (expr.node/kind/fullname),
+        # Native seam retired (#1723): rust_classify_member_resolution
+        # loses 4.2x to the member branch below on top of a 6-argument
+        # FFI call (130k corpus calls).
+        if isinstance(base, RefExpr) and isinstance(base.node, MypyFile):
+            # Handle module attribute.
+            sym = self.get_module_symbol(base.node, expr.name)
+            if sym:
+                if isinstance(sym.node, PlaceholderNode):
+                    self.process_placeholder(expr.name, "attribute", expr)
+                    return
+                self.record_imported_symbol(sym)
+                expr.kind = sym.kind
+                expr.fullname = sym.fullname or ""
+                expr.node = sym.node
+        elif isinstance(base, RefExpr):
+            # This branch handles C.bar (or cls.bar/self.bar in methods),
+            # looking bar up in the class' TypeInfo namespace when it is a
+            # module or a type; methods are handled in checkmember.
+            type_info = None
+            if isinstance(base.node, TypeInfo):
+                # C.bar where C is a class
+                type_info = base.node
+            elif isinstance(base.node, Var) and self.type and self.function_stack:
+                # check for self.bar or cls.bar in method/classmethod
+                func_def = self.function_stack[-1]
+                if (
+                    func_def.has_self_or_cls_argument
+                    and func_def.info is self.type
+                    and isinstance(func_def.type, CallableType)
+                    and func_def.arguments
+                    and base.node is func_def.arguments[0].variable
+                ):
+                    type_info = self.type
+            elif isinstance(base.node, TypeAlias) and base.node.no_args:
+                assert isinstance(base.node.target, ProperType)
+                if isinstance(base.node.target, Instance):
+                    type_info = base.node.target.type
 
-        # record_imported_symbol, and process_placeholder stay in Python.
-        # state is None when the classifier is inactive or has no
-        # classification (module re-export / incomplete-namespace /
-
-        # __getattr__ / missing-module paths), in which case the pure
-        # branches below run unchanged.
-        state: tuple[str, SymbolTableNode | None] | None = None
-        if _SEMANAL_VISITOR_HAS_KERNEL and _native_semanal_visitor_active:
-            try:
-                classification, sym = _rust_classify_member_resolution(
-                    expr, MemberExpr, RefExpr, MypyFile, TypeInfo, TypeAlias
-                )
-                if classification is not None:
-                    state = (classification, sym)
-            except (AssertionError, NotImplementedError):
-                pass
-        if state is None:
-            if isinstance(base, RefExpr) and isinstance(base.node, MypyFile):
-                # Handle module attribute.
-                sym = self.get_module_symbol(base.node, expr.name)
-                if sym:
-                    if isinstance(sym.node, PlaceholderNode):
-                        self.process_placeholder(expr.name, "attribute", expr)
-                        return
-                    self.record_imported_symbol(sym)
-                    expr.kind = sym.kind
-                    expr.fullname = sym.fullname or ""
-                    expr.node = sym.node
-            elif isinstance(base, RefExpr):
-                # This branch handles the case C.bar (or cls.bar or self.bar inside
-                # a classmethod/method), where C is a class and bar is a type
-                # definition or a module resulting from `import bar` (or a module
-
-                # assignment) inside class C. We look up bar in the class' TypeInfo
-                # namespace.  This is done only when bar is a module or a type;
-                # other things (e.g. methods) are handled by other code in
-
-                # checkmember.
-                type_info = None
-                if isinstance(base.node, TypeInfo):
-                    # C.bar where C is a class
-                    type_info = base.node
-                elif isinstance(base.node, Var) and self.type and self.function_stack:
-                    # check for self.bar or cls.bar in method/classmethod
-                    func_def = self.function_stack[-1]
-                    if (
-                        func_def.has_self_or_cls_argument
-                        and func_def.info is self.type
-                        and isinstance(func_def.type, CallableType)
-                        and func_def.arguments
-                        and base.node is func_def.arguments[0].variable
-                    ):
-                        type_info = self.type
-                elif isinstance(base.node, TypeAlias) and base.node.no_args:
-                    assert isinstance(base.node.target, ProperType)
-                    if isinstance(base.node.target, Instance):
-                        type_info = base.node.target.type
-
-                if type_info:
-                    n = type_info.names.get(expr.name)
-                    if n is not None and isinstance(n.node, (MypyFile, TypeInfo, TypeAlias)):
-                        self.record_imported_symbol(n)
-                        expr.kind = n.kind
-                        expr.fullname = n.fullname or ""
-                        expr.node = n.node
-            return
-        # Classified path: apply the same side effects as the pure branch the
-        # classifier selected. state == ("none", None) means Python also
-        # leaves the expression unresolved (module_hidden symbol or a TypeInfo
-
-        # member outside the (MypyFile, TypeInfo, TypeAlias) set).
-        _, sym = state
-        if sym is None:
-            return
-        if isinstance(sym.node, PlaceholderNode):
-            # Mirror the module branch: defer/error via process_placeholder
-            # without binding. Only module symbols classify as placeholders;
-            # a TypeInfo member whose node is a PlaceholderNode is never
-
-            # classified (it is outside the (MypyFile, TypeInfo, TypeAlias)
-            # set), so this is the module-branch path only.
-            self.process_placeholder(expr.name, "attribute", expr)
-            return
-        self.record_imported_symbol(sym)
-        expr.kind = sym.kind
-        expr.fullname = sym.fullname or ""
-        expr.node = sym.node
+            if type_info:
+                n = type_info.names.get(expr.name)
+                if n is not None and isinstance(n.node, (MypyFile, TypeInfo, TypeAlias)):
+                    self.record_imported_symbol(n)
+                    expr.kind = n.kind
+                    expr.fullname = n.fullname or ""
+                    expr.node = n.node
+        return
 
     def visit_op_expr(self, expr: OpExpr) -> None:
         if _SEMANAL_VISITOR_HAS_KERNEL and _native_semanal_visitor_active:

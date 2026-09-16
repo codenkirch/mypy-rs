@@ -4498,3 +4498,56 @@ class FlattenLvaluesContractTestCase(TestCase):
         assert sa.flatten_lvalues([TupleExpr([a, b])]) == flatten_lvalues(
             [TupleExpr([a, b])], unwrap_star=False
         )
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeClassifyMemberResolutionSuite(Suite):
+    """Direct pins for rust_classify_member_resolution (#1723).
+
+    The visit_member_expr shim is retired; the pyfunction stays
+    registered, and these tests keep it exercised.
+    """
+
+    def setUp(self) -> None:
+        import type_kernel as _tk
+
+        self._tk = _tk
+
+    def _info(self, name: str = "C") -> TypeInfo:
+        from mypy.nodes import Block, ClassDef, SymbolTable
+
+        class_def = ClassDef(name, Block([]), None, [])
+        class_def.fullname = f"mod.{name}"
+        return TypeInfo(SymbolTable(), class_def, "mod")
+
+    def _bound(self, node: Any, attr: str) -> MemberExpr:
+        base = NameExpr("b")
+        base.node = node
+        return MemberExpr(base, attr)
+
+    def _call(self, expr: MemberExpr) -> tuple[str | None, Any]:
+        from mypy.nodes import MemberExpr, MypyFile, RefExpr, TypeAlias, TypeInfo
+
+        return self._tk.rust_classify_member_resolution(
+            expr, MemberExpr, RefExpr, MypyFile, TypeInfo, TypeAlias
+        )
+
+    def test_class_member_hit(self) -> None:
+        info = self._info()
+        inner = self._info("Inner")
+        info.names["attr"] = SymbolTableNode(GDEF, inner)
+        code, sym = self._call(self._bound(info, "attr"))
+        assert code == "member"
+        assert sym is not None
+
+    def test_var_member_decided_negative(self) -> None:
+        info = self._info()
+        info.names["attr"] = SymbolTableNode(GDEF, Var("v"))
+        code, sym = self._call(self._bound(info, "attr"))
+        assert code == "none"
+        assert sym is None
+
+    def test_unbound_base_defers(self) -> None:
+        code, sym = self._call(self._bound(None, "attr"))
+        assert code is None
+        assert sym is None
