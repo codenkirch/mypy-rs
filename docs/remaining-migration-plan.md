@@ -661,6 +661,20 @@ Every measured F slice was <= noise or a loss (capture +78.7s; proxy P2
 cache-data bridge ~1.5x slower), and the only architecture that removes
 per-object Python work (replacement views) was declined by ADR-0004
 Decision 1. The mirror stays as opt-in byte-identity audit tooling.
+**That bar was tested and failed — recorded 2026-09-16, per ADR-0006
+Consequence 1, which asked for exactly this record and did not get it.**
+ADR-0006 (`58d32ab24`, PR #1694) is the experiment for #1671 and its verdict is
+**NO-GO by ~4.7x**, on arithmetic: the `Instance` funnel is 2.119% of the cold
+self-check's total work, so a replacement view that removed *all* of it at *zero*
+cost would beat the native default by 2.12% against the 10% bar. All four
+ADR-0004 contract surfaces (plugins, `isinstance`/identity, `__slots__`,
+astmerge) measured **satisfiable**, so F was closed by measurement, not by
+contract. The 2026-09-16 retirements made the gap *worse*: the funnel's direct
+call counter fell 55% (2,839,692 -> 1,287,230) while total work fell at most
+~6.7%, so the ceiling is now ~0.9-1.1% and the gap ~9-11x. Do not re-open this
+route without a *new* mechanism; see #1769 for the assessment and the
+falsification plan.
+
 Reopening requires a one-family replacement-view prototype clearing a
 >=10% relative total work-share win on the cold self-check with full
 parity green (see `docs/plans/2026-09-11-f-program-close-out.md`).

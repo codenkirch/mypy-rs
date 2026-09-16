@@ -24,6 +24,41 @@ made. Reopening requires the measurement in "Reopening bar" below.
 | Proxy P2b thresholded | dropped | - | corpus A +8.97% wall; corpus B -11% inside noise; ceiling <=0.5% |
 | Cache-data bridge | landed | off | hybrid ~1.5x the Python writer per round |
 
+## Experiment result: the reopening route was run and measured dead
+
+Recorded 2026-09-16 by the F1 assessment lane (#1769), because ADR-0006's
+Consequence 1 asked for this record in the close-out and it was never added —
+until now the only places the NO-GO existed were the ADR itself and a wave-5
+entry in `docs/HANDOFF.md`, while this file and the Phase F section of
+`docs/remaining-migration-plan.md` still read as if the route were open.
+
+- **Verdict: NO-GO by ~4.7x, on arithmetic.** ADR-0006 (`58d32ab24`, PR #1694)
+  is the experiment for #1671. Its baseline leg measured `serialize_funnel_s`
+  1.347s against parse+semanal+type_check 63.572s = **2.119%** of total work, so
+  removing the entire funnel at zero cost still beats the native default by
+  2.12% against the >=10% bar. The measured arm served 25.1% of funnel calls,
+  cut walk encodes 32.4%, cost **+1.67 GB RSS**, and read routing was strictly
+  negative (17.43M pyO3 round-trips for zero additional wire saving).
+- **It was declined on measurement, not contract.** All four ADR-0004 contract
+  surfaces measured satisfiable.
+- **Today's retirements widened the gap to ~9-11x.** The funnel's direct call
+  counter fell 55% between 09-15 and 09-16 (2,839,692 -> 1,287,230) while the
+  whole retire-favourable exposure is bounded at <=4.17s of a >=62s run
+  (<=6.7%), so the ceiling fell to ~0.9-1.1% against the same 10% bar.
+- **Two loose ends, both still open.** (1) ADR-0006's Status is still
+  "Draft. Measured; the maintainer accepts or rejects", and its Consequence 2
+  (delete the prototype or file a successor) is unresolved — an owner decision.
+  (2) `mypy/test/testtypeview.py` (33 test definitions) is referenced by no CI
+  job and no registry: `rg -i typeview .github/` matches nothing, so the
+  prototype's own differential suite has no gate at all. That is today's
+  "CI green while an assertion could not fail" one level up — here CI does not
+  run the assertions.
+- **The prototype is still in the tree, default-off, env-gated** (`MYPY_TYPE_VIEW`
+  0/1/2 at `mypy/build.py:1386-1397`, store in
+  `crates/type_kernel/src/typeview.rs`), so re-running it costs one corpus slot
+  and no new code if the owner wants the current head's figure; the counters
+  already bound it below 1.1%.
+
 ## Why the claim cannot be earned by the shipped architecture
 
 - Every F mechanism measured zero or worse; the two proxy patches are
