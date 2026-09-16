@@ -7966,21 +7966,17 @@ class NativeTryAnalyzeSpecialUnboundSuite(Suite):
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeAnalyzeTypeWithInfoSuite(Suite):
-    """Parity for the Rust `analyze_type_with_type_info` decision front.
+    """Values and tag-table pins for `analyze_type_with_type_info`.
 
-    `TypeAnalyser.analyze_type_with_type_info` binds an unbound type that
-    resolved to a `TypeInfo` node. The front classifier runs in Rust from
-    raw node facts (fullname, argument count, which of tuple_type /
-    special_alias / typeddict_type are set) and returns a branch tag; the
-    Python shim applies the side effects for the two tags it executes inline
-    (tuple with args, types.NoneType). Every other tag re-runs the original
-    body, so message side effects stay single-sourced and parity is trivial
-    for the vec / tail / Instance branches.
-
-    Toggling the typeanal gate off (pure Python) and on (Rust seam) must
-    produce identical (str(result), captured fail messages) on both engaged
-    and body paths, and a direct seam call proves the classifier engages on
-    each decision branch.
+    The Rust front classifier this suite used to exercise was **retired** in
+    #1739: `analyze_type_with_type_info` is pure Python again, so the
+    gate-on/gate-off comparison below runs the *same* body on both settings
+    and therefore asserts the Python path's values, not agreement between two
+    implementations. What is still genuinely native is the registered
+    `rust_classify_type_with_info` pyfunction, whose tag table the
+    `_assert_engages` calls pin directly; the retired-shim contract lives in
+    `NativeValidateInstanceRetiredSuite` and
+    `NativeClassifyTypeWithInfoRetiredSuite` (testtypes_native_retired_typeanal.py).
     """
 
     def setUp(self) -> None:
@@ -8081,6 +8077,9 @@ class NativeAnalyzeTypeWithInfoSuite(Suite):
     def _assert_par(
         self, info: TypeInfo, args: Sequence[Type], empty_tuple_index: bool = False
     ) -> None:
+        # Since #1739 both gates run the same pure-Python body, so this asserts
+        # the path's values rather than two-implementation agreement; the
+        # retired shim's contract lives in testtypes_native_retired_typeanal.py.
         off = self._with_gate(False, lambda: self._call(info, args, empty_tuple_index))
         self._set_active(True)
         on = self._with_gate(True, lambda: self._call(info, args, empty_tuple_index))

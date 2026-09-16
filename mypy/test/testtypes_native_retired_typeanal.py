@@ -103,12 +103,10 @@ class NativeValidateInstanceRetiredSuite(Suite):
         ]
 
     def _run(self, instance: Instance, indexed: bool) -> tuple[bool, list[str]]:
-        api = _FakeApi()
         messages: list[str] = []
         result = validate_instance(
             instance, lambda msg, ctx, code=None: messages.append(msg), indexed
         )
-        assert api.errors == []
         return result, messages
 
     def test_shim_name_gone(self) -> None:
