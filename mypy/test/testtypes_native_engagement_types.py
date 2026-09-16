@@ -10150,6 +10150,9 @@ class NativeTruthinessSuite(Suite):
         assert _type_kernel.rust_true_only(d_bytes, self.resolver) is not None
 
 
+_ABSENT = object()
+
+
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeTypeImplTruthinessSuite(Suite):
     """Parity for the Rust `can_be_true_default`/`can_be_false_default` ports.
@@ -10220,7 +10223,14 @@ class NativeTypeImplTruthinessSuite(Suite):
         import mypy.types as _types_mod
 
         self._types_mod = _types_mod
-        # Bind the seam names the module-level try would have bound.
+        # Bind the seam names the module-level try would have bound. The injected
+        # `_rust_*` names leaked into later suites once this file's name sorted
+        # ahead of the retired-pin file in the glob, so save and restore them.
+        self._orig_module_bindings = {
+            name: _types_mod.__dict__.get(name, _ABSENT)
+            for name in ("_VisitorWriteBuffer", "_ReadBuffer")
+            + tuple("_rust_" + n for n in self._VISITOR_SEAM_NAMES)
+        }
         _types_mod._VisitorWriteBuffer = WriteBuffer  # type: ignore[attr-defined]
         _types_mod._ReadBuffer = ReadBuffer  # type: ignore[attr-defined]
         for n in self._VISITOR_SEAM_NAMES:
@@ -10250,6 +10260,11 @@ class NativeTypeImplTruthinessSuite(Suite):
         self._set_gate(self._orig_visitor_gate)
         _set_native_truthiness_resolver(None)
         self._types_mod._VISITOR_HAS_TYPE_KERNEL = self._orig_kernel_flag
+        for name, prior in self._orig_module_bindings.items():
+            if prior is _ABSENT:
+                self._types_mod.__dict__.pop(name, None)
+            else:
+                self._types_mod.__dict__[name] = prior
 
     def _set_gate(self, active: bool) -> None:
         from mypy.types import _set_native_visitor_active
