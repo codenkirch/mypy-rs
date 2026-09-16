@@ -123,11 +123,9 @@ try:
         rust_analyze_member_method as _rust_analyze_member_method,
         rust_analyze_union_member_access as _rust_analyze_union_member_access,
         rust_check_final_member as _rust_check_final_member,
-        rust_classify_analyze_var as _rust_classify_analyze_var,
         rust_classify_type_type_member_access as _rust_classify_type_type_member_access,
         rust_defined_in_superclass as _rust_defined_in_superclass,
         rust_has_operator as _rust_has_operator,
-        rust_is_instance_var as _rust_is_instance_var,
     )
 
     from mypy.types import read_type as _checkmember_read_type
@@ -135,10 +133,8 @@ try:
     _HAS_TYPE_KERNEL = True
 except ImportError:
     _rust_has_operator = None  # type: ignore[assignment]
-    _rust_is_instance_var = None  # type: ignore[assignment]
     _rust_check_final_member = None  # type: ignore[assignment]
     _rust_defined_in_superclass = None  # type: ignore[assignment]
-    _rust_classify_analyze_var = None  # type: ignore[assignment]
     _rust_classify_type_type_member_access = None  # type: ignore[assignment]
     _rust_analyze_member_access = None  # type: ignore[assignment]
     _rust_analyze_member_method = None  # type: ignore[assignment]
@@ -206,16 +202,6 @@ NATIVE_TT_ITEM_FUNC_TYPEOBJ = 9
 NATIVE_TT_ITEM_FUNC_NOT_TYPEOBJ = 10
 NATIVE_TT_ITEM_TYPE_TYPE_INSTANCE = 11
 NATIVE_TT_ITEM_TYPE_TYPE_OTHER = 12
-
-# Decision tag returned by `rust_classify_analyze_var`; must match the
-# `ANALYZE_VAR_*` constants in crates/type_kernel/src/checkmember.rs.
-NATIVE_AV_SETTER = 0
-NATIVE_AV_GETTER = 1
-NATIVE_AV_PARTIAL = 2
-NATIVE_AV_NOT_READY = 3
-NATIVE_AV_ENUM_LITERAL = 4
-NATIVE_AV_UNBOUND_ANY = 5
-
 
 _BUILTIN_INSTANCE_BYTES: Final[dict[str, bytes]] = {
     "builtins.str": b"\x50\x53",
@@ -1604,10 +1590,9 @@ def analyze_descriptor_assign(descriptor_type: Instance, mx: MemberContext) -> T
 
 def is_instance_var(var: Var) -> bool:
     """Return if var is an instance variable according to PEP 526."""
-    if _HAS_TYPE_KERNEL and _native_checkmember_active and _rust_is_instance_var is not None:
-        result = _rust_is_instance_var(var)
-        if result is not None:
-            return result
+    # Native seam retired (#1739): 44,309 calls/corpus, but the PyO3 read of
+    # four live Var scalars costs 3.4x-5.5x the Python conjunction it replaces
+    # (380-530 vs 70-140 ns/call) and never deferred on a well-formed Var.
     return (
         # check the type_info node is the var (not a decorated function, etc.)
         var.name in var.info.names
@@ -1616,122 +1601,6 @@ def is_instance_var(var: Var) -> bool:
         # variables without annotations are treated as classvar
         and not var.is_inferred
     )
-
-
-def _apply_analyze_var_tag(
-    name: str,
-    var: Var,
-    itype: Instance,
-    mx: MemberContext,
-    tag: int,
-    *,
-    implicit: bool,
-    is_trivial_self: bool,
-) -> Type:
-    """Apply the branch `rust_classify_analyze_var` selected (issue #1056).
-
-    Mirrors the tagged arms of `analyze_var`; handle_partial_var_type, the
-    not-ready callback, the property `__call__` re-analysis, the message
-    emissions, and the bind tails all stay here.
-    """
-    # Found a member variable.
-    original_itype = itype
-    itype = map_instance_to_supertype(itype, var.info)
-    if tag == NATIVE_AV_PARTIAL:
-        if var.is_settable_property and mx.is_lvalue:
-            typ: Type | None = var.setter_type
-            if typ is None and var.is_ready:
-                # Existing synthetic properties may not set setter type. Fall back to getter.
-                typ = var.type
-        else:
-            typ = var.type
-        assert isinstance(typ, PartialType)
-        return mx.chk.handle_partial_var_type(typ, mx.is_lvalue, var, mx.context)
-
-    if tag == NATIVE_AV_ENUM_LITERAL:
-        result: Type = itype.copy_modified(last_known_value=LiteralType(name, fallback=itype))
-    elif tag == NATIVE_AV_NOT_READY:
-        mx.not_ready_callback(var.name, mx.context)
-        result = AnyType(TypeOfAny.special_form)
-    elif tag == NATIVE_AV_UNBOUND_ANY:
-        # Implicit 'Any' type.
-        result = AnyType(TypeOfAny.special_form)
-    else:
-        if tag == NATIVE_AV_SETTER:
-            typ = var.setter_type
-            if typ is None and var.is_ready:
-                # Existing synthetic properties may not set setter type. Fall back to getter.
-                typ = var.type
-        else:
-            typ = var.type
-        assert typ is not None
-        if mx.is_lvalue and not mx.suppress_errors:
-            if var.is_property and not var.is_settable_property:
-                mx.msg.read_only_property(name, itype.type, mx.context)
-            if var.is_classvar:
-                mx.msg.cant_assign_to_classvar(name, mx.context)
-        # This is the most common case for variables, so start with this.
-        result = expand_without_binding(typ, var, itype, original_itype, mx)
-
-        # A non-None value indicates that we should actually bind self for this variable.
-        call_type: ProperType | None = None
-        if var.is_initialized_in_class and (not is_instance_var(var) or mx.is_operator):
-            typ = get_proper_type(typ)
-            if isinstance(typ, FunctionLike) and not typ.is_type_obj():
-                call_type = typ
-            elif var.is_property:
-                deco_mx = mx.copy_modified(original_type=typ, self_type=typ, is_lvalue=False)
-                call_type = get_proper_type(_analyze_member_access("__call__", typ, deco_mx))
-            else:
-                call_type = typ
-
-        # Bound variables with callable types are treated like methods
-        # (these are usually method aliases like __rmul__ = __mul__).
-        if isinstance(call_type, FunctionLike) and not call_type.is_type_obj():
-            if mx.is_lvalue and not var.is_property and not mx.suppress_errors:
-                mx.msg.cant_assign_to_method(mx.context)
-
-        # Bind the self type for each callable component (when needed).
-        if call_type and not var.is_staticmethod:
-            bound_items = []
-            for ct in call_type.items if isinstance(call_type, UnionType) else [call_type]:
-                p_ct = get_proper_type(ct)
-                if isinstance(p_ct, FunctionLike) and (not p_ct.bound() or var.is_property):
-                    item = expand_and_bind_callable(p_ct, var, itype, name, mx, is_trivial_self)
-                else:
-                    item = expand_without_binding(ct, var, itype, original_itype, mx)
-                bound_items.append(item)
-            result = UnionType.make_union(bound_items)
-    fullname = f"{var.info.fullname}.{name}"
-    # Stage 4/C3: skip the Python attribute-hook chain when the registry
-    # proves no DefaultPlugin hook matches (per-attribute-access hot path).
-    from mypy.checkexpr import plugin_hook_known_absent
-
-    if not plugin_hook_known_absent("get_attribute_hook", fullname):
-        hook = mx.chk.plugin.get_attribute_hook(fullname)
-    else:
-        hook = None
-
-    if var.info.is_enum and not mx.is_lvalue:
-        if name in var.info.enum_members and name not in {"name", "value"}:
-            enum_literal = LiteralType(name, fallback=itype)
-            result = itype.copy_modified(last_known_value=enum_literal)
-        elif (
-            isinstance(p_result := get_proper_type(result), Instance)
-            and p_result.type.fullname == "enum.nonmember"
-            and p_result.args
-        ):
-            # Unwrap nonmember similar to class-level access
-            result = p_result.args[0]
-    if result and not (implicit or var.info.is_protocol and is_instance_var(var)):
-        result = analyze_descriptor_access(result, mx)
-    if hook:
-        result = hook(
-            AttributeContext(
-                get_proper_type(mx.original_type), result, mx.is_lvalue, mx.context, mx.chk
-            )
-        )
-    return result
 
 
 def analyze_var(
@@ -1751,31 +1620,9 @@ def analyze_var(
     if implicit is True, the original Var was created as an assignment to self
     if is_trivial_self is True, we can use fast path for bind_self().
     """
-    # Found a member variable.
-    # Native type_kernel seam (issue #1056): Rust classifies the decision
-    # head from live Var scalars; Python applies side effects; None defers.
-    if (
-        _HAS_TYPE_KERNEL
-        and _native_checkmember_active
-        and _native_checkmember_resolver is not None
-        and _rust_classify_analyze_var is not None
-    ):
-        try:
-            tag = _rust_classify_analyze_var(
-                name,
-                var,
-                _serialize_type_for_checkmember(itype),
-                mx.is_lvalue,
-                mx.no_deferral,
-                mx.is_operator,
-                _native_checkmember_resolver,
-            )
-        except (AssertionError, NotImplementedError, ValueError, TypeError):
-            tag = None
-        if tag is not None:
-            return _apply_analyze_var_tag(
-                name, var, itype, mx, tag, implicit=implicit, is_trivial_self=is_trivial_self
-            )
+    # Native seam retired (#1739): 99,852 calls/corpus, but the classification
+    # head plus a full `itype` wire serialize cost 1.6x-4.5x the inline body
+    # (2.2-12.1 us/call), wire-cache hit included.
     original_itype = itype
     itype = map_instance_to_supertype(itype, var.info)
     if var.is_settable_property and mx.is_lvalue:
