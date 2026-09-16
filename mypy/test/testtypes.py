@@ -1664,6 +1664,8 @@ except ImportError:
     _WriteBuffer = None  # type: ignore[assignment,misc]
     _HAS_TYPE_KERNEL_WIRE = False
 
+_HAS_TYPE_KERNEL = _type_kernel is not None
+
 _NATIVE_WIRE_ENABLED = _env_gate("TEST_NATIVE_TYPE_KERNEL") and _HAS_TYPE_KERNEL_WIRE
 
 _NATIVE_SEMANAL_LOOKUP_ENABLED = _env_gate("TEST_NATIVE_TYPE_KERNEL") and _HAS_TYPE_KERNEL_WIRE
@@ -52732,6 +52734,7 @@ class NativeMirrorSpliceSuite(Suite):
         assert types_mod._type_wire_cache_session_depth == 0
 
 
+@skipUnless(_HAS_TYPE_KERNEL, "requires the type_kernel extension")
 class NativeMirrorTypeVarIdSuite(Suite):
     """Unit tests for the TypeVarId capture shim of the F1 mirror.
 
@@ -52871,6 +52874,7 @@ class NativeMirrorTypeVarIdSuite(Suite):
             self._m._strict = False
 
 
+@skipUnless(_HAS_TYPE_KERNEL, "requires the type_kernel extension")
 class NativeMirrorTypeAliasFlagSuite(Suite):
     """Unit tests for the TypeAlias._is_recursive capture shim of the F1 mirror.
 
@@ -52999,6 +53003,7 @@ class NativeMirrorTypeAliasFlagSuite(Suite):
             self._m._strict = False
 
 
+@skipUnless(_HAS_TYPE_KERNEL, "requires the type_kernel extension")
 class NativeMirrorAdoptStrikeSuite(Suite):
     """Unit tests for the adoption-strike lifecycle of the F1 mirror.
 
@@ -53153,6 +53158,7 @@ class NativeMirrorIdFifoSuite(Suite):
         assert not q._members
 
 
+@skipUnless(_HAS_TYPE_KERNEL, "requires the type_kernel extension")
 class NativeMirrorHiddenParentSuite(Suite):
     """Unit tests for the hidden-parent cascade of the F1 mirror.
 
@@ -53299,6 +53305,7 @@ class NativeMirrorHiddenParentSuite(Suite):
         assert not any(k.startswith("mismatch.") for k in delta), delta
 
 
+@skipUnless(_HAS_TYPE_KERNEL, "requires the type_kernel extension")
 class NativeWriteFunnelSkipSuite(Suite):
     """Unit tests for the unprotected-write epoch protocol (slice 6, #1397).
 
@@ -53965,6 +53972,7 @@ class NativeMirrorWalkIndicesRustSuite(Suite):
             self._m._kernel_mod = saved
 
 
+@skipUnless(_HAS_TYPE_KERNEL, "requires the type_kernel extension")
 class NativeMirrorReadSuite(Suite):
     """Unit tests for the Phase F2 (#1393) mirror-read flip at checkexpr.
 
@@ -54292,6 +54300,7 @@ class NativeMirrorReadSuite(Suite):
         assert _serialize_type_join(ct) == self._m._fresh_bytes(ct)
 
 
+@skipUnless(_HAS_TYPE_KERNEL, "requires the type_kernel extension")
 class NativeInstanceWriteSuite(Suite):
     """Unit tests for the Phase F3 (#1397) instance-write splice of the mirror.
 
@@ -54529,6 +54538,7 @@ class NativeInstanceWriteSuite(Suite):
         self._blob_matches_fresh(inst)
 
 
+@skipUnless(_HAS_TYPE_KERNEL, "requires the type_kernel extension")
 class NativeInvisibleFieldSuite(Suite):
     """Wire-invisible field writes stay outside the mirror capture funnel.
 
@@ -54628,6 +54638,7 @@ class NativeInvisibleFieldSuite(Suite):
         self._blob_matches_fresh(inst)
 
 
+@skipUnless(_HAS_TYPE_KERNEL, "requires the type_kernel extension")
 class NativeMirrorCallableWriteSuite(Suite):
     """Unit tests for the Phase F3 slice-8 (#1397) CallableType splice ops.
 
@@ -54943,6 +54954,7 @@ class NativeMirrorUnionPlainDataSuite(Suite):
         assert u.original_str_fallback == "builtins.int"
 
 
+@skipUnless(_HAS_TYPE_KERNEL, "requires the type_kernel extension")
 class NativeMirrorAdoptionFastPathSuite(Suite):
     """Slice 10 funnel fast paths around the adoption strike (#1397).
 
@@ -55545,6 +55557,7 @@ class NativeFormatAliasTopSuite(Suite):
         self._assert_format_par(UnionType([self.fx.a, alias]))
 
 
+@skipUnless(_HAS_TYPE_KERNEL, "requires the type_kernel extension")
 class NativeAmaResidualSuite(Suite):
     """Wave 46a residual deferrals on the ama seam (#1449).
 
@@ -57001,6 +57014,7 @@ class NativePluginFakeRegistrarSuite(Suite):
             _set_native_expand_type_active(False)
 
 
+@skipUnless(_HAS_TYPE_KERNEL, "requires the type_kernel extension")
 class NativeCtorBlobGatesSuite(Suite):
     """`_native_ctor_blob` must clear the expand/maptype gates too (#1484).
 
@@ -57586,6 +57600,7 @@ class NativeAstdiffSnapshotSuite(Suite):
             self._snapshot(42, True)
 
 
+@skipUnless(_HAS_TYPE_KERNEL, "requires the type_kernel extension")
 class NativeAstdiffSymbolSnapshotSuite(Suite):
     """Issue #1500 (B7 slice 2): native `astdiff.snapshot_symbol_table` port.
 
@@ -60023,6 +60038,7 @@ class NativeStmtDefMirrorSuite(Suite):
         assert self._k.rust_mirror_handle_of(var) == handle
 
 
+@skipUnless(_HAS_TYPE_KERNEL, "requires the type_kernel extension")
 class NativeSymtableMirrorSuite(Suite):
     """Unit tests for the G3.0a namespace entry funnel + capture scaffold (#1581).
 
@@ -60503,6 +60519,7 @@ class NativeSymtableMirrorSuite(Suite):
         assert record_after["node_fullname"] == "mod.y"
 
 
+@skipUnless(_HAS_TYPE_KERNEL, "requires the type_kernel extension")
 class NativeSymtableMetaExtraSuite(Suite):
     """G3.0c: extended TypeInfo meta fields (bool flags, type_vars
     count, self_type/declared_metaclass fullnames) captured through
@@ -62116,6 +62133,7 @@ class NativeIsBaseClassSuite(Suite):
         self._assert_par(t, t)
 
 
+@skipUnless(_HAS_TYPE_KERNEL, "requires the type_kernel extension")
 class NativeIsOverloadedItemSuite(Suite):
     """Parity for `rust_is_overloaded_item` (H1q).
 
@@ -63800,6 +63818,7 @@ class NativeSubexprAststripSuite(Suite):
         self._set_aststrip(False)
 
 
+@skipUnless(_HAS_TYPE_KERNEL, "requires the type_kernel extension")
 class NativeStmtDriverSuite(Suite):
     """Parity for `rust_classify_range_int_gate` and
     `rust_classify_match_subject_head` (issue #1634).
@@ -64446,6 +64465,7 @@ class NativeIsLiteralTypeLikeRetiredSuite(Suite):
         assert is_literal_type_like(u2) is False
 
 
+@skipUnless(_HAS_TYPE_KERNEL, "requires the type_kernel extension")
 class NativePluginHookDeclareSuite(Suite):
     """Tests for ``Plugin.declare_hook_fullnames`` and the
     ``ChainedPlugin`` union that feeds ``PluginHookRegistry``.
@@ -65319,6 +65339,9 @@ class NativeLiteralIntExprSuite(Suite):
         expr = NameExpr("x")
         self._assert_par_deferring([{expr: UnionType([self._literal(3)])}], expr)
         assert self._run([{expr: UnionType([self._literal(3)])}], expr) == (3, 3)
+
+
+@skipUnless(_HAS_TYPE_KERNEL, "requires the type_kernel extension")
 class NativeSymtableReadFlipSuite(Suite):
     """Issue #1670 (G3.1): symbol-table read flip for the astdiff snapshot.
 
