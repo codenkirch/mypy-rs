@@ -256,8 +256,9 @@ def _symtable_setitem(self: Any, key: Any, value: Any) -> None:
     _ORIG_SETITEM(self, key, value)
     if not _active or _in_capture:
         return
-    _count("bypass.put")
     if isinstance(value, SymbolTableNode):
+        # _capture counts "bypass.put" itself; counting here too would
+        # double-count the write (#1689).
         _capture(self, key, value, "bypass.put")
     else:
         _count("capture_fail.not_symbol")

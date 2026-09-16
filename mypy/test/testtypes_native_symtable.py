@@ -753,7 +753,7 @@ class NativeSymtableReadFlipSuite(Suite):
         # the entry is `bypass.put` *and* servable.
         table: SymbolTable = SymbolTable()
         table["a"] = self._sym("a", "mod.a")
-        assert self._suppressed_puts() >= 1
+        assert self._suppressed_puts() == 1
         assert self._m.entry_count(table) == len(table) == 1
         flipped = self._snapshot(table, 1)
         assert flipped == self._snapshot(table, 0)
