@@ -5040,4 +5040,16 @@ measurements are appended below as the coordinator reports each landing.
   Filed #1708 for an inherited `NativeSymtableReadFlipSuite` flake observed
   during that verification (raw identity layer answers `handle_of` for a
   recycled address; reproduces on `main` without this branch's gates).
+- `c73260211` (PR #1697, coordinator) — docs/handoff, tier T1: the wave-5
+  resume point refreshed to the merges that landed minutes after `#1682`, and
+  the `#1672`/`#1690` H1d entry added here, so the pinned T4 head and the `main`
+  chain reflect the merged state of that morning.
+- `5b012830e` (PR #1707, coordinator) — docs, tier T1: the append of the two
+  final lane entries above (`#1671`/`58d32ab24`, `#1674`/`a5bb83244`), the head
+  line and queue corrected to the merged state, and the new "T4 on the merged
+  wave head" section (cargo `2856`/0/11, testtypes `4013`/7, testcheck
+  `8198`/15/7, fine-grained `1454`/257, cold self-check 354 files clean, audit
+  `--check` clean).
+- `f2835c480` (PR #1709, coordinator) — docs/handoff, tier T1: head-line
+  refresh to `5b012830e` after the entries PR merged.
 
