@@ -5,6 +5,11 @@ Issue: #1674. Basis: `506aa7e4c` (`origin/main` at branch point), worktree
 below was measured against **this worktree's** `mypy/` tree
 (`.venv/bin/python -c "import mypy; print(mypy.__file__)"` →
 `…/worktrees/mypy-rs-g12/mypy/__init__.py`), not the shared checkout's.
+Rebased for the final merge; the last base is `58d32ab24` (#1694). The
+generated tables were regenerated there (`--check` clean) and the gate
+battery re-run on that tree: cargo `2856 passed / 0 failed / 11 ignored`,
+testtypes `4013 passed / 7 skipped` with the flip gates on, self-check
+clean (354 files). The measurement sections below were taken pre-rebase.
 
 ## Why this audit exists
 
@@ -421,7 +426,7 @@ account for minutes of difference.
 | G1 | `IndexExpr` | `base` | `mypy/checkstrformat.py:863` |
 | G1 | `IndexExpr` | `index` | `mypy/checkstrformat.py:858` |
 | G2 | `ImportFrom` | `id` | `mypy/build.py:232` |
-| G2 | `ImportFrom` | `names` | `mypy/build.py:4650`, `mypy/treetransform.py:156` |
+| G2 | `ImportFrom` | `names` | `mypy/build.py:4675`, `mypy/treetransform.py:156` |
 | G2 | `ImportAll` | `id` | `mypy/build.py:232` |
 | G2 | `Block` | `body` | `mypy/fastparse.py:852`, `mypy/nativeparse.py:1936`, `mypy/semanal_namedtuple.py:145` |
 | G2 | `ForStmt` | `body` | `mypy/fastparse.py:852`, `mypy/nativeparse.py:1936`, `mypy/server/aststrip.py:147` |
