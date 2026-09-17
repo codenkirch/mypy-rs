@@ -20,7 +20,9 @@ seam calls in *this* process, and `mypy_self_check.ini` sets
 0 calls for every seam while still printing a full report. The script
 now refuses to start when the effective worker count is not 0, and
 exits non-zero when it counted no seam call at all, rather than letting
-a hollow zero pass as evidence.
+a hollow zero pass as evidence. It refuses the same way when
+`type_kernel` is not importable (#1821), instead of dying in a bare
+`ModuleNotFoundError` raised before the hollow-zero guard can run.
 
 Throwaway-style instrumentation, kept in-tree so the ranking is
 reproducible. Exact, load-insensitive counters: every serializer
@@ -263,7 +265,12 @@ def make_serializer(name: str, fn: Callable[..., Any]) -> Callable[..., Any]:
 
 
 def patch_kernel() -> int:
-    import type_kernel
+    try:
+        import type_kernel
+    except ImportError as exc:
+        # The one cause #1820's message names that never reached the guard:
+        # a missing extension dies here, before any counting starts (#1821).
+        raise KernelUnavailableError(missing_kernel_reason(exc)) from exc
 
     n = 0
     for name in dir(type_kernel):
@@ -467,7 +474,7 @@ def report() -> None:
         print(f"  plugin-state probe failed: {exc!r}", file=out)
 
 
-# --- fail-loud guards (#1820) ---------------------------------------------
+# --- fail-loud guards (#1820/#1821) ----------------------------------------
 # An in-process proxy cannot observe a fanned-out run: that is a hollow zero,
 # so refuse it the #1789/#1799 way (exit non-zero, name the setting).
 DEFAULT_CONFIG_FILE = "mypy_self_check.ini"
@@ -490,6 +497,35 @@ HOLLOW_ZERO_REFUSAL = (
     "  remedy: re-run single-process with -n0 and the extension .so dirs on\n"
     "  PYTHONPATH, and read the mypy status in the report above.\n"
 )
+MISSING_KERNEL_REFUSAL = (
+    "audit_wire_traffic: MISSING type_kernel EXTENSION (#1821).\n"
+    "  the audit wraps every `rust_*` seam with a counting proxy, so the in-repo\n"
+    "  type_kernel extension must import before any work starts. It did not.\n"
+    "  cause: {cause}\n"
+    "  effect: nothing would be registered and the report would be a hollow zero,\n"
+    "  and this failure precedes the #1820 hollow-zero guard, so it must refuse here.\n"
+    "  remedy: build the extension (AGENTS.md, 'Type kernel build order') and put\n"
+    "  its scratch dir on PYTHONPATH together with the ast_serialize and\n"
+    "  module_resolver dirs, exactly as pinned in the module docstring:\n"
+    "  PYTHONPATH=/private/tmp/mypy-rs-<lane>-tk"
+    ":/private/tmp/mypy-rs-local-ast:/private/tmp/mypy-rs-local-resolver\n"
+    "  a no-scratch run is not a remedy on its own: the shared .venv ships a\n"
+    "  type-stub-only ast_serialize (#1800), so that run dies on the parser instead.\n"
+)
+
+
+class KernelUnavailableError(RuntimeError):
+    """`type_kernel` is not importable: refuse before any work (#1821)."""
+
+
+def missing_kernel_reason(cause: BaseException) -> str:
+    """The refusal message for an unimportable `type_kernel`.
+
+    The cause is carried verbatim, class name included: a transitive
+    ImportError (a missing `librt`, say) must stay diagnosable instead of
+    being flattened into "no type_kernel extension".
+    """
+    return MISSING_KERNEL_REFUSAL.format(cause=f"{type(cause).__name__}: {cause}")
 
 
 def audit_argv(extra: str | None) -> list[str]:
@@ -614,7 +650,12 @@ def main() -> int:
         print(refusal, file=sys.stderr)
         return 1
     _t0 = _time.perf_counter()
-    n_seams = patch_kernel()
+    try:
+        n_seams = patch_kernel()
+    except KernelUnavailableError as exc:
+        # Before any work, like the fan-out refusal: no report at all.
+        print(str(exc), file=sys.stderr)
+        return 1
     import mypy.main
 
     n_ser = patch_serializers()

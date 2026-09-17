@@ -1,9 +1,12 @@
-"""Guards for `misc/audit_wire_traffic.py` (#1820).
+"""Guards for `misc/audit_wire_traffic.py` (#1820, #1821).
 
 The audit counts seam calls with an in-process proxy, so a check that fans
 out to workers makes it report 0 calls for every seam and still succeed.
 Two guards close that: a fan-out refusal before any work starts, and a
-non-zero exit when the run counted nothing at all.
+non-zero exit when the run counted nothing at all. A third refuses when
+`type_kernel` itself is unimportable, the one cause the hollow-zero
+message names that would otherwise die in a bare `ModuleNotFoundError`
+before the guard could run (#1821).
 
 `main()` is driven with the kernel probe and `mypy.main.main` stubbed out,
 so the guards are proven without a self-check. A guard that rejected every
@@ -186,6 +189,8 @@ class FanoutGuardSuite(AuditGuardHarness):
     def test_default_invocation_is_accepted_and_runs(self) -> None:
         rc, err = self.run_main("", tally=1)
         self.assertEqual(rc, 0, err)
+        # Non-empty first: a guard regression must not read as an IndexError.
+        self.assertTrue(self.touched, f"nothing ran: {err}")
         self.assertEqual(self.touched[0], "patch_kernel")
         self.assertIn("mypy.main.main", self.touched)
 
@@ -236,8 +241,71 @@ class HollowZeroGuardSuite(AuditGuardHarness):
         self.assertIn("HOLLOW ZERO", output)
 
 
+class _MissingTypeKernel:
+    """Meta-path finder that makes `import type_kernel` fail, nothing else."""
+
+    def find_spec(self, name: str, path: Any = None, target: Any = None) -> None:
+        if name == "type_kernel":
+            raise ModuleNotFoundError(f"No module named {name!r}", name=name)
+        return
+
+
+class MissingKernelGuardSuite(AuditGuardHarness):
+    """The real `patch_kernel` against an unimportable extension (#1821)."""
+
+    def test_missing_kernel_refuses_with_the_remedy_before_any_work(self) -> None:
+        # Unlike the other suites, `patch_kernel` is NOT stubbed: the real
+        # import runs and fails, which is the defect #1821 reports.
+        cfg = self.config_file(0)
+
+        def serializer_stub() -> int:
+            self.touched.append("patch_serializers")
+            return 0
+
+        def probe_stub() -> int:
+            self.touched.append("patch_probes")
+            return 0
+
+        def mypy_stub(*args_: Any, **kwargs: Any) -> None:
+            self.touched.append("mypy.main.main")
+
+        err = io.StringIO()
+        with mock.patch.dict(os.environ, clear=False):
+            for key in ("MYPY_AUDIT_ARGS", "MYPY_NUM_WORKERS"):
+                os.environ.pop(key, None)
+            os.environ["MYPY_AUDIT_ARGS"] = f"-n0 -p mypy --config-file {cfg}"
+            with (
+                mock.patch.object(self.audit, "patch_serializers", serializer_stub),
+                mock.patch.object(self.audit, "patch_probes", probe_stub),
+                mock.patch.object(mypy.main, "main", mypy_stub),
+                mock.patch.object(sys, "meta_path", [_MissingTypeKernel(), *sys.meta_path]),
+                mock.patch.object(sys, "argv", list(sys.argv)),
+                contextlib.redirect_stderr(err),
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                rc = self.audit.main()
+        output = err.getvalue()
+        # Fail loud: non-zero, a named refusal, and the remedy the bare
+        # `ModuleNotFoundError` never carried.
+        self.assertEqual(rc, 1, output)
+        self.assertIn("MISSING type_kernel EXTENSION (#1821)", output)
+        self.assertIn("cause: ModuleNotFoundError: No module named 'type_kernel'", output)
+        self.assertIn(
+            "/private/tmp/mypy-rs-<lane>-tk"
+            ":/private/tmp/mypy-rs-local-ast:/private/tmp/mypy-rs-local-resolver",
+            output,
+        )
+        # The stale shared-venv stub is why the remedy is not "just run it".
+        self.assertIn("#1800", output)
+        # A refusal, not a hollow-zero report: nothing ran, nothing is
+        # registered, and no report was printed.
+        self.assertEqual(self.touched, [])
+        self.assertEqual(self.audit.registered_seams, set())
+        self.assertNotIn("wire-waste audit", output)
+
+
 class GuardPolicySuite(unittest.TestCase):
-    """The two policies called directly: no `main()`, no kernel, no run."""
+    """The policies called directly: no `main()`, no kernel, no run."""
 
     def setUp(self) -> None:
         self.audit = _load_audit_module()
@@ -295,6 +363,15 @@ class GuardPolicySuite(unittest.TestCase):
         self.assertIn("-n0", self.audit.audit_argv(None))
         self.assertEqual(self.audit.audit_argv("-n0 -p mypy")[3:], ["-n0", "-p", "mypy"])
         self.assertEqual(self.audit.audit_argv("-p mypy")[3:], ["-p", "mypy"])
+
+    def test_missing_kernel_reason_keeps_a_different_cause(self) -> None:
+        # A transitive ImportError must stay diagnosable: the message carries
+        # the cause verbatim rather than flattening it to "no type_kernel".
+        message = self.audit.missing_kernel_reason(
+            ModuleNotFoundError("No module named 'librt'", name="librt")
+        )
+        self.assertIn("cause: ModuleNotFoundError: No module named 'librt'", message)
+        self.assertIn("type_kernel", message)
 
 
 if __name__ == "__main__":
