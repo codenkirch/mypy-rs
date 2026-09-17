@@ -60,7 +60,7 @@ that `extract_var_from_literal_hash` reverses through
 `rust_node_mirror_object_of`. A handle only translates when it resolves back
 to the exact pinned `Var`, so an unresolvable key defers to the live object
 instead of keying a lookup on the wrong node. The mode lives in Rust storage
-(`VarKeyState`), the gate is opt-in (`MYPY_TK_VAR_KEY_FLIP`, an unset
+(`FlipState`), the gate is opt-in (`MYPY_TK_VAR_KEY_FLIP`, an unset
 variable wires no hook into `literal_hash`), and the counters report
 `deferred == 0` in mode 2 to prove the key space stayed homogeneous.
 

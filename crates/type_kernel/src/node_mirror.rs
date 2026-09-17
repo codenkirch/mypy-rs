@@ -28,6 +28,7 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::thread::LocalKey;
 
 use pyo3::exceptions::{PyException, PyValueError};
 use pyo3::prelude::*;
@@ -675,19 +676,21 @@ pub(crate) fn shadow_field_text(handle: u64, field: &str) -> Option<String> {
 // the differential compare below, which is what makes a corpus run
 // evidence rather than a silent pass.
 
-/// Serving mode: 0 off (default), 1 serve, 2 serve + differential compare.
-///
-/// Thread-local like the store it reads: a mode set on one thread cannot
-/// make another thread's empty store look authoritative, and the unit
-/// tests stay isolated from each other.
+// ---- shared flip-state plumbing (G1.1/G2.1/G2.2) ----
+// The expression, statement and var-key serving channels each keep their
+// own thread-local cell, but all three hold this one state shape.
+
+/// One serving channel's thread-local state: a mode plus the seven
+/// provenance counters every channel reports.
 #[derive(Default)]
-struct ReadState {
+struct FlipState {
+    /// 0 off (default), 1 serve, 2 serve + differential compare.
     mode: u8,
-    /// Provenance. `consulted`: a store lookup ran. `served`: the record
-    /// answered with an exact snapshot. `deferred_off`: mode 0.
-    /// `deferred_unrecorded`: no exact record, so the live read stayed in
-    /// charge. `compared`/`mismatched`/`compare_errors`: the mode-2
-    /// differential.
+    /// Provenance. `consulted`: a lookup or translation ran. `served`: the
+    /// record (or handle) answered with an exact snapshot.
+    /// `deferred_off`: mode 0. `deferred_unrecorded`: no exact record, so
+    /// the live read stayed in charge. `compared`/`mismatched`/
+    /// `compare_errors`: the mode-2 differential.
     consulted: u64,
     served: u64,
     deferred_off: u64,
@@ -697,13 +700,67 @@ struct ReadState {
     compare_errors: u64,
 }
 
+fn flip_mode(key: &'static LocalKey<RefCell<FlipState>>) -> u8 {
+    key.with(|cell| cell.borrow().mode)
+}
+
+/// Set a channel's serving mode. Only 0, 1 and 2 exist; any other value
+/// raises so the raw pyfunction cannot select a mode no read path
+/// implements. `label` names the channel so each keeps its own message.
+fn flip_set_mode(
+    key: &'static LocalKey<RefCell<FlipState>>,
+    label: &str,
+    mode: u8,
+) -> PyResult<u8> {
+    if mode > 2 {
+        return Err(PyValueError::new_err(format!(
+            "{label} flip mode must be 0, 1 or 2, got {mode}"
+        )));
+    }
+    key.with(|cell| cell.borrow_mut().mode = mode);
+    Ok(flip_mode(key))
+}
+
+/// `(consulted, served, deferred_off, deferred_unrecorded, compared,
+/// mismatched, compare_errors)`.
+fn flip_counters(key: &'static LocalKey<RefCell<FlipState>>) -> ReadCounters {
+    key.with(|cell| {
+        let state = cell.borrow();
+        (
+            state.consulted,
+            state.served,
+            state.deferred_off,
+            state.deferred_unrecorded,
+            state.compared,
+            state.mismatched,
+            state.compare_errors,
+        )
+    })
+}
+
+/// Clear a channel's counters. The mode is deliberately kept: it is set
+/// once per process (or per test) and a reset must not silently stop
+/// serving.
+fn flip_reset(key: &'static LocalKey<RefCell<FlipState>>) {
+    key.with(|cell| {
+        let mode = cell.borrow().mode;
+        *cell.borrow_mut() = FlipState {
+            mode,
+            ..FlipState::default()
+        };
+    });
+}
+
+// Thread-local like the store it reads: a mode set on one thread cannot
+// make another thread's empty store look authoritative, and the unit tests
+// stay isolated from each other.
 thread_local! {
-    static READ_STATE: RefCell<ReadState> = RefCell::new(ReadState::default());
+    static READ_STATE: RefCell<FlipState> = RefCell::new(FlipState::default());
 }
 
 /// One leaf update of the read state. Never called while a read-state
 /// borrow is held: `RefCell` would panic on the second borrow.
-fn bump(update: impl FnOnce(&mut ReadState)) {
+fn bump(update: impl FnOnce(&mut FlipState)) {
     READ_STATE.with(|cell| update(&mut cell.borrow_mut()));
 }
 
@@ -727,48 +784,25 @@ pub(crate) type ServedRef = (Option<i64>, Option<String>, String, bool, bool);
 pub(crate) type ReadCounters = (u64, u64, u64, u64, u64, u64, u64);
 
 pub(crate) fn read_mode() -> u8 {
-    READ_STATE.with(|cell| cell.borrow().mode)
+    flip_mode(&READ_STATE)
 }
 
 /// Set the serving mode. Only 0, 1 and 2 exist; any other value raises so
 /// the raw pyfunction cannot select a mode no read path implements.
 pub(crate) fn set_read_mode(mode: u8) -> PyResult<u8> {
-    if mode > 2 {
-        return Err(PyValueError::new_err(format!(
-            "node read flip mode must be 0, 1 or 2, got {mode}"
-        )));
-    }
-    bump(|state| state.mode = mode);
-    Ok(read_mode())
+    flip_set_mode(&READ_STATE, "node read", mode)
 }
 
 /// `(consulted, served, deferred_off, deferred_unrecorded, compared,
 /// mismatched, compare_errors)`.
 pub(crate) fn read_counters() -> ReadCounters {
-    READ_STATE.with(|cell| {
-        let state = cell.borrow();
-        (
-            state.consulted,
-            state.served,
-            state.deferred_off,
-            state.deferred_unrecorded,
-            state.compared,
-            state.mismatched,
-            state.compare_errors,
-        )
-    })
+    flip_counters(&READ_STATE)
 }
 
 /// Clear the counters. The mode is deliberately kept: it is set once per
 /// process (or per test) and a reset must not silently stop serving.
 pub(crate) fn reset_read_counters() {
-    bump(|state| {
-        let mode = state.mode;
-        *state = ReadState {
-            mode,
-            ..ReadState::default()
-        };
-    });
+    flip_reset(&READ_STATE);
 }
 
 /// Serve the five `RefExpr` binding scalars for `obj`, or `None` when the
@@ -1076,35 +1110,16 @@ pub(crate) fn rust_node_mirror_meta_entry_count() -> usize {
 // live: `Block.is_unreachable`. A record serves only in the exact shape
 // the capture wrote (`Bool`); a shape-crossed write defers (#1785 class).
 
-/// Serving mode: 0 off (default), 1 serve, 2 serve + differential compare.
-///
-/// Thread-local like the G1.1 read state: a mode set on one thread cannot
-/// make another thread's empty store look authoritative, and the unit
-/// tests stay isolated from each other.
-#[derive(Default)]
-struct StmtReadState {
-    mode: u8,
-    /// Provenance. `consulted`: a store lookup ran. `served`: the record
-    /// answered with an exact `Bool` snapshot. `deferred_off`: mode 0.
-    /// `deferred_unrecorded`: no exact record, so the live read stayed in
-    /// charge. `compared`/`mismatched`/`compare_errors`: the mode-2
-    /// differential.
-    consulted: u64,
-    served: u64,
-    deferred_off: u64,
-    deferred_unrecorded: u64,
-    compared: u64,
-    mismatched: u64,
-    compare_errors: u64,
-}
-
+// Thread-local like the G1.1 read state: a mode set on one thread cannot
+// make another thread's empty store look authoritative, and the unit tests
+// stay isolated from each other.
 thread_local! {
-    static STMT_READ_STATE: RefCell<StmtReadState> = RefCell::new(StmtReadState::default());
+    static STMT_READ_STATE: RefCell<FlipState> = RefCell::new(FlipState::default());
 }
 
 /// One leaf update of the read state. Never called while a read-state
 /// borrow is held: `RefCell` would panic on the second borrow.
-fn bump_stmt(update: impl FnOnce(&mut StmtReadState)) {
+fn bump_stmt(update: impl FnOnce(&mut FlipState)) {
     STMT_READ_STATE.with(|cell| update(&mut cell.borrow_mut()));
 }
 
@@ -1114,48 +1129,25 @@ fn bump_stmt(update: impl FnOnce(&mut StmtReadState)) {
 pub(crate) type StmtReadCounters = (u64, u64, u64, u64, u64, u64, u64);
 
 pub(crate) fn stmt_read_mode() -> u8 {
-    STMT_READ_STATE.with(|cell| cell.borrow().mode)
+    flip_mode(&STMT_READ_STATE)
 }
 
 /// Set the serving mode. Only 0, 1 and 2 exist; any other value raises so
 /// the raw pyfunction cannot select a mode no read path implements.
 pub(crate) fn set_stmt_read_mode(mode: u8) -> PyResult<u8> {
-    if mode > 2 {
-        return Err(PyValueError::new_err(format!(
-            "stmt read flip mode must be 0, 1 or 2, got {mode}"
-        )));
-    }
-    bump_stmt(|state| state.mode = mode);
-    Ok(stmt_read_mode())
+    flip_set_mode(&STMT_READ_STATE, "stmt read", mode)
 }
 
 /// `(consulted, served, deferred_off, deferred_unrecorded, compared,
 /// mismatched, compare_errors)`.
 pub(crate) fn stmt_read_counters() -> StmtReadCounters {
-    STMT_READ_STATE.with(|cell| {
-        let state = cell.borrow();
-        (
-            state.consulted,
-            state.served,
-            state.deferred_off,
-            state.deferred_unrecorded,
-            state.compared,
-            state.mismatched,
-            state.compare_errors,
-        )
-    })
+    flip_counters(&STMT_READ_STATE)
 }
 
 /// Clear the counters. The mode is deliberately kept: it is set once per
 /// process (or per test) and a reset must not silently stop serving.
 pub(crate) fn reset_stmt_read_counters() {
-    bump_stmt(|state| {
-        let mode = state.mode;
-        *state = StmtReadState {
-            mode,
-            ..StmtReadState::default()
-        };
-    });
+    flip_reset(&STMT_READ_STATE);
 }
 
 /// Serve `obj.field` from the metadata record, or `None` when the read
@@ -1287,34 +1279,15 @@ pub(crate) fn rust_node_mirror_verify_stmt_flag(obj: &PyAny, field: &str) -> Opt
 // identity (name-based keys are wrong under shadowing). This seam emits the
 // stored identity handle in the key when the gate serves, else the live object.
 
-/// Serving mode: 0 off (default), 1 serve, 2 serve + differential compare.
-///
-/// Thread-local like the other read states: a mode set on one thread cannot
-/// make another thread's empty pin store look authoritative.
-#[derive(Default)]
-struct VarKeyState {
-    mode: u8,
-    /// Provenance. `consulted`: a translation ran in a serving mode.
-    /// `served`: the emitted key element is the handle.
-    /// `deferred_off`: mode 0. `deferred_unrecorded`: no identity handle or
-    /// no resolving pin, so the key stayed the live object.
-    /// `compared`/`mismatched`/`compare_errors`: the mode-2 differential.
-    consulted: u64,
-    served: u64,
-    deferred_off: u64,
-    deferred_unrecorded: u64,
-    compared: u64,
-    mismatched: u64,
-    compare_errors: u64,
-}
-
+// Thread-local like the other read states: a mode set on one thread cannot
+// make another thread's empty pin store look authoritative.
 thread_local! {
-    static VAR_KEY_STATE: RefCell<VarKeyState> = RefCell::new(VarKeyState::default());
+    static VAR_KEY_STATE: RefCell<FlipState> = RefCell::new(FlipState::default());
 }
 
 /// One leaf update of the var-key state. Never called while a var-key-state
 /// borrow is held: `RefCell` would panic on the second borrow.
-fn bump_var_key(update: impl FnOnce(&mut VarKeyState)) {
+fn bump_var_key(update: impl FnOnce(&mut FlipState)) {
     VAR_KEY_STATE.with(|cell| update(&mut cell.borrow_mut()));
 }
 
@@ -1324,48 +1297,25 @@ fn bump_var_key(update: impl FnOnce(&mut VarKeyState)) {
 pub(crate) type VarKeyCounters = (u64, u64, u64, u64, u64, u64, u64);
 
 pub(crate) fn var_key_mode() -> u8 {
-    VAR_KEY_STATE.with(|cell| cell.borrow().mode)
+    flip_mode(&VAR_KEY_STATE)
 }
 
 /// Set the serving mode. Only 0, 1 and 2 exist; any other value raises so
 /// the raw pyfunction cannot select a mode no translation path implements.
 pub(crate) fn set_var_key_mode(mode: u8) -> PyResult<u8> {
-    if mode > 2 {
-        return Err(PyValueError::new_err(format!(
-            "var key flip mode must be 0, 1 or 2, got {mode}"
-        )));
-    }
-    bump_var_key(|state| state.mode = mode);
-    Ok(var_key_mode())
+    flip_set_mode(&VAR_KEY_STATE, "var key", mode)
 }
 
 /// `(consulted, served, deferred_off, deferred_unrecorded, compared,
 /// mismatched, compare_errors)`.
 pub(crate) fn var_key_counters() -> VarKeyCounters {
-    VAR_KEY_STATE.with(|cell| {
-        let state = cell.borrow();
-        (
-            state.consulted,
-            state.served,
-            state.deferred_off,
-            state.deferred_unrecorded,
-            state.compared,
-            state.mismatched,
-            state.compare_errors,
-        )
-    })
+    flip_counters(&VAR_KEY_STATE)
 }
 
 /// Clear the counters. The mode is deliberately kept: it is set once per
 /// process (or per test) and a reset must not silently stop translating.
 pub(crate) fn reset_var_key_counters() {
-    bump_var_key(|state| {
-        let mode = state.mode;
-        *state = VarKeyState {
-            mode,
-            ..VarKeyState::default()
-        };
-    });
+    flip_reset(&VAR_KEY_STATE);
 }
 
 /// Whether the handle resolves back to this exact live object.
