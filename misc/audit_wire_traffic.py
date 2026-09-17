@@ -33,10 +33,24 @@ event lands in exactly one bucket:
 
   useful        consumed by a seam that returned a decision
   deferred      consumed by a seam that returned None / a -1 slot
-  unconsumed    never reached any seam at all (gated-off / parity-only)
+  unconsumed    never reached any seam at all, for one of three reasons: the
+                bytes were built to key the subtype dedup cache and the lookup
+                answered from it (`mypy/subtypes.py:916`), the batch buffer
+                holding them was dropped at a build boundary, or the
+                serialization sat under a dark gate (parity-only)
 
 Buckets 2 and 3 are the waste. Both are attributed to the Python call
-site that paid for the serialization.
+site that paid for the serialization, and section B2 splits the
+unconsumed bucket by the causes above instead of glossing all of it as
+"gated-off / parity-only" (#1827).
+
+The report also names the audited run's outcome and the extension build
+behind the numbers (#1828). `source tree:` alone cannot distinguish a
+rebuilt `type_kernel` from a stale one, and a stale build is invisible a
+second time over: the eager `from type_kernel import ...` blocks fall
+back on ImportError and `patch_kernel()` registers only the names
+`dir(type_kernel)` holds, so a seam the build lacks never appears in
+section Z either.
 """
 
 from __future__ import annotations
@@ -62,6 +76,7 @@ import collections
 import configparser
 import os
 import sys
+import time
 import types
 from collections.abc import Callable, Mapping
 from typing import Any
@@ -129,6 +144,17 @@ registered_seams: set[str] = set()
 seam_call_bytes: collections.Counter = collections.Counter()
 probe_calls: collections.Counter = collections.Counter()
 probe_stats: dict[str, dict[str, Any]] = {}
+# #1827 cause split for the unconsumed bucket: `mypy.subtypes._subtype_answers`
+# answers a repeated pair without calling any seam, so the two keys built for
+# that lookup at `mypy/subtypes.py:879-880` never reach a seam by construction.
+subtype_dedup: dict[str, int] = {"probes": 0, "hits": 0}
+# id(blob) -> the blob itself, for every pair key a dedup hit turned away.
+# Pinned like `_tracked_blobs`, since the split keys on `id()`; bounded by the
+# keys `_subtype_answers` holds, which the run keeps alive anyway.
+dedup_hit_blobs: dict[int, Any] = {}
+# Never a silent zero: the report says which of these holds when it prints the
+# split, so an uninstrumented run cannot be read as "0 dedup hits" (#1827).
+subtype_dedup_status = "NOT INSTALLED: patch_probes() has not run"
 
 # Python-side sites worth counting directly: parity-only oracles and the
 # per-SCC resolver-snapshot upkeep the issue names as root cause (a).
@@ -303,6 +329,81 @@ def patch_serializers() -> int:
     return n
 
 
+class _CountingAnswers(dict[Any, Any]):
+    """`mypy.subtypes._subtype_answers` with its dedup lookups counted (#1827).
+
+    The dict answers an identical pair from `mypy/subtypes.py:916-920`, which
+    returns before any single-pair or batch seam call: the two blobs built at
+    `:879-880` for that lookup are unconsumed by construction. Counting `in`
+    on the dict is the only place that says so; the buckets cannot.
+    """
+
+    def __contains__(self, key: object) -> bool:
+        subtype_dedup["probes"] += 1
+        hit = super().__contains__(key)
+        if hit:
+            subtype_dedup["hits"] += 1
+            if isinstance(key, tuple) and len(key) >= 2:
+                # The key is (left_bytes, right_bytes, ctx_key): pinning the
+                # two blobs is what lets report() join them against `pending`
+                # by identity instead of extrapolating from the hit count.
+                dedup_hit_blobs[id(key[0])] = key[0]
+                dedup_hit_blobs[id(key[1])] = key[1]
+        return hit
+
+
+def _reinstall_after_reset(subtypes_mod: Any, orig: Callable[..., Any]) -> Any:
+    """Wrap a build-boundary reset so the counting dict survives it."""
+
+    def reset(*args: Any, **kwargs: Any) -> Any:
+        result = orig(*args, **kwargs)
+        subtypes_mod._subtype_answers = _CountingAnswers(subtypes_mod._subtype_answers)
+        return result
+
+    reset.__name__ = orig.__name__
+    return reset
+
+
+def patch_subtype_dedup_probe(subtypes_mod: Any = None) -> bool:
+    """Count `_subtype_answers` lookups for the #1827 cause split.
+
+    `_subtype_answers` is *reassigned* (not cleared) at every build boundary
+    (`_clear_subtype_batch`, `_set_native_subtype_active`), so the counting
+    subclass is re-installed after each of those rather than installed once.
+    A probe that counts nothing because a reset replaced its dict would be a
+    structural zero in the report, so the install outcome is recorded in
+    `subtype_dedup_status` and printed either way.
+    """
+    global subtype_dedup_status
+    if subtypes_mod is None:
+        import mypy.subtypes as subtypes_mod
+
+    answers = getattr(subtypes_mod, "_subtype_answers", None)
+    if not isinstance(answers, dict):
+        subtype_dedup_status = (
+            "NOT INSTALLED: mypy.subtypes._subtype_answers is not a dict, so the "
+            "dedup share is unmeasured, not zero"
+        )
+        return False
+    # Validated before anything is written, so a refusal cannot leave the
+    # module half-patched with a counter that stops at the first reset.
+    resets: list[tuple[str, Any]] = []
+    for name in ("_clear_subtype_batch", "_set_native_subtype_active"):
+        orig = getattr(subtypes_mod, name, None)
+        if not isinstance(orig, types.FunctionType):
+            subtype_dedup_status = (
+                f"NOT INSTALLED: mypy.subtypes.{name} is not a function, so a "
+                f"build-boundary reset would drop the counter"
+            )
+            return False
+        resets.append((name, orig))
+    subtypes_mod._subtype_answers = _CountingAnswers(answers)
+    for name, orig in resets:
+        setattr(subtypes_mod, name, _reinstall_after_reset(subtypes_mod, orig))
+    subtype_dedup_status = "installed"
+    return True
+
+
 def patch_probes() -> int:
     n = 0
     import importlib
@@ -325,8 +426,6 @@ def patch_probes() -> int:
         n += 1
     # Per-SCC resolver snapshot upkeep (issue root cause (a)).
     try:
-        import time as _time
-
         from mypy.build import BuildManager
 
         orig = BuildManager._collect_incremental
@@ -358,11 +457,11 @@ def patch_probes() -> int:
             return infos, aliases
 
         def build_resolvers(self: Any, scc: list[str]) -> Any:
-            t0 = _time.perf_counter()
+            t0 = time.perf_counter()
             try:
                 return orig_build(self, scc)
             finally:
-                stats["resolver_build_s"] += _time.perf_counter() - t0
+                stats["resolver_build_s"] += time.perf_counter() - t0
 
         orig_build = BuildManager._build_native_resolvers
         BuildManager._collect_incremental = collect
@@ -371,10 +470,105 @@ def patch_probes() -> int:
         n += 2
     except ImportError:
         pass
+    # #1827: the subtype dedup lookups that turn a freshly built pair away.
+    n += 1 if patch_subtype_dedup_probe() else 0
     return n
 
 
-def report() -> None:
+# Extension modules whose build produced the counted numbers (#1828). A stale
+# `.so` (the #228 class) otherwise reads exactly like a rebuilt one: same
+# report, same `source tree:`.
+_EXTENSION_MODULES: tuple[str, ...] = ("type_kernel", "ast_serialize", "module_resolver")
+
+
+def _stamp(mtime: float) -> str:
+    return time.strftime("%Y-%m-%d %H:%M", time.localtime(mtime))
+
+
+def _newest_source_mtime(root: str | None) -> float | None:
+    """Newest `crates/type_kernel/src/**/*.rs` mtime under `root`, else None.
+
+    Same comparison `mypy/test/conftest.py` makes before a parity run: the
+    installed `.so` is stale when it predates the sources it should carry.
+    None covers a tree without the Rust sources (an installed wheel).
+    """
+    if root is None:
+        return None
+    src = os.path.join(root, "crates", "type_kernel", "src")
+    newest: float | None = None
+    for dirpath, _dirnames, filenames in os.walk(src):
+        for filename in filenames:
+            if not filename.endswith(".rs"):
+                continue
+            try:
+                mtime = os.path.getmtime(os.path.join(dirpath, filename))
+            except OSError:
+                continue
+            newest = mtime if newest is None or mtime > newest else newest
+    return newest
+
+
+def extension_identity(mypy_mod: types.ModuleType) -> list[str]:
+    """Report lines naming the extension builds behind these numbers (#1828).
+
+    Paths and mtimes, because "which build produced this ranking" is the one
+    thing `source tree:` cannot answer. `type_kernel` is additionally compared
+    against the newest `crates/type_kernel/src` mtime: a stale build is
+    invisible twice over, since the eager `from type_kernel import ...` blocks
+    fall back silently on ImportError and `patch_kernel()` registers only the
+    names `dir(type_kernel)` holds, so a seam the build lacks never even shows
+    up in the zero-call section.
+    """
+    mypy_path = mypy_mod.__file__
+    root = os.path.dirname(os.path.dirname(os.path.abspath(mypy_path))) if mypy_path else None
+    lines: list[str] = []
+    mtimes: dict[str, float] = {}
+    for name in _EXTENSION_MODULES:
+        module = sys.modules.get(name)
+        path = getattr(module, "__file__", None) if module is not None else None
+        if not path:
+            lines.append(f"  {name}: NOT LOADED (this run used no part of it)")
+            continue
+        try:
+            mtimes[name] = os.path.getmtime(path)
+            shown = _stamp(mtimes[name])
+        except OSError:
+            shown = "mtime unreadable"
+        lines.append(f"  {name}: {path} (mtime {shown})")
+    newest = _newest_source_mtime(root)
+    if newest is None:
+        lines.append("  crates/type_kernel/src: not in this source tree, staleness not checked")
+    else:
+        lines.append(f"  crates/type_kernel/src newest: {_stamp(newest)}")
+        built = mtimes.get("type_kernel")
+        if built is not None and built < newest:
+            lines.append(
+                f"  STALE: type_kernel predates {_stamp(newest)}; rebuild it "
+                f"(AGENTS.md, 'Type kernel build order') before ranking"
+            )
+    return lines
+
+
+def _buffered_blob_ids() -> set[int] | None:
+    """ids of the blobs `mypy.subtypes._subtype_batch` still holds, else None.
+
+    Settles the competing explanation for the unconsumed bucket (#1827): a
+    buffered pair whose buffer was dropped at a build boundary never reached a
+    seam either. None (unreadable buffer) must not print as a zero.
+    """
+    subtypes_mod = sys.modules.get("mypy.subtypes")
+    batch = getattr(subtypes_mod, "_subtype_batch", None) if subtypes_mod is not None else None
+    if not isinstance(batch, list):
+        return None
+    ids: set[int] = set()
+    for row in batch:
+        if isinstance(row, tuple) and len(row) >= 2:
+            ids.add(id(row[0]))
+            ids.add(id(row[1]))
+    return ids
+
+
+def report(run_status: str) -> None:
     out = sys.stderr
     for entry in pending.values():
         origin, nbytes = entry[0], entry[1]
@@ -389,6 +583,9 @@ def report() -> None:
     print("\n=== #1624 wire-waste audit (self-check) ===", file=out)
     print(f"[audit] {n_reg} seams registered, {n_called} called, {n_zero} zero-call", file=out)
     print(f"source tree: {_mypy.__file__}", file=out)
+    print(f"audited run: {run_status}", file=out)
+    for line in extension_identity(_mypy):
+        print(line, file=out)
     print(f"serialization events: {tot}", file=out)
     print(f"  useful:      {sum(useful.values())} ({sum(useful_bytes.values())} B)", file=out)
     print(f"  deferred:    {sum(deferred.values())} ({sum(deferred_bytes.values())} B)", file=out)
@@ -406,6 +603,55 @@ def report() -> None:
     print("\n--- B. serialized, NEVER consumed by any seam (top 25) ---", file=out)
     for site_, cnt in unconsumed.most_common(25):
         print(f"  {cnt:8d}  {unconsumed_bytes[site_]:10d}B  {site_}", file=out)
+
+    print("\n--- B2. unconsumed bucket by cause (#1827) ---", file=out)
+    n_unconsumed = sum(unconsumed.values())
+    if n_unconsumed:
+        site_, cnt = unconsumed.most_common(1)[0]
+        share = 100.0 * cnt / n_unconsumed
+        print(
+            f"  dominant call site: {site_} {cnt} events, "
+            f"{unconsumed_bytes[site_]}B ({share:.1f}% of the bucket)",
+            file=out,
+        )
+    print(f"  subtype dedup probe: {subtype_dedup_status}", file=out)
+    if subtype_dedup_status == "installed":
+        hits, probes = subtype_dedup["hits"], subtype_dedup["probes"]
+        print(f"  mypy.subtypes._subtype_answers: {hits} dedup hits of {probes} lookups", file=out)
+        # The join is by blob identity against this run's `pending` map, not by
+        # extrapolating from the hit count: one wire-cached blob is registered
+        # once and looked up many times.
+        turned_away = [entry for entry in pending.values() if id(entry[2]) in dedup_hit_blobs]
+        n_dedup = len(turned_away)
+        n_dedup_bytes = sum(entry[1] for entry in turned_away)
+        share = 100.0 * n_dedup / n_unconsumed if n_unconsumed else 0.0
+        print(
+            f"  a dedup hit turned these away: {n_dedup} of the {n_unconsumed} "
+            f"unconsumed events ({share:.1f}%, {n_dedup_bytes} B)",
+            file=out,
+        )
+        residual = n_unconsumed - n_dedup
+        if residual > 0:
+            print(
+                f"  other causes: {residual} events, a batch dropped at a build "
+                f"boundary or a serialization under a dark gate; not split further here",
+                file=out,
+            )
+        if n_dedup:
+            # Recorded because the share dominates: no gate flip or reordering
+            # removes these bytes, the dedup key IS the wire bytes built for it.
+            print(
+                "  reduction path: the cache key is the serialization, so it cannot "
+                "be skipped by reordering; only a memo keyed on object identity, "
+                "taken before the bytes are built, avoids rebuilding them",
+                file=out,
+            )
+    buffered_ids = _buffered_blob_ids()
+    if buffered_ids is None:
+        print("  mypy.subtypes._subtype_batch: NOT READABLE, buffered share unmeasured", file=out)
+    else:
+        n_buffered = sum(1 for key in pending if key in buffered_ids)
+        print(f"  still in mypy.subtypes._subtype_batch at exit: {n_buffered} blobs", file=out)
 
     print("\n--- C. useful: consumed and decided (top 15) ---", file=out)
     for site_, cnt in useful.most_common(15):
@@ -497,10 +743,24 @@ HOLLOW_ZERO_REFUSAL = (
     "  remedy: re-run single-process with -n0 and the extension .so dirs on\n"
     "  PYTHONPATH, and read the mypy status in the report above.\n"
 )
+AUDITED_RUN_FAILED_REFUSAL = (
+    "audit_wire_traffic: THE AUDITED RUN FAILED (#1828).\n"
+    "  the report above was printed from a run that did not finish its work, so it\n"
+    "  is a truncated census and not a ranking: every seam it is missing was never\n"
+    "  reached. This is decided from the run's outcome, not from the tally, because\n"
+    "  a run that aborted after one counted call still produced a partial report.\n"
+    "  failure: {failure}\n"
+    "  remedy: fix the crash (a stale extension build is the usual cause, see the\n"
+    "  extension identity lines in the report above) and re-run.\n"
+)
 MISSING_KERNEL_REFUSAL = (
-    "audit_wire_traffic: MISSING type_kernel EXTENSION (#1821).\n"
-    "  the audit wraps every `rust_*` seam with a counting proxy, so the in-repo\n"
-    "  type_kernel extension must import before any work starts. It did not.\n"
+    "audit_wire_traffic: {headline} (#1821).\n"
+    "  the audit wraps every `rust_*` seam with a counting proxy, so an importable\n"
+    "  type_kernel must exist before any work starts. `import type_kernel` failed.\n"
+    "  A failure of the extension itself and a failure inside its own import\n"
+    "  (a missing `librt`, say) are indistinguishable from the exception class\n"
+    "  alone, so the headline names the extension as one cause and `cause:` below\n"
+    "  carries the failure verbatim.\n"
     "  cause: {cause}\n"
     "  effect: nothing would be registered and the report would be a hollow zero,\n"
     "  and this failure precedes the #1820 hollow-zero guard, so it must refuse here.\n"
@@ -518,14 +778,30 @@ class KernelUnavailableError(RuntimeError):
     """`type_kernel` is not importable: refuse before any work (#1821)."""
 
 
+# The headline is derived from the cause (#1831): `except ImportError` also
+# catches a failure raised inside type_kernel's own initialisation (the missing
+# `librt` case above), where the extension itself is present.
+MISSING_EXTENSION_HEADLINE = "MISSING type_kernel EXTENSION"
+KERNEL_UNAVAILABLE_HEADLINE = "type_kernel UNAVAILABLE"
+
+
 def missing_kernel_reason(cause: BaseException) -> str:
     """The refusal message for an unimportable `type_kernel`.
 
     The cause is carried verbatim, class name included: a transitive
     ImportError (a missing `librt`, say) must stay diagnosable instead of
-    being flattened into "no type_kernel extension".
+    being flattened into "no type_kernel extension". The headline follows the
+    cause for the same reason: only `name == "type_kernel"` is the extension
+    missing, anything else failed while type_kernel imported something.
     """
-    return MISSING_KERNEL_REFUSAL.format(cause=f"{type(cause).__name__}: {cause}")
+    headline = (
+        MISSING_EXTENSION_HEADLINE
+        if getattr(cause, "name", None) == "type_kernel"
+        else KERNEL_UNAVAILABLE_HEADLINE
+    )
+    return MISSING_KERNEL_REFUSAL.format(
+        headline=headline, cause=f"{type(cause).__name__}: {cause}"
+    )
 
 
 def audit_argv(extra: str | None) -> list[str]:
@@ -640,16 +916,58 @@ def hollow_zero_reason(calls: int, seams: int) -> str | None:
     return HOLLOW_ZERO_REFUSAL.format(calls=calls, seams=seams)
 
 
-def main() -> int:
-    import time as _time
+def classify_run_exit(code: object) -> str | None:
+    """The failure detail for a `SystemExit` code, else None (#1828).
 
+    `clean_exit=True` makes the audited run's own exits raise as well, so a
+    `SystemExit` is not automatically a crash: mypy returns normally on a clean
+    run, exits 1 when it found type errors (every module was still checked, and
+    a census does not care), and exits 2 for a serious error or when blockers
+    stopped analysis. Only the last one truncates the census.
+    """
+    if code is None or code == 0 or code == 1:
+        return None
+    return f"mypy exited {code!r}"
+
+
+def run_failure_reason(failure: str | None) -> str | None:
+    """The refusal when the audited run itself failed, else None (#1828).
+
+    Independent of the seam tally, because the tally is exactly what a
+    truncated run still produces: one counted call before an abort was enough
+    to exit 0 with a partial report.
+    """
+    if failure is None:
+        return None
+    return AUDITED_RUN_FAILED_REFUSAL.format(failure=failure)
+
+
+def evidence_refusals(total_calls: int, seams: int, run_failure: str | None) -> list[str]:
+    """Every reason the printed report cannot be read as evidence (#1820/#1828).
+
+    An empty list means the report is readable. Collecting all of them instead
+    of returning the first keeps the crashed-run message and the hollow-zero
+    message visible together: a run that aborted before counting anything is
+    both.
+    """
+    reasons = []
+    failed = run_failure_reason(run_failure)
+    if failed is not None:
+        reasons.append(failed)
+    hollow = hollow_zero_reason(total_calls, seams)
+    if hollow is not None:
+        reasons.append(hollow)
+    return reasons
+
+
+def main() -> int:
     argv = audit_argv(os.environ.get("MYPY_AUDIT_ARGS"))
     refusal = fanout_reason(argv, os.environ)
     if refusal is not None:
         # Before any work: a fanned-out run must not produce a report at all.
         print(refusal, file=sys.stderr)
         return 1
-    _t0 = _time.perf_counter()
+    _t0 = time.perf_counter()
     try:
         n_seams = patch_kernel()
     except KernelUnavailableError as exc:
@@ -674,28 +992,38 @@ def main() -> int:
         file=sys.stderr,
     )
     sys.argv = argv
+    # The audited run's outcome is part of the evidence (#1828), and it is
+    # recorded on the abnormal path: every exit and every raise sets it.
+    run_failure: str | None = None
+    run_status = "not started"
     try:
         mypy.main.main(clean_exit=True)
-    except SystemExit:
-        pass
-    except Exception:
+        run_status = "completed, mypy.main returned"
+    except SystemExit as exc:
+        run_failure = classify_run_exit(exc.code)
+        if run_failure is None:
+            run_status = f"completed, mypy exit {exc.code!r}"
+        else:
+            run_status = f"FAILED, {run_failure}"
+    except BaseException as exc:
+        run_failure = f"{type(exc).__name__}: {exc}"
+        run_status = f"FAILED, raised {run_failure}"
         # The counters are the whole point: report them on the error path too.
         import traceback
 
         traceback.print_exc()
     finally:
-        total_run_s = _time.perf_counter() - _t0
+        total_run_s = time.perf_counter() - _t0
         print(f"\n[audit] total run wall {total_run_s:.1f}s (load-contaminated)", file=sys.stderr)
-        report()
-    # The report is printed on every path; the guard only decides whether it
+        report(run_status)
+    # The report is printed on every path; the guards only decide whether it
     # may be read as evidence. `report()` sits in the `finally` above, so the
     # tally read here is complete even when the audited run raised.
     total_calls = sum(seam_calls.values())
-    refusal = hollow_zero_reason(total_calls, len(registered_seams))
-    if refusal is not None:
-        print(refusal, file=sys.stderr)
-        return 1
-    return 0
+    refusals = evidence_refusals(total_calls, len(registered_seams), run_failure)
+    for reason in refusals:
+        print(reason, file=sys.stderr)
+    return 1 if refusals else 0
 
 
 if __name__ == "__main__":

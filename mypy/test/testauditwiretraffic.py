@@ -1,4 +1,4 @@
-"""Guards for `misc/audit_wire_traffic.py` (#1820, #1821).
+"""Guards for `misc/audit_wire_traffic.py` (#1820, #1821, #1827, #1828, #1831).
 
 The audit counts seam calls with an in-process proxy, so a check that fans
 out to workers makes it report 0 calls for every seam and still succeed.
@@ -7,6 +7,13 @@ non-zero exit when the run counted nothing at all. A third refuses when
 `type_kernel` itself is unimportable, the one cause the hollow-zero
 message names that would otherwise die in a bare `ModuleNotFoundError`
 before the guard could run (#1821).
+
+Two more refusals were added after review: the audit now also fails when
+the audited run aborted (a crashed run still produced a partial report and
+exited 0 as long as one call was counted), and it names the extension
+build behind the numbers (#1828). The refusal for the unimportable kernel
+is headed from its cause, because `except ImportError` also catches a
+failure inside `type_kernel`'s own import (#1831).
 
 `main()` is driven with the kernel probe and `mypy.main.main` stubbed out,
 so the guards are proven without a self-check. A guard that rejected every
@@ -59,9 +66,18 @@ class AuditGuardHarness(unittest.TestCase):
         return str(path)
 
     def run_main(
-        self, args: str, tally: int = 0, workers_env: str | None = None
+        self,
+        args: str,
+        tally: int = 0,
+        workers_env: str | None = None,
+        run_exc: BaseException | None = None,
     ) -> tuple[int, str]:
-        """Run `main()` once. `tally` is the seam calls the stub run "made"."""
+        """Run `main()` once.
+
+        `tally` is the seam calls the stub run "made"; `run_exc` is raised by
+        the stub in place of returning, which is how a crashed audited run is
+        driven (#1828).
+        """
 
         def kernel_stub() -> int:
             self.touched.append("patch_kernel")
@@ -79,6 +95,8 @@ class AuditGuardHarness(unittest.TestCase):
             self.touched.append("mypy.main.main")
             if tally:
                 self.audit.seam_calls["rust_stub_probe"] += tally
+            if run_exc is not None:
+                raise run_exc
 
         err = io.StringIO()
         with mock.patch.dict(os.environ, clear=False):
@@ -241,6 +259,67 @@ class HollowZeroGuardSuite(AuditGuardHarness):
         self.assertIn("HOLLOW ZERO", output)
 
 
+class CrashedRunGuardSuite(AuditGuardHarness):
+    """#1828: the exit status must never come from the tally alone."""
+
+    def test_a_run_that_exits_2_with_counted_calls_refuses(self) -> None:
+        # The issue's own probe: a stale kernel crashes mypy with
+        # `INTERNAL ERROR` and exit 2 after counting seam calls, and the audit
+        # used to return 0 with a truncated report.
+        rc, err = self.run_main("", tally=3, run_exc=SystemExit(2))
+        self.assertEqual(rc, 1, err)
+        self.assertIn("THE AUDITED RUN FAILED (#1828)", err)
+        self.assertIn("failure: mypy exited 2", err)
+        # The partial numbers are still worth reading, so the report is
+        # printed first and the refusal follows it.
+        self.assertIn("wire-waste audit", err)
+        self.assertLess(err.index("wire-waste audit"), err.index("THE AUDITED RUN FAILED"))
+        # The report itself carries the outcome: a reader who only sees the
+        # report must not read a truncated census as a complete one.
+        self.assertIn("audited run: FAILED, mypy exited 2", err)
+
+    def test_a_raising_run_with_counted_calls_refuses(self) -> None:
+        # The same defect for any other abort, not just mypy's own exit path.
+        rc, err = self.run_main("", tally=3, run_exc=RuntimeError("stale kernel blew up"))
+        self.assertEqual(rc, 1)
+        self.assertIn("failure: RuntimeError: stale kernel blew up", err)
+        self.assertIn("audited run: FAILED, raised RuntimeError: stale kernel blew up", err)
+
+    def test_a_crashed_run_with_no_calls_reports_both_causes(self) -> None:
+        # A run that aborted before counting anything is both defects; one
+        # message must not hide the other.
+        rc, err = self.run_main("", tally=0, run_exc=SystemExit(2))
+        self.assertEqual(rc, 1)
+        self.assertIn("THE AUDITED RUN FAILED (#1828)", err)
+        self.assertIn("HOLLOW ZERO", err)
+        self.assertLess(err.index("THE AUDITED RUN FAILED"), err.index("HOLLOW ZERO"))
+
+    def test_a_clean_run_with_counted_calls_is_accepted(self) -> None:
+        # Positive control: `clean_exit=True` makes mypy return normally on a
+        # clean run, which must stay a readable report.
+        rc, err = self.run_main("", tally=1)
+        self.assertEqual(rc, 0, err)
+        self.assertIn("audited run: completed, mypy.main returned", err)
+        # The header names the extension build the numbers came from (#1828),
+        # so a stale `.so` cannot read like a rebuilt one.
+        self.assertIn("type_kernel:", err)
+        self.assertIn("ast_serialize:", err)
+        self.assertIn("module_resolver:", err)
+
+    def test_a_run_that_found_type_errors_is_accepted(self) -> None:
+        # Positive control: mypy exits 1 when it found type errors, having
+        # still checked every module, so the census is complete.
+        rc, err = self.run_main("", tally=1, run_exc=SystemExit(1))
+        self.assertEqual(rc, 0, err)
+        self.assertIn("audited run: completed, mypy exit 1", err)
+        self.assertNotIn("THE AUDITED RUN FAILED", err)
+
+    def test_a_zero_exit_with_counted_calls_is_accepted(self) -> None:
+        rc, err = self.run_main("", tally=1, run_exc=SystemExit(0))
+        self.assertEqual(rc, 0, err)
+        self.assertIn("audited run: completed, mypy exit 0", err)
+
+
 class _MissingTypeKernel:
     """Meta-path finder that makes `import type_kernel` fail, nothing else."""
 
@@ -253,7 +332,8 @@ class _MissingTypeKernel:
 class MissingKernelGuardSuite(AuditGuardHarness):
     """The real `patch_kernel` against an unimportable extension (#1821)."""
 
-    def test_missing_kernel_refuses_with_the_remedy_before_any_work(self) -> None:
+    def run_refusal(self) -> tuple[int, str]:
+        """Drive the real `patch_kernel` with `import type_kernel` failing."""
         # Unlike the other suites, `patch_kernel` is NOT stubbed: the real
         # import runs and fails, which is the defect #1821 reports.
         cfg = self.config_file(0)
@@ -278,13 +358,21 @@ class MissingKernelGuardSuite(AuditGuardHarness):
                 mock.patch.object(self.audit, "patch_serializers", serializer_stub),
                 mock.patch.object(self.audit, "patch_probes", probe_stub),
                 mock.patch.object(mypy.main, "main", mypy_stub),
+                # `import type_kernel` reads `sys.modules` before any meta-path
+                # finder runs, so the cache is emptied alongside the finder
+                # (#1831); a cached module would never consult the finder.
+                mock.patch.dict(sys.modules),
                 mock.patch.object(sys, "meta_path", [_MissingTypeKernel(), *sys.meta_path]),
                 mock.patch.object(sys, "argv", list(sys.argv)),
                 contextlib.redirect_stderr(err),
                 contextlib.redirect_stdout(io.StringIO()),
             ):
+                sys.modules.pop("type_kernel", None)
                 rc = self.audit.main()
-        output = err.getvalue()
+        return rc, err.getvalue()
+
+    def test_missing_kernel_refuses_with_the_remedy_before_any_work(self) -> None:
+        rc, output = self.run_refusal()
         # Fail loud: non-zero, a named refusal, and the remedy the bare
         # `ModuleNotFoundError` never carried.
         self.assertEqual(rc, 1, output)
@@ -300,6 +388,20 @@ class MissingKernelGuardSuite(AuditGuardHarness):
         # A refusal, not a hollow-zero report: nothing ran, nothing is
         # registered, and no report was printed.
         self.assertEqual(self.touched, [])
+        self.assertEqual(self.audit.registered_seams, set())
+        self.assertNotIn("wire-waste audit", output)
+
+    def test_a_cached_type_kernel_does_not_defeat_the_refusal(self) -> None:
+        # The control for that neutralisation: a fake kernel with a
+        # real-looking seam is cached, so the finder is consulted only if the
+        # cache is emptied -- in any environment, parity or not.
+        fake = types.ModuleType("type_kernel")
+        fake.rust_fake_seam = lambda: None  # type: ignore[attr-defined]
+        with mock.patch.dict(sys.modules, {"type_kernel": fake}):
+            self.assertIs(sys.modules["type_kernel"], fake)
+            rc, output = self.run_refusal()
+        self.assertEqual(rc, 1, output)
+        self.assertIn("MISSING type_kernel EXTENSION (#1821)", output)
         self.assertEqual(self.audit.registered_seams, set())
         self.assertNotIn("wire-waste audit", output)
 
@@ -372,6 +474,211 @@ class GuardPolicySuite(unittest.TestCase):
         )
         self.assertIn("cause: ModuleNotFoundError: No module named 'librt'", message)
         self.assertIn("type_kernel", message)
+
+    def test_missing_kernel_headline_follows_the_cause(self) -> None:
+        # #1831: in the librt case the extension is present and only its own
+        # import failed, so the headline must not claim it is missing.
+        dependency = self.audit.missing_kernel_reason(
+            ModuleNotFoundError("No module named 'librt'", name="librt")
+        )
+        self.assertIn("type_kernel UNAVAILABLE (#1821)", dependency)
+        self.assertNotIn("MISSING type_kernel EXTENSION", dependency)
+        extension = self.audit.missing_kernel_reason(
+            ModuleNotFoundError("No module named 'type_kernel'", name="type_kernel")
+        )
+        self.assertIn("MISSING type_kernel EXTENSION (#1821)", extension)
+        # A bare ImportError (no `name`) is a failed initialisation, not a
+        # missing file: mypy's Rust init errors carry no `name`.
+        bare = self.audit.missing_kernel_reason(ImportError("librt symbol missing"))
+        self.assertIn("type_kernel UNAVAILABLE (#1821)", bare)
+
+    def test_run_exit_codes_name_a_failure(self) -> None:
+        # #1828: only an exit that truncates the census is a failure. 0 is a
+        # clean run, 1 means type errors were found after every module was
+        # checked, 2 is a serious error or a build stopped by blockers.
+        self.assertIsNone(self.audit.classify_run_exit(None))
+        self.assertIsNone(self.audit.classify_run_exit(0))
+        self.assertIsNone(self.audit.classify_run_exit(1))
+        self.assertEqual(self.audit.classify_run_exit(2), "mypy exited 2")
+        self.assertEqual(self.audit.classify_run_exit("boom"), "mypy exited 'boom'")
+
+    def test_evidence_refusals_collect_every_reason(self) -> None:
+        # A run that crashed before counting anything is both defects, so both
+        # messages print: either alone would hide a real cause.
+        both = self.audit.evidence_refusals(0, 3, "mypy exited 2")
+        self.assertEqual(len(both), 2)
+        self.assertIn("THE AUDITED RUN FAILED (#1828)", both[0])
+        self.assertIn("HOLLOW ZERO", both[1])
+        # A readable report, and one refusal at a time.
+        self.assertEqual(self.audit.evidence_refusals(1, 3, None), [])
+        self.assertEqual(len(self.audit.evidence_refusals(1, 3, "mypy exited 2")), 1)
+        self.assertEqual(len(self.audit.evidence_refusals(0, 3, None)), 1)
+
+    def test_extension_identity_names_the_build(self) -> None:
+        # #1828: the header must answer "which build produced these numbers".
+        import mypy
+
+        lines = "\n".join(self.audit.extension_identity(mypy))
+        for name in ("type_kernel", "ast_serialize", "module_resolver"):
+            self.assertIn(name, lines)
+        self.assertIn("crates/type_kernel/src", lines)
+
+
+class UnconsumedCauseSplitSuite(unittest.TestCase):
+    """#1827: the unconsumed bucket's cause split, and the probe behind it."""
+
+    def setUp(self) -> None:
+        self.audit = _load_audit_module()
+
+    def report_text(self) -> str:
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+            self.audit.report("completed, mypy.main returned")
+        return err.getvalue()
+
+    def seed_pending(self, caller: str, n: int, payload: int = 100, turned_away: int = 0) -> None:
+        """Register `n` unconsumed blobs in `pending`, as a run leaves them.
+
+        The first `turned_away` of them are also recorded as pair keys a dedup
+        hit turned away, which is the identity the report joins on.
+        """
+        for i in range(n):
+            blob = f"{caller}-{i}".encode()
+            self.audit.pending[id(blob)] = [caller, payload, blob]
+            if i < turned_away:
+                self.audit.dedup_hit_blobs[id(blob)] = blob
+
+    def test_the_report_names_the_dominant_site_and_the_dedup_share(self) -> None:
+        self.seed_pending("subtypes.py:879:_is_subtype", 30, turned_away=10)
+        self.seed_pending("subtypes.py:880:_is_subtype", 10)
+        self.audit.subtype_dedup.update({"probes": 90, "hits": 10})
+        # `mock.patch.object`, not a bare assignment: this module is loaded
+        # dynamically, so mypy sees only `ModuleType` and rejects a direct
+        # attribute write (`mypy/test/*` is inside the self-check's `-p mypy`).
+        with mock.patch.object(self.audit, "subtype_dedup_status", "installed"):
+            output = self.report_text()
+        self.assertIn("--- B2. unconsumed bucket by cause (#1827) ---", output)
+        self.assertIn(
+            "dominant call site: subtypes.py:879:_is_subtype 30 events, "
+            "3000B (75.0% of the bucket)",
+            output,
+        )
+        self.assertIn("10 dedup hits of 90 lookups", output)
+        self.assertIn("a dedup hit turned these away: 10 of the 40 unconsumed events", output)
+        self.assertIn("(25.0%, 1000 B)", output)
+        self.assertIn("other causes: 30 events", output)
+        # The reduction path is recorded too: the key IS the bytes, so no
+        # reordering removes them (#1827 fix direction 2).
+        self.assertIn("reduction path: the cache key is the serialization", output)
+
+    def test_the_split_joins_by_identity_not_by_the_hit_count(self) -> None:
+        # Two blobs turned away against a hit count of 30121: the split follows
+        # the blob identities, so it cannot swallow the non-dedup remainder by
+        # extrapolating two events per hit (#1827).
+        self.seed_pending("subtypes.py:879:_is_subtype", 30, turned_away=2)
+        self.seed_pending("subtypes.py:880:_is_subtype", 10)
+        self.audit.subtype_dedup.update({"probes": 90_000, "hits": 30_121})
+        with mock.patch.object(self.audit, "subtype_dedup_status", "installed"):
+            output = self.report_text()
+        self.assertIn("a dedup hit turned these away: 2 of the 40 unconsumed events", output)
+        self.assertIn("other causes: 38 events", output)
+
+    def test_a_bucket_the_probe_fully_explains_has_no_other_causes(self) -> None:
+        self.seed_pending("subtypes.py:879:_is_subtype", 5, turned_away=5)
+        self.audit.subtype_dedup.update({"probes": 5, "hits": 5})
+        with mock.patch.object(self.audit, "subtype_dedup_status", "installed"):
+            output = self.report_text()
+        self.assertIn("a dedup hit turned these away: 5 of the 5 unconsumed events", output)
+        self.assertNotIn("other causes:", output)
+
+    def test_an_uninstalled_probe_is_not_reported_as_zero_hits(self) -> None:
+        # A structural zero would read as "no dedup hits"; the report must say
+        # the measurement is missing instead (#1827, AGENTS.md).
+        self.seed_pending("subtypes.py:879:_is_subtype", 3, turned_away=3)
+        with mock.patch.object(self.audit, "subtype_dedup_status", "NOT INSTALLED: no dict"):
+            output = self.report_text()
+        self.assertIn("subtype dedup probe: NOT INSTALLED: no dict", output)
+        self.assertNotIn("dedup hits of", output)
+        self.assertNotIn("turned these away", output)
+        self.assertNotIn("reduction path:", output)
+        # The dominant site stays visible either way.
+        self.assertIn("dominant call site:", output)
+
+    def test_counting_answers_counts_lookups_and_hits(self) -> None:
+        answers = self.audit._CountingAnswers({(b"l", b"r", ()): True})
+        self.assertIn((b"l", b"r", ()), answers)
+        self.assertNotIn((b"x", b"y", ()), answers)
+        self.assertEqual(self.audit.subtype_dedup, {"probes": 2, "hits": 1})
+
+    def test_a_build_boundary_reset_keeps_the_counter_installed(self) -> None:
+        # The reset reassigns `_subtype_answers`, dropping its contents by
+        # design; the counter must survive it, or the report would read as
+        # "no dedup hits" for the rest of the run.
+        holder = types.SimpleNamespace(
+            _subtype_answers=self.audit._CountingAnswers({(b"k",): True})
+        )
+
+        def reset() -> None:
+            holder._subtype_answers = {}
+
+        self.audit._reinstall_after_reset(holder, reset)()
+        self.assertIsInstance(holder._subtype_answers, self.audit._CountingAnswers)
+        self.assertNotIn((b"k",), holder._subtype_answers)
+        self.assertEqual(self.audit.subtype_dedup, {"probes": 1, "hits": 0})
+
+    def test_the_probe_refuses_loudly_when_it_cannot_install(self) -> None:
+        # A renamed or non-dict cache must be a refusal, not a silent zero.
+        holder = types.SimpleNamespace(_subtype_answers=None)
+        self.assertFalse(self.audit.patch_subtype_dedup_probe(holder))
+        self.assertIn("NOT INSTALLED", self.audit.subtype_dedup_status)
+        # A reset that is not a function would lose the counter mid-run.
+        holder2 = types.SimpleNamespace(
+            _subtype_answers={},
+            _clear_subtype_batch=lambda: None,
+            _set_native_subtype_active="not a function",
+        )
+        self.assertFalse(self.audit.patch_subtype_dedup_probe(holder2))
+        self.assertIn("_set_native_subtype_active", self.audit.subtype_dedup_status)
+        # Nothing was written before the refusal.
+        self.assertNotIsInstance(holder2._subtype_answers, self.audit._CountingAnswers)
+
+    def test_the_probe_installs_and_survives_a_reset(self) -> None:
+        def reset() -> None:
+            holder._subtype_answers = {}
+
+        holder = types.SimpleNamespace(
+            _subtype_answers={(b"a", b"b", ()): True},
+            _clear_subtype_batch=reset,
+            _set_native_subtype_active=lambda active: None,
+        )
+        self.assertTrue(self.audit.patch_subtype_dedup_probe(holder))
+        self.assertEqual(self.audit.subtype_dedup_status, "installed")
+        self.assertIsInstance(holder._subtype_answers, self.audit._CountingAnswers)
+        # The live cache is wrapped, not replaced: its contents survive.
+        self.assertIn((b"a", b"b", ()), holder._subtype_answers)
+        # A build-boundary reset wipes the cache and reassigns the name; the
+        # counter must come back with the new dict.
+        holder._clear_subtype_batch()
+        self.assertIsInstance(holder._subtype_answers, self.audit._CountingAnswers)
+        self.assertNotIn((b"r", b"s", ()), holder._subtype_answers)
+        self.assertEqual(self.audit.subtype_dedup, {"probes": 2, "hits": 1})
+
+    def test_an_unreadable_batch_buffer_is_not_reported_as_zero(self) -> None:
+        # The competing explanation for the bucket is a dropped batch buffer.
+        # A buffer this probe cannot read must say so: printing "0 blobs" for
+        # it would be a structural zero (#1827, AGENTS.md).
+        self.seed_pending("mypy/subtypes.py:1:f", 1)
+        absent = types.SimpleNamespace()
+        with mock.patch.dict(sys.modules, {"mypy.subtypes": absent}):
+            self.assertIsNone(self.audit._buffered_blob_ids())
+            self.assertIn("NOT READABLE", self.report_text())
+        # A readable but empty buffer is a real zero, and stays a number.
+        empty = types.SimpleNamespace(_subtype_batch=[])
+        with mock.patch.dict(sys.modules, {"mypy.subtypes": empty}):
+            self.assertEqual(self.audit._buffered_blob_ids(), set())
+            self.assertIn(
+                "still in mypy.subtypes._subtype_batch at exit: 0 blobs", self.report_text()
+            )
 
 
 if __name__ == "__main__":
