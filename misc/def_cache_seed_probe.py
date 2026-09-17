@@ -78,8 +78,6 @@ _SOURCES: list[tuple[str, str, str]] = [
     ("main.py", "__main__", "import pkg.use\n"),
 ]
 
-_ORIGINS = ("parse", "cache_fixed", "cache_json")
-
 
 def _options(cache_dir: str, *, fixed_format_cache: bool) -> Options:
     options = Options()
@@ -100,7 +98,7 @@ def _provenance(report: dict[str, int]) -> dict[str, int]:
 
 
 def _seed_counts(report: dict[str, int]) -> dict[str, int]:
-    keys = [k for k in report if k.startswith(("meta_seed_loaded", "meta_seed_"))]
+    keys = [k for k in report if k.startswith("meta_seed_")]
     return {k: report[k] for k in sorted(keys)}
 
 

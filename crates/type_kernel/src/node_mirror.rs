@@ -566,13 +566,27 @@ pub(crate) fn rust_node_mirror_seed_loaded(
         let value = meta_value_for(&kind, text, num, items)?;
         encoded.push((intern_meta_field(&field), value));
     }
+    // A duplicate name from Python must not double-count: the repeat would
+    // match the record this loop just pushed, counting the slot in `minted`
+    // and again in `replaced`. Last-write-wins, per `capture_meta`.
+    let mut deduped: Vec<(&'static str, MetaValue)> = Vec::with_capacity(encoded.len());
+    let mut index: HashMap<&'static str, usize> = HashMap::with_capacity(encoded.len());
+    for (field, value) in encoded {
+        match index.get(&field).copied() {
+            Some(pos) => deduped[pos].1 = value,
+            None => {
+                index.insert(field, deduped.len());
+                deduped.push((field, value));
+            }
+        }
+    }
     let handle = handle_or_error(obj)?;
     let (preexisting, minted, replaced) = with_meta_store(|store| {
         let preexisting = store.by_handle.contains_key(&handle);
         let entry = store.by_handle.entry(handle).or_default();
         let mut minted = 0usize;
         let mut replaced = 0usize;
-        for (field, value) in encoded {
+        for (field, value) in deduped {
             match entry.fields.iter_mut().find(|(name, _)| *name == field) {
                 Some(existing) => {
                     existing.1 = value;

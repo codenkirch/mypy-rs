@@ -238,6 +238,53 @@ class DefCacheSeedSuite(Suite):
         assert delta.get("meta_seed_loaded_missing", 0) == 1
         assert delta.get("meta_seed_loaded") == 1
 
+    def test_a_condition_that_never_occurred_leaves_no_key(self) -> None:
+        """A zero-valued counter must not materialize (#1849).
+
+        `meta_seed_loaded_preexisting` and `..._missing` were written on
+        every seed, so their presence did not mean the event happened and a
+        reader could not tell "0 occurrences" from "not applicable".
+        """
+        saved_active = self._m._active
+        self._m._active = False
+        try:
+            var = self._var()
+            tracked = self._m._meta_tracked(type(var))
+            missing = [f for f in tracked if not hasattr(var, f)]
+            assert missing == [], f"pick a node with no missing slot, got {missing}"
+        finally:
+            self._m._active = saved_active
+        before = self._m.report()
+        self._seed_node(var)
+        after = self._m.report()
+        assert after.get("meta_seed_loaded", 0) - before.get("meta_seed_loaded", 0) == 1
+        assert (
+            "meta_seed_loaded_preexisting" not in after
+        ), "nothing had adopted this node, so the key must be absent, not 0"
+        assert (
+            "meta_seed_loaded_missing" not in after
+        ), "no tracked slot was missing, so the key must be absent, not 0"
+
+    def test_a_duplicate_field_is_deduped_before_counting(self) -> None:
+        """`fields` crosses the Python boundary, so a repeat must not count twice.
+
+        The duplicate used to match the record the loop itself had just
+        pushed, landing the slot in `minted` and again in `replaced` (and
+        bumping `captures` per occurrence): `minted + replaced` then
+        over-counted the records actually taken. Last-write-wins, matching
+        `capture_meta`'s replace-in-place semantics (#1849).
+        """
+        var = self._var()
+        var.is_final = True  # tracked, so the node has an entry and a handle
+        fields = [("zz_probe", "none", None, None, None), ("zz_probe", "int", None, 7, None)]
+        _, _, minted, replaced = self._k.rust_node_mirror_seed_loaded(var, fields)
+        assert (minted, replaced) == (
+            1,
+            0,
+        ), "one unique field: a counted duplicate would report (1, 1)"
+        record = self._record(var) or {}
+        assert record["zz_probe"][0] == "int" and record["zz_probe"][2] == 7, "last write wins"
+
     def test_the_seed_never_raises_into_the_reader(self) -> None:
         """A failing kernel call is accounted, not propagated (#1773's rule).
 

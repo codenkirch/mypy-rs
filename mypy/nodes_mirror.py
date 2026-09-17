@@ -1182,10 +1182,14 @@ def seed_loaded(node: Any) -> int:
     _META_HANDLES[id(node)] = int(handle)
     taken = int(minted) + int(replaced)
     _count("meta_seed_loaded")
-    _count("meta_seed_loaded_preexisting", 1 if preexisting else 0)
+    # A zero-valued counter would break the "presence means it happened"
+    # convention: a key with no event must not materialize (#1849).
+    if preexisting:
+        _count("meta_seed_loaded_preexisting")
     _count("meta_seed_loaded_minted", int(minted))
     _count("meta_seed_loaded_replaced", int(replaced))
-    _count("meta_seed_loaded_missing", missing)
+    if missing:
+        _count("meta_seed_loaded_missing", missing)
     _count_origin("meta_seeded", taken)
     return taken
 
