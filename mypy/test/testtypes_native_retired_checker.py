@@ -78,6 +78,19 @@ class NativeIsDefinitionRetiredSuite(Suite):
             _set_native_checker_active(False)
         assert loaded == [], f"is_definition still loads {loaded}"
 
+    def test_the_co_names_scan_bites(self) -> None:
+        # Negative control: the scan above must flag a code object that loads
+        # a live rust_* alias, or a green `loaded == []` proves nothing. This
+        # probe is a wired neighbour; retarget it if that seam ever retires.
+        from mypy import checker
+        from mypy.checker import TypeChecker
+
+        found = [
+            n for n in TypeChecker.find_isinstance_check_helper.__code__.co_names if "rust_" in n
+        ]
+        live = [n for n in found if callable(getattr(checker, n, None))]
+        assert live, f"no live rust_* alias in find_isinstance_check_helper: {found}"
+
     def _cases(self) -> list[tuple[Any, bool]]:
         fx = self.fx
         name_inferred = NameExpr("x")
@@ -295,6 +308,17 @@ class NativeClassifyCheckAssignmentRetiredSuite(Suite):
         finally:
             _set_native_checker_active(False)
         assert loaded == [], f"check_assignment still loads {loaded}"
+
+    def test_the_co_names_scan_bites(self) -> None:
+        # Negative control: the scan above must flag a code object that loads
+        # a live rust_* alias, or a green `loaded == []` proves nothing. This
+        # probe is a wired neighbour; retarget it if that seam ever retires.
+        from mypy import checker
+        from mypy.checker import TypeChecker
+
+        found = [n for n in TypeChecker.check_match_args.__code__.co_names if "rust_" in n]
+        live = [n for n in found if callable(getattr(checker, n, None))]
+        assert live, f"no live rust_* alias in check_match_args: {found}"
 
     def _run(
         self, lvalue: Any, lvalue_type: Type | None, inferred: Any, active_class: Any = None

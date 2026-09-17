@@ -4406,9 +4406,13 @@ class NativeMatchArgsSuite(Suite):
         tup = TupleType([fx.lit_str1, fx.a], fx.std_tuple)
         assert self._bool(self._bytes_of(tup)) is False
 
-    def test_parity_skip_no_class(self) -> None:
+    def test_module_scope_precedes_the_gate(self) -> None:
+        # A module scope returns at checker.py:3425, before the seam gate is
+        # read, so the arm comparison cannot fail; the empty note list on
+        # this non-literal tuple pins the skip (a class scope emits LITERAL_REQ).
         fx = TypeFixture()
-        self._assert_par(self._module_scope(), TupleType([fx.lit_str1], fx.std_tuple))
+        notes, _ = self._run(self._module_scope(), TupleType([fx.a], fx.std_tuple))
+        assert_equal(notes, [])
 
     def test_parity_ok_all_string_literals(self) -> None:
         fx = TypeFixture()
@@ -4645,23 +4649,17 @@ class NativeFindIsinstanceHeadSuite(Suite):
         result = self._run(node)
         assert set(result[0]) == {node} and set(result[1]) == {node}
 
-    def test_parity_is_true_false_literal_precedes_seam(self) -> None:
-        # True/False literals short-circuit before the CallExpr dispatch.
+    def test_true_false_literal_precedes_the_gate(self) -> None:
+        # True/False literals short-circuit at checker.py:8637-8640, before
+        # the seam gate at :8648 is read, so the arm comparison cannot fail
+        # on this shape; the literal maps of one run are pinned instead.
         from mypy.checker import TypeChecker
         from mypy.types import UninhabitedType
 
         def run(node: Any) -> Any:
-            def check_one() -> Any:
-                chk = TypeChecker.__new__(TypeChecker)
-                chk._type_maps = [{}]
-                return TypeChecker.find_isinstance_check_helper(
-                    chk, node, in_boolean_context=False
-                )
-
-            off = self._with_gate(False, check_one)
-            on = self._with_gate(True, check_one)
-            assert_equal(on, off, "true/false literal parity")
-            return on
+            chk = TypeChecker.__new__(TypeChecker)
+            chk._type_maps = [{}]
+            return TypeChecker.find_isinstance_check_helper(chk, node, in_boolean_context=False)
 
         true_ref = self._builtin_ref("builtins.True")
         assert_equal(run(true_ref), ({}, {true_ref: UninhabitedType()}))
@@ -7729,16 +7727,18 @@ class NativeIsDefinedInBaseClassSuite(Suite):
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeIsDefinitionSuite(Suite):
-    """Parity for the Rust `is_definition` pure-predicate port (#1603).
+    """Production pins for the retired `is_definition` seam (#1603).
 
-    `TypeChecker.is_definition` (checker.py:6173-6188) is a pure bool
-    over a live `Lvalue`: a `NameExpr` is a definition when
-    `is_inferred_def` is set or its `node` is a `Var` with `type is None`;
-    a `MemberExpr` is a definition when `is_inferred_def` is set; else
-    `False`. The Rust port reads the live node via PyO3 and returns the
-    bool directly, mirroring `rust_is_writable_attribute`. Direct seam
-    calls assert the exact bool; the gate-off vs gate-on differential
-    drives the real TypeChecker method.
+    `TypeChecker.is_definition` (checker.py:6180) is a pure bool over a
+    live `Lvalue`: a `NameExpr` is a definition when `is_inferred_def` is
+    set or its `node` is a `Var` with `type is None`; a `MemberExpr` is a
+    definition when `is_inferred_def` is set; else `False`. The Rust port
+    `rust_is_definition` was retired by #1739: the alias and shim are gone,
+    the pyfunction stays registered for the direct-seam calls below, and
+    the host reads no gate, so a gate-off vs gate-on differential cannot
+    fail on any shape here. The production tests pin the exact bool of
+    one run each; the retirement pin lives in
+    `testtypes_native_retired_checker.py::NativeIsDefinitionRetiredSuite`.
     """
 
     def setUp(self) -> None:
@@ -7750,13 +7750,6 @@ class NativeIsDefinitionSuite(Suite):
 
     def tearDown(self) -> None:
         self._set_active(False)
-
-    def _with_gate(self, active: bool, fn: Callable[[], T]) -> T:
-        self._set_active(active)
-        try:
-            return fn()
-        finally:
-            self._set_active(True)
 
     def _name_expr(self, name: str, is_inferred_def: bool = False, node: Any = None) -> NameExpr:
         ne = NameExpr(name)
@@ -7773,20 +7766,12 @@ class NativeIsDefinitionSuite(Suite):
     def _seam(self, node: Any) -> Any:
         return _type_kernel.rust_is_definition(node)
 
-    def _run(self, node: Any) -> tuple[bool, bool]:
+    def _assert_value(self, node: Any, expected: bool) -> None:
         from mypy.checker import TypeChecker
 
-        def check_one() -> bool:
-            chk = TypeChecker.__new__(TypeChecker)
-            return chk.is_definition(node)
-
-        off = self._with_gate(False, check_one)
-        on = self._with_gate(True, check_one)
-        return off, on
-
-    def _assert_par(self, node: Any) -> None:
-        off, on = self._run(node)
-        assert_equal(on, off, f"is_definition parity for node={node!r}")
+        chk = TypeChecker.__new__(TypeChecker)
+        got = chk.is_definition(node)
+        assert got is expected, f"is_definition({node!r}) -> {got}"
 
     def test_seam_name_expr_inferred_def(self) -> None:
         assert self._seam(self._name_expr("x", is_inferred_def=True)) is True
@@ -7813,24 +7798,24 @@ class NativeIsDefinitionSuite(Suite):
     def test_seam_non_expr(self) -> None:
         assert self._seam(self.fx.oi) is False
 
-    def test_parity_name_expr_inferred_def(self) -> None:
-        self._assert_par(self._name_expr("x", is_inferred_def=True))
+    def test_value_name_expr_inferred_def(self) -> None:
+        self._assert_value(self._name_expr("x", is_inferred_def=True), True)
 
-    def test_parity_name_expr_var_no_type(self) -> None:
+    def test_value_name_expr_var_no_type(self) -> None:
         v = Var("x")
         v.type = None
-        self._assert_par(self._name_expr("x", node=v))
+        self._assert_value(self._name_expr("x", node=v), True)
 
-    def test_parity_name_expr_var_with_type(self) -> None:
+    def test_value_name_expr_var_with_type(self) -> None:
         v = Var("x")
         v.type = self.fx.o
-        self._assert_par(self._name_expr("x", node=v))
+        self._assert_value(self._name_expr("x", node=v), False)
 
-    def test_parity_member_expr_inferred_def(self) -> None:
-        self._assert_par(self._member_expr("attr", is_inferred_def=True))
+    def test_value_member_expr_inferred_def(self) -> None:
+        self._assert_value(self._member_expr("attr", is_inferred_def=True), True)
 
-    def test_parity_member_expr_not_inferred(self) -> None:
-        self._assert_par(self._member_expr("attr"))
+    def test_value_member_expr_not_inferred(self) -> None:
+        self._assert_value(self._member_expr("attr"), False)
 
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
@@ -8725,20 +8710,25 @@ class NativeNarrowIdentityEqualitySuite(Suite):
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeCheckAssignmentHeadSuite(Suite):
-    """Parity for `rust_classify_check_assignment` (issue #1090).
+    """Direct-seam tests and production pins for `rust_classify_check_assignment` (#1090).
 
-    `TypeChecker.check_assignment` (checker.py:4681) classifies a
+    `TypeChecker.check_assignment` (checker.py:4800) classifies a
     special-name front (NameExpr `__setattr__`/`__getattribute__`/
     `__getattr__` signature check, `__slots__` in a class body,
     `__match_args__` with an inferred Var, `__post_init__`, and the
     MemberExpr `__match_args__` fail) plus the `lvalue_type` branch
     (partial-None inference, member assignment when `kind is None`,
-    check_simple_assignment tail, no-type fallthrough). The Rust seam
-    reads live-object facts via PyO3 and returns `(special_tag,
-    branch_tag)`; Python applies every arm body. Direct seam calls assert
-    the exact tags; the gate-off vs gate-on differential drives the real
-    `check_assignment` through stubbed helpers and asserts identical
-    captured observations.
+    check_simple_assignment tail, no-type fallthrough). Direct seam calls
+    assert the exact tags via the registered pyfunction.
+
+    The seam was retired by #1739: the call was removed from
+    `check_assignment` (the inline isinstance chain at checker.py:4815-4837
+    applies every arm), the alias and shim are gone, and only the
+    `NATIVE_CA_*` tag constants survive. The host reads no gate, so a
+    gate-off vs gate-on differential cannot fail on any shape here. The
+    production tests below pin the captured observations of one run each;
+    the retirement pin lives in
+    `testtypes_native_retired_checker.py::NativeClassifyCheckAssignmentRetiredSuite`.
     """
 
     def setUp(self) -> None:
@@ -8750,13 +8740,6 @@ class NativeCheckAssignmentHeadSuite(Suite):
 
     def tearDown(self) -> None:
         self._set_active(False)
-
-    def _with_gate(self, active: bool, fn: Callable[[], T]) -> T:
-        self._set_active(active)
-        try:
-            return fn()
-        finally:
-            self._set_active(True)
 
     # ---- direct seam tests ----
 
@@ -8868,7 +8851,7 @@ class NativeCheckAssignmentHeadSuite(Suite):
         ne = self._name("x", node=SimpleNamespace())
         assert self._seam(ne, None, False, False) is None
 
-    # ---- gate-off vs gate-on differential ----
+    # ---- production pins (the seam is retired; see the docstring) ----
 
     def _run(
         self,
@@ -8880,87 +8863,84 @@ class NativeCheckAssignmentHeadSuite(Suite):
         rvalue_type: Type | None = None,
         active_class: object | None = None,
         is_stub: bool = False,
-    ) -> tuple[tuple[object, ...], tuple[object, ...]]:
+    ) -> tuple[object, ...]:
+        """One `check_assignment` run with the gate on, as production runs it."""
         from mypy.checker import TypeChecker
 
         rvalue: Expression = StrExpr("v")
         rt = rvalue_type if rvalue_type is not None else Instance(self.fx.ai, [])
 
-        def check_one() -> tuple[object, ...]:
-            obs: list[object] = []
-            # The mock surface below intentionally diverges from the real
-            # TypeChecker signatures, so the instance is typed as Any.
-            chk = cast(Any, TypeChecker.__new__(TypeChecker))
-            chk.options = Options()
-            chk.is_stub = is_stub
-            chk.current_node_deferred = False
-            chk.can_skip_diagnostics = True
-            chk.var_decl_frames = {}
-            chk._expr_checker = SimpleNamespace(
-                accept=lambda expr, type_context=None, always_allow_any=False: rt
-            )
-            chk.scope = SimpleNamespace(active_class=lambda: active_class)
-            chk.binder = SimpleNamespace(
-                assign_type=lambda lv, rvt, lvt: obs.append(("assign",)),
-                frames=[],
-                put=lambda lv, t: obs.append(("put",)),
-            )
-            chk.msg = SimpleNamespace(
-                concrete_only_assign=lambda lt, rv: obs.append(("concrete_only",))
-            )
-            chk.try_infer_partial_generic_type_from_assignment = lambda lv, rv, op: obs.append(
-                ("partial_generic",)
-            )
-            chk.check_lvalue = lambda lv, rv=None: (lvalue_type, index_lvalue, inferred)
-            chk.fail = lambda msg, ctx: obs.append(("fail", str(msg)))
-            chk.check_setattr_method = lambda sig, lv: obs.append(("setattr",))
-            chk.check_getattr_method = lambda sig, lv, name: obs.append(("getattr", name))
-            chk.check_slots_definition = lambda typ, lv: obs.append(("slots_def",))
-            chk.check_match_args = lambda typ, t, lv: obs.append(("match_args",))
+        obs: list[object] = []
+        # The mock surface below intentionally diverges from the real
+        # TypeChecker signatures, so the instance is typed as Any.
+        chk = cast(Any, TypeChecker.__new__(TypeChecker))
+        chk.options = Options()
+        chk.is_stub = is_stub
+        chk.current_node_deferred = False
+        chk.can_skip_diagnostics = True
+        chk.var_decl_frames = {}
+        chk._expr_checker = SimpleNamespace(
+            accept=lambda expr, type_context=None, always_allow_any=False: rt
+        )
+        chk.scope = SimpleNamespace(active_class=lambda: active_class)
+        chk.binder = SimpleNamespace(
+            assign_type=lambda lv, rvt, lvt: obs.append(("assign",)),
+            frames=[],
+            put=lambda lv, t: obs.append(("put",)),
+        )
+        chk.msg = SimpleNamespace(
+            concrete_only_assign=lambda lt, rv: obs.append(("concrete_only",))
+        )
+        chk.try_infer_partial_generic_type_from_assignment = lambda lv, rv, op: obs.append(
+            ("partial_generic",)
+        )
+        chk.check_lvalue = lambda lv, rv=None: (lvalue_type, index_lvalue, inferred)
+        chk.fail = lambda msg, ctx: obs.append(("fail", str(msg)))
+        chk.check_setattr_method = lambda sig, lv: obs.append(("setattr",))
+        chk.check_getattr_method = lambda sig, lv, name: obs.append(("getattr", name))
+        chk.check_slots_definition = lambda typ, lv: obs.append(("slots_def",))
+        chk.check_match_args = lambda typ, t, lv: obs.append(("match_args",))
 
-            def _mock_member_assignment(
-                lv: Any, it: Any, lt: Any, rv: Any, context: Any = None
-            ) -> tuple[Any, Any, bool]:
-                obs.append(("member",))
-                return rt, lt, True
+        def _mock_member_assignment(
+            lv: Any, it: Any, lt: Any, rv: Any, context: Any = None
+        ) -> tuple[Any, Any, bool]:
+            obs.append(("member",))
+            return rt, lt, True
 
-            def _mock_simple_assignment(
-                lt: Any, rv: Any, context: Any = None, inferred: Any = None, lvalue: Any = None
-            ) -> tuple[Any, Any]:
-                obs.append(("simple",))
-                return rt, lt
+        def _mock_simple_assignment(
+            lt: Any, rv: Any, context: Any = None, inferred: Any = None, lvalue: Any = None
+        ) -> tuple[Any, Any]:
+            obs.append(("simple",))
+            return rt, lt
 
-            chk.check_member_assignment = _mock_member_assignment
-            chk.check_simple_assignment = _mock_simple_assignment
-            chk.check_indexed_assignment = lambda il, rv, lv: obs.append(("indexed",))
-            chk.get_variable_type_context = lambda inf, rv: None
-            chk.infer_variable_type = lambda inf, lv, rvt, rv: obs.append(("infer_var",))
-            chk.check_assignment_to_slots = lambda lv: obs.append(("slots",))
-            chk.find_partial_types = lambda var: {var: None}
-            chk.set_inferred_type = lambda var, lv, t: obs.append(("set_type", str(t)))
-            chk.infer_partial_type = lambda var, lv, rvt: False
-            chk.inference_error_fallback_type = lambda rvt: rvt
-            chk.check_assignment_to_multiple_lvalues = lambda items, rv, ctx, ilt: obs.append(
-                ("multiple",)
-            )
-            chk.check_assignment(lvalue, rvalue)
-            return tuple(obs)
+        chk.check_member_assignment = _mock_member_assignment
+        chk.check_simple_assignment = _mock_simple_assignment
+        chk.check_indexed_assignment = lambda il, rv, lv: obs.append(("indexed",))
+        chk.get_variable_type_context = lambda inf, rv: None
+        chk.infer_variable_type = lambda inf, lv, rvt, rv: obs.append(("infer_var",))
+        chk.check_assignment_to_slots = lambda lv: obs.append(("slots",))
+        chk.find_partial_types = lambda var: {var: None}
+        chk.set_inferred_type = lambda var, lv, t: obs.append(("set_type", str(t)))
+        chk.infer_partial_type = lambda var, lv, rvt: False
+        chk.inference_error_fallback_type = lambda rvt: rvt
+        chk.check_assignment_to_multiple_lvalues = lambda items, rv, ctx, ilt: obs.append(
+            ("multiple",)
+        )
+        chk.check_assignment(lvalue, rvalue)
+        return tuple(obs)
 
-        off = self._with_gate(False, check_one)
-        on = self._with_gate(True, check_one)
-        return off, on
-
-    def _assert_par(
+    def _assert_obs(
         self,
         lvalue: Lvalue,
         lvalue_type: Type | None,
         index_lvalue: Lvalue | None,
         inferred: Var | None,
+        expected: tuple[object, ...],
         *,
         rvalue_type: Type | None = None,
         active_class: object | None = None,
     ) -> None:
-        off, on = self._run(
+        obs = self._run(
             lvalue,
             lvalue_type,
             index_lvalue,
@@ -8968,69 +8948,134 @@ class NativeCheckAssignmentHeadSuite(Suite):
             rvalue_type=rvalue_type,
             active_class=active_class,
         )
-        assert_equal(on, off, f"check_assignment parity for lvalue={lvalue!r}")
-        assert off, "differential produced no observations"
+        assert obs == expected, f"check_assignment observations for lvalue={lvalue!r}: {obs}"
 
-    def test_parity_name_simple(self) -> None:
-        self._assert_par(self._name("x"), Instance(self.fx.ai, []), None, None)
+    def test_value_name_simple(self) -> None:
+        self._assert_obs(
+            self._name("x"),
+            Instance(self.fx.ai, []),
+            None,
+            None,
+            (("partial_generic",), ("simple",), ("assign",), ("slots",)),
+        )
 
-    def test_parity_name_no_type(self) -> None:
-        self._assert_par(self._name("x"), None, None, None)
+    def test_value_name_no_type(self) -> None:
+        self._assert_obs(self._name("x"), None, None, None, (("partial_generic",), ("slots",)))
 
-    def test_parity_member(self) -> None:
-        self._assert_par(MemberExpr(NameExpr("b"), "attr"), Instance(self.fx.ai, []), None, None)
+    def test_value_member(self) -> None:
+        self._assert_obs(
+            MemberExpr(NameExpr("b"), "attr"),
+            Instance(self.fx.ai, []),
+            None,
+            None,
+            (("partial_generic",), ("member",), ("assign",), ("slots",)),
+        )
 
-    def test_parity_index(self) -> None:
-        self._assert_par(
+    def test_value_index(self) -> None:
+        self._assert_obs(
             IndexExpr(NameExpr("a"), NameExpr("b")),
             None,
             IndexExpr(NameExpr("a"), NameExpr("c")),
             None,
+            (("partial_generic",), ("indexed",), ("slots",)),
         )
 
-    def test_parity_inferred_tail(self) -> None:
-        self._assert_par(self._name("x"), None, None, Var("x"))
-
-    def test_parity_setattr(self) -> None:
-        self._assert_par(self._name("__setattr__"), Instance(self.fx.ai, []), None, None)
-
-    def test_parity_getattr_family(self) -> None:
-        self._assert_par(self._name("__getattribute__"), None, None, None)
-
-    def test_parity_slots(self) -> None:
-        self._assert_par(
-            self._name("__slots__"), None, None, None, active_class=SimpleNamespace(metadata={})
+    def test_value_inferred_tail(self) -> None:
+        self._assert_obs(
+            self._name("x"),
+            None,
+            None,
+            Var("x"),
+            (("partial_generic",), ("infer_var",), ("slots",)),
         )
 
-    def test_parity_match_args_name(self) -> None:
-        self._assert_par(self._name("__match_args__"), None, None, Var("__match_args__"))
+    def test_value_setattr(self) -> None:
+        self._assert_obs(
+            self._name("__setattr__"),
+            Instance(self.fx.ai, []),
+            None,
+            None,
+            (("partial_generic",), ("setattr",), ("simple",), ("assign",), ("slots",)),
+        )
 
-    def test_parity_post_init(self) -> None:
-        self._assert_par(
+    def test_value_getattr_family(self) -> None:
+        self._assert_obs(
+            self._name("__getattribute__"),
+            None,
+            None,
+            None,
+            (("partial_generic",), ("getattr", "__getattribute__"), ("slots",)),
+        )
+
+    def test_value_slots(self) -> None:
+        self._assert_obs(
+            self._name("__slots__"),
+            None,
+            None,
+            None,
+            (("partial_generic",), ("slots_def",), ("slots",)),
+            active_class=SimpleNamespace(metadata={}),
+        )
+
+    def test_value_match_args_name(self) -> None:
+        self._assert_obs(
+            self._name("__match_args__"),
+            None,
+            None,
+            Var("__match_args__"),
+            (("partial_generic",), ("match_args",), ("infer_var",), ("slots",)),
+        )
+
+    def test_value_post_init(self) -> None:
+        self._assert_obs(
             self._name("__post_init__"),
             None,
             None,
             None,
+            (
+                ("partial_generic",),
+                ("fail", '"__post_init__" method must be an instance method'),
+                ("slots",),
+            ),
             active_class=SimpleNamespace(metadata={"dataclass"}),
         )
 
-    def test_parity_member_match_args(self) -> None:
-        self._assert_par(
-            MemberExpr(NameExpr("b"), "__match_args__"), Instance(self.fx.ai, []), None, None
+    def test_value_member_match_args(self) -> None:
+        self._assert_obs(
+            MemberExpr(NameExpr("b"), "__match_args__"),
+            Instance(self.fx.ai, []),
+            None,
+            None,
+            (
+                ("partial_generic",),
+                ("fail", 'Cannot assign to "__match_args__"'),
+                ("member",),
+                ("assign",),
+                ("slots",),
+            ),
         )
 
-    def test_parity_partial_none_return(self) -> None:
-
-        self._assert_par(
-            self._name("x"), PartialType(None, Var("x"), None), None, None, rvalue_type=NoneType()
+    def test_value_partial_none_return(self) -> None:
+        self._assert_obs(
+            self._name("x"),
+            PartialType(None, Var("x"), None),
+            None,
+            None,
+            (("partial_generic",),),
+            rvalue_type=NoneType(),
         )
 
-    def test_parity_partial_none_infer(self) -> None:
+    def test_value_partial_none_infer(self) -> None:
+        self._assert_obs(
+            self._name("x"),
+            PartialType(None, Var("x"), None),
+            None,
+            None,
+            (("partial_generic",), ("set_type", "A | None"), ("assign",), ("slots",)),
+        )
 
-        self._assert_par(self._name("x"), PartialType(None, Var("x"), None), None, None)
-
-    def test_parity_tuple(self) -> None:
-        self._assert_par(TupleExpr([NameExpr("a")]), None, None, None)
+    def test_value_tuple(self) -> None:
+        self._assert_obs(TupleExpr([NameExpr("a")]), None, None, None, (("multiple",),))
 
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
@@ -10073,36 +10118,26 @@ class NativeIsLiteralEnumSuite(Suite):
         assert_equal(on, off, "is_literal_enum parity: true case")
         assert on is True
 
-    def test_parity_false_not_member_expr(self) -> None:
+    def test_false_not_member_expr_precedes_the_gate(self) -> None:
+        # A bare NameExpr returns at checker.py:10717, before the seam gate
+        # at :10727 is read, so both gate states run identical Python and the
+        # arm comparison cannot fail on this shape. Pin one run instead.
         from mypy.checker import TypeChecker
 
-        expr = NameExpr("Foo")
         chk = TypeChecker.__new__(TypeChecker)
         chk._type_maps = [{}]
+        assert chk.is_literal_enum(NameExpr("Foo")) is False
 
-        def check() -> bool:
-            chk2 = TypeChecker.__new__(TypeChecker)
-            chk2._type_maps = [{}]
-            return chk2.is_literal_enum(expr)
+    def test_false_none_types_precede_the_gate(self) -> None:
+        # Neither expression has a recorded type, so is_literal_enum
+        # returns at checker.py:10722, before the seam gate is read; the
+        # arm comparison cannot fail on this shape. Pin one run instead.
+        from mypy.checker import TypeChecker
 
-        off = self._with_gate(False, check)
-        on = self._with_gate(True, check)
-        assert_equal(on, off, "is_literal_enum parity: not MemberExpr")
-
-    def test_parity_false_none_types(self) -> None:
-        parent_expr = NameExpr("Foo")
-        member_expr = MemberExpr(parent_expr, "A")
-
-        def check() -> bool:
-            from mypy.checker import TypeChecker
-
-            chk = TypeChecker.__new__(TypeChecker)
-            chk._type_maps = [{}]
-            return chk.is_literal_enum(member_expr)
-
-        off = self._with_gate(False, check)
-        on = self._with_gate(True, check)
-        assert_equal(on, off, "is_literal_enum parity: None types")
+        member_expr = MemberExpr(NameExpr("Foo"), "A")
+        chk = TypeChecker.__new__(TypeChecker)
+        chk._type_maps = [{}]
+        assert chk.is_literal_enum(member_expr) is False
 
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
@@ -11177,7 +11212,10 @@ class NativePatternCheckDriverSuite(Suite):
         # Both alternatives capture x: the union is inhabited.
         assert str(on.type) == "A"
 
-    def test_value_visit_patterntype_parity(self) -> None:
+    def test_value_visit_patterntype(self) -> None:
+        # visit_value_pattern (checkpattern.py:308-320) reads no checkpattern
+        # gate: its PatternType comes from the stubbed accept and narrow
+        # helpers, so a gate differential cannot fail; the triple is pinned.
         from mypy.patterns import ValuePattern
 
         lit = self._capture("v")
@@ -11197,10 +11235,7 @@ class NativePatternCheckDriverSuite(Suite):
             finally:
                 pc.type_context.pop()
 
-        off = self._with_gate(False, run)
-        on = self._with_gate(True, run)
-        assert_equal(self._triple(on), self._triple(off), "value-visit triple parity")
-        assert_equal(self._triple(on), ("A", "A", []))
+        assert_equal(self._triple(run()), ("A", "A", []))
 
     def test_singleton_visit_patterntype_parity(self) -> None:
         from mypy.patterns import SingletonPattern
