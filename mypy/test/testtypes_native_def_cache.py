@@ -276,7 +276,10 @@ class DefCacheSeedSuite(Suite):
         """
         var = self._var()
         var.is_final = True  # tracked, so the node has an entry and a handle
-        fields = [("zz_probe", "none", None, None, None), ("zz_probe", "int", None, 7, None)]
+        fields: list[tuple[str, str, str | None, int | None, list[str] | None]] = [
+            ("zz_probe", "none", None, None, None),
+            ("zz_probe", "int", None, 7, None),
+        ]
         _, _, minted, replaced = self._k.rust_node_mirror_seed_loaded(var, fields)
         assert (minted, replaced) == (
             1,
