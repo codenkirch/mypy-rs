@@ -1259,7 +1259,7 @@ pub(crate) fn rust_node_mirror_meta_drop(handle: u64) -> bool {
 }
 
 /// Retire one field record for `handle`, so a `del` on a tracked slot makes
-/// absence mean "not recorded" again (#1841). Whether the entry held it.
+/// absence mean "not recorded" again (#1841). Returns whether the entry held it.
 #[pyfunction]
 pub(crate) fn rust_node_mirror_meta_retire_field(handle: u64, field: &str) -> bool {
     let field = intern_meta_field(field);
@@ -2012,6 +2012,8 @@ mod g2_meta_tests {
             let h = capture_meta(obj, "items", MetaValue::List(vec!["FuncDef".into()])).unwrap();
             assert_eq!(rust_node_mirror_meta_captures(h), Some(1));
             assert_eq!(rust_node_mirror_meta_captures(h + 1), None);
+            assert!(rust_node_mirror_meta_retire_field(h, "items"));
+            assert!(!rust_node_mirror_meta_retire_field(h, "items"));
             assert!(rust_node_mirror_meta_drop(h));
             assert_eq!(rust_node_mirror_meta_entry_count(), 0);
         });

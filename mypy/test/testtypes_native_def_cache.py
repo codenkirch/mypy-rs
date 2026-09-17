@@ -474,7 +474,7 @@ class MetaSlotDeletionSuite(Suite):
     def test_a_deleted_slot_retracts_its_record(self) -> None:
         var = Var("x")
         var._fullname = "mod.x"
-        self._m.seed_loaded(var)  # adopt: the store now holds a record
+        self._m.seed_loaded(var)  # re-seed: construction already adopted it
         record = self._record(var)
         assert record is not None and "is_final" in record
         before = self._report()
@@ -515,3 +515,47 @@ class MetaSlotDeletionSuite(Suite):
         assert (
             self._report().get("meta_del_unadopted", 0) - before.get("meta_del_unadopted", 0) == 1
         ), "the refusal is counted, so it cannot read as a silent success"
+
+    def test_a_deleted_tracked_slot_without_a_record_counts_unrecorded(self) -> None:
+        saved = self._m._active
+        self._m._active = False
+        try:
+            var = Var("x")  # built inert, so no constructor write records anything
+        finally:
+            self._m._active = saved
+        var._fullname = "mod.x"  # the one adopting write: the record stays sparse
+        assert "type" not in (self._record(var) or {})
+        before = self._report()
+        del var.type  # tracked for Var, but this record never held it
+        after = self._report()
+        assert (
+            after.get("meta_del_unrecorded", 0) - before.get("meta_del_unrecorded", 0) == 1
+        ), "the tracked-but-never-recorded path must be pinned (#1856)"
+        assert after.get("meta_del.type", 0) - before.get("meta_del.type", 0) == 1
+        record = self._record(var) or {}
+        assert "type" not in record, "an unrecorded deletion must not fabricate a record"
+        assert "_fullname" in record, "the deletion leaves the other records alone"
+
+    def test_a_failed_retraction_is_counted_never_raised(self) -> None:
+        var = Var("x")  # construction adopts and records `is_ready` among others
+        real = self._m._kernel_mod
+
+        class _FailingRetireKernel:
+            """The control kernel: only the retire seam fails (#1856)."""
+
+            def rust_node_mirror_meta_retire_field(self, handle: int, field: str) -> bool:
+                raise RuntimeError("simulated kernel failure")
+
+            def __getattr__(self, name: str) -> Any:
+                return getattr(real, name)
+
+        self._m._kernel_mod = _FailingRetireKernel()
+        try:
+            del var.is_ready
+        finally:
+            self._m._kernel_mod = real
+        after = self._report()
+        assert after.get("meta_del_failed", 0) == 1, "the failed retraction is counted"
+        assert after.get("meta_del.is_ready", 0) == 1
+        record = self._record(var) or {}
+        assert "is_ready" in record, "the failed retraction leaves the record untouched"

@@ -108,6 +108,14 @@ Blind channels, audited against #1787 §1(b):
   call `touch` afterwards. `mypy/plugins/attrs.py` does, after its
   `decorators.remove` loop - the second explicit touch site after
   `ImportBase.assignments`.
+- A `del` on a tracked *G1* slot is out of contract (#1856): the G1
+  classes carry only the `__setattr__` patch, so the record keeps the
+  deleted slot. The G1 record is not per-field where it matters - the five
+  binding scalars the serving channel reads are one snapshot gated by a
+  single presence marker (`ref_captures`) - so the #1841-style per-field
+  retire cannot cover them without new record state; the retraction lands
+  with the G1 serving flip going default-on, pinned meanwhile by
+  `NodeSlotDeletionOutOfContractSuite`.
 
 Design notes:
 - Capture is via class-level monkeypatching of ``__setattr__`` on

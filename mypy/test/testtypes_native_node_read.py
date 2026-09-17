@@ -520,3 +520,81 @@ class NodeShadowServingSuite(Suite):
         assert (
             mode1.get("served", 0) >= 2
         ), "the logical-deps tail must serve the lvalue beside process_lvalue"
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NodeSlotDeletionOutOfContractSuite(Suite):
+    """#1856: a `del` on a tracked G1 slot keeps its record, pinned as such.
+
+    The G1 classes carry only the `__setattr__` patch, so a deleted slot's
+    record is not retracted - the same defect class #1841 closed for the
+    def-family store. It stays open rather than half-closed because the G1
+    record is not per-field where it matters: the five binding scalars the
+    serving channel reads are one snapshot gated by a single presence
+    marker (`ref_captures`), so the #1841-style per-field retire cannot
+    cover them without new record state. The retraction lands with the G1
+    serving flip going default-on; until then these pins document today's
+    behavior, and the fix must flip them knowingly.
+    """
+
+    def setUp(self) -> None:
+        from mypy import nodes_mirror
+
+        self._m = nodes_mirror
+        self._k = _type_kernel
+        self._m.activate(audit=True)
+        self._m.reset(clear_counts=True)
+
+    def tearDown(self) -> None:
+        self._m.reset(clear_counts=True)
+
+    def _adopted_ref(self) -> NameExpr:
+        """A NameExpr the shadow holds an exact snapshot record for."""
+        ref = NameExpr("x")
+        ref.fullname = "main.x"
+        ref.kind = GDEF
+        assert id(ref) in self._m._NODE_HANDLES, "the binding write must adopt the node"
+        return ref
+
+    def test_a_deleted_binding_scalar_keeps_the_stale_snapshot(self) -> None:
+        ref = self._adopted_ref()
+        before = self._m.report()
+        del ref.kind
+        record = self._k.rust_node_mirror_ref(self._m._NODE_HANDLES[id(ref)])
+        assert record is not None, "the deletion is no store event: the entry stays"
+        assert record[0] == GDEF, "out of contract (#1856): the stale scalar stays"
+        assert self._m.report() == before, "no retraction hook exists to count it"
+
+    def test_a_deleted_field_slot_keeps_its_map_record(self) -> None:
+        member = MemberExpr(NameExpr("o"), "y")
+        member.def_var = Var("y")
+        assert id(member) in self._m._NODE_HANDLES
+        del member.def_var
+        handle = self._m._NODE_HANDLES[id(member)]
+        fields = self._k.rust_node_mirror_fields(handle) or []
+        assert "def_var" in fields, "out of contract (#1856): the deleted slot stays recorded"
+
+    def test_a_deleted_analyzed_keeps_its_presence_bit(self) -> None:
+        call = CallExpr(NameExpr("f"), [], [], [])
+        call.analyzed = NameExpr("x")
+        assert id(call) in self._m._NODE_HANDLES
+        del call.analyzed
+        record = self._k.rust_node_mirror_analyzed(self._m._NODE_HANDLES[id(call)])
+        assert record == (True, "NameExpr"), "out of contract (#1856): the record stays"
+
+    def test_a_deletion_on_a_never_adopted_node_adopts_nothing(self) -> None:
+        saved = self._m._active
+        self._m._active = False
+        try:
+            ref = NameExpr("x")
+            ref.kind = LDEF
+        finally:
+            self._m._active = saved
+        assert id(ref) not in self._m._NODE_HANDLES
+        assert self._k.rust_node_mirror_entry_count() == 0
+        del ref.kind
+        # The identity layer keys on id() and outlives a store reset, so a
+        # recycled address can answer handle_of; adoption is asserted on the
+        # store's own state instead (the handle map and the entry count).
+        assert id(ref) not in self._m._NODE_HANDLES, "a deletion must not adopt"
+        assert self._k.rust_node_mirror_entry_count() == 0, "no entry exists to retract"
