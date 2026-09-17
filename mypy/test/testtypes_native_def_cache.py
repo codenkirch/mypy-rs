@@ -431,9 +431,9 @@ class MetaSlotDeletionSuite(Suite):
         del var.is_final
         after = self._report()
         assert self._record(var) is not None, "the entry itself must survive"
-        assert "is_final" not in (self._record(var) or {}), (
-            "a deleted slot must not stay recorded: absence keeps meaning " "not recorded (#1841)"
-        )
+        assert "is_final" not in (
+            self._record(var) or {}
+        ), "a deleted slot must not stay recorded: absence keeps meaning not recorded (#1841)"
         assert after.get("meta_del.is_final", 0) - before.get("meta_del.is_final", 0) == 1
 
     def test_the_rest_of_the_entry_survives_a_deletion(self) -> None:
