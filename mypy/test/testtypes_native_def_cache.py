@@ -216,9 +216,10 @@ class DefCacheSeedSuite(Suite):
         """Absence keeps meaning "not recorded": the seed never fabricates.
 
         The node is built with the store inactive, so nothing recorded the
-        slot before it was deleted: a `del` on an *already captured* slot
-        leaves the old value in the record instead of retracting it, which
-        is a separate (pre-existing) gap this suite does not pin.
+        slot before it was deleted; the seed then skips the slot the live
+        object lacks. A `del` on an *already captured* slot is the other
+        half: it now retracts, pinned by
+        `MetaSlotDeletionSuite.test_a_deleted_slot_retracts_its_record`.
         """
         saved_active = self._m._active
         self._m._active = False
@@ -387,3 +388,80 @@ class DefCacheSeedSuite(Suite):
             )
         finally:
             self._m.seed_loaded = real
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class MetaSlotDeletionSuite(Suite):
+    """#1841: a `del` on a tracked slot retracts its record.
+
+    The store's contract is "absence means not recorded", but the write
+    hook only watched `__setattr__`: a deleted slot kept its stale record,
+    so a served read answered from a slot the live object no longer had.
+    The `__delattr__` patch now retracts the one field, leaving the rest
+    of the entry alone.
+    """
+
+    def setUp(self) -> None:
+        from mypy import nodes_mirror
+
+        self._m = nodes_mirror
+        self._k = _type_kernel
+        self._m.activate(audit=True)
+        self._m.reset(clear_counts=True)
+
+    def tearDown(self) -> None:
+        self._m.reset(clear_counts=True)
+
+    def _record(self, node: Any) -> dict[str, Any] | None:
+        handle = self._k.rust_node_mirror_handle_of(node)
+        if handle is None:
+            return None
+        return self._k.rust_node_mirror_meta(handle)
+
+    def _report(self) -> dict[str, int]:
+        return self._m.report()
+
+    def test_a_deleted_slot_retracts_its_record(self) -> None:
+        var = Var("x")
+        var._fullname = "mod.x"
+        self._m.seed_loaded(var)  # adopt: the store now holds a record
+        record = self._record(var)
+        assert record is not None and "is_final" in record
+        before = self._report()
+        del var.is_final
+        after = self._report()
+        assert self._record(var) is not None, "the entry itself must survive"
+        assert "is_final" not in (self._record(var) or {}), (
+            "a deleted slot must not stay recorded: absence keeps meaning " "not recorded (#1841)"
+        )
+        assert after.get("meta_del.is_final", 0) - before.get("meta_del.is_final", 0) == 1
+
+    def test_the_rest_of_the_entry_survives_a_deletion(self) -> None:
+        var = Var("x")
+        var._fullname = "mod.x"
+        self._m.seed_loaded(var)
+        del var.is_final
+        record = self._record(var) or {}
+        assert record, "deleting one slot must not drop the whole entry"
+        assert "type" in record, "an untouched tracked slot keeps its record"
+
+    def test_an_untracked_slot_deletion_touches_nothing(self) -> None:
+        var = Var("x")
+        var._fullname = "mod.x"
+        before = self._report()
+        del var.line  # a Node slot Var tracks no record for
+        assert self._report() == before, "an untracked deletion is not a store event"
+
+    def test_a_deletion_on_a_never_adopted_node_is_refused_not_crashed(self) -> None:
+        before = self._report()
+        saved = self._m._active
+        self._m._active = False
+        try:
+            var = Var("y")  # built inert: no tracked write adopted it
+        finally:
+            self._m._active = saved
+        del var.type
+        assert self._record(var) is None, "a deletion must not adopt a node"
+        assert (
+            self._report().get("meta_del_unadopted", 0) - before.get("meta_del_unadopted", 0) == 1
+        ), "the refusal is counted, so it cannot read as a silent success"

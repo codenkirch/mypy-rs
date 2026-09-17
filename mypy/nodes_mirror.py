@@ -99,10 +99,11 @@ Blind channels, audited against #1787 §1(b):
 - `replace_object_state` (`mypy/util.py`): its `setattr` leg re-registers
   the surviving identity through the same hook, pinned by
   `test_replace_object_state_reregisters_surviving_identity`. The
-  `delattr(new, attr)` leg has no captured counterpart, but it fires only
-  where `old` lacks a slot and every tracked slot of the G2 families is
-  constructor-set on `old`, so it cannot drop a captured value; the
-  `new.__dict__` leg is inert for these `__slots__`-only classes.
+  `delattr(new, attr)` leg fires only where `old` lacks a slot, and every
+  tracked slot of the G2 families is constructor-set on `old`, so it cannot
+  drop a captured value; should it ever fire on a recorded one, the
+  `__delattr__` patch retracts it (#1841). The `new.__dict__` leg is inert
+  for these `__slots__`-only classes.
 - An in-place list mutation is invisible to the patch, so its writer must
   call `touch` afterwards. `mypy/plugins/attrs.py` does, after its
   `decorators.remove` loop - the second explicit touch site after
@@ -240,6 +241,7 @@ _audit_mode = False
 # the guard keeps a future field-property hook from recursing.
 _in_capture = False
 _ORIG_SETATTR: Any = object.__setattr__
+_ORIG_DELATTR: Any = object.__delattr__
 # id(node) -> native handle for every node the store holds a record for.
 # The Rust store pins the node, so the id() keys cannot be recycled while
 # an entry exists; the patched __setattr__ is the only minting path.
@@ -1236,6 +1238,39 @@ def touch(node: Any, field: str) -> None:
     _capture_meta(node, field)
 
 
+def _meta_delattr(self: Any, name: str) -> None:
+    # Apply the deletion first (an unknown-slot AttributeError propagates
+    # as the unpatched object.__delattr__ would), then retract the slot's
+    # record so absence keeps meaning "not recorded" (#1841).
+    _ORIG_DELATTR(self, name)
+    if not _active or _in_capture:
+        return
+    if name not in _meta_tracked(type(self)):
+        return
+    _retract_meta(self, name)
+
+
+def _retract_meta(node: Any, field: str) -> None:
+    """Retract one tracked slot's record after a `del` (#1841).
+
+    The whole entry must not be dropped: the other tracked slots are still
+    live. Never raises into the deleting site; a failed retraction is
+    counted, and the stale record then answers mode-2 catches as an error.
+    """
+    try:
+        handle = _META_HANDLES.get(id(node))
+        if handle is None:
+            # Never adopted: there is no record to retract, and minting a
+            # handle here would adopt a node by deleting a slot from it.
+            _count("meta_del_unadopted")
+            return
+        _count("meta_del." + field)
+        if not _kernel_mod.rust_node_mirror_meta_retire_field(int(handle), field):
+            _count("meta_del_unrecorded")
+    except Exception:
+        _count("meta_del_failed")
+
+
 def _activate_meta() -> None:
     for cls in _G2_TRACKED:
         try:
@@ -1243,6 +1278,7 @@ def _activate_meta() -> None:
             # assignment reports as an incompatible assignment (unlike the
             # G1 tuple of concrete classes).
             cls.__setattr__ = _meta_setattr  # type: ignore[assignment]
+            cls.__delattr__ = _meta_delattr  # type: ignore[assignment]
         except Exception:
             # A compiled (mypyc) class refuses class-level patching; a
             # partial install only skips that class's capture.

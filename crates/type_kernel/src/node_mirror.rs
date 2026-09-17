@@ -1244,6 +1244,20 @@ pub(crate) fn rust_node_mirror_meta_drop(handle: u64) -> bool {
     retire_meta(handle)
 }
 
+/// Retire one field record for `handle`, so a `del` on a tracked slot makes
+/// absence mean "not recorded" again (#1841). Whether the entry held it.
+#[pyfunction]
+pub(crate) fn rust_node_mirror_meta_retire_field(handle: u64, field: &str) -> bool {
+    let field = intern_meta_field(field);
+    with_meta_store(|store| {
+        store.by_handle.get_mut(&handle).is_some_and(|entry| {
+            let before = entry.fields.len();
+            entry.fields.retain(|(name, _)| *name != field);
+            before != entry.fields.len()
+        })
+    })
+}
+
 /// Clear all metadata entries and pins; returns the dropped count.
 #[pyfunction]
 pub(crate) fn rust_node_mirror_meta_reset() -> usize {
@@ -2539,6 +2553,8 @@ pub(crate) fn register_registry(m: &PyModule) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(rust_node_mirror_meta_captures, m)?)?;
 
     m.add_function(wrap_pyfunction!(rust_node_mirror_meta_drop, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_node_mirror_meta_retire_field, m)?)?;
 
     m.add_function(wrap_pyfunction!(rust_node_mirror_meta_reset, m)?)?;
 
