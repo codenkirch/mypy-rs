@@ -202,6 +202,20 @@ fn opt_int_attr(obj: &PyAny, name: &str) -> Result<Option<i64>, DeferError> {
 /// mix a served scalar with a live one. Each accessor keeps the live read
 /// (and its `DeferError`) as the fallback, so mode 0 and an unrecorded
 /// node behave exactly as they did before the channel existed.
+///
+/// Record-shape contract (#1785): `node_mirror::RefScalars` freezes the
+/// scalars at capture time, so a post-capture write outside the recorded
+/// shape (`kind` a non-`int`, `fullname` absent) cannot be represented -
+/// `_capture_ref` fails conversion, the store keeps the earlier record,
+/// and the served branch answers the stale scalar where the live fallback
+/// would answer the new one. Compare-before-answer was rejected for the
+/// two sites below: it re-reads the live slot on every call, which is the
+/// PyO3 cost this channel exists to avoid, so serving them would buy
+/// nothing over the fallback. The writes that would need it are
+/// out-of-contract by construction (`RefExpr.kind` carries the `Kind`
+/// ints, `_fullname` is a `str`), the mode 2 differential
+/// (`compare_ref_scalars`) is the detector, and a read flip requires zero
+/// mismatches on a pinned corpus.
 struct RefView<'a> {
     obj: &'a PyAny,
     served: Option<node_mirror::RefScalars>,

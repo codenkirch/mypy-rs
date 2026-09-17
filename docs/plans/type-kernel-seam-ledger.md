@@ -5087,3 +5087,29 @@ measurements are appended below as the coordinator reports each landing.
 - `f2835c480` (PR #1709, coordinator) — docs/handoff, tier T1: head-line
   refresh to `5b012830e` after the entries PR merged.
 
+#### RefView record-shape contract (#1785, recorded 2026-09-17)
+
+`node_mirror::RefScalars` freezes a `RefExpr`'s scalars at capture time
+(`kind: Option<i64>`, `fullname: String`). A post-capture write outside
+that shape (`kind` a non-`int`, `fullname` absent) cannot be represented:
+`_capture_ref` fails conversion, its `except Exception` keeps the earlier
+record, and `RefView`'s served branch answers the stale scalar where the
+live fallback answers the new one. The two named sites are
+`kind_is_none` and `fullname_opt` (`crates/type_kernel/src/depswalk.rs`),
+whose live semantics are a plain `None` check and an optional-string read,
+so neither defers.
+
+Verdict: **documented limitation**, not compare-before-answer.
+Compare-before-answer re-reads the live slot on every call, which is
+exactly the PyO3 cost the channel exists to remove (the F close-out
+measured 17.43M routing round-trips at +5.8s), so serving those two sites
+would buy nothing over their fallback. The drift is latent by
+construction: the writers that would trigger it are out-of-contract
+(`RefExpr.kind` carries the `Kind` ints, `_fullname` is a `str`), and the
+mode 2 differential (`compare_ref_scalars`) is the detector. A read flip
+anywhere on this shape requires zero mismatches on a pinned corpus; if an
+in-contract writer ever appears, the fix is to widen the capture contract
+(mark the out-of-contract value or drop the record so the live fallback
+answers), not to double every served read. Refs: #1785, PR #1783, ocr
+session `52a4e3b2`.
+
