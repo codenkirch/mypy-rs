@@ -68,7 +68,6 @@ from mypy.types import (
     ProperType,
     TupleType,
     Type,
-    TypeAliasType,
     TypedDictType,
     TypeOfAny,
     TypeType,
@@ -91,11 +90,11 @@ from mypy.types import (
 from mypy.typestate import type_state
 
 # M20: type-kernel seam for checkmember. When the `type_kernel` Rust
-# extension is importable and `Options.native_type_kernel` is set,
-# `bind_self_fast` and `_analyze_member_access` dispatch route through
+# extension is importable and `Options.native_type_kernel` is set, the
+# surviving per-seam gates below route through Rust.
 
-# Rust. The Rust path returns `None` for any type it does not handle, in
-# which case we fall back to the pure-Python implementation. This is the
+# The Rust path returns `None` for any type it does not handle, in which
+# case we fall back to the pure-Python implementation. This is the
 # strangler-fig per-call gate — no behavior change unless the option is
 
 # explicitly enabled.
@@ -119,7 +118,6 @@ try:
         rust_analyze_enum_class_attribute_access as _rust_analyze_enum_class_attribute_access,
         rust_analyze_instance_member_access as _rust_analyze_instance_member_access,
         rust_analyze_instance_member_dispatch as _rust_analyze_instance_member_dispatch,
-        rust_analyze_member_access as _rust_analyze_member_access,
         rust_analyze_member_method as _rust_analyze_member_method,
         rust_analyze_union_member_access as _rust_analyze_union_member_access,
         rust_check_final_member as _rust_check_final_member,
@@ -136,7 +134,6 @@ except ImportError:
     _rust_check_final_member = None  # type: ignore[assignment]
     _rust_defined_in_superclass = None  # type: ignore[assignment]
     _rust_classify_type_type_member_access = None  # type: ignore[assignment]
-    _rust_analyze_member_access = None  # type: ignore[assignment]
     _rust_analyze_member_method = None  # type: ignore[assignment]
     _rust_analyze_instance_member_access = None  # type: ignore[assignment]
     _rust_analyze_instance_member_dispatch = None  # type: ignore[assignment]
@@ -379,41 +376,6 @@ def _restore_definition(original: Type, decoded: ProperType) -> ProperType:
     return decoded
 
 
-def _restore_native_method_definition(name: str, typ: Type, decoded: ProperType) -> ProperType:
-    """Best-effort relink of ``definition`` for a native-decoded method type.
-
-    The general member-access seam resolves a fallback to an Instance and
-    dispatches the method branch natively, so the decoded result is a
-    method signature whose ``definition`` the wire format dropped. That link
-    drives error formatting (e.g. ``pretty_callable`` re-inserting the bound
-    ``self`` arg in overload-variant notes), so mirror the instance/union
-    seams by restoring it from the method node on the resolved class.
-    Returns ``decoded`` unchanged when no method node is resolvable.
-    """
-    from mypy.types import CallableType, Instance, TupleType, get_proper_type
-
-    typ = get_proper_type(typ)
-    info = None
-    if isinstance(typ, Instance):
-        info = typ.type
-    elif isinstance(typ, TupleType):
-        from mypy.typeops import tuple_fallback
-
-        fallback = tuple_fallback(typ)
-        if isinstance(fallback, Instance):
-            info = fallback.type
-    elif isinstance(typ, (LiteralType, CallableType)):
-        fallback = typ.fallback
-        if isinstance(fallback, Instance):
-            info = fallback.type
-    if info is None:
-        return decoded
-    method = info.get_method(name) if name else None
-    if method is not None and not isinstance(method, Decorator) and method.type is not None:
-        return _restore_definition(method.type, decoded)
-    return decoded
-
-
 class MemberContext:
     """Information and objects needed to type check attribute access.
 
@@ -577,64 +539,9 @@ def _analyze_member_access(
     name: str, typ: Type, mx: MemberContext, override_info: TypeInfo | None = None
 ) -> Type:
     typ = get_proper_type(typ)
-    # M20: gate the general dispatch path through Rust when the kernel
-    # is active.  Rust handles pure type-transform branches (AnyType,
-    # DeletedType, UninhabitedType, TupleType fallback recursion,
-
-    # Literal/Callable/Overloaded fallback recursion,
-    # ParamSpec/TypeVarTuple fallback recursion) plus, once a fallback
-    # recursion lands on an Instance, the full native method + var
-
-    # analysis.  Returns None (Python None) for branches needing plugin
-    # state, union construction, error reporting, or resolver lookups:
-
-    # Python falls through.  The isinstance gate below also skips types
-    # Rust always defers on.
-    if (
-        _HAS_TYPE_KERNEL
-        and _native_checkmember_active
-        and _native_checkmember_resolver is not None
-        and not isinstance(
-            typ,
-            (Instance, UnionType, TypeType, TypedDictType, NoneType, DeletedType, TypeAliasType),
-        )
-        and not isinstance(typ, PartialType)
-        and not (isinstance(typ, FunctionLike) and typ.is_type_obj())
-    ):
-        try:
-            result = _rust_analyze_member_access(
-                _native_checkmember_resolver,
-                name,
-                _serialize_type_for_checkmember(typ),
-                _serialize_type_for_checkmember(mx.self_type),
-                mx.is_lvalue,
-                mx.is_super,
-                mx.is_operator,
-                mx.is_self,
-                mx.preserve_type_var_ids,
-                TypeVarId.next_raw_id,
-                state.state.strict_optional,
-                mx.chk.plugin,
-            )
-            if result is not None:
-                next_raw_id, changed, wire_bytes = result
-                if changed:
-                    TypeVarId.next_raw_id = next_raw_id
-                decoded = _deserialize_type_for_checkmember(bytes(wire_bytes))
-                if decoded is not None:
-                    # The wire round-trip drops .definition (drives error
-                    # formatting, e.g. re-inserting the bound self arg in
-                    # overload-variant notes). Restore it for method results.
-                    if isinstance(decoded, (CallableType, Overloaded)):
-                        decoded = _restore_native_method_definition(name, typ, decoded)
-                    if isinstance(decoded, ProperType):
-                        decoded.line = typ.line
-                        decoded.column = typ.column
-                        if isinstance(decoded, CallableType):
-                            decoded.fallback.line = decoded.line
-                    return decoded
-        except (AssertionError, NotImplementedError):
-            pass
+    # The general dispatch is pure Python. The M20 native seam retired in
+    # #1739 (6.2x-9.1x loss) paid a serialize/wire/deserialize round-trip
+    # per call to re-derive what this isinstance chain already decides.
     if isinstance(typ, Instance):
         return analyze_instance_member_access(name, typ, mx, override_info)
     elif isinstance(typ, AnyType):

@@ -21,7 +21,17 @@ from unittest import skipUnless
 from mypy.nodes import MDEF, Block, ClassDef, NameExpr, SymbolTable, SymbolTableNode, TypeInfo, Var
 from mypy.test.helpers import Suite
 from mypy.test.testtypes import _NATIVE_WIRE_ENABLED
-from mypy.types import AnyType, CallableType, Instance, PartialType, TypeOfAny
+from mypy.types import (
+    AnyType,
+    CallableType,
+    DeletedType,
+    Instance,
+    PartialType,
+    TypeOfAny,
+    TypeVarId,
+    TypeVarType,
+    UninhabitedType,
+)
 
 
 def _make_typeinfo(fullname: str) -> TypeInfo:
@@ -66,6 +76,7 @@ def _make_mx(itype: Instance, is_lvalue: bool = False) -> Any:
         read_only_property=lambda *a: None,
         cant_assign_to_classvar=lambda *a: None,
         cant_assign_to_method=lambda *a: None,
+        deleted_as_rvalue=lambda *a: None,
     )
     chk = SimpleNamespace(
         msg=msg,
@@ -211,3 +222,129 @@ class NativeCheckmemberRetiredSeamsSuite(Suite):
         assert _type_kernel is not None
         assert hasattr(_type_kernel, "rust_classify_analyze_var")
         assert hasattr(_type_kernel, "rust_is_instance_var")
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeAnalyzeMemberAccessRetiredSuite(Suite):
+    """Pin the #1739 retirement of the `_analyze_member_access` gate.
+
+    The M20 seam was the general member-access dispatch for every type the
+    `isinstance` exclusions did not cover (AnyType, UninhabitedType,
+    TupleType fallback recursion, Literal/FunctionLike fallback recursion,
+    TypeVarLikeType recursion). Measured at 13,060 calls with a 6.2x-9.1x
+    loss to its Python body, it was also a *serializing* seam: every call
+    paid `_serialize_type_for_checkmember(typ)` plus the same for
+    `mx.self_type`, one `_deserialize_type_for_checkmember` inbound, and a
+    wire round-trip that drops `.definition` (patched back by
+    `_restore_native_method_definition`). The Python `isinstance` chain
+    below the gate was already the authoritative body, so the seam is now
+    uncalled: the Rust pyfunction stays registered for the direct-seam
+    tests in `testtypes_native_engagement_checkmember.py`.
+
+    The pins below fail if the production call comes back: the module
+    attribute is gone, no `rust_*` name is loaded by the function, and the
+    gate's own shapes stop serializing.
+    """
+
+    def setUp(self) -> None:
+        from mypy.checkmember import (
+            _set_native_checkmember_active,
+            _set_native_checkmember_resolver,
+        )
+
+        self._set_active = _set_native_checkmember_active
+        self._set_resolver = _set_native_checkmember_resolver
+        self.info = _make_typeinfo("mod.A")
+        resolver = _type_kernel.build_native_resolver([self.info], [])
+        resolver.set_live_typeinfo_map({"mod.A": self.info})
+        self._set_resolver(resolver)
+        self._set_active(True)
+
+    def tearDown(self) -> None:
+        self._set_resolver(None)
+        self._set_active(False)
+
+    def _gate_shapes(self) -> list[tuple[str, Any]]:
+        """The proper-type shapes the retired gate used to serve."""
+        tv = TypeVarType(
+            "T",
+            "T",
+            TypeVarId(300),
+            [],
+            AnyType(TypeOfAny.special_form),
+            AnyType(TypeOfAny.special_form),
+        )
+        return [
+            ("Any", AnyType(TypeOfAny.explicit)),
+            ("Never", UninhabitedType()),
+            ("Any", tv),
+            ("Any", DeletedType()),
+        ]
+
+    def test_shim_helper_and_source_removed(self) -> None:
+        import inspect
+
+        from mypy import checkmember
+
+        assert not hasattr(checkmember, "_rust_analyze_member_access")
+        assert not hasattr(checkmember, "_restore_native_method_definition")
+        src = inspect.getsource(checkmember._analyze_member_access)
+        assert "rust_" not in src, "_analyze_member_access should be pure Python"
+        assert "_restore_native_method_definition" not in src
+
+    def test_no_rust_name_loaded_with_gate_on(self) -> None:
+        from mypy.checkmember import _analyze_member_access
+
+        loaded = [n for n in _analyze_member_access.__code__.co_names if "rust_" in n]
+        assert loaded == [], f"_analyze_member_access still loads {loaded}"
+
+    def test_no_wire_serialization_on_the_gate_shapes(self) -> None:
+        from mypy import checkmember
+        from mypy.checkmember import _analyze_member_access
+
+        calls: list[str] = []
+        orig = checkmember._serialize_type_for_checkmember
+
+        def spy(t: Any) -> bytes:
+            calls.append("serialize")
+            return orig(t)
+
+        checkmember._serialize_type_for_checkmember = spy
+        try:
+            for _expected, receiver in self._gate_shapes():
+                assert str(
+                    _analyze_member_access("x", receiver, _make_mx(Instance(self.info, [])))
+                )
+        finally:
+            checkmember._serialize_type_for_checkmember = orig
+        assert calls == [], f"retired member-access gate serialized: {len(calls)} calls"
+
+    def test_values_match_with_gate_off_and_on(self) -> None:
+        from mypy.checkmember import _analyze_member_access
+
+        shapes = self._gate_shapes()
+
+        def run() -> list[str]:
+            return [
+                str(_analyze_member_access("x", receiver, _make_mx(Instance(self.info, []))))
+                for _expected, receiver in shapes
+            ]
+
+        self._set_active(False)
+        off = run()
+        self._set_active(True)
+        on = run()
+        assert on == off, f"gate flag changed the dispatch: off={off!r} on={on!r}"
+        assert on == [expected for expected, _receiver in shapes], on
+
+    def test_shared_serialize_helpers_remain(self) -> None:
+        # The retirement is surgical: `_serialize_type_for_checkmember` and
+        # its inverse still serve the surviving checkmember gates.
+        from mypy import checkmember
+
+        assert callable(checkmember._serialize_type_for_checkmember)
+        assert callable(checkmember._deserialize_type_for_checkmember)
+
+    def test_pyfunction_stays_registered(self) -> None:
+        assert _type_kernel is not None
+        assert hasattr(_type_kernel, "rust_analyze_member_access")
