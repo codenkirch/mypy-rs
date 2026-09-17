@@ -3,7 +3,7 @@ import json
 import sys
 
 
-def load(pattern: str) -> tuple[dict, dict]:
+def load(pattern: str) -> tuple[dict[str, int], dict[str, int]]:
     total: dict[str, int] = {}
     ex_keys: dict[str, int] = {}
     import glob

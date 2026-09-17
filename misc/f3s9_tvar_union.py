@@ -46,13 +46,16 @@ if _orig_union_copy is None:
     # mirror report below (`setattr_*` counters).
     pass
 else:
+    # Bound to a non-Optional local: narrowing does not survive into the
+    # nested function, where `_orig_union_copy` reads back as `None`.
+    _union_orig: Any = _orig_union_copy
 
     def _union_copy(self: Any, **kwargs: Any) -> Any:
         for k in kwargs:
             _counters[f"union.copy_modified.{k}"] += 1
-        return _orig_union_copy(self, **kwargs)
+        return _union_orig(self, **kwargs)
 
-    types_mod.UnionType.copy_modified = _union_copy  # type: ignore[method-assign]
+    types_mod.UnionType.copy_modified = _union_copy  # type: ignore[attr-defined]
 
 _orig_tvar_copy = types_mod.TypeVarType.copy_modified
 

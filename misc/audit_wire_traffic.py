@@ -40,9 +40,13 @@ event lands in exactly one bucket:
                 serialization sat under a dark gate (parity-only)
 
 Buckets 2 and 3 are the waste. Both are attributed to the Python call
-site that paid for the serialization, and section B2 splits the
-unconsumed bucket by the causes above instead of glossing all of it as
-"gated-off / parity-only" (#1827).
+site that registered the blob *first*, which is the site that had the
+bytes built: a wire-cache hit hands the same object back to a later call
+site, and that later site used to take the row instead (#1837).
+Re-registrations are counted and marked on the affected rows, so a shared
+blob is visible rather than silently moving between call sites. Section B2
+splits the unconsumed bucket by the causes above instead of glossing all of
+it as "gated-off / parity-only" (#1827).
 
 The report also names the audited run's outcome and the extension build
 behind the numbers (#1828). `source tree:` alone cannot distinguish a
@@ -51,6 +55,10 @@ second time over: the eager `from type_kernel import ...` blocks fall
 back on ImportError and `patch_kernel()` registers only the names
 `dir(type_kernel)` holds, so a seam the build lacks never appears in
 section Z either.
+
+An operator Ctrl-C is not the audited run's failure (#1846): the census is
+skipped and the interrupt is re-raised, because the report walks `pending`
+and `dedup_hit_blobs` for a run the operator just asked to stop.
 """
 
 from __future__ import annotations
@@ -122,18 +130,22 @@ _TRACKED_WARN_BYTES = 1 << 30
 _tracked_bytes = 0
 _tracked_warned = False
 
-useful: collections.Counter = collections.Counter()  # caller -> events
-deferred: collections.Counter = collections.Counter()
-unconsumed: collections.Counter = collections.Counter()
-useful_bytes: collections.Counter = collections.Counter()
-deferred_bytes: collections.Counter = collections.Counter()
-unconsumed_bytes: collections.Counter = collections.Counter()
+useful: collections.Counter[str] = collections.Counter()  # caller -> events
+deferred: collections.Counter[str] = collections.Counter()
+unconsumed: collections.Counter[str] = collections.Counter()
+useful_bytes: collections.Counter[str] = collections.Counter()
+deferred_bytes: collections.Counter[str] = collections.Counter()
+unconsumed_bytes: collections.Counter[str] = collections.Counter()
 # (caller, seam) -> events, for the deferred list only: a useful pair list
 # was collected and never read, so it is not collected at all.
-deferred_pair: collections.Counter = collections.Counter()
-seam_calls: collections.Counter = collections.Counter()
-seam_defers: collections.Counter = collections.Counter()
-seam_bytes: collections.Counter = collections.Counter()
+deferred_pair: collections.Counter[tuple[str, str]] = collections.Counter()
+seam_calls: collections.Counter[str] = collections.Counter()
+seam_defers: collections.Counter[str] = collections.Counter()
+seam_bytes: collections.Counter[str] = collections.Counter()
+# Credited caller -> re-registration events (#1837). A wire-cache hit returns
+# the same bytes object to a later call site, so the event stays keyed by
+# identity and the site that had it built keeps the row.
+reregistered: collections.Counter[str] = collections.Counter()
 # Every `rust_*` name wrapped in patch_kernel(), called or not. A
 # call-counter census is otherwise silent about seams whose call sites
 # are shadowed by another answering seam (they leave no row to rank).
@@ -141,8 +153,8 @@ registered_seams: set[str] = set()
 # Blob bytes passed to the seam on EVERY call (wire-cache hits included);
 # this is the per-call payload the Rust side re-decodes, the dominant
 # per-call cost for whole-tree wire seams.
-seam_call_bytes: collections.Counter = collections.Counter()
-probe_calls: collections.Counter = collections.Counter()
+seam_call_bytes: collections.Counter[str] = collections.Counter()
+probe_calls: collections.Counter[str] = collections.Counter()
 probe_stats: dict[str, dict[str, Any]] = {}
 # #1827 cause split for the unconsumed bucket: `mypy.subtypes._subtype_answers`
 # answers a repeated pair without calling any seam, so the two keys built for
@@ -226,7 +238,14 @@ def register_serializer_result(result: Any, caller: str) -> None:
         if key in consumed_ids:
             # A wire-cache hit returns an already-consumed blob; not a new event.
             continue
-        pending[key] = [caller, len(b), b]
+        entry = pending.get(key)
+        if entry is None:
+            pending[key] = [caller, len(b), b]
+        else:
+            # A wire-cache hit on a blob nothing has consumed yet: the same
+            # object registered again, so this is one event and the site that
+            # had the bytes built keeps the row (#1837), not the last one.
+            reregistered[entry[0]] += 1
 
 
 def consume(blob: Any, useful_: bool, seam: str) -> None:
@@ -404,6 +423,18 @@ def patch_subtype_dedup_probe(subtypes_mod: Any = None) -> bool:
     return True
 
 
+def install_shim(target: Any, name: str, fn: Callable[..., Any]) -> None:
+    """Install a monkey-patch on a class without a `method-assign` error.
+
+    The attribute name is a parameter rather than a literal because ruff's B010
+    rewrites `setattr(x, "attr", v)` straight back to an assignment, and an
+    assignment to a method is the error this avoids (#1838): a type check that
+    is already red cannot report a regression. Same shape as the serializer and
+    probe installs below, which name their attribute at runtime too.
+    """
+    setattr(target, name, fn)
+
+
 def patch_probes() -> int:
     n = 0
     import importlib
@@ -464,8 +495,8 @@ def patch_probes() -> int:
                 stats["resolver_build_s"] += time.perf_counter() - t0
 
         orig_build = BuildManager._build_native_resolvers
-        BuildManager._collect_incremental = collect
-        BuildManager._build_native_resolvers = build_resolvers
+        install_shim(BuildManager, "_collect_incremental", collect)
+        install_shim(BuildManager, "_build_native_resolvers", build_resolvers)
         probe_stats["_collect_incremental"] = stats
         n += 2
     except ImportError:
@@ -568,6 +599,18 @@ def _buffered_blob_ids() -> set[int] | None:
     return ids
 
 
+def _shared_marker(caller: str) -> str:
+    """Row suffix for a credited site whose blobs a second site also registered.
+
+    A wire-cache hit hands the same bytes object back, so the event stays with
+    the site that built it and the later site only counts here (#1837). Without
+    the marker the sharing is invisible, and the row reads as that site's own
+    cost.
+    """
+    n = reregistered.get(caller, 0)
+    return f"  [shared: {n}]" if n else ""
+
+
 def report(run_status: str) -> None:
     out = sys.stderr
     for entry in pending.values():
@@ -592,17 +635,29 @@ def report(run_status: str) -> None:
     print(
         f"  unconsumed:  {sum(unconsumed.values())} ({sum(unconsumed_bytes.values())} B)", file=out
     )
+    # Printed even at zero: a site's row is a bound, not an exact attribution,
+    # whenever a wire-cache hit handed its blob to another call site (#1837).
+    print(
+        f"  wire-cache shares: {sum(reregistered.values())} re-registration(s) by "
+        f"another call site (#1837); the blob keeps its builder's row, marked "
+        f"[shared: N] in sections A, B and C",
+        file=out,
+    )
 
     print("\n--- A. serialized then SEAM DEFERRED (top 25 call sites) ---", file=out)
     for site_, cnt in deferred.most_common(25):
-        print(f"  {cnt:8d}  {deferred_bytes[site_]:10d}B  {site_}", file=out)
+        print(
+            f"  {cnt:8d}  {deferred_bytes[site_]:10d}B  {site_}{_shared_marker(site_)}", file=out
+        )
     print("\n--- A2. same, top 25 (call site, seam) pairs ---", file=out)
     for (site_, seam), cnt in deferred_pair.most_common(25):
         print(f"  {cnt:8d}  {seam:<45} {site_}", file=out)
 
     print("\n--- B. serialized, NEVER consumed by any seam (top 25) ---", file=out)
     for site_, cnt in unconsumed.most_common(25):
-        print(f"  {cnt:8d}  {unconsumed_bytes[site_]:10d}B  {site_}", file=out)
+        print(
+            f"  {cnt:8d}  {unconsumed_bytes[site_]:10d}B  {site_}{_shared_marker(site_)}", file=out
+        )
 
     print("\n--- B2. unconsumed bucket by cause (#1827) ---", file=out)
     n_unconsumed = sum(unconsumed.values())
@@ -655,7 +710,7 @@ def report(run_status: str) -> None:
 
     print("\n--- C. useful: consumed and decided (top 15) ---", file=out)
     for site_, cnt in useful.most_common(15):
-        print(f"  {cnt:8d}  {useful_bytes[site_]:10d}B  {site_}", file=out)
+        print(f"  {cnt:8d}  {useful_bytes[site_]:10d}B  {site_}{_shared_marker(site_)}", file=out)
 
     print("\n--- ALL seams with calls (calls / defers / bytes first-consumed) ---", file=out)
     print(
@@ -752,6 +807,15 @@ AUDITED_RUN_FAILED_REFUSAL = (
     "  failure: {failure}\n"
     "  remedy: fix the crash (a stale extension build is the usual cause, see the\n"
     "  extension identity lines in the report above) and re-run.\n"
+)
+OPERATOR_ABORT_NOTICE = (
+    "\naudit_wire_traffic: ABORTED by the operator (#1846).\n"
+    "  KeyboardInterrupt reached the audited run: that is not the run's own\n"
+    "  failure, so it is not recorded as one, and no census is printed. The\n"
+    "  report walks `pending` and `dedup_hit_blobs`, which is the work Ctrl-C\n"
+    "  asked to stop. The interrupt is re-raised, so the exit status is the\n"
+    "  interpreter's (130), not this tool's.\n"
+    "  seam calls counted before the interrupt: {calls}\n"
 )
 MISSING_KERNEL_REFUSAL = (
     "audit_wire_traffic: {headline} (#1821).\n"
@@ -1005,6 +1069,12 @@ def main() -> int:
             run_status = f"completed, mypy exit {exc.code!r}"
         else:
             run_status = f"FAILED, {run_failure}"
+    except KeyboardInterrupt:
+        # A Ctrl-C is an operator action, not the audited run's failure
+        # (#1846): recording it as one attributed the abort to mypy and let
+        # the census below walk `pending` for a run already asked to stop.
+        print(OPERATOR_ABORT_NOTICE.format(calls=sum(seam_calls.values())), file=sys.stderr)
+        raise
     except BaseException as exc:
         run_failure = f"{type(exc).__name__}: {exc}"
         run_status = f"FAILED, raised {run_failure}"
@@ -1015,10 +1085,10 @@ def main() -> int:
     finally:
         total_run_s = time.perf_counter() - _t0
         print(f"\n[audit] total run wall {total_run_s:.1f}s (load-contaminated)", file=sys.stderr)
-        report(run_status)
-    # The report is printed on every path; the guards only decide whether it
-    # may be read as evidence. `report()` sits in the `finally` above, so the
-    # tally read here is complete even when the audited run raised.
+    # The report is printed on every path that reaches this line; the guards
+    # only decide whether it may be read as evidence. It used to sit in the
+    # `finally`, which is what made an operator abort print a census (#1846).
+    report(run_status)
     total_calls = sum(seam_calls.values())
     refusals = evidence_refusals(total_calls, len(registered_seams), run_failure)
     for reason in refusals:

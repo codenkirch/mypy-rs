@@ -1,4 +1,5 @@
-"""Guards for `misc/audit_wire_traffic.py` (#1820, #1821, #1827, #1828, #1831).
+"""Guards for `misc/audit_wire_traffic.py` (#1820, #1821, #1827, #1828, #1831,
+#1837, #1846).
 
 The audit counts seam calls with an in-process proxy, so a check that fans
 out to workers makes it report 0 calls for every seam and still succeed.
@@ -14,6 +15,14 @@ exited 0 as long as one call was counted), and it names the extension
 build behind the numbers (#1828). The refusal for the unimportable kernel
 is headed from its cause, because `except ImportError` also catches a
 failure inside `type_kernel`'s own import (#1831).
+
+Two further defects in the same tool are guarded here. An operator Ctrl-C
+used to be recorded as the audited run's failure, which then attributed the
+abort to mypy and printed a census for a run the operator had just stopped;
+the interrupt now leaves `main()` before the report (#1846). And a blob the
+wire cache hands to a second call site used to credit that later site; it
+keeps the row of the site that registered it first, with the
+re-registrations counted and marked on the affected row (#1837).
 
 `main()` is driven with the kernel probe and `mypy.main.main` stubbed out,
 so the guards are proven without a self-check. A guard that rejected every
@@ -71,12 +80,14 @@ class AuditGuardHarness(unittest.TestCase):
         tally: int = 0,
         workers_env: str | None = None,
         run_exc: BaseException | None = None,
+        stderr: io.StringIO | None = None,
     ) -> tuple[int, str]:
         """Run `main()` once.
 
         `tally` is the seam calls the stub run "made"; `run_exc` is raised by
         the stub in place of returning, which is how a crashed audited run is
-        driven (#1828).
+        driven (#1828). `stderr` is for the callers that drive a `main()` which
+        does not return (#1846), where the returned text never arrives.
         """
 
         def kernel_stub() -> int:
@@ -98,7 +109,7 @@ class AuditGuardHarness(unittest.TestCase):
             if run_exc is not None:
                 raise run_exc
 
-        err = io.StringIO()
+        err = stderr if stderr is not None else io.StringIO()
         with mock.patch.dict(os.environ, clear=False):
             for key in ("MYPY_AUDIT_ARGS", "MYPY_NUM_WORKERS"):
                 os.environ.pop(key, None)
@@ -318,6 +329,41 @@ class CrashedRunGuardSuite(AuditGuardHarness):
         rc, err = self.run_main("", tally=1, run_exc=SystemExit(0))
         self.assertEqual(rc, 0, err)
         self.assertIn("audited run: completed, mypy exit 0", err)
+
+
+class OperatorAbortSuite(AuditGuardHarness):
+    """#1846: a Ctrl-C is an operator action, not the audited run's failure."""
+
+    def abort(self, tally: int = 3) -> str:
+        """Drive `main()` under a simulated Ctrl-C, returning its output."""
+        err = io.StringIO()
+        with self.assertRaises(KeyboardInterrupt):
+            self.run_main("", tally=tally, run_exc=KeyboardInterrupt(), stderr=err)
+        return err.getvalue()
+
+    def test_an_operator_interrupt_aborts_without_a_census(self) -> None:
+        output = self.abort()
+        # The census is the work the interrupt asked to stop: it walks
+        # `pending` and `dedup_hit_blobs`, so it must not run at all. A test
+        # reading only the message would not tell the two designs apart.
+        self.assertNotIn("wire-waste audit", output)
+        # And the abort is not the audited run's failure: recording it as one
+        # printed `FAILED, raised KeyboardInterrupt`, a crash-shaped traceback,
+        # and fired the run-failure refusal for an operator action.
+        self.assertNotIn("FAILED, raised KeyboardInterrupt", output)
+        self.assertNotIn("Traceback (most recent call last)", output)
+        self.assertNotIn("THE AUDITED RUN FAILED", output)
+        self.assertIn("ABORTED by the operator (#1846)", output)
+
+    def test_the_abort_notice_carries_the_tally_so_far(self) -> None:
+        # The notice replaces the census, so it must say how far the run got
+        # rather than leaving the operator with nothing.
+        self.assertIn("seam calls counted before the interrupt: 3", self.abort(tally=3))
+
+    def test_the_abort_notice_reads_the_tally_not_a_constant(self) -> None:
+        # A second test method, so a fresh module: the number must come from
+        # the counter, not from a leftover or a literal.
+        self.assertIn("seam calls counted before the interrupt: 5", self.abort(tally=5))
 
 
 class _MissingTypeKernel:
@@ -679,6 +725,109 @@ class UnconsumedCauseSplitSuite(unittest.TestCase):
             self.assertIn(
                 "still in mypy.subtypes._subtype_batch at exit: 0 blobs", self.report_text()
             )
+
+
+class SharedBlobAttributionSuite(unittest.TestCase):
+    """#1837: a wire-cache-shared blob keeps the row of the site that built it.
+
+    Every registration here goes through the real `register_serializer_result`
+    rather than the seeded shapes the other suites use, so the mutation control
+    for each assertion is a mutation of the attribution rule itself.
+    """
+
+    def setUp(self) -> None:
+        self.audit = _load_audit_module()
+
+    def register(self, caller: str, n: int, payload: int = 100) -> list[bytes]:
+        """Register `n` distinct blobs of `payload` bytes from `caller`."""
+        blobs = [f"{caller}#{i}".encode().ljust(payload, b".") for i in range(n)]
+        for blob in blobs:
+            self.audit.register_serializer_result(blob, caller)
+        return blobs
+
+    def report_text(self) -> str:
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+            self.audit.report("completed, mypy.main returned")
+        return err.getvalue()
+
+    def test_the_first_registration_keeps_the_row(self) -> None:
+        builder = "subtypes.py:879:_is_subtype"
+        later = "subtypes.py:881:_is_subtype"
+        blob = self.register(builder, 1)[0]
+        self.audit.register_serializer_result(blob, later)
+        # One event, keyed by identity, and it belongs to the site that had the
+        # bytes built: the later site used to take the row (#1837).
+        self.assertEqual(len(self.audit.pending), 1)
+        self.assertEqual(self.audit.pending[id(blob)][0], builder)
+        self.assertEqual(dict(self.audit.reregistered), {builder: 1})
+
+    def test_a_consumed_blob_is_not_a_re_registration(self) -> None:
+        # The identity is already spent, so a wire-cache hit on it is not an
+        # event at all: it must not resurrect a pending entry or inflate the
+        # share count of a run that is over.
+        builder = "types.py:5005:_restore_dedup_identity"
+        blob = self.register(builder, 1)[0]
+        self.audit.consume(blob, True, "rust_seam")
+        self.audit.register_serializer_result(blob, "types.py:5100:_serialize_type")
+        self.assertEqual(self.audit.pending, {})
+        self.assertEqual(dict(self.audit.reregistered), {})
+
+    def test_the_report_marks_the_shared_row_and_counts_the_shares(self) -> None:
+        builder = "subtypes.py:879:_is_subtype"
+        later = "subtypes.py:881:_is_subtype"
+        blobs = self.register(builder, 4)
+        self.register("subtypes.py:880:_is_subtype", 2)
+        for blob in blobs[:2]:
+            self.audit.register_serializer_result(blob, later)
+        output = self.report_text()
+        # The share is counted and the affected row says so, instead of the
+        # row silently reading as that site's own cost.
+        self.assertIn(
+            "wire-cache shares: 2 re-registration(s) by another call site (#1837)", output
+        )
+        self.assertIn(f"  {4:8d}  {400:10d}B  {builder}  [shared: 2]", output)
+        # The re-registering site paid nothing, so it gets no row of its own.
+        self.assertNotIn(later, output)
+
+    def test_a_report_without_sharing_says_zero_rather_than_nothing(self) -> None:
+        # A structural zero: the line prints, so "no sharing" is measured
+        # rather than silent, and no row carries a marker.
+        self.register("subtypes.py:879:_is_subtype", 3)
+        output = self.report_text()
+        self.assertIn("wire-cache shares: 0 re-registration(s)", output)
+        # The B row is compared whole: the header line carries the literal
+        # "[shared: N]" as its legend, so a marker on the row is what this
+        # asserts is absent.
+        rows = [
+            line
+            for line in output.splitlines()
+            if line.strip().endswith("subtypes.py:879:_is_subtype")
+        ]
+        self.assertEqual(rows, [f"  {3:8d}  {300:10d}B  subtypes.py:879:_is_subtype"])
+
+    def test_sharing_does_not_move_the_dedup_split(self) -> None:
+        # #1840's B2 joins the buckets against the dedup keys by blob identity,
+        # so a shared blob keeps its place in the split: the credited caller
+        # changed, the split's totals did not.
+        blobs = self.register("subtypes.py:879:_is_subtype", 30)
+        self.register("subtypes.py:880:_is_subtype", 10)
+        for blob in blobs[:10]:
+            self.audit.dedup_hit_blobs[id(blob)] = blob
+        for blob in blobs[:5]:
+            self.audit.register_serializer_result(blob, "subtypes.py:881:_is_subtype")
+        self.audit.subtype_dedup.update({"probes": 90, "hits": 10})
+        with mock.patch.object(self.audit, "subtype_dedup_status", "installed"):
+            output = self.report_text()
+        self.assertIn(
+            "dominant call site: subtypes.py:879:_is_subtype 30 events, "
+            "3000B (75.0% of the bucket)",
+            output,
+        )
+        self.assertIn("a dedup hit turned these away: 10 of the 40 unconsumed events", output)
+        self.assertIn("(25.0%, 1000 B)", output)
+        self.assertIn("other causes: 30 events", output)
+        self.assertIn("subtypes.py:879:_is_subtype  [shared: 5]", output)
 
 
 if __name__ == "__main__":

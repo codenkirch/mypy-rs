@@ -44,7 +44,7 @@ from typing import Any
 
 from mypy import build, nodes_mirror
 from mypy.modulefinder import BuildSource
-from mypy.nodes import MypyFile, SymbolTableNode
+from mypy.nodes import MypyFile
 from mypy.options import Options
 
 _SOURCES: list[tuple[str, str, str]] = [
@@ -123,8 +123,6 @@ def _coverage(modules: dict[str, MypyFile]) -> dict[str, Any]:
             continue
         skeleton_modules += 1
         for name, entry in tree.names.items():
-            if not isinstance(entry, SymbolTableNode):
-                continue
             node = entry.node
             if node is None:
                 continue
