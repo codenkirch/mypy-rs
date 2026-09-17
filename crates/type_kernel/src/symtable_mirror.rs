@@ -330,6 +330,21 @@ fn seed_entries(store: &mut SymStore, owner: &PyAny, owner_handle: u64, pairs: V
     store.flip.seeded_owners += 1;
 }
 
+/// Whether the store already decided this owner: adopted (`by_owner`) or
+/// refused (`inherited`). Neither may be seeded over, so a seed that
+/// re-enters the store during `prepare_seed` respects the decision.
+fn owner_taken(store: &SymStore, owner_handle: u64) -> bool {
+    store.by_owner.contains_key(&owner_handle) || store.inherited.contains(&owner_handle)
+}
+
+/// Fail-closed refusal: pin the owner so the read gate reports `Inherited`
+/// (not a bare no-handle), and count the attempt as evidence.
+fn refuse_seed(store: &mut SymStore, owner: &PyAny, owner_handle: u64) {
+    store.pins.insert(owner_handle, Py::from(owner));
+    store.inherited.insert(owner_handle);
+    store.flip.seed_rejects += 1;
+}
+
 /// Record (or replace) the entry for `(owner, name)`; returns
 /// `(owner_handle, node_handle, seq, generation)`.
 pub(crate) fn put(
@@ -348,16 +363,13 @@ pub(crate) fn put(
     let seed = (first_write && table_len > 1).then(|| prepare_seed(owner));
     Ok(with_store(|store| {
         // The store's own view decides at the moment of the mutation: a
-        // re-entrant put between the two acquisitions must not be seeded
-        // over (`prepare_seed` reads plain slots only, so none can run).
-        if first_write && table_len > 1 && !store.by_owner.contains_key(&owner_handle) {
+        // re-entrant call during `prepare_seed` can adopt or refuse this
+        // owner, and either decision wins (same guard as `seed`).
+        if first_write && table_len > 1 && !owner_taken(store, owner_handle) {
             match seed {
                 Some(Some(pairs)) => seed_entries(store, owner, owner_handle, pairs),
                 // Not a readable namespace: the order claim cannot hold.
-                _ => {
-                    store.inherited.insert(owner_handle);
-                    store.flip.seed_rejects += 1;
-                }
+                _ => refuse_seed(store, owner, owner_handle),
             }
         }
         let generation = store.generation_for(owner_handle);
@@ -424,19 +436,33 @@ pub(crate) fn put(
 /// closed to `Inherited`. Returns the seeded entry count.
 pub(crate) fn seed(owner: &PyAny) -> PyResult<usize> {
     let owner_handle = handle_or_error(owner)?;
-    if owner.len().unwrap_or(0) == 0 {
+    // The doc contract: an unreadable size fails closed like an unreadable
+    // namespace, not "empty". `entries_if_mirrored` names this shape
+    // `NotSized`; without the pin the owner would read as a bare no-handle.
+    let table_len = match owner.len() {
+        Ok(len) => len,
+        Err(_) => {
+            return Ok(with_store(|store| {
+                if !owner_taken(store, owner_handle) {
+                    refuse_seed(store, owner, owner_handle);
+                }
+                0
+            }));
+        }
+    };
+    if table_len == 0 {
         return Ok(0);
     }
-    if with_store(|store| {
-        store.by_owner.contains_key(&owner_handle) || store.inherited.contains(&owner_handle)
-    }) {
+    if with_store(|store| owner_taken(store, owner_handle)) {
         return Ok(0);
     }
     // Outside the store borrow: a slot read that runs Python code must not
     // re-enter the store (same rule as the write-time seed in `put`).
     let pairs = prepare_seed(owner);
     Ok(with_store(|store| {
-        if store.by_owner.contains_key(&owner_handle) {
+        // A re-entrant call during `prepare_seed` can adopt or refuse this
+        // owner; either decision wins, so this seed never records over it.
+        if owner_taken(store, owner_handle) {
             return 0;
         }
         match pairs {
@@ -446,12 +472,7 @@ pub(crate) fn seed(owner: &PyAny) -> PyResult<usize> {
                 count
             }
             None => {
-                // Pin like a refused write-time seed does, so the flip's
-                // defer reason is `Inherited` (not a bare no-handle) and
-                // `inherited` state is observable from Python.
-                store.pins.insert(owner_handle, Py::from(owner));
-                store.inherited.insert(owner_handle);
-                store.flip.seed_rejects += 1;
+                refuse_seed(store, owner, owner_handle);
                 0
             }
         }
@@ -1080,6 +1101,8 @@ pub(crate) fn rust_symtable_mirror_meta_entry_count() -> usize {
 #[cfg(test)]
 mod symtable_mirror_tests {
     use super::*;
+    use pyo3::types::PyModule;
+    use pyo3::wrap_pyfunction;
 
     fn with_py<T>(f: impl FnOnce(Python<'_>) -> T) -> T {
         pyo3::prepare_freethreaded_python();
@@ -1598,6 +1621,136 @@ mod symtable_mirror_tests {
             assert!(matches!(
                 entries_if_mirrored(py, table),
                 Err(ShadowGap::NoHandle)
+            ));
+        });
+    }
+
+    /// Expose the seed seam to Python so a test namespace can re-enter the
+    /// store from inside `items()`.
+    fn seed_module<'py>(py: Python<'py>) -> &'py PyModule {
+        let kernel = PyModule::new(py, "tk").unwrap();
+        kernel
+            .add_function(wrap_pyfunction!(rust_symtable_mirror_seed, kernel).unwrap())
+            .unwrap();
+        kernel
+    }
+
+    #[test]
+    fn test_seed_reentrant_refusal_is_not_seeded_over() {
+        with_py(|py| {
+            reset();
+            flip_counts_reset();
+            // `items()` re-enters the store: the nested call refuses the
+            // owner, then the namespace is made readable before the outer
+            // read resumes. The outer seed must honor that refusal.
+            let globals = PyDict::new(py);
+            globals.set_item("tk", seed_module(py)).unwrap();
+            globals.set_item("sym", symbol_object(py, "mod.a")).unwrap();
+            py.run(
+                r#"class T(dict):
+    def items(self):
+        if not self.__dict__.get('_reentered'):
+            self._reentered = True
+            tk.rust_symtable_mirror_seed(self)
+            dict.__setitem__(self, 'a', sym)
+        return dict.items(self)
+
+
+table = T({'a': object()})
+"#,
+                Some(globals),
+                None,
+            )
+            .unwrap();
+            let table = globals.get_item("table").unwrap().unwrap();
+            let handle = identity::handle_for(table).unwrap();
+            assert_eq!(seed(table).unwrap(), 0);
+            let counts = flip_counts();
+            assert_eq!(counts.seed_rejects, 1);
+            assert_eq!(counts.seeded_owners, 0);
+            assert_eq!(counts.seeded_entries, 0);
+            // Refused, not adopted: the owner is never in both maps.
+            assert!(with_store(|store| store.inherited.contains(&handle)));
+            assert!(!with_store(|store| store.by_owner.contains_key(&handle)));
+            assert!(with_store(|store| store.pins.contains_key(&handle)));
+            assert!(matches!(
+                entries_if_mirrored(py, table),
+                Err(ShadowGap::Inherited)
+            ));
+        });
+    }
+
+    #[test]
+    fn test_seed_len_failure_fails_closed() {
+        with_py(|py| {
+            reset();
+            flip_counts_reset();
+            // A namespace whose size cannot be read: the doc contract says
+            // fail closed to `Inherited`, not read as empty and unadopted.
+            let globals = PyDict::new(py);
+            globals.set_item("sym", symbol_object(py, "mod.a")).unwrap();
+            py.run(
+                r#"class U(dict):
+    def __len__(self):
+        raise TypeError('unsized')
+
+
+table = U({'a': sym})
+"#,
+                Some(globals),
+                None,
+            )
+            .unwrap();
+            let table = globals.get_item("table").unwrap().unwrap();
+            let handle = identity::handle_for(table).unwrap();
+            assert_eq!(seed(table).unwrap(), 0);
+            let counts = flip_counts();
+            assert_eq!(counts.seed_rejects, 1);
+            assert_eq!(counts.seeded_owners, 0);
+            assert!(with_store(|store| store.inherited.contains(&handle)));
+            assert!(with_store(|store| store.pins.contains_key(&handle)));
+            assert!(!with_store(|store| store.by_owner.contains_key(&handle)));
+            // Adopted into the fail-closed state, not a bare no-handle: the
+            // unreadable size surfaces as `NotSized`, matching the gate.
+            assert!(matches!(
+                entries_if_mirrored(py, table),
+                Err(ShadowGap::NotSized)
+            ));
+            // A second call is a no-op (already refused), no double count.
+            assert_eq!(seed(table).unwrap(), 0);
+            assert_eq!(flip_counts().seed_rejects, 1);
+        });
+    }
+
+    #[test]
+    fn test_put_does_not_seed_over_an_inherited_owner() {
+        with_py(|py| {
+            reset();
+            flip_counts_reset();
+            // Refuse the owner first (an unreadable value), then make the
+            // namespace readable. The write-time seed in `put` must respect
+            // the refusal instead of adopting the owner into both maps.
+            let table = py.eval("{}", None, None).unwrap();
+            table
+                .set_item("a", py.eval("object()", None, None).unwrap())
+                .unwrap();
+            table.set_item("b", symbol_object(py, "mod.b")).unwrap();
+            assert_eq!(seed(table).unwrap(), 0);
+            assert_eq!(flip_counts().seed_rejects, 1);
+            table.set_item("a", symbol_object(py, "mod.a")).unwrap();
+            put(table, "a", symbol_object(py, "mod.a"), flags(1)).unwrap();
+            let handle = identity::handle_for(table).unwrap();
+            // Only the explicit write recorded; the seed stayed refused.
+            assert_eq!(flip_counts().seeded_owners, 0);
+            assert_eq!(flip_counts().put_entries, 1);
+            assert!(with_store(|store| store.inherited.contains(&handle)));
+            assert_eq!(
+                with_store(|store| store.by_owner.get(&handle).map(Vec::len)),
+                Some(1)
+            );
+            assert!(matches!(
+                entries_if_mirrored(py, table),
+                Err(ShadowGap::Inherited)
             ));
         });
     }
