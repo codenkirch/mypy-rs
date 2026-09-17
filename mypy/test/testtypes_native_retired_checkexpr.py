@@ -16,7 +16,7 @@ except ImportError:
 
 from unittest import skipUnless
 
-from mypy.nodes import ARG_POS, ARG_STAR, ARG_STAR2, ArgKind
+from mypy.nodes import ARG_POS, ARG_STAR, ARG_STAR2, ArgKind, TypeInfo
 from mypy.test.helpers import Suite
 from mypy.test.testtypes import _NATIVE_WIRE_ENABLED
 from mypy.test.typefixture import TypeFixture
@@ -152,10 +152,11 @@ class NativeCheckCallHeadRetiredSuite(Suite):
     6.80x-12.37x the `isinstance(...) and fullname in ENUM_BASES` predicate, so
     landing the batch on that chain would have made the head slower.
 
-    The typeobj gate is **kept**: it measured 0.70x-0.91x the Python if/elif on
-    the type-object arms. It stays registered and wired, so this file asserts
-    it too. The enum arm returns before the gate, which is a pure decision
-    function, so the gate no longer runs on a path that discards its tag.
+    Its constituent typeobj gate was **kept by this PR** on a per-shape
+    rule ("wins on the abstract arm, so keep"). #1833 measured that gate
+    against production shape weights and retired it, so the
+    `NativeClassifyTypeobjGateRetiredSuite` below now owns its pins and the
+    enum arm returning before the gate is moot: nothing is left to call.
     """
 
     def test_shim_and_alias_removed(self) -> None:
@@ -193,15 +194,16 @@ class NativeCheckCallHeadRetiredSuite(Suite):
         assert "isinstance(callable_node, RefExpr) and callable_node.fullname in ENUM_BASES" in src
         assert "check_enum_call()" in src
 
-    def test_typeobj_gate_stays_wired(self) -> None:
-        # The kept seam: registered, aliased, and still the first tag source.
+    def test_typeobj_gate_call_is_gone_too(self) -> None:
+        # #1833 retired the gate this PR kept; the head must carry no trace of
+        # it. The seam's own pins live in the #1833 suite below.
         import inspect
 
         from mypy import checkexpr
 
-        assert hasattr(checkexpr, "_rust_classify_typeobj_gate")
+        assert not hasattr(checkexpr, "_rust_classify_typeobj_gate")
         src = inspect.getsource(checkexpr.ExpressionChecker.check_callable_call)
-        assert "_rust_classify_typeobj_gate(callee)" in src
+        assert "rust_classify_typeobj_gate" not in src
 
     def test_pyfunctions_stay_registered(self) -> None:
         assert _type_kernel is not None
@@ -281,3 +283,151 @@ class NativeComputeArgContextIndicesRetiredSuite(Suite):
     def test_values_unmapped_actual(self) -> None:
         out = self._contexts([ARG_POS, ARG_POS, ARG_POS], [[0], [], [2]], 3)
         assert [t is not None for t in out] == [True, False, True]
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeClassifyTypeobjGateRetiredSuite(Suite):
+    """Pin the #1833 retirement of the `classify_typeobj_gate` shim.
+
+    #1830 kept this seam on a per-shape rule: it beat the Python if/elif on
+    the abstract arm (0.68x-0.70x) and lost on the protocol arm, so "wins on
+    some shape" read as keep. The frequency evidence shows the two shapes that
+    decided that rule barely occur: over a cold self-check (183,318 crossings,
+    tag/shape agreement checked per crossing) the split is 88.26%
+    non-type-object, 11.74% type-object with no arm, **0 protocol**, 1
+    abstract; a second corpus (73,018 crossings, `-p sphinx -p _pytest`) is
+    89.79% / 10.21% / 0 / 0.
+
+    Weighted by those frequencies the crossing costs 1.02x-1.07x the Python
+    body (`sum(f*native)/sum(f*python)`, two timing runs x two corpora), so the
+    retirement is a small net win: 12% of crossings win 0.92x-0.94x, but 88%
+    pay 1.07x-1.14x, and the arm that justified the keep is a single call.
+
+    The tag if/elif/else is now the only source. The Rust pyfunction stays
+    registered for the direct-seam tests in `NativeTypeobjGateSuite`.
+    """
+
+    def setUp(self) -> None:
+        self.fx = TypeFixture()
+
+    def test_shim_and_alias_removed(self) -> None:
+        import inspect
+
+        from mypy import checkexpr
+
+        assert not hasattr(checkexpr, "_rust_classify_typeobj_gate")
+        src = inspect.getsource(checkexpr.ExpressionChecker.check_callable_call)
+        assert "rust_classify_typeobj_gate" not in src, "check_callable_call should be pure Python"
+
+    def test_no_rust_gate_loaded_with_gate_on(self) -> None:
+        # Not "no rust_ name at all": the head legitimately still loads
+        # `_rust_solve_generic_call` and `_rust_calibrate_type_obj_return`.
+        from mypy.checkexpr import ExpressionChecker, _set_native_checkexpr_active
+
+        dead = ("_rust_classify_typeobj_gate",)
+        names = ExpressionChecker.check_callable_call.__code__.co_names
+        _set_native_checkexpr_active(True)
+        try:
+            loaded = [n for n in names if n in dead]
+        finally:
+            _set_native_checkexpr_active(False)
+        assert loaded == [], f"check_callable_call still loads {loaded}"
+
+    def test_tag_default_is_gone_and_all_arms_assign(self) -> None:
+        # The `tag: int | None = None` defer default was the thing a failing
+        # seam fell back through; with it gone the chain must be total.
+        import inspect
+
+        from mypy.checkexpr import ExpressionChecker
+
+        src = inspect.getsource(ExpressionChecker.check_callable_call)
+        assert "tag: int | None = None" not in src
+        for arm in (
+            "NATIVE_TYPEOBJ_GATE_PROTOCOL",
+            "NATIVE_TYPEOBJ_GATE_ABSTRACT",
+            "NATIVE_TYPEOBJ_GATE_NONE",
+        ):
+            assert arm in src, f"check_callable_call lost the {arm} arm"
+        assert "and not callee.from_type_type" in src
+        assert "and not callee.type_object().fallback_to_any" in src
+
+    def test_constants_match_the_rust_arms(self) -> None:
+        # The tag values the direct-seam tests assert as raw ints.
+        from mypy import checkexpr
+
+        assert checkexpr.NATIVE_TYPEOBJ_GATE_NONE == 0
+        assert checkexpr.NATIVE_TYPEOBJ_GATE_PROTOCOL == 1
+        assert checkexpr.NATIVE_TYPEOBJ_GATE_ABSTRACT == 2
+
+    def test_pyfunction_stays_registered(self) -> None:
+        assert _type_kernel is not None
+        assert hasattr(_type_kernel, "rust_classify_typeobj_gate")
+
+    # --- the surviving Python gate still emits both fails with the gate on ---
+
+    def _fails(self, callee: CallableType, gate: bool) -> list[str]:
+        from mypy.checker import TypeChecker
+        from mypy.checkexpr import ExpressionChecker, _set_native_checkexpr_active
+        from mypy.errors import Errors
+        from mypy.messages import MessageBuilder
+        from mypy.nodes import Context, MypyFile, SymbolTable
+        from mypy.options import Options
+        from mypy.plugin import Plugin
+
+        options = Options()
+        errors = Errors(options)
+        tree = MypyFile([], [])
+        tree.is_stub = True
+        tree.names = SymbolTable()
+        chk = TypeChecker(errors, {}, options, tree, "", Plugin(options), {})
+        ec = ExpressionChecker(chk, MessageBuilder(errors, {}), Plugin(options), {})
+        captured: list[str] = []
+        ec.chk.fail = lambda m, ctx, code=None: captured.append("protocol")  # type: ignore[method-assign, misc, assignment]
+        ec.msg.cannot_instantiate_abstract_class = lambda name, attrs, ctx: captured.append(  # type: ignore[method-assign, assignment]
+            "abstract"
+        )
+        _set_native_checkexpr_active(gate)
+        try:
+            ec.check_callable_call(callee, [], [], Context(), None, None, None, None)
+        except Exception as err:
+            captured.append(f"exc:{type(err).__name__}")
+        finally:
+            _set_native_checkexpr_active(False)
+        return captured
+
+    def _type_object_callable(self, info: TypeInfo, from_type_type: bool = False) -> CallableType:
+        from mypy.types import Instance
+
+        callee = self.fx.callable_type(self.fx.a, Instance(info, []))
+        callee.from_type_type = from_type_type
+        return callee
+
+    def _protocol_info(self) -> TypeInfo:
+        info = self.fx.make_type_info("ProtoKlass")
+        assert info is not None
+        info.is_protocol = True
+        return info
+
+    def _abstract_info(self) -> TypeInfo:
+        info = self.fx.make_type_info("AbsKlass")
+        assert info is not None
+        info.is_abstract = True
+        return info
+
+    def test_protocol_fail_still_fires_gate_on(self) -> None:
+        assert "protocol" in self._fails(self._type_object_callable(self._protocol_info()), True)
+
+    def test_abstract_fail_still_fires_gate_on(self) -> None:
+        assert "abstract" in self._fails(self._type_object_callable(self._abstract_info()), True)
+
+    def test_plain_typeobj_fires_no_gate_fail(self) -> None:
+        got = self._fails(self.fx.callable_type(self.fx.a, self.fx.b), True)
+        assert "protocol" not in got
+        assert "abstract" not in got
+
+    def test_gate_toggle_is_inert_for_this_body(self) -> None:
+        # With no Rust arm left the toggle cannot change the captured fails;
+        # a re-wired call would show up here as a differential.
+        for info in (self._protocol_info(), self._abstract_info()):
+            callee = self._type_object_callable(info)
+            assert self._fails(callee, False) == self._fails(callee, True)

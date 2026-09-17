@@ -264,7 +264,6 @@ try:
         rust_classify_reveal_imported as _rust_classify_reveal_imported,
         rust_classify_super_arg_types as _rust_classify_super_arg_types,
         rust_classify_typeddict_call as _rust_classify_typeddict_call,
-        rust_classify_typeobj_gate as _rust_classify_typeobj_gate,
         rust_classify_visit_op_expr as _rust_classify_visit_op_expr,
         rust_combine_function_signatures as _rust_combine_function_signatures,
         rust_conditional_expr_join as _rust_conditional_expr_join,
@@ -346,7 +345,6 @@ except ImportError:
     _rust_classify_visit_op_expr = None  # type: ignore[assignment]
     _rust_classify_check_boolean_op = None  # type: ignore[assignment]
     _rust_classify_typeddict_call = None  # type: ignore[assignment]
-    _rust_classify_typeobj_gate = None  # type: ignore[assignment]
     _rust_calibrate_type_obj_return = None  # type: ignore[assignment]
     _rust_normalize_callable = None  # type: ignore[assignment]
     _rust_real_union = None  # type: ignore[assignment]
@@ -384,8 +382,9 @@ NATIVE_SUPER_ARG_SINGLE_ARG = 6
 NATIVE_SUPER_ARG_TWO_ARG_OK = 7
 NATIVE_SUPER_ARG_TOO_MANY = 8
 
-# Decision tags returned by `_rust_classify_typeobj_gate`; must match
-# `TYPEOBJ_GATE_*` in crates/type_kernel/src/checkcall_typeobj.rs.
+# Decision tags for the instantiation gate in `check_callable_call`; the values
+# mirror `TYPEOBJ_GATE_*` in crates/type_kernel/src/checkcall_typeobj.rs, which
+# the direct-seam tests assert as raw ints.
 NATIVE_TYPEOBJ_GATE_NONE = 0
 NATIVE_TYPEOBJ_GATE_PROTOCOL = 1
 NATIVE_TYPEOBJ_GATE_ABSTRACT = 2
@@ -2932,37 +2931,27 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
             # An Enum() call that failed SemanticAnalyzerPass2.check_enum_call().
             return callee.ret_type, callee
 
-        # Native type_kernel seam (issue #1464 C2): Rust collapses the
-        # if/elif double-evaluation of is_type_obj()/type_object() into one
-        # arm tag; the two fails and the can_return_none fold stay here.
-        tag: int | None = None
+        # The typeobj-fail gate (issue #1464 C2) is pure Python again: the Rust
+        # fold was retired in #1833 (1.02x-1.07x of this body, production-
+        # weighted). The two fails and the can_return_none fold stay here.
+        tag: int
         if (
-            _CHECKEXPR_HAS_TYPE_KERNEL
-            and _native_checkexpr_active
-            and _rust_classify_typeobj_gate is not None
+            callee.is_type_obj()
+            and callee.type_object().is_protocol
+            # Exception for Type[...]
+            and not callee.from_type_type
         ):
-            try:
-                tag = _rust_classify_typeobj_gate(callee)
-            except (AssertionError, NotImplementedError, ValueError, TypeError):
-                tag = None
-        if tag is None:
-            if (
-                callee.is_type_obj()
-                and callee.type_object().is_protocol
-                # Exception for Type[...]
-                and not callee.from_type_type
-            ):
-                tag = NATIVE_TYPEOBJ_GATE_PROTOCOL
-            elif (
-                callee.is_type_obj()
-                and callee.type_object().is_abstract
-                # Exception for Type[...]
-                and not callee.from_type_type
-                and not callee.type_object().fallback_to_any
-            ):
-                tag = NATIVE_TYPEOBJ_GATE_ABSTRACT
-            else:
-                tag = NATIVE_TYPEOBJ_GATE_NONE
+            tag = NATIVE_TYPEOBJ_GATE_PROTOCOL
+        elif (
+            callee.is_type_obj()
+            and callee.type_object().is_abstract
+            # Exception for Type[...]
+            and not callee.from_type_type
+            and not callee.type_object().fallback_to_any
+        ):
+            tag = NATIVE_TYPEOBJ_GATE_ABSTRACT
+        else:
+            tag = NATIVE_TYPEOBJ_GATE_NONE
         if tag == NATIVE_TYPEOBJ_GATE_PROTOCOL:
             self.chk.fail(
                 message_registry.CANNOT_INSTANTIATE_PROTOCOL.format(callee.type_object().name),
