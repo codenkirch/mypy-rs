@@ -60,16 +60,25 @@ return values, because a deferred path still returns a correct-looking result.
   statement nodes is not stated anywhere I could find, and criterion 2 depends on
   it.
 
-## Open forks for the owner (not decided here)
+## Owner decisions (ratified 2026-09-17, #1836)
 
-1. **Does G4 require the write flip, or does read-serving suffice?** F4's text
-   required write ownership; G4's slogan does not say. This is the highest-stakes
-   ambiguity, because read-only serving is much cheaper and partially true
-   already; choosing "read-serving suffices" would let G4 arrive with the store
-   still a mirror.
-2. **Is expression-first still the order?** See above; history says the opposite.
-3. **Which family does the claim cover first**, if the rung may be claimed
-   per family rather than for all three at once.
+The three forks below were laid out in #1836 with options, costs and a
+recommendation per fork; the owner ruling adopts the recommendations.
+
+1. **Read-serving suffices for G4** (fork 1, option A). G4's purpose is the
+   rung that unblocks Phase H, and H's precondition (#1770) is the node
+   serving channel, i.e. the read side. The write flip lands later beside H
+   rather than gating G4. Binding condition: any "Rust owns `<family>`" claim
+   made under this ruling must state in the ledger that the write path is
+   still Python and that the cross-run differential is the evidence of
+   agreement, not proof of ownership.
+2. **Expression → statement → def is the operative order** (fork 2). The
+   order was settled by what landed (G1.1 first, then #1826 statement, then
+   #1825 def), not by preference; the criteria doc records it as settled.
+3. **The claim is per family** (fork 3, option A). Each family carries its
+   own pin file, ledger entry, differential and counter set, so a family
+   graduates — and is claimed — independently. All three at once is not
+   a shape this evidence structure supports.
 
 ## What G4 explicitly does not require
 
@@ -79,6 +88,6 @@ return values, because a deferred path still returns a correct-looking result.
   path.
 - A standalone binary (Phase J).
 
-Filed as an issue and left for the owner to ratify or amend; this document is a
-proposal, and the criteria above are derived from F4's precedent plus the G-track
+The forks above were left for the owner and are now ratified (#1836, 2026-09-17);
+the criteria above remain derived from F4's precedent plus the G-track
 evidence contracts that are already in force.

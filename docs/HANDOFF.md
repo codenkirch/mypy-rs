@@ -413,7 +413,9 @@ in #1769. Do not re-open without a new mechanism.
 ### Settled: G4's criteria are pinned; H1 is not next
 
 - G4 criteria, each with a receipt: `docs/plans/2026-09-16-g4-graduation-criteria.md`
-  (#1767/#1768). The write-flip-versus-read-serving fork is left to the owner.
+  (#1767/#1768). Forks ratified 2026-09-17 (#1836): read-serving suffices for
+  G4 (write flip lands beside H), order expression -> statement -> def,
+  claims are per family.
 - **H1 now: no** (#1770). The binder is H1's only mass and `mypy/literals.py:204`
   keys narrowing on the live `Var` object (`extract_var_from_literal_hash` reads
   `key[1]` back as a `Var`), so Rust cannot own `Frame.types` without a Var handle
