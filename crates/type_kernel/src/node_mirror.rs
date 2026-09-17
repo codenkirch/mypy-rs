@@ -2299,12 +2299,8 @@ mod g2_serving_tests {
     /// A stand-in for a `Block`: the serving read inspects the record,
     /// never the class, and the mode-2 compare reads exactly this slot.
     fn fresh_block(py: Python<'_>) -> &PyAny {
-        py.eval(
-            "type('B', (), {'is_unreachable': False})()",
-            None,
-            None,
-        )
-        .unwrap()
+        py.eval("type('B', (), {'is_unreachable': False})()", None, None)
+            .unwrap()
     }
 
     fn start_stmt(mode: u8) {
