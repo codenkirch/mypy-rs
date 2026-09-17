@@ -262,7 +262,6 @@ try:
         rust_classify_check_arg as _rust_classify_check_arg,
         rust_classify_check_boolean_op as _rust_classify_check_boolean_op,
         rust_classify_index_with_type as _rust_classify_index_with_type,
-        rust_classify_protocol_test_callee as _rust_classify_protocol_test_callee,
         rust_classify_reveal_imported as _rust_classify_reveal_imported,
         rust_classify_super_arg_types as _rust_classify_super_arg_types,
         rust_classify_typeddict_call as _rust_classify_typeddict_call,
@@ -345,7 +344,6 @@ except ImportError:
     _rust_try_getting_literal = None  # type: ignore[assignment]
     _rust_classify_call = None  # type: ignore[assignment]
     _rust_classify_check_arg = None  # type: ignore[assignment]
-    _rust_classify_protocol_test_callee = None  # type: ignore[assignment]
     _rust_classify_reveal_imported = None  # type: ignore[assignment]
     _rust_classify_index_with_type = None  # type: ignore[assignment]
     _rust_classify_super_arg_types = None  # type: ignore[assignment]
@@ -1764,22 +1762,17 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
         ret_type = self.check_call_expr_with_callee_type(
             callee_type, e, fullname, object_type, member
         )
-        tag: str | None = None
-        if _CHECKEXPR_HAS_TYPE_KERNEL and _native_checkexpr_active:
-            try:
-                tag = _rust_classify_protocol_test_callee(e.callee, len(e.args))
-            except (AssertionError, NotImplementedError):
-                tag = None
-        if tag in ("builtins.isinstance", "builtins.issubclass") or (
-            tag is None
-            and isinstance(e.callee, RefExpr)
+        # Native seam retired (#1739): the protocol-test callee classifier lost
+        # 1.3x-3.7x and decided 0/200 on the common shapes. The Python
+        # isinstance/issubclass predicates below are the path it gated.
+        if (
+            isinstance(e.callee, RefExpr)
             and len(e.args) == 2
             and e.callee.fullname in ("builtins.isinstance", "builtins.issubclass")
         ):
             self.check_runtime_protocol_test(e)
-        if tag == "builtins.issubclass" or (
-            tag is None
-            and isinstance(e.callee, RefExpr)
+        if (
+            isinstance(e.callee, RefExpr)
             and len(e.args) == 2
             and e.callee.fullname == "builtins.issubclass"
         ):

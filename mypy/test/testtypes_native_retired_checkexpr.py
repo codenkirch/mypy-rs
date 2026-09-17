@@ -83,3 +83,53 @@ class NativeIsDuplicateMappingRetiredSuite(Suite):
     def test_pyfunction_stays_registered(self) -> None:
         assert _type_kernel is not None
         assert hasattr(_type_kernel, "rust_is_duplicate_mapping")
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeClassifyProtocolTestCalleeRetiredSuite(Suite):
+    """Pin the #1739 retirement of the `classify_protocol_test_callee` shim.
+
+    The seam re-derived across the FFI a tag `visit_call_expr_inner` already
+    held on live AST nodes: whether the callee is a `RefExpr` with an
+    isinstance/issubclass fullname and exactly two args. It measured
+    1.3x-3.7x the Python predicate and decided on 0/200 calls on the two
+    common shapes, so the crossing was doomed work. This path is now pure
+    Python; the Rust pyfunction stays registered for the direct-seam tests in
+    `NativeEnumProtocolClassifierSuite`.
+    """
+
+    def test_shim_and_alias_removed(self) -> None:
+        import inspect
+
+        from mypy import checkexpr
+
+        assert not hasattr(checkexpr, "_rust_classify_protocol_test_callee")
+        src = inspect.getsource(checkexpr.ExpressionChecker.visit_call_expr_inner)
+        assert "rust_" not in src, "visit_call_expr_inner should be pure Python"
+
+    def test_no_rust_name_loaded_with_gate_on(self) -> None:
+        from mypy import checkexpr
+        from mypy.checkexpr import ExpressionChecker, _set_native_checkexpr_active
+
+        _orig_gate = checkexpr._native_checkexpr_active
+        _set_native_checkexpr_active(True)
+        try:
+            loaded = [
+                n
+                for n in ExpressionChecker.visit_call_expr_inner.__code__.co_names
+                if "rust_" in n
+            ]
+        finally:
+            _set_native_checkexpr_active(_orig_gate)
+        assert loaded == [], f"visit_call_expr_inner still loads {loaded}"
+
+    def test_protocol_branches_remain(self) -> None:
+        # The retired seam only gated two downstream calls; both must survive
+        # so the isinstance/issubclass work still runs on the Python path.
+        import inspect
+
+        from mypy.checkexpr import ExpressionChecker
+
+        src = inspect.getsource(ExpressionChecker.visit_call_expr_inner)
+        assert "self.check_runtime_protocol_test(e)" in src
+        assert "self.check_protocol_issubclass(e)" in src
