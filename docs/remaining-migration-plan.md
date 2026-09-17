@@ -816,6 +816,12 @@ if the bridge costs outweigh the standalone benefit.
   kernel-complete and opt-in. The F4 rung ("the type graph executes in
   Rust; Python is the host and plugin bridge") is retired unclaimed; a
   phase closed without graduating contributes no rung.
+- G4, expression family (2026-09-18, #1860): "the expression family's
+  node reads execute on Rust storage" — a per-family claim (#1836 fork 3)
+  under the binding condition that the write path is still Python and the
+  cross-run differential is evidence of agreement, not proof of ownership.
+  Statement and def families follow; the "the AST executes in Rust" rung
+  below is claimed only when all three graduate.
 - After G4: "the AST executes in Rust."
 - After H: "the type-checking pipeline executes in Rust."
 - After J: "full Rust port", with the Python plugin bridge optional.

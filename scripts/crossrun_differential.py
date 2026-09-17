@@ -12,10 +12,11 @@ LEGS. Each is compared and reported under its own name, so a failure says which
 leg broke rather than only that something differed:
 
   kernel            provenance and gate arming: the arm imported mypy from the
-                    tree under test, ran single-process, every requested
-                    serving mode was in force (read back from the kernel)
-                    rather than silently inert, and no in-run differential
-                    counter reported a mismatch.
+                    tree under test, ran single-process, the mode each gate
+                    should hold (its env value, or the option-default serving
+                    mode #1860 when the env gate is unset) was in force, read
+                    back from the kernel rather than silently inert, and no
+                    in-run differential counter reported a mismatch.
   errors            the build's error output, byte-for-byte.
   ast               `mypy.exportjson`'s MypyFile JSON per module, both the
                     in-memory tree (`convert_mypy_file_to_json`, which carries
@@ -569,9 +570,11 @@ def compare_kernel_leg(runs: dict[str, dict[str, Any]], names: tuple[str, str]) 
                     f"declared {state['declared']}: an undeclared channel decided this arm, so the "
                     f"mode in force is not the one the report claims"
                 )
-            if state["requested"] != state["in_force"]:
+            expected = state.get("effective", state["requested"])
+            if expected != state["in_force"]:
                 problems.append(
-                    f"arm {name} requested {gate}={state['requested']} but the mode in force is "
+                    f"arm {name} should hold {gate}={expected} (env {state['requested']}, "
+                    f"option default {state.get('default', 0)}) but the mode in force is "
                     f"{state['in_force']}: the gate is inert, so the leg it belongs to compared "
                     f"nothing"
                 )
@@ -615,7 +618,8 @@ def compare_kernel_leg(runs: dict[str, dict[str, Any]], names: tuple[str, str]) 
         inert += [
             f"{name}/{gate.removeprefix('MYPY_TK_').removesuffix('_FLIP')}"
             for gate, state in sorted(states.items())
-            if state["requested"] != 0 and not state.get("counters", {}).get("consulted")
+            if state.get("effective", state["requested"]) != 0
+            and not state.get("counters", {}).get("consulted")
         ]
     deltas = option_deltas(provenance, names)
     # A requested mode that nothing consulted is not evidence about that channel,
@@ -1337,6 +1341,19 @@ def worker_main(argv: list[str]) -> int:
         state["build_errors"] = len(result.errors)
         flush()
 
+        # Serving gates have two channels: the env var, and the production
+        # default the build wiring serves when the env gate is unset (#1860).
+        # The node default mirrors build.py's wiring, kernel presence included.
+        kernel_present = nodes_mirror._kernel() is not None
+        production_defaults = {
+            "MYPY_TK_NODE_READ_FLIP": (
+                1
+                if kernel_present and options.native_ast_mirror and options.native_ast_mirror_read
+                else 0
+            ),
+            "MYPY_TK_STMT_READ_FLIP": 0,
+            "MYPY_TK_VAR_KEY_FLIP": 0,
+        }
         gates: dict[str, dict[str, Any]] = {}
         for gate, mode, counters in zip(
             FLIP_GATES,
@@ -1348,9 +1365,17 @@ def worker_main(argv: list[str]) -> int:
             ),
             strict=True,
         ):
+            raw_env = os.environ.get(gate)
+            default = production_defaults[gate]
             gates[gate] = {
                 "declared": gate_mode(declared_env.get(gate, "0"), gate, "the arm's tokens"),
-                "requested": gate_mode(os.environ.get(gate, "0"), gate, "the process environment"),
+                "requested": gate_mode(raw_env or "0", gate, "the process environment"),
+                "default": default,
+                "effective": (
+                    gate_mode(raw_env, gate, "the process environment")
+                    if raw_env is not None
+                    else default
+                ),
                 "in_force": mode,
                 "counters": counters,
             }
@@ -1376,7 +1401,7 @@ def worker_main(argv: list[str]) -> int:
         record(
             LEG_KERNEL,
             provenance["tree_ok"]
-            and all(data["requested"] == data["in_force"] for data in gates.values()),
+            and all(data["effective"] == data["in_force"] for data in gates.values()),
             f"tree_ok={provenance['tree_ok']}, kernel={provenance['kernel_file']}, gates="
             + ", ".join(f"{gate}={data['in_force']}" for gate, data in sorted(gates.items())),
         )

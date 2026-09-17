@@ -68,6 +68,14 @@ PR #1862 closed unmerged, **branch preserved for the re-attempt**.
   lost the worktree `cwd` and the recorded command showed no `cd` prefix: the
   run would have executed from the main checkout and silently tested
   unpatched `main` (the #1789 wrong-tree hazard, conftest assertion and all).
+- **Do not pre-queue a corpus behind another corpus.** Two `run 2` waiters
+  were killed with their process group 25-45 s into the pool wait (no output,
+  exit -1; cause outside the pool script - it only polls). Launch a corpus
+  when the status shows free slots, or accept losing the run.
+- **The engagement probe must pin the tree** (strip the editable finder and
+  the cwd entry, then refuse unless `mypy.__file__` is under the tree): the
+  first probe draft resolved mypy from the main checkout through the venv's
+  editable finder and happily reported `mirror=False` for the branch.
 - **A helper script is not `-m`**: `python /private/tmp/.../script.py` puts the
   script's own directory at `sys.path[0]`, so `import mypy` goes through the
   venv's editable finder (the main checkout) while `-m`-spawned build workers
@@ -83,6 +91,10 @@ PR #1862 closed unmerged, **branch preserved for the re-attempt**.
 - **r3-style contamination is detectable in-band**: log load1 at leg end and
   discard pairs where the trend reverses (load rose 9.6 → 11.1 mid-r3); the
   verdict rests on clean pairs only.
+- **`read_flip.modeN` in the audit is `activate`'s record, not the final
+  mode**: with the env unset it always reads `mode0` because the production
+  wiring patches the mode after `activate` ran. The effective mode is
+  `read_mode` / `rust_node_mirror_read_mode()`.
 
 ## RESUME POINT — 2026-09-17, night (wave 11: 4 PRs merged; #1624's caching lever measured dead)
 

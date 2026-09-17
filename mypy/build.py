@@ -1408,18 +1408,24 @@ class BuildManager:
                 read_route=_view_arm >= 2,
                 audit=_os_view.environ.get("MYPY_TYPE_VIEW_AUDIT") == "1",
             )
-        # Phase G1.0a (#1572): activate the expression dual-write node
-        # shadow (capture-only; no consumer reads it). Independent of the
-        # type-kernel gate: it wraps live node classes.
+        # Phase G1 (#1572, #1860): dual-write node shadow, default on and
+        # family-agnostic (serving is decided per channel below). Wraps
+        # live node classes, independent of the type-kernel gate.
         capture_active = False
+        from mypy import nodes_mirror
+
         if self.options.native_ast_mirror:
             import os as _os_ast_mirror
-
-            from mypy import nodes_mirror
 
             capture_active = nodes_mirror.activate(
                 audit=_os_ast_mirror.environ.get("MYPY_TK_AST_MIRROR_AUDIT") == "1"
             )
+        # G4 (#1860): production serves the expression family's shadow
+        # reads; the statement/def serving modes stay env-gated 0. Set on
+        # every manager (off case too): no later run inherits a stale mode.
+        nodes_mirror.set_production_read_flip(
+            capture_active and self.options.native_ast_mirror_read
+        )
         # Phase G1.2 (#1674): the aststrip read flip is a differential gate on
         # the same shadow. Written on every manager, including the off
         # case, so no later run inherits a stale True.

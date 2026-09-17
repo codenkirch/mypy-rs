@@ -422,14 +422,14 @@ class Options:
         # write is pushed into the stored blob by the Rust splice op instead
         # of a full Python re-serialize. Default off until parity.
         self.native_type_instance_write = False
-        # Phase G1.0a (#1572): opt-in dual-write node shadow of the first
-        # AST family (RefExpr bindings + analyzed); capture-only and not in
-        # OPTIONS_AFFECTING_CACHE: no shadow state may enter the cache.
-        self.native_ast_mirror = False
-        # Phase G1.2 (#1674): when the node shadow is on, the aststrip MemberExpr
-        # lvalue read (`is_new_def` + `name`) and its class-namespace delete
-        # are served from shadow storage; not in OPTIONS_AFFECTING_CACHE.
-        self.native_ast_mirror_read = False
+        # Phase G1 (#1860, G4 graduation): dual-write node shadow, default
+        # on, family-agnostic capture; only the expression serving channels
+        # follow `native_ast_mirror_read`. Not in OPTIONS_AFFECTING_CACHE.
+        self.native_ast_mirror = True
+        # Phase G1.2/G1.1 (#1674, #1860): the expression family's serving
+        # reads (aststrip lvalue, walker `RefExpr` scalars) serve from shadow
+        # storage in production. Not in OPTIONS_AFFECTING_CACHE.
+        self.native_ast_mirror_read = True
         # Phase G3.0a (#1581): opt-in dual-write namespace capture shadow
         # for symbol tables (semanal adding funnel via put_names_entry).
         # Capture-only, not in OPTIONS_AFFECTING_CACHE.
