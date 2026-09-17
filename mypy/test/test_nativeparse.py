@@ -9,8 +9,11 @@ from __future__ import annotations
 import contextlib
 import os
 import tempfile
+import types
 import unittest
 from collections.abc import Iterator
+from typing import Any
+from unittest import mock
 
 from librt.internal import ReadBuffer
 
@@ -67,6 +70,79 @@ try:
     has_nativeparse = True
 except Exception:
     has_nativeparse = False
+
+# The skew diagnostics in parse_to_binary_ast need only the module importable
+# (a stale real wheel is importable), not a working extension.
+_nativeparse: Any
+try:
+    import mypy.nativeparse as _nativeparse
+
+    has_nativeparse_module = True
+except Exception:
+    has_nativeparse_module = False
+
+
+@unittest.skipUnless(has_nativeparse_module, "mypy.nativeparse not importable")
+class TestNativeParserExtensionSkew(unittest.TestCase):
+    """The ast_serialize on sys.path may be a stale real wheel or the stub.
+
+    Both are importable, so neither the module import nor the wire-version
+    guard can reject them; parse() fails with a signature-shaped error that
+    must be rewritten into a pointed, actionable message.
+    """
+
+    def _parse(self) -> None:
+        _nativeparse.parse_to_binary_ast("t.py", Options(), "x = 1\n")
+
+    def test_stale_wheel_unexpected_keyword_points_at_remedy(self) -> None:
+        def parse(
+            filename: str,
+            source: str | bytes | None,
+            *,
+            skip_function_bodies: bool = False,
+            python_version: tuple[int, int] | None = None,
+            platform: str | None = None,
+            always_true: list[str] | None = None,
+            always_false: list[str] | None = None,
+            cache_version: int = 0,
+            custom_typing_module: str | None = None,
+        ) -> None:
+            raise AssertionError("a stale parse() must not be entered")
+
+        with mock.patch.object(_nativeparse, "ast_serialize", types.SimpleNamespace(parse=parse)):
+            with self.assertRaises(RuntimeError) as ctx:
+                self._parse()
+        msg = str(ctx.exception)
+        self.assertIn("unexpected keyword argument 'include_docstrings'", msg)
+        self.assertIn("PYTHONPATH", msg)
+        self.assertIn("Native parser build order", msg)
+
+    def test_stub_missing_parse_points_at_remedy(self) -> None:
+        stub = types.ModuleType("ast_serialize")
+        with mock.patch.object(_nativeparse, "ast_serialize", stub):
+            with self.assertRaises(RuntimeError) as ctx:
+                self._parse()
+        msg = str(ctx.exception)
+        self.assertIn("attribute 'parse'", msg)
+        self.assertIn("PYTHONPATH", msg)
+
+    def test_unrelated_type_error_propagates_unchanged(self) -> None:
+        def parse(*args: object, **kwargs: object) -> None:
+            raise TypeError("entirely unrelated failure")
+
+        with mock.patch.object(_nativeparse, "ast_serialize", types.SimpleNamespace(parse=parse)):
+            with self.assertRaises(TypeError) as ctx:
+                self._parse()
+        self.assertEqual(str(ctx.exception), "entirely unrelated failure")
+
+    def test_unrelated_attribute_error_propagates_unchanged(self) -> None:
+        def parse(*args: object, **kwargs: object) -> None:
+            raise AttributeError("'X' object has no attribute 'other'")
+
+        with mock.patch.object(_nativeparse, "ast_serialize", types.SimpleNamespace(parse=parse)):
+            with self.assertRaises(AttributeError) as ctx:
+                self._parse()
+        self.assertEqual(str(ctx.exception), "'X' object has no attribute 'other'")
 
 
 class NativeParserSuite(DataSuite):
@@ -542,10 +618,7 @@ class TestNativeParserOptionParity(unittest.TestCase):
         ]
         self.assertEqual(
             dep_records,
-            [
-                ((("a", None), ("b", None)), False, False),
-                ((("c", None), ("d", None)), True, True),
-            ],
+            [((("a", None), ("b", None)), False, False), ((("c", None), ("d", None)), True, True)],
         )
         fast_lines = [imp.line for imp in fast.imports if isinstance(imp, nodes.Import)]
         self.assertEqual(fast_lines, [1, 3])

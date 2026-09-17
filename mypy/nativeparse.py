@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import os
 import time
-from typing import Final, cast
+from typing import Final, NoReturn, cast
 
 import ast_serialize
 from librt.internal import (
@@ -324,6 +324,19 @@ def read_statements(state: State, data: ReadBuffer, n: int) -> list[Statement]:
     return defs
 
 
+STALE_AST_SERIALIZE_REMEDY = (
+    "build the in-repo ast_serialize extension and prepend its scratch directory to "
+    "PYTHONPATH (see AGENTS.md, 'Native parser build order')"
+)
+
+
+def _raise_stale_extension(cause: Exception) -> NoReturn:
+    raise RuntimeError(
+        f"the ast_serialize on sys.path is not the in-repo extension: {cause}. "
+        + STALE_AST_SERIALIZE_REMEDY
+    ) from cause
+
+
 def parse_to_binary_ast(
     filename: str,
     options: Options,
@@ -337,19 +350,34 @@ def parse_to_binary_ast(
         time.sleep(0.0001)  # type: ignore[unreachable]
         if time.time() - t0 > 10.0:
             raise ImportError("Cannot import ast_serialize")
-    ast_bytes, errors, ignores, import_bytes, ast_data = ast_serialize.parse(
-        filename,
-        source,
-        skip_function_bodies=skip_function_bodies,
-        python_version=options.python_version,
-        platform=options.platform,
-        always_true=options.always_true,
-        always_false=options.always_false,
-        cache_version=AST_WIRE_VERSION,
-        include_docstrings=options.include_docstrings,
-        custom_typing_module=options.custom_typing_module,
+    try:
+        ast_bytes, errors, ignores, import_bytes, ast_data = ast_serialize.parse(
+            filename,
+            source,
+            skip_function_bodies=skip_function_bodies,
+            python_version=options.python_version,
+            platform=options.platform,
+            always_true=options.always_true,
+            always_false=options.always_false,
+            cache_version=AST_WIRE_VERSION,
+            include_docstrings=options.include_docstrings,
+            custom_typing_module=options.custom_typing_module,
+        )
+    except TypeError as err:
+        # A stale real wheel rejects include_docstrings before the wire guard
+        # can run; any other TypeError is a genuine bug and must propagate.
+        if "include_docstrings" not in str(err):
+            raise
+        _raise_stale_extension(err)
+    except AttributeError as err:
+        # Stub shape: the package imports but carries no parse() at all.
+        if "attribute 'parse'" not in str(err):
+            raise
+        _raise_stale_extension(err)
+    assert ast_data["ast_wire_version"] == AST_WIRE_VERSION, (
+        f"ast_serialize wire version {ast_data['ast_wire_version']} != {AST_WIRE_VERSION}. "
+        + STALE_AST_SERIALIZE_REMEDY
     )
-    assert ast_data["ast_wire_version"] == AST_WIRE_VERSION, ast_data["ast_wire_version"]
     return (
         ast_bytes,
         errors,

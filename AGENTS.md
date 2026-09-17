@@ -246,8 +246,13 @@ Do **not** use `maturin develop` for these crates: `crates/ast_serialize` has no
 `mypy-0.1.0` that shadows the real mypy. A second hazard: `pyproject.toml`
 declares the PyPI `ast-serialize` stub (type stubs only, no `parse`
 implementation), so without the Rust `.so` on `PYTHONPATH`, `import
-ast_serialize` resolves to the stub and fails with `no attribute 'parse'`. Build
-to a scratch dir and put it on `PYTHONPATH`:
+ast_serialize` resolves to the stub and fails with `no attribute 'parse'`. A
+third: a real but stale wheel (e.g. 0.6.0) is importable yet rejects the current
+`include_docstrings` keyword, surfacing as `INTERNAL ERROR` with
+`TypeError: parse() got an unexpected keyword argument 'include_docstrings'`
+instead of the stub message. `parse_to_binary_ast` rewrites both failure shapes
+into a pointed `RuntimeError` naming the remedy. Build to a scratch dir and put
+it on `PYTHONPATH`:
 
 ```bash
 cargo rustc -p mypy-ast-serialize --features extension-module --lib \
