@@ -76,6 +76,25 @@ instead of keying a lookup on the wrong node. The mode lives in Rust storage
 variable wires no hook into `literal_hash`), and the counters report
 `deferred == 0` in mode 2 to prove the key space stayed homogeneous.
 
+G2.4 (#1825) makes the store's cache-loaded coverage a contract rather
+than a by-product of the reader. The fixed-format and JSON cache readers
+materialize a def-family node through plain attribute writes, so the
+patched ``__setattr__`` sees them - but a write at its constructor default
+is skipped, so which slots a cached node's record held followed the
+reader's write order and values. `seed_loaded` now runs once per finished
+node (from `read_symbol`, `read_overload_part` and the JSON
+`SymbolNode.deserialize`) and records every tracked slot the live object
+still has, in one kernel crossing. A field record is attributed on two
+axes: the capture origin (`meta_written.parse` /
+`meta_written.cache_fixed` / `meta_written.cache_json`, set by
+`cache_read_origin` around the readers) and the mechanism
+(`meta_written.*` for the capture funnel, `meta_seeded.*` for the seed).
+Absence still means "not recorded": a slot the live object lacks is skipped
+and counted (`meta_seed_loaded_missing`), and a class the store tracks no
+slot for is counted as a refusal (`meta_seed_rejected_untracked`) rather
+than passing silently, so "the seed declined" and "the seed never ran" are
+never the same reading.
+
 Blind channels, audited against #1787 §1(b):
 - `replace_object_state` (`mypy/util.py`): its `setattr` leg re-registers
   the surviving identity through the same hook, pinned by
@@ -240,11 +259,31 @@ _STMT_READ_FLIP_ENV: Final = "MYPY_TK_STMT_READ_FLIP"
 # wiring a PyO3 crossing into every `literal_hash`.
 _VAR_KEY_FLIP_ENV: Final = "MYPY_TK_VAR_KEY_FLIP"
 
+# G2.4 (#1825): capture origins. A field record is attributed to the path
+# that materialized the object; the marker is module state, not a per-call
+# argument, because the reader's own writes are captures too.
+ORIGIN_PARSE: Final = "parse"
+ORIGIN_CACHE_FIXED: Final = "cache_fixed"
+ORIGIN_CACHE_JSON: Final = "cache_json"
+_capture_origin: str = ORIGIN_PARSE
+
 
 def _count(key: str, n: int = 1) -> None:
     if not _audit_mode:
         return
     _audit[key] = _audit.get(key, 0) + n
+
+
+def _count_origin(prefix: str, n: int = 1) -> None:
+    """Count one capture under the origin now in force (#1825).
+
+    The key is built only under audit, so the off-audit path pays one call
+    and no string allocation: these sites are on mypy's write and cache
+    paths, where an f-string per record would be a real cost.
+    """
+    if not _audit_mode:
+        return
+    _count(f"{prefix}.{_capture_origin}", n)
 
 
 def _kernel() -> Any | None:
@@ -1052,12 +1091,103 @@ def _capture_meta(node: Any, field: str) -> None:
         newly_adopted = id(node) not in _META_HANDLES
         _META_HANDLES[id(node)] = handle
         _count("meta_capture")
+        _count_origin("meta_written")
         if newly_adopted:
             _seed_meta_ctor_fields(node)
     except Exception:
         _count("meta_capture_fail")
     finally:
         _in_capture = False
+
+
+def cache_read_origin(origin: str) -> str | None:
+    """Mark the capture origin while a cache reader materializes nodes.
+
+    Returns the origin to hand back to `restore_origin`, or None when the
+    store is inactive: an off-gate reader pays one call and changes no
+    state. The pair is deliberately not a context manager, because the
+    readers are on mypy's hot cache path and this must cost one call.
+    """
+    global _capture_origin
+    if not _active:
+        return None
+    previous = _capture_origin
+    _capture_origin = origin
+    return previous
+
+
+def restore_origin(previous: str | None) -> None:
+    """Restore the origin `cache_read_origin` returned (None: no-op)."""
+    global _capture_origin
+    if previous is not None:
+        _capture_origin = previous
+
+
+def seed_loaded(node: Any) -> int:
+    """Seed one finished cache-loaded node's shadow record (#1825).
+
+    `mypy.nodes.read_symbol`, `read_overload_part` and the JSON
+    `SymbolNode.deserialize` materialize a def-family node through plain
+    attribute writes. The patched `__setattr__` sees every one of them, but
+    a write at its constructor default is skipped, so which slots a cached
+    node's record held depended on the reader's write order and on the
+    values it wrote. This hands the finished node to the kernel once, which
+    records every tracked slot the live object still has.
+
+    Returns the number of field records the seed took (0 when the gate is
+    off, the class is untracked, or the call failed). Absence keeps meaning
+    "not recorded": a slot the live object does not have is skipped and
+    counted, never fabricated, and a class with no tracked slot is counted
+    as a refusal rather than passing silently. Never raises into the
+    reader's deserialization path.
+    """
+    if not _active:
+        return 0
+    tracked = _meta_tracked(type(node))
+    if not tracked:
+        # The store tracks nothing for this class, so the seed declined.
+        # Counting the decline is what separates it from "never ran": the
+        # two look identical in every other counter (#1810's rule).
+        _count("meta_seed_rejected_untracked")
+        return 0
+    node_fields = _meta_node_fields(type(node))
+    records: list[tuple[str, str, str | None, int | None, list[str] | None]] = []
+    missing = 0
+    for field in tracked:
+        try:
+            value = getattr(node, field)
+        except AttributeError:
+            missing += 1
+            continue
+        kind, text, num, items = _meta_encode(value, node_field=field in node_fields)
+        records.append((field, kind, text, num, items))
+    if not records:
+        # Every tracked slot is unreadable on the live object: a refusal
+        # for the same reason as an untracked class, split from it so the
+        # two shapes stay distinguishable.
+        _count("meta_seed_rejected_unreadable")
+        return 0
+    try:
+        handle, preexisting, minted, replaced = _kernel_mod.rust_node_mirror_seed_loaded(
+            node, records
+        )
+    except Exception:
+        # Same convention as the capture failures: account, never raise
+        # into the reader's deserialization path.
+        _count("meta_seed_failed")
+        return 0
+    # Register the handle like any other adoption: `_meta_setattr` keys its
+    # skip arms on this map, so a seeded node missing from it would drop a
+    # later default write and keep the pre-load value the live object lost.
+    _META_HANDLES[id(node)] = int(handle)
+    taken = int(minted) + int(replaced)
+    _count("meta_seed_loaded")
+    _count("meta_seed_loaded_preexisting", 1 if preexisting else 0)
+    _count("meta_seed_loaded_minted", int(minted))
+    _count("meta_seed_loaded_replaced", int(replaced))
+    _count("meta_seed_loaded_missing", missing)
+    _count_origin("meta_seeded", taken)
+    return taken
 
 
 def _meta_setattr(self: Any, name: str, value: Any) -> None:
@@ -1226,7 +1356,12 @@ def reset(*, clear_counts: bool = False) -> None:
     ``clear_counts`` zeroes them. Clearing them per build would make a
     whole-run reading come from the last build alone, which reads as "the
     channel never engaged" whenever the last build is a small one.
+
+    It also restores the capture origin to `parse`: the readers restore it
+    themselves in a `finally`, and the boundary makes a marker that somehow
+    outlived its reader incapable of mis-attributing a later build.
     """
+    global _capture_origin
     if _kernel_mod is not None:
         _kernel_mod.rust_node_mirror_reset()
         if clear_counts:
@@ -1234,6 +1369,10 @@ def reset(*, clear_counts: bool = False) -> None:
             _kernel_mod.rust_node_mirror_stmt_read_reset()
             _kernel_mod.rust_node_mirror_var_key_reset()
     _NODE_HANDLES.clear()
+    # G2.4 (#1825): the per-build boundary restores the capture origin, so a
+    # marker that outlived its reader cannot silently mis-attribute a later
+    # build's records to a cache path.
+    _capture_origin = ORIGIN_PARSE
     # G2.0 (#1577): drop the statement/def metadata store too.
     _reset_meta()
     _count("reset")

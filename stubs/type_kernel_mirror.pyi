@@ -128,6 +128,14 @@ def rust_node_mirror_meta_drop(handle: int) -> bool: ...
 def rust_node_mirror_meta_reset() -> int: ...
 def rust_node_mirror_meta_entry_count() -> int: ...
 
+# Phase G2.4 (#1825): the load-time seed of a cache-loaded def-family node.
+# `fields` are `(field, kind, text, num, items)` records as
+# `capture_meta` takes one of; it answers (handle, preexisting, minted, replaced).
+def rust_node_mirror_seed_loaded(
+    obj: Any,
+    fields: list[tuple[str, str, str | None, int | None, list[str] | None]],
+) -> tuple[int, bool, int, int]: ...
+
 # Phase G2.1 (#1787 PR B): statement-family serving read flip.
 # `serve_stmt_flag` answers the record's Bool or None when the read must
 # stay live; `verify_stmt_flag` answers whether the served read matched.
@@ -223,6 +231,7 @@ __all__ = [
     "rust_node_mirror_meta_drop",
     "rust_node_mirror_meta_reset",
     "rust_node_mirror_meta_entry_count",
+    "rust_node_mirror_seed_loaded",
     "rust_node_mirror_set_stmt_read_mode",
     "rust_node_mirror_stmt_read_mode",
     "rust_node_mirror_stmt_read_counters",

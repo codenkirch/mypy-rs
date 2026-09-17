@@ -369,11 +369,18 @@ class SymbolNode(Node):
 
     @classmethod
     def deserialize(cls, data: JsonDict) -> SymbolNode:
-        classname = data[".class"]
-        method = deserialize_map.get(classname)
-        if method is not None:
-            return method(data)
-        raise NotImplementedError(f"unexpected .class {classname}")
+        # The JSON cache reader's mirror of `read_symbol` (#1825): every
+        # symbol node the JSON cache materializes passes through here, so the
+        # read is attributed to this reader and the node is seeded explicitly.
+        from mypy import nodes_mirror
+
+        previous = nodes_mirror.cache_read_origin(nodes_mirror.ORIGIN_CACHE_JSON)
+        try:
+            node = _deserialize_symbol(data)
+            nodes_mirror.seed_loaded(node)
+            return node
+        finally:
+            nodes_mirror.restore_origin(previous)
 
     def write(self, data: WriteBuffer) -> None:
         raise NotImplementedError(f"Cannot serialize {self.__class__.__name__} instance")
@@ -1458,8 +1465,16 @@ class Decorator(SymbolNode, Statement):
 
     @classmethod
     def deserialize(cls, data: JsonDict) -> Decorator:
+        # Same two direct constructions as `read`, on the JSON cache path
+        # (#1825). The origin marker is already set by `SymbolNode.deserialize`.
+        from mypy import nodes_mirror
+
         assert data[".class"] == "Decorator"
-        dec = Decorator(FuncDef.deserialize(data["func"]), [], Var.deserialize(data["var"]))
+        func = FuncDef.deserialize(data["func"])
+        nodes_mirror.seed_loaded(func)
+        var = Var.deserialize(data["var"])
+        nodes_mirror.seed_loaded(var)
+        dec = Decorator(func, [], var)
         dec.is_overload = data["is_overload"]
         return dec
 
@@ -1472,10 +1487,17 @@ class Decorator(SymbolNode, Statement):
 
     @classmethod
     def read(cls, data: ReadBuffer) -> Decorator:
+        # `Decorator.read` constructs its `func` and `var` directly rather
+        # than through `read_symbol`/`read_overload_part`, so both are seeded
+        # here to keep the def-family cache contract whole (#1825).
+        from mypy import nodes_mirror
+
         assert read_tag(data) == FUNC_DEF
         func = FuncDef.read(data)
+        nodes_mirror.seed_loaded(func)
         assert read_tag(data) == VAR
         var = Var.read(data)
+        nodes_mirror.seed_loaded(var)
         dec = Decorator(func, [], var)
         dec.is_overload = read_bool(data)
         assert read_tag(data) == END_TAG
@@ -5535,6 +5557,20 @@ deserialize_map: Final = {
 }
 
 
+def _deserialize_symbol(data: JsonDict) -> SymbolNode:
+    """The JSON cache reader's dispatch, kept separable from the seed (#1825).
+
+    `SymbolNode.deserialize` wraps this with the capture-origin marker and
+    the load-time seed, the way `read_symbol` wraps `_read_symbol` on the
+    fixed-format path.
+    """
+    classname = data[".class"]
+    method = deserialize_map.get(classname)
+    if method is not None:
+        return method(data)
+    raise NotImplementedError(f"unexpected .class {classname}")
+
+
 def check_arg_kinds(
     arg_kinds: list[ArgKind], nodes: list[T], fail: Callable[[str, T], None]
 ) -> None:
@@ -5758,6 +5794,21 @@ TSTRING_EXPR: Final[Tag] = 229
 
 
 def read_symbol(data: ReadBuffer, tag: Tag) -> SymbolNode:
+    # A def-family node the fixed-format reader materialized: its writes reach
+    # the node shadow, but which become records depends on their value, so the
+    # read is attributed to this reader and the node seeded explicitly (#1825).
+    from mypy import nodes_mirror
+
+    previous = nodes_mirror.cache_read_origin(nodes_mirror.ORIGIN_CACHE_FIXED)
+    try:
+        node = _read_symbol(data, tag)
+        nodes_mirror.seed_loaded(node)
+        return node
+    finally:
+        nodes_mirror.restore_origin(previous)
+
+
+def _read_symbol(data: ReadBuffer, tag: Tag) -> SymbolNode:
     # The branches here are ordered manually by type "popularity".
     if tag == VAR:
         return Var.read(data)
@@ -5779,6 +5830,17 @@ def read_symbol(data: ReadBuffer, tag: Tag) -> SymbolNode:
 
 
 def read_overload_part(data: ReadBuffer, tag: Tag | None = None) -> OverloadPart:
+    # The parts of an `OverloadedFuncDef` bypass `read_symbol`, so this is
+    # the second materialization point the def-family seed covers (#1825).
+    # The origin marker is already set by the caller; this only seeds.
+    from mypy import nodes_mirror
+
+    node = _read_overload_part(data, tag)
+    nodes_mirror.seed_loaded(node)
+    return node
+
+
+def _read_overload_part(data: ReadBuffer, tag: Tag | None = None) -> OverloadPart:
     if tag is None:
         tag = read_tag(data)
     if tag == DECORATOR:

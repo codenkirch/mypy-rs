@@ -515,6 +515,108 @@ pub(crate) fn capture_meta(obj: &PyAny, field: &str, value: MetaValue) -> PyResu
     Ok(handle)
 }
 
+/// One encoded field record as the load-time seed takes it:
+/// `(field, kind, text, num, items)`, the same five values
+/// `rust_node_mirror_capture_meta` takes one of.
+pub(crate) type MetaFieldRecord = (
+    String,
+    String,
+    Option<String>,
+    Option<i64>,
+    Option<Vec<String>>,
+);
+
+/// G2.4 (#1825): record every tracked slot of one finished cache-loaded
+/// object, in a single crossing.
+///
+/// The fixed-format and JSON cache readers materialize a def-family node
+/// through plain attribute writes. Those writes do reach the patch, but
+/// which of them become records depends on the written value: a slot the
+/// reader writes at its constructor default is skipped, so a cached node's
+/// coverage described the reader's write order rather than a contract.
+/// The seed runs once per finished node and takes the whole field list the
+/// caller derived from the live object, so the record no longer depends on
+/// what the reader happened to write.
+///
+/// Returns `(handle, preexisting, minted, replaced)`. The handle feeds the
+/// same caller-side bookkeeping `capture_meta`'s return value feeds, so a
+/// seeded node is a known adopted node from the moment the seed returns.
+/// `preexisting` is whether the node already had an entry when the seed
+/// ran, which is the incidental side of the coverage question: true means
+/// a patched write adopted this node before the seed could, so part of its
+/// record came from the reader. `minted` counts the field records the seed
+/// is the first writer of and `replaced` the ones a write had already
+/// recorded. One crossing per node, not one per field: a def-family class
+/// tracks ~30 slots.
+#[pyfunction]
+pub(crate) fn rust_node_mirror_seed_loaded(
+    obj: &PyAny,
+    fields: Vec<MetaFieldRecord>,
+) -> PyResult<(u64, bool, usize, usize)> {
+    // No field list means there is nothing to take: refuse before minting
+    // a handle or an empty entry, so a caller that derives its field list
+    // from an empty tracked set leaves the store untouched.
+    if fields.is_empty() {
+        return Ok((0, false, 0, 0));
+    }
+    // Decode before taking the store borrow: a bad kind must fail without
+    // a partially seeded entry.
+    let mut encoded: Vec<(&'static str, MetaValue)> = Vec::with_capacity(fields.len());
+    for (field, kind, text, num, items) in fields {
+        let value = meta_value_for(&kind, text, num, items)?;
+        encoded.push((intern_meta_field(&field), value));
+    }
+    let handle = handle_or_error(obj)?;
+    let (preexisting, minted, replaced) = with_meta_store(|store| {
+        let preexisting = store.by_handle.contains_key(&handle);
+        let entry = store.by_handle.entry(handle).or_default();
+        let mut minted = 0usize;
+        let mut replaced = 0usize;
+        for (field, value) in encoded {
+            match entry.fields.iter_mut().find(|(name, _)| *name == field) {
+                Some(existing) => {
+                    existing.1 = value;
+                    replaced += 1;
+                }
+                None => {
+                    entry.fields.push((field, value));
+                    minted += 1;
+                }
+            }
+            entry.captures += 1;
+        }
+        store.pins.insert(handle, Py::from(obj));
+        (preexisting, minted, replaced)
+    });
+    Ok((handle, preexisting, minted, replaced))
+}
+
+/// Decode one encoded field record into a store value. Shared by the
+/// single-field capture and the load-time seed, so the two cannot drift.
+fn meta_value_for(
+    kind: &str,
+    text: Option<String>,
+    num: Option<i64>,
+    items: Option<Vec<String>>,
+) -> PyResult<MetaValue> {
+    Ok(match kind {
+        "none" => MetaValue::NoneVal,
+        "bool" => MetaValue::Bool(num.unwrap_or(0) != 0),
+        "int" => MetaValue::Int(num.unwrap_or(0)),
+        "str" => MetaValue::Text(text.unwrap_or_default()),
+        "obj" => MetaValue::Obj {
+            marker: text.unwrap_or_default(),
+            handle: num.and_then(|n| u64::try_from(n).ok()),
+        },
+        "list" => MetaValue::List(items.unwrap_or_default()),
+        other => {
+            return Err(PyValueError::new_err(format!(
+                "node_mirror: unknown meta kind {other:?}"
+            )))
+        }
+    })
+}
+
 /// Capture a type-valued field (`method_type`, `as_type`,
 /// `type_guard`, `type_is`) as the current value's class name.
 #[pyfunction]
@@ -1082,22 +1184,7 @@ pub(crate) fn rust_node_mirror_capture_meta(
     num: Option<i64>,
     items: Option<Vec<String>>,
 ) -> PyResult<u64> {
-    let value = match kind {
-        "none" => MetaValue::NoneVal,
-        "bool" => MetaValue::Bool(num.unwrap_or(0) != 0),
-        "int" => MetaValue::Int(num.unwrap_or(0)),
-        "str" => MetaValue::Text(text.unwrap_or_default()),
-        "obj" => MetaValue::Obj {
-            marker: text.unwrap_or_default(),
-            handle: num.and_then(|n| u64::try_from(n).ok()),
-        },
-        "list" => MetaValue::List(items.unwrap_or_default()),
-        other => {
-            return Err(PyValueError::new_err(format!(
-                "node_mirror: unknown meta kind {other:?}"
-            )))
-        }
-    };
+    let value = meta_value_for(kind, text, num, items)?;
     capture_meta(obj, field, value)
 }
 
@@ -1740,6 +1827,141 @@ mod g2_meta_tests {
         });
     }
 
+    /// One encoded field record as the Python seed sends it.
+    fn record(field: &str, kind: &str, text: Option<&str>, num: Option<i64>) -> MetaFieldRecord {
+        (
+            field.to_string(),
+            kind.to_string(),
+            text.map(str::to_string),
+            num,
+            None,
+        )
+    }
+
+    fn field_order(handle: u64) -> Vec<&'static str> {
+        with_meta_store(|s| {
+            s.by_handle[&handle]
+                .fields
+                .iter()
+                .map(|(name, _)| *name)
+                .collect()
+        })
+    }
+
+    #[test]
+    fn test_seed_loaded_takes_the_whole_field_list_in_one_entry() {
+        with_py(|py| {
+            reset_meta();
+            let obj = fresh_object(py);
+            let h = handle_or_error(obj).unwrap();
+            let fields = vec![
+                record("_name", "str", Some("x"), None),
+                record("is_final", "bool", None, Some(1)),
+                record("final_value", "none", None, None),
+            ];
+            assert_eq!(
+                rust_node_mirror_seed_loaded(obj, fields).unwrap(),
+                (h, false, 3, 0),
+                "a fresh node mints every record and had no entry"
+            );
+            assert_eq!(meta_entry_count(), 1, "one node, one entry");
+            assert_eq!(field_value(h, "_name"), Some(MetaValue::Text("x".into())));
+            assert_eq!(field_value(h, "is_final"), Some(MetaValue::Bool(true)));
+            assert_eq!(field_value(h, "final_value"), Some(MetaValue::NoneVal));
+            assert_eq!(with_meta_store(|s| s.by_handle[&h].captures), 3);
+            assert!(
+                with_meta_store(|s| s.pins.contains_key(&h)),
+                "the seed must pin the node its records describe"
+            );
+        });
+    }
+
+    #[test]
+    fn test_seed_loaded_tops_up_an_entry_a_write_already_adopted() {
+        with_py(|py| {
+            reset_meta();
+            let obj = fresh_object(py);
+            let h = capture_meta(obj, "_fullname", MetaValue::Text("mod.f".into())).unwrap();
+            let fields = vec![
+                record("_fullname", "str", Some("mod.f"), None),
+                record("is_final", "bool", None, Some(0)),
+            ];
+            assert_eq!(
+                rust_node_mirror_seed_loaded(obj, fields).unwrap(),
+                (h, true, 1, 1),
+                "the entry the write adopted is reported as preexisting"
+            );
+            assert_eq!(meta_entry_count(), 1);
+            assert_eq!(
+                field_order(h),
+                vec!["_fullname", "is_final"],
+                "a topped-up entry appends; it does not rewrite the reader's record"
+            );
+            assert_eq!(field_value(h, "is_final"), Some(MetaValue::Bool(false)));
+        });
+    }
+
+    #[test]
+    fn test_seed_loaded_with_no_field_list_leaves_the_store_untouched() {
+        with_py(|py| {
+            reset_meta();
+            let obj = fresh_object(py);
+            assert_eq!(
+                rust_node_mirror_seed_loaded(obj, vec![]).unwrap(),
+                (0, false, 0, 0)
+            );
+            assert_eq!(
+                meta_entry_count(),
+                0,
+                "an empty field list must not mint an empty entry"
+            );
+            assert!(
+                with_meta_store(|s| s.pins.is_empty()),
+                "and must not pin the node either"
+            );
+        });
+    }
+
+    #[test]
+    fn test_seed_loaded_refuses_an_unknown_kind_without_partial_state() {
+        with_py(|py| {
+            reset_meta();
+            let obj = fresh_object(py);
+            let fields = vec![
+                record("_name", "str", Some("x"), None),
+                record("type", "bogus", None, None),
+            ];
+            assert!(rust_node_mirror_seed_loaded(obj, fields).is_err());
+            assert_eq!(
+                meta_entry_count(),
+                0,
+                "a refused seed must leave no half-populated record"
+            );
+        });
+    }
+
+    #[test]
+    fn test_seed_loaded_keeps_an_obj_records_marker_without_a_handle() {
+        with_py(|py| {
+            reset_meta();
+            let obj = fresh_object(py);
+            let h = handle_or_error(obj).unwrap();
+            let fields = vec![record("type", "obj", Some("InstanceType:mod.C"), None)];
+            assert_eq!(
+                rust_node_mirror_seed_loaded(obj, fields).unwrap(),
+                (h, false, 1, 0)
+            );
+            assert_eq!(
+                field_value(h, "type"),
+                Some(MetaValue::Obj {
+                    marker: "InstanceType:mod.C".into(),
+                    handle: None,
+                }),
+                "a marker-only field stays unservable, so its read defers"
+            );
+        });
+    }
+
     #[test]
     fn test_meta_reset_does_not_reset_identity() {
         with_py(|py| {
@@ -2323,6 +2545,10 @@ pub(crate) fn register_registry(m: &PyModule) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(rust_node_mirror_meta_entry_count, m)?)?;
 
     m.add_function(wrap_pyfunction!(rust_node_mirror_meta_field_handle, m)?)?;
+
+    // Phase G2.4 (#1825): the load-time seed of a cache-loaded def-family
+    // node. One crossing per finished node instead of one per tracked slot.
+    m.add_function(wrap_pyfunction!(rust_node_mirror_seed_loaded, m)?)?;
 
     // Phase G2.1 (#1787 PR B): statement-family serving read flip for
     // `Block.is_unreachable`. Mode 0 by default; mode 2 adds the
