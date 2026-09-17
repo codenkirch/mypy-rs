@@ -583,9 +583,9 @@ _LINE_ANCHOR = re.compile(r"\.(?:py|rs):\d+")
 
 
 # The G2/G3 home shape `` `nodes_mirror.py:NNN` via `_G2_TRACKED[Cls]` ``,
-# matched after _LINE_ANCHOR so the file token has no line number left. The
-# negated class excludes newlines, so a match cannot span unrelated prose.
-_VIA_ANCHOR = re.compile(r"`[^`\n]*`\s+via\s+`[^`\n]*`")
+# matched after _LINE_ANCHOR so the file token has no line number left. Both
+# separators are horizontal-only, so a match cannot span unrelated prose.
+_VIA_ANCHOR = re.compile(r"`[^`\n]*`[ \t]+via[ \t]+`[^`\n]*`")
 
 
 def _normalise(text: str) -> str:
