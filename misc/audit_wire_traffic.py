@@ -14,6 +14,14 @@ the main checkout):
 The ranking method and the cost-proxy constants are documented in
 `docs/plans/2026-09-14-perf-wire-traffic-audit.md`.
 
+`-n0` above is load-bearing, not decoration (#1820). This proxy counts
+seam calls in *this* process, and `mypy_self_check.ini` sets
+`num_workers = 4`, so a run without it fans out and the parent observes
+0 calls for every seam while still printing a full report. The script
+now refuses to start when the effective worker count is not 0, and
+exits non-zero when it counted no seam call at all, rather than letting
+a hollow zero pass as evidence.
+
 Throwaway-style instrumentation, kept in-tree so the ranking is
 reproducible. Exact, load-insensitive counters: every serializer
 invocation is registered in a pending map keyed by the
@@ -49,10 +57,11 @@ if _AUDIT_ROOT:
 
 
 import collections
+import configparser
 import os
 import sys
 import types
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from typing import Any
 
 # rust_* classifier seams whose None is a decided negative, not a deferral.
@@ -458,9 +467,152 @@ def report() -> None:
         print(f"  plugin-state probe failed: {exc!r}", file=out)
 
 
+# --- fail-loud guards (#1820) ---------------------------------------------
+# An in-process proxy cannot observe a fanned-out run: that is a hollow zero,
+# so refuse it the #1789/#1799 way (exit non-zero, name the setting).
+DEFAULT_CONFIG_FILE = "mypy_self_check.ini"
+FANOUT_REFUSAL = (
+    "audit_wire_traffic: REFUSING TO RUN (#1820).\n"
+    "  the audited check would fan out to worker processes, and this audit counts\n"
+    "  seam calls with an in-process proxy: every seam would report 0 calls.\n"
+    "  effective num_workers = {value}\n"
+    "  setting: {source}\n"
+    "  remedy: run single-process. Pass -n0 (the pinned invocation in the module\n"
+    "  docstring does exactly that), or set num_workers = 0 in the config.\n"
+)
+HOLLOW_ZERO_REFUSAL = (
+    "audit_wire_traffic: HOLLOW ZERO (#1820).\n"
+    "  the proxy recorded {calls} calls across {seams} registered seam(s), so the\n"
+    "  report above is NOT evidence of a dark kernel. Either the run fanned out to\n"
+    "  workers (num_workers > 0), or it registered no rust_* seam at all (a stub or\n"
+    "  missing extension), or every native gate was dark, or the run aborted before\n"
+    "  checking any code.\n"
+    "  remedy: re-run single-process with -n0 and the extension .so dirs on\n"
+    "  PYTHONPATH, and read the mypy status in the report above.\n"
+)
+
+
+def audit_argv(extra: str | None) -> list[str]:
+    """The argv handed to `mypy.main.main`. The guards never rewrite it."""
+    if extra:
+        return ["mypy", "--config-file", DEFAULT_CONFIG_FILE] + extra.split()
+    return [
+        "mypy",
+        "--config-file",
+        DEFAULT_CONFIG_FILE,
+        "-n0",
+        "--no-incremental",
+        "-p",
+        "mypy",
+        "-p",
+        "mypyc",
+    ]
+
+
+def _int_or_none(raw: str) -> int | None:
+    try:
+        return int(raw)
+    except ValueError:
+        return None
+
+
+def _config_path(argv: list[str]) -> str:
+    """The config file mypy will read: last `--config-file`, else the default."""
+    path = DEFAULT_CONFIG_FILE
+    i = 0
+    while i < len(argv):
+        tok = argv[i]
+        if tok == "--config-file" and i + 1 < len(argv):
+            path = argv[i + 1]
+            i += 1
+        elif tok.startswith("--config-file="):
+            path = tok.split("=", 1)[1]
+        i += 1
+    return path
+
+
+def _cli_worker_spelling(argv: list[str]) -> tuple[str, str] | None:
+    """The last `-n`/`--num-workers` in argv as (spelling, raw value), else None.
+
+    Last occurrence wins, matching argparse's store action. Covers `-n<k>`,
+    `-n <k>`, `--num-workers <k>` and `--num-workers=<k>`. A `-n<k>` token
+    whose remainder is not an integer is left to mypy's own parser.
+    """
+    found: tuple[str, str] | None = None
+    i = 0
+    while i < len(argv):
+        tok = argv[i]
+        if tok in ("-n", "--num-workers"):
+            if i + 1 < len(argv):
+                found = (f"{tok} {argv[i + 1]}", argv[i + 1])
+            i += 2
+            continue
+        if tok.startswith("--num-workers="):
+            found = (tok, tok.split("=", 1)[1])
+        elif len(tok) > 2 and tok.startswith("-n") and _int_or_none(tok[2:]) is not None:
+            found = (tok, tok[2:])
+        i += 1
+    return found
+
+
+def _config_num_workers(path: str) -> str | None:
+    """`num_workers` from the config file's `[mypy]` section, else None.
+
+    None also covers an absent file, which mypy itself rejects loudly
+    (`Cannot find config file`); nothing is read here that mypy will not
+    read as well, so the guard cannot disagree with the run it gates.
+    """
+    parser = configparser.ConfigParser(interpolation=None)
+    if not parser.read(path):
+        return None
+    return parser.get("mypy", "num_workers", fallback=None)
+
+
+def _fanout_decision(raw: str, source: str) -> str | None:
+    """Refuse unless `raw` resolves to num_workers == 0."""
+    value = _int_or_none(raw.strip())
+    if value == 0:
+        return None
+    shown = str(value) if value is not None else f"{raw!r} (not an integer)"
+    return FANOUT_REFUSAL.format(value=shown, source=source)
+
+
+def fanout_reason(argv: list[str], environ: Mapping[str, str]) -> str | None:
+    """The refusal message when the audited run would fan out, else None.
+
+    Precedence mirrors mypy's `process_options`: an explicit `-n` beats
+    MYPY_NUM_WORKERS, which beats the config file. Checked before any
+    work, so a fan-out is never "measured" first.
+    """
+    spelling = _cli_worker_spelling(argv)
+    if spelling is not None:
+        return _fanout_decision(spelling[1], f"MYPY_AUDIT_ARGS {spelling[0]!r}")
+    env_raw = environ.get("MYPY_NUM_WORKERS", "").strip()
+    if env_raw:
+        return _fanout_decision(env_raw, "MYPY_NUM_WORKERS")
+    config_path = _config_path(argv)
+    config_raw = _config_num_workers(config_path)
+    if config_raw is not None and config_raw.strip():
+        return _fanout_decision(config_raw, f"{config_path} [mypy] num_workers")
+    return None
+
+
+def hollow_zero_reason(calls: int, seams: int) -> str | None:
+    """The refusal message when the proxy observed nothing, else None."""
+    if calls > 0:
+        return None
+    return HOLLOW_ZERO_REFUSAL.format(calls=calls, seams=seams)
+
+
 def main() -> int:
     import time as _time
 
+    argv = audit_argv(os.environ.get("MYPY_AUDIT_ARGS"))
+    refusal = fanout_reason(argv, os.environ)
+    if refusal is not None:
+        # Before any work: a fanned-out run must not produce a report at all.
+        print(refusal, file=sys.stderr)
+        return 1
     _t0 = _time.perf_counter()
     n_seams = patch_kernel()
     import mypy.main
@@ -480,21 +632,7 @@ def main() -> int:
         f"semanal/semanal-visitor gates {gate_state}",
         file=sys.stderr,
     )
-    extra = os.environ.get("MYPY_AUDIT_ARGS")
-    if extra:
-        sys.argv = ["mypy", "--config-file", "mypy_self_check.ini"] + extra.split()
-    else:
-        sys.argv = [
-            "mypy",
-            "--config-file",
-            "mypy_self_check.ini",
-            "-n0",
-            "--no-incremental",
-            "-p",
-            "mypy",
-            "-p",
-            "mypyc",
-        ]
+    sys.argv = argv
     try:
         mypy.main.main(clean_exit=True)
     except SystemExit:
@@ -508,6 +646,14 @@ def main() -> int:
         total_run_s = _time.perf_counter() - _t0
         print(f"\n[audit] total run wall {total_run_s:.1f}s (load-contaminated)", file=sys.stderr)
         report()
+    # The report is printed on every path; the guard only decides whether it
+    # may be read as evidence. `report()` sits in the `finally` above, so the
+    # tally read here is complete even when the audited run raised.
+    total_calls = sum(seam_calls.values())
+    refusal = hollow_zero_reason(total_calls, len(registered_seams))
+    if refusal is not None:
+        print(refusal, file=sys.stderr)
+        return 1
     return 0
 
 
