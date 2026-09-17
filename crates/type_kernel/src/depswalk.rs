@@ -16,6 +16,7 @@
 //! `alias_deps` defaultdict produced by semanal, and `TraverserVisitor`
 //! itself (a subclass surface).
 
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 
 use pyo3::prelude::*;
@@ -230,19 +231,32 @@ impl<'a> RefView<'a> {
         }
     }
 
-    /// `obj.fullname` in an f-string (`fstr_attr` semantics).
-    fn fullname(&self) -> Result<String, DeferError> {
+    /// `obj.kind is None` (`deps.py`'s plain `None` check): a present but
+    /// non-`int` value reads as a present kind and never defers the walk,
+    /// which is what this site did before the channel existed. The other
+    /// `kind()` sites read `int | None` semantics instead.
+    fn kind_is_none(&self) -> Result<bool, DeferError> {
         match &self.served {
-            Some(served) => Ok(served.fullname.clone()),
-            None => fstr_attr(self.obj, "fullname"),
+            Some(served) => Ok(served.kind.is_none()),
+            None => Ok(get_attr_or_defer(self.obj, "kind")?.is_none()),
         }
     }
 
-    /// `obj.fullname` as an optional string (`opt_str_attr` semantics).
-    fn fullname_opt(&self) -> Result<Option<String>, DeferError> {
+    /// `obj.fullname` in an f-string (`fstr_attr` semantics), borrowed from
+    /// the owned record when served instead of cloned per qualifying lvalue.
+    fn fullname(&self) -> Result<Cow<'_, str>, DeferError> {
         match &self.served {
-            Some(served) => Ok(Some(served.fullname.clone())),
-            None => opt_str_attr(self.obj, "fullname"),
+            Some(served) => Ok(Cow::Borrowed(&served.fullname)),
+            None => fstr_attr(self.obj, "fullname").map(Cow::Owned),
+        }
+    }
+
+    /// `obj.fullname` as an optional string (`opt_str_attr` semantics),
+    /// borrowed from the record when served.
+    fn fullname_opt(&self) -> Result<Option<Cow<'_, str>>, DeferError> {
+        match &self.served {
+            Some(served) => Ok(Some(Cow::Borrowed(&served.fullname))),
+            None => opt_str_attr(self.obj, "fullname").map(|s| s.map(Cow::Owned)),
         }
     }
 }
@@ -1220,7 +1234,7 @@ impl<'py> DepsWalker<'py> {
                         }
                     }
                 }
-                if ref_lvalue.kind()?.is_none() {
+                if ref_lvalue.kind_is_none()? {
                     let obj = get_attr_or_defer(lvalue, "expr")?;
                     let raw = match self.type_map.get_item(obj).map_err(|_| DeferError)? {
                         Some(t) => t,
@@ -2184,4 +2198,41 @@ pub(crate) fn register_registry(m: &PyModule) -> PyResult<()> {
 
     m.add_function(wrap_pyfunction!(rust_walk_dependency_target, m)?)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod ref_view_fallback_tests {
+    use super::*;
+
+    fn with_py<T>(f: impl FnOnce(Python<'_>) -> T) -> T {
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(f)
+    }
+
+    /// Mode 0 keeps `RefView` on its live fallback, so these pin the exact
+    /// reads the MemberExpr lvalue site made before the channel (#1781).
+    #[test]
+    fn kind_is_none_keeps_the_plain_none_check() {
+        with_py(|py| {
+            node_mirror::set_read_mode(0).unwrap();
+            // `RefExpr.kind` is `int | None`; a non-`int` value is a
+            // *present* kind for `deps.py`'s `is None` check and must not
+            // defer the whole walk.
+            let obj = py.eval("type('R', (), {'kind': 'x'})()", None, None).unwrap();
+            let view = RefView::of(obj);
+            assert!(matches!(view.kind_is_none(), Ok(false)));
+            // The `int | None` accessor defers on the same value; that
+            // drift is what this site must not inherit.
+            assert!(view.kind().is_err());
+        });
+    }
+
+    #[test]
+    fn kind_is_none_reads_a_none_kind_as_none() {
+        with_py(|py| {
+            node_mirror::set_read_mode(0).unwrap();
+            let obj = py.eval("type('R', (), {'kind': None})()", None, None).unwrap();
+            assert!(matches!(RefView::of(obj).kind_is_none(), Ok(true)));
+        });
+    }
 }

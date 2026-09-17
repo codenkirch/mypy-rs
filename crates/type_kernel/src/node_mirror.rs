@@ -647,9 +647,16 @@ pub(crate) fn read_mode() -> u8 {
     READ_STATE.with(|cell| cell.borrow().mode)
 }
 
-pub(crate) fn set_read_mode(mode: u8) -> u8 {
+/// Set the serving mode. Only 0, 1 and 2 exist; any other value raises so
+/// the raw pyfunction cannot select a mode no read path implements.
+pub(crate) fn set_read_mode(mode: u8) -> PyResult<u8> {
+    if mode > 2 {
+        return Err(PyValueError::new_err(format!(
+            "node read flip mode must be 0, 1 or 2, got {mode}"
+        )));
+    }
     bump(|state| state.mode = mode);
-    read_mode()
+    Ok(read_mode())
 }
 
 /// `(consulted, served, deferred_off, deferred_unrecorded, compared,
@@ -773,21 +780,26 @@ fn live_flag(obj: &PyAny, name: &str) -> Result<bool, ()> {
 }
 
 /// `obj.node.fullname` with `_capture_ref`'s own semantics: `None` when the
-/// target is `None` or its `fullname` is not a `str`.
+/// target is `None`, its `fullname` is not a `str`, or reading it raises
+/// (the capture records `None` for the same states, so both sides agree).
+/// An unreadable `node` slot itself stays an error: the capture would have
+/// failed wholesale there, so no record exists to compare against.
 fn live_node_fullname(obj: &PyAny) -> Result<Option<String>, ()> {
     let target = obj.getattr("node").map_err(|_| ())?;
     if target.is_none() {
         return Ok(None);
     }
-    let fullname = target.getattr("fullname").map_err(|_| ())?;
-    Ok(fullname.extract::<String>().ok())
+    let fullname = target.getattr("fullname").ok();
+    Ok(fullname.and_then(|f| f.extract::<String>().ok()))
 }
 
 /// Mode-2 differential: compare the served snapshot against the live slots
 /// through the conversions the capture hook uses.
 ///
-/// Every call is counted, and an unreadable slot counts as a compare error
-/// *and* a mismatch, so a probe that cannot read cannot report success.
+/// Every call is counted, and an unreadable scalar counts as a compare
+/// error *and* a mismatch, so a probe that cannot read cannot report
+/// success. The one exception is the target `fullname`, which the capture
+/// itself records as `None` when unreadable (`live_node_fullname`).
 pub(crate) fn compare_ref_scalars(obj: &PyAny, served: &RefScalars) -> bool {
     bump(|state| state.compared += 1);
     let checks: [Result<bool, ()>; 5] = [
@@ -807,7 +819,7 @@ pub(crate) fn compare_ref_scalars(obj: &PyAny, served: &RefScalars) -> bool {
 // ---- pyfunctions: mode, counters, and the two read entry points ----
 
 #[pyfunction]
-pub(crate) fn rust_node_mirror_set_read_mode(mode: u8) -> u8 {
+pub(crate) fn rust_node_mirror_set_read_mode(mode: u8) -> PyResult<u8> {
     set_read_mode(mode)
 }
 
@@ -1612,7 +1624,7 @@ mod g1_serving_tests {
     fn start(mode: u8) {
         reset();
         reset_read_counters();
-        set_read_mode(mode);
+        set_read_mode(mode).unwrap();
     }
 
     fn served_counters() -> (u64, u64, u64, u64, u64, u64, u64) {
@@ -1634,7 +1646,7 @@ mod g1_serving_tests {
             )
             .unwrap();
             assert_eq!(serve_ref_scalars(obj), None);
-            let (consulted, served, deferred_off, unrecorded, compared, swapped, errors) =
+            let (consulted, served, deferred_off, unrecorded, compared, mismatched, errors) =
                 served_counters();
             assert_eq!(
                 (
@@ -1643,7 +1655,7 @@ mod g1_serving_tests {
                     deferred_off,
                     unrecorded,
                     compared,
-                    swapped,
+                    mismatched,
                     errors
                 ),
                 (0, 0, 1, 0, 0, 0, 0)
@@ -1674,7 +1686,7 @@ mod g1_serving_tests {
             assert_eq!(served.fullname, "mod.x");
             assert!(served.is_new_def);
             assert!(!served.is_inferred_def);
-            let (consulted, served_n, deferred_off, unrecorded, compared, swapped, errors) =
+            let (consulted, served_n, deferred_off, unrecorded, compared, mismatched, errors) =
                 served_counters();
             assert_eq!(
                 (
@@ -1683,7 +1695,7 @@ mod g1_serving_tests {
                     deferred_off,
                     unrecorded,
                     compared,
-                    swapped,
+                    mismatched,
                     errors
                 ),
                 (1, 1, 0, 0, 0, 0, 0)
@@ -1760,8 +1772,8 @@ mod g1_serving_tests {
             obj.setattr("fullname", "mod.x").unwrap();
             capture_ref(obj, Some(1), None, "mod.x".into(), false, false).unwrap();
             assert_eq!(serve_ref_scalars(obj).is_some(), true);
-            let (_, served, _, _, compared, swapped, errors) = served_counters();
-            assert_eq!((served, compared, swapped, errors), (1, 1, 0, 0));
+            let (_, served, _, _, compared, mismatched, errors) = served_counters();
+            assert_eq!((served, compared, mismatched, errors), (1, 1, 0, 0));
         });
     }
 
@@ -1776,8 +1788,8 @@ mod g1_serving_tests {
             // the compare must say so instead of passing.
             obj.setattr("is_new_def", true).unwrap();
             assert_eq!(verify_ref_scalars(obj), Some(false));
-            let (_, _, _, _, compared, swapped, errors) = served_counters();
-            assert_eq!((compared, swapped, errors), (1, 1, 0));
+            let (_, _, _, _, compared, mismatched, errors) = served_counters();
+            assert_eq!((compared, mismatched, errors), (1, 1, 0));
             // And the serving path answers from the record, still stale.
             assert!(!serve_ref_scalars(obj).unwrap().is_new_def);
         });
@@ -1799,8 +1811,41 @@ mod g1_serving_tests {
                 .unwrap();
             capture_ref(obj, Some(1), None, "".into(), false, false).unwrap();
             assert_eq!(verify_ref_scalars(obj), Some(false));
-            let (_, _, _, _, compared, swapped, errors) = served_counters();
-            assert_eq!((compared, swapped, errors), (1, 1, 1));
+            let (_, _, _, _, compared, mismatched, errors) = served_counters();
+            assert_eq!((compared, mismatched, errors), (1, 1, 1));
+        });
+    }
+
+    #[test]
+    fn test_an_unreadable_target_fullname_matches_the_captured_none() {
+        with_py(|py| {
+            start(2);
+            // `node.fullname` raises: the capture records `None` for that
+            // state, so the compare must read the error as `None` and match
+            // instead of inventing a desync for two agreeing sides (#1780).
+            let obj = py
+                .eval(
+                    "type('R_raise', (), {'kind': None, 'fullname': '', 'is_new_def': False, \
+                     'is_inferred_def': False, 'node': type('T', (), \
+                     {'fullname': property(lambda self: 1/0)})()})()",
+                    None,
+                    None,
+                )
+                .unwrap();
+            capture_ref(obj, None, None, "".into(), false, false).unwrap();
+            assert_eq!(verify_ref_scalars(obj), Some(true));
+            let (_, served, _, _, compared, mismatched, errors) = served_counters();
+            assert_eq!((served, compared, mismatched, errors), (1, 1, 0, 0));
+        });
+    }
+
+    #[test]
+    fn test_set_read_mode_refuses_a_mode_outside_the_range() {
+        with_py(|_py| {
+            assert!(set_read_mode(3).is_err(), "mode 3 does not exist");
+            assert!(set_read_mode(255).is_err(), "u8 headroom must not widen the range");
+            assert_eq!(set_read_mode(0).unwrap(), 0);
+            assert_eq!(set_read_mode(2).unwrap(), 2);
         });
     }
 

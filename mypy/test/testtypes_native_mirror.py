@@ -109,6 +109,10 @@ from mypy.types import (
     has_recursive_types,
 )
 
+# Sentinel for a binding the module never had; `None` is a real value the
+# ImportError branch binds, so the two must stay distinguishable (#1778).
+_ABSENT = object()
+
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeTypeWireSuite(Suite):
@@ -415,7 +419,13 @@ class NativeRemoveDupsSuite(Suite):
         import mypy.types as _types_mod
 
         self._types_mod = _types_mod
-        # Bind the seam names the module-level try would have bound.
+        # Bind the seam names the module-level try would have bound. Save
+        # the prior bindings first (absent stays distinct from the
+        # ImportError branch's `None`) and restore them in tearDown (#1778).
+        self._orig_module_bindings = {
+            name: _types_mod.__dict__.get(name, _ABSENT)
+            for name in ("_VisitorWriteBuffer", "_ReadBuffer", "_rust_remove_dups")
+        }
         _types_mod._VisitorWriteBuffer = WriteBuffer  # type: ignore[attr-defined]
         _types_mod._ReadBuffer = ReadBuffer  # type: ignore[attr-defined]
         _types_mod.__dict__.setdefault("_rust_remove_dups", _type_kernel.rust_remove_dups)
@@ -448,6 +458,11 @@ class NativeRemoveDupsSuite(Suite):
         _set_native_visitor_resolver(None)
         self._types_mod._VISITOR_HAS_TYPE_KERNEL = self._orig_kernel_flag
         self._set_gates(self._orig_visitor_gate, self._orig_types_gate)
+        for name, prior in self._orig_module_bindings.items():
+            if prior is _ABSENT:
+                self._types_mod.__dict__.pop(name, None)
+            else:
+                self._types_mod.__dict__[name] = prior
 
     def _set_gates(self, visitor: bool, types: bool) -> None:
         from mypy.types import _set_native_visitor_active, _set_native_visitor_types_active
@@ -542,6 +557,13 @@ class NativeHasRecursiveTypesFlattenSuite(Suite):
         import mypy.types as _types_mod
 
         self._types_mod = _types_mod
+        # Same process-global hygiene as NativeRemoveDupsSuite (#1778):
+        # save the prior bindings, absent distinct from `None`, and put
+        # them back in tearDown.
+        self._orig_module_bindings = {
+            name: _types_mod.__dict__.get(name, _ABSENT)
+            for name in ("_VisitorWriteBuffer", "_ReadBuffer")
+        }
         _types_mod._VisitorWriteBuffer = WriteBuffer  # type: ignore[attr-defined]
         _types_mod._ReadBuffer = ReadBuffer  # type: ignore[attr-defined]
         self._orig_kernel_flag = _types_mod._VISITOR_HAS_TYPE_KERNEL
@@ -566,6 +588,11 @@ class NativeHasRecursiveTypesFlattenSuite(Suite):
         self._set_gates(self._orig_visitor_gate, self._orig_types_gate)
         _set_native_visitor_resolver(None)
         self._types_mod._VISITOR_HAS_TYPE_KERNEL = self._orig_kernel_flag
+        for name, prior in self._orig_module_bindings.items():
+            if prior is _ABSENT:
+                self._types_mod.__dict__.pop(name, None)
+            else:
+                self._types_mod.__dict__[name] = prior
 
     def _set_gates(self, visitor: bool, types: bool) -> None:
         from mypy.types import _set_native_visitor_active, _set_native_visitor_types_active
@@ -766,6 +793,51 @@ class NativeHasRecursiveTypesFlattenSuite(Suite):
             set_wire_typeinfo_map(None)
         assert [str(x) for x in on] == [str(self.fx.a), str(self.fx.str_type)]
         assert not seen, f"retired flatten seam serialized {len(seen)} time(s)"
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeMirrorBindingHygieneSuite(Suite):
+    """#1778: the suites that inject seam bindings into `mypy.types` must
+    leave the module as they found it, or a leaked injection reads as an
+    unrelated broken test once a reorder puts the writer ahead of a pin
+    (the #1775 failure mode).
+    """
+
+    def test_the_binding_suites_restore_the_types_module_bindings(self) -> None:
+        import mypy.types as _types_mod
+
+        cases = (
+            (NativeRemoveDupsSuite, "test_alias_rows_parity_and_identity",
+             ("_VisitorWriteBuffer", "_ReadBuffer", "_rust_remove_dups")),
+            (NativeHasRecursiveTypesFlattenSuite, "test_hrt_parities",
+             ("_VisitorWriteBuffer", "_ReadBuffer")),
+        )
+        names = ("_VisitorWriteBuffer", "_ReadBuffer", "_rust_remove_dups")
+        prior = {name: _types_mod.__dict__.get(name, _ABSENT) for name in names}
+        try:
+            for suite_cls, test_name, suite_names in cases:
+                # Both pristine shapes: the `None` the module's ImportError
+                # branch binds, and a name the module never bound at all.
+                for pristine in (None, _ABSENT):
+                    for name in suite_names:
+                        if pristine is _ABSENT:
+                            _types_mod.__dict__.pop(name, None)
+                        else:
+                            _types_mod.__dict__[name] = pristine
+                    case = suite_cls(test_name)
+                    case.setUp()
+                    case.tearDown()
+                    for name in suite_names:
+                        after = _types_mod.__dict__.get(name, _ABSENT)
+                        assert after is pristine, (
+                            f"{suite_cls.__name__} leaked {name}: {after!r} != {pristine!r}"
+                        )
+        finally:
+            for name, value in prior.items():
+                if value is _ABSENT:
+                    _types_mod.__dict__.pop(name, None)
+                else:
+                    _types_mod.__dict__[name] = value
 
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")

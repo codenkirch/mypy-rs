@@ -96,6 +96,7 @@ G1.0b write sites (anchors from the #1574 base, all through the patched
 
 from __future__ import annotations
 
+import os
 from typing import Any, Final
 
 from mypy.nodes import (
@@ -175,6 +176,23 @@ def _count(key: str, n: int = 1) -> None:
     _audit[key] = _audit.get(key, 0) + n
 
 
+def _kernel() -> Any | None:
+    """The kernel module, imported and cached on first need.
+
+    Every read-flip entry point resolves the extension through here, so
+    a mode set before `activate` registered the module stays readable
+    afterwards and the three functions can never disagree (#1779).
+    """
+    global _kernel_mod
+    if _kernel_mod is None:
+        try:
+            import type_kernel as _km
+        except ImportError:
+            return None
+        _kernel_mod = _km
+    return _kernel_mod
+
+
 def set_read_flip(mode: int) -> int:
     """Set the node-shadow serving mode and return the mode now in force.
 
@@ -184,19 +202,16 @@ def set_read_flip(mode: int) -> int:
     """
     if mode not in _READ_MODES:
         raise ValueError(f"node read flip mode must be 0, 1 or 2, got {mode!r}")
-    kernel = _kernel_mod
+    kernel = _kernel()
     if kernel is None:
-        try:
-            import type_kernel as kernel
-        except ImportError:
-            _count("read_flip.no_type_kernel")
-            return 0
+        _count("read_flip.no_type_kernel")
+        return 0
     return int(kernel.rust_node_mirror_set_read_mode(mode))
 
 
 def read_flip() -> int:
     """The serving mode now in force (0 when the extension is absent)."""
-    kernel = _kernel_mod
+    kernel = _kernel()
     if kernel is None:
         return 0
     return int(kernel.rust_node_mirror_read_mode())
@@ -210,7 +225,7 @@ def read_counters() -> dict[str, int]:
     and `compared`/`mismatched` the differential. A run whose `compared`
     is 0 proves nothing about the served values.
     """
-    kernel = _kernel_mod
+    kernel = _kernel()
     if kernel is None:
         return {}
     (
@@ -730,23 +745,32 @@ def activate(*, audit: bool = False) -> bool:
 
     Activation is one-shot (un-patching mid-run would desync live
     records), matching the type mirror. A later activate call may still
-    turn counters on.
+    turn counters on. A malformed serving-mode env var raises before any
+    state change, so the failure cannot half-activate and a retry is not
+    swallowed by the one-shot guard.
 
     Returns whether the store is active afterwards, so a caller that
     gates a consumer on the shadow (the G1.2 read flip) can refuse to
     enable it against a missing extension instead of trusting the option.
     """
-    global _active, _audit_mode, _kernel_mod
+    global _active, _audit_mode
     if _active:
         if audit:
             _audit_mode = True
         return True
+    # G1.1: parse and validate the env gate before anything is patched, so
+    # a bad value fails loudly with the module untouched.
+    raw_mode = os.environ.get(_READ_FLIP_ENV, "0")
     try:
-        import type_kernel as _km
-    except ImportError:
+        env_mode = int(raw_mode)
+    except ValueError:
+        raise ValueError(f"{_READ_FLIP_ENV} must be 0, 1 or 2, got {raw_mode!r}") from None
+    if env_mode not in _READ_MODES:
+        raise ValueError(f"{_READ_FLIP_ENV} must be 0, 1 or 2, got {raw_mode!r}")
+    kernel = _kernel()
+    if kernel is None:
         _count("activate_failed.no_type_kernel")
         return False
-    _kernel_mod = _km
     _audit_mode = audit
     # G1.0b adds ComparisonExpr / StrExpr / UnaryExpr; NameExpr and
     # MemberExpr already route through the RefExpr patch.
@@ -765,13 +789,6 @@ def activate(*, audit: bool = False) -> bool:
     # G1.1: the serving mode is set only once capture is live, so the
     # channel can never answer from an empty store. The env var is the
     # measurement gate (see `_READ_FLIP_ENV`).
-    import os as _os_read_flip
-
-    raw_mode = _os_read_flip.environ.get(_READ_FLIP_ENV, "0")
-    try:
-        env_mode = int(raw_mode)
-    except ValueError:
-        raise ValueError(f"{_READ_FLIP_ENV} must be 0, 1 or 2, got {raw_mode!r}") from None
     set_read_flip(env_mode)
     _count(f"read_flip.mode{read_flip()}")
     return True

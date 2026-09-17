@@ -245,12 +245,95 @@ class NodeShadowServingSuite(Suite):
         assert served is not None
         assert served[4] is True, "the captured write must reach the served read"
 
+    def test_an_unreadable_target_fullname_is_not_a_mismatch(self) -> None:
+        """#1780: the capture records `None` when a target `fullname`
+        cannot be read, so the mode-2 differential must read the same
+        error as `None` instead of inventing a desync for agreeing state.
+        """
+
+        class _RaisingTarget(Var):
+            @property
+            def fullname(self) -> str:
+                raise RuntimeError("unreadable fullname")
+
+        ref = self._adopted_ref()
+        ref.node = _RaisingTarget("t")
+        self._m.set_read_flip(2)
+        before = self._m.read_counters()
+        assert self._k.rust_node_mirror_verify_ref(ref) is True
+        delta = self._delta(before)
+        assert delta.get("compared") == 1, delta
+        assert delta.get("mismatched", 0) == 0, delta
+        assert delta.get("compare_errors", 0) == 0, delta
+
     def test_an_out_of_range_mode_is_refused(self) -> None:
         try:
             self._m.set_read_flip(3)
         except ValueError:
             return
         raise AssertionError("mode 3 must be refused, not silently accepted")
+
+    def test_the_raw_seam_refuses_an_out_of_range_mode(self) -> None:
+        # The stubs expose the pyfunction directly, so the range check
+        # cannot live only on the Python wrapper (#1779).
+        try:
+            self._k.rust_node_mirror_set_read_mode(3)
+        except ValueError:
+            return
+        raise AssertionError("the raw seam must refuse mode 3")
+
+    # -- the gate's own state handling (#1779) --
+
+    def test_a_mode_set_before_registration_is_still_readable(self) -> None:
+        """`set_read_flip` before `activate` must not desync `read_flip`.
+
+        The three entry points share one kernel lookup, so a mode the
+        pre-activation call already handed to Rust reads back through
+        `read_flip`/`read_counters` instead of reporting 0/{}.
+        """
+        saved_active = self._m._active
+        saved_kernel = self._m._kernel_mod
+        try:
+            self._m._active = False
+            self._m._kernel_mod = None
+            assert self._m.set_read_flip(1) == 1
+            assert self._m.read_flip() == 1, "the set mode must be readable back"
+            assert self._m.read_counters() != {}, "the counters must see the same store"
+        finally:
+            self._m.set_read_flip(0)
+            self._m._active = saved_active
+            self._m._kernel_mod = saved_kernel
+
+    def test_a_malformed_mode_env_fails_activate_with_no_state_change(self) -> None:
+        """A bad `MYPY_TK_NODE_READ_FLIP` raises before anything is patched.
+
+        Failure with no state change is what keeps the one-shot guard
+        honest: the retry below must activate for real, not report
+        success while no serving mode was ever set.
+        """
+        env_name = self._m._READ_FLIP_ENV
+        saved_active = self._m._active
+        saved_env = os.environ.get(env_name)
+        try:
+            for bad in ("nonsense", "7"):
+                self._m._active = False
+                os.environ[env_name] = bad
+                raised = False
+                try:
+                    self._m.activate()
+                except ValueError:
+                    raised = True
+                assert raised, f"{env_name}={bad!r} must be refused"
+                assert self._m._active is False, "a refused activate must change no state"
+            os.environ.pop(env_name, None)
+            assert self._m.activate() is True, "the retry must not be swallowed"
+            assert self._m.read_flip() == 0
+        finally:
+            self._m._active = saved_active
+            if saved_env is None:
+                os.environ.pop(env_name, None)
+            else:
+                os.environ[env_name] = saved_env
 
     # -- the real consumer, in every mode --
 
