@@ -22,6 +22,10 @@ def rust_symtable_mirror_put(
     no_serialize: bool,
     cross_ref: str | None,
 ) -> tuple[int, int, int, int]: ...
+
+# G3.2b (#1773): load-time seed for namespaces the C-level fixed-format
+# reader populated (no patched `__setitem__` ever runs for them).
+def rust_symtable_mirror_seed(owner: Any) -> int: ...
 def rust_symtable_mirror_delete(owner: Any, name: str) -> bool: ...
 def rust_symtable_mirror_refresh_flags(
     node: Any,
@@ -60,6 +64,7 @@ def rust_symtable_mirror_meta_entry_count() -> int: ...
 
 __all__ = [
     "rust_symtable_mirror_put",
+    "rust_symtable_mirror_seed",
     "rust_symtable_mirror_delete",
     "rust_symtable_mirror_refresh_flags",
     "rust_symtable_mirror_lookup",

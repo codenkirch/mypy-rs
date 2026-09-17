@@ -20,7 +20,9 @@ Design notes (see docs/plans/2026-09-11-g3-symbol-table-brief.md):
   `dict.update/clear`, the Rust `PyDict::del_item` in
   `rust_remove_imported_names_from_symtable`) bypass Python overrides;
   the last one is pinned as a documented known bypass until G3.0b
-  reroutes it.
+  reroutes it. The fixed-format reader compensates for the first:
+  `SymbolTable.read` calls `seed_loaded` on the finished table (#1773),
+  so a cache-loaded namespace reaches the store without a write.
 - Lazy adoption: `SymbolTableNode` constructor writes happen before any
   put, so the node patch skips nodes with no record and the first put
   captures the post-construction flag snapshot. A later flag write
@@ -39,6 +41,10 @@ Design notes (see docs/plans/2026-09-11-g3-symbol-table-brief.md):
   populated namespace takes its ordinals from the live dict (Rust `put`),
   so aststrip survivors and loaded tables serve instead of deferring.
   `sessionfinish` reports the seeded vs write-log provenance split.
+- Load-time seed (#1773): the fixed-format cache reader seeds each
+  finished namespace (`seed_loaded`), so cache-loaded trees serve the
+  read flip like JSON-loaded ones (which the capture sees through
+  `__setitem__`).
 """
 
 from __future__ import annotations
@@ -223,6 +229,31 @@ def put(table: Any, name: str, symbol: Any) -> tuple[int, int, int, int] | None:
         _count("capture_fail.not_symbol")
         return None
     return _capture(table, name, symbol, "routed.put")
+
+
+def seed_loaded(table: Any) -> int:
+    """Seed one namespace the fixed-format reader populated (#1773).
+
+    `SymbolTable.read` builds a cache-loaded namespace through the dict
+    constructor, a C-level path the class patches never see, so no
+    recorded write runs and the G3.2 write-time seed cannot trigger: the
+    namespace stays unadopted and the read flip defers. This hands the
+    finished table to the kernel, which takes the live order exactly like
+    the write-time seed, so a loaded tree serves like a JSON-loaded one.
+    Returns the seeded entry count (0 when inactive, empty or refused).
+    """
+    if not _active:
+        return 0
+    try:
+        count = int(_kernel_mod.rust_symtable_mirror_seed(table))
+    except Exception:
+        # Same convention as the capture failures: account, never raise
+        # into the reader's deserialization path.
+        _count("capture_fail.seed")
+        return 0
+    if count:
+        _count("seed.loaded")
+    return count
 
 
 def _delete(table: Any, name: Any) -> None:

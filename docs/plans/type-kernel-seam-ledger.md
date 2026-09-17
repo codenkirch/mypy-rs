@@ -5113,3 +5113,47 @@ in-contract writer ever appears, the fix is to widen the capture contract
 answers), not to double every served read. Refs: #1785, PR #1783, ocr
 session `52a4e3b2`.
 
+
+#### Load-time seed for the fixed-format reader (#1773, recorded 2026-09-17)
+
+Verified cause: `SymbolTable.read` (`mypy/nodes.py`, the fixed-format cache
+reader reached from `load_tree`) built namespaces through the dict
+constructor, a C-level path the mirror's `__setitem__` patches never see, and
+the #1755 write-time seed needs a recorded write, so every cache-loaded
+namespace stayed unadopted and the G3 read flip deferred it
+(`defer_no_handle`), which #1765 pinned as the expected deferral.
+
+Fix: kernel entry point `rust_symtable_mirror_seed(owner)`
+(`crates/type_kernel/src/symtable_mirror.rs`) takes a finished namespace's
+live order exactly like the write-time seed; when seeding fails it pins the
+owner and marks it inherited, so the flip defers `Inherited` rather than
+answering from a half-populated record or leaving a silent no-handle. Python
+wrapper `symtables_mirror.seed_loaded` (gate-off no-op, counts `seed.loaded`
+and `capture_fail.seed`, never raises into the deserialization path), called
+from `SymbolTable.read` for `size > 0`, which covers module and nested class
+namespaces alike. The #1765 pin is inverted to
+`test_cached_fixed_format_trees_serve_the_read_flip`, asserting the handle,
+the entry count and a zero-defer sweep for every loaded namespace.
+
+Probe (two-run fixed-format corpus, flip verify on): pkg.base handle 27524,
+entries 32/32; pkg.use handle 27557, entries 13/13; flip delta 7/7 tables
+mirrored, 77 entries served, every defer reason 0, astdiff 2/2 verify.ok.
+Provenance across the cache-loading build: seeded_owners 521, seeded_entries
+6535, put_entries 12, seed_rejects 0 (the seed mints the whole cache-loaded
+universe including typeshed deps); the JSON reader answers through the
+capture instead (put_entries 6547, zero seeds), same serving 7/7/77.
+
+Gate evidence, both states: `testcheck` 8144 passed / 69 skipped / 7 xfailed
+identical gates on and off; cold self-check (`-p mypy -p mypyc`, num_workers 4
+forced by `mypy_self_check.ini`) `Success: no issues found in 373 source
+files` both states with mirror + verify forced through an Options wrapper;
+fine-grained trio (`testfinegrained` + `testfinegrainedcache` +
+`testdaemon`) 1334 passed / 256 skipped identical both states; `testdiff` 79
+passed with the step-level flip report at 320/320 tables mirrored, 1810
+entries served, defers 0. One evidence caveat, verified as a limitation
+rather than a defect: the parallel self-check's sessionfinish dump is all
+zeros in the master because the forked workers hold the counters (an
+in-process single-file run shows put_entries 33192), so cache-loaded
+engagement evidence comes from the single-process probe. Refs: #1773, #1755,
+#1765, and the residual line in the `#1670` entry ("cache-loaded tables
+defer") is superseded by this seed.

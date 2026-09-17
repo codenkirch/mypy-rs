@@ -5359,9 +5359,15 @@ class SymbolTable(dict[str, SymbolTableNode]):
     def read(cls, data: ReadBuffer) -> SymbolTable:
         assert read_tag(data) == DICT_STR_GEN
         size = read_int_bare(data)
-        return SymbolTable(
-            [(read_str_bare(data), SymbolTableNode.read(data)) for _ in range(size)]
-        )
+        st = SymbolTable([(read_str_bare(data), SymbolTableNode.read(data)) for _ in range(size)])
+        if size:
+            # The dict constructor is a C-level path the mirror's class
+            # patches never see, so a loaded namespace needs an explicit
+            # seed to reach the shadow (#1773). No-op with the gate off.
+            from mypy import symtables_mirror
+
+            symtables_mirror.seed_loaded(st)
+        return st
 
 
 class DataclassTransformSpec:

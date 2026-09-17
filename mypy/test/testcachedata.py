@@ -350,42 +350,65 @@ class CacheDataWriterSuite(unittest.TestCase):
             self.assertEqual(stats.get("verify.ok", 0), len(trees), f"verify: {stats}")
 
     @skipUnless(_SYMTABLE_FLIP, "requires TEST_NATIVE_SYMTABLE_READ_FLIP(_VERIFY)")
-    def test_cached_fixed_format_trees_defer_the_read_flip(self) -> None:
-        """The fixed-format reader records nothing, so the flip defers.
+    def test_cached_fixed_format_trees_serve_the_read_flip(self) -> None:
+        """The fixed-format reader seeds the store, so the flip serves.
 
         `MypyFile.read` builds each namespace with `SymbolTable.read`, a
         C-level dict-constructor path that never reaches the patched
-        `SymbolTable.__setitem__`, and the G3.2 write-time seed needs a
-        recorded write to run. Every cache-loaded namespace therefore has
-        an empty shadow here, so the flip defers to the live table: the
-        deferred state is pinned so the vacancy is measured evidence, not
-        a silent pass. Closing it needs the reader to seed the store
-        (#1773), not a change to this suite.
+        `SymbolTable.__setitem__`, so the reader seeds the finished table
+        explicitly (#1773). This is the inverted #1765 pin: the deferred
+        state it froze as measured evidence is closed, and a seeding or
+        capture regression here fails the assertions instead of passing
+        silently.
         """
         trees = self._cache_load_round_trip(fixed_format_cache=True)
         for module_id, tree in trees.items():
-            self.assertIsNone(
+            self.assertIsNotNone(
                 symtables_mirror.handle_of(tree.names),
-                f"{module_id}: the fixed-format reader adopted a namespace",
+                f"{module_id}: the seed never adopted the loaded namespace; "
+                "is the symtable mirror armed and the type_kernel extension loaded?",
             )
-            invisible = 0
+            self.assertEqual(
+                symtables_mirror.entry_count(tree.names),
+                len(tree.names),
+                f"{module_id}: shadow is not the loaded namespace",
+            )
+            shadowed = 0
             for symbol in tree.names.values():
                 node = symbol.node
                 if node is None or not hasattr(node, "names"):
                     continue
-                invisible += symtables_mirror.entry_count(node.names) == 0
-            self.assertGreater(invisible, 0, f"{module_id}: no class namespace to check")
+                if len(node.names) == 0:
+                    continue
+                self.assertEqual(
+                    symtables_mirror.entry_count(node.names),
+                    len(node.names),
+                    f"{module_id}: class namespace {node.fullname} was not seeded",
+                )
+                shadowed += 1
+            self.assertGreater(shadowed, 0, f"{module_id}: no class namespace to check")
 
         before = _flip_state()
         for module_id, tree in trees.items():
             snapshot_symbol_table(module_id, tree.names)
         stats = _counter_delta(before[0], _flip_state()[0])
         counts = _counter_delta(before[1], _flip_state()[1])
-        self.assertEqual(stats.get("calls", 0), len(trees), f"flip was not consulted: {stats}")
-        self.assertEqual(stats.get("deferred", 0), len(trees), f"deferrals: {stats}")
-        self.assertEqual(stats.get("served", 0), 0, f"flip served a loaded table: {stats}")
-        self.assertEqual(counts.get("tables_mirrored", 0), 0, f"mirrored: {counts}")
-        self.assertEqual(counts.get("defer_no_handle", 0), len(trees), f"defer reason: {counts}")
+        self.assertEqual(stats.get("deferred", 0), 0, f"flip deferred: {stats}")
+        self.assertEqual(stats.get("served", 0), len(trees), f"flip served: {stats}")
+        self.assertGreaterEqual(
+            counts.get("tables_mirrored", 0),
+            len(trees),
+            f"loaded namespaces were not mirrored from the store: {counts}",
+        )
+        self.assertGreaterEqual(
+            counts.get("entries_mirrored", 0),
+            sum(len(tree.names) for tree in trees.values()),
+            f"too few entries served from the store: {counts}",
+        )
+        self.assertEqual(counts.get("defer_no_handle", 0), 0, f"defer reason: {counts}")
+        if _SYMTABLE_FLIP_VERIFY:
+            # Mode 2 diffs every served snapshot against the flip-off walk.
+            self.assertEqual(stats.get("verify.ok", 0), len(trees), f"verify: {stats}")
 
     def test_unsupported_shape_defers(self) -> None:
         tree = MypyFile([], [])

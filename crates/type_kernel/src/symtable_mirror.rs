@@ -33,6 +33,11 @@
 //!    already populated is seeded from one `owner.items()` read, so the
 //!    live order becomes the store's ordinals and the namespace serves.
 //!    A namespace the seed cannot read atomically stays `Inherited`.
+//! 8. **Load-time seed (#1773).** The fixed-format cache reader builds a
+//!    namespace through the C-level dict constructor, so no patched
+//!    `__setitem__` runs and the write-time seed never triggers;
+//!    `rust_symtable_mirror_seed` takes the live order for the reader's
+//!    finished namespaces instead, so cache-loaded trees serve too.
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -409,6 +414,50 @@ pub(crate) fn put(
     }))
 }
 
+/// Seed one namespace a C-level reader populated (#1773): the fixed-format
+/// cache reader builds each `SymbolTable` through the dict constructor, so
+/// no patched `__setitem__` runs and no recorded write can trigger the
+/// write-time seed. This takes the live order without a write, exactly
+/// like the write-time seed: an already-adopted or refused owner is a
+/// no-op, an empty owner stays unadopted (matching a JSON-read namespace
+/// whose zero writes captured nothing), and an unreadable owner fails
+/// closed to `Inherited`. Returns the seeded entry count.
+pub(crate) fn seed(owner: &PyAny) -> PyResult<usize> {
+    let owner_handle = handle_or_error(owner)?;
+    if owner.len().unwrap_or(0) == 0 {
+        return Ok(0);
+    }
+    if with_store(|store| {
+        store.by_owner.contains_key(&owner_handle) || store.inherited.contains(&owner_handle)
+    }) {
+        return Ok(0);
+    }
+    // Outside the store borrow: a slot read that runs Python code must not
+    // re-enter the store (same rule as the write-time seed in `put`).
+    let pairs = prepare_seed(owner);
+    Ok(with_store(|store| {
+        if store.by_owner.contains_key(&owner_handle) {
+            return 0;
+        }
+        match pairs {
+            Some(pairs) => {
+                let count = pairs.len();
+                seed_entries(store, owner, owner_handle, pairs);
+                count
+            }
+            None => {
+                // Pin like a refused write-time seed does, so the flip's
+                // defer reason is `Inherited` (not a bare no-handle) and
+                // `inherited` state is observable from Python.
+                store.pins.insert(owner_handle, Py::from(owner));
+                store.inherited.insert(owner_handle);
+                store.flip.seed_rejects += 1;
+                0
+            }
+        }
+    }))
+}
+
 /// Remove the record for `(owner, name)`; returns whether one existed.
 ///
 /// The pins (owner and node) stay until reset: another record may still
@@ -678,12 +727,18 @@ pub(crate) fn rust_symtable_mirror_put(
     put(owner, name, symbol, flags)
 }
 
+/// Seed one C-level-populated namespace (#1773); returns the entry count
+/// the store took (0 when the owner is empty, already adopted or refused).
+#[pyfunction]
+pub(crate) fn rust_symtable_mirror_seed(owner: &PyAny) -> PyResult<usize> {
+    seed(owner)
+}
+
 /// Remove one record; returns whether one existed.
 #[pyfunction]
 pub(crate) fn rust_symtable_mirror_delete(owner: &PyAny, name: &str) -> PyResult<bool> {
     delete(owner, name)
 }
-
 /// Refresh ref flags on every record referencing `node`; false when the
 /// node was never adopted by a put.
 #[pyfunction]
@@ -1364,6 +1419,66 @@ mod symtable_mirror_tests {
     }
 
     #[test]
+    fn test_load_seed_adopts_without_a_write() {
+        with_py(|py| {
+            reset();
+            flip_counts_reset();
+            // The fixed-format reader shape: a table whose keys and values
+            // landed through C-level paths, so no put ever recorded it.
+            let table = py.eval("{}", None, None).unwrap();
+            let d = symbol_object(py, "mod.D");
+            let b = symbol_object(py, "mod.b");
+            table.set_item("D", d).unwrap();
+            table.set_item("b", b).unwrap();
+            assert_eq!(rust_symtable_mirror_seed(table).unwrap(), 2);
+            assert_eq!(read_names(py, table), dict_order(table));
+            // Provenance: the seed minted every entry, the write log none.
+            let counts = flip_counts();
+            assert_eq!(counts.seeded_owners, 1);
+            assert_eq!(counts.seeded_entries, 2);
+            assert_eq!(counts.put_entries, 0);
+            assert_eq!(counts.seed_rejects, 0);
+            assert_eq!(counts.tables_mirrored, 1);
+            // Idempotent: an adopted owner re-seeds nothing.
+            assert_eq!(rust_symtable_mirror_seed(table).unwrap(), 0);
+            assert_eq!(flip_counts().seeded_owners, 1);
+        });
+    }
+
+    #[test]
+    fn test_load_seed_skips_empty_and_fails_closed_on_unreadable() {
+        with_py(|py| {
+            reset();
+            flip_counts_reset();
+            // An empty namespace matches the JSON reader's captured-nothing
+            // shape: unadopted, so the flip defers rather than serving it.
+            let empty = py.eval("{}", None, None).unwrap();
+            assert_eq!(rust_symtable_mirror_seed(empty).unwrap(), 0);
+            assert!(matches!(
+                entries_if_mirrored(py, empty),
+                Err(ShadowGap::NoHandle)
+            ));
+            // A live value without the capture's flag slots refuses the
+            // seed: the owner stays unservable, like a refused write seed.
+            let table = py.eval("{}", None, None).unwrap();
+            table
+                .set_item("a", py.eval("object()", None, None).unwrap())
+                .unwrap();
+            assert_eq!(rust_symtable_mirror_seed(table).unwrap(), 0);
+            assert!(matches!(
+                entries_if_mirrored(py, table),
+                Err(ShadowGap::Inherited)
+            ));
+            let counts = flip_counts();
+            assert_eq!(counts.seeded_owners, 0);
+            assert_eq!(counts.seed_rejects, 1);
+            // A refused seed is not retried on a second call.
+            assert_eq!(rust_symtable_mirror_seed(table).unwrap(), 0);
+            assert_eq!(flip_counts().seed_rejects, 1);
+        });
+    }
+
+    #[test]
     fn test_unseedable_namespace_fails_closed() {
         with_py(|py| {
             reset();
@@ -1494,6 +1609,9 @@ pub(crate) fn register_registry(m: &PyModule) -> PyResult<()> {
     // record per (owner table handle, name) with generation + seq;
     // capture-only, same identity base as the type mirror.
     m.add_function(wrap_pyfunction!(rust_symtable_mirror_put, m)?)?;
+
+    // G3.2b (#1773): load-time seed for C-level-populated namespaces.
+    m.add_function(wrap_pyfunction!(rust_symtable_mirror_seed, m)?)?;
 
     m.add_function(wrap_pyfunction!(rust_symtable_mirror_delete, m)?)?;
 

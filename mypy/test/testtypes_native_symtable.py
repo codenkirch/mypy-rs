@@ -899,6 +899,66 @@ class NativeSymtableReadFlipSuite(Suite):
         assert list(flipped) == ["s", "a", "b"] == list(table)
         assert flipped == self._snapshot(table, 0)
 
+    def test_seed_loaded_adopts_fixed_format_reader_table(self) -> None:
+        # #1773: `SymbolTable.read` populates through the C-level dict
+        # constructor, so no patched `__setitem__` runs; the reader seeds
+        # the finished table so the namespace serves like a JSON-loaded one.
+        table: SymbolTable = SymbolTable()
+        dict.__setitem__(table, "D", self._sym("D", "mod.D"))
+        dict.__setitem__(table, "a", self._sym("a", "mod.a"))
+        assert self._k.rust_symtable_mirror_handle_of(table) is None
+        seeded = self._m.seed_loaded(table)
+        assert seeded == 2
+        assert self._m.handle_of(table) is not None
+        assert self._m.entry_count(table) == len(table) == 2
+        flipped = self._snapshot(table, 2)
+        assert flipped == self._snapshot(table, 0)
+        assert list(flipped) == list(table) == ["D", "a"]
+        assert self._stats() == {"calls": 1, "served": 1, "verify.ok": 1}
+        counters = self._m.flip_report()
+        assert counters["seeded_owners"] == 1
+        assert counters["seeded_entries"] == 2
+        assert counters["put_entries"] == 0
+        assert counters["seed_rejects"] == 0
+        # Idempotent: re-seeding an adopted namespace records nothing.
+        assert self._m.seed_loaded(table) == 0
+        assert self._m.flip_report()["seeded_owners"] == 1
+        assert self._m.report().get("seed.loaded", 0) == 1
+
+    def test_seed_loaded_gate_off_and_refusal_leave_no_trace(self) -> None:
+        # Gate off: the reader's call is a plain no-op.
+        self._m._active = False
+        try:
+            table: SymbolTable = SymbolTable()
+            dict.__setitem__(table, "a", self._sym("a", "mod.a"))
+            assert self._m.seed_loaded(table) == 0
+            assert self._k.rust_symtable_mirror_total_entry_count() == 0
+        finally:
+            self._m._active = True
+
+        # A live value without the capture's flag slots refuses the seed:
+        # the namespace stays unservable and the attempt is observable.
+        class PartialSymbol:
+            def __init__(self, node: Var) -> None:
+                self.node = node
+                self.kind = MDEF
+                self.module_public = True
+
+        unreadable: SymbolTable = SymbolTable()
+        partial = cast(Any, PartialSymbol(self._var("p", "mod.p")))
+        dict.__setitem__(unreadable, "p", partial)
+        assert self._m.seed_loaded(unreadable) == 0
+        # A refused seed is not a capture failure, and nothing was taken.
+        assert self._m.report().get("seed.loaded", 0) == 0
+        assert self._m.report().get("capture_fail.seed", 0) == 0
+        counters = self._m.flip_report()
+        assert counters["seeded_owners"] == 0
+        assert counters["seed_rejects"] == 1
+        flipped = self._snapshot(unreadable, 1)
+        assert flipped == self._snapshot(unreadable, 0)
+        assert self._m.flip_report()["defer_inherited"] == 1
+        assert self._stats() == {"calls": 1, "deferred": 1}
+
     def test_unreadable_namespace_does_not_seed(self) -> None:
         # Negative control for the seed's eligibility rule: a live value
         # without the capture's flag slots rejects the whole seed, and the
