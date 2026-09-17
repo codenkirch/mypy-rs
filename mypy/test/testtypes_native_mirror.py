@@ -469,7 +469,10 @@ class NativeRemoveDupsSuite(Suite):
         self._orig_module_bindings = _snapshot_types_module_bindings(self._SEAM_BINDINGS)
         _types_mod._VisitorWriteBuffer = WriteBuffer  # type: ignore[attr-defined]
         _types_mod._ReadBuffer = ReadBuffer  # type: ignore[attr-defined]
-        _types_mod.__dict__.setdefault("_rust_remove_dups", _type_kernel.rust_remove_dups)
+        # Overwrite, not setdefault: the module already binds the seam (the
+        # kernel fn when the ext imports), but a pristine `None` must still
+        # be genuinely injected for the hygiene assertion to bite (#1794).
+        _types_mod._rust_remove_dups = _type_kernel.rust_remove_dups  # type: ignore[attr-defined]
         self._orig_kernel_flag = _types_mod._VISITOR_HAS_TYPE_KERNEL
         _types_mod._VISITOR_HAS_TYPE_KERNEL = True
         self._orig_visitor_gate = _types_mod._native_visitor_active
