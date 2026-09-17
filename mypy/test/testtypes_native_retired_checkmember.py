@@ -319,23 +319,18 @@ class NativeAnalyzeMemberAccessRetiredSuite(Suite):
             checkmember._serialize_type_for_checkmember = orig
         assert calls == [], f"retired member-access gate serialized: {len(calls)} calls"
 
-    def test_values_match_with_gate_off_and_on(self) -> None:
+    def test_values_on_the_gate_shapes(self) -> None:
+        # `_analyze_member_access` reads no gate at all, so both arms execute
+        # the same Python and the old `on == off` conjunct could not fail.
+        # One run, with the value pin as the substance.
         from mypy.checkmember import _analyze_member_access
 
         shapes = self._gate_shapes()
-
-        def run() -> list[str]:
-            return [
-                str(_analyze_member_access("x", receiver, _make_mx(Instance(self.info, []))))
-                for _expected, receiver in shapes
-            ]
-
-        self._set_active(False)
-        off = run()
-        self._set_active(True)
-        on = run()
-        assert on == off, f"gate flag changed the dispatch: off={off!r} on={on!r}"
-        assert on == [expected for expected, _receiver in shapes], on
+        got = [
+            str(_analyze_member_access("x", receiver, _make_mx(Instance(self.info, []))))
+            for _expected, receiver in shapes
+        ]
+        assert got == [expected for expected, _receiver in shapes], got
 
     def test_shared_serialize_helpers_remain(self) -> None:
         # The retirement is surgical: `_serialize_type_for_checkmember` and

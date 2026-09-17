@@ -5497,19 +5497,26 @@ class NativeArgInferPassesSuite(Suite):
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeCheckArgSuite(Suite):
-    """Parity for `rust_classify_check_arg` (issue #1048).
+    """Direct-seam and production pins for `rust_classify_check_arg` (#1048).
 
-    `ExpressionChecker.check_arg` (checkexpr.py:4161-4204) dispatches a
+    `ExpressionChecker.check_arg` (checkexpr.py:4371-4415) dispatches a
     4-way branch: DeletedType -> deleted_as_rvalue,
     has_abstract_type_part -> concrete_only_call, not is_subtype ->
     incompatible_argument (+ optional note + check_possible_missing_await),
     else pass. The Rust seam decides only the tag from the wire caller
     type plus two Python-computed booleans (is_subtype via the subtype
     resolver; has_abstract_type_part via rust_has_abstract_type with the
-    Tuple-x-Tuple fold kept Python-side); Python applies every side
-    effect. Direct seam calls assert the exact tag for every branch;
-    toggling the checkexpr gate off vs on must produce identical
-    captured message lists.
+    Tuple-x-Tuple fold kept Python-side); Python applies every side effect.
+
+    That seam is unwired, not removed: fcc1f8e2c dropped the call from
+    `check_arg` after measuring 233k calls / 10.3MB wire / 0.60s proxy on a
+    cold self-check, and kept the pyfunction registered for the direct-seam
+    calls below ("The Rust pyfunction stays registered for direct-seam
+    tests"). So the production tests here pin one observation each: a
+    gate-off vs gate-on differential cannot fail on this host, because
+    `check_arg` reaches zero `rust_*` seams and reads no gate in either
+    state (measured, #1834). The re-wired-call pin lives in
+    `testtypes_native_retired_checkexpr.py::NativeCheckArgClassifyRetiredSuite`.
     """
 
     def setUp(self) -> None:
@@ -5520,13 +5527,6 @@ class NativeCheckArgSuite(Suite):
 
     def tearDown(self) -> None:
         self._set_active(False)
-
-    def _with_gate(self, active: bool, fn: Callable[[], T]) -> T:
-        self._set_active(active)
-        try:
-            return fn()
-        finally:
-            self._set_active(True)
 
     def _make_ec(self) -> tuple[ExpressionChecker, list[tuple[str, str]]]:
         captured: list[tuple[str, str]] = []
@@ -5558,23 +5558,15 @@ class NativeCheckArgSuite(Suite):
         return ec, captured
 
     def _run_check_arg(
-        self, caller_type: Type, callee_type: Type, kind: ArgKind, active: bool
+        self, caller_type: Type, callee_type: Type, kind: ArgKind
     ) -> list[tuple[str, str]]:
+        """One `check_arg` run with the gate on, as production runs it."""
         fx = TypeFixture()
         ec, captured = self._make_ec()
         callee = fx.callable_type(fx.anyt)
         ctx = NameExpr("ctx")
-
-        def run() -> None:
-            self._with_gate(
-                active,
-                lambda: ec.check_arg(
-                    caller_type, caller_type, kind, callee_type, 1, 1, callee, None, ctx, ctx
-                ),
-            )
-
         try:
-            run()
+            ec.check_arg(caller_type, caller_type, kind, callee_type, 1, 1, callee, None, ctx, ctx)
         except Exception as exc:
             captured.append(("EXC", str(exc)))
         return captured
@@ -5634,14 +5626,13 @@ class NativeCheckArgSuite(Suite):
     def test_seam_defers_on_bad_wire(self) -> None:
         assert _type_kernel.rust_classify_check_arg(b"\xff\xff\xff", True, True) is None
 
-    # -- gate off/on differential tests (all 4 branches) --
+    # -- production branch tests (all 4 branches, one run each) --
 
     def test_par_deleted(self) -> None:
         fx = TypeFixture()
-        off = self._run_check_arg(DeletedType("x"), fx.anyt, ARG_POS, False)
-        on = self._run_check_arg(DeletedType("x"), fx.anyt, ARG_POS, True)
-        assert off == on, f"deleted: off={off} on={on}"
-        assert ("deleted_as_rvalue", "x") in off, f"expected delete: {off}"
+        assert self._run_check_arg(DeletedType("x"), fx.anyt, ARG_POS) == [
+            ("deleted_as_rvalue", "x")
+        ]
 
     def test_par_abstract_only(self) -> None:
         fx = TypeFixture()
@@ -5650,35 +5641,29 @@ class NativeCheckArgSuite(Suite):
         fx.fi.is_abstract = True
         caller = fx.callable_type(Instance(fx.fi, []))
         callee = TypeType.make_normalized(Instance(fx.fi, []))
-        off = self._run_check_arg(caller, callee, ARG_POS, False)
-        on = self._run_check_arg(caller, callee, ARG_POS, True)
-        assert off == on, f"abstract: off={off} on={on}"
-        assert ("concrete_only_call", str(callee)) in off, f"expected abstract: {off}"
+        assert self._run_check_arg(caller, callee, ARG_POS) == [
+            ("concrete_only_call", str(callee))
+        ]
 
     def test_par_incompatible(self) -> None:
         fx = TypeFixture()
-        off = self._run_check_arg(fx.a, fx.d, ARG_POS, False)
-        on = self._run_check_arg(fx.a, fx.d, ARG_POS, True)
-        assert off == on, f"incompatible: off={off} on={on}"
-        assert ("incompatible_argument", "1:1") in off
-        assert ("incompatible_argument_note", "note") in off
-        assert ("await", "None") in off, f"expected await check: {off}"
+        assert self._run_check_arg(fx.a, fx.d, ARG_POS) == [
+            ("incompatible_argument", "1:1"),
+            ("incompatible_argument_note", "note"),
+            ("await", "None"),
+        ]
 
     def test_par_incompatible_star_no_note(self) -> None:
         # For *args / **kwargs the note would be incorrect: suppressed.
         fx = TypeFixture()
-        off = self._run_check_arg(fx.a, fx.d, ARG_STAR, False)
-        on = self._run_check_arg(fx.a, fx.d, ARG_STAR, True)
-        assert off == on, f"star: off={off} on={on}"
-        assert ("incompatible_argument", "1:1") in off
-        assert ("incompatible_argument_note", "note") not in off
+        assert self._run_check_arg(fx.a, fx.d, ARG_STAR) == [
+            ("incompatible_argument", "1:1"),
+            ("await", "None"),
+        ]
 
     def test_par_pass(self) -> None:
         fx = TypeFixture()
-        off = self._run_check_arg(fx.a, fx.a, ARG_POS, False)
-        on = self._run_check_arg(fx.a, fx.a, ARG_POS, True)
-        assert off == on, f"pass: off={off} on={on}"
-        assert off == [], f"expected no messages: {off}"
+        assert self._run_check_arg(fx.a, fx.a, ARG_POS) == []
 
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")

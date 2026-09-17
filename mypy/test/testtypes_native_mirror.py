@@ -586,9 +586,10 @@ class NativeHasRecursiveTypesFlattenSuite(Suite):
     Both seams are retired: `has_recursive_types` in #1640 and
     `flatten_nested_unions` in #1739 (the wire round trip serialized
     every input tree to reach the same list scan, ~26x the Python body).
-    The gate-on/gate-off differentials below now pin the Python body,
-    and `_spy_flatten_serialize` pins zero wire crossings; the retired
-    pyfunctions are pinned by direct calls.
+    Neither body reads a gate, so every test below pins the Python body's
+    value in a single run instead of comparing a gate-off arm against a
+    gate-on arm, and `_spy_flatten_serialize` pins zero wire crossings;
+    the retired pyfunctions are pinned by direct calls.
     """
 
     # Same derivation as NativeRemoveDupsSuite (#1786).
@@ -636,13 +637,12 @@ class NativeHasRecursiveTypesFlattenSuite(Suite):
         _set_native_visitor_active(visitor)
         _set_native_visitor_types_active(types)
 
-    def _hrt_par(self, t: Type, expected: bool) -> None:
-
-        self._set_gates(False, self._orig_types_gate)
-        off = has_recursive_types(t)
-        self._set_gates(True, self._orig_types_gate)
-        on = has_recursive_types(t)
-        assert on == off == expected, f"hrt parity {t!r}: off={off} on={on} expected={expected}"
+    def _assert_hrt(self, t: Type, expected: bool) -> None:
+        # `has_recursive_types` was retired in #1640 (types.py:4929): it reads
+        # no gate and loads no `rust_*` name, so both gate states run identical
+        # Python and the old `on == off == expected` chain could not fail.
+        got = has_recursive_types(t)
+        assert got == expected, f"has_recursive_types({t!r}) = {got}, expected {expected}"
 
     def _def_union_alias(self, name: str, target: Type) -> tuple[TypeAlias, TypeAliasType]:
         node = TypeAlias(target, f"__main__.{name}", "__main__", -1, -1)
@@ -665,11 +665,11 @@ class NativeHasRecursiveTypesFlattenSuite(Suite):
         U = UnionType([self.fx.a, A])
         # Recursive alias in the upper bound position.
         UB = TypeVarType("U", "U", TypeVarId(-2), [], A, self.fx.o)
-        self._hrt_par(A, True)
-        self._hrt_par(NA, True)
-        self._hrt_par(U, True)
-        self._hrt_par(UB, True)
-        self._hrt_par(self.fx.a, False)
+        self._assert_hrt(A, True)
+        self._assert_hrt(NA, True)
+        self._assert_hrt(U, True)
+        self._assert_hrt(UB, True)
+        self._assert_hrt(self.fx.a, False)
 
     def test_hrt_direct_seam_engages(self) -> None:
         from mypy.types import _serialize_type_for_visitor
@@ -685,26 +685,22 @@ class NativeHasRecursiveTypesFlattenSuite(Suite):
 
         node, alias = self._def_union_alias("F", UnionType([self.fx.a, self.fx.str_type]))
         self._install_resolver([node])
-        self._set_gates(True, False)
-        off = flatten_nested_unions([alias])
-        self._set_gates(True, True)
-        on = flatten_nested_unions([alias])
-        assert [str(x) for x in on] == [str(x) for x in off]
-        assert len(on) == 2
-        assert all(not isinstance(x, TypeAliasType) for x in on)
+        # The flatten seam was retired in #1739 (types.py:5181) and the body
+        # reads no gate, so a gate-off/gate-on comparison could not fail.
+        # Pin the expansion instead.
+        got = flatten_nested_unions([alias])
+        assert [str(x) for x in got] == [str(self.fx.a), str(self.fx.str_type)], got
+        assert all(not isinstance(x, TypeAliasType) for x in got)
 
     def test_flatten_alias_preserved_for_non_union_target(self) -> None:
         from mypy.types import flatten_nested_unions
 
         node, alias = self._def_union_alias("L", Instance(self.fx.gi, [self.fx.a]))
         self._install_resolver([node])
-        self._set_gates(True, False)
-        off = flatten_nested_unions([alias])
-        self._set_gates(True, True)
-        on = flatten_nested_unions([alias])
-        assert [str(x) for x in on] == [str(x) for x in off]
+        # Retired flatten seam (#1739): one run, value pin.
+        got = flatten_nested_unions([alias])
         # Python appends the ORIGINAL alias for a non-union expansion.
-        assert on[0] is alias
+        assert len(got) == 1 and got[0] is alias
 
     def test_flatten_nested_bare_alias_in_union_items(self) -> None:
         from mypy.types import flatten_nested_unions
@@ -712,22 +708,23 @@ class NativeHasRecursiveTypesFlattenSuite(Suite):
         node, inner = self._def_union_alias("N", UnionType([self.fx.b]))
         outer = UnionType([self.fx.a, inner])
         self._install_resolver([node])
-        self._set_gates(True, False)
-        off = flatten_nested_unions([outer])
-        self._set_gates(True, True)
-        on = flatten_nested_unions([outer])
-        assert [str(x) for x in on] == [str(x) for x in off]
-        assert len(on) == 2
+        # Retired flatten seam (#1739): one run, value pin.
+        got = flatten_nested_unions([outer])
+        assert [str(x) for x in got] == [str(self.fx.a), str(self.fx.b)], got
 
     def test_flatten_recursive_alias_handle_off_kept(self) -> None:
         from mypy.types import flatten_nested_unions
 
-        A, _ = self.fx.def_alias_1(self.fx.a)
-        self._set_gates(True, False)
-        off = flatten_nested_unions([A], handle_recursive=False)
-        self._set_gates(True, True)
-        on = flatten_nested_unions([A], handle_recursive=False)
-        assert on[0] is off[0] is A
+        # `def_alias_2`'s target is a union, the only shape where the flag
+        # decides: hr=False keeps the ORIGINAL alias, hr=True expands one
+        # union target step. `def_alias_1` has a tuple target, inert for it.
+        A, _target = self.fx.def_alias_2(self.fx.a)
+        assert A.is_recursive
+        kept = flatten_nested_unions([A], handle_recursive=False)
+        assert len(kept) == 1 and kept[0] is A
+        expanded = flatten_nested_unions([A], handle_recursive=True)
+        assert expanded[0] is self.fx.a
+        assert len(expanded) == 2
 
     def test_flatten_alias_missing_snapshot_defers(self) -> None:
         from mypy.types import _serialize_type_list_for_visitor, flatten_nested_unions
@@ -740,15 +737,11 @@ class NativeHasRecursiveTypesFlattenSuite(Suite):
             )
             is None
         )
-        # Module function falls back to the Python body, which expands
+        # Module function runs the pure-Python body, which expands
         # the union target (no snapshot needed).
-        self._set_gates(True, False)
-        off = flatten_nested_unions([alias])
-        self._set_gates(True, True)
-        on = flatten_nested_unions([alias])
-        assert [str(x) for x in on] == [str(x) for x in off]
-        assert len(on) == 1
-        assert not isinstance(on[0], TypeAliasType)
+        got = flatten_nested_unions([alias])
+        assert [str(x) for x in got] == [str(self.fx.a)], got
+        assert not isinstance(got[0], TypeAliasType)
 
     def test_flatten_direct_seam_engages(self) -> None:
         from mypy.types import _serialize_type_list_for_visitor
@@ -784,10 +777,10 @@ class NativeHasRecursiveTypesFlattenSuite(Suite):
 
         return seen, restore
 
-    def test_flatten_recursive_alias_no_resolver_matches_python(self) -> None:
+    def test_flatten_recursive_alias_no_resolver_expands_in_python(self) -> None:
         # Issue #1532 / #1739: the pure-Python body expands one union
         # target step for hr=True and keeps the alias row for hr=False,
-        # with no wire crossing in either gate state.
+        # with no wire crossing. The retired body reads no gate either.
         from mypy.types import _set_native_visitor_resolver, flatten_nested_unions
 
         A, _target = self.fx.def_alias_2(self.fx.a)
@@ -795,20 +788,15 @@ class NativeHasRecursiveTypesFlattenSuite(Suite):
         seen, restore = self._spy_flatten_serialize()
         _set_native_visitor_resolver(None)
         try:
-            self._set_gates(True, False)
-            off_true = [str(x) for x in flatten_nested_unions([A], handle_recursive=True)]
-            off_false = [str(x) for x in flatten_nested_unions([A], handle_recursive=False)]
             self._set_gates(True, True)
-            on_true = [str(x) for x in flatten_nested_unions([A], handle_recursive=True)]
-            on_false = [str(x) for x in flatten_nested_unions([A], handle_recursive=False)]
+            hr_true = [str(x) for x in flatten_nested_unions([A], handle_recursive=True)]
+            hr_false = [str(x) for x in flatten_nested_unions([A], handle_recursive=False)]
         finally:
             restore()
-        assert on_true == off_true, f"no-resolver recursive parity hr=True: {on_true}"
-        assert on_false == off_false, f"no-resolver recursive parity hr=False: {on_false}"
         # hr=True expands one union target step (base + tuple item);
         # hr=False keeps the alias row.
-        assert len(on_true) == 2
-        assert on_false == [str(A)]
+        assert hr_true == [str(self.fx.a), f"builtins.tuple[{str(A)}, ...]"], hr_true
+        assert hr_false == [str(A)], hr_false
         assert not seen, f"retired flatten seam serialized {len(seen)} time(s)"
 
     def test_flatten_nonrecursive_alias_expands_in_python(self) -> None:

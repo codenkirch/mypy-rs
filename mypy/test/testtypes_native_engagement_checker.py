@@ -7132,15 +7132,17 @@ class NativeSimpleAssignmentSuite(Suite):
         # a function definition.
         return CallExpr(NameExpr("f"), [], [], [])
 
-    def test_par_stub_ellipsis(self) -> None:
-        off, on = self._assert_par(
+    def test_stub_ellipsis_precedes_the_gate(self) -> None:
+        # The stub '...' initializer returns at checker.py:6512, before the
+        # `_rust_classify_simple_assignment` gate is read, so both gate states
+        # run identical Python and `_assert_par` cannot fail on this shape.
+        obs = self._run(
             Instance(TypeFixture().ai, []),
             EllipsisExpr(),
             AnyType(TypeOfAny.special_form),
             is_stub=True,
-        )
-        # Both gates short-circuit to the stub Any before any inference.
-        assert off == (("ret", "Any", "A"),), off
+        )[0]
+        assert obs == (("ret", "Any", "A"),), obs
 
     def test_par_direct_no_lvalue(self) -> None:
         fx = TypeFixture()

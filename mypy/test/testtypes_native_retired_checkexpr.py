@@ -431,3 +431,59 @@ class NativeClassifyTypeobjGateRetiredSuite(Suite):
         for info in (self._protocol_info(), self._abstract_info()):
             callee = self._type_object_callable(info)
             assert self._fails(callee, False) == self._fails(callee, True)
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeCheckArgClassifyRetiredSuite(Suite):
+    """Pin the #1654 unwiring of the `classify_check_arg` wire seam (#1834).
+
+    fcc1f8e2c removed the call from `ExpressionChecker.check_arg` after
+    measuring 233k calls / 10.3MB wire / 0.60s proxy on a cold self-check:
+    the classifier read one DeletedType wire tag plus two Python-computed
+    booleans, which the pure-Python if/elif chain answers without serializing
+    `caller_type` on every call. Its message ends "The Rust pyfunction stays
+    registered for direct-seam tests", and the pyfunction is registered. What
+    it did not add is this pin, so until now nothing distinguished "retired
+    deliberately" from "wired off by accident", and `NativeCheckArgSuite`'s
+    gate-off/gate-on comparisons could not fail.
+
+    The detector is the `co_names` scan, not `hasattr`: unlike the #1739
+    retirements this lane keeps the import (checkexpr.py:261) and the
+    whole-`None` fallback at :341 is the extension-missing path, so
+    `checkexpr._rust_classify_check_arg` is a live callable on a kernel host.
+    Nothing here wraps a scan in a gate toggle: `co_names` is a static
+    code-object attribute, so the toggle could not change the answer (#1847).
+    The `NATIVE_CHECK_ARG_*` tag constants stay in lockstep with `CHECK_ARG_*`
+    in `crates/type_kernel/src/checkexpr_functions.rs`; the direct-seam tests
+    in `NativeCheckArgSuite` exercise them.
+    """
+
+    def test_alias_kept_and_pyfunction_registered(self) -> None:
+        # `getattr`, not `checkexpr._rust_classify_check_arg` and not a
+        # `from mypy.checkexpr import _rust_classify_check_arg`: the host binds
+        # it as `... as _rust_classify_check_arg`, not a re-export (strict).
+        from mypy import checkexpr
+
+        assert _type_kernel is not None
+        assert hasattr(_type_kernel, "rust_classify_check_arg")
+        alias = getattr(checkexpr, "_rust_classify_check_arg", None)
+        assert callable(alias), f"alias not callable: {alias!r}"
+
+    def test_no_rust_name_loaded_by_check_arg(self) -> None:
+        from mypy.checkexpr import ExpressionChecker
+
+        loaded = [n for n in ExpressionChecker.check_arg.__code__.co_names if "rust_" in n]
+        assert loaded == [], f"check_arg still loads {loaded}"
+
+    def test_the_co_names_scan_bites(self) -> None:
+        # Negative control: the scan above must flag a code object that loads
+        # a live rust_* alias, or a green `loaded == []` proves nothing. This
+        # probe is a wired neighbour; retarget it if that seam ever retires.
+        from mypy import checkexpr
+        from mypy.checkexpr import ExpressionChecker
+
+        found = [
+            n for n in ExpressionChecker.check_argument_types.__code__.co_names if "rust_" in n
+        ]
+        live = [n for n in found if callable(getattr(checkexpr, n, None))]
+        assert live, f"no live rust_* alias in check_argument_types: {found}"
