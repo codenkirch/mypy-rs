@@ -4421,6 +4421,50 @@ class NativeAstMirrorSuite(Suite):
         assert self._k.rust_node_mirror_handle_of(expr) == handle
         assert self._k.rust_mirror_handle_of(expr) == handle
 
+    def test_capture_pin_resolves_the_binding_target(self) -> None:
+        # #1787: `_capture_ref` pins the binding target under its shared
+        # identity handle, so `object_of` reads the exact object back. This
+        # is the Var-key substrate; no consumer reads it yet.
+        expr = NameExpr("x")
+        target = Var("x")
+        other = Var("y")
+        assert self._k.rust_node_mirror_pin_count() == 0
+        expr.kind = GDEF
+        expr.node = target
+        other_expr = NameExpr("y")
+        other_expr.kind = GDEF
+        other_expr.node = other
+        assert self._k.rust_node_mirror_pin_count() == 2
+        handle = self._k.rust_node_mirror_handle_of(target)
+        assert handle is not None
+        assert self._k.rust_node_mirror_object_of(handle) is target
+        other_handle = self._k.rust_node_mirror_handle_of(other)
+        assert other_handle is not None and other_handle != handle
+        assert self._k.rust_node_mirror_object_of(other_handle) is other
+        # Idempotent: a target reached by a second RefExpr keeps one pin.
+        again = NameExpr("x")
+        again.kind = GDEF
+        again.node = target
+        assert self._k.rust_node_mirror_pin_count() == 2
+        # An unminted handle resolves to None, never to a wrong object.
+        assert self._k.rust_node_mirror_object_of(0) is None
+
+    def test_reset_drops_target_pins_and_keeps_identity(self) -> None:
+        expr = NameExpr("x")
+        target = Var("x")
+        expr.kind = GDEF
+        expr.node = target
+        handle = self._k.rust_node_mirror_handle_of(target)
+        assert handle is not None
+        assert self._k.rust_node_mirror_pin_count() == 1
+        self._m.reset()
+        # The per-build boundary drops the pins with the entries, so a
+        # stale handle cannot resolve a dead target across builds; the
+        # identity registry stays valid for the seams that hold handles.
+        assert self._k.rust_node_mirror_pin_count() == 0
+        assert self._k.rust_node_mirror_object_of(handle) is None
+        assert self._k.rust_node_mirror_handle_of(target) == handle
+
     def test_reset_drops_entries_and_keeps_activation(self) -> None:
         expr = NameExpr("x")
         expr.kind = GDEF
@@ -5124,11 +5168,14 @@ class NativeStmtDefMirrorSuite(Suite):
         var.info = self._typeinfo()
         var.final_value = 7
         value_fields = {"_fullname", "type", "setter_type", "info", "final_value"}
-        bool_fields = sorted(self._m._G2_VAR - value_fields)
+        # `_name` is constructor-set and str-valued: it is in the record
+        # from the adoption read-back (#1787), not from the bool loop.
+        bool_fields = sorted(self._m._G2_VAR - value_fields - {"_name"})
         for name in bool_fields:
             setattr(var, name, True)
         record = self._meta(var)
         assert set(record) == set(self._m._G2_VAR)
+        assert record["_name"] == ("str", "x", None, None)
         assert record["_fullname"] == ("str", "mod.x", None, None)
         assert record["type"] == ("obj", "AnyType", None, None)
         assert record["setter_type"] == ("obj", "CallableType", None, None)
@@ -5136,6 +5183,72 @@ class NativeStmtDefMirrorSuite(Suite):
         assert record["final_value"] == ("int", None, 7, None)
         for name in bool_fields:
             assert record[name] == ("bool", None, 1, None), name
+
+    def test_ctor_payload_fields_seed_at_adoption(self) -> None:
+        from mypy import nodes as nodes_mod
+
+        before = dict(self._m.report())
+        var = nodes_mod.Var("x")
+        # The constructor `_name` write never adopts (it precedes the
+        # `info` write that does); adoption reads the slot back instead.
+        assert self._m.report().get("meta_ctor_skip", 0) - before.get("meta_ctor_skip", 0) == 1
+        assert self._meta(var)["_name"] == ("str", "x", None, None)
+
+        func = nodes_mod.FuncDef("f")
+        record = self._meta(func)
+        # FuncBase's `info` write adopts inside `FuncItem.__init__`, before
+        # the constructor sets these, so they land as ordinary writes.
+        assert record["_name"] == ("str", "f", None, None)
+        assert record["arg_names"] == ("list", None, None, [])
+        assert record["arg_kinds"] == ("list", None, None, [])
+        assert record["original_first_arg"] == ("none", None, None, None)
+
+        cls = nodes_mod.ClassDef("C", nodes_mod.Block([]))
+        assert self._meta(cls)["name"] == ("str", "C", None, None)
+
+    def test_ctor_payload_field_seeds_only_when_set(self) -> None:
+        from mypy import nodes as nodes_mod
+
+        # A node adopted before the constructor reached its payload writes
+        # keeps those fields absent; one later write refreshes them.
+        func = nodes_mod.FuncDef.__new__(nodes_mod.FuncDef)
+        nodes_mod.FuncItem.__init__(func)
+        assert "arg_names" in self._meta(func)
+        assert "_name" not in self._meta(func)
+        func._name = "g"
+        assert self._meta(func)["_name"] == ("str", "g", None, None)
+
+    def test_ctor_payload_rename_on_adopted_node_captures(self) -> None:
+        from mypy import nodes as nodes_mod
+
+        var = nodes_mod.Var("x")
+        assert self._meta(var)["_name"] == ("str", "x", None, None)
+        # The writer audit found no production renamer, so this arm is a
+        # safety net; it must still capture when one appears (#1787).
+        var._name = "y"
+        assert self._meta(var)["_name"] == ("str", "y", None, None)
+        cls = nodes_mod.ClassDef("C", nodes_mod.Block([]))
+        cls.name = "D"
+        assert self._meta(cls)["name"] == ("str", "D", None, None)
+
+    def test_attrs_decorator_removal_refreshes_the_record(self) -> None:
+        from mypy import nodes as nodes_mod
+        from mypy.plugins import attrs as attrs_plugin
+
+        kept = nodes_mod.NameExpr("decorator")
+        dropped = nodes_mod.MemberExpr(nodes_mod.NameExpr("x"), "default")
+        dec = nodes_mod.Decorator(nodes_mod.FuncDef("f"), [kept, dropped], nodes_mod.Var("f"))
+        attribute = attrs_plugin.Attribute(
+            "x", None, self._typeinfo(), False, True, False, None, nodes_mod.Context(), None
+        )
+        assert self._meta(dec)["decorators"] == ("list", None, None, ["NameExpr", "MemberExpr"])
+        attrs_plugin._cleanup_decorator(dec, {"x": attribute})
+        assert dec.decorators == [kept]
+        assert attribute.has_default is True
+        # The removal is an in-place list mutation, invisible to the
+        # patched `__setattr__`; `_cleanup_decorator`'s `touch` is what
+        # keeps the record from going stale (#1787 blind channel).
+        assert self._meta(dec)["decorators"] == ("list", None, None, ["NameExpr"])
 
     def test_meta_read_shape_and_capture_counter(self) -> None:
         import type_kernel as kernel
@@ -5327,13 +5440,17 @@ class NativeStmtDefMirrorSuite(Suite):
         cls.has_incompatible_baseclass = True
         cls.metaclass = nodes_mod.NameExpr("ABCMeta")
         record = self._meta(cls)
+        # `name` is a constructor-set payload field (#1787 §1(a)); adoption
+        # reads it back, so it is in the record without a post-hoc write.
         assert set(record) == {
+            "name",
             "info",
             "analyzed",
             "has_incompatible_baseclass",
             "metaclass",
             "removed_statements",
         }
+        assert record["name"] == ("str", "C", None, None)
         assert record["has_incompatible_baseclass"] == ("bool", None, 1, None)
         assert record["metaclass"] == ("obj", "NameExpr", None, None)
 

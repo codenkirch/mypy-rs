@@ -30,6 +30,30 @@ every read live, and `read_counters` reports the channel's provenance
 (served, deferred, compared, mismatched), which is what makes a run's
 evidence checkable rather than assumed.
 
+G2 store extension (#1787 / PR A, record-only, no consumer): the
+statement/def metadata store registers the constructor-set payload
+fields (`Var._name`, `FuncDef._name` / `arg_names` / `arg_kinds` /
+`original_first_arg`, `ClassDef.name`) in `_META_CTOR_FIELDS`, reads
+them back once at first adoption (`_seed_meta_ctor_fields`, the G1.2
+`_seed_name` pattern generalized), and pins every captured `RefExpr`
+binding target under its identity handle
+(`rust_node_mirror_capture_pin`), which `rust_node_mirror_object_of`
+resolves back to that exact live object - the substrate the Var key
+scheme needs.
+
+Blind channels, audited against #1787 §1(b):
+- `replace_object_state` (`mypy/util.py`): its `setattr` leg re-registers
+  the surviving identity through the same hook, pinned by
+  `test_replace_object_state_reregisters_surviving_identity`. The
+  `delattr(new, attr)` leg has no captured counterpart, but it fires only
+  where `old` lacks a slot and every tracked slot of the G2 families is
+  constructor-set on `old`, so it cannot drop a captured value; the
+  `new.__dict__` leg is inert for these `__slots__`-only classes.
+- An in-place list mutation is invisible to the patch, so its writer must
+  call `touch` afterwards. `mypy/plugins/attrs.py` does, after its
+  `decorators.remove` loop - the second explicit touch site after
+  `ImportBase.assignments`.
+
 Design notes:
 - Capture is via class-level monkeypatching of ``__setattr__`` on
   ``RefExpr``, ``CallExpr``, ``IndexExpr`` and ``OpExpr``. These classes
@@ -341,6 +365,11 @@ def _capture_ref(node: RefExpr) -> None:
                 fullname = None
             if isinstance(fullname, str):
                 node_fullname = fullname
+            # G2 (#1787): pin the binding target under its identity handle
+            # so `rust_node_mirror_object_of` can resolve the handle back
+            # to this exact object later (the Var key substrate).
+            _kernel_mod.rust_node_mirror_capture_pin(target)
+            _count("pin_target")
         handle = _kernel_mod.rust_node_mirror_capture_ref(
             node, node.kind, node_fullname, node._fullname, node.is_new_def, node.is_inferred_def
         )
@@ -478,6 +507,14 @@ def _node_setattr(self: Any, name: str, value: Any) -> None:
 # store; object values become class/fullname markers (`InstanceType`,
 # `NameExpr:mod.x`) and are never serialized.
 
+# Constructor-set payload fields (#1787 §1(a)): `_META_CTOR_FIELDS` below
+# names them, `_seed_meta_ctor_fields` reads them back at adoption, and
+# the rename-safety-net contract is documented on that function.
+
+# Fidelity gap (recorded, not fixed): list payload fields (`arg_names`,
+# `arg_kinds`) hold per-item class markers, not values, like every other
+# list field; a criterion-2 cache-writer slice needs a value-encoding.
+
 _G2_FUNC_BASE: Final[frozenset[str]] = frozenset(
     {
         "type",
@@ -528,6 +565,12 @@ _G2_FUNC_DEF: Final[frozenset[str]] = (
             "original_def",
             "dataclass_transform_spec",
             "docstring",
+            # Constructor-set payload fields (#1787 §1(a)); seeded at
+            # adoption through `_META_CTOR_FIELDS` below.
+            "_name",
+            "arg_names",
+            "arg_kinds",
+            "original_first_arg",
         }
     )
     | _G2_FUNC_BASE
@@ -536,6 +579,7 @@ _G2_FUNC_DEF: Final[frozenset[str]] = (
 
 _G2_VAR: Final[frozenset[str]] = frozenset(
     {
+        "_name",
         "_fullname",
         "type",
         "setter_type",
@@ -603,6 +647,7 @@ _G2_TRACKED: Final[dict[type, frozenset[str]]] = {
     Decorator: frozenset({"func", "var", "is_overload", "decorators", "original_decorators"}),
     ClassDef: frozenset(
         {
+            "name",
             "info",
             "analyzed",
             "has_incompatible_baseclass",
@@ -617,7 +662,17 @@ _G2_TRACKED: Final[dict[type, frozenset[str]]] = {
     Var: _G2_VAR,
 }
 
+# Constructor-set payload fields (#1787 §1(a)): written by `__init__`
+# before any adopted tracked write, so a tracked-set entry alone would
+# adopt every constructed node at parse time (see the seed below).
+_META_CTOR_FIELDS: Final[dict[type, frozenset[str]]] = {
+    Var: frozenset({"_name"}),
+    FuncDef: frozenset({"_name", "arg_names", "arg_kinds", "original_first_arg"}),
+    ClassDef: frozenset({"name"}),
+}
+
 _META_FIELDS: dict[type, frozenset[str]] = {}
+_META_CTOR_CACHE: dict[type, frozenset[str]] = {}
 # id(node) -> native handle for every node the metadata store holds.
 _META_HANDLES: dict[int, int] = {}
 
@@ -634,6 +689,20 @@ def _meta_tracked(cls: type) -> frozenset[str]:
                 break
         _META_FIELDS[cls] = tracked
     return tracked
+
+
+def _meta_ctor_fields(cls: type) -> frozenset[str]:
+    """Constructor-set slots for a patched class or any of its subclasses."""
+    fields = _META_CTOR_CACHE.get(cls)
+    if fields is None:
+        fields = frozenset()
+        for base in cls.__mro__:
+            found = _META_CTOR_FIELDS.get(base)
+            if found is not None:
+                fields = found
+                break
+        _META_CTOR_CACHE[cls] = fields
+    return fields
 
 
 def _meta_marker(value: Any) -> str:
@@ -674,14 +743,45 @@ def _meta_is_baseline(value: Any) -> bool:
     return False
 
 
+def _seed_meta_ctor_fields(node: Any) -> None:
+    """Read back the constructor-set slots at first adoption (#1787).
+
+    Generalizes the G1.2 `_seed_name` pattern: the constructor wrote these
+    before the node was adopted, so absence keeps meaning "not recorded"
+    only if adoption reads them back once. A field the constructor left
+    unset (mid-construction adoption) stays absent until a later captured
+    write lands, so the record never holds a value the live object lacks.
+
+    The constructor write itself never adopts (the `_META_CTOR_FIELDS`
+    arm in `_meta_setattr`); a write to an already-adopted node is
+    captured, which is the rename safety net. The #1787 open-question-1
+    writer audit found no production writer that renames these slots:
+    `_name` only in `FuncDef.__init__` / `Var.__init__`, `arg_names` /
+    `arg_kinds` only in `FuncItem.__init__` plus the `read` classmethods
+    (fresh objects), `original_first_arg` in `FuncDef.__init__` (both
+    branches) plus `read`, and `ClassDef.name` only in its `__init__`.
+    """
+    for field in _meta_ctor_fields(type(node)):
+        try:
+            getattr(node, field)
+        except AttributeError:
+            _count("meta_seed_skip")
+            continue
+        _capture_meta(node, field)
+        _count("meta_seed")
+
+
 def _capture_meta(node: Any, field: str) -> None:
     global _in_capture
     _in_capture = True
     try:
         kind, text, num, items = _meta_encode(getattr(node, field))
         handle = _kernel_mod.rust_node_mirror_capture_meta(node, field, kind, text, num, items)
+        newly_adopted = id(node) not in _META_HANDLES
         _META_HANDLES[id(node)] = handle
         _count("meta_capture")
+        if newly_adopted:
+            _seed_meta_ctor_fields(node)
     except Exception:
         _count("meta_capture_fail")
     finally:
@@ -695,6 +795,11 @@ def _meta_setattr(self: Any, name: str, value: Any) -> None:
     if not _active or _in_capture:
         return
     if name not in _meta_tracked(type(self)):
+        return
+    if id(self) not in _META_HANDLES and name in _meta_ctor_fields(type(self)):
+        # A constructor-set field never adopts: parse-time construction
+        # stays out of the store, and adoption reads the value back.
+        _count("meta_ctor_skip")
         return
     if _meta_is_baseline(value) and id(self) not in _META_HANDLES:
         _count("meta_baseline_skip")

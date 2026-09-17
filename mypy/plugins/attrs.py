@@ -45,6 +45,7 @@ from mypy.nodes import (
     Var,
     is_class_var,
 )
+from mypy.nodes_mirror import touch as _touch_node_meta
 from mypy.plugin import SemanticAnalyzerPluginInterface
 from mypy.plugins.common import (
     _get_argument,
@@ -891,6 +892,10 @@ def _cleanup_decorator(stmt: Decorator, attr_map: dict[str, Attribute]) -> None:
                 remove_me.append(func_decorator)
     for dec in remove_me:
         stmt.decorators.remove(dec)
+    if remove_me:
+        # In-place list mutation: invisible to the node-shadow capture
+        # hook, so the record must be refreshed explicitly (#1787).
+        _touch_node_meta(stmt, "decorators")
 
 
 def _attribute_from_auto_attrib(
@@ -1229,7 +1234,9 @@ def _add_attrs_magic_attribute(
 
     # We need to stash the type of the magic attribute so it can be
     # loaded on cached runs.
-    _put_names_entry(ctx.cls.info.names, attr_name, SymbolTableNode(MDEF, ti, plugin_generated=True))
+    _put_names_entry(
+        ctx.cls.info.names, attr_name, SymbolTableNode(MDEF, ti, plugin_generated=True)
+    )
 
     add_attribute_to_class(
         ctx.api,

@@ -141,7 +141,9 @@ pub(crate) fn retire(handle: u64) -> bool {
 /// Clear every entry and pin; returns how many entries were dropped.
 /// Deliberately does NOT call `identity::reset`: the raw handle registry
 /// is owned by `rust_mirror_reset`, and node-shadow state must not
-/// invalidate handles other seams still hold.
+/// invalidate handles other seams still hold. The binding-target pins
+/// drop here too: they were minted by the captures this reset erases, so
+/// the per-build boundary keeps handles from resolving stale targets.
 pub(crate) fn reset() -> usize {
     let (entries, pins) = with_store(|store| {
         let entries = store.by_handle.len();
@@ -151,12 +153,58 @@ pub(crate) fn reset() -> usize {
     });
     // Drop the pins only after the guard is released (see `retire`).
     drop(pins);
+    reset_pins();
     entries
 }
 
 /// Number of live entries.
 pub(crate) fn entry_count() -> usize {
     with_store(|store| store.by_handle.len())
+}
+
+// ---- G2 (#1787): binding-target handle pins ----
+
+// One strong pin per captured `RefExpr` binding target, keyed by the
+// shared identity handle, so a later consumer can resolve a handle back to
+// the exact live object (`rust_node_mirror_object_of`).
+
+// The Var key scheme depends on this: a key holding a handle is sound iff
+// the pinned object outlives every read-back, and injectivity holds because
+// a pinned object cannot die and free its address for reuse while pinned.
+
+thread_local! {
+    static TARGET_PINS: RefCell<HashMap<u64, Py<PyAny>>> = RefCell::new(HashMap::new());
+}
+
+/// Pin `obj` under its identity handle (idempotent); returns the handle.
+pub(crate) fn capture_pin(obj: &PyAny) -> PyResult<u64> {
+    let handle = handle_or_error(obj)?;
+    TARGET_PINS.with(|cell| cell.borrow_mut().insert(handle, Py::from(obj)));
+    Ok(handle)
+}
+
+/// Resolve a pinned handle back to the live object; `None` when the handle
+/// was never minted or the pins were reset (the per-build boundary).
+pub(crate) fn object_of(py: Python<'_>, handle: u64) -> Option<Py<PyAny>> {
+    TARGET_PINS.with(|cell| cell.borrow().get(&handle).map(|pin| pin.clone_ref(py)))
+}
+
+/// Drop every target pin; returns how many were held. The pins drop only
+/// after the borrow is released (a release can run a Python deallocator
+/// that would re-enter on the active borrow).
+pub(crate) fn reset_pins() -> usize {
+    let (count, pins) = TARGET_PINS.with(|cell| {
+        let mut pins = cell.borrow_mut();
+        let count = pins.len();
+        (count, pins.drain().map(|(_, pin)| pin).collect::<Vec<_>>())
+    });
+    drop(pins);
+    count
+}
+
+/// Number of live target pins (audit + tests).
+pub(crate) fn pin_count() -> usize {
+    TARGET_PINS.with(|cell| cell.borrow().len())
 }
 
 // ---- pyfunction wrappers ----
@@ -258,6 +306,27 @@ pub(crate) fn rust_node_mirror_entry_count() -> usize {
 #[pyfunction]
 pub(crate) fn rust_node_mirror_handle_of(obj: &PyAny) -> Option<u64> {
     identity::handle_of(obj)
+}
+
+/// Pin a captured binding target under its identity handle (#1787);
+/// returns the handle. Idempotent: a target reached by many RefExprs
+/// holds one pin.
+#[pyfunction]
+pub(crate) fn rust_node_mirror_capture_pin(obj: &PyAny) -> PyResult<u64> {
+    capture_pin(obj)
+}
+
+/// Resolve a pinned handle back to the live object; None when the handle
+/// was never minted or the per-build reset dropped its pin (#1787).
+#[pyfunction]
+pub(crate) fn rust_node_mirror_object_of(py: Python<'_>, handle: u64) -> Option<Py<PyAny>> {
+    object_of(py, handle)
+}
+
+/// Live binding-target pin count (audit + tests).
+#[pyfunction]
+pub(crate) fn rust_node_mirror_pin_count() -> usize {
+    pin_count()
 }
 
 // ---- G1.0b: remaining G1 expression fields (wave 71A, #1576) ----
@@ -1303,6 +1372,61 @@ mod node_mirror_tests {
             assert_eq!(rust_node_mirror_analyzed(h), Some((true, None)));
         });
     }
+
+    #[test]
+    fn test_capture_pin_roundtrip_resolves_identity() {
+        with_py(|py| {
+            reset();
+            let obj = fresh_object(py);
+            let h = capture_pin(obj).unwrap();
+            assert_eq!(identity::handle_of(obj), Some(h));
+            assert_eq!(pin_count(), 1);
+            let back = object_of(py, h).unwrap();
+            assert_eq!(back.as_ptr(), obj.as_ptr());
+            // Idempotent: the same target keeps one pin under one handle.
+            assert_eq!(capture_pin(obj).unwrap(), h);
+            assert_eq!(pin_count(), 1);
+        });
+    }
+
+    #[test]
+    fn test_two_targets_never_share_a_handle() {
+        with_py(|py| {
+            reset();
+            let a = fresh_object(py);
+            let b = fresh_object(py);
+            let ha = capture_pin(a).unwrap();
+            let hb = capture_pin(b).unwrap();
+            assert_ne!(ha, hb);
+            assert_eq!(object_of(py, ha).unwrap().as_ptr(), a.as_ptr());
+            assert_eq!(object_of(py, hb).unwrap().as_ptr(), b.as_ptr());
+            assert_eq!(pin_count(), 2);
+        });
+    }
+
+    #[test]
+    fn test_reset_drops_target_pins_not_identity() {
+        with_py(|py| {
+            reset();
+            let obj = fresh_object(py);
+            let h = capture_pin(obj).unwrap();
+            assert_eq!(reset(), 0);
+            assert_eq!(pin_count(), 0);
+            assert!(object_of(py, h).is_none());
+            // Like the entry/pin resets, the identity registry survives so
+            // other seams' handles stay valid across the build boundary.
+            assert_eq!(identity::handle_of(obj), Some(h));
+        });
+    }
+
+    #[test]
+    fn test_object_of_unknown_handle_is_none() {
+        with_py(|py| {
+            reset();
+            assert!(object_of(py, 0).is_none());
+            assert!(object_of(py, u64::MAX).is_none());
+        });
+    }
 }
 
 /// G1.0b field-record tests (wave 71A, #1576), separate from the G1.0a
@@ -1550,6 +1674,15 @@ pub(crate) fn register_registry(m: &PyModule) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(rust_node_mirror_entry_count, m)?)?;
 
     m.add_function(wrap_pyfunction!(rust_node_mirror_handle_of, m)?)?;
+
+    // Phase G2 (#1787): binding-target handle pins. The mint rides the
+    // RefExpr capture path; `object_of` is the read-back a later serving
+    // or Var-key consumer resolves handles through. Record-only.
+    m.add_function(wrap_pyfunction!(rust_node_mirror_capture_pin, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_node_mirror_object_of, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_node_mirror_pin_count, m)?)?;
 
     // Phase G1.0b (#1576): per-field records for the remaining G1
     // expression analysis fields. Capture-only, same identity handles.
