@@ -441,9 +441,9 @@ class NodeShadowServingSuite(Suite):
         fails = self._m.report().get("capture_fail.ref", 0)
         # Out-of-contract: a present non-int must fail the capture.
         member.kind = "bogus"  # type: ignore[assignment]
-        assert self._m.report().get("capture_fail.ref", 0) == fails + 1, (
-            "the non-int kind must fail the Option<i64> capture"
-        )
+        assert (
+            self._m.report().get("capture_fail.ref", 0) == fails + 1
+        ), "the non-int kind must fail the Option<i64> capture"
         self._apply_control(member)
         assert member.kind is not None, "the live slot holds a present kind"
 
@@ -456,9 +456,10 @@ class NodeShadowServingSuite(Suite):
         served = self._k.rust_node_mirror_serve_ref(member)
         assert served is not None
         mode1_answers_none = served[0] is None  # the served record
-        assert (mode0_answers_none, mode1_answers_none) == (False, True), (
-            "mode 0 answers the live kind, mode 1 answers the stale one"
-        )
+        assert (mode0_answers_none, mode1_answers_none) == (
+            False,
+            True,
+        ), "mode 0 answers the live kind, mode 1 answers the stale one"
         assert self._k.rust_node_mirror_verify_ref(member) is False
 
         self._assert_mode_answers(tree, type_map)
@@ -490,9 +491,9 @@ class NodeShadowServingSuite(Suite):
         fails = self._m.report().get("capture_fail.ref", 0)
         # Out-of-contract: a `None` `_fullname` must fail the capture.
         member._fullname = None  # type: ignore[assignment]
-        assert self._m.report().get("capture_fail.ref", 0) == fails + 1, (
-            "a None _fullname must fail the String capture"
-        )
+        assert (
+            self._m.report().get("capture_fail.ref", 0) == fails + 1
+        ), "a None _fullname must fail the String capture"
         self._apply_control(member)
         # `str | None` keeps the read out of `fullname: str`'s narrowing.
         live_fullname: str | None = member.fullname
@@ -506,9 +507,9 @@ class NodeShadowServingSuite(Suite):
         served = self._k.rust_node_mirror_serve_ref(member)
         assert served is not None
         mode1_fullname = served[2]  # the served record
-        assert mode0_fullname is None and mode1_fullname == "main.y", (
-            "mode 0 answers the live fullname, mode 1 answers the stale one"
-        )
+        assert (
+            mode0_fullname is None and mode1_fullname == "main.y"
+        ), "mode 0 answers the live fullname, mode 1 answers the stale one"
         assert self._k.rust_node_mirror_verify_ref(member) is False
 
         self._assert_mode_answers(tree, type_map, logical=True)
@@ -516,6 +517,6 @@ class NodeShadowServingSuite(Suite):
         # serve count above the process_lvalue one proves the tail answered
         # the lvalue too, so the stale fullname was served by that site.
         mode1 = self._walk_mode(tree, type_map, 1, logical=True)
-        assert mode1.get("served", 0) >= 2, (
-            "the logical-deps tail must serve the lvalue beside process_lvalue"
-        )
+        assert (
+            mode1.get("served", 0) >= 2
+        ), "the logical-deps tail must serve the lvalue beside process_lvalue"
