@@ -29,7 +29,7 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 
-use pyo3::exceptions::PyValueError;
+use pyo3::exceptions::{PyException, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 
@@ -783,14 +783,20 @@ fn live_flag(obj: &PyAny, name: &str) -> Result<bool, ()> {
 /// target is `None`, its `fullname` is not a `str`, or reading it raises
 /// (the capture records `None` for the same states, so both sides agree).
 /// An unreadable `node` slot itself stays an error: the capture would have
-/// failed wholesale there, so no record exists to compare against.
+/// failed wholesale there, so no record exists to compare against. Only an
+/// `Exception` from `fullname` reads as `None`, matching `_capture_ref`'s
+/// `except Exception`; a broader error stays a compare error.
 fn live_node_fullname(obj: &PyAny) -> Result<Option<String>, ()> {
     let target = obj.getattr("node").map_err(|_| ())?;
     if target.is_none() {
         return Ok(None);
     }
-    let fullname = target.getattr("fullname").ok();
-    Ok(fullname.and_then(|f| f.extract::<String>().ok()))
+    let py = obj.py();
+    match target.getattr("fullname") {
+        Ok(fullname) => Ok(fullname.extract::<String>().ok()),
+        Err(err) if err.is_instance(py, py.get_type::<PyException>()) => Ok(None),
+        Err(_) => Err(()),
+    }
 }
 
 /// Mode-2 differential: compare the served snapshot against the live slots
@@ -799,7 +805,8 @@ fn live_node_fullname(obj: &PyAny) -> Result<Option<String>, ()> {
 /// Every call is counted, and an unreadable scalar counts as a compare
 /// error *and* a mismatch, so a probe that cannot read cannot report
 /// success. The one exception is the target `fullname`, which the capture
-/// itself records as `None` when unreadable (`live_node_fullname`).
+/// records as `None` when it raises `Exception` (`live_node_fullname`); a
+/// `BaseException` stays an error like any other unreadable scalar.
 pub(crate) fn compare_ref_scalars(obj: &PyAny, served: &RefScalars) -> bool {
     bump(|state| state.compared += 1);
     let checks: [Result<bool, ()>; 5] = [
@@ -1836,6 +1843,29 @@ mod g1_serving_tests {
             assert_eq!(verify_ref_scalars(obj), Some(true));
             let (_, served, _, _, compared, mismatched, errors) = served_counters();
             assert_eq!((served, compared, mismatched, errors), (1, 1, 0, 0));
+        });
+    }
+
+    #[test]
+    fn test_a_base_exception_fullname_stays_a_compare_error() {
+        with_py(|py| {
+            start(2);
+            // `_capture_ref` swallows only `Exception` subclasses, so a
+            // broader error (KeyboardInterrupt) must not read as the `None`
+            // the capture records: it stays an unreadable scalar (#1780).
+            let obj = py
+                .eval(
+                    "type('R_interrupt', (), {'kind': None, 'fullname': '', 'is_new_def': False, \
+                     'is_inferred_def': False, 'node': type('T', (), {'fullname': \
+                     property(lambda self: (_ for _ in ()).throw(KeyboardInterrupt))})()})()",
+                    None,
+                    None,
+                )
+                .unwrap();
+            capture_ref(obj, None, None, "".into(), false, false).unwrap();
+            assert_eq!(verify_ref_scalars(obj), Some(false));
+            let (_, served, _, _, compared, mismatched, errors) = served_counters();
+            assert_eq!((served, compared, mismatched, errors), (1, 1, 1, 1));
         });
     }
 
