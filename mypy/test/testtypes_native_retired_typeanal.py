@@ -309,12 +309,7 @@ class NativeUnknownUnpackRetiredSuite(Suite):
 
         from mypy.typeanal import _serialize_typeanal_type
 
-        infos = [
-            v
-            for n in dir(self.fx)
-            for v in (getattr(self.fx, n),)
-            if _is_type_info(v)
-        ]
+        infos = [v for n in dir(self.fx) for v in (getattr(self.fx, n),) if _is_type_info(v)]
         resolver = type_kernel.build_native_resolver(infos, [])
         plain = _serialize_typeanal_type(Instance(self.fx.std_listi, [self.fx.a]))
         unpack = _serialize_typeanal_type(UnpackType(AnyType(TypeOfAny.special_form)))
