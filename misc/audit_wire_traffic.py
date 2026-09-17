@@ -108,6 +108,10 @@ deferred_pair: collections.Counter = collections.Counter()
 seam_calls: collections.Counter = collections.Counter()
 seam_defers: collections.Counter = collections.Counter()
 seam_bytes: collections.Counter = collections.Counter()
+# Every `rust_*` name wrapped in patch_kernel(), called or not. A
+# call-counter census is otherwise silent about seams whose call sites
+# are shadowed by another answering seam (they leave no row to rank).
+registered_seams: set[str] = set()
 # Blob bytes passed to the seam on EVERY call (wire-cache hits included);
 # this is the per-call payload the Rust side re-decodes, the dominant
 # per-call cost for whole-tree wire seams.
@@ -259,6 +263,7 @@ def patch_kernel() -> int:
         attr = getattr(type_kernel, name)
         if not callable(attr):
             continue
+        registered_seams.add(name)
         setattr(type_kernel, name, make_seam(name, attr))
         n += 1
     return n
@@ -362,7 +367,11 @@ def report() -> None:
     tot = sum(useful.values()) + sum(deferred.values()) + sum(unconsumed.values())
     import mypy as _mypy
 
+    n_reg = len(registered_seams)
+    n_called = len(seam_calls)
+    n_zero = n_reg - n_called
     print("\n=== #1624 wire-waste audit (self-check) ===", file=out)
+    print(f"[audit] {n_reg} seams registered, {n_called} called, {n_zero} zero-call", file=out)
     print(f"source tree: {_mypy.__file__}", file=out)
     print(f"serialization events: {tot}", file=out)
     print(f"  useful:      {sum(useful.values())} ({sum(useful_bytes.values())} B)", file=out)
@@ -387,10 +396,20 @@ def report() -> None:
         print(f"  {cnt:8d}  {useful_bytes[site_]:10d}B  {site_}", file=out)
 
     print("\n--- ALL seams with calls (calls / defers / bytes first-consumed) ---", file=out)
+    print(
+        f"  total seam calls (armed gates only; "
+        f"lower bound on the registered surface): {sum(seam_calls.values())}",
+        file=out,
+    )
     for seam, cnt in seam_calls.most_common():
         d = seam_defers.get(seam, 0)
         b = seam_bytes.get(seam, 0)
         print(f"  {seam}: {cnt} calls, {d} defers, {b}B", file=out)
+
+    zero = sorted(registered_seams - seam_calls.keys())
+    print(f"\n--- Z. registered seams with ZERO calls ({len(zero)}) ---", file=out)
+    for seam in zero:
+        print(f"  {seam}", file=out)
 
     # Ranked cost proxy: calls * fixed FFI + per-call payload bytes (re-decoded
     # on every wire call) + first-consumed bytes. The constants and their
@@ -450,6 +469,16 @@ def main() -> int:
     n_probe = patch_probes()
     print(
         f"[audit] patched {n_seams} seams, {n_ser} serializers, {n_probe} probes", file=sys.stderr
+    )
+    semanal_flag = os.environ.get("MYPY_ENABLE_NATIVE_SEMANAL")
+    if semanal_flag:
+        gate_state = "armed (native_type_kernel default on)"
+    else:
+        gate_state = "DARK"
+    print(
+        f"[audit] MYPY_ENABLE_NATIVE_SEMANAL={semanal_flag!r}; "
+        f"semanal/semanal-visitor gates {gate_state}",
+        file=sys.stderr,
     )
     extra = os.environ.get("MYPY_AUDIT_ARGS")
     if extra:

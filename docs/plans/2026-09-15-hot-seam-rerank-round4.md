@@ -46,6 +46,10 @@ PYTHONPATH=$PWD:/private/tmp/mypy-rs-perf4-tk:/private/tmp/mypy-rs-local-ast:/pr
   .venv/bin/python misc/audit_wire_traffic.py
 ```
 
+The command leaves `MYPY_ENABLE_NATIVE_SEMANAL` unset, so the semanal.py
+family (~110 seams) and the semanal-visitor `rust_visit_*` family are dark;
+totals are a lower bound on the registered surface (#1754).
+
 Two additive deviations from the 09-14 harness, neither touching the method:
 `--dump-build-stats` + `MYPY_SERIALIZE_STATS=1` now also emit the global
 serialize totals, and `MYPY_AUDIT_ROOT` drops the `.venv` editable finder when
