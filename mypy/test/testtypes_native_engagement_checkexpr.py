@@ -4044,7 +4044,9 @@ class NativeEnumProtocolClassifierSuite(Suite):
     #1739 retired the `is_enum_callable_base` shim (6.80x-12.37x the Python
     predicate, which is `isinstance` plus a frozenset lookup): these are
     direct-seam tests for the still-registered pyfunction only. The
-    `typeobj_gate` seam stays wired and is measured as a keep.
+    `typeobj_gate` pyfunction stays registered but is no longer called from
+    production: #1833 retired it after re-measuring with production shape
+    weights (1.02x-1.07x the Python body), reversing #1830's per-shape keep.
     """
 
     def setUp(self) -> None:

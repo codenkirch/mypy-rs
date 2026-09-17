@@ -16,7 +16,18 @@ except ImportError:
 
 from unittest import skipUnless
 
-from mypy.nodes import ARG_POS, ARG_STAR, ARG_STAR2, ArgKind, TypeInfo
+from mypy.nodes import (
+    ARG_POS,
+    ARG_STAR,
+    ARG_STAR2,
+    MDEF,
+    ArgKind,
+    Context,
+    MypyFile,
+    SymbolTable,
+    SymbolTableNode,
+    TypeInfo,
+)
 from mypy.test.helpers import Suite
 from mypy.test.testtypes import _NATIVE_WIRE_ENABLED
 from mypy.test.typefixture import TypeFixture
@@ -319,18 +330,17 @@ class NativeClassifyTypeobjGateRetiredSuite(Suite):
         src = inspect.getsource(checkexpr.ExpressionChecker.check_callable_call)
         assert "rust_classify_typeobj_gate" not in src, "check_callable_call should be pure Python"
 
-    def test_no_rust_gate_loaded_with_gate_on(self) -> None:
+    def test_no_rust_name_in_co_names(self) -> None:
         # Not "no rust_ name at all": the head legitimately still loads
         # `_rust_solve_generic_call` and `_rust_calibrate_type_obj_return`.
-        from mypy.checkexpr import ExpressionChecker, _set_native_checkexpr_active
+        # `co_names` is a static attribute of the code object and does not
+        # vary with `_set_native_checkexpr_active`, so this pins the source
+        # of the retirement, not the toggle (#1847).
+        from mypy.checkexpr import ExpressionChecker
 
         dead = ("_rust_classify_typeobj_gate",)
         names = ExpressionChecker.check_callable_call.__code__.co_names
-        _set_native_checkexpr_active(True)
-        try:
-            loaded = [n for n in names if n in dead]
-        finally:
-            _set_native_checkexpr_active(False)
+        loaded = [n for n in names if n in dead]
         assert loaded == [], f"check_callable_call still loads {loaded}"
 
     def test_tag_default_is_gone_and_all_arms_assign(self) -> None:
@@ -370,7 +380,6 @@ class NativeClassifyTypeobjGateRetiredSuite(Suite):
         from mypy.checkexpr import ExpressionChecker, _set_native_checkexpr_active
         from mypy.errors import Errors
         from mypy.messages import MessageBuilder
-        from mypy.nodes import Context, MypyFile, SymbolTable
         from mypy.options import Options
         from mypy.plugin import Plugin
 
@@ -379,7 +388,30 @@ class NativeClassifyTypeobjGateRetiredSuite(Suite):
         tree = MypyFile([], [])
         tree.is_stub = True
         tree.names = SymbolTable()
-        chk = TypeChecker(errors, {}, options, tree, "", Plugin(options), {})
+        # A bare checker must resolve `typing`/`builtins`: the call proceeds
+        # past the gate into `check_argument_types`, and the KeyError it hit
+        # there used to be swallowed, so a crash read as "no fail fired" (#1847).
+        modules = {
+            "typing": self._module_tree(("Mapping", "Iterable", "Sequence"), self.fx),
+            "builtins": self._module_tree(
+                (
+                    "dict",
+                    "list",
+                    "tuple",
+                    "set",
+                    "frozenset",
+                    "type",
+                    "object",
+                    "int",
+                    "str",
+                    "bytes",
+                    "bool",
+                    "float",
+                ),
+                self.fx,
+            ),
+        }
+        chk = TypeChecker(errors, modules, options, tree, "", Plugin(options), {})
         ec = ExpressionChecker(chk, MessageBuilder(errors, {}), Plugin(options), {})
         captured: list[str] = []
         ec.chk.fail = lambda m, ctx, code=None: captured.append("protocol")  # type: ignore[method-assign, misc, assignment]
@@ -389,11 +421,20 @@ class NativeClassifyTypeobjGateRetiredSuite(Suite):
         _set_native_checkexpr_active(gate)
         try:
             ec.check_callable_call(callee, [], [], Context(), None, None, None, None)
-        except Exception as err:
-            captured.append(f"exc:{type(err).__name__}")
         finally:
             _set_native_checkexpr_active(False)
         return captured
+
+    @staticmethod
+    def _module_tree(names: tuple[str, ...], fx: TypeFixture) -> MypyFile:
+        """A MypyFile instantiating each bare-name lookup the harness needs."""
+
+        tree = MypyFile([], [])
+        tree.names = SymbolTable()
+        for name in names:
+            info = fx.make_type_info(f"typing.{name}" if name[0].isupper() else name)
+            tree.names[name] = SymbolTableNode(MDEF, info)
+        return tree
 
     def _type_object_callable(self, info: TypeInfo, from_type_type: bool = False) -> CallableType:
         from mypy.types import Instance
@@ -421,13 +462,16 @@ class NativeClassifyTypeobjGateRetiredSuite(Suite):
         assert "abstract" in self._fails(self._type_object_callable(self._abstract_info()), True)
 
     def test_plain_typeobj_fires_no_gate_fail(self) -> None:
+        # `_fails` no longer swallows the KeyError a bare checker raised, so a
+        # crash under the call fails this test rather than satisfying it (#1847).
         got = self._fails(self.fx.callable_type(self.fx.a, self.fx.b), True)
         assert "protocol" not in got
         assert "abstract" not in got
 
     def test_gate_toggle_is_inert_for_this_body(self) -> None:
         # With no Rust arm left the toggle cannot change the captured fails;
-        # a re-wired call would show up here as a differential.
+        # a re-wired call would show up here as a differential. A raise cannot
+        # masquerade as a differential: it propagates out of `_fails` (#1847).
         for info in (self._protocol_info(), self._abstract_info()):
             callee = self._type_object_callable(info)
             assert self._fails(callee, False) == self._fails(callee, True)
