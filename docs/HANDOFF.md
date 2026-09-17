@@ -1,5 +1,116 @@
 # Handoff: strangler-fig Rust migration loop (seam-deferral reduction)
 
+## RESUME POINT — 2026-09-17, afternoon (wave 9 close: 12 PRs landed, #1787 PR A+B in, Var-key lane in flight)
+
+`main` = `0aa7844a6` (#1804, #1787 PR B — the wave's last merge). Twelve PRs
+landed this wave, eleven issues closed (#1795 closed by merge).
+
+### Wave-9 lane outcomes
+
+| PR | issue | outcome |
+|---|---|---|
+| #1788 | #1761 | perf: retired the `rust_unknown_unpack` wire seam |
+| #1790 | #1787 PR A | store extension + Var handle substrate |
+| #1792 | #1763 | chore: retired the write-only visitor resolver + dead test registration |
+| #1793 | #1786 | test: derive binding-hygiene names from the suites |
+| #1797 | #1791 | docs: regenerated the stale G1.2 node-shadow audit tables |
+| #1798 | #1754 | fix(audit): report zero-call registered seams and semanal gate state |
+| #1799 | #1789 | fix(harness): make cross-tree suite runs fail loudly |
+| #1801 | #1796 | ci: gate the G1.2 audit tables on verdict-only drift |
+| #1803 | #1802 | ci: drop the audit gate's runtime ripgrep install |
+| #1805 | #1794 | test(mirror): inject `_rust_remove_dups` with plain assignment |
+| #1806 | #1773 | feat: seed the symtable shadow from the fixed-format cache reader |
+| #1804 | #1787 PR B, closes #1795 | feat: statement-family serving read flip (`MYPY_TK_STMT_READ_FLIP`) |
+
+### #1787 progression (the wave's spine)
+
+PR A (#1790) extended the meta store and added the Var handle substrate; PR B
+(#1804) delivered the statement-family serving read flip over the single
+registered statement field native code reads live, `Block.is_unreachable`
+(gate `MYPY_TK_STMT_READ_FLIP`, modes 0 off / 1 serve / 2 serve+differential),
+plus `rust_node_mirror_object_of`. The default stays mode 0: no `Options`
+default moved, so both PRs are T2. **#1787 stays open for the Var-key flip**
+(§2 option A, gate `MYPY_TK_VAR_KEY_FLIP`) — that lane is in flight (below).
+
+### #1795 resolved: validate inside `object_of`
+
+`capture_pin` keys pins by identity handle and `object_of` resolves a handle
+back to the pinned object; before the fix `object_of` answered from
+`TARGET_PINS` alone while `handle_of` delegated to the identity layer, so after
+an identity-only reset a stale pin could still resolve and the two read-backs
+disagreed. Verdict: **`object_of` now validates** (`identity::handle_of(pin) ==
+handle`), not a documented independence. Rationale recorded in the ledger:
+divergence is unreachable in the production reset order, the validation is one
+cold thread-local lookup (not the PyO3 round-trip class #1785 rejected for
+compare-before-answer), and the fail direction is the defer (`None`), never a
+wrong object. The Var-key lane inherits the invariant `object_of(h) = Some(obj)
+=> handle_of(obj) = Some(h)`.
+
+### Audit gate and harness guard are now load-bearing
+
+- **Audit gate** (#1798, #1801, #1803): the census now prints `N registered, M
+  called, K zero-call` plus a `registered seams with ZERO calls` section, and
+  labels the ALL-seams total a *lower bound* (the pinned command leaves
+  `MYPY_ENABLE_NATIVE_SEMANAL` unset, so the semanal families are dark by
+  design). #1801 gates the tables on **verdict-only** drift, so line-anchor
+  shifts no longer trip it, and #1803 dropped the runtime ripgrep install — the
+  gate is anchor-insensitive and no longer depends on `rg`.
+- **Harness guard** (#1799): `mypy/test/conftest.py` asserts, before any suite
+  code runs and in **every** xdist worker, that the imported `mypy` lives in
+  the tree under test; `scripts/assert_worktree_import.py` is the documented
+  pre-flight (it strips the editable finder and the cwd `sys.path[0]` entry,
+  both of which defeat the old `PYTHONPATH=... python -c "import mypy"`
+  incantation). Cross-tree hollow green now fails loudly (rc=4) instead of
+  reporting engagement against a foreign tree.
+
+### #1754 correction (mechanism refuted)
+
+The originally-recorded "0-defer filter" mechanism was **wrong**: the script was
+never a filter. The real blind spot is **registered seams that are never
+called** — seams shadowed by another answering seam (`rust_is_duplicate_mapping`
+sat dark behind `rust_check_argument_count` until #1747 retired it, then became
+the #1 seam) leave no row for a call-counter census to rank, and the semanal
+family (~110 seams) is dark in every census run. Fixed by the zero-call section
+above; corrigenda posted on #1739 and #1754.
+
+### In flight (dispatch 2026-09-17 afternoon)
+
+- **`fix/1807-symtable-seed-fail-closed`** (pool w2, meta-speed): the two
+  defensive-path consistency gaps OCR left on PR #1806 (post-`prepare_seed`
+  re-check tests only `by_owner`; `len().unwrap_or(0)` maps a failed read to
+  "empty" against the fail-closed doc). Advisory severity, no observable
+  defect today.
+- **`feat/1787-varkey-handle-scheme`** (pool w1, meta-speed): #1787 §2 option A
+  — mint a store handle for the `Var` at `_capture_ref`, emit `("Var", handle)`
+  in `literal_hash` under `MYPY_TK_VAR_KEY_FLIP` (mode 0 keeps the live object
+  key), resolve handle→Var through `rust_node_mirror_object_of`, with identity /
+  injectivity / mint-order / negative-control tests and a mode-2
+  `key_translation.deferred == 0` differential.
+
+### Advisory dispositions (PR #1804 review of record)
+
+Two `low` / advisory findings, verified real, **not applied** (an advisory-only
+commit would force a full CI cycle for no correctness gain):
+`mypy/test/testtypes_native_mirror.py:4513` should read `self._k` not
+`self._m._kernel_mod`; `mypy/test/testtypes_native_stmt_read.py:71` has a dead
+`self.fx = TypeFixture()` and an unused `TypeFixture` import. Both ride along
+with the next lane touching those files.
+
+### Next queue
+
+1. Land the two in-flight lanes above (both must stop at CI-green for the
+   orchestrator to review and merge).
+2. **#1785** — served `RefView` answers can drift from live slots for
+   out-of-contract writes (`depswalk.rs` `RefView::kind_is_none` /
+   `fullname_opt`). Needs the narrow-vs-document contract decision before any
+   gate that serves those fields is promoted.
+3. **#1800** — the shared venv holds a real but stale `ast_serialize` 0.6.0
+   wheel; fix touches the shared venv, so run it only when no lane is mid-run.
+4. **#1770** (H1 Rust traversal driver) and **#1624** (handle caching at
+   `checker_functions.rs:42-47`) remain the larger open direction; **#1745**
+   (branch protection on `main` — every gate is advisory-only) is an owner
+   decision.
+
 ## RESUME POINT — 2026-09-17, morning (wave 8 close: lanes landed, counters published, timing leg retired)
 
 All five wave-8 lanes are resolved. `main` = `f191bb71a`+ (G1.1 `#1777`, suite
