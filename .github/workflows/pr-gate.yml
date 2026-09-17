@@ -193,6 +193,13 @@ jobs:
         # Source-tree only: python3 + ripgrep, no kernel or corpus. Line
         # anchors are normalised out of both sides, so this fires on a
         # verdict/served-as change, not on file:NNN churn (#1796).
+        # The runner image does not ship ripgrep, and the generator shells
+        # out to `rg` for its call-site derivation: install it explicitly
+        # rather than assume it, or the gate fails with FileNotFoundError.
         run: |
+          if ! command -v rg > /dev/null; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq ripgrep
+          fi
           python3 misc/g12_node_shadow_audit.py --check \
             docs/plans/2026-09-15-g12-node-shadow-fidelity-audit.md
