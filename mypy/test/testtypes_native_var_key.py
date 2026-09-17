@@ -222,12 +222,67 @@ class VarKeyTranslationSuite(Suite):
         self._pin(var)
         key = self._key(var, 2)
         live_key = ("Var", var)
-        # The translated key is hashable and looks up its own entry, and the
-        # live-key computation resolves through the same Var.
-        d = {key: var}
-        assert d[key] is var
-        assert d.get(key) is self._extract(live_key)
-        assert {live_key: 1}.get(live_key) == 1
+        assert key != live_key, "mode 2 must translate, not pass the live key through"
+        # Distinct Vars must not conflate: two translated keys, one dict, two
+        # entries, each resolving back to its own Var.
+        other = Var("y")
+        self._pin(other)
+        other_key = self._key(other, 2)
+        assert other_key != key
+        d = {key: var, other_key: other}
+        assert len(d) == 2, "distinct Vars must not share a key"
+        assert d[key] is var and d[other_key] is other
+        assert self._extract(key) is var and self._extract(other_key) is other
+
+    # -- the raw seam: both entry points, not merely registered --
+
+    def test_mode_zero_serves_and_verifies_nothing(self) -> None:
+        var = Var("x")
+        self._pin(var)
+        self._m.set_var_key_flip(0)
+        assert self._k.rust_node_mirror_serve_var_key(var) is None
+        assert self._k.rust_node_mirror_verify_var_key(var) is None
+        counters = self._m.var_key_counters()
+        assert counters["served"] == 0
+        assert counters["compared"] == 0
+        assert counters["deferred_off"] == 2, "both entry points count the off defer"
+
+    def test_verify_answers_coherence_without_emitting_a_key(self) -> None:
+        var = Var("x")
+        self._pin(var)
+        self._m.set_var_key_flip(1)
+        assert self._k.rust_node_mirror_serve_var_key(var) is not None
+        assert self._k.rust_node_mirror_verify_var_key(var) is True
+        counters = self._m.var_key_counters()
+        # `serve` emits the key element, `verify` only compares: `served`
+        # counts emissions, so only the `serve` call may move it.
+        assert counters["served"] == 1
+        assert counters["compared"] == 1
+        assert counters["mismatched"] == 0
+
+    def test_the_env_gate_activates_the_positive_path(self) -> None:
+        # The one-shot guard short-circuits a re-activate, so drop it like the
+        # sibling stmt suite does; the env var must then engage the mode.
+        env_name = self._m._VAR_KEY_FLIP_ENV
+        saved_active = self._m._active
+        saved_env = os.environ.get(env_name)
+        try:
+            os.environ[env_name] = "2"
+            self._m._active = False
+            assert self._m.activate() is True
+            assert self._m.var_key_flip() == 2, "the env gate must engage the mode"
+            var = Var("x")
+            self._pin(var)
+            key = self._key(var, 2)
+            assert isinstance(key[1], int), "the env-gated mode must serve handles"
+        finally:
+            self._m._active = saved_active
+            if saved_env is None:
+                os.environ.pop(env_name, None)
+            else:
+                os.environ[env_name] = saved_env
+            self._m.set_var_key_flip(0)
+            self._m._uninstall_var_key_hooks()
 
     # -- the gate's own state handling (#1779) --
 

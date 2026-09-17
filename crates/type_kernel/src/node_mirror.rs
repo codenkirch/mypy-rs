@@ -1435,10 +1435,11 @@ pub(crate) fn translate_var_key(py: Python<'_>, obj: &PyAny) -> Option<u64> {
     Some(handle)
 }
 
-/// The differential entry point: `Some(matched)` when the handle was
-/// emitted, `None` when the key stayed live. Counts one comparison either
-/// way. This is the read the negative control drives, so it must be usable
-/// in mode 1 where the producing path does not compare by itself.
+/// The standalone differential for one `Var`: `Some(matched)` when the
+/// identity handle resolves to this exact object, `None` when mode 0 or no
+/// handle/pin exists. It emits no key, so it never moves `served`; the
+/// producing path (`translate_var_key`) owns that counter, and the lane's
+/// suite drives this entry directly. Counts one comparison per call.
 pub(crate) fn verify_var_key(py: Python<'_>, obj: &PyAny) -> Option<bool> {
     if var_key_mode() == 0 {
         bump_var_key(|state| state.deferred_off += 1);
@@ -1456,7 +1457,6 @@ pub(crate) fn verify_var_key(py: Python<'_>, obj: &PyAny) -> Option<bool> {
     if !matched {
         bump_var_key(|state| state.mismatched += 1);
     }
-    bump_var_key(|state| state.served += 1);
     Some(matched)
 }
 
