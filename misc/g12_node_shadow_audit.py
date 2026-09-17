@@ -13,8 +13,12 @@ from the code:
 - Mutation evidence for every gap: assignment sites of that slot outside
   the defining module, with file:line anchors.
 
-Run it from the repo root; ``--check`` exits non-zero when the committed
-document no longer matches the derived tables::
+Run it from the repo root; ``--check`` exits non-zero when a verdict or
+served-as value in the committed document no longer matches the derived
+tables. The volatile line anchors (``nodes.py:NNN``, ``node_mirror.rs:NNN``
+and the ``nodes_mirror.py:NNN via `_G2_TRACKED[Cls]` `` homes) are
+normalised out of both sides first, so unrelated line-number churn does not
+fire the check::
 
     .venv/bin/python misc/g12_node_shadow_audit.py > docs/plans/<doc>.md
     .venv/bin/python misc/g12_node_shadow_audit.py --check docs/plans/<doc>.md
@@ -187,9 +191,7 @@ def parse_slots(path: Path) -> dict[str, list[Slot]]:
         for stmt in node.body:
             if not isinstance(stmt, ast.Assign):
                 continue
-            if not any(
-                isinstance(t, ast.Name) and t.id == "__slots__" for t in stmt.targets
-            ):
+            if not any(isinstance(t, ast.Name) and t.id == "__slots__" for t in stmt.targets):
                 continue
             slots.extend(Slot(name, line) for name, line in _literal_strings(stmt.value))
         if slots:
@@ -234,7 +236,10 @@ def parse_tracked(path: Path) -> list[Tracked]:
         table = _assign_target(node)
         if table is None or not table.startswith("_"):
             continue
-        entries = [Tracked(name, line, table) for name, line in _resolve_members(_assign_value(node), flat)]
+        entries = [
+            Tracked(name, line, table)
+            for name, line in _resolve_members(_assign_value(node), flat)
+        ]
         flat.setdefault(table, []).extend(entries)
         out.extend(entries)
     return out
@@ -374,10 +379,7 @@ def mutation_sites(slot: str, owner: str, limit: int = 3) -> list[str]:
     """
     pattern = rf"\.{re.escape(slot)}\s*=[^=]"
     proc = subprocess.run(
-        ["rg", "-n", "--no-heading", pattern, "mypy"],
-        cwd=ROOT,
-        capture_output=True,
-        text=True,
+        ["rg", "-n", "--no-heading", pattern, "mypy"], cwd=ROOT, capture_output=True, text=True
     )
     hits: list[tuple[str, str]] = []
     seen: set[str] = set()
@@ -492,7 +494,9 @@ def emit() -> str:
                     "name": "Text",
                 }.get(slot.name, "?")
                 rust = f"`node_mirror.rs:{shape.variants.get(variant, 0)}`"
-                served = f"`FieldValue::{variant}` (`nodes_mirror.py:{g1_lines.get(slot.name, 0)}`)"
+                served = (
+                    f"`FieldValue::{variant}` (`nodes_mirror.py:{g1_lines.get(slot.name, 0)}`)"
+                )
             else:
                 rust = "-"
                 served = "-"
@@ -514,9 +518,7 @@ def emit() -> str:
             entries = [t for t in g2_map.get(cls, []) if t.name == slot.name]
             tracked = bool(entries)
             if tracked:
-                anchor = (
-                    f"`nodes_mirror.py:{entries[0].line}` via `{entries[0].table}[{cls}]`"
-                )
+                anchor = f"`nodes_mirror.py:{entries[0].line}` via `{entries[0].table}[{cls}]`"
             else:
                 anchor = "-"
             sites = [] if tracked else writes(slot.name, cls)
@@ -535,7 +537,11 @@ def emit() -> str:
             if not entries and slot.name in g3_names:
                 entries = [t for t in g3_tracked if t.name == slot.name]
             tracked = bool(entries)
-            anchor = f"`symtables_mirror.py:{entries[0].line}` via `{entries[0].table}`" if tracked else "-"
+            anchor = (
+                f"`symtables_mirror.py:{entries[0].line}` via `{entries[0].table}`"
+                if tracked
+                else "-"
+            )
             sites = [] if tracked else writes(slot.name, cls)
             verdict = _verdict(slot.name, tracked, len(sites))
             lines.append(
@@ -570,6 +576,27 @@ def emit() -> str:
     return "\n".join(lines) + "\n"
 
 
+# Every line-bearing anchor emit() writes: the slot column `(nodes.py:NNN)`,
+# the Rust/served-as refs `node_mirror.rs:NNN` / `(nodes_mirror.py:NNN)`, and
+# the ledger's `mypy/x.py:NNN` write sites. They churn on unrelated edits.
+_LINE_ANCHOR = re.compile(r"\.(?:py|rs):\d+")
+
+
+# The G2/G3 home shape `` `nodes_mirror.py:NNN` via `_G2_TRACKED[Cls]` ``,
+# matched after _LINE_ANCHOR so the file token has no line number left. The
+# negated class excludes newlines, so a match cannot span unrelated prose.
+_VIA_ANCHOR = re.compile(r"`[^`\n]*`\s+via\s+`[^`\n]*`")
+
+
+def _normalise(text: str) -> str:
+    """``text`` with the volatile anchors removed for the ``--check`` diff.
+
+    Only the verdict and served-as cells then differ, so line-number churn
+    stops firing the gate while a real verdict change still does.
+    """
+    return _VIA_ANCHOR.sub("", _LINE_ANCHOR.sub("", text))
+
+
 def main(argv: list[str]) -> int:
     if "--check" in argv[1:]:
         if len(argv) != 3:
@@ -579,11 +606,13 @@ def main(argv: list[str]) -> int:
         if not doc.is_file():
             print(f"no such document: {doc}", file=sys.stderr)
             return 2
-        text = emit()
-        if text not in doc.read_text():
-            print(f"stale audit tables in {doc}: re-run the generator", file=sys.stderr)
+        if _normalise(emit()) not in _normalise(doc.read_text()):
+            print(
+                f"verdict drift in the G1.2 audit tables ({doc}): re-run the generator",
+                file=sys.stderr,
+            )
             return 1
-        print(f"{doc}: audit tables match the derived state")
+        print(f"{doc}: audit verdicts match the derived state (line anchors ignored)")
         return 0
     sys.stdout.write(emit())
     return 0

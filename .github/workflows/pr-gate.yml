@@ -188,3 +188,11 @@ jobs:
           # applies to explicit paths, and the flag turns an all-excluded list
           # into a usage error instead of a clean skip.
           uvx black@26.1.0 --check "${FILES[@]}"
+
+      - name: G1.2 audit tables (verdict-only drift gate)
+        # Source-tree only: python3 + ripgrep, no kernel or corpus. Line
+        # anchors are normalised out of both sides, so this fires on a
+        # verdict/served-as change, not on file:NNN churn (#1796).
+        run: |
+          python3 misc/g12_node_shadow_audit.py --check \
+            docs/plans/2026-09-15-g12-node-shadow-fidelity-audit.md
