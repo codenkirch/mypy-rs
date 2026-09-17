@@ -2019,6 +2019,11 @@ class NativeDescriptorHeadSuite(Suite):
     lvalue `__set__` assign path defer (`None`). The decided branches
     never touch `mx.chk`, so the gate-off vs gate-on differential runs
     through the real `analyze_descriptor_access` with a stub MemberContext.
+
+    The guards run *before* the gate, so the shapes they answer (a plain
+    or setter-only Instance on a non-lvalue read) never reach the seam:
+    `test_plain_instance*` and `test_setter_instance*` pin those values
+    directly instead of comparing two arms of code that cannot differ.
     """
 
     def setUp(self) -> None:
@@ -2175,14 +2180,32 @@ class NativeDescriptorHeadSuite(Suite):
     def test_parity_non_instance_none(self) -> None:
         self._assert_par(NoneType())
 
-    def test_parity_plain_instance(self) -> None:
-        self._assert_par(Instance(self.plaini, []))
+    def test_plain_instance_returns_original_object(self) -> None:
+        # The plain-Instance guards precede the gate, so no arm reaches the
+        # seam: pin the guard's own result instead of comparing two arms of
+        # identical Python.
+        from mypy.checkmember import analyze_descriptor_access
 
-    def test_parity_plain_instance_lvalue(self) -> None:
-        self._assert_par(Instance(self.plaini, []), is_lvalue=True)
+        typ = Instance(self.plaini, [])
+        result = analyze_descriptor_access(typ, self._make_mx(False))
+        assert result is typ, f"plain instance round-tripped: {result!r}"
+        assert str(result) == "mod.Plain"
 
-    def test_parity_setter_instance_non_lvalue(self) -> None:
-        self._assert_par(Instance(self.setteri, []))
+    def test_plain_instance_lvalue_returns_original_object(self) -> None:
+        from mypy.checkmember import analyze_descriptor_access
+
+        typ = Instance(self.plaini, [])
+        result = analyze_descriptor_access(typ, self._make_mx(True))
+        assert result is typ, f"plain instance lvalue round-tripped: {result!r}"
+        assert str(result) == "mod.Plain"
+
+    def test_setter_instance_non_lvalue_returns_original_object(self) -> None:
+        from mypy.checkmember import analyze_descriptor_access
+
+        typ = Instance(self.setteri, [])
+        result = analyze_descriptor_access(typ, self._make_mx(False))
+        assert result is typ, f"setter-only instance round-tripped: {result!r}"
+        assert str(result) == "mod.Setter"
 
     def test_parity_union_plain_items(self) -> None:
         typ = UnionType.make_union([Instance(self.plaini, []), NoneType()])
@@ -2208,19 +2231,16 @@ class NativeDescriptorHeadSuite(Suite):
         typ = UnionType.make_union([inner, NoneType()])
         self._assert_par(typ)
 
-    def test_parity_result_is_original_object(self) -> None:
-        # Tag 0 returns the live orig_descriptor_type object, not a
-        # round-tripped copy.
+    def test_non_instance_returns_original_object(self) -> None:
+        # Tag 0 must return the live orig_descriptor_type object, not a
+        # round-tripped copy, so the shape has to reach the gate: a plain
+        # Instance is answered by the guards before it.
         from mypy.checkmember import analyze_descriptor_access
 
-        typ = Instance(self.plaini, [])
-
-        def run() -> bool:
-            mx = self._make_mx(False)
-            return analyze_descriptor_access(typ, mx) is typ
-
-        assert self._with_gate(False, run)
-        assert self._with_gate(True, run)
+        typ = NoneType()
+        result = analyze_descriptor_access(typ, self._make_mx(False))
+        assert result is typ, f"tag 0 round-tripped: {result!r}"
+        assert str(result) == "None"
 
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
@@ -2233,8 +2253,11 @@ class NativeIsInstanceVarSuite(Suite):
     `not var.is_inferred`. The Rust seam reads the live attrs via PyO3
     and returns a plain bool on every well-formed Var; it defers
     (None) only when an attribute is unreadable (e.g. a Var whose
-    `info` is the FakeInfo placeholder). Gate-off vs gate-on runs must
-    agree and the direct seam call must engage (non-None).
+    `info` is the FakeInfo placeholder). The production gate retired in
+    #1739 (`testtypes_native_retired_checkmember.py` pins that
+    `is_instance_var` loads no `rust_*` name), so the Python-predicate
+    asserts below pin the exact bool per shape and `_assert_seam` calls
+    the still-registered pyfunction directly.
     """
 
     def setUp(self) -> None:
@@ -2245,13 +2268,6 @@ class NativeIsInstanceVarSuite(Suite):
 
     def tearDown(self) -> None:
         self._set_active(False)
-
-    def _with_gate(self, active: bool, fn: Callable[[], T]) -> T:
-        self._set_active(active)
-        try:
-            return fn()
-        finally:
-            self._set_active(True)
 
     def _typeinfo(self, fullname: str = "mod.A") -> TypeInfo:
         from mypy.nodes import Block, SymbolTable
@@ -2282,13 +2298,10 @@ class NativeIsInstanceVarSuite(Suite):
         info.names[name] = SymbolTableNode(MDEF, registered)
         return var
 
-    def _assert_par(self, var: Var, expected: bool) -> None:
+    def _assert_value(self, var: Var, expected: bool) -> None:
         from mypy.checkmember import is_instance_var
 
-        off = self._with_gate(False, lambda: is_instance_var(var))
-        on = self._with_gate(True, lambda: is_instance_var(var))
-        assert off == expected, f"gate-off: {off} != {expected}"
-        assert on == expected, f"gate-on: {on} != {expected}"
+        assert is_instance_var(var) == expected, f"{var.name}: {is_instance_var(var)}"
 
     def _assert_seam(self, var: Var, expected: bool) -> None:
         result = _type_kernel.rust_is_instance_var(var)
@@ -2297,29 +2310,29 @@ class NativeIsInstanceVarSuite(Suite):
 
     def test_true_instance_var(self) -> None:
         var = self._make_var("x")
-        self._assert_par(var, True)
+        self._assert_value(var, True)
         self._assert_seam(var, True)
 
     def test_name_not_in_names_false(self) -> None:
         var = self._make_var("x")
         var.info.names.pop("x")
-        self._assert_par(var, False)
+        self._assert_value(var, False)
         self._assert_seam(var, False)
 
     def test_node_not_var_false(self) -> None:
         other = Var("x")
         var = self._make_var("x", node=other)
-        self._assert_par(var, False)
+        self._assert_value(var, False)
         self._assert_seam(var, False)
 
     def test_is_classvar_false(self) -> None:
         var = self._make_var("x", is_classvar=True)
-        self._assert_par(var, False)
+        self._assert_value(var, False)
         self._assert_seam(var, False)
 
     def test_is_inferred_false(self) -> None:
         var = self._make_var("x", is_inferred=True)
-        self._assert_par(var, False)
+        self._assert_value(var, False)
         self._assert_seam(var, False)
 
     def test_seam_defers_on_fake_info(self) -> None:
@@ -2491,9 +2504,15 @@ class NativeAnalyzeVarSuite(Suite):
     a None tag (fake info, undecodable wire, snapshot miss) falls back
     to the pure-Python body.
 
-    Direct seam calls assert the exact tag per branch; the gate-off vs
-    gate-on differential drives the real `analyze_var` through a mock
-    checker and asserts identical results and recorded side effects.
+    Direct seam calls assert the exact tag per branch; the `test_value_*`
+    pins drive the real `analyze_var` through a mock checker and assert the
+    exact result plus recorded side effects per shape.
+
+    The production gate retired in #1739: `analyze_var` loads no `rust_*`
+    name (pinned by `NativeCheckmemberRetiredSeamsSuite` in
+    `testtypes_native_retired_checkmember.py`), so there is no gate left to
+    toggle and the former gate-off vs gate-on comparison is replaced by the
+    value pin it used to hold on both arms.
     """
 
     _UNSET: object = object()
@@ -2520,13 +2539,6 @@ class NativeAnalyzeVarSuite(Suite):
     def tearDown(self) -> None:
         self._set_resolver(None)
         self._set_active(False)
-
-    def _with_gate(self, active: bool, fn: Callable[[], T]) -> T:
-        self._set_active(active)
-        try:
-            return fn()
-        finally:
-            self._set_active(True)
 
     def _typeinfo(self, fullname: str = "mod.A") -> TypeInfo:
         from mypy.nodes import Block, SymbolTable
@@ -2622,19 +2634,29 @@ class NativeAnalyzeVarSuite(Suite):
         )
         return mx, calls
 
-    def _assert_differential(
-        self, name: str, var: Var, itype: Instance, *, is_lvalue: bool = False
+    def _assert_value(
+        self,
+        name: str,
+        var: Var,
+        itype: Instance,
+        expected: tuple[str, list[tuple[Any, ...]]],
+        *,
+        is_lvalue: bool = False,
     ) -> None:
+        """`analyze_var`'s result and recorded side effects on the live path.
+
+        The head gate this suite was written around (`rust_classify_analyze_var`)
+        retired in #1739, so a gate-off vs gate-on comparison of `analyze_var`
+        only re-read the same Python. The expected tuple is the value both arms
+        produced under the parity assertion this replaced; the retirement pin
+        `NativeCheckmemberRetiredSeamsSuite` re-checks it against the gate off.
+        """
         from mypy.checkmember import analyze_var
 
-        def run() -> tuple[str, list[tuple[Any, ...]]]:
-            mx, calls = self._mx_and_calls(itype, is_lvalue)
-            result = analyze_var(name, var, itype, mx)
-            return str(result), calls
-
-        off = self._with_gate(False, run)
-        on = self._with_gate(True, run)
-        assert off == on, f"gate mismatch: off={off!r} on={on!r}"
+        mx, calls = self._mx_and_calls(itype, is_lvalue)
+        result = analyze_var(name, var, itype, mx)
+        got = (str(result), calls)
+        assert got == expected, f"{name}: {got!r} != {expected!r}"
 
     # --- direct seam tag tests ---
 
@@ -2722,52 +2744,59 @@ class NativeAnalyzeVarSuite(Suite):
         var = Var("x")
         assert self._seam(var, Instance(self.info, [])) is None
 
-    # --- gate-off vs gate-on differentials through real analyze_var ---
+    # --- value + side-effect pins through real analyze_var ---
 
-    def test_differential_getter(self) -> None:
+    def test_value_getter(self) -> None:
         var = self._make_var("x", typ=Instance(self.info, []))
-        self._assert_differential("x", var, Instance(self.info, []))
+        self._assert_value("x", var, Instance(self.info, []), ("mod.A", []))
 
-    def test_differential_read_only_property_lvalue(self) -> None:
+    def test_value_read_only_property_lvalue(self) -> None:
         var = self._make_var("x", typ=Instance(self.info, []), is_property=True)
-        self._assert_differential("x", var, Instance(self.info, []), is_lvalue=True)
+        self._assert_value(
+            "x", var, Instance(self.info, []), ("mod.A", [("read_only_property",)]), is_lvalue=True
+        )
 
-    def test_differential_setter_lvalue(self) -> None:
+    def test_value_setter_lvalue(self) -> None:
         setter = CallableType([], [], [], AnyType(TypeOfAny.special_form), Instance(self.info, []))
         var = self._make_var(
             "x", typ=Instance(self.info, []), setter_type=setter, is_settable_property=True
         )
-        self._assert_differential("x", var, Instance(self.info, []), is_lvalue=True)
+        self._assert_value(
+            "x", var, Instance(self.info, []), ("def () -> Any", []), is_lvalue=True
+        )
 
-    def test_differential_partial(self) -> None:
-
+    def test_value_partial(self) -> None:
+        # A PartialType var returns from the handler before any surviving
+        # checkmember gate, so the retired comparison could not fail here.
         inner = Var("x")
         var = Var("x", PartialType(None, inner))
         var.info = self.info
         var.is_ready = True
         self.info.names["x"] = SymbolTableNode(MDEF, var)
-        self._assert_differential("x", var, Instance(self.info, []))
+        self._assert_value(
+            "x", var, Instance(self.info, []), ("Any", [("partial", "<partial None>")])
+        )
 
-    def test_differential_not_ready(self) -> None:
+    def test_value_not_ready(self) -> None:
         var = self._make_var("x", typ=None, is_ready=False)
-        self._assert_differential("x", var, Instance(self.info, []))
+        self._assert_value("x", var, Instance(self.info, []), ("Any", [("not_ready", "x")]))
 
-    def test_differential_unbound_any(self) -> None:
+    def test_value_unbound_any(self) -> None:
         var = self._make_var("x", typ=None, is_ready=True)
-        self._assert_differential("x", var, Instance(self.info, []))
+        self._assert_value("x", var, Instance(self.info, []), ("Any", []))
 
-    def test_differential_enum_literal(self) -> None:
+    def test_value_enum_literal(self) -> None:
         var = Var("RED", Instance(self.enum_info, []))
         var.info = self.enum_info
         var.is_ready = True
         var.has_explicit_value = True
         self.enum_info.names["RED"] = SymbolTableNode(MDEF, var)
-        self._assert_differential("RED", var, Instance(self.enum_info, []))
+        self._assert_value("RED", var, Instance(self.enum_info, []), ("Literal[mod.E.RED]?", []))
 
-    def test_differential_enum_member_bind_tail_engages(self) -> None:
+    def test_value_enum_member_bind_tail(self) -> None:
         # Real enum members are class-body assignments: is_inferred=True
         # (so is_instance_var is False) and is_initialized_in_class=True.
-        # Rust returns GETTER; the enum-literal wrap happens in the tail.
+        # The enum-literal wrap happens in the tail after the getter arm.
         var = Var("RED", Instance(self.enum_info, []))
         var.info = self.enum_info
         var.is_ready = True
@@ -2775,7 +2804,7 @@ class NativeAnalyzeVarSuite(Suite):
         var.is_initialized_in_class = True
         var.has_explicit_value = True
         self.enum_info.names["RED"] = SymbolTableNode(MDEF, var)
-        self._assert_differential("RED", var, Instance(self.enum_info, []))
+        self._assert_value("RED", var, Instance(self.enum_info, []), ("Literal[mod.E.RED]?", []))
 
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
@@ -3248,9 +3277,21 @@ class NativeAmaResidualSuite(Suite):
     type unchanged. Enum vars run the full arm plus the literal-wrap /
     nonmember-unwrap tail with a resolver-snapshot membership test.
 
-    Direct seam calls assert the exact result per branch; the gate-off
-    vs gate-on differential drives the real `_analyze_member_access`
-    through a stub MemberContext, comparing str equality.
+    Direct seam calls assert the exact result per branch; the
+    `test_member_access_*` pins assert the exact result the real
+    `_analyze_member_access` produces for the same shapes through a stub
+    MemberContext.
+
+    The ama gate retired in #1823 (`_analyze_member_access` carries no gate
+    and loads no `rust_*` name; pinned by `NativeAnalyzeMemberAccessRetiredSuite`
+    in `testtypes_native_retired_checkmember.py`). The is_self shape's two
+    arms could not differ: the gate-on arm's sole native call is the
+    descriptor head's tag-0 path, which returns the original object by
+    construction. The enum shape's arms differed only in
+    `expand_without_binding`, a different live seam that
+    `NativeAnalyzeVarSuite::test_value_enum_literal` exercises on the same
+    shape. Both former differentials are value pins now, and the Rust
+    pyfunction stays registered and is called directly above.
     """
 
     def setUp(self) -> None:
@@ -3318,13 +3359,6 @@ class NativeAmaResidualSuite(Suite):
         self._set_resolver(None)
         set_wire_typeinfo_map(None)
         self._set_active(False)
-
-    def _with_gate(self, active: bool, fn: Callable[[], T]) -> T:
-        self._set_active(active)
-        try:
-            return fn()
-        finally:
-            self._set_active(True)
 
     def _typeinfo(self, fullname: str = "mod.A") -> TypeInfo:
         from mypy.nodes import Block, SymbolTable
@@ -3460,7 +3494,7 @@ class NativeAmaResidualSuite(Suite):
         self._register_var(ghost, "y", Instance(self.base, []))
         assert self._seam(Instance(ghost, []), "y") is None
 
-    # --- gate-off vs gate-on differential through the real function ---
+    # --- value pins through the real function ---
 
     def _stub_mx(
         self, itype: Instance, *, is_self: bool = False, self_type: Type | None = None
@@ -3501,32 +3535,19 @@ class NativeAmaResidualSuite(Suite):
             is_self=is_self,
         )
 
-    def test_differential_is_self_substitution(self) -> None:
+    def test_member_access_is_self_substitution(self) -> None:
         from mypy.checkmember import _analyze_member_access
 
         self._register_var(self.info, "x", self.self_tvar)
-        receiver = self.self_tvar
+        mx = self._stub_mx(self.info_inst, is_self=True, self_type=self.other_tvar)
+        assert str(_analyze_member_access("x", self.self_tvar, mx)) == "S"
 
-        def run() -> str:
-            mx = self._stub_mx(self.info_inst, is_self=True, self_type=self.other_tvar)
-            return str(_analyze_member_access("x", receiver, mx))
-
-        assert self._with_gate(False, run) == "S"
-        assert self._with_gate(True, run) == "S"
-
-    def test_differential_enum_member(self) -> None:
+    def test_member_access_enum_member_literal(self) -> None:
         from mypy.checkmember import _analyze_member_access
 
         receiver = Instance(self.enum_info, [])
-
-        def run() -> str:
-            mx = self._stub_mx(receiver)
-            return str(_analyze_member_access("RED", receiver, mx))
-
-        off = self._with_gate(False, run)
-        on = self._with_gate(True, run)
-        assert off == on, f"enum member gate mismatch: off={off!r} on={on!r}"
-        assert "RED" in off
+        mx = self._stub_mx(receiver)
+        assert str(_analyze_member_access("RED", receiver, mx)) == "Literal[mod.E.RED]?"
 
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
