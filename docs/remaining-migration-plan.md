@@ -759,6 +759,21 @@ Same pattern as Phase F for `mypy.nodes`, family by family:
   last, because semanal mutates them mid-pass.
 - **G4:** graduation: "the AST executes on Rust storage."
 
+**G4 status (updated 2026-09-18, #1860).** The G4 forks are ratified
+(#1836, closed by #1858): read-serving suffices for G4, the claim is
+per family, and the landed order expression → statement → def stands.
+The expression family's rung is claimed: production defaults now capture
+the node shadow (`Options.native_ast_mirror`, family-agnostic — the G1
+expression and G2 statement/def records ride one capture gate) and serve
+the expression family's reads (`Options.native_ast_mirror_read` feeds
+the aststrip lvalue read and the production G1.1 walker mode 1, never the
+differential mode 2). Statement (`MYPY_TK_STMT_READ_FLIP`) and def
+(`MYPY_TK_VAR_KEY_FLIP`) serving stay env-gated default 0 until their own
+flip issues. The claim carries #1836's binding condition: the write path
+is still Python — the store is a per-write delta mirror — and the
+cross-run differential is evidence of agreement, not proof of ownership.
+The G1 write flip lands later beside Phase H.
+
 The same risk register applies, with one extra item: semanal visitor
 mutation sites must migrate behind accessor methods on the views as their
 families flip; defer-compatible returns stay until Phase H.
@@ -793,6 +808,12 @@ if the bridge costs outweigh the standalone benefit.
   kernel-complete and opt-in. The F4 rung ("the type graph executes in
   Rust; Python is the host and plugin bridge") is retired unclaimed; a
   phase closed without graduating contributes no rung.
+- G4, expression family (2026-09-18, #1860): "the expression family's
+  node reads execute on Rust storage" — a per-family claim (#1836 fork 3)
+  under the binding condition that the write path is still Python and the
+  cross-run differential is evidence of agreement, not proof of ownership.
+  Statement and def families follow; the "the AST executes in Rust" rung
+  below is claimed only when all three graduate.
 - After G4: "the AST executes in Rust."
 - After H: "the type-checking pipeline executes in Rust."
 - After J: "full Rust port", with the Python plugin bridge optional.

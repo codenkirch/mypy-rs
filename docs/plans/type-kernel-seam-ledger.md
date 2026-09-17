@@ -5292,3 +5292,85 @@ mode-2 differential will assert. Tests:
 `node_mirror_tests::test_object_of_defers_when_identity_forgets_the_handle`
 (Rust) and `NativeNodeMirrorSuite::test_identity_reset_defers_object_of`
 (Python, through `rust_mirror_reset(False)`). Refs: #1795, #1787 PR B.
+
+#### G4 expression-family graduation: production read-serving default on (#1860, recorded 2026-09-18)
+
+`Options.native_ast_mirror` and `Options.native_ast_mirror_read` flip
+to default `True` (neither is in `OPTIONS_AFFECTING_CACHE`; no shadow
+state may enter the cache). The #1836 one-family-one-flip rule is
+carried by the capture/serving split, not by new options: **capture
+is family-agnostic** (the G1 expression records and the G2
+statement/def metadata records ride the one `native_ast_mirror`
+gate), while **serving is per-channel**, and only the expression
+channels follow `native_ast_mirror_read`: the G1.1 `RefExpr` binding
+scalars (`depswalk.rs` through `RefView`) and the G1.2 aststrip
+MemberExpr lvalue read. The G2.1 statement channel
+(`MYPY_TK_STMT_READ_FLIP`) and the G2.2 Var-key translation
+(`MYPY_TK_VAR_KEY_FLIP`) stay env-only default 0; their flips are
+follow-up issues.
+
+The wiring is `BuildManager.__init__` calling
+`nodes_mirror.set_production_read_flip(capture_active and
+options.native_ast_mirror_read)`, on every manager including the off
+case (the aststrip rule: a later build in the process must not
+inherit a stale mode). Production serves mode 1 only; mode 2
+(serve + differential compare) is a measurement mode this entry
+point never selects, so a production run cannot end up differential
+by default. `MYPY_TK_NODE_READ_FLIP` wins over the option:
+`activate()` parses the env before the wiring runs, and the wiring
+defers (`read_flip()`, no write) whenever the env var is present, so
+measurement arms keep control of the channel. The test harness
+stays a differential: `helpers.parse_options` forces both gates from
+env (unset = off), so the DataSuites never exercise the default-on
+path; default-on is exercised by the self-check, the CLI, and the
+tree-pinned probe. The #1839 cross-run kernel leg models the same
+resolution (`effective` = env value when present, else the
+production default computed from kernel presence and the options),
+so an option-armed channel is compared rather than misread as
+inert.
+
+The #1859 del contract is restated unchanged and still in force: a
+`del` on a tracked G1 slot is out of contract (the five binding
+scalars are one snapshot gated by a single presence marker, so the
+#1841-style per-field retire cannot cover them without new record
+state); no production `del` on a tracked G1 slot exists; the pins
+stay in force (`NodeSlotDeletionOutOfContractSuite`), and the G1
+write-flip work must flip them knowingly.
+
+The #1836 binding condition rides the claim: the expression family's
+**write path is still Python**, and the cross-run differential is
+**evidence of agreement, not proof of ownership**.
+
+Evidence: tree-pinned dmypy probe on the corpus (branch vs
+unpatched-main control, same extension dirs): branch ran
+`read_mode 1` with the node channel serving `4/4` consults (0
+mismatched, 0 compared) while the control ran `read_mode 0` with the
+same 4 consults deferring (`deferred_off 4`) and identical error
+output; capture on the branch recorded `capture_ref 112529` against
+an empty control audit, with the statement channel idle
+(`deferred_off 5658`, `served 0`) and the Var-key channel untouched.
+The #1839 cross-run differential (mirror-on vs mirror-off, legs
+kernel/errors/ast/typemap/deferral.build) agreed on all five legs:
+errors byte-identical, 49 trees and 49 cache payloads byte-identical,
+typemap 6214/6214 entries, deferral.build byte-identical; the
+kernel leg shows the on-arm armed through the option default
+(`NODE_READ=1 STMT_READ=0 VAR_KEY=0` vs `0/0/0`) and its
+`ARMED BUT INERT (0 consulted)` note is expected in batch mode (the
+deps walk is fine-grained-only; engagement is the probe's counter
+gate). The full T3 battery held both gate states:
+`testcheck` 8144 passed / 69 skipped / 7 xfailed in each state
+(404 s off, 515 s on); the fine-grained family
+(`testfinegrained` + `testfinegrainedcache`) 1296 passed / 256
+skipped in each state (102 s off, 70 s on); the reversed-order
+isolation run (#336 shape, `testcheck` first in one xdist
+invocation with all five gates env-on) 12370 passed / 76 skipped /
+7 xfailed; cold self-check `Success: no issues found in 378 source
+files` in each state with byte-identical output (the gate-off leg
+runs through a tree-pinned `Options.__init__` patch wrapper, since
+no CLI flag exists for the gates). The native lane suites passed
+both states (gate-off 20 passed on `testtypes_native_node_read`
+after the wiring test was corrected to model `activate`'s env
+role; gate-on 425 passed / 5 skipped over the five files);
+`testcrossrundifferential` 64 passed / 4 subtests with the three
+new option-default cases; `cargo fmt --check` and `cargo clippy -D
+warnings` clean on `mypy-type-kernel` (no Rust change).

@@ -1,5 +1,99 @@
 # Handoff: strangler-fig Rust migration loop (seam-deferral reduction)
 
+## RESUME POINT — 2026-09-18, early morning (wave 12: G4 expression-family production flip in flight)
+
+`main` = `47209c257` (#1859). Seventeen PRs merged this wave; the #1860 flip
+lane was still closing its battery as this was written — **verify real state
+before trusting the table**.
+
+### Merged this wave
+
+| merge SHA | PR | what |
+|---|---|---|
+| `cb09a1dc7` | #1826 | feat(type_kernel): statement-family serve seed + handle encoding for stmt.expr (#1787) |
+| `a0b8a5350` | #1829 | fix(audit): name the remedy when type_kernel is not importable (#1821) |
+| `9601d2b9c` | #1830 | perf(type_kernel): retire the checkexpr call head and arg-context shims (#1739) |
+| `3546293d1` | #1832 | test(checkmember): pin values where a gate differential cannot fail |
+| `1b20d5d65` | #1839 | feat(parity): cross-run differential runner for gate-state comparison (#1770) |
+| `e0085dcf5` | #1840 | fix(audit): crashed-run refusal, extension identity, unconsumed cause split |
+| `655017555` | #1843 | perf(type_kernel): retire rust_classify_typeobj_gate (#1833) |
+| `19093d51d` | #1844 | feat(type_kernel): explicit load-time seed + provenance split for the def-family store (#1825) |
+| `40c64f541` | #1848 | test: pin values where the remaining gate comparisons cannot fail (#1834) |
+| `d4e59684c` | #1850 | fix(audit): shared-blob attribution, operator abort, type-misc green |
+| `dfa12ad20` | #1851 | test(type_kernel): repair two vacuous pins and a stale retirement claim |
+| `0a97f7f35` | #1852 | fix(type_kernel): def-family seed hygiene - dedupe, dead constants, zero counters |
+| `da333de00` | #1854 | test: pin values where the 22 gate comparisons cannot fail (#1845) |
+| `9393db907` | #1855 | fix(type_kernel): retract a deleted tracked slot's record |
+| `8fe6ef805` | #1857 | test: pin values where the 8 gate comparisons cannot fail (#1853) |
+| `42187f067` | #1858 | docs: ratify the G4 forks - read-serving, landed order, per-family claims (#1836) |
+| `47209c257` | #1859 | test(type_kernel): pin retraction counters and the G1 del gap (#1856) |
+
+### The #1860 G4 flip (w1, `feat/1860-g4-expression-serve-flip`, the wave's one T3 lane)
+
+`Options.native_ast_mirror` and `Options.native_ast_mirror_read` flip default
+`True` (never in `OPTIONS_AFFECTING_CACHE`). Capture stays family-agnostic;
+serving is per-channel and only the expression channels moved: the G1.1
+`RefExpr` binding scalars (depswalk via `RefView`) and the G1.2 aststrip
+lvalue read serve through `set_production_read_flip` wired from
+`BuildManager.__init__` (every manager, off case included). Mode 2 stays
+measurement-only; `MYPY_TK_NODE_READ_FLIP` wins over the option; G2.1/G2.2
+stay env-only default 0 (their flips are follow-up issues). Full evidence in
+the PR body, the seam-ledger entry, and the plan's claim-ladder rung. The
+#1859 del contract is restated in the ledger entry: no production `del` on a
+tracked G1 slot exists, the pins stay in force, and the write-flip work must
+flip them knowingly.
+
+The correctness battery closed green in both gate states: `testcheck`
+8144/69/7 each state, fine-grained family 1296/256 each state, the
+reversed-order isolation run (#336 shape, all five gates env-on) 12370/76/7,
+cold self-check 378 files with byte-identical output both states, the #1839
+cross-run differential agreeing on all five legs, and the tree-pinned probe
+serving 4/4 fine-grained consults gate-on vs 0 (deferred) on an
+unpatched-main control. Still pending when this was written: the 10%
+cold-path wall-clock gate and `measure_work_share.py`, both quiet-host legs
+(see Pool and host).
+
+### In flight as this was written (NOT merged — verify)
+
+| slot | branch | scope |
+|---|---|---|
+| w1 | `feat/1860-g4-expression-serve-flip` | #1860: G4 expression-family production read-serving flip (T3) — battery green both states; 10% gate + work-share waiting on a quiet host; PR next |
+
+### Pool and host
+
+Foreign load ran **60-90 on 18 cores all session** (a 5-hour-plus
+cargo-mutants nightly shard from another repo plus two CI runners), so the
+10% cold-path wall-clock gate and `measure_work_share.py` were still waiting
+for a quiet window; a loaded wall-clock number is never presented as the
+gate's verdict. The pool's weighted semaphore behaved (one corpus + one build
+at a time); the two corpus kills below were not pool starvation.
+
+### Rules that bit this session
+
+- **Pin `cwd` on every Bash pool/pytest call.** Post-compaction, tool calls
+  lost the worktree `cwd` and the recorded command showed no `cd` prefix: the
+  run would have executed from the main checkout and silently tested
+  unpatched `main` (the #1789 wrong-tree hazard, conftest assertion and all).
+- **Do not pre-queue a corpus behind another corpus.** Two `run 2` waiters
+  were killed with their process group 25-45 s into the pool wait (no output,
+  exit -1; cause outside the pool script - it only polls). Launch a corpus
+  when the status shows free slots, or accept losing the run.
+- **The engagement probe must pin the tree** (strip the editable finder and
+  the cwd entry, then refuse unless `mypy.__file__` is under the tree): the
+  first probe draft resolved mypy from the main checkout through the venv's
+  editable finder and happily reported `mirror=False` for the branch.
+- **A helper script is not `-m`**: `python /private/tmp/.../script.py` puts the
+  script's own directory at `sys.path[0]`, so `import mypy` goes through the
+  venv's editable finder (the main checkout) while `-m`-spawned build workers
+  import the worktree — the parent/worker wire formats then disagree and the
+  self-check dies with `Cannot connect to build worker(s)`. Every helper that
+  imports mypy must pin the tree the way the probe does, or be run via `-m`
+  from the worktree.
+- **`read_flip.modeN` in the audit is `activate`'s record, not the final
+  mode**: with the env unset it always reads `mode0` because the production
+  wiring patches the mode after `activate` ran. The effective mode is
+  `read_mode` / `rust_node_mirror_read_mode()`.
+
 ## RESUME POINT — 2026-09-17, night (wave 11: 4 PRs merged; #1624's caching lever measured dead)
 
 `main` = `476accf40` (#1819). Four PRs merged this wave; four lanes were still

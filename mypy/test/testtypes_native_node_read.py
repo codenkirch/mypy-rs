@@ -3,8 +3,11 @@
 `mypy/nodes_mirror` serves the `RefExpr` binding scalars (`kind`,
 `_fullname`, `is_new_def`, ...) from Rust storage when the record is
 provably exact, and the native dependency walk (`depswalk.rs`) reads them
-through `RefView`. Mode 0 (the default) serves nothing; mode 1 serves;
-mode 2 serves and compares every served read against the live slots.
+through `RefView`. Mode 0 serves nothing; mode 1 serves and is the
+production default (#1860, G4 expression-family graduation: `build` sets
+it through `set_production_read_flip` when the capture and
+`native_ast_mirror_read` gates are on); mode 2 serves and compares every
+served read against the live slots, and is measurement-only.
 
 The suite has three jobs:
 
@@ -169,7 +172,7 @@ class NodeShadowServingSuite(Suite):
 
     # -- the serving contract --
 
-    def test_mode_zero_is_the_default_and_serves_nothing(self) -> None:
+    def test_mode_zero_is_off_and_serves_nothing(self) -> None:
         ref = self._adopted_ref()
         assert self._m.read_flip() == 0
         assert self._k.rust_node_mirror_serve_ref(ref) is None
@@ -331,6 +334,43 @@ class NodeShadowServingSuite(Suite):
             assert self._m.read_flip() == 0
         finally:
             self._m._active = saved_active
+            if saved_env is None:
+                os.environ.pop(env_name, None)
+            else:
+                os.environ[env_name] = saved_env
+
+    # -- the production default (#1860) --
+
+    def test_production_wiring_serves_only_when_told_to(self) -> None:
+        """`set_production_read_flip` is what `build` calls (#1860).
+
+        Without an env gate it sets the mode from the option (1 serves,
+        0 off). With one, the measurement arm keeps control of the channel:
+        `activate` parsed the env value before the wiring ran, so the wiring
+        defers to the mode in force instead of overriding it. The compare
+        mode (2) is never selected by the option alone, so a production run
+        cannot end up in a differential mode by default.
+        """
+        env_name = self._m._READ_FLIP_ENV
+        saved_env = os.environ.get(env_name)
+        try:
+            os.environ.pop(env_name, None)
+            assert self._m.set_production_read_flip(False) == 0
+            assert self._m.read_flip() == 0
+            assert self._m.set_production_read_flip(True) == 1
+            assert self._m.read_flip() == 1
+            os.environ[env_name] = "2"
+            # `activate` applies the env mode before the wiring runs; the
+            # stand-in call plays that role here, and neither option may
+            # override it.
+            assert self._m.set_read_flip(2) == 2
+            assert self._m.set_production_read_flip(False) == 2
+            assert self._m.set_production_read_flip(True) == 2
+            os.environ[env_name] = "0"
+            assert self._m.set_read_flip(0) == 0
+            assert self._m.set_production_read_flip(True) == 0
+        finally:
+            self._m.set_read_flip(0)
             if saved_env is None:
                 os.environ.pop(env_name, None)
             else:
@@ -532,9 +572,10 @@ class NodeSlotDeletionOutOfContractSuite(Suite):
     record is not per-field where it matters: the five binding scalars the
     serving channel reads are one snapshot gated by a single presence
     marker (`ref_captures`), so the #1841-style per-field retire cannot
-    cover them without new record state. The retraction lands with the G1
-    serving flip going default-on; until then these pins document today's
-    behavior, and the fix must flip them knowingly.
+    cover them without new record state. #1860 sent the G1 serving flip
+    default-on with this gap still open, by owner contract: no production
+    `del` on a tracked G1 slot exists, these pins stay in force, and the
+    write-flip work must flip them knowingly.
     """
 
     def setUp(self) -> None:

@@ -76,13 +76,28 @@ def _make_run(root: Path, name: str, files: dict[str, Any]) -> dict[str, Any]:
 
 
 def _gate(
-    requested: int = 0, declared: int | None = None, in_force: int | None = None, **counters: int
+    requested: int = 0,
+    declared: int | None = None,
+    in_force: int | None = None,
+    default: int = 0,
+    effective: int | None = None,
+    **counters: int,
 ) -> dict[str, Any]:
-    """One gate's provenance: declared defaults to what the arm asked for."""
+    """One gate's provenance: the env value wins over the option default.
+
+    `requested` holds the env value the worker saw ("0" when the env gate is
+    unset), `default` the production serving default (#1860), and `effective`
+    their resolution: the env value when present, else the default. Tests that
+    need an env "0" overriding a default pass `effective` explicitly.
+    """
+    if effective is None:
+        effective = requested if requested != 0 else default
     return {
         "declared": requested if declared is None else declared,
         "requested": requested,
-        "in_force": requested if in_force is None else in_force,
+        "default": default,
+        "effective": effective,
+        "in_force": effective if in_force is None else in_force,
         "counters": {"consulted": 0, "mismatched": 0, **counters},
     }
 
@@ -405,6 +420,39 @@ class KernelLegSuite(unittest.TestCase):
         comparison = runner.compare_kernel_leg(self._runs(left, _provenance("b")), ("a", "b"))
         self.assertEqual(comparison.verdict, runner.VERDICT_NOT_RUN)
         self.assertIn("is inert", comparison.detail)
+
+    def test_an_option_default_gate_in_force_agrees(self) -> None:
+        """A gate armed only by the option default (#1860) is not inert.
+
+        An arm carrying no env token serves mode 1 through the production
+        default, so the leg must compare it, not call it inert.
+        """
+        left = _provenance("a")
+        left["gates"]["MYPY_TK_NODE_READ_FLIP"] = _gate(
+            requested=0, default=1, effective=1, in_force=1, served=3, consulted=3
+        )
+        comparison = runner.compare_kernel_leg(self._runs(left, _provenance("b")), ("a", "b"))
+        self.assertEqual(comparison.verdict, runner.VERDICT_AGREE)
+        self.assertNotIn("is inert", comparison.detail)
+
+    def test_an_inert_option_default_gate_is_not_run(self) -> None:
+        left = _provenance("a")
+        left["gates"]["MYPY_TK_NODE_READ_FLIP"] = _gate(
+            requested=0, default=1, effective=1, in_force=0
+        )
+        comparison = runner.compare_kernel_leg(self._runs(left, _provenance("b")), ("a", "b"))
+        self.assertEqual(comparison.verdict, runner.VERDICT_NOT_RUN)
+        self.assertIn("is inert", comparison.detail)
+        self.assertIn("option default 1", comparison.detail)
+
+    def test_a_declared_env_zero_beats_the_option_default(self) -> None:
+        left = _provenance("a")
+        left["gates"]["MYPY_TK_NODE_READ_FLIP"] = _gate(
+            requested=0, default=1, effective=0, in_force=0
+        )
+        comparison = runner.compare_kernel_leg(self._runs(left, _provenance("b")), ("a", "b"))
+        self.assertEqual(comparison.verdict, runner.VERDICT_AGREE)
+        self.assertNotIn("is inert", comparison.detail)
 
     def test_an_undeclared_channel_is_not_run(self) -> None:
         """Regression for the env leak: a served mode nothing declared fails.

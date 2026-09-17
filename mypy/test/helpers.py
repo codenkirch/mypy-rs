@@ -390,10 +390,7 @@ _NATIVE_ENV_MODULE_PROBES = {
     "TEST_NATIVE_TYPE_KERNEL": ("type_kernel", "erase_type"),
     "TEST_NATIVE_AST_MIRROR": ("type_kernel", "rust_node_mirror_entry_count"),
     "TEST_NATIVE_SYMTABLE_READ_FLIP": ("type_kernel", "rust_snapshot_symbol_table_shadow"),
-    "TEST_NATIVE_SYMTABLE_READ_FLIP_VERIFY": (
-        "type_kernel",
-        "rust_snapshot_symbol_table_shadow",
-    ),
+    "TEST_NATIVE_SYMTABLE_READ_FLIP_VERIFY": ("type_kernel", "rust_snapshot_symbol_table_shadow"),
     "TEST_NATIVE_AST_MIRROR_READ": ("type_kernel", "rust_aststrip_process_lvalue"),
 }
 
@@ -483,11 +480,13 @@ def parse_options(
     # Phase F3 (#1397) write flip is a differential mirror gate: splices
     # only engage when the capture mirror is on.
     options.native_type_instance_write = _env_gate("TEST_NATIVE_TYPE_INSTANCE_WRITE")
-    # Phase G1.0a (#1572) node shadow is capture-only; the option only
-    # installs the AST-mirror hooks, so a missing extension is a no-op.
+    # Phase G1 (#1572, #1860): default-on in production since the G4 flip,
+    # but the harness is a differential (unset env = off; the self-check
+    # exercises the default-on path). A missing extension is a no-op.
     options.native_ast_mirror = _env_gate("TEST_NATIVE_AST_MIRROR")
-    # Phase G1.2 (#1674) read flip is a differential mirror gate: the
-    # aststrip lvalue read is only served when the capture mirror is on.
+    # Phase G1.2/G1.1 (#1674, #1860) serving-read gate: the aststrip
+    # lvalue read and the production walker mode serve only when the
+    # capture mirror is on.
     options.native_ast_mirror_read = _env_gate("TEST_NATIVE_AST_MIRROR_READ")
     # Phase G3.0a (#1581) namespace shadow is capture-only for the same
     # reason: the option installs the SymbolTable class hooks only.
