@@ -990,7 +990,13 @@ impl<'py> DepsWalker<'py> {
     }
 
     fn visit_block(&mut self, o: &PyAny) -> Result<(), DeferError> {
-        if !truthy_attr(o, "is_unreachable")? {
+        // The stmt read flip serves `is_unreachable` from the record when
+        // on; mode 0 and any unrecorded object take the live read.
+        let unreachable = match node_mirror::serve_stmt_flag(o, "is_unreachable") {
+            Some(v) => v,
+            None => truthy_attr(o, "is_unreachable")?,
+        };
+        if !unreachable {
             for s in list_attr(o, "body")?.iter() {
                 self.walk(s)?;
             }

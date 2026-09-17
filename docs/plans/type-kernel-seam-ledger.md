@@ -5157,3 +5157,74 @@ in-process single-file run shows put_entries 33192), so cache-loaded
 engagement evidence comes from the single-process probe. Refs: #1773, #1755,
 #1765, and the residual line in the `#1670` entry ("cache-loaded tables
 defer") is superseded by this seed.
+
+#### Statement-family serving read flip (#1787 PR B, recorded 2026-09-17)
+
+`MYPY_TK_STMT_READ_FLIP` selects a mode (0 off / 1 serve / 2 serve +
+differential compare) over the G2 metadata store for the one registered
+statement field native code reads live: `Block.is_unreachable`. The
+consumers are `depswalk.rs::visit_block` (production, the native deps
+walk behind `Options.native_type_kernel`) and
+`semanal_visitor.rs::rust_visit_block` (parity-only,
+`MYPY_ENABLE_NATIVE_SEMANAL`), both via `node_mirror::serve_stmt_flag`
+with the live attribute read as the fallback. Serve contract: a record
+answers only as the exact shape the capture wrote (`MetaValue::Bool`);
+an unrecorded object, a missing identity handle, or a shape-crossed
+record (any other `MetaValue`, e.g. an `Int` landed on the bool field)
+defers, so the #1785 record-shape drift class is structurally excluded.
+The channel keeps its own `StmtReadState` thread-local with the same
+seven-tuple counters as G1.1 (`consulted` / `served` / `deferred_off` /
+`deferred_unrecorded` / `compared` / `mismatched` / `compare_errors`),
+exposed through `nodes_mirror.set_stmt_read_flip` /
+`stmt_read_flip` / `stmt_read_counters` and the six
+`rust_node_mirror_*_stmt_*` pyfunctions. Mode 2 compares every served
+flag against the live slot; an unreadable or non-`bool` live slot
+counts as a compare error *and* a mismatch (capture encodes `Bool` only
+for literal `True`/`False`, so such a slot on a served record is an
+out-of-contract post-capture mutation). The default stays 0: no
+`Options` default changed, no `num_workers` force-on, and the
+production walk keeps every read live until the env gate opts in.
+`MYPY_TK_STMT_SESSIONFINISH_OUT` dumps
+`{"stmt_read": ..., "capture": ...}` from `build()`'s finally (the G3.2
+`sessionfinish_dump` pattern) for per-pid corpus evidence.
+
+Evidence: `cargo test -p mypy-type-kernel` 2887 passed / 0 failed /
+8 ignored (11 new `g2_serving_tests` + the #1795 `object_of` test);
+lane suites 368 passed / 5 skipped (all five pre-existing
+environmental: t-strings need 3.14+, librt splice);
+`testtypes_native_stmt_read` negative controls fail as designed
+(`off` -> "the walker must be answered by the record", `desync` ->
+"native/Python deps mismatch", both rc=1); the fine-grained corpus
+(`testfinegrained` 747 passed / 27 skipped, 4 xdist pids) in mode 2
+served 87 and compared all 87 with 0 mismatches, 0 compare errors,
+9739 unrecorded defers over 9826 consults, while the mode-0 baseline
+shows served 0 / deferred_off 9826 over the identical consult count;
+cold self-check clean (374 files) on the rebuilt extension. The
+`--check` audit drift is line-anchor-only (the new G2.1 section shifts
+`nodes_mirror.py` anchors); the sibling lane regenerates the tables
+(#1791).
+
+#### #1795 verdict: object_of validates identity coherence (recorded 2026-09-17)
+
+`capture_pin` stores pins keyed by identity handle; `object_of`
+resolves a handle back to the pinned object. Before this change it
+answered purely from `TARGET_PINS`, while `handle_of` delegates to
+`identity::handle_of` - so after an identity-only reset
+(`rust_mirror_reset`) a stale pin could still resolve, and the two
+read-backs disagreed. Verdict: **validate inside `object_of`** (the
+pin answers only when `identity::handle_of(pin) == handle`), not a
+documented independence. Rationale: the divergence is unreachable in
+the production flow either way (`nodes_mirror.reset()` runs before
+`types_mirror.reset(preserve_stable=True)` under the same option gate,
+so pins never outlive the identity reset there), which makes cost the
+only differentiator; the validation is one non-minting thread-local map
+lookup on a cold read-back, not the PyO3 round-trip class that made
+#1785 reject compare-before-answer; the fail direction is the defer
+(`None`), never a wrong object (handles are never re-issued after a
+reset and pins keep the referent alive, so a mismatch can only mean the
+identity layer moved on); and the Var-key lane inherits the invariant
+`object_of(h) = Some(obj) => handle_of(obj) = Some(h)` that its own
+mode-2 differential will assert. Tests:
+`node_mirror_tests::test_object_of_defers_when_identity_forgets_the_handle`
+(Rust) and `NativeNodeMirrorSuite::test_identity_reset_defers_object_of`
+(Python, through `rust_mirror_reset(False)`). Refs: #1795, #1787 PR B.

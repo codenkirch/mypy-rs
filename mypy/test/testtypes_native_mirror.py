@@ -4499,6 +4499,21 @@ class NativeAstMirrorSuite(Suite):
         assert self._k.rust_node_mirror_object_of(handle) is None
         assert self._k.rust_node_mirror_handle_of(target) == handle
 
+    def test_identity_reset_defers_object_of(self) -> None:
+        # #1795: after an identity-only reset (rust_mirror_reset) the two
+        # read-backs stay coherent: `object_of` defers rather than answering
+        # a handle `handle_of` no longer knows.
+        expr = NameExpr("x")
+        target = Var("x")
+        expr.kind = GDEF
+        expr.node = target
+        handle = self._k.rust_node_mirror_handle_of(target)
+        assert handle is not None
+        assert self._k.rust_node_mirror_object_of(handle) is target
+        self._m._kernel_mod.rust_mirror_reset(False)
+        assert self._k.rust_node_mirror_handle_of(target) is None
+        assert self._k.rust_node_mirror_object_of(handle) is None
+
     def test_reset_drops_entries_and_keeps_activation(self) -> None:
         expr = NameExpr("x")
         expr.kind = GDEF

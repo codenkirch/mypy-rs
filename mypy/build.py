@@ -473,6 +473,12 @@ def build(
             from mypy import symtables_mirror
 
             symtables_mirror.sessionfinish_dump()
+        # G2.1 (#1787 PR B): the statement serving evidence of this
+        # session, same contract as the symtable dump above.
+        if os.environ.get("MYPY_TK_STMT_SESSIONFINISH_OUT"):
+            from mypy import nodes_mirror
+
+            nodes_mirror.stmt_sessionfinish_dump()
 
 
 def build_inner(

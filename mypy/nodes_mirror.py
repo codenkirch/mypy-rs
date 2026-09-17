@@ -41,6 +41,17 @@ binding target under its identity handle
 resolves back to that exact live object - the substrate the Var key
 scheme needs.
 
+G2.1 (#1787 PR B) gives the statement family its own mode-gated serving
+read: `set_stmt_read_flip` selects a mode (0 off, 1 serve, 2 serve +
+differential compare) that the native consumers obey when they read the
+one registered statement field they read live, `Block.is_unreachable`
+(the dependency walker and the native semanal visitor). A record is
+served only in the exact shape the capture wrote (`Bool`); a
+shape-crossed record defers to the live slot, so record-shape drift can
+never answer a read. `stmt_read_counters` reports the same provenance
+seven-tuple as the G1.1 channel, which is what makes a run's evidence
+checkable rather than assumed.
+
 Blind channels, audited against #1787 §1(b):
 - `replace_object_state` (`mypy/util.py`): its `setattr` leg re-registers
   the surviving identity through the same hook, pinned by
@@ -120,7 +131,9 @@ G1.0b write sites (anchors from the #1574 base, all through the patched
 
 from __future__ import annotations
 
+import json
 import os
+import sys
 from typing import Any, Final
 
 from mypy.nodes import (
@@ -192,6 +205,9 @@ _audit: dict[str, int] = {}
 # `activate` reads this env var, so a run can enable it without an option.
 _READ_FLIP_ENV: Final = "MYPY_TK_NODE_READ_FLIP"
 _READ_MODES: Final[frozenset[int]] = frozenset({0, 1, 2})
+# G2.1 (#1787 PR B): the statement-family serving gate, same convention
+# as the G1.1 gate above.
+_STMT_READ_FLIP_ENV: Final = "MYPY_TK_STMT_READ_FLIP"
 
 
 def _count(key: str, n: int = 1) -> None:
@@ -261,6 +277,59 @@ def read_counters() -> dict[str, int]:
         mismatched,
         compare_errors,
     ) = kernel.rust_node_mirror_read_counters()
+    return {
+        "consulted": int(consulted),
+        "served": int(served),
+        "deferred_off": int(deferred_off),
+        "deferred_unrecorded": int(deferred_unrecorded),
+        "compared": int(compared),
+        "mismatched": int(mismatched),
+        "compare_errors": int(compare_errors),
+    }
+
+
+def set_stmt_read_flip(mode: int) -> int:
+    """Set the statement-family serving mode; returns the mode in force.
+
+    Modes: 0 off (default), 1 serve, 2 serve + differential compare. A
+    missing extension leaves the mode at 0, the same state as an inert
+    channel, so no caller can be misled into thinking it served.
+    """
+    if mode not in _READ_MODES:
+        raise ValueError(f"stmt read flip mode must be 0, 1 or 2, got {mode!r}")
+    kernel = _kernel()
+    if kernel is None:
+        _count("stmt_read_flip.no_type_kernel")
+        return 0
+    return int(kernel.rust_node_mirror_set_stmt_read_mode(mode))
+
+
+def stmt_read_flip() -> int:
+    """The statement-family serving mode (0 when the extension is absent)."""
+    kernel = _kernel()
+    if kernel is None:
+        return 0
+    return int(kernel.rust_node_mirror_stmt_read_mode())
+
+
+def stmt_read_counters() -> dict[str, int]:
+    """Provenance counters for the statement-family serving channel.
+
+    Same seven-tuple as `read_counters`. A run whose `compared` is 0
+    proves nothing about the served values.
+    """
+    kernel = _kernel()
+    if kernel is None:
+        return {}
+    (
+        consulted,
+        served,
+        deferred_off,
+        deferred_unrecorded,
+        compared,
+        mismatched,
+        compare_errors,
+    ) = kernel.rust_node_mirror_stmt_read_counters()
     return {
         "consulted": int(consulted),
         "served": int(served),
@@ -872,6 +941,17 @@ def activate(*, audit: bool = False) -> bool:
         raise ValueError(f"{_READ_FLIP_ENV} must be 0, 1 or 2, got {raw_mode!r}") from None
     if env_mode not in _READ_MODES:
         raise ValueError(f"{_READ_FLIP_ENV} must be 0, 1 or 2, got {raw_mode!r}")
+    # G2.1 (#1787 PR B): same contract for the statement-family gate,
+    # parsed before anything is patched so a bad value cannot half-activate.
+    raw_stmt_mode = os.environ.get(_STMT_READ_FLIP_ENV, "0")
+    try:
+        env_stmt_mode = int(raw_stmt_mode)
+    except ValueError:
+        raise ValueError(
+            f"{_STMT_READ_FLIP_ENV} must be 0, 1 or 2, got {raw_stmt_mode!r}"
+        ) from None
+    if env_stmt_mode not in _READ_MODES:
+        raise ValueError(f"{_STMT_READ_FLIP_ENV} must be 0, 1 or 2, got {raw_stmt_mode!r}")
     kernel = _kernel()
     if kernel is None:
         _count("activate_failed.no_type_kernel")
@@ -896,6 +976,10 @@ def activate(*, audit: bool = False) -> bool:
     # measurement gate (see `_READ_FLIP_ENV`).
     set_read_flip(env_mode)
     _count(f"read_flip.mode{read_flip()}")
+    # G2.1 (#1787 PR B): set only once the meta capture is live, so the
+    # statement channel can never answer from an empty store.
+    set_stmt_read_flip(env_stmt_mode)
+    _count(f"stmt_read_flip.mode{stmt_read_flip()}")
     return True
 
 
@@ -917,6 +1001,7 @@ def reset(*, clear_counts: bool = False) -> None:
         _kernel_mod.rust_node_mirror_reset()
         if clear_counts:
             _kernel_mod.rust_node_mirror_read_reset()
+            _kernel_mod.rust_node_mirror_stmt_read_reset()
     _NODE_HANDLES.clear()
     # G2.0 (#1577): drop the statement/def metadata store too.
     _reset_meta()
@@ -928,3 +1013,37 @@ def reset(*, clear_counts: bool = False) -> None:
 def report() -> dict[str, int]:
     """Return a copy of the audit counters."""
     return dict(_audit)
+
+
+_STMT_SESSIONFINISH_ENV: Final = "MYPY_TK_STMT_SESSIONFINISH_OUT"
+
+
+def stmt_sessionfinish() -> dict[str, object]:
+    """The statement serving evidence of one finished session.
+
+    Two sections: `stmt_read` (the Rust read counters of the statement
+    serving channel) and `capture` (the Python audit counters, non-empty
+    only in audit mode).
+    """
+    return {"stmt_read": stmt_read_counters(), "capture": report()}
+
+
+def stmt_sessionfinish_dump() -> None:
+    """Write `stmt_sessionfinish` where the environment asks for it.
+
+    Called from `mypy.build.build`'s finally, like the symtable mirror's
+    `sessionfinish_dump`. No-op without `MYPY_TK_STMT_SESSIONFINISH_OUT`
+    (`{pid}` expands to the process id) and without an activated shadow.
+    Never raises: the call site sits in a `finally` whose job is to
+    preserve the in-flight build exception.
+    """
+    out = os.environ.get(_STMT_SESSIONFINISH_ENV)
+    if not out or _kernel_mod is None:
+        return
+    out = out.replace("{pid}", str(os.getpid()))
+    try:
+        with open(out, "w") as f:
+            json.dump(stmt_sessionfinish(), f, indent=1, sort_keys=True)
+    except Exception as err:
+        # Same convention as the capture failures: account, never raise.
+        print(f"native-nodes-mirror: stmt sessionfinish dump failed: {err}", file=sys.stderr)

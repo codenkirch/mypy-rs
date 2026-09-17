@@ -2655,8 +2655,16 @@ pub(crate) fn rust_visit_operator_assignment_stmt(
 /// block_depth[-1], then `semanal.accept`s each statement.
 #[pyfunction]
 pub(crate) fn rust_visit_block(_py: Python<'_>, b: &PyAny, semanal: &PyAny) -> PyResult<bool> {
-    let unreachable = b.getattr("is_unreachable")?;
-    if unreachable.is_true()? {
+    // The stmt read flip serves `is_unreachable` from the record when on;
+    // mode 0 and any unrecorded object take the live read.
+    let unreachable = match crate::node_mirror::serve_stmt_flag(b, "is_unreachable") {
+        Some(v) => v,
+        None => {
+            let v = b.getattr("is_unreachable")?;
+            v.is_true()?
+        }
+    };
+    if unreachable {
         return Ok(true);
     }
     let depth = semanal.getattr("block_depth")?;

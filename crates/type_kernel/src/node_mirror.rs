@@ -184,9 +184,24 @@ pub(crate) fn capture_pin(obj: &PyAny) -> PyResult<u64> {
 }
 
 /// Resolve a pinned handle back to the live object; `None` when the handle
-/// was never minted or the pins were reset (the per-build boundary).
+/// was never minted, the pins were reset (the per-build boundary), or the
+/// identity registry no longer maps the pinned object to this handle
+/// (#1795: an identity-only reset must not leave `object_of` answering a
+/// handle `handle_of` no longer knows - the two read-backs stay coherent,
+/// so a consumer can assert one from the other).
+///
+/// The validation is a non-minting thread-local lookup, not a PyO3
+/// crossing, and the fail direction is the defer: a stale handle resolves
+/// to `None`, never to a wrong object (handles are never re-issued after a
+/// reset, and the pin keeps the referent alive, so a mismatch can only
+/// mean the identity layer moved on).
 pub(crate) fn object_of(py: Python<'_>, handle: u64) -> Option<Py<PyAny>> {
-    TARGET_PINS.with(|cell| cell.borrow().get(&handle).map(|pin| pin.clone_ref(py)))
+    TARGET_PINS.with(|cell| {
+        cell.borrow()
+            .get(&handle)
+            .filter(|pin| identity::handle_of(pin.as_ref(py)) == Some(handle))
+            .map(|pin| pin.clone_ref(py))
+    })
 }
 
 /// Drop every target pin; returns how many were held. The pins drop only
@@ -1054,6 +1069,217 @@ pub(crate) fn rust_node_mirror_meta_entry_count() -> usize {
     meta_entry_count()
 }
 
+// ===========================================================================
+// G2.1 (#1787 PR B): statement-family serving read flip
+// ===========================================================================
+
+// The serve set is the one registered statement field native code reads
+// live: `Block.is_unreachable`. A record serves only in the exact shape
+// the capture wrote (`Bool`); a shape-crossed write defers (#1785 class).
+
+/// Serving mode: 0 off (default), 1 serve, 2 serve + differential compare.
+///
+/// Thread-local like the G1.1 read state: a mode set on one thread cannot
+/// make another thread's empty store look authoritative, and the unit
+/// tests stay isolated from each other.
+#[derive(Default)]
+struct StmtReadState {
+    mode: u8,
+    /// Provenance. `consulted`: a store lookup ran. `served`: the record
+    /// answered with an exact `Bool` snapshot. `deferred_off`: mode 0.
+    /// `deferred_unrecorded`: no exact record, so the live read stayed in
+    /// charge. `compared`/`mismatched`/`compare_errors`: the mode-2
+    /// differential.
+    consulted: u64,
+    served: u64,
+    deferred_off: u64,
+    deferred_unrecorded: u64,
+    compared: u64,
+    mismatched: u64,
+    compare_errors: u64,
+}
+
+thread_local! {
+    static STMT_READ_STATE: RefCell<StmtReadState> = RefCell::new(StmtReadState::default());
+}
+
+/// One leaf update of the read state. Never called while a read-state
+/// borrow is held: `RefCell` would panic on the second borrow.
+fn bump_stmt(update: impl FnOnce(&mut StmtReadState)) {
+    STMT_READ_STATE.with(|cell| update(&mut cell.borrow_mut()));
+}
+
+/// `rust_node_mirror_stmt_read_counters`'s answer: `(consulted, served,
+/// deferred_off, deferred_unrecorded, compared, mismatched,
+/// compare_errors)`.
+pub(crate) type StmtReadCounters = (u64, u64, u64, u64, u64, u64, u64);
+
+pub(crate) fn stmt_read_mode() -> u8 {
+    STMT_READ_STATE.with(|cell| cell.borrow().mode)
+}
+
+/// Set the serving mode. Only 0, 1 and 2 exist; any other value raises so
+/// the raw pyfunction cannot select a mode no read path implements.
+pub(crate) fn set_stmt_read_mode(mode: u8) -> PyResult<u8> {
+    if mode > 2 {
+        return Err(PyValueError::new_err(format!(
+            "stmt read flip mode must be 0, 1 or 2, got {mode}"
+        )));
+    }
+    bump_stmt(|state| state.mode = mode);
+    Ok(stmt_read_mode())
+}
+
+/// `(consulted, served, deferred_off, deferred_unrecorded, compared,
+/// mismatched, compare_errors)`.
+pub(crate) fn stmt_read_counters() -> StmtReadCounters {
+    STMT_READ_STATE.with(|cell| {
+        let state = cell.borrow();
+        (
+            state.consulted,
+            state.served,
+            state.deferred_off,
+            state.deferred_unrecorded,
+            state.compared,
+            state.mismatched,
+            state.compare_errors,
+        )
+    })
+}
+
+/// Clear the counters. The mode is deliberately kept: it is set once per
+/// process (or per test) and a reset must not silently stop serving.
+pub(crate) fn reset_stmt_read_counters() {
+    bump_stmt(|state| {
+        let mode = state.mode;
+        *state = StmtReadState {
+            mode,
+            ..StmtReadState::default()
+        };
+    });
+}
+
+/// Serve `obj.field` from the metadata record, or `None` when the read
+/// must stay live: mode 0, no identity handle, or no `Bool` record.
+///
+/// The store borrow is released before the mode-2 compare, which reads
+/// live Python attributes and could re-enter the store.
+pub(crate) fn serve_stmt_flag(obj: &PyAny, field: &str) -> Option<bool> {
+    let served = read_stmt_flag_record(obj, field)?;
+    if stmt_read_mode() >= 2 && !compare_stmt_flag(obj, field, served) {
+        bump_stmt(|state| state.mismatched += 1);
+    }
+    bump_stmt(|state| state.served += 1);
+    Some(served)
+}
+
+/// The differential entry point: serve the record and compare it against
+/// the live slot in any serving mode, counting one comparison. This is
+/// the read the negative control drives, so it must be usable in mode 1
+/// where the production path does not compare by itself.
+pub(crate) fn verify_stmt_flag(obj: &PyAny, field: &str) -> Option<bool> {
+    let served = read_stmt_flag_record(obj, field)?;
+    let matched = compare_stmt_flag(obj, field, served);
+    if !matched {
+        bump_stmt(|state| state.mismatched += 1);
+    }
+    bump_stmt(|state| state.served += 1);
+    Some(matched)
+}
+
+/// The record's `Bool` snapshot for `obj.field`, or `None` when the read
+/// must stay live. Counts provenance only: it neither compares nor counts
+/// a serve, so both read entry points above own those counters.
+fn read_stmt_flag_record(obj: &PyAny, field: &str) -> Option<bool> {
+    if stmt_read_mode() == 0 {
+        bump_stmt(|state| state.deferred_off += 1);
+        return None;
+    }
+    bump_stmt(|state| state.consulted += 1);
+    let handle = match identity::handle_of(obj) {
+        Some(handle) => handle,
+        None => {
+            bump_stmt(|state| state.deferred_unrecorded += 1);
+            return None;
+        }
+    };
+    // The store borrow is released here, before any live attribute read.
+    let served = with_meta_store(|store| {
+        store
+            .by_handle
+            .get(&handle)
+            .and_then(|entry| {
+                entry
+                    .fields
+                    .iter()
+                    .find(|(name, _)| *name == field)
+                    .map(|(_, value)| value)
+            })
+            .and_then(|value| match value {
+                MetaValue::Bool(v) => Some(*v),
+                _ => None,
+            })
+    });
+    if served.is_none() {
+        bump_stmt(|state| state.deferred_unrecorded += 1);
+    }
+    served
+}
+
+/// Mode-2 differential: compare the served `Bool` against the live slot.
+///
+/// Every call is counted, and an unreadable or non-`bool` live slot counts
+/// as a compare error *and* a mismatch: the capture encodes `Bool` only
+/// for literal `True`/`False`, so such a slot on a served record means an
+/// out-of-contract post-capture mutation, which a probe must not report
+/// as success.
+fn compare_stmt_flag(obj: &PyAny, field: &str, served: bool) -> bool {
+    bump_stmt(|state| state.compared += 1);
+    match live_flag(obj, field) {
+        Ok(live) => live == served,
+        Err(()) => {
+            bump_stmt(|state| state.compare_errors += 1);
+            false
+        }
+    }
+}
+
+// ---- pyfunctions: mode, counters, and the two read entry points ----
+
+#[pyfunction]
+pub(crate) fn rust_node_mirror_set_stmt_read_mode(mode: u8) -> PyResult<u8> {
+    set_stmt_read_mode(mode)
+}
+
+#[pyfunction]
+pub(crate) fn rust_node_mirror_stmt_read_mode() -> u8 {
+    stmt_read_mode()
+}
+
+#[pyfunction]
+pub(crate) fn rust_node_mirror_stmt_read_counters() -> StmtReadCounters {
+    stmt_read_counters()
+}
+
+#[pyfunction]
+pub(crate) fn rust_node_mirror_stmt_read_reset() {
+    reset_stmt_read_counters();
+}
+
+/// `Some(flag)` served from the record for `obj.field`; `None` when the
+/// read must stay live (mode 0, unrecorded, or a shape-crossed record).
+#[pyfunction]
+pub(crate) fn rust_node_mirror_serve_stmt_flag(obj: &PyAny, field: &str) -> Option<bool> {
+    serve_stmt_flag(obj, field)
+}
+
+/// The differential entry point: `Some(matched)` when the record served the
+/// read, `None` when it stayed live. Counts one comparison either way.
+#[pyfunction]
+pub(crate) fn rust_node_mirror_verify_stmt_flag(obj: &PyAny, field: &str) -> Option<bool> {
+    verify_stmt_flag(obj, field)
+}
+
 #[cfg(test)]
 mod g2_meta_tests {
     use super::*;
@@ -1420,6 +1646,23 @@ mod node_mirror_tests {
     }
 
     #[test]
+    fn test_object_of_defers_when_identity_forgets_the_handle() {
+        with_py(|py| {
+            reset();
+            identity::reset(false, py);
+            let obj = fresh_object(py);
+            let h = capture_pin(obj).unwrap();
+            assert!(object_of(py, h).is_some());
+            // #1795: an identity-only reset must not leave `object_of`
+            // answering a handle `handle_of` no longer knows. Handles are
+            // never re-issued, so the stale pin resolves to `None`.
+            identity::reset(false, py);
+            assert_eq!(identity::handle_of(obj), None);
+            assert!(object_of(py, h).is_none());
+        });
+    }
+
+    #[test]
     fn test_object_of_unknown_handle_is_none() {
         with_py(|py| {
             reset();
@@ -1736,6 +1979,21 @@ pub(crate) fn register_registry(m: &PyModule) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(rust_node_mirror_meta_reset, m)?)?;
 
     m.add_function(wrap_pyfunction!(rust_node_mirror_meta_entry_count, m)?)?;
+
+    // Phase G2.1 (#1787 PR B): statement-family serving read flip for
+    // `Block.is_unreachable`. Mode 0 by default; mode 2 adds the
+    // differential compare that makes a corpus run evidence.
+    m.add_function(wrap_pyfunction!(rust_node_mirror_set_stmt_read_mode, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_node_mirror_stmt_read_mode, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_node_mirror_stmt_read_counters, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_node_mirror_stmt_read_reset, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_node_mirror_serve_stmt_flag, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_node_mirror_verify_stmt_flag, m)?)?;
     Ok(())
 }
 
@@ -2023,6 +2281,209 @@ mod g1_serving_tests {
             capture_ref(obj, None, None, "".into(), false, false).unwrap();
             assert_eq!(verify_ref_scalars(obj), None);
             let (_, _, deferred_off, _, compared, _, _) = served_counters();
+            assert_eq!((deferred_off, compared), (1, 0));
+        });
+    }
+}
+
+#[cfg(test)]
+mod g2_serving_tests {
+    use super::*;
+
+    /// Initialize the embedded interpreter, then run with the GIL.
+    fn with_py<T>(f: impl FnOnce(Python<'_>) -> T) -> T {
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(f)
+    }
+
+    /// A stand-in for a `Block`: the serving read inspects the record,
+    /// never the class, and the mode-2 compare reads exactly this slot.
+    fn fresh_block(py: Python<'_>) -> &PyAny {
+        py.eval(
+            "type('B', (), {'is_unreachable': False})()",
+            None,
+            None,
+        )
+        .unwrap()
+    }
+
+    fn start_stmt(mode: u8) {
+        reset_meta();
+        reset_stmt_read_counters();
+        set_stmt_read_mode(mode).unwrap();
+    }
+
+    fn fresh_object(py: Python<'_>) -> &PyAny {
+        py.eval("object()", None, None).unwrap()
+    }
+
+    fn stmt_counters() -> (u64, u64, u64, u64, u64, u64, u64) {
+        stmt_read_counters()
+    }
+
+    #[test]
+    fn test_mode_zero_serves_nothing_and_counts_the_deferral() {
+        with_py(|py| {
+            start_stmt(0);
+            let obj = fresh_block(py);
+            capture_meta(obj, "is_unreachable", MetaValue::Bool(true)).unwrap();
+            assert_eq!(serve_stmt_flag(obj, "is_unreachable"), None);
+            let (consulted, served, deferred_off, unrecorded, compared, mismatched, errors) =
+                stmt_counters();
+            assert_eq!(
+                (
+                    consulted,
+                    served,
+                    deferred_off,
+                    unrecorded,
+                    compared,
+                    mismatched,
+                    errors
+                ),
+                (0, 0, 1, 0, 0, 0, 0)
+            );
+        });
+    }
+
+    #[test]
+    fn test_a_recorded_flag_is_served_exactly() {
+        with_py(|py| {
+            start_stmt(1);
+            let obj = fresh_block(py);
+            capture_meta(obj, "is_unreachable", MetaValue::Bool(true)).unwrap();
+            assert_eq!(
+                serve_stmt_flag(obj, "is_unreachable"),
+                Some(true),
+                "a recorded flag must serve"
+            );
+            let (consulted, served, deferred_off, unrecorded, compared, mismatched, errors) =
+                stmt_counters();
+            assert_eq!(
+                (
+                    consulted,
+                    served,
+                    deferred_off,
+                    unrecorded,
+                    compared,
+                    mismatched,
+                    errors
+                ),
+                (1, 1, 0, 0, 0, 0, 0)
+            );
+        });
+    }
+
+    #[test]
+    fn test_an_unrecorded_flag_defers() {
+        with_py(|py| {
+            start_stmt(1);
+            let obj = fresh_block(py);
+            assert_eq!(serve_stmt_flag(obj, "is_unreachable"), None);
+            let (consulted, served, _, unrecorded, _, _, _) = stmt_counters();
+            assert_eq!((consulted, served, unrecorded), (1, 0, 1));
+        });
+    }
+
+    #[test]
+    fn test_a_shape_crossed_record_is_not_served() {
+        with_py(|py| {
+            start_stmt(1);
+            let obj = fresh_block(py);
+            // A raw pyfunction write lands an `Int` on the bool field: the
+            // record exists, but its shape is not servable, so the live
+            // read must stay in charge (#1785's drift class).
+            rust_node_mirror_capture_meta(obj, "is_unreachable", "int", None, Some(1), None)
+                .unwrap();
+            assert_eq!(serve_stmt_flag(obj, "is_unreachable"), None);
+            let (_, served, _, unrecorded, _, _, _) = stmt_counters();
+            assert_eq!((served, unrecorded), (0, 1));
+        });
+    }
+
+    #[test]
+    fn test_mode_two_compares_and_passes_in_sync() {
+        with_py(|py| {
+            start_stmt(2);
+            let obj = fresh_block(py);
+            obj.setattr("is_unreachable", true).unwrap();
+            capture_meta(obj, "is_unreachable", MetaValue::Bool(true)).unwrap();
+            assert_eq!(serve_stmt_flag(obj, "is_unreachable"), Some(true));
+            let (_, served, _, _, compared, mismatched, errors) = stmt_counters();
+            assert_eq!((served, compared, mismatched, errors), (1, 1, 0, 0));
+        });
+    }
+
+    #[test]
+    fn test_mode_two_compare_detects_a_desync() {
+        with_py(|py| {
+            start_stmt(2);
+            let obj = fresh_block(py);
+            capture_meta(obj, "is_unreachable", MetaValue::Bool(true)).unwrap();
+            // A live write no capture saw: the record is now stale, and
+            // the compare must say so instead of passing.
+            obj.setattr("is_unreachable", false).unwrap();
+            assert_eq!(verify_stmt_flag(obj, "is_unreachable"), Some(false));
+            let (_, _, _, _, compared, mismatched, errors) = stmt_counters();
+            assert_eq!((compared, mismatched, errors), (1, 1, 0));
+            // And the serving path answers from the record, still stale.
+            assert_eq!(serve_stmt_flag(obj, "is_unreachable"), Some(true));
+        });
+    }
+
+    #[test]
+    fn test_an_unreadable_slot_counts_as_a_mismatch_not_a_skip() {
+        with_py(|py| {
+            start_stmt(1);
+            // The object has no `is_unreachable` slot at all, so the
+            // compare cannot read the live side: that must read as a
+            // failure, not a skip.
+            let obj = fresh_object(py);
+            capture_meta(obj, "is_unreachable", MetaValue::Bool(false)).unwrap();
+            assert_eq!(verify_stmt_flag(obj, "is_unreachable"), Some(false));
+            let (_, _, _, _, compared, mismatched, errors) = stmt_counters();
+            assert_eq!((compared, mismatched, errors), (1, 1, 1));
+        });
+    }
+
+    #[test]
+    fn test_serving_does_not_mutate_the_record() {
+        with_py(|py| {
+            start_stmt(1);
+            let obj = fresh_block(py);
+            let h = capture_meta(obj, "is_unreachable", MetaValue::Bool(true)).unwrap();
+            for _ in 0..5 {
+                assert!(serve_stmt_flag(obj, "is_unreachable").is_some());
+            }
+            assert_eq!(
+                rust_node_mirror_meta_captures(h),
+                Some(1),
+                "reads must not write the record"
+            );
+            assert_eq!(meta_entry_count(), 1, "reads must not mint entries");
+        });
+    }
+
+    #[test]
+    fn test_set_stmt_read_mode_refuses_a_mode_outside_the_range() {
+        with_py(|_py| {
+            assert!(set_stmt_read_mode(3).is_err(), "mode 3 does not exist");
+            assert!(
+                set_stmt_read_mode(255).is_err(),
+                "u8 headroom must not widen the range"
+            );
+            assert_eq!(set_stmt_read_mode(0).unwrap(), 0);
+            assert_eq!(set_stmt_read_mode(2).unwrap(), 2);
+        });
+    }
+
+    #[test]
+    fn test_verify_requires_the_serving_mode() {
+        with_py(|py| {
+            start_stmt(0);
+            let obj = fresh_block(py);
+            capture_meta(obj, "is_unreachable", MetaValue::Bool(true)).unwrap();
+            assert_eq!(verify_stmt_flag(obj, "is_unreachable"), None);
+            let (_, _, deferred_off, _, compared, _, _) = stmt_counters();
             assert_eq!((deferred_off, compared), (1, 0));
         });
     }
