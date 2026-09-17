@@ -962,6 +962,11 @@ class NativeInferArgContextSuite(Suite):
     no-context tail, malformed deferral); gate off vs on must produce
     identical accept traces across the 3 call-site shapes
     (checkexpr.py:3004, 3424, 3627).
+
+    #1739 retired the shim (1.37x-1.59x the Python double loop), so the
+    gate toggle is inert for this body now: both arms are the Python loop.
+    The pyfunction stays registered for the direct-seam tests above, and
+    the retirement pins live in `testtypes_native_retired_checkexpr.py`.
     """
 
     def setUp(self) -> None:
@@ -4035,6 +4040,11 @@ class NativeEnumProtocolClassifierSuite(Suite):
     `rust_classify_protocol_test_callee` mirrors the isinstance/issubclass
     protocol-test gate in `visit_call_expr_inner` (checkexpr.py:1471).
     Both classify on live AST nodes via PyO3; Python keeps the side effects.
+
+    #1739 retired the `is_enum_callable_base` shim (6.80x-12.37x the Python
+    predicate, which is `isinstance` plus a frozenset lookup): these are
+    direct-seam tests for the still-registered pyfunction only. The
+    `typeobj_gate` seam stays wired and is measured as a keep.
     """
 
     def setUp(self) -> None:

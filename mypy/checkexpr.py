@@ -254,7 +254,6 @@ try:
         rust_calibrate_type_obj_return as _rust_calibrate_type_obj_return,
         rust_callable_type as _rust_callable_type,
         rust_check_argument_types_plan as _rust_check_argument_types_plan,
-        rust_check_call_head as _rust_check_call_head,
         rust_check_callable_call as _rust_check_callable_call,
         rust_check_operator as _rust_check_operator,
         rust_check_overload_call as _rust_check_overload_call,
@@ -268,7 +267,6 @@ try:
         rust_classify_typeobj_gate as _rust_classify_typeobj_gate,
         rust_classify_visit_op_expr as _rust_classify_visit_op_expr,
         rust_combine_function_signatures as _rust_combine_function_signatures,
-        rust_compute_arg_context_indices as _rust_compute_arg_context_indices,
         rust_conditional_expr_join as _rust_conditional_expr_join,
         rust_container_type as _rust_container_type,
         rust_dangerous_comparison as _rust_dangerous_comparison,
@@ -282,7 +280,6 @@ try:
         rust_has_uninhabited_component as _rust_has_uninhabited_component,
         rust_infer_function_type_arguments as _rust_infer_function_type_arguments,
         rust_is_async_def as _rust_is_async_def,
-        rust_is_enum_callable_base as _rust_is_enum_callable_base,
         rust_is_expr_literal_type as _rust_is_expr_literal_type,
         rust_is_non_empty_tuple as _rust_is_non_empty_tuple,
         rust_is_operator_method as _rust_is_operator_method,
@@ -330,7 +327,6 @@ except ImportError:
     _rust_has_bytes_component = None  # type: ignore[assignment]
     _rust_is_non_empty_tuple = None  # type: ignore[assignment]
     _rust_is_async_def = None  # type: ignore[assignment]
-    _rust_is_enum_callable_base = None  # type: ignore[assignment]
     _rust_is_expr_literal_type = None  # type: ignore[assignment]
     _rust_get_partial_instance_type = None  # type: ignore[assignment]
     _rust_has_coroutine_decorator = None  # type: ignore[assignment]
@@ -351,13 +347,11 @@ except ImportError:
     _rust_classify_check_boolean_op = None  # type: ignore[assignment]
     _rust_classify_typeddict_call = None  # type: ignore[assignment]
     _rust_classify_typeobj_gate = None  # type: ignore[assignment]
-    _rust_check_call_head = None  # type: ignore[assignment]
     _rust_calibrate_type_obj_return = None  # type: ignore[assignment]
     _rust_normalize_callable = None  # type: ignore[assignment]
     _rust_real_union = None  # type: ignore[assignment]
     _rust_possible_none_type_var_overlap = None  # type: ignore[assignment]
     _rust_combine_function_signatures = None  # type: ignore[assignment]
-    _rust_compute_arg_context_indices = None  # type: ignore[assignment]
     _rust_solve_generic_call = None  # type: ignore[assignment]
     _rust_container_type = None  # type: ignore[assignment]
     _rust_tuple_context_matches = None  # type: ignore[assignment]
@@ -2934,46 +2928,23 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
             instance_type = callee.get_instance_type(force_fallback=True)
             if isinstance(instance_type, Instance):
                 callable_name = instance_type.type.fullname
-        enum_hit: bool | None = None
-        tag: int | None = None
-        if (
-            _CHECKEXPR_HAS_TYPE_KERNEL
-            and _native_checkexpr_active
-            and _rust_check_call_head is not None
-        ):
-            # Issue #1642: batch enum_callable_base + typeobj_gate into
-            # one FFI crossing (saves ~183k crossings on cold self-check).
-            try:
-                enum_hit, tag = _rust_check_call_head(callable_node, callee, ENUM_BASES)
-            except (AssertionError, NotImplementedError, ValueError, TypeError):
-                enum_hit, tag = None, None
-        if enum_hit is None:
-            # Fallback: individual seams or pure-Python paths.
-            if _CHECKEXPR_HAS_TYPE_KERNEL and _native_checkexpr_active:
-                try:
-                    enum_hit = _rust_is_enum_callable_base(callable_node, ENUM_BASES)
-                except (AssertionError, NotImplementedError):
-                    enum_hit = None
-            if (
-                _CHECKEXPR_HAS_TYPE_KERNEL
-                and _native_checkexpr_active
-                and _rust_classify_typeobj_gate is not None
-            ):
-                try:
-                    tag = _rust_classify_typeobj_gate(callee)
-                except (AssertionError, NotImplementedError, ValueError, TypeError):
-                    tag = None
-        if enum_hit is True or (
-            enum_hit is None
-            and isinstance(callable_node, RefExpr)
-            and callable_node.fullname in ENUM_BASES
-        ):
+        if isinstance(callable_node, RefExpr) and callable_node.fullname in ENUM_BASES:
             # An Enum() call that failed SemanticAnalyzerPass2.check_enum_call().
             return callee.ret_type, callee
 
         # Native type_kernel seam (issue #1464 C2): Rust collapses the
         # if/elif double-evaluation of is_type_obj()/type_object() into one
         # arm tag; the two fails and the can_return_none fold stay here.
+        tag: int | None = None
+        if (
+            _CHECKEXPR_HAS_TYPE_KERNEL
+            and _native_checkexpr_active
+            and _rust_classify_typeobj_gate is not None
+        ):
+            try:
+                tag = _rust_classify_typeobj_gate(callee)
+            except (AssertionError, NotImplementedError, ValueError, TypeError):
+                tag = None
         if tag is None:
             if (
                 callee.is_type_obj()
@@ -3506,31 +3477,13 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
 
         Returns the inferred types of *actual arguments*.
         """
-        # Native type_kernel seam (issue #1064): Rust computes the pure
-        # arg_context index map (formal index per actual, -1 = no context);
-        # accept + infer_unions toggle stay in Python. None defers below.
-        indices: list[int] | None = None
-        if _CHECKEXPR_HAS_TYPE_KERNEL and _native_checkexpr_active:
-            try:
-                indices = _rust_compute_arg_context_indices(
-                    [ak.value for ak in arg_kinds],
-                    formal_to_actual,
-                    len(args),
-                    len(callee.arg_types),
-                )
-            except (AssertionError, NotImplementedError, ValueError, TypeError):
-                indices = None
-
-        if indices is None:
-            # Precompute arg_context so that we type check argument expressions in evaluation order
-            arg_context: list[Type | None] = [None] * len(args)
-            for fi, actuals in enumerate(formal_to_actual):
-                for ai in actuals:
-                    if arg_kinds[ai].is_star():
-                        continue
-                    arg_context[ai] = callee.arg_types[fi]
-        else:
-            arg_context = [callee.arg_types[fi] if fi >= 0 else None for fi in indices]
+        # Precompute arg_context so that we type check argument expressions in evaluation order
+        arg_context: list[Type | None] = [None] * len(args)
+        for fi, actuals in enumerate(formal_to_actual):
+            for ai in actuals:
+                if arg_kinds[ai].is_star():
+                    continue
+                arg_context[ai] = callee.arg_types[fi]
 
         res = []
         for arg, ctx in zip(args, arg_context):
