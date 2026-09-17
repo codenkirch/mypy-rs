@@ -1,9 +1,9 @@
-"""Retired-seam pins for `mypy/typeanal.py` (#1739).
+"""Retired-seam pins for `mypy/typeanal.py` (#1739, #1761).
 
-Two typeanal shims were micro-benched (min-of-7 ns/call, both arms in one
+Three typeanal shims were micro-benched (min-of-7 ns/call, both arms in one
 process, gate flag the only variable) against the Python work they wrapped;
-both lost on every shape, so the shim is deleted and the Rust pyfunction stays
-registered per the #1640/#1648 precedent.
+all lost on every shape, so each shim is deleted and the Rust pyfunction
+stays registered per the #1640/#1648 precedent.
 
 `rust_validate_instance` (85,556 calls/corpus, 0 defers) replaced an O(n) scan
 over `t.args` with a live-object crossing: 4.76x / 3.48x / 4.16x slower than the
@@ -15,10 +15,11 @@ to 2.77x slower across all six shapes, and on its dominant tag (8, plain
 Instance) it displaced no work, since the body it classified to is the body it
 then re-ran.
 
-Structural evidence below: neither shim name survives on the module and neither
-body loads a `rust_*` global with the gate ON, which is zero crossings. Value
-evidence: gate-off and gate-on runs agree on `(result, messages)` for every
-shape, and direct `type_kernel` calls prove both pyfunctions stay reachable.
+Structural evidence below: no shim name survives on the module and no
+retired body loads a `rust_*` global with the gate ON, which is zero
+crossings. Value evidence: gate-off and gate-on runs agree on
+`(result, messages)` for every shape, and direct `type_kernel` calls prove
+the pyfunctions stay reachable.
 """
 
 from __future__ import annotations
@@ -27,10 +28,10 @@ from typing import Any
 from unittest import skipUnless
 
 from mypy.test.helpers import Suite, assert_equal
-from mypy.test.testtypes import _NATIVE_WIRE_ENABLED
+from mypy.test.testtypes import _NATIVE_WIRE_ENABLED, _is_type_info
 from mypy.test.typefixture import TypeFixture
-from mypy.typeanal import TypeAnalyser, validate_instance
-from mypy.types import Instance, Type, UnboundType
+from mypy.typeanal import TypeAnalyser, unknown_unpack, validate_instance
+from mypy.types import AnyType, Instance, Type, TypeOfAny, UnboundType, UnpackType
 
 
 class _FakeApi:
@@ -236,3 +237,88 @@ class NativeClassifyTypeWithInfoRetiredSuite(Suite):
         assert (
             type_kernel.rust_classify_type_with_info("mod.UserClass", 0, False, False, False) == 8
         )
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeUnknownUnpackRetiredSuite(Suite):
+    """Pin the #1761 retirement of `unknown_unpack`'s Rust shim.
+
+    The shim wrapped a two-branch isinstance check with a wire crossing that
+    serialized the whole argument first, and became load-bearing when the
+    #1739 retirement of `rust_validate_instance` restored the Python `t.args`
+    scan it had short-circuited. Fresh seam-head measurement on current
+    main (min-of-7 ns/call, both arms in one process, gate flag the only
+    variable, FFI spied, every crossing decided): 30.0ns gate-off vs
+    544.2ns gate-on on the common Instance shape (18.14x), 86.0ns vs
+    361.3ns on the UnpackType shape (4.20x); the live variant with a
+    resolver installed measured within noise of the byte variant. Audit
+    traffic at retirement: 16,683 + 3,470 calls, 0 defers.
+    """
+
+    def setUp(self) -> None:
+        self.fx = TypeFixture()
+
+    def _shapes(self) -> list[tuple[str, Type, bool]]:
+        return [
+            ("plain-instance", Instance(self.fx.std_listi, [self.fx.a]), False),
+            ("unpack-special-form-any", UnpackType(AnyType(TypeOfAny.special_form)), True),
+            ("unpack-plain-any", UnpackType(AnyType(TypeOfAny.unannotated)), False),
+            ("unpack-instance", UnpackType(Instance(self.fx.std_listi, [])), False),
+        ]
+
+    def test_shim_name_gone(self) -> None:
+        import inspect
+
+        from mypy import typeanal
+
+        # Negative control: the lookup still finds a seam that is wired.
+        assert hasattr(typeanal, "_rust_has_explicit_any")
+        assert not hasattr(typeanal, "_rust_unknown_unpack")
+        assert not hasattr(typeanal, "_rust_unknown_unpack_live")
+        src = inspect.getsource(typeanal.unknown_unpack)
+        assert "rust_" not in src, "unknown_unpack should be pure Python"
+
+    def test_no_rust_name_loaded_with_gate_on(self) -> None:
+        from mypy.typeanal import _set_native_typeanal_active, has_explicit_any
+
+        _set_native_typeanal_active(True)
+        try:
+            # Negative control: a still-wired shim does load a rust_ global.
+            assert "_rust_has_explicit_any" in has_explicit_any.__code__.co_names
+            loaded = [n for n in unknown_unpack.__code__.co_names if "rust_" in n]
+            assert loaded == [], f"unknown_unpack still loads {loaded}"
+        finally:
+            _set_native_typeanal_active(False)
+
+    def test_values_match_python_on_both_gates(self) -> None:
+        from mypy.typeanal import _set_native_typeanal_active
+
+        for label, t, want in self._shapes():
+            _set_native_typeanal_active(False)
+            off = unknown_unpack(t)
+            _set_native_typeanal_active(True)
+            try:
+                on = unknown_unpack(t)
+            finally:
+                _set_native_typeanal_active(False)
+            assert_equal(on, off, f"unknown_unpack parity {label}")
+            assert_equal(on, want, f"unknown_unpack value {label}")
+
+    def test_pyfunctions_stay_registered(self) -> None:
+        import type_kernel
+
+        from mypy.typeanal import _serialize_typeanal_type
+
+        infos = [
+            v
+            for n in dir(self.fx)
+            for v in (getattr(self.fx, n),)
+            if _is_type_info(v)
+        ]
+        resolver = type_kernel.build_native_resolver(infos, [])
+        plain = _serialize_typeanal_type(Instance(self.fx.std_listi, [self.fx.a]))
+        unpack = _serialize_typeanal_type(UnpackType(AnyType(TypeOfAny.special_form)))
+        assert type_kernel.rust_unknown_unpack(plain) is False
+        assert type_kernel.rust_unknown_unpack(unpack) is True
+        assert type_kernel.rust_unknown_unpack_live(resolver, plain) is False
+        assert type_kernel.rust_unknown_unpack_live(resolver, unpack) is True

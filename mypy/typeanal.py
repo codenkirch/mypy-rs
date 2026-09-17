@@ -3852,8 +3852,6 @@ try:
         rust_make_optional_type as _rust_make_optional_type,
         rust_make_optional_type_live as _rust_make_optional_type_live,
         rust_type_analyze as _rust_type_analyze,
-        rust_unknown_unpack as _rust_unknown_unpack,
-        rust_unknown_unpack_live as _rust_unknown_unpack_live,
     )
 
     from mypy.types import read_type as _typeanal_read_type
@@ -3871,8 +3869,6 @@ except ImportError:
     _rust_make_optional_type = None  # type: ignore[assignment]
     _rust_make_optional_type_live = None  # type: ignore[assignment]
     _rust_type_analyze = None  # type: ignore[assignment]
-    _rust_unknown_unpack = None  # type: ignore[assignment]
-    _rust_unknown_unpack_live = None  # type: ignore[assignment]
     _rust_detect_diverging_alias = None  # type: ignore[assignment]
     _rust_find_self_type = None  # type: ignore[assignment]
     _rust_find_self_type_live = None  # type: ignore[assignment]
@@ -4504,18 +4500,6 @@ def unknown_unpack(t: Type) -> bool:
     genuine undefined names here. But this worked well so far, although it looks
     quite fragile.
     """
-    if _TYPEANAL_HAS_KERNEL and _native_typeanal_active:
-        try:
-            if _native_typeanal_resolver is not None:
-                result = _rust_unknown_unpack_live(
-                    _native_typeanal_resolver, _serialize_typeanal_type(t)
-                )
-            else:
-                result = _rust_unknown_unpack(_serialize_typeanal_type(t))
-            if result is not None:
-                return result
-        except (AssertionError, NotImplementedError):
-            pass
     if isinstance(t, UnpackType):
         unpacked = get_proper_type(t.type)
         if isinstance(unpacked, AnyType) and unpacked.type_of_any == TypeOfAny.special_form:
