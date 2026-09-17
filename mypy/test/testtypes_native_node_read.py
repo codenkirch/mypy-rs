@@ -34,6 +34,7 @@ from unittest import skipUnless
 
 from mypy.nodes import (
     GDEF,
+    LDEF,
     MDEF,
     AssignmentStmt,
     CallExpr,
@@ -380,3 +381,141 @@ class NodeShadowServingSuite(Suite):
             counters["deferred_unrecorded"] > 0
         ), "an unrecorded node in the same walk must be counted separately"
         assert counters["consulted"] == counters["served"] + counters["deferred_unrecorded"]
+
+    # -- the #1785 record-shape contract and its detector --
+
+    def _member_tree(self, member: MemberExpr) -> tuple[MypyFile, dict[Expression, Type]]:
+        """One member-lvalue assignment: the shape `process_lvalue` reads."""
+        base = NameExpr("o")
+        type_map: dict[Expression, Type] = {base: self.fx.a, member: self.fx.a}
+        return self._tree([AssignmentStmt([member], base)]), type_map
+
+    def _walk_mode(
+        self, tree: MypyFile, type_map: dict[Expression, Type], mode: int, logical: bool = False
+    ) -> dict[str, int]:
+        """Walk in `mode`, returning the read-counter delta.
+
+        The `off` control forces mode 0 for every leg, which is what makes
+        a mutated run fail where the unmutated one passes.
+        """
+        self._m.set_read_flip(0 if self.control == "off" else mode)
+        before = self._m.read_counters()
+        self._walk(tree, type_map, logical=logical)
+        return self._delta(before)
+
+    def _assert_mode_answers(
+        self, tree: MypyFile, type_map: dict[Expression, Type], logical: bool = False
+    ) -> None:
+        """Mode 0 serves nothing, mode 1 serves, mode 2 serves and reports."""
+        delta = self._walk_mode(tree, type_map, 0, logical=logical)
+        assert delta.get("served", 0) == 0, "mode 0 must serve nothing"
+        assert delta.get("deferred_off", 0) > 0, "the mode-0 leg must read live"
+        assert delta.get("mismatched", 0) == 0
+        delta = self._walk_mode(tree, type_map, 1, logical=logical)
+        assert delta.get("served", 0) > 0, "mode 1 must answer from the record"
+        assert delta.get("compared", 0) == 0, "mode 1 does not compare"
+        assert delta.get("mismatched", 0) == 0
+        delta = self._walk_mode(tree, type_map, 2, logical=logical)
+        assert delta.get("served", 0) > 0
+        assert delta.get("compared", 0) > 0, "mode 2 must compare, not just return"
+        assert delta.get("mismatched", 0) > 0, "the detector must fire on the drift"
+
+    def test_the_differential_fires_on_a_present_non_int_kind(self) -> None:
+        """#1785 case 1: `kind` written to a present non-`int` after capture.
+
+        `_capture_ref` hands `node.kind` to the `Option<i64>` seam; a
+        present non-`int` fails conversion, the `except Exception` keeps
+        the earlier record, and the served `kind_is_none` answers the
+        stale scalar where the live plain-`None` check answers the new
+        one. Pins what each mode answers so the limitation is explicit.
+        """
+        member = self._adopted_member()
+        member.kind = None  # in-contract: the record refreshes to `None`
+        tree, type_map = self._member_tree(member)
+
+        # Positive control: an unfaulted record never fires the detector.
+        clean = self._walk_mode(tree, type_map, 2)
+        assert clean.get("served", 0) > 0, "the clean leg must serve"
+        assert clean.get("mismatched", 0) == 0, "no drift, no mismatch"
+
+        fails = self._m.report().get("capture_fail.ref", 0)
+        # Out-of-contract: a present non-int must fail the capture.
+        member.kind = "bogus"  # type: ignore[assignment]
+        assert self._m.report().get("capture_fail.ref", 0) == fails + 1, (
+            "the non-int kind must fail the Option<i64> capture"
+        )
+        self._apply_control(member)
+        assert member.kind is not None, "the live slot holds a present kind"
+
+        # Mode 0 serves nothing and the fallback reads the live slot; mode 1
+        # serves the stale record. The two answers disagree by construction.
+        self._m.set_read_flip(0)
+        assert self._k.rust_node_mirror_serve_ref(member) is None
+        mode0_answers_none = member.kind is None  # the live fallback
+        self._m.set_read_flip(1)
+        served = self._k.rust_node_mirror_serve_ref(member)
+        assert served is not None
+        mode1_answers_none = served[0] is None  # the served record
+        assert (mode0_answers_none, mode1_answers_none) == (False, True), (
+            "mode 0 answers the live kind, mode 1 answers the stale one"
+        )
+        assert self._k.rust_node_mirror_verify_ref(member) is False
+
+        self._assert_mode_answers(tree, type_map)
+
+    def test_the_differential_fires_on_a_none_fullname(self) -> None:
+        """#1785 case 2: `_fullname` written to `None` after capture.
+
+        The record field is a non-optional `String`, so the served
+        `fullname_opt` always answers `Some(...)` while the live fallback
+        (`opt_str_attr`) answers `None` for the same slot. The walk legs
+        use logical deps with a `CallExpr` rvalue, the shape that reaches
+        `RefView::fullname_opt` in `depswalk.rs`.
+        """
+        member = self._adopted_member()
+        # `depswalk` returns early on a local (LDEF) lvalue, so the stale
+        # fullname is served at the site without changing the deps map.
+        member.kind = LDEF
+        member.fullname = "main.y"  # in-contract: the record holds the string
+        member.is_new_def = True
+        callee = self._adopted_ref("f", "main.f")
+        call = CallExpr(callee, [], [], [])
+        type_map: dict[Expression, Type] = {}
+        tree = self._tree([AssignmentStmt([member], call)])
+
+        clean = self._walk_mode(tree, type_map, 2, logical=True)
+        assert clean.get("served", 0) > 0, "the clean leg must serve"
+        assert clean.get("mismatched", 0) == 0, "no drift, no mismatch"
+
+        fails = self._m.report().get("capture_fail.ref", 0)
+        # Out-of-contract: a `None` `_fullname` must fail the capture.
+        member._fullname = None  # type: ignore[assignment]
+        assert self._m.report().get("capture_fail.ref", 0) == fails + 1, (
+            "a None _fullname must fail the String capture"
+        )
+        self._apply_control(member)
+        # `str | None` keeps the read out of `fullname: str`'s narrowing.
+        live_fullname: str | None = member.fullname
+        assert live_fullname is None, "the live slot holds the out-of-contract value"
+
+        # Mode 0 answers the live `None`, mode 1 the stale non-empty string.
+        self._m.set_read_flip(0)
+        assert self._k.rust_node_mirror_serve_ref(member) is None
+        mode0_fullname: str | None = member.fullname  # the live fallback
+        self._m.set_read_flip(1)
+        served = self._k.rust_node_mirror_serve_ref(member)
+        assert served is not None
+        mode1_fullname = served[2]  # the served record
+        assert mode0_fullname is None and mode1_fullname == "main.y", (
+            "mode 0 answers the live fullname, mode 1 answers the stale one"
+        )
+        assert self._k.rust_node_mirror_verify_ref(member) is False
+
+        self._assert_mode_answers(tree, type_map, logical=True)
+        # The logical-deps tail is the site that reads `fullname_opt`; a
+        # serve count above the process_lvalue one proves the tail answered
+        # the lvalue too, so the stale fullname was served by that site.
+        mode1 = self._walk_mode(tree, type_map, 1, logical=True)
+        assert mode1.get("served", 0) >= 2, (
+            "the logical-deps tail must serve the lvalue beside process_lvalue"
+        )

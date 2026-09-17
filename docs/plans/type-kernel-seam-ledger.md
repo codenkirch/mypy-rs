@@ -5113,6 +5113,49 @@ in-contract writer ever appears, the fix is to widen the capture contract
 answers), not to double every served read. Refs: #1785, PR #1783, ocr
 session `52a4e3b2`.
 
+##### #1785 detector tests: the mode-2 differential fires (recorded 2026-09-17)
+
+The section above named `compare_ref_scalars` as the detector but pinned no
+out-of-contract write, so the detector's fire was asserted nowhere. Two
+tests now pin it in `mypy/test/testtypes_native_node_read.py`, one per
+named call site, each through the real `get_dependencies` walk:
+
+- `test_the_differential_fires_on_a_present_non_int_kind` (site 1,
+  `kind_is_none`): adopt a `MemberExpr`, refresh the record to `kind=None`,
+  then write a present non-`int`. `_capture_ref` hands `node.kind` to the
+  `Option<i64>` seam, the conversion raises, `except Exception` keeps the
+  stale `None`, and `capture_fail.ref` increments by one (asserted). Mode 0
+  answers the live `is None` (False), mode 1 answers the stale record
+  (True); mode 2 serves, compares, and reports `mismatched > 0`.
+- `test_the_differential_fires_on_a_none_fullname` (site 2,
+  `fullname_opt`): the walk legs use logical deps with a `CallExpr` rvalue
+  and an LDEF-kind defining lvalue, the only shape that reaches
+  `RefView::fullname_opt` (`depswalk.rs` line 1196); a mode-1 serve count
+  above the `process_lvalue` one (>= 2) proves the tail answered the
+  lvalue. The record holds `"main.y"`, then `_fullname` is written to
+  `None`. The non-optional `String` field cannot represent it, the capture
+  fails (`capture_fail.ref` +1), mode 0 answers the live `None` while mode
+  1 answers `Some("main.y")` at that site; mode 2 serves, compares, and
+  reports `mismatched > 0`.
+
+Each test first walks the unfaulted record in mode 2 to pin the positive
+control (`served > 0`, `mismatched == 0`), so the faulted leg's
+`mismatched > 0` is a difference the same walk produces, not a constant.
+The deps map is identical across modes for both cases: the drift is
+invisible to the native/Python map comparison because the kind branch
+early-returns before adding deps (`deps.py` line 684 for site 1, the LDEF
+return at line 656 for site 2), which is exactly why the counter
+differential is required.
+
+Evidence: node-read suite 15 passed / 0 skipped (13 before + 2);
+`testtypes_native_mirror` 344 passed / 5 skipped (3.14 + librt, all
+pre-existing); `testdeps.py` (the `deps.test` corpus) 230 passed / 0
+skipped. Negative controls: `MYPY_TK_NODE_READ_CONTROL=off` rc=1 (both new
+tests fail at the clean-leg `served > 0`), `=desync` rc=1 (the agreeing
+corpus test fails on the injected desync). No `Options` default, gate
+default, or `CACHE_VERSION` changed; compare-before-answer was not
+implemented. Refs: #1785, PR #1783.
+
 
 #### Load-time seed for the fixed-format reader (#1773, recorded 2026-09-17)
 
