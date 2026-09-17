@@ -762,6 +762,19 @@ class SharedBlobAttributionSuite(unittest.TestCase):
         self.assertEqual(self.audit.pending[id(blob)][0], builder)
         self.assertEqual(dict(self.audit.reregistered), {builder: 1})
 
+    def test_a_same_site_re_registration_is_not_a_share(self) -> None:
+        # A site can re-serialize a value it still has pending (a wire-cache
+        # self-hit). The row is already that site's, and the report line says
+        # "by another call site", so counting it as a share would mislabel it.
+        builder = "subtypes.py:879:_is_subtype"
+        blob = self.register(builder, 1)[0]
+        self.audit.register_serializer_result(blob, builder)
+        self.assertEqual(len(self.audit.pending), 1)
+        self.assertEqual(dict(self.audit.reregistered), {})
+        output = self.report_text()
+        self.assertIn("wire-cache shares: 0 re-registration(s)", output)
+        self.assertNotIn("[shared:", output.split("sections A, B and C")[1])
+
     def test_a_consumed_blob_is_not_a_re_registration(self) -> None:
         # The identity is already spent, so a wire-cache hit on it is not an
         # event at all: it must not resurrect a pending entry or inflate the

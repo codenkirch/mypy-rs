@@ -241,10 +241,13 @@ def register_serializer_result(result: Any, caller: str) -> None:
         entry = pending.get(key)
         if entry is None:
             pending[key] = [caller, len(b), b]
-        else:
+        elif caller != entry[0]:
             # A wire-cache hit on a blob nothing has consumed yet: the same
             # object registered again, so this is one event and the site that
             # had the bytes built keeps the row (#1837), not the last one.
+            # Only a *different* site is a share: a site re-registering its own
+            # still-pending blob is a self-hit, which the report line (by
+            # "another call site") and the [shared: N] legend must not count.
             reregistered[entry[0]] += 1
 
 
