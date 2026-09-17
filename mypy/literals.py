@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from typing import Any, Final, TypeAlias as _TypeAlias
 
 from mypy.nodes import (
@@ -111,6 +111,39 @@ from mypy.visitor import ExpressionVisitor
 
 Key: _TypeAlias = tuple[Any, ...]
 
+# The `Var` binder-key translation hook (G2.2, #1787). None until the node
+# mirror's var-key gate engages; while None a `NameExpr` key keeps the live
+# node, which is the default path and the pre-gate behavior.
+_var_key_translate: Callable[[Var], Any] | None = None
+_var_key_resolve: Callable[[Any], Var | None] | None = None
+
+
+def set_var_key_hooks(
+    translate: Callable[[Var], Any] | None, resolve: Callable[[Any], Var | None] | None
+) -> None:
+    """Install (or clear) the `Var`-key translation hooks (#1787).
+
+    `mypy.nodes_mirror` owns the gate; this module stays ignorant of it. The
+    translate hook is the only place `literal_hash` can leave the live object
+    behind, and the resolve hook is its inverse for `extract_var_from_literal_hash`.
+    """
+    global _var_key_translate, _var_key_resolve
+    _var_key_translate = translate
+    _var_key_resolve = resolve
+
+
+def _var_key_element(node: Any) -> Any:
+    """The `("Var", ...)` key element for a `NameExpr` binding.
+
+    The node is the identity, not the name (shadowing), so the element is the
+    node itself unless the var-key gate translates captured `Var`s to their
+    store handles. A non-`Var` binding keeps the live node.
+    """
+    hook = _var_key_translate
+    if hook is None or not isinstance(node, Var):
+        return node
+    return hook(node)
+
 
 def literal_hash(e: Expression) -> Key | None:
     """Generate a hashable, (mostly) opaque key for expressions supported by the binder.
@@ -169,11 +202,20 @@ def subkeys(key: Key) -> Iterable[Key]:
 def extract_var_from_literal_hash(key: Key) -> Var | None:
     """If key refers to a Var node, return it.
 
-    Return None otherwise.
+    Return None otherwise. Under the var-key gate a `Var` binding is a store
+    handle, resolved back to the live `Var`; a handle that no longer resolves
+    leaves the key opaque, exactly as a non-`Var` element does.
     """
-    if len(key) == 2 and key[0] == "Var" and isinstance(key[1], Var):
-        return key[1]
-    return None
+    if len(key) != 2 or key[0] != "Var":
+        return None
+    element = key[1]
+    if isinstance(element, Var):
+        return element
+    resolve = _var_key_resolve
+    if resolve is None:
+        return None
+    var = resolve(element)
+    return var if isinstance(var, Var) else None
 
 
 class _Hasher(ExpressionVisitor[Key | None]):
@@ -201,7 +243,7 @@ class _Hasher(ExpressionVisitor[Key | None]):
         # N.B: We use the node itself as the key, and not the name,
         # because using the name causes issues when there is shadowing
         # (for example, in list comprehensions).
-        return ("Var", e.node)
+        return ("Var", _var_key_element(e.node))
 
     def visit_member_expr(self, e: MemberExpr) -> Key:
         return ("Member", literal_hash(e.expr), e.name)

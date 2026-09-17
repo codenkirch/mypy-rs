@@ -52,6 +52,18 @@ never answer a read. `stmt_read_counters` reports the same provenance
 seven-tuple as the G1.1 channel, which is what makes a run's evidence
 checkable rather than assumed.
 
+G2.2 (#1787, the Var handle scheme) gives the binder key its own
+mode-gated translation: `set_var_key_flip` selects a mode (0 keeps the
+live-object key, 1 emits the store handle, 2 emit + per-key differential
+compare) that `mypy/literals.py` obeys for `("Var", ...)` narrowing keys and
+that `extract_var_from_literal_hash` reverses through
+`rust_node_mirror_object_of`. A handle only translates when it resolves back
+to the exact pinned `Var`, so an unresolvable key defers to the live object
+instead of keying a lookup on the wrong node. The mode lives in Rust storage
+(`VarKeyState`), the gate is opt-in (`MYPY_TK_VAR_KEY_FLIP`, an unset
+variable wires no hook into `literal_hash`), and the counters report
+`deferred == 0` in mode 2 to prove the key space stayed homogeneous.
+
 Blind channels, audited against #1787 §1(b):
 - `replace_object_state` (`mypy/util.py`): its `setattr` leg re-registers
   the surviving identity through the same hook, pinned by
@@ -208,6 +220,10 @@ _READ_MODES: Final[frozenset[int]] = frozenset({0, 1, 2})
 # G2.1 (#1787 PR B): the statement-family serving gate, same convention
 # as the G1.1 gate above.
 _STMT_READ_FLIP_ENV: Final = "MYPY_TK_STMT_READ_FLIP"
+# G2.2 (#1787): the `Var` binder-key translation gate. Opt-in even among the
+# other flips: an unset variable leaves the key path untouched rather than
+# wiring a PyO3 crossing into every `literal_hash`.
+_VAR_KEY_FLIP_ENV: Final = "MYPY_TK_VAR_KEY_FLIP"
 
 
 def _count(key: str, n: int = 1) -> None:
@@ -339,6 +355,101 @@ def stmt_read_counters() -> dict[str, int]:
         "mismatched": int(mismatched),
         "compare_errors": int(compare_errors),
     }
+
+
+def set_var_key_flip(mode: int) -> int:
+    """Set the `Var`-key translation mode; returns the mode now in force.
+
+    Modes: 0 off (keys keep the live object, deferrals counted), 1 serve the
+    store handle, 2 serve + a per-key differential compare. A missing
+    extension leaves the mode at 0 and installs no hook, so the key path stays
+    untouched rather than half-wired.
+    """
+    if mode not in _READ_MODES:
+        raise ValueError(f"var key flip mode must be 0, 1 or 2, got {mode!r}")
+    kernel = _kernel()
+    if kernel is None:
+        _count("var_key_flip.no_type_kernel")
+        return 0
+    mode_in_force = int(kernel.rust_node_mirror_set_var_key_mode(mode))
+    _install_var_key_hooks()
+    return mode_in_force
+
+
+def var_key_flip() -> int:
+    """The `Var`-key translation mode (0 when the extension is absent)."""
+    kernel = _kernel()
+    if kernel is None:
+        return 0
+    return int(kernel.rust_node_mirror_var_key_mode())
+
+
+def var_key_counters() -> dict[str, int]:
+    """Provenance counters for the `Var`-key translation.
+
+    The same seven-tuple as `read_counters`, plus the derived `deferred`
+    (`deferred_off` + `deferred_unrecorded`): mode 2 requires it to be 0,
+    because a key space mixing handle keys and live-object keys is what the
+    translation exists to rule out.
+    """
+    kernel = _kernel()
+    if kernel is None:
+        return {}
+    (
+        consulted,
+        served,
+        deferred_off,
+        deferred_unrecorded,
+        compared,
+        mismatched,
+        compare_errors,
+    ) = kernel.rust_node_mirror_var_key_counters()
+    return {
+        "consulted": int(consulted),
+        "served": int(served),
+        "deferred_off": int(deferred_off),
+        "deferred_unrecorded": int(deferred_unrecorded),
+        "deferred": int(deferred_off) + int(deferred_unrecorded),
+        "compared": int(compared),
+        "mismatched": int(mismatched),
+        "compare_errors": int(compare_errors),
+    }
+
+
+def _translate_var_key(var: Var) -> Any:
+    """The handle for a captured `Var`'s key element, or the live object.
+
+    A `None` from the seam is the defer: mode 0, or a `Var` the capture never
+    pinned, so the key must stay the live object.
+    """
+    kernel = _kernel()
+    if kernel is None:
+        return var
+    handle = kernel.rust_node_mirror_serve_var_key(var)
+    return var if handle is None else handle
+
+
+def _resolve_var_key(element: Any) -> Var | None:
+    """Resolve a translated key element back to the live `Var` (#1787)."""
+    kernel = _kernel()
+    if kernel is None or not isinstance(element, int):
+        return None
+    obj = kernel.rust_node_mirror_object_of(element)
+    return obj if isinstance(obj, Var) else None
+
+
+def _install_var_key_hooks() -> None:
+    """Wire the translation hooks into `mypy.literals` (idempotent)."""
+    from mypy.literals import set_var_key_hooks
+
+    set_var_key_hooks(_translate_var_key, _resolve_var_key)
+
+
+def _uninstall_var_key_hooks() -> None:
+    """Clear the translation hooks so `literal_hash` keeps live keys."""
+    from mypy.literals import set_var_key_hooks
+
+    set_var_key_hooks(None, None)
 
 
 def count(key: str, n: int = 1) -> None:
@@ -952,6 +1063,20 @@ def activate(*, audit: bool = False) -> bool:
         ) from None
     if env_stmt_mode not in _READ_MODES:
         raise ValueError(f"{_STMT_READ_FLIP_ENV} must be 0, 1 or 2, got {raw_stmt_mode!r}")
+    # G2.2 (#1787): the Var-key gate is opt-in even among the flips, so an
+    # unset variable leaves the key path untouched (no hook, no PyO3 crossing
+    # per `literal_hash`); a malformed value still fails before any patching.
+    raw_var_key = os.environ.get(_VAR_KEY_FLIP_ENV)
+    env_var_key_mode = 0
+    if raw_var_key is not None:
+        try:
+            env_var_key_mode = int(raw_var_key)
+        except ValueError:
+            raise ValueError(
+                f"{_VAR_KEY_FLIP_ENV} must be 0, 1 or 2, got {raw_var_key!r}"
+            ) from None
+        if env_var_key_mode not in _READ_MODES:
+            raise ValueError(f"{_VAR_KEY_FLIP_ENV} must be 0, 1 or 2, got {raw_var_key!r}")
     kernel = _kernel()
     if kernel is None:
         _count("activate_failed.no_type_kernel")
@@ -980,6 +1105,11 @@ def activate(*, audit: bool = False) -> bool:
     # statement channel can never answer from an empty store.
     set_stmt_read_flip(env_stmt_mode)
     _count(f"stmt_read_flip.mode{stmt_read_flip()}")
+    # G2.2 (#1787): engage the Var-key translation only when the env asked
+    # for it, so the default path never crosses into Rust per `literal_hash`.
+    if raw_var_key is not None:
+        set_var_key_flip(env_var_key_mode)
+        _count(f"var_key_flip.mode{var_key_flip()}")
     return True
 
 
@@ -1002,6 +1132,7 @@ def reset(*, clear_counts: bool = False) -> None:
         if clear_counts:
             _kernel_mod.rust_node_mirror_read_reset()
             _kernel_mod.rust_node_mirror_stmt_read_reset()
+            _kernel_mod.rust_node_mirror_var_key_reset()
     _NODE_HANDLES.clear()
     # G2.0 (#1577): drop the statement/def metadata store too.
     _reset_meta()
@@ -1047,3 +1178,35 @@ def stmt_sessionfinish_dump() -> None:
     except Exception as err:
         # Same convention as the capture failures: account, never raise.
         print(f"native-nodes-mirror: stmt sessionfinish dump failed: {err}", file=sys.stderr)
+
+
+_VAR_KEY_SESSIONFINISH_ENV: Final = "MYPY_TK_VAR_KEY_SESSIONFINISH_OUT"
+
+
+def var_key_sessionfinish() -> dict[str, object]:
+    """The `Var`-key translation evidence of one finished session.
+
+    Two sections: `key_translation` (the Rust translation counters) and
+    `capture` (the Python audit counters, non-empty only in audit mode).
+    """
+    return {"key_translation": var_key_counters(), "capture": report()}
+
+
+def var_key_sessionfinish_dump() -> None:
+    """Write `var_key_sessionfinish` where the environment asks for it.
+
+    Same contract as `stmt_sessionfinish_dump`: called from `mypy.build.build`'s
+    finally, a no-op without `MYPY_TK_VAR_KEY_SESSIONFINISH_OUT` (`{pid}`
+    expands to the process id) and without an activated shadow, and never
+    raises into the `finally`.
+    """
+    out = os.environ.get(_VAR_KEY_SESSIONFINISH_ENV)
+    if not out or _kernel_mod is None:
+        return
+    out = out.replace("{pid}", str(os.getpid()))
+    try:
+        with open(out, "w") as f:
+            json.dump(var_key_sessionfinish(), f, indent=1, sort_keys=True)
+    except Exception as err:
+        # Same convention as the capture failures: account, never raise.
+        print(f"native-nodes-mirror: var key sessionfinish dump failed: {err}", file=sys.stderr)

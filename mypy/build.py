@@ -479,6 +479,12 @@ def build(
             from mypy import nodes_mirror
 
             nodes_mirror.stmt_sessionfinish_dump()
+        # G2.2 (#1787): the `Var`-key translation evidence of this session,
+        # same contract again.
+        if os.environ.get("MYPY_TK_VAR_KEY_SESSIONFINISH_OUT"):
+            from mypy import nodes_mirror
+
+            nodes_mirror.var_key_sessionfinish_dump()
 
 
 def build_inner(

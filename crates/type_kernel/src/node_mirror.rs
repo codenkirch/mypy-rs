@@ -1279,6 +1279,224 @@ pub(crate) fn rust_node_mirror_verify_stmt_flag(obj: &PyAny, field: &str) -> Opt
     verify_stmt_flag(obj, field)
 }
 
+// ===========================================================================
+// G2.2 (#1787): the `Var` binder-key handle translation
+// ===========================================================================
+
+// The narrowing key embeds the live `Var` object, and the object IS the
+// identity (name-based keys are wrong under shadowing). This seam emits the
+// stored identity handle in the key when the gate serves, else the live object.
+
+/// Serving mode: 0 off (default), 1 serve, 2 serve + differential compare.
+///
+/// Thread-local like the other read states: a mode set on one thread cannot
+/// make another thread's empty pin store look authoritative.
+#[derive(Default)]
+struct VarKeyState {
+    mode: u8,
+    /// Provenance. `consulted`: a translation ran in a serving mode.
+    /// `served`: the emitted key element is the handle.
+    /// `deferred_off`: mode 0. `deferred_unrecorded`: no identity handle or
+    /// no resolving pin, so the key stayed the live object.
+    /// `compared`/`mismatched`/`compare_errors`: the mode-2 differential.
+    consulted: u64,
+    served: u64,
+    deferred_off: u64,
+    deferred_unrecorded: u64,
+    compared: u64,
+    mismatched: u64,
+    compare_errors: u64,
+}
+
+thread_local! {
+    static VAR_KEY_STATE: RefCell<VarKeyState> = RefCell::new(VarKeyState::default());
+}
+
+/// One leaf update of the var-key state. Never called while a var-key-state
+/// borrow is held: `RefCell` would panic on the second borrow.
+fn bump_var_key(update: impl FnOnce(&mut VarKeyState)) {
+    VAR_KEY_STATE.with(|cell| update(&mut cell.borrow_mut()));
+}
+
+/// `rust_node_mirror_var_key_counters`'s answer: `(consulted, served,
+/// deferred_off, deferred_unrecorded, compared, mismatched,
+/// compare_errors)`.
+pub(crate) type VarKeyCounters = (u64, u64, u64, u64, u64, u64, u64);
+
+pub(crate) fn var_key_mode() -> u8 {
+    VAR_KEY_STATE.with(|cell| cell.borrow().mode)
+}
+
+/// Set the serving mode. Only 0, 1 and 2 exist; any other value raises so
+/// the raw pyfunction cannot select a mode no translation path implements.
+pub(crate) fn set_var_key_mode(mode: u8) -> PyResult<u8> {
+    if mode > 2 {
+        return Err(PyValueError::new_err(format!(
+            "var key flip mode must be 0, 1 or 2, got {mode}"
+        )));
+    }
+    bump_var_key(|state| state.mode = mode);
+    Ok(var_key_mode())
+}
+
+/// `(consulted, served, deferred_off, deferred_unrecorded, compared,
+/// mismatched, compare_errors)`.
+pub(crate) fn var_key_counters() -> VarKeyCounters {
+    VAR_KEY_STATE.with(|cell| {
+        let state = cell.borrow();
+        (
+            state.consulted,
+            state.served,
+            state.deferred_off,
+            state.deferred_unrecorded,
+            state.compared,
+            state.mismatched,
+            state.compare_errors,
+        )
+    })
+}
+
+/// Clear the counters. The mode is deliberately kept: it is set once per
+/// process (or per test) and a reset must not silently stop translating.
+pub(crate) fn reset_var_key_counters() {
+    bump_var_key(|state| {
+        let mode = state.mode;
+        *state = VarKeyState {
+            mode,
+            ..VarKeyState::default()
+        };
+    });
+}
+
+/// Whether the handle resolves back to this exact live object.
+///
+/// The fail direction is the defer: a poisoned or reset pin makes
+/// `object_of` answer `None`, so a translated key can never key a lookup on
+/// the wrong `Var`.
+fn resolves_to(py: Python<'_>, obj: &PyAny, handle: u64) -> bool {
+    object_of(py, handle).is_some_and(|resolved| resolved.as_ptr() == obj.as_ptr())
+}
+
+/// The mode-2 differential: the emitted handle against the live-key
+/// computation. `resolves_to` is the whole check, because `object_of`'s
+/// #1795 coherence validation makes "the handle resolves to this exact
+/// object" equivalent to "the identity key the live object would hash to is
+/// the emitted handle": a poisoned pin reads as a mismatch, never as a wrong
+/// key. Every call counts one comparison; a failure also counts a compare
+/// error, and the caller owns the mismatch counter.
+fn compare_var_key(py: Python<'_>, obj: &PyAny, handle: u64) -> bool {
+    bump_var_key(|state| state.compared += 1);
+    let ok = resolves_to(py, obj, handle);
+    if !ok {
+        bump_var_key(|state| state.compare_errors += 1);
+    }
+    ok
+}
+
+/// Emit the key element for `obj`, or `None` when the key must stay the
+/// live object: mode 0, no identity handle, or a handle that does not
+/// resolve back. Mode 2 additionally counts the differential per emitted
+/// key, so `compared == served` whenever no translation mismatched.
+///
+/// Soundness: the handle must resolve to the same live object for as long as
+/// any key holds it, which the capture-time pin guarantees per build, and
+/// `object_of`'s #1795 coherence check turns a poisoned pin into a defer
+/// rather than a key that answers for another `Var`.
+pub(crate) fn translate_var_key(py: Python<'_>, obj: &PyAny) -> Option<u64> {
+    if var_key_mode() == 0 {
+        bump_var_key(|state| state.deferred_off += 1);
+        return None;
+    }
+    bump_var_key(|state| state.consulted += 1);
+    let handle = match identity::handle_of(obj) {
+        Some(handle) => handle,
+        None => {
+            bump_var_key(|state| state.deferred_unrecorded += 1);
+            return None;
+        }
+    };
+    // The emitted key is sound only if the handle resolves back to this
+    // exact live object; an unresolvable handle defers to the live key. Mode
+    // 2 owns the per-key differential, mode 1 keeps every read live.
+    let sound = if var_key_mode() >= 2 {
+        let ok = compare_var_key(py, obj, handle);
+        if !ok {
+            bump_var_key(|state| state.mismatched += 1);
+        }
+        ok
+    } else {
+        resolves_to(py, obj, handle)
+    };
+    if !sound {
+        bump_var_key(|state| state.deferred_unrecorded += 1);
+        return None;
+    }
+    bump_var_key(|state| state.served += 1);
+    Some(handle)
+}
+
+/// The differential entry point: `Some(matched)` when the handle was
+/// emitted, `None` when the key stayed live. Counts one comparison either
+/// way. This is the read the negative control drives, so it must be usable
+/// in mode 1 where the producing path does not compare by itself.
+pub(crate) fn verify_var_key(py: Python<'_>, obj: &PyAny) -> Option<bool> {
+    if var_key_mode() == 0 {
+        bump_var_key(|state| state.deferred_off += 1);
+        return None;
+    }
+    bump_var_key(|state| state.consulted += 1);
+    let handle = match identity::handle_of(obj) {
+        Some(handle) => handle,
+        None => {
+            bump_var_key(|state| state.deferred_unrecorded += 1);
+            return None;
+        }
+    };
+    let matched = compare_var_key(py, obj, handle);
+    if !matched {
+        bump_var_key(|state| state.mismatched += 1);
+    }
+    bump_var_key(|state| state.served += 1);
+    Some(matched)
+}
+
+// ---- pyfunctions: mode, counters, and the two key entry points ----
+
+#[pyfunction]
+pub(crate) fn rust_node_mirror_set_var_key_mode(mode: u8) -> PyResult<u8> {
+    set_var_key_mode(mode)
+}
+
+#[pyfunction]
+pub(crate) fn rust_node_mirror_var_key_mode() -> u8 {
+    var_key_mode()
+}
+
+#[pyfunction]
+pub(crate) fn rust_node_mirror_var_key_counters() -> VarKeyCounters {
+    var_key_counters()
+}
+
+#[pyfunction]
+pub(crate) fn rust_node_mirror_var_key_reset() {
+    reset_var_key_counters();
+}
+
+/// The key element for `obj` as `("Var", handle)`'s second element, or
+/// `None` when the key must stay the live object.
+#[pyfunction]
+pub(crate) fn rust_node_mirror_serve_var_key(py: Python<'_>, obj: &PyAny) -> Option<u64> {
+    translate_var_key(py, obj)
+}
+
+/// The differential entry point: `Some(matched)` when the handle was
+/// emitted, `None` when the key stayed live. Counts one comparison either
+/// way.
+#[pyfunction]
+pub(crate) fn rust_node_mirror_verify_var_key(py: Python<'_>, obj: &PyAny) -> Option<bool> {
+    verify_var_key(py, obj)
+}
+
 #[cfg(test)]
 mod g2_meta_tests {
     use super::*;
@@ -1993,6 +2211,21 @@ pub(crate) fn register_registry(m: &PyModule) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(rust_node_mirror_serve_stmt_flag, m)?)?;
 
     m.add_function(wrap_pyfunction!(rust_node_mirror_verify_stmt_flag, m)?)?;
+
+    // Phase G2.2 (#1787): the `Var` binder-key handle translation. Mode 0
+    // by default; mode 2 adds the per-key differential that makes a corpus
+    // run evidence and reports `deferred == 0` when the pin precondition holds.
+    m.add_function(wrap_pyfunction!(rust_node_mirror_set_var_key_mode, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_node_mirror_var_key_mode, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_node_mirror_var_key_counters, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_node_mirror_var_key_reset, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_node_mirror_serve_var_key, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_node_mirror_verify_var_key, m)?)?;
     Ok(())
 }
 
@@ -2480,6 +2713,167 @@ mod g2_serving_tests {
             assert_eq!(verify_stmt_flag(obj, "is_unreachable"), None);
             let (_, _, deferred_off, _, compared, _, _) = stmt_counters();
             assert_eq!((deferred_off, compared), (1, 0));
+        });
+    }
+}
+
+#[cfg(test)]
+mod var_key_tests {
+    use super::*;
+
+    /// Initialize the embedded interpreter, then run with the GIL.
+    fn with_py<T>(f: impl FnOnce(Python<'_>) -> T) -> T {
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(f)
+    }
+
+    fn fresh_object(py: Python<'_>) -> &PyAny {
+        py.eval("object()", None, None).unwrap()
+    }
+
+    /// Fresh pins and counters, then the serving mode: the var-key state is
+    /// thread-local, so every case starts clean.
+    fn start_var_key(mode: u8) {
+        reset_pins();
+        reset_var_key_counters();
+        set_var_key_mode(mode).unwrap();
+    }
+
+    fn counters() -> VarKeyCounters {
+        var_key_counters()
+    }
+
+    #[test]
+    fn test_mode_zero_keeps_the_live_key_and_counts_the_deferral() {
+        with_py(|py| {
+            start_var_key(0);
+            let obj = fresh_object(py);
+            capture_pin(obj).unwrap();
+            assert_eq!(translate_var_key(py, obj), None);
+            assert_eq!(counters(), (0, 0, 1, 0, 0, 0, 0));
+        });
+    }
+
+    #[test]
+    fn test_a_pinned_object_serves_its_handle() {
+        with_py(|py| {
+            start_var_key(1);
+            let obj = fresh_object(py);
+            let handle = capture_pin(obj).unwrap();
+            assert_eq!(translate_var_key(py, obj), Some(handle));
+            assert_eq!(counters(), (1, 1, 0, 0, 0, 0, 0));
+        });
+    }
+
+    #[test]
+    fn test_an_unpinned_object_defers_to_the_live_key() {
+        with_py(|py| {
+            start_var_key(1);
+            let obj = fresh_object(py);
+            assert_eq!(translate_var_key(py, obj), None);
+            assert_eq!(counters(), (1, 0, 0, 1, 0, 0, 0));
+        });
+    }
+
+    #[test]
+    fn test_an_identity_handle_without_a_pin_defers() {
+        with_py(|py| {
+            start_var_key(1);
+            let obj = fresh_object(py);
+            // Another seam gave the object an identity handle but the capture
+            // never pinned it, so a keyed lookup could not resolve it back.
+            assert!(identity::handle_for(obj).is_some());
+            assert_eq!(translate_var_key(py, obj), None);
+            assert_eq!(counters(), (1, 0, 0, 1, 0, 0, 0));
+        });
+    }
+
+    #[test]
+    fn test_mode_two_compares_and_passes_in_sync() {
+        with_py(|py| {
+            start_var_key(2);
+            let obj = fresh_object(py);
+            capture_pin(obj).unwrap();
+            assert!(translate_var_key(py, obj).is_some());
+            assert_eq!(counters(), (1, 1, 0, 0, 1, 0, 0));
+        });
+    }
+
+    #[test]
+    fn test_mode_two_compare_detects_a_shared_handle() {
+        with_py(|py| {
+            start_var_key(2);
+            let a = fresh_object(py);
+            let b = fresh_object(py);
+            let ha = capture_pin(a).unwrap();
+            let hb = capture_pin(b).unwrap();
+            assert_ne!(ha, hb, "no two live objects share a handle");
+            // A poisoned pin makes the emitted handle resolve elsewhere: the
+            // differential must report it rather than key a lookup on `b`.
+            TARGET_PINS.with(|cell| {
+                cell.borrow_mut().insert(ha, Py::from(b));
+            });
+            assert_eq!(verify_var_key(py, a), Some(false));
+            let (_, _, _, _, compared, mismatched, errors) = counters();
+            assert_eq!((compared, mismatched, errors), (1, 1, 1));
+            // The producing path must defer the poisoned key too, never emit
+            // a handle that resolves to another object.
+            assert_eq!(translate_var_key(py, a), None);
+        });
+    }
+
+    #[test]
+    fn test_two_objects_never_share_a_handle() {
+        with_py(|py| {
+            start_var_key(1);
+            let a = fresh_object(py);
+            let b = fresh_object(py);
+            let ha = capture_pin(a).unwrap();
+            let hb = capture_pin(b).unwrap();
+            assert_ne!(ha, hb);
+            assert_eq!(translate_var_key(py, a), Some(ha));
+            assert_eq!(translate_var_key(py, b), Some(hb));
+            assert_eq!(var_key_counters().1, 2, "both keys served");
+        });
+    }
+
+    #[test]
+    fn test_translating_neither_mints_nor_pins() {
+        with_py(|py| {
+            start_var_key(1);
+            let obj = fresh_object(py);
+            assert_eq!(pin_count(), 0);
+            capture_pin(obj).unwrap();
+            let pinned = pin_count();
+            for _ in 0..5 {
+                assert!(translate_var_key(py, obj).is_some());
+            }
+            assert_eq!(pin_count(), pinned, "a read must not mint a pin");
+        });
+    }
+
+    #[test]
+    fn test_verify_requires_the_serving_mode() {
+        with_py(|py| {
+            start_var_key(0);
+            let obj = fresh_object(py);
+            capture_pin(obj).unwrap();
+            assert_eq!(verify_var_key(py, obj), None);
+            let (_, _, deferred_off, _, compared, _, _) = counters();
+            assert_eq!((deferred_off, compared), (1, 0));
+        });
+    }
+
+    #[test]
+    fn test_set_var_key_mode_refuses_a_mode_outside_the_range() {
+        with_py(|_py| {
+            assert!(set_var_key_mode(3).is_err(), "mode 3 does not exist");
+            assert!(
+                set_var_key_mode(255).is_err(),
+                "u8 headroom must not widen the range"
+            );
+            assert_eq!(set_var_key_mode(0).unwrap(), 0);
+            assert_eq!(set_var_key_mode(2).unwrap(), 2);
         });
     }
 }
