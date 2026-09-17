@@ -1,5 +1,56 @@
 # Handoff: strangler-fig Rust migration loop (seam-deferral reduction)
 
+## RESUME POINT — 2026-09-17, morning (wave 8 close: lanes landed, counters published, timing leg retired)
+
+All five wave-8 lanes are resolved. `main` = `f191bb71a`+ (G1.1 `#1777`, suite
+split `#1775`, flip-gate arming `#1774`).
+
+### Wave-8 lane outcomes
+
+| lane | outcome |
+|---|---|
+| N1 | **landed** `#1777` — G1.1 mode-gated serving read channel. Its `ocr` pass filed four leftovers: `#1778` (mirror test never restores `mypy.types` bindings), `#1779` (serving gate self-contradiction: `set_read_flip`/`read_flip` disagree, half-activation, unvalidated mode), `#1780` (mode-2 differential counts an unreadable fullname as a mismatch, unlike the capture), `#1781` (chore lows). |
+| N2 | **landed** `#1774` (`#1765`). The deeper finding is **`#1773`**: the fixed-format cache reader never seeds the symtable shadow, so the read flip cannot serve cache-loaded namespaces. |
+| T1 | **landed** `#1775` (`#1757`). |
+| G0V | **done** — G0 partial, G4 criterion 2 needs retargeting (below, `#1767`; criteria pinned `#1768`). |
+| W1 | **counters published** on `#1723`/`#1624`: 311 seams with calls, 3,138,600 calls, 99.8% native, 5,271 fallbacks; the retirement wave `809b53b90 -> e2d648080` removed 2,621,274 crossings. |
+
+### The timing leg is retired (owner decision)
+
+The quiet-host wall-clock A/B (`#1723` item 3, `#1624` wall clock) is **retired
+as unreachable on this host; do not re-attempt as a tracked work item**. Full
+evidence trail on `#1723` (closed). Summary: the admission bar (1-min load
+< 5.00) is met only in minute-scale dips — 3.92 was observed at 2026-09-17
+08:09, gone by 08:12 (Vidiom CI on the shared runner, Spotlight, Norton) —
+while a full 6-run interleaved set needs ~15-30 quiet minutes. Two integrity
+facts from the final attempt: the main-arm scratch kernel had gone missing and
+`w1-quiet-ab.sh`'s guard checks `mypy.__file__` but not `type_kernel`, so the
+provisioned script would have silently measured a **kernel-less main arm**; any
+future attempt on a genuinely quiet machine must rebuild both kernels and add a
+`type_kernel` import assertion to the guard. The A/B worktrees are removed; the
+load-invariant counters remain the operative evidence standard. `#1624` stays
+open for **handle caching** (`checker_functions.rs:42-47`, `:5117-5120`), the
+one mechanism fix that can flip a measured keep.
+
+### In flight
+
+- **`fix/g11-review-leftovers`** (pool slot w1, dispatched 2026-09-17 morning):
+  one lane, one PR fixing `#1778`+`#1779`+`#1780`+`#1781`. Rationale for its
+  priority over the queue's statement-family item: that lane builds directly on
+  the G1.1 channel, and `#1779`/`#1780` sit exactly in the gate state handling
+  and the differential it will consume — do not build the statement family on a
+  self-contradicting gate or a false-mismatch differential.
+
+### Queue after it lands
+
+1. **Statement family + `Var` handles** (H1's precondition), then H1 as ONE
+   T3 slice (`#1770` holds the corrections a designer must read first).
+2. Owner decisions pending: ADR-0006 disposition (delete prototype or successor;
+   `testtypeview.py` runs in no CI job), G4 write-flip-vs-read-serving fork,
+   `#1745` (branch protection).
+3. `#1773` (cache-reader shadow seeding), `#1761` (`rust_unknown_unpack` 5.81x),
+   `#1763`, `#1754`.
+
 ## RESUME POINT — 2026-09-17, early (wave 8: the objective is the full migration, parallelised)
 
 The active objective changed to *"do the full migration to rust parallelize as
