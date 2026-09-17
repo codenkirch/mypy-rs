@@ -1,5 +1,123 @@
 # Handoff: strangler-fig Rust migration loop (seam-deferral reduction)
 
+## RESUME POINT — 2026-09-17, evening (wave 10: #1811 Var-key landed; two lanes in flight)
+
+`main` = `a4b86848c` (#1811, the Var binder-key handle translation — §2 option A
+of #1787). This section is current state; the wave-9 tables below remain valid
+history.
+
+### Merged this session
+
+| merge SHA | PR | what |
+|---|---|---|
+| `a4b86848c` | #1811 | feat(type_kernel): #1787 Var binder-key handle translation |
+
+**#1787 stays OPEN** — its §3 store-shape work is not delivered; the lane
+deliberately did not close it.
+
+#### #1811 detail
+
+Gate `MYPY_TK_VAR_KEY_FLIP` (0 off default / 1 serve / 2 serve+differential).
+Files: `crates/type_kernel/src/node_mirror.rs`, `mypy/nodes_mirror.py`,
+`mypy/literals.py`, `mypy/test/testtypes_native_var_key.py`,
+`stubs/type_kernel_mirror.pyi`, `mypy/build.py`. Merged head `460ecd7fc`.
+
+- CI green on `460ecd7fc`: pr-gate `35227955522` (lint-changed + pr-gate);
+  parity `35227955614` (parity, parity-mirror, parity-symtable-flip,
+  parity-typeops; parity-ast skipped). AI Code Review skipped (fork — never
+  `agent-wait until github.pr`).
+- Independent review (separate read-only agent, meta-pro): no blocking findings,
+  seven advisories. Fixes 1-5 landed in `460ecd7fc`; advisory 6 tracked as
+  #1815; advisory 7 recorded, no code change. Dispositions posted as PR comment
+  (issuecomment-5715248049).
+- Local evidence on `460ecd7fc`: `cargo test -p mypy-type-kernel` 2899 passed /
+  0 failed / 8 ignored; `testtypes_native_var_key.py` 17 passed; under
+  `MYPY_TK_VAR_KEY_CONTROL=share` 8 failed / 9 passed (identity test reddens as
+  designed); fmt/ruff/black clean.
+- Cleanup done: w1 released, local + remote `feat/1787-varkey-handle-scheme`
+  deleted, local `main` fast-forwarded.
+
+### In flight at handoff time (NOT merged)
+
+Two lanes were dispatched in parallel, both based on `a4b86848c`, both on
+`meta-speed` (the standing model order for #1787-family work). At this writing
+neither had committed or opened a PR — **verify real state before trusting it**
+(`gh pr list -R codenkirch/mypy-rs --state open`; `git -C <slot> log -1`).
+
+| slot | branch | issue | agent id / task id |
+|---|---|---|---|
+| w2 | `refactor/1815-flipstate-collapse` | #1815 | agent-26 / agent-uwf0k3f2 |
+| w3 | `perf/1739-retire-classify-protocol-test-callee` | #1739 | agent-27 / agent-q4f4wjwn |
+
+- **#1815**: collapse `ReadState` / `StmtReadState` / `VarKeyState` (three
+  identical `mode`+7-counter structs in `node_mirror.rs`) into one `FlipState`
+  with per-seam thread-locals; keep the per-channel pyfunctions as thin
+  delegates; preserve the three mode-error strings and the three counter type
+  aliases. Pure refactor, T2.
+- **#1739**: retire `rust_classify_protocol_test_callee` (measured 1.3-3.7x
+  loss, 0/200 decided on the common shapes). Call `checkexpr.py:1770`, import
+  `:265`, fallback `:348`; pins into `mypy/test/testtypes_native_retired.py`.
+  T3 (both gate states).
+
+Recovery: `Agent(resume="agent-26", ...)` / `Agent(resume="agent-27", ...)`, or
+read their `agents/<id>/wire.jsonl` under the session dir.
+
+### Next-perf-lane recon (agent-25, read-only, complete)
+
+`#1739`'s round-5 table is ~consumed (9 of 16 seams already retired). Ready
+slices, in order:
+1. retire `rust_classify_protocol_test_callee` — **in flight** (w3, above).
+2. retire `rust_check_unpacks_in_list` — `typeanal.py:3212` (5.5-10.2x loss,
+   110,966 calls). T3.
+3. retire `rust_analyze_member_access` — `checkmember.py:605` (6.2-9.1x loss,
+   13,060 calls). T3.
+   AGENTS caps a wave at 1-2 T3 lanes — pick one of 2/3 next, queue the other.
+4. **#1624's live lever: handle caching** in `checker_functions.rs` — cache
+   `nodes_class` results (fn `:42-46`, 42 sites) and hoist the 9
+   `py.import("mypy.types")` lookups (`:1329 :1684 :3549 :5175 :6094 :6109
+   :6202 :6571 :7363`). T2.
+5. re-measure `rust_analyze_instance_member_dispatch` (`checkmember.py:756`)
+   after 4 — marginal 1.10x keep. T2 measurement, evidence-critical.
+
+Stale anchors flagged: `#1624`'s `checker_functions.rs:5117-5120` is now
+`:5175`; wave-6 census drift (`get_declaration` `binder.py:735`,
+`flatten_lvalues` `checker.py:5919`, `infer_condition_value`
+`reachability.py:149`, `unmangle` `util.py:588`). `rust_get_declaration` is a
+*semantic* collision with #1787's binder-key scheme — defer it.
+
+### Host / environment
+
+- Wall-clock leg of `scripts/measure_work_share.py` stays retired (no quiet
+  window; bar is 1-min load < 5). All post-retirement evidence is load-invariant
+  counters (`scripts/measure_native_share.py`, `misc/audit_wire_traffic.py`).
+- A single-core oracle process from another portfolio ran days at ~98% CPU;
+  flagged, not killed (owner decision).
+
+### Pool state at handoff
+
+w1 free; w2 claimed (`refactor/1815-flipstate-collapse`); w3 claimed
+(`perf/1739-retire-classify-protocol-test-callee`). Release with
+`sh scripts/worktree_pool.sh release <slot>` (refuses on a dirty tree; deletes
+the local branch).
+
+### Standing rules that bit this session
+
+- Never `agent-wait until github.pr` (hangs on the fork's skipped AI Code
+  Review check) — use `agent-wait until github.ci <run-id>`. Background bash
+  tasks are capped at 600s by default; pass a longer `timeout` for long waits
+  (the parity wait was killed at 600s mid-run and had to be re-checked).
+- Pre-flight before any suite run:
+  `.venv/bin/python scripts/assert_worktree_import.py <tree>` — exit 0 + the
+  tree path is the only acceptable result (a worktree `.venv` symlinks the main
+  venv, so `import mypy` can resolve to the wrong tree).
+- Heavy ops via `/private/tmp/mypy-rs-sem.sh run 1 <build>` / `run 2 <corpus>`;
+  never bare, never `-n auto`.
+- Kernel build: `cargo rustc -p mypy-type-kernel --features extension-module
+  --lib --crate-type cdylib --release -- -C link-arg=-undefined
+  -C link-arg=dynamic_lookup`, copy the `.so` to a private scratch dir,
+  `codesign -f -s -`; NEVER `maturin develop`.
+- Merge style is `--squash --admin`; branch from `main`; never commit to `main`.
+
 ## RESUME POINT — 2026-09-17, afternoon (wave 9 close: 12 PRs landed, #1787 PR A+B in, Var-key lane in flight)
 
 `main` = `0aa7844a6` (#1804, #1787 PR B — the wave's last merge). Twelve PRs
