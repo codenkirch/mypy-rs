@@ -116,11 +116,23 @@ pub(crate) struct FlipCounts {
     /// namespace came from the write log, so a test that claims seed
     /// coverage is vacuous.
     pub(crate) seeded_owners: u64,
-    /// Owners the seed was attempted on and refused, because a live value
-    /// had no readable flag slots (#1755). This is the only evidence that
-    /// the attempt happened: it separates "the seed declined" from "the
-    /// seed never ran", which `seeded_owners == 0` cannot.
-    pub(crate) seed_rejects: u64,
+    /// Owners the seed was attempted on and refused because the live
+    /// namespace (or a symbol's flag slots) was unreadable (#1755). This
+    /// is the only evidence that the attempt happened: it separates "the
+    /// seed declined" from "the seed never ran", which `seeded_owners == 0`
+    /// cannot.
+    pub(crate) seed_rejects_unreadable: u64,
+    /// Owners the seed refused because the live `len()` could not be read
+    /// (`ShadowGap::NotSized`). Split from the namespace reason (#1810) so
+    /// seed-side evidence separates the two refusal shapes.
+    pub(crate) seed_rejects_not_sized: u64,
+}
+
+impl FlipCounts {
+    /// Owners refused across both seed refusal reasons.
+    pub(crate) fn seed_rejects_total(&self) -> u64 {
+        self.seed_rejects_unreadable + self.seed_rejects_not_sized
+    }
 }
 
 /// The ref flags passed on every put/refresh.
@@ -337,12 +349,25 @@ fn owner_taken(store: &SymStore, owner_handle: u64) -> bool {
     store.by_owner.contains_key(&owner_handle) || store.inherited.contains(&owner_handle)
 }
 
+/// Which refusal reason a seed hit, so the counters can tell a namespace
+/// the seed could not read from a live `len()` it could not read (#1810).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum SeedRefusal {
+    /// `owner.items()` (or a flag slot on a live symbol) was unreadable.
+    Unreadable,
+    /// `owner.len()` raised, so the size gate cannot run (`NotSized`).
+    NotSized,
+}
+
 /// Fail-closed refusal: pin the owner so the read gate reports `Inherited`
 /// (not a bare no-handle), and count the attempt as evidence.
-fn refuse_seed(store: &mut SymStore, owner: &PyAny, owner_handle: u64) {
+fn refuse_seed(store: &mut SymStore, owner: &PyAny, owner_handle: u64, reason: SeedRefusal) {
     store.pins.insert(owner_handle, Py::from(owner));
     store.inherited.insert(owner_handle);
-    store.flip.seed_rejects += 1;
+    match reason {
+        SeedRefusal::Unreadable => store.flip.seed_rejects_unreadable += 1,
+        SeedRefusal::NotSized => store.flip.seed_rejects_not_sized += 1,
+    }
 }
 
 /// Record (or replace) the entry for `(owner, name)`; returns
@@ -356,20 +381,20 @@ pub(crate) fn put(
     let owner_handle = handle_or_error(owner)?;
     let node_handle = handle_or_error(symbol)?;
     let table_len = owner.len().unwrap_or(0);
-    let first_write = with_store(|store| !store.by_owner.contains_key(&owner_handle));
-    // Write-time seed (#1755): keys present on the first recorded write of
-    // this build predate the store's ordinals, so the store takes its
-    // ordinals from the live order instead of declaring the owner dead.
-    let seed = (first_write && table_len > 1).then(|| prepare_seed(owner));
+    // Write-time seed (#1755): keys on the first recorded write predate
+    // the store's ordinals, so the store takes its ordinals from the live
+    // order. A short borrow skips the read for a decided owner (#1810).
+    let seed = (table_len > 1 && !with_store(|store| owner_taken(store, owner_handle)))
+        .then(|| prepare_seed(owner));
     Ok(with_store(|store| {
         // The store's own view decides at the moment of the mutation: a
         // re-entrant call during `prepare_seed` can adopt or refuse this
         // owner, and either decision wins (same guard as `seed`).
-        if first_write && table_len > 1 && !owner_taken(store, owner_handle) {
+        if table_len > 1 && !owner_taken(store, owner_handle) {
             match seed {
                 Some(Some(pairs)) => seed_entries(store, owner, owner_handle, pairs),
                 // Not a readable namespace: the order claim cannot hold.
-                _ => refuse_seed(store, owner, owner_handle),
+                _ => refuse_seed(store, owner, owner_handle, SeedRefusal::Unreadable),
             }
         }
         let generation = store.generation_for(owner_handle);
@@ -444,7 +469,7 @@ pub(crate) fn seed(owner: &PyAny) -> PyResult<usize> {
         Err(_) => {
             return Ok(with_store(|store| {
                 if !owner_taken(store, owner_handle) {
-                    refuse_seed(store, owner, owner_handle);
+                    refuse_seed(store, owner, owner_handle, SeedRefusal::NotSized);
                 }
                 0
             }));
@@ -472,7 +497,7 @@ pub(crate) fn seed(owner: &PyAny) -> PyResult<usize> {
                 count
             }
             None => {
-                refuse_seed(store, owner, owner_handle);
+                refuse_seed(store, owner, owner_handle, SeedRefusal::Unreadable);
                 0
             }
         }
@@ -921,7 +946,11 @@ pub(crate) fn rust_symtable_mirror_flip_counts<'py>(py: Python<'py>) -> PyResult
     dict.set_item("put_entries", counts.put_entries)?;
     dict.set_item("seeded_entries", counts.seeded_entries)?;
     dict.set_item("seeded_owners", counts.seeded_owners)?;
-    dict.set_item("seed_rejects", counts.seed_rejects)?;
+    // #1810: the refusal reasons split from the single total, which stays
+    // the sum so existing consumers keep reading it.
+    dict.set_item("seed_rejects", counts.seed_rejects_total())?;
+    dict.set_item("seed_rejects_unreadable", counts.seed_rejects_unreadable)?;
+    dict.set_item("seed_rejects_not_sized", counts.seed_rejects_not_sized)?;
     Ok(dict)
 }
 
@@ -1436,7 +1465,7 @@ mod symtable_mirror_tests {
             assert_eq!(counts.defer_inherited, 0);
             assert_eq!(counts.seeded_entries, 2);
             assert_eq!(counts.seeded_owners, 1);
-            assert_eq!(counts.seed_rejects, 0);
+            assert_eq!(counts.seed_rejects_total(), 0);
             assert_eq!(counts.put_entries, 0);
         });
     }
@@ -1460,7 +1489,7 @@ mod symtable_mirror_tests {
             assert_eq!(counts.seeded_owners, 1);
             assert_eq!(counts.seeded_entries, 2);
             assert_eq!(counts.put_entries, 0);
-            assert_eq!(counts.seed_rejects, 0);
+            assert_eq!(counts.seed_rejects_total(), 0);
             assert_eq!(counts.tables_mirrored, 1);
             // Idempotent: an adopted owner re-seeds nothing.
             assert_eq!(rust_symtable_mirror_seed(table).unwrap(), 0);
@@ -1494,10 +1523,11 @@ mod symtable_mirror_tests {
             ));
             let counts = flip_counts();
             assert_eq!(counts.seeded_owners, 0);
-            assert_eq!(counts.seed_rejects, 1);
+            assert_eq!(counts.seed_rejects_unreadable, 1);
+            assert_eq!(counts.seed_rejects_not_sized, 0);
             // A refused seed is not retried on a second call.
             assert_eq!(rust_symtable_mirror_seed(table).unwrap(), 0);
-            assert_eq!(flip_counts().seed_rejects, 1);
+            assert_eq!(flip_counts().seed_rejects_unreadable, 1);
         });
     }
 
@@ -1523,7 +1553,8 @@ mod symtable_mirror_tests {
             assert_eq!(counts.seeded_entries, 0);
             // The attempt is observable: it ran and refused, which is what
             // `seeded_owners == 0` alone cannot say.
-            assert_eq!(counts.seed_rejects, 1);
+            assert_eq!(counts.seed_rejects_unreadable, 1);
+            assert_eq!(counts.seed_rejects_not_sized, 0);
             // The write still records: only the seed refused.
             assert_eq!(counts.put_entries, 1);
             // The mark is per build: after a reset, a namespace the store
@@ -1666,7 +1697,8 @@ table = T({'a': object()})
             let handle = identity::handle_for(table).unwrap();
             assert_eq!(seed(table).unwrap(), 0);
             let counts = flip_counts();
-            assert_eq!(counts.seed_rejects, 1);
+            assert_eq!(counts.seed_rejects_unreadable, 1);
+            assert_eq!(counts.seed_rejects_not_sized, 0);
             assert_eq!(counts.seeded_owners, 0);
             assert_eq!(counts.seeded_entries, 0);
             // Refused, not adopted: the owner is never in both maps.
@@ -1705,7 +1737,8 @@ table = U({'a': sym})
             let handle = identity::handle_for(table).unwrap();
             assert_eq!(seed(table).unwrap(), 0);
             let counts = flip_counts();
-            assert_eq!(counts.seed_rejects, 1);
+            assert_eq!(counts.seed_rejects_not_sized, 1);
+            assert_eq!(counts.seed_rejects_unreadable, 0);
             assert_eq!(counts.seeded_owners, 0);
             assert!(with_store(|store| store.inherited.contains(&handle)));
             assert!(with_store(|store| store.pins.contains_key(&handle)));
@@ -1718,7 +1751,7 @@ table = U({'a': sym})
             ));
             // A second call is a no-op (already refused), no double count.
             assert_eq!(seed(table).unwrap(), 0);
-            assert_eq!(flip_counts().seed_rejects, 1);
+            assert_eq!(flip_counts().seed_rejects_not_sized, 1);
         });
     }
 
@@ -1736,7 +1769,7 @@ table = U({'a': sym})
                 .unwrap();
             table.set_item("b", symbol_object(py, "mod.b")).unwrap();
             assert_eq!(seed(table).unwrap(), 0);
-            assert_eq!(flip_counts().seed_rejects, 1);
+            assert_eq!(flip_counts().seed_rejects_unreadable, 1);
             table.set_item("a", symbol_object(py, "mod.a")).unwrap();
             put(table, "a", symbol_object(py, "mod.a"), flags(1)).unwrap();
             let handle = identity::handle_for(table).unwrap();
@@ -1752,6 +1785,57 @@ table = U({'a': sym})
                 entries_if_mirrored(py, table),
                 Err(ShadowGap::Inherited)
             ));
+        });
+    }
+
+    #[test]
+    fn test_taken_owner_skips_the_seed_read() {
+        with_py(|py| {
+            reset();
+            flip_counts_reset();
+            // A namespace that counts its `items()` reads (#1810). Once the
+            // store has refused the owner it is taken, so the write-time
+            // seed must not run `prepare_seed` at all.
+            let globals = PyDict::new(py);
+            globals.set_item("sym", symbol_object(py, "mod.a")).unwrap();
+            py.run(
+                r#"reads = 0
+
+
+class R(dict):
+    def items(self):
+        global reads
+        reads += 1
+        return dict.items(self)
+
+
+table = R({'a': object(), 'b': sym})
+"#,
+                Some(globals),
+                None,
+            )
+            .unwrap();
+            let table = globals.get_item("table").unwrap().unwrap();
+            let sym = globals.get_item("sym").unwrap().unwrap();
+            // `a` carries no flag slots, so the seed declines and marks the
+            // owner taken (`Inherited`).
+            assert_eq!(seed(table).unwrap(), 0);
+            assert_eq!(flip_counts().seed_rejects_unreadable, 1);
+            // Make the namespace readable and reset the read counter: the
+            // write below must not read `items()`.
+            table.set_item("a", sym).unwrap();
+            globals.set_item("reads", 0i64).unwrap();
+            put(table, "a", sym, flags(1)).unwrap();
+            let reads: i64 = globals
+                .get_item("reads")
+                .unwrap()
+                .unwrap()
+                .extract()
+                .unwrap();
+            assert_eq!(reads, 0);
+            // The refusal still stands: the write recorded, the seed did not.
+            assert_eq!(flip_counts().seeded_owners, 0);
+            assert_eq!(flip_counts().put_entries, 1);
         });
     }
 }

@@ -954,10 +954,32 @@ class NativeSymtableReadFlipSuite(Suite):
         counters = self._m.flip_report()
         assert counters["seeded_owners"] == 0
         assert counters["seed_rejects"] == 1
+        # #1810: the refusal reason is the unreadable namespace, not the size.
+        assert counters["seed_rejects_unreadable"] == 1
+        assert counters["seed_rejects_not_sized"] == 0
         flipped = self._snapshot(unreadable, 1)
         assert flipped == self._snapshot(unreadable, 0)
         assert self._m.flip_report()["defer_inherited"] == 1
         assert self._stats() == {"calls": 1, "deferred": 1}
+
+    def test_seed_unreadable_len_reports_the_not_sized_reason(self) -> None:
+        # #1810: the two seed refusal reasons are separate in the evidence.
+        # A namespace whose `len()` raises is refused as `NotSized`, not as
+        # an unreadable namespace, so seed-side evidence names the shape.
+        class Unsized(SymbolTable):
+            def __len__(self) -> int:
+                raise TypeError("unsized")
+
+        table: SymbolTable = Unsized()
+        dict.__setitem__(table, "a", self._sym("a", "mod.a"))
+        assert self._m.seed_loaded(table) == 0
+        counters = self._m.flip_report()
+        assert counters["seeded_owners"] == 0
+        assert counters["seed_rejects"] == 1
+        assert counters["seed_rejects_not_sized"] == 1
+        assert counters["seed_rejects_unreadable"] == 0
+        # Pinned into the fail-closed state, not left as a bare no-handle.
+        assert self._k.rust_symtable_mirror_handle_of(table) is not None
 
     def test_unreadable_namespace_does_not_seed(self) -> None:
         # Negative control for the seed's eligibility rule: a live value
@@ -984,6 +1006,9 @@ class NativeSymtableReadFlipSuite(Suite):
         # `seed_rejects == 0`) and `defer_inherited` stays 0.
         assert counters["seeded_entries"] == 0
         assert counters["seed_rejects"] == 1
+        # #1810: the unreadable-namespace reason, not the size reason.
+        assert counters["seed_rejects_unreadable"] == 1
+        assert counters["seed_rejects_not_sized"] == 0
         assert counters["put_entries"] == 1
         # The read defers and the live walk answers, as before the seed.
         flipped = self._snapshot(table, 1)
