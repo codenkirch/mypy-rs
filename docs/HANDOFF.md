@@ -1,5 +1,108 @@
 # Handoff: strangler-fig Rust migration loop (seam-deferral reduction)
 
+## RESUME POINT — 2026-09-17, night (wave 11: 4 PRs merged; #1624's caching lever measured dead)
+
+`main` = `476accf40` (#1819). Four PRs merged this wave; four lanes were still
+in flight as this was written — **verify real state before trusting the table**.
+
+### Merged this wave
+
+| merge SHA | PR | what |
+|---|---|---|
+| `22e25aa0a` | #1816 | docs: wave-10 resume point in the handoff |
+| `b878fbedc` | #1817 | refactor(type_kernel): collapse `ReadState`/`StmtReadState`/`VarKeyState` into one `FlipState` (#1815, closed) |
+| `dcf02b804` | #1818 | perf: retire `rust_classify_protocol_test_callee` (#1739) |
+| `476accf40` | #1819 | perf: retire `rust_check_unpacks_in_list` (#1739) |
+
+Review of record: `ocr review` returned **0 findings** on #1818 (2 files) and on
+#1819 (3 files, 3m23s). #1817 is a pure refactor and was reviewed by an
+independent read of the diff, not by OCR: the three per-channel mode-error
+strings preserved verbatim and distinct (`node read` / `stmt read` / `var key`),
+the seven-counter tuples and the three public type aliases unchanged, `reset`
+still preserving `mode`, thread-locals still per-channel, Python diff
+docstring-only, `grep -c '#\[test\]'` 59 on both sides. #1819's engagement
+numbers were re-verified from the lane's own artifacts rather than the PR body:
+before total 125,545 with `rust_check_unpacks_in_list: 17584 calls, 0 defers,
+0B`; after 107,961 with the seam in the zero-call list — the delta is exactly
+that seam's traffic and no other seam moved.
+
+### #1624's handle caching: mechanism real, lever dead — do not re-attempt
+
+The lane completed with **no PR** (kill criterion honoured, tree byte-identical
+to `main`). Cached class handles do beat uncached per call (−0.45 µs static,
+−0.47 µs trivial-self, −1.62 µs generic), but the kernel-wide mechanism is
+bounded by the per-call import cost it removes: **1,692,196 counted imports**
+unarmed and **2,477,218** with `MYPY_ENABLE_NATIVE_SEMANAL=1` (`mypy.nodes`
+1,017,979 / 1,593,914; `mypy.types` 616,262 / 717,167; `mypy.semanal` 0 /
+99,927; `mypy.state` 47,831 / 47,831) at ~162 ns each ≈ **0.40 s of imports
+(~0.5 s with the getattr term) against a ~72 s cold self-check, ~0.6 %**. It
+cannot flip a measured keep, and the shim ratio moved ≤4 % with inconsistent
+sign.
+
+Also from that lane: the **1.10x keep of `rust_analyze_instance_member_dispatch`
+is not reproducible** in any reader-visible shape (measured 0.40-0.62x loss on
+static / trivial-self / generic). That is a method/shape gap, not a
+falsification — the ledger never records which shape produced 1.10x. Do **not**
+retire the seam on the different-shape number; the originating harness needs
+recording or the keep re-deriving. Full reasoning on #1624, including the pyo3
+finding that `PyModule::import`'s wrapper is not the cost (162 ns vs 156 ns for
+`ffi::PyImport_ImportModule` + static `CStr`), so nobody should chase that swap.
+
+### Measurement corrections this wave (cite these before ranking anything)
+
+- **#1739's round-5 table is stale in its top rows**: five checked rows have
+  zero production call sites — `rust_flatten_nested_unions` (278,082),
+  `rust_copy_modified` (265,437), `rust_has_abstract_type` (246,897),
+  `rust_refers_to_typeddict` (111,940), `rust_has_placeholder` (~79k). "Slice 1
+  (predicate sweep)" and half of slice 2 as written target dead seams.
+- **Registered ≠ live**: 826 registered, 153 called, **673 zero-call** on one
+  probe run. Rank the live set, never the registered surface.
+- **Liveness method caveat**: a `\b`-anchored `rg` **misses calls made through
+  the `_rust_*` alias** (`_` is a word character, so `\brust_x\b` cannot match
+  `_rust_x(`). Corrected census on `476accf40` — live: `rust_expand_type`
+  (`expandtype.py:355`), `rust_analyze_member_access` (`checkmember.py:605`,
+  retirement in flight), `rust_analyze_instance_member_dispatch`
+  (`checkmember.py:756`, keep disputed), `rust_check_call_head`
+  (`checkexpr.py:2947`), `rust_compute_arg_context_indices`
+  (`checkexpr.py:3515`), `rust_classify_special_unbound` (`typeanal.py:993`).
+  Everything else named in the round-5 table is uncalled.
+- **#1820 filed**: `misc/audit_wire_traffic.py` prints a full report of zeros
+  and exits 0 when the audited check fans out (`mypy_self_check.ini:31`
+  `num_workers = 4`); there is no fan-out guard.
+- **#1754 addendum**: the pinned census command never arms
+  `MYPY_ENABLE_NATIVE_SEMANAL`, which nearly halves the counted imports, so
+  census totals are gate-dependent.
+
+### In flight as this was written (NOT merged — verify)
+
+| slot | branch | scope |
+|---|---|---|
+| w3 | `perf/1739-retire-analyze-member-access` | retire `rust_analyze_member_access` (T3) |
+| w4 | `feat/1787-stmt-serve-seed-wire` | #1787 §3 minimum extension: adoption-time seed + a wire slot for one type-valued consumer (T2) |
+| w5 | `fix/1820-audit-fail-on-fanout` | the #1820 fan-out and hollow-zero guards |
+| w1 | `recon/1787-next-ladder-slice` | read-only: pins the next Phase-G slice after the §3 extension as a new issue |
+
+### Pool and host
+
+The pool is now **five** slots (`w1`-`w5`), but the throttle remains the
+weighted semaphore (3 units; build = 1, corpus = 2, never two corpora), not the
+slot count. Host load ran 24-30 on 18 cores with three heavy lanes live, and
+CI's parity jobs run on **this same host**: #1819's parity run took **546 s**
+where #1817's took ~91 s. Budget before adding a fourth heavy lane.
+
+### Rules that bit this session
+
+- **Fast-forward the local checkout after every GitHub merge.** A stale local
+  `main` made a liveness check read the pre-merge file and report
+  `rust_classify_protocol_test_callee` as still called after its retirement had
+  merged.
+- Never `agent-wait until github.pr` (the fork's AI Code Review is skipped); use
+  `agent-wait until github.ci <run-id>`. Background bash caps at 600 s.
+- Gate every seam selection on a production-call-site liveness check.
+- Do not let a lane commit its probe into the crate: `crates/type_kernel/src/lib.rs`
+  declares every module, so a probe module ships. Probes belong in `misc/`,
+  `scripts/`, or `/private/tmp`.
+
 ## RESUME POINT — 2026-09-17, evening (wave 10: #1811 Var-key landed; two lanes in flight)
 
 `main` = `a4b86848c` (#1811, the Var binder-key handle translation — §2 option A

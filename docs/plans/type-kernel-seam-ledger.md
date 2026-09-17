@@ -34,6 +34,18 @@ In flight when this log was written: `rust_fill_typevars` (#1744),
 `rust_map_actuals_to_formals`, `rust_map_actuals_to_formals_with_types`,
 `rust_map_formals_to_actuals` and `rust_check_argument_count` (#1747).
 
+Correction, 2026-09-17: this table was not extended by the retirement waves
+that followed, so treat the **per-area pin files** as the authoritative
+per-seam list —
+`mypy/test/testtypes_native_retired{,_checker,_checkexpr,_checkmember,_typeanal,_types}.py`.
+The five seams named as in flight above have all since been retired: verified on
+`476accf40` by scanning every `mypy/**/*.py` outside `mypy/test/` for each name
+and classifying each hit as a call site, an import item, a `= None` fallback or a
+comment — none has a call site left. Beware one method trap when re-verifying:
+a `\b`-anchored search (`rg "\b<seam>\b"`) **misses calls made through the
+aliased name** `_rust_<seam>`, because `_` is a word character, so the alias call
+form is invisible to it.
+
 The decision rule behind these, measured as min-of-7 ns/call with both arms in
 one process and the FFI ticket spied for engagement: **the wire interface loses
 when the Python body is an O(1)/O(n) rebuild or scan, and wins when the body is
@@ -42,6 +54,15 @@ of a port that pays and keeps its interface. Per-seam numbers and the ranked
 remainder are in #1739; `rust_analyze_instance_member_dispatch` (1.10x) and
 `rust_classify_special_unbound` (0.78x on its common shape) measured as
 keeps, not retirements.
+
+Caveat added 2026-09-17 (#1624 addendum): the 1.10x figure for
+`rust_analyze_instance_member_dispatch` is **not reproducible** in the
+reader-visible shapes — re-measured 0.40-0.62x on static, trivial-self and
+generic, all three a loss. The shape that produced 1.10x is unrecorded, so the
+keep is **unresolved rather than established**. Do not retire the seam on the
+different-shape number; the originating harness needs recording or the keep
+re-deriving. `rust_expand_type`'s keep is unaffected: it is documented here as
+a deliberate keep of a port that pays.
 
 ### Native-parser parity
 
