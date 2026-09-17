@@ -959,12 +959,12 @@ class NativeInferArgContextSuite(Suite):
     skipped); the per-arg accept recursion and the infer_unions toggle
     stay in Python. The Rust seam decides from scalars only. Direct seam
     calls assert the mapping (star-skip, empty formal_to_actual,
-    no-context tail, malformed deferral); gate off vs on must produce
-    identical accept traces across the 3 call-site shapes
-    (checkexpr.py:3004, 3424, 3627).
+    no-context tail, malformed deferral); the 3 call-site shapes
+    (checkexpr.py:3004, 3424, 3627) are single-run value pins.
 
-    #1739 retired the shim (1.37x-1.59x the Python double loop), so the
-    gate toggle is inert for this body now: both arms are the Python loop.
+    #1739 retired the shim (1.37x-1.59x the Python double loop): the host
+    method (checkexpr.py:3455) reads no gate and loads no `_rust_*` name,
+    so the shapes below run once, with the gate on as production runs it.
     The pyfunction stays registered for the direct-seam tests above, and
     the retirement pins live in `testtypes_native_retired_checkexpr.py`.
     """
@@ -978,13 +978,6 @@ class NativeInferArgContextSuite(Suite):
 
     def tearDown(self) -> None:
         self._set_active(False)
-
-    def _with_gate(self, active: bool, fn: Callable[[], T]) -> T:
-        self._set_active(active)
-        try:
-            return fn()
-        finally:
-            self._set_active(True)
 
     def _make_callee(self, n_args: int) -> CallableType:
         return CallableType(
@@ -1022,7 +1015,7 @@ class NativeInferArgContextSuite(Suite):
         out = _type_kernel.rust_compute_arg_context_indices([0], [[0]], 2, 1)
         assert out is None, f"{out}"
 
-    # -- gate off/on differential across the 3 call sites --
+    # -- value pins across the 3 call sites --
 
     def _run_infer(
         self,
@@ -1030,7 +1023,6 @@ class NativeInferArgContextSuite(Suite):
         args: list[Expression],
         arg_kinds: list[ArgKind],
         formal_to_actual: list[list[int]],
-        active: bool,
     ) -> list[str]:
         from mypy.checkexpr import ExpressionChecker
 
@@ -1042,55 +1034,49 @@ class NativeInferArgContextSuite(Suite):
             return arg
 
         ec.accept = accept  # type: ignore[assignment]
-        result = self._with_gate(
-            active,
-            lambda: ec.infer_arg_types_in_context(callee, args, arg_kinds, formal_to_actual),
-        )
+        result = ec.infer_arg_types_in_context(callee, args, arg_kinds, formal_to_actual)
         return [str(r) for r in result] + captured
 
     def _make_args(self, n: int) -> list[Expression]:
         return [NameExpr(f"a{i}") for i in range(n)]
 
-    def test_par_lambda_body_site(self) -> None:
+    def test_value_lambda_body_site(self) -> None:
         # checkexpr.py:3004 shape: positional args, 1:1 formal mapping.
+        # The body (checkexpr.py:3455) reads no gate, so one run pins it.
         callee = self._make_callee(2)
         args = self._make_args(2)
         kinds = [ARG_POS, ARG_POS]
         f2a = [[0], [1]]
-        off = self._run_infer(callee, args, kinds, f2a, False)
-        on = self._run_infer(callee, args, kinds, f2a, True)
-        assert off == on, f"lambda_body: off={off} on={on}"
+        on = self._run_infer(callee, args, kinds, f2a)
         assert all("ctx=Any" in s for s in on[len(args) :]), f"expected contexts: {on}"
 
-    def test_par_first_pass_site(self) -> None:
-        # checkexpr.py:3424 shape: optional + named formals, error-filtered.
+    def test_value_first_pass_site(self) -> None:
+        # checkexpr.py:3424 shape: optional + named formals still map
+        # 1:1, so every arg is accepted with the callee's Any context.
         callee = self._make_callee(3)
         args = self._make_args(3)
         kinds = [ARG_POS, ARG_OPT, ARG_NAMED]
         f2a = [[0], [1], [2]]
-        off = self._run_infer(callee, args, kinds, f2a, False)
-        on = self._run_infer(callee, args, kinds, f2a, True)
-        assert off == on, f"first_pass: off={off} on={on}"
+        on = self._run_infer(callee, args, kinds, f2a)
+        assert all("ctx=Any" in s for s in on[len(args) :]), f"expected contexts: {on}"
 
-    def test_par_second_pass_site(self) -> None:
-        # checkexpr.py:3627 shape: star args skipped, kwargs shares a formal.
+    def test_value_second_pass_site(self) -> None:
+        # checkexpr.py:3627 shape: star args skipped, kwargs shares a
+        # formal, so only the positional arg gets the callee's context.
         callee = self._make_callee(2)
         args = self._make_args(3)
         kinds = [ARG_POS, ARG_STAR, ARG_STAR2]
         f2a = [[0, 1, 2], [2]]
-        off = self._run_infer(callee, args, kinds, f2a, False)
-        on = self._run_infer(callee, args, kinds, f2a, True)
-        assert off == on, f"second_pass: off={off} on={on}"
+        on = self._run_infer(callee, args, kinds, f2a)
+        assert "ctx=Any" in on[len(args)], f"positional arg must have context: {on}"
         assert "ctx=None" in on[len(args) + 1], f"star arg must have no context: {on}"
 
-    def test_par_no_context_all(self) -> None:
+    def test_value_no_context_all(self) -> None:
         # Empty formal_to_actual: every actual accepted without context.
         callee = self._make_callee(2)
         args = self._make_args(2)
         kinds = [ARG_POS, ARG_POS]
-        off = self._run_infer(callee, args, kinds, [], False)
-        on = self._run_infer(callee, args, kinds, [], True)
-        assert off == on, f"no_context: off={off} on={on}"
+        on = self._run_infer(callee, args, kinds, [])
         assert all("ctx=None" in s for s in on[len(args) :]), f"{on}"
 
 
@@ -1768,9 +1754,12 @@ class NativeTupleExpandAndJoinSuite(Suite):
     identical to the Python twin; the Rust side now decides these cases
     inline, keeping the fold native for the nominal fast path.
 
-    Each test asserts both parity (gate-off vs gate-on produce the same
-    result string) and Rust engagement (the direct seam call returns a
-    result rather than deferring).
+    Each test asserts the direct seam result against the Python fallback
+    body it replaced (`visit_tuple_expr` / `fast_container_type`), plus
+    Rust engagement (the seam returns a result rather than deferring).
+    The pyfunctions are called directly and read no gate, so the old
+    gate-off arms replayed the same Rust call (#1853); the Python
+    reference below is the genuine differential.
     """
 
     def setUp(self) -> None:
@@ -1819,16 +1808,15 @@ class NativeTupleExpandAndJoinSuite(Suite):
         return _deserialize_type_from_checkexpr(bytes(raw))
 
     def test_single_star_any_tuple_unwraps(self) -> None:
-        # (*ts,) with ts: tuple[Any, ...] -> tuple[Any, ...]. Python runs
-        # expand_type(result, {}) which normalizes the lone unpack to the
-        # tuple Instance. Rust now mirrors it.
-        from mypy.checkexpr import _set_native_checkexpr_active
-
-        items = [AnyType(TypeOfAny.special_form)]
-        off = self._with_gate(_set_native_checkexpr_active, False, self._build_tuple, items, 1)
+        # (*ts,) with ts: tuple[Any, ...]: the lone unpack normalizes to
+        # the tuple Instance (expandtype.py:1009-1033). The seam must match
+        # the fallback body run on defer: expand_type(...) (7502).
+        ts = Instance(self.fx.std_tuplei, [AnyType(TypeOfAny.special_form)])
+        items = [UnpackType(ts)]
         on = self._build_tuple(items, 1)
         assert on is not None, "Rust build_tuple_type single-star did not engage"
-        assert str(on) == str(off)
+        expected = mypy.expandtype.expand_type(TupleType(list(items), self.fx.std_tuple), {})
+        assert str(on) == str(expected) == "builtins.tuple[Any, ...]", f"{on} != {expected}"
 
     def test_single_star_typevar_tuple_unpack_passthrough(self) -> None:
         # (*Ts,) with Ts a TypeVarTuple: lone unpack is not a tuple Instance,
@@ -1843,16 +1831,14 @@ class NativeTupleExpandAndJoinSuite(Suite):
         assert str(t) == "tuple[*Ts]"
 
     def test_multi_star_defers(self) -> None:
-        # A tuple with two stars is not the seen_unpack == 1 case; the
-        # Rust path returns the tuple directly (no expansion). Python
-        # expands each item (identity with an empty map). Parity holds.
-        from mypy.checkexpr import _set_native_checkexpr_active
-
+        # seen_unpack == 0 is not the single-star case; the Rust path
+        # returns the tuple directly. The fallback body (checkexpr.py:
+        # 7495-7499) builds the same TupleType without the expand tail.
         items = [self.fx.a, self.fx.b]
-        off = self._with_gate(_set_native_checkexpr_active, False, self._build_tuple, items, 0)
         on = self._build_tuple(items, 0)
         assert on is not None, "Rust build_tuple_type did not engage"
-        assert str(on) == str(off)
+        expected = TupleType(list(items), self.fx.std_tuple)
+        assert str(on) == str(expected) == "tuple[A, B]", f"{on} != {expected}"
 
     def test_join_same_instance_engages(self) -> None:
         # [A, A] -> list[A]. The fixture TypeInfo uses the full builtins
@@ -1869,24 +1855,16 @@ class NativeTupleExpandAndJoinSuite(Suite):
         assert str(t) == "builtins.list[builtins.object]"
 
     def test_join_pair_parity(self) -> None:
-        # Same container literal through the gate-off (pure-Python
-        # join_type_list) and gate-on (Rust seam) paths.
-        from mypy.checkexpr import _set_native_checkexpr_active
+        # The container literal join must match the Python fallback body
+        # it replaced: _first_or_join_fast_item joins via join_type_list
+        # (checkexpr.py:7321-7324), then wraps the named container type.
+        from mypy.join import join_type_list
 
         items = [self.fx.a, self.fx.o]
-        off = self._with_gate(_set_native_checkexpr_active, False, self._container, "list", items)
         on = self._container("list", items)
         assert on is not None, "Rust container type did not engage"
-        assert str(on) == str(off)
-
-    def _with_gate(
-        self, set_active: Any, active: bool, fn: Callable[..., Type | None], *args: Any
-    ) -> Type | None:
-        set_active(active)
-        try:
-            return fn(*args)
-        finally:
-            set_active(True)
+        expected = Instance(self.fx.std_listi, [join_type_list(list(items))])
+        assert str(on) == str(expected) == "builtins.list[builtins.object]", f"{on} != {expected}"
 
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
@@ -4542,8 +4520,11 @@ class NativeCheckcallSetopsDeferSuite(Suite):
     (Python's `isinstance(typ, UnionType)` is False on the TypeVar
     itself). This suite locks in the parity of that native decision.
 
-    Gate-on vs gate-off must agree on the result, and direct seam calls
-    prove the Rust side engages rather than silently deferring.
+    Each result is a single-run value pin per strict_optional setting
+    (`real_union`, checkexpr.py:4934, is pure Python: isinstance + len,
+    no gate read, so a gate-off arm would replay the same call), and
+    direct seam calls prove the Rust side engages rather than silently
+    deferring.
     """
 
     def setUp(self) -> None:
@@ -4580,23 +4561,16 @@ class NativeCheckcallSetopsDeferSuite(Suite):
         self._set_resolver(None)
         set_wire_typeinfo_map(None)
 
-    def _with_gate(self, active: bool, fn: Callable[[], T]) -> T:
-        self._set_active(active)
-        try:
-            return fn()
-        finally:
-            self._set_active(True)
-
     # --- expression checker wall for the real_union method ---
 
     def _make_checker(self) -> ExpressionChecker:
         """Minimal ExpressionChecker with only the fields real_union touches.
 
-        The method only reads `_CHECKEXPR_HAS_TYPE_KERNEL`,
-        `_native_checkexpr_active`, `state.strict_optional` and serializes
-        `typ`; everything else is inert for this call, so a wall with
-        `None` providers is safe (matching the existing `method_fullname`
-        suite which passes `None` for the checker).
+        The method only reads `state.strict_optional` (via
+        `relevant_items`) and inspects `typ`; it reads no native gate and
+        serializes nothing since Python stayed cheaper than the FFI, so
+        everything else is inert for this call and a wall with `None`
+        providers is safe.
         """
         from mypy.checker import TypeChecker
         from mypy.checkexpr import ExpressionChecker
@@ -4617,18 +4591,18 @@ class NativeCheckcallSetopsDeferSuite(Suite):
 
     # --- real_union ---
 
-    def _assert_real_union_par(self, typ: Type) -> None:
+    def _assert_real_union_value(self, typ: Type, strict: bool, expected: bool) -> None:
+        # real_union (checkexpr.py:4934) is pure Python: no gate read, so
+        # one run per strict setting pins the value the body returns.
         expr = self._make_checker()
-        for strict in (True, False):
-            old = mypy.state.state.strict_optional
-            mypy.state.state.strict_optional = strict
-            try:
-                off = self._with_gate(False, lambda: expr.real_union(typ))
-                on = self._with_gate(True, lambda: expr.real_union(typ))
-            finally:
-                mypy.state.state.strict_optional = old
-            msg = f"real_union parity strict={strict} {typ}"
-            assert_equal(on, off, msg)
+        old = mypy.state.state.strict_optional
+        mypy.state.state.strict_optional = strict
+        try:
+            got = expr.real_union(typ)
+        finally:
+            mypy.state.state.strict_optional = old
+        assert_equal(got, expected, f"real_union strict={strict} {typ}")
+        self._assert_real_union_engages(typ)
 
     def _assert_real_union_engages(self, typ: Type) -> None:
         from mypy.checkexpr import _serialize_type_for_checkexpr
@@ -4641,18 +4615,17 @@ class NativeCheckcallSetopsDeferSuite(Suite):
     def test_real_union_strips_none_non_strict(self) -> None:
         # relevant_items() drops NoneType when strict_optional is False.
         typ = UnionType([self.fx.a, self.fx.nonet])
-        self._assert_real_union_par(typ)
-        self._assert_real_union_engages(typ)
+        self._assert_real_union_value(typ, strict=False, expected=False)
 
     def test_real_union_keeps_none_strict(self) -> None:
         # With strict_optional True, len(relevant_items()) is 2 -> real.
         typ = UnionType([self.fx.a, self.fx.nonet])
-        self._assert_real_union_par(typ)
-        self._assert_real_union_engages(typ)
+        self._assert_real_union_value(typ, strict=True, expected=True)
 
     def test_real_union_typevar_not_union(self) -> None:
-        # A TypeVar is not an isinstance-UnionType in Python, so real_union
-        # is False even though its upper bound is a union.
+        # A TypeVar is not an isinstance-UnionType in Python, so
+        # real_union is False even though its upper bound is a union.
+        # Strict-independent: the isinstance head decides first (4936).
         tvar = TypeVarType(
             "T",
             "T",
@@ -4661,17 +4634,7 @@ class NativeCheckcallSetopsDeferSuite(Suite):
             UnionType([self.fx.a, self.fx.b]),
             AnyType(TypeOfAny.special_form),
         )
-        expr = self._make_checker()
-        for strict in (True, False):
-            old = mypy.state.state.strict_optional
-            mypy.state.state.strict_optional = strict
-            try:
-                off = self._with_gate(False, lambda: expr.real_union(tvar))
-                on = self._with_gate(True, lambda: expr.real_union(tvar))
-            finally:
-                mypy.state.state.strict_optional = old
-            assert_equal(on, off, f"real_union typevar parity strict={strict}")
-            assert off is False
+        self._assert_real_union_value(tvar, strict=True, expected=False)
         from mypy.checkexpr import _serialize_type_for_checkexpr
 
         result = _type_kernel.rust_real_union(
