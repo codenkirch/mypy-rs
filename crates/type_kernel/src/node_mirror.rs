@@ -194,14 +194,13 @@ pub(crate) fn capture_pin(obj: &PyAny) -> PyResult<u64> {
 /// crossing, and the fail direction is the defer: a stale handle resolves
 /// to `None`, never to a wrong object (handles are never re-issued after a
 /// reset, and the pin keeps the referent alive, so a mismatch can only
-/// mean the identity layer moved on).
+/// mean the identity layer moved on). The pin is cloned out of the map so
+/// the store borrow is released before the identity call: its defensive
+/// mixed-pairing drop can release a `Py<PyAny>`, and the deallocator must
+/// not see the pin-store borrow still active.
 pub(crate) fn object_of(py: Python<'_>, handle: u64) -> Option<Py<PyAny>> {
-    TARGET_PINS.with(|cell| {
-        cell.borrow()
-            .get(&handle)
-            .filter(|pin| identity::handle_of(pin.as_ref(py)) == Some(handle))
-            .map(|pin| pin.clone_ref(py))
-    })
+    let pin = TARGET_PINS.with(|cell| cell.borrow().get(&handle).map(|p| p.clone_ref(py)))?;
+    (identity::handle_of(pin.as_ref(py)) == Some(handle)).then_some(pin)
 }
 
 /// Drop every target pin; returns how many were held. The pins drop only
