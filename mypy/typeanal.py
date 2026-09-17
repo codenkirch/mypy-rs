@@ -3207,21 +3207,9 @@ class TypeAnalyser(SyntheticTypeVisitor[Type], TypeAnalyzerPluginInterface):
         )
 
     def check_unpacks_in_list(self, items: list[Type]) -> list[Type]:
-        if _TYPEANAL_HAS_KERNEL and _native_typeanal_active:
-            try:
-                result = _rust_check_unpacks_in_list(items)
-                if result is not None:
-                    keep, final_unpack_idx = result
-                    if final_unpack_idx is not None:
-                        final_unpack = items[final_unpack_idx]
-                        assert isinstance(final_unpack, UnpackType)
-                        self.fail(
-                            "More than one variadic Unpack in a type is not allowed",
-                            final_unpack.type,
-                        )
-                    return [items[i] for i in keep]
-            except (AssertionError, NotImplementedError):
-                pass
+        # Rust shim retired in #1739: it re-derived this scan across the FFI
+        # behind a per-call `py.import("mypy.types")`, at 5.5x-10.2x the cost
+        # of the Python body, with 0 wire bytes and 0 defers.
         new_items: list[Type] = []
         num_unpacks = 0
         final_unpack = None
@@ -3827,7 +3815,6 @@ try:
     )
     from type_kernel import (
         rust_analyze_unbound_without_info as _rust_analyze_unbound_without_info,
-        rust_check_unpacks_in_list as _rust_check_unpacks_in_list,
         rust_check_vec_type_args as _rust_check_vec_type_args,
         rust_classify_analyze_callable_type as _rust_classify_analyze_callable_type,
         rust_classify_check_warn_deprecated as _rust_classify_check_warn_deprecated,
@@ -3876,7 +3863,6 @@ except ImportError:
     _rust_is_typevar_default_recursive = None  # type: ignore[assignment]
     _rust_instantiate_type_alias = None  # type: ignore[assignment]
     _rust_analyze_unbound_without_info = None  # type: ignore[assignment]
-    _rust_check_unpacks_in_list = None  # type: ignore[assignment]
     _rust_classify_unbound_front = None  # type: ignore[assignment]
     _rust_classify_special_unbound = None  # type: ignore[assignment]
     _rust_classify_tuple_type_implicit = None  # type: ignore[assignment]

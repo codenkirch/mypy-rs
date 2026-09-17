@@ -74,14 +74,19 @@ from mypy.types import (
 # Moved from mypy/test/testtypes_native_checker.py.
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeCheckUnpacksInListSuite(Suite):
-    """Parity for the Rust `check_unpacks_in_list` filter.
+    """Shape coverage for `check_unpacks_in_list` (Rust shim retired, #1739).
 
-    `TypeAnalyser.check_unpacks_in_list` (typeanal.py:2991) counts the
-    non-tuple `Unpack` items in a type-arg list: the first passes through,
-    later ones are dropped, and more than one emits "More than one
-    variadic Unpack in a type is not allowed" with the final unpack's
-    inner type as context. Rust returns the kept indices plus the final
-    unpack index; Python applies the fail and rebuilds the list.
+    `TypeAnalyser.check_unpacks_in_list` counts the non-tuple `Unpack` items
+    in a type-arg list: the first passes through, later ones are dropped, and
+    more than one emits "More than one variadic Unpack in a type is not
+    allowed" with the final unpack's inner type as context.
+
+    The Rust shim was retired in #1739 (5.5x-10.2x loss, 0 wire bytes), so
+    `_assert_parity`'s gate toggle is now inert: both arms run the *same*
+    Python body, and the comparison asserts this path's values rather than
+    agreement between two implementations. The direct pyfunction assertions
+    stay meaningful because the pyfunction remains registered; see
+    `mypy/test/testtypes_native_retired_typeanal.py` for the retirement pin.
     """
 
     def setUp(self) -> None:
@@ -176,25 +181,28 @@ class NativeCheckUnpacksInListSuite(Suite):
         self._assert_parity([item, self.fx.a])
 
     def test_direct_seam(self) -> None:
-        from mypy.typeanal import _rust_check_unpacks_in_list  # type: ignore[attr-defined]
+        # The shim alias is gone (#1739); the pyfunction stays registered.
+        import type_kernel
 
         va, tb = self._variadic_unpack(), self._tuple_unpack()
-        assert _rust_check_unpacks_in_list([self.fx.a]) == ([0], None)
-        assert _rust_check_unpacks_in_list([va]) == ([0], None)
-        assert _rust_check_unpacks_in_list([va, self.fx.a, va]) == ([0, 1], 2)
-        assert _rust_check_unpacks_in_list([self.fx.a, tb, va, va]) == ([0, 1, 2], 3)
+        assert type_kernel.rust_check_unpacks_in_list([self.fx.a]) == ([0], None)
+        assert type_kernel.rust_check_unpacks_in_list([va]) == ([0], None)
+        assert type_kernel.rust_check_unpacks_in_list([va, self.fx.a, va]) == ([0, 1], 2)
+        assert type_kernel.rust_check_unpacks_in_list([self.fx.a, tb, va, va]) == ([0, 1, 2], 3)
 
     def test_tuple_instance_unpack_counts_variadic(self) -> None:
         # Unpack[Instance(tuple, [X])] is NOT a TupleType proper, so both
         # paths count it as a variadic unpack (not an ordinary item).
         self._assert_parity([self._tuple_instance_unpack(), self._tuple_instance_unpack()])
 
-    def test_engagement(self) -> None:
-        # The gate-on differential must exercise the Rust path, not just
-        # agree with Python: the seam returns kept indices directly.
-        from mypy.typeanal import _rust_check_unpacks_in_list  # type: ignore[attr-defined]
+    def test_pyfunction_stays_reachable(self) -> None:
+        # Not a gate-on differential any more (#1739): this pins the kept
+        # Rust index fold's values, since the pyfunction stays registered.
+        import type_kernel
 
-        result = _rust_check_unpacks_in_list([self._variadic_unpack(), self._variadic_unpack()])
+        result = type_kernel.rust_check_unpacks_in_list(
+            [self._variadic_unpack(), self._variadic_unpack()]
+        )
         assert result is not None
         keep, final_unpack_idx = result
         assert keep == [0]
