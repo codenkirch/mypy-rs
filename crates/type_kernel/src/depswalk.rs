@@ -2218,7 +2218,9 @@ mod ref_view_fallback_tests {
             // `RefExpr.kind` is `int | None`; a non-`int` value is a
             // *present* kind for `deps.py`'s `is None` check and must not
             // defer the whole walk.
-            let obj = py.eval("type('R', (), {'kind': 'x'})()", None, None).unwrap();
+            let obj = py
+                .eval("type('R', (), {'kind': 'x'})()", None, None)
+                .unwrap();
             let view = RefView::of(obj);
             assert!(matches!(view.kind_is_none(), Ok(false)));
             // The `int | None` accessor defers on the same value; that
@@ -2231,7 +2233,9 @@ mod ref_view_fallback_tests {
     fn kind_is_none_reads_a_none_kind_as_none() {
         with_py(|py| {
             node_mirror::set_read_mode(0).unwrap();
-            let obj = py.eval("type('R', (), {'kind': None})()", None, None).unwrap();
+            let obj = py
+                .eval("type('R', (), {'kind': None})()", None, None)
+                .unwrap();
             assert!(matches!(RefView::of(obj).kind_is_none(), Ok(true)));
         });
     }

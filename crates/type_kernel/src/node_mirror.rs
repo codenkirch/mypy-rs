@@ -1843,7 +1843,10 @@ mod g1_serving_tests {
     fn test_set_read_mode_refuses_a_mode_outside_the_range() {
         with_py(|_py| {
             assert!(set_read_mode(3).is_err(), "mode 3 does not exist");
-            assert!(set_read_mode(255).is_err(), "u8 headroom must not widen the range");
+            assert!(
+                set_read_mode(255).is_err(),
+                "u8 headroom must not widen the range"
+            );
             assert_eq!(set_read_mode(0).unwrap(), 0);
             assert_eq!(set_read_mode(2).unwrap(), 2);
         });

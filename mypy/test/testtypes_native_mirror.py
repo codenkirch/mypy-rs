@@ -807,10 +807,16 @@ class NativeMirrorBindingHygieneSuite(Suite):
         import mypy.types as _types_mod
 
         cases = (
-            (NativeRemoveDupsSuite, "test_alias_rows_parity_and_identity",
-             ("_VisitorWriteBuffer", "_ReadBuffer", "_rust_remove_dups")),
-            (NativeHasRecursiveTypesFlattenSuite, "test_hrt_parities",
-             ("_VisitorWriteBuffer", "_ReadBuffer")),
+            (
+                NativeRemoveDupsSuite,
+                "test_alias_rows_parity_and_identity",
+                ("_VisitorWriteBuffer", "_ReadBuffer", "_rust_remove_dups"),
+            ),
+            (
+                NativeHasRecursiveTypesFlattenSuite,
+                "test_hrt_parities",
+                ("_VisitorWriteBuffer", "_ReadBuffer"),
+            ),
         )
         names = ("_VisitorWriteBuffer", "_ReadBuffer", "_rust_remove_dups")
         prior = {name: _types_mod.__dict__.get(name, _ABSENT) for name in names}
@@ -829,9 +835,9 @@ class NativeMirrorBindingHygieneSuite(Suite):
                     case.tearDown()
                     for name in suite_names:
                         after = _types_mod.__dict__.get(name, _ABSENT)
-                        assert after is pristine, (
-                            f"{suite_cls.__name__} leaked {name}: {after!r} != {pristine!r}"
-                        )
+                        assert (
+                            after is pristine
+                        ), f"{suite_cls.__name__} leaked {name}: {after!r} != {pristine!r}"
         finally:
             for name, value in prior.items():
                 if value is _ABSENT:
