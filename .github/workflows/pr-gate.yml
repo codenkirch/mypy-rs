@@ -148,6 +148,7 @@ jobs:
   # PR touches instead of the tree. Touching a dirty file means cleaning it.
   lint-changed:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       # fetch-depth 0 keeps the PR merge base reachable for the diff below.
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -190,16 +191,9 @@ jobs:
           uvx black@26.1.0 --check "${FILES[@]}"
 
       - name: G1.2 audit tables (verdict-only drift gate)
-        # Source-tree only: python3 + ripgrep, no kernel or corpus. Line
-        # anchors are normalised out of both sides, so this fires on a
-        # verdict/served-as change, not on file:NNN churn (#1796).
-        # The runner image does not ship ripgrep, and the generator shells
-        # out to `rg` for its call-site derivation: install it explicitly
-        # rather than assume it, or the gate fails with FileNotFoundError.
+        # Source-tree only: python3 over git-tracked sources, no kernel, no
+        # corpus, no external scanner (#1802). Line anchors are normalised out
+        # of both sides, so this fires on verdict/served-as change (#1796).
         run: |
-          if ! command -v rg > /dev/null; then
-            sudo apt-get update -qq
-            sudo apt-get install -y -qq ripgrep
-          fi
           python3 misc/g12_node_shadow_audit.py --check \
             docs/plans/2026-09-15-g12-node-shadow-fidelity-audit.md

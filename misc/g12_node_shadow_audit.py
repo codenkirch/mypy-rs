@@ -366,49 +366,78 @@ def parse_rust_shape(path: Path) -> RustShape:
     return shape
 
 
+def _tracked_mypy_files() -> list[str]:
+    """The scan population: files tracked under ``mypy/``.
+
+    ``git ls-files`` matches a fresh CI checkout exactly (every file there
+    is tracked), so the gate measures the tree under review. A failing or
+    missing ``git`` raises instead of yielding an empty population, which
+    would read as "no gap found": a structural zero in the evidence.
+    """
+    proc = subprocess.run(
+        ["git", "ls-files", "--", "mypy"], cwd=ROOT, capture_output=True, text=True
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"git ls-files failed ({proc.returncode}) listing mypy/: {proc.stderr.strip()}"
+        )
+    return sorted(proc.stdout.splitlines())
+
+
+_SOURCE_CACHE: dict[str, str] = {}
+_OWNER_FILES: dict[str, tuple[str, ...]] = {}
+
+
+def _source(path: str) -> str:
+    text = _SOURCE_CACHE.get(path)
+    if text is None:
+        # surrogateescape keeps odd bytes intact instead of raising, so one
+        # exotic file cannot take the whole gate down mid-scan.
+        with open(ROOT / path, encoding="utf-8", errors="surrogateescape") as f:
+            text = f.read()
+        _SOURCE_CACHE[path] = text
+    return text
+
+
+def _owner_files(owner: str) -> tuple[str, ...]:
+    """Tracked ``mypy/`` files that name ``owner`` as a whole word."""
+    files = _OWNER_FILES.get(owner)
+    if files is None:
+        word = re.compile(rf"(?<!\w){re.escape(owner)}(?!\w)")
+        files = tuple(
+            path
+            for path in _tracked_mypy_files()
+            if (ROOT / path).is_file() and word.search(_source(path))
+        )
+        _OWNER_FILES[owner] = files
+    return files
+
+
 def mutation_sites(slot: str, owner: str, limit: int = 3) -> list[str]:
     """Assignment sites for ``owner.slot`` outside its module and the tests.
 
-    Two precision filters, both cheap and both documented in the audit:
+    Pure Python over the tracked sources: no external scanner, so the CI
+    gate needs nothing beyond ``git`` + ``python3``. Two precision filters,
+    both cheap and both documented in the audit:
 
-    - ``mypyc/`` is scanned out: its IR classes reuse the same slot names
-      (``mypyc.ir.ops.Op.op``), so a bare name match there is not a write
-      to a ``mypy.nodes`` object.
+    - the population is ``mypy/`` only, which scans ``mypyc/`` out: its IR
+      classes reuse the same slot names (``mypyc.ir.ops.Op.op``), so a bare
+      name match there is not a write to a ``mypy.nodes`` object.
     - a hit counts only if its file also names ``owner``, which drops the
       remaining same-name-slot collisions.
     """
-    pattern = rf"\.{re.escape(slot)}\s*=[^=]"
-    proc = subprocess.run(
-        ["rg", "-n", "--no-heading", pattern, "mypy"], cwd=ROOT, capture_output=True, text=True
-    )
-    hits: list[tuple[str, str]] = []
-    seen: set[str] = set()
-    # `rg` exit 1 is "no matches" (legitimate); anything else is an error
-    # whose empty stdout would otherwise read as "no gap found", i.e. a
-    # silently structural zero in the evidence.
-    if proc.returncode not in (0, 1):
-        raise RuntimeError(
-            f"rg failed ({proc.returncode}) scanning {slot!r}: {proc.stderr.strip()}"
-        )
-    for line in proc.stdout.splitlines():
-        path, _, rest = line.partition(":")
+    pattern = re.compile(rf"\.{re.escape(slot)}\s*=[^=]")
+    hits: list[tuple[str, int]] = []
+    for path in _owner_files(owner):
         if path.endswith("nodes.py") or "/test" in path or "test/" in path:
             continue
-        if path in seen:
-            continue
-        probe = subprocess.run(["rg", "-q", "-w", owner, path], cwd=ROOT, capture_output=True)
-        if probe.returncode not in (0, 1):
-            raise RuntimeError(
-                f"rg failed ({probe.returncode}) probing {owner} in {path}: "
-                f"{probe.stderr.decode().strip()}"
-            )
-        if probe.returncode == 1:
-            continue
-        seen.add(path)
-        hits.append((path, rest.split(":", 1)[0]))
-    # `rg` parallelizes its walk, so its output order is not stable; sort
-    # (path, line) so the generated tables are reproducible.
-    hits.sort(key=lambda hit: (hit[0], int(hit[1])))
+        for line, text in enumerate(_source(path).split("\n"), start=1):
+            if pattern.search(text):
+                hits.append((path, line))
+                break
+    # First hit per file, then (path, line) order, so the limit=3 slice and
+    # the generated tables are reproducible run to run.
+    hits.sort()
     return [f"`{path}:{line}`" for path, line in hits[:limit]]
 
 
@@ -500,8 +529,8 @@ def emit() -> str:
             else:
                 rust = "-"
                 served = "-"
-            # `writes` shells out to ripgrep per candidate file; only an
-            # untracked slot needs that evidence.
+            # The write-site scan only runs for an untracked slot; tracked
+            # slots are served and need no gap evidence.
             sites = [] if tracked else writes(slot.name, cls)
             verdict = _verdict(slot.name, tracked, len(sites))
             lines.append(
