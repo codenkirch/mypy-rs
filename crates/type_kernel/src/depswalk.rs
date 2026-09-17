@@ -656,10 +656,13 @@ impl<'py> DepsWalker<'py> {
             "AwaitExpr" => self.visit_await_expr(obj),
             // Pure-traversal nodes (mirror TraverserVisitor exactly).
             "OverloadedFuncDef" => self.traverse_overloaded_func_def(obj),
-            "ExpressionStmt" => self.traverse_single_child(obj, "expr"),
+            // Three statement classes carry a node-valued serve field
+            // (`expr`): their child read goes through the statement read
+            // flip, so a served record answers with the pinned object.
+            "ExpressionStmt" => self.traverse_served_child(obj, "expr"),
             "IfStmt" => self.traverse_if_stmt(obj),
             "WhileStmt" => self.traverse_while_stmt(obj),
-            "ReturnStmt" => self.traverse_optional_child(obj, "expr"),
+            "ReturnStmt" => self.traverse_served_optional_child(obj, "expr"),
             "AssertStmt" => self.traverse_assert_stmt(obj),
             "RaiseStmt" => self.traverse_raise_stmt(obj),
             "TryStmt" => self.traverse_try_stmt(obj),
@@ -1921,6 +1924,36 @@ impl<'py> DepsWalker<'py> {
         Ok(())
     }
 
+    /// The structural child read of a node-valued serve field: when the
+    /// statement meta record holds an exact handle for `o.field`, the walk
+    /// continues with the live object that handle resolves to, otherwise
+    /// the live attribute read stays in charge. `serve_stmt_node` answers
+    /// `None` for mode 0, an unrecorded node, a marker-only record, or a
+    /// handle the pin layer can no longer resolve, so a servable shape is
+    /// never a wrong child.
+    fn traverse_served_child(&mut self, o: &PyAny, field: &str) -> Result<(), DeferError> {
+        let served: Option<Py<PyAny>> = crate::node_mirror::serve_stmt_node(self.py, o, field);
+        match &served {
+            Some(child) => self.walk(child.as_ref(self.py)),
+            None => self.walk(get_attr_or_defer(o, field)?),
+        }
+    }
+
+    /// `traverse_served_child` for an optional slot: a served `None` and a
+    /// live `None` are the same answer (nothing to walk), so the record
+    /// never has to distinguish them.
+    fn traverse_served_optional_child(&mut self, o: &PyAny, field: &str) -> Result<(), DeferError> {
+        let served: Option<Py<PyAny>> = crate::node_mirror::serve_stmt_node(self.py, o, field);
+        let child = match &served {
+            Some(obj) => obj.as_ref(self.py),
+            None => get_attr_or_defer(o, field)?,
+        };
+        if child.is_none() {
+            return Ok(());
+        }
+        self.walk(child)
+    }
+
     fn traverse_truthy_child(&mut self, o: &PyAny, field: &str) -> Result<(), DeferError> {
         if truthy_attr(o, field)? {
             self.walk(get_attr_or_defer(o, field)?)?;
@@ -1979,7 +2012,9 @@ impl<'py> DepsWalker<'py> {
     }
 
     fn traverse_assert_stmt(&mut self, o: &PyAny) -> Result<(), DeferError> {
-        self.traverse_optional_child(o, "expr")?;
+        // `expr` is the registered node-valued serve field; `msg` is not
+        // registered and keeps its live read.
+        self.traverse_served_optional_child(o, "expr")?;
         self.traverse_optional_child(o, "msg")?;
         Ok(())
     }

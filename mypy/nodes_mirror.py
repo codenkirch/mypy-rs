@@ -52,6 +52,18 @@ never answer a read. `stmt_read_counters` reports the same provenance
 seven-tuple as the G1.1 channel, which is what makes a run's evidence
 checkable rather than assumed.
 
+G2.3 (#1787, the node-valued serve set) extends the same channel to the
+node-valued structural field native code reads live,
+`AssertStmt`/`ReturnStmt`/`ExpressionStmt` `expr`. Those records carry the
+captured object's identity handle (`_META_NODE_FIELDS`), and a read is
+answered with the live object `rust_node_mirror_object_of` resolves that
+handle to, so the served child is the pinned object itself rather than a
+copy. A record without a resolvable handle defers, which is what keeps a
+stale or marker-only record from answering with a wrong child. These three
+classes have no post-construction writer for their serve field, so the
+constructor write is their adoption point (`_meta_ctor_adopts`) and the
+adoption-time seed holds the set from there on.
+
 G2.2 (#1787, the Var handle scheme) gives the binder key its own
 mode-gated translation: `set_var_key_flip` selects a mode (0 keeps the
 live-object key, 1 emits the store handle, 2 emit + per-key differential
@@ -149,12 +161,14 @@ import sys
 from typing import Any, Final
 
 from mypy.nodes import (
+    AssertStmt,
     AssignmentStmt,
     Block,
     CallExpr,
     ClassDef,
     ComparisonExpr,
     Decorator,
+    ExpressionStmt,
     ForStmt,
     FuncDef,
     IfStmt,
@@ -165,6 +179,7 @@ from mypy.nodes import (
     OpExpr,
     OverloadedFuncDef,
     RefExpr,
+    ReturnStmt,
     StrExpr,
     TypeAliasStmt,
     UnaryExpr,
@@ -331,8 +346,13 @@ def stmt_read_flip() -> int:
 def stmt_read_counters() -> dict[str, int]:
     """Provenance counters for the statement-family serving channel.
 
-    Same seven-tuple as `read_counters`. A run whose `compared` is 0
-    proves nothing about the served values.
+    One seven-tuple for both served record shapes: the `Bool` records
+    (`Block.is_unreachable`) and the node-valued ones (`expr`). `served`
+    counts a read the record answered, `deferred_off` the mode-0
+    deferrals, `deferred_unrecorded` the reads no exact record covered (or
+    whose handle no longer resolves), and `compared`/`mismatched`/
+    `compare_errors` the differential. A run whose `compared` is 0 proves
+    nothing about the served values.
     """
     kernel = _kernel()
     if kernel is None:
@@ -790,6 +810,15 @@ _G2_VAR: Final[frozenset[str]] = frozenset(
     }
 )
 
+# The node-valued serve set (#1787 §3): the fields whose record carries the
+# captured object's handle, so a served read resolves the live node through
+# `rust_node_mirror_object_of`. See `_meta_node_fields`/`_meta_ctor_adopts`.
+_META_NODE_FIELDS: Final[dict[type, frozenset[str]]] = {
+    AssertStmt: frozenset({"expr"}),
+    ReturnStmt: frozenset({"expr"}),
+    ExpressionStmt: frozenset({"expr"}),
+}
+
 # Class -> tracked slots. `ImportBase.assignments` is a list; the append
 # sites call `touch()` because the patched `__setattr__` cannot see it.
 _G2_TRACKED: Final[dict[type, frozenset[str]]] = {
@@ -803,6 +832,12 @@ _G2_TRACKED: Final[dict[type, frozenset[str]]] = {
         }
     ),
     Block: frozenset({"is_unreachable"}),
+    # The node-valued serve set (#1787 §3): `depswalk.rs` reads `expr`
+    # live here, and since each tracked set is constructor-set the
+    # constructor write is the adoption point (`_meta_ctor_adopts`).
+    AssertStmt: _META_NODE_FIELDS[AssertStmt],
+    ReturnStmt: _META_NODE_FIELDS[ReturnStmt],
+    ExpressionStmt: _META_NODE_FIELDS[ExpressionStmt],
     AssignmentStmt: frozenset(
         {"type", "unanalyzed_type", "is_alias_def", "is_final_def", "invalid_recursive_alias"}
     ),
@@ -849,6 +884,9 @@ _META_CTOR_FIELDS: Final[dict[type, frozenset[str]]] = {
     Var: frozenset({"_name"}),
     FuncDef: frozenset({"_name", "arg_names", "arg_kinds", "original_first_arg"}),
     ClassDef: frozenset({"name"}),
+    # The node-valued serve set is constructor-set too, and read back by
+    # the same seed; one table, so the two can never drift apart.
+    **_META_NODE_FIELDS,
 }
 
 _META_FIELDS: dict[type, frozenset[str]] = {}
@@ -885,6 +923,32 @@ def _meta_ctor_fields(cls: type) -> frozenset[str]:
     return fields
 
 
+def _meta_node_fields(cls: type) -> frozenset[str]:
+    """Node-valued serve slots for a patched class or its subclasses."""
+    fields: frozenset[str] = frozenset()
+    for base in cls.__mro__:
+        found = _META_NODE_FIELDS.get(base)
+        if found is not None:
+            fields = found
+            break
+    return fields
+
+
+def _meta_ctor_adopts(cls: type) -> bool:
+    """Whether a constructor write is also the adoption point for `cls`.
+
+    True when every tracked slot of the class is constructor-set. Such a
+    class has no post-construction writer, so the constructor write is the
+    only adoption point it has; without this the record would be empty and
+    serving the field would defer on every read. Every other class keeps
+    the lazy-adoption baseline: its constructor stays out of the store and
+    the first post-construction write adopts it, with the seed reading the
+    constructor-set slots back.
+    """
+    tracked = _meta_tracked(cls)
+    return bool(tracked) and tracked <= _meta_ctor_fields(cls)
+
+
 def _meta_marker(value: Any) -> str:
     """Record-only marker for an object value: `Class` or `Class:fullname`."""
     name = type(value).__name__
@@ -897,8 +961,30 @@ def _meta_marker(value: Any) -> str:
     return name
 
 
-def _meta_encode(value: Any) -> tuple[str, str | None, int | None, list[str] | None]:
-    """Encode one field value for the Rust store (kind, text, num, items)."""
+def _meta_node_handle(value: Any) -> int | None:
+    """Pin `value` under its identity handle for a served read-back.
+
+    Only a node-valued serve field pays for this: the pin retains the
+    object for the life of the build, which every other object-valued
+    field deliberately avoids. A failed pin leaves the record marker-only,
+    which can never serve, so the failure direction is the defer.
+    """
+    try:
+        return int(_kernel_mod.rust_node_mirror_capture_pin(value))
+    except Exception:
+        _count("meta_pin_fail")
+        return None
+
+
+def _meta_encode(
+    value: Any, *, node_field: bool = False
+) -> tuple[str, str | None, int | None, list[str] | None]:
+    """Encode one field value for the Rust store (kind, text, num, items).
+
+    A node-valued serve field (`node_field`) carries its identity handle in
+    `num`, so the store can answer the read with the exact live object;
+    every other object-valued field stays marker-only.
+    """
     if value is None:
         return "none", None, None, None
     if value is True or value is False:
@@ -909,7 +995,8 @@ def _meta_encode(value: Any) -> tuple[str, str | None, int | None, list[str] | N
         return "str", value, None, None
     if isinstance(value, (list, tuple)):
         return "list", None, None, [_meta_marker(item) for item in value]
-    return "obj", _meta_marker(value), None, None
+    handle = _meta_node_handle(value) if node_field else None
+    return "obj", _meta_marker(value), handle, None
 
 
 def _meta_is_baseline(value: Any) -> bool:
@@ -932,14 +1019,18 @@ def _seed_meta_ctor_fields(node: Any) -> None:
     unset (mid-construction adoption) stays absent until a later captured
     write lands, so the record never holds a value the live object lacks.
 
-    The constructor write itself never adopts (the `_META_CTOR_FIELDS`
-    arm in `_meta_setattr`); a write to an already-adopted node is
-    captured, which is the rename safety net. The #1787 open-question-1
-    writer audit found no production writer that renames these slots:
-    `_name` only in `FuncDef.__init__` / `Var.__init__`, `arg_names` /
-    `arg_kinds` only in `FuncItem.__init__` plus the `read` classmethods
-    (fresh objects), `original_first_arg` in `FuncDef.__init__` (both
-    branches) plus `read`, and `ClassDef.name` only in its `__init__`.
+    The constructor write itself does not adopt for a class with a later
+    writer (`_META_CTOR_FIELDS` arm in `_meta_setattr`); a write to an
+    already-adopted node is captured, which is the rename safety net. For a
+    class whose whole tracked set is constructor-set, the constructor write
+    IS the adoption point (`_meta_ctor_adopts`) and the seed holds the
+    serve set from there on. The #1787 open-question-1 writer audit found
+    no production writer that renames these slots: `_name` only in
+    `FuncDef.__init__` / `Var.__init__`, `arg_names` / `arg_kinds` only in
+    `FuncItem.__init__` plus the `read` classmethods (fresh objects),
+    `original_first_arg` in `FuncDef.__init__` (both branches) plus `read`,
+    `ClassDef.name` only in its `__init__`, and the node-valued `expr`
+    slots only in the constructors of the three statement classes.
     """
     for field in _meta_ctor_fields(type(node)):
         try:
@@ -955,7 +1046,8 @@ def _capture_meta(node: Any, field: str) -> None:
     global _in_capture
     _in_capture = True
     try:
-        kind, text, num, items = _meta_encode(getattr(node, field))
+        node_field = field in _meta_node_fields(type(node))
+        kind, text, num, items = _meta_encode(getattr(node, field), node_field=node_field)
         handle = _kernel_mod.rust_node_mirror_capture_meta(node, field, kind, text, num, items)
         newly_adopted = id(node) not in _META_HANDLES
         _META_HANDLES[id(node)] = handle
@@ -977,9 +1069,17 @@ def _meta_setattr(self: Any, name: str, value: Any) -> None:
     if name not in _meta_tracked(type(self)):
         return
     if id(self) not in _META_HANDLES and name in _meta_ctor_fields(type(self)):
-        # A constructor-set field never adopts: parse-time construction
-        # stays out of the store, and adoption reads the value back.
-        _count("meta_ctor_skip")
+        if _meta_ctor_adopts(type(self)) and not _meta_is_baseline(value):
+            # This class has no later adoption point, so the constructor
+            # write adopts it and the seed holds the serve set from there;
+            # a default value still adopts nothing.
+            _capture_meta(self, name)
+            _count("meta_ctor_adopt")
+        else:
+            # A constructor-set field never adopts here: parse-time
+            # construction stays out of the store, and adoption reads the
+            # value back.
+            _count("meta_ctor_skip")
         return
     if _meta_is_baseline(value) and id(self) not in _META_HANDLES:
         _count("meta_baseline_skip")
@@ -1152,11 +1252,16 @@ _STMT_SESSIONFINISH_ENV: Final = "MYPY_TK_STMT_SESSIONFINISH_OUT"
 def stmt_sessionfinish() -> dict[str, object]:
     """The statement serving evidence of one finished session.
 
-    Two sections: `stmt_read` (the Rust read counters of the statement
-    serving channel) and `capture` (the Python audit counters, non-empty
-    only in audit mode).
+    Three sections: `stmt_read` (the Rust read counters of the statement
+    serving channel), `capture` (the Python audit counters, non-empty only
+    in audit mode) and `meta_entries` (the live metadata entry count of
+    the session's last build, so the store's population cost is readable
+    from the same dump rather than inferred).
     """
-    return {"stmt_read": stmt_read_counters(), "capture": report()}
+    entries = None
+    if _kernel_mod is not None:
+        entries = int(_kernel_mod.rust_node_mirror_meta_entry_count())
+    return {"stmt_read": stmt_read_counters(), "capture": report(), "meta_entries": entries}
 
 
 def stmt_sessionfinish_dump() -> None:

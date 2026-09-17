@@ -138,6 +138,13 @@ def rust_node_mirror_stmt_read_reset() -> None: ...
 def rust_node_mirror_serve_stmt_flag(obj: Any, field: str) -> bool | None: ...
 def rust_node_mirror_verify_stmt_flag(obj: Any, field: str) -> bool | None: ...
 
+# Phase G2.3 (#1787): the same channel over the node-valued serve set.
+# `serve_stmt_node` answers the live object the record pinned; `verify_stmt_node`
+# answers whether it is the live one; `meta_field_handle` reads the handle.
+def rust_node_mirror_serve_stmt_node(obj: Any, field: str) -> Any | None: ...
+def rust_node_mirror_verify_stmt_node(obj: Any, field: str) -> bool | None: ...
+def rust_node_mirror_meta_field_handle(handle: int, field: str) -> int | None: ...
+
 # Phase G2.2 (#1787): the `Var` binder-key handle translation.
 # `serve_var_key` answers the store handle for a pinned `Var`, or None when
 # the key must stay the live object; `verify_var_key` reports the resolution.
@@ -222,6 +229,9 @@ __all__ = [
     "rust_node_mirror_stmt_read_reset",
     "rust_node_mirror_serve_stmt_flag",
     "rust_node_mirror_verify_stmt_flag",
+    "rust_node_mirror_serve_stmt_node",
+    "rust_node_mirror_verify_stmt_node",
+    "rust_node_mirror_meta_field_handle",
     "rust_node_mirror_set_var_key_mode",
     "rust_node_mirror_var_key_mode",
     "rust_node_mirror_var_key_counters",

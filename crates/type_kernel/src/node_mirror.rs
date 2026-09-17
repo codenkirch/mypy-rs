@@ -400,9 +400,9 @@ fn capture_field_value(obj: &PyAny, field: String, value: FieldValue) -> PyResul
 // the shadowed fields are heterogeneous (bools, ints, strings, type
 // objects, node collections).
 
-// Object-valued fields are stored as class/fullname markers only, so no
-// live type or node graph is retained beyond the strong pin that keeps
-// the record key valid.
+// Object fields are marker-only, except the node serve fields, whose record
+// also carries the captured handle; pinning every object would retain a live
+// graph for the whole build, which this store avoids.
 
 // Guarantees mirror G1.0a: thread-local entries and pins, strong pins so
 // a recycled `id()` cannot adopt a stale entry, and one merged record per
@@ -432,17 +432,37 @@ fn intern_meta_field(field: &str) -> &'static str {
 }
 
 /// One tagged scalar value. `NoneVal` keeps a captured `None` distinct
-/// from "this field was never written"; `Obj`/`List` are record-only
-/// markers (`Class` or `Class:fullname`) for values the Python side
-/// refuses to serialize.
+/// from "this field was never written"; `List` is a record-only marker
+/// list (`Class` or `Class:fullname`) for values the Python side refuses
+/// to serialize.
+///
+/// `Obj` is the marker (`Class` or `Class:fullname`) plus, for a
+/// node-valued serve field, the identity handle of the captured object.
+/// `handle: None` means the capture could not mint a pin (or the field is
+/// not in the node serve set), so the record stays marker-only and can
+/// never be resolved to an object; the marker is kept either way, so a
+/// handle-less record is still readable and still compare-able.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub(crate) enum MetaValue {
     NoneVal,
     Bool(bool),
     Int(i64),
     Text(String),
-    Obj(String),
+    Obj { marker: String, handle: Option<u64> },
     List(Vec<String>),
+}
+
+impl MetaValue {
+    /// A marker-only `Obj` record: the shape every non-node object field
+    /// has, and the shape a node-valued field degrades to when the capture
+    /// could not mint a pin.
+    #[cfg(test)]
+    pub(crate) fn obj(marker: &str) -> Self {
+        MetaValue::Obj {
+            marker: marker.to_string(),
+            handle: None,
+        }
+    }
 }
 
 /// One object's metadata shadow: insertion-ordered field values plus a
@@ -1021,9 +1041,37 @@ pub(crate) fn meta_entry_count() -> usize {
     with_meta_store(|store| store.by_handle.len())
 }
 
+/// The identity handle an `Obj` record holds for `handle`'s `field`; None
+/// when the entry or field is absent, the field is another shape, or the
+/// capture left it marker-only (no pin to resolve).
+///
+/// The store borrow is released before the caller resolves anything with
+/// the handle, so a failed resolution cannot re-enter an active borrow.
+pub(crate) fn meta_field_node_handle(handle: u64, field: &str) -> Option<u64> {
+    with_meta_store(|store| {
+        store.by_handle.get(&handle).and_then(|entry| {
+            entry
+                .fields
+                .iter()
+                .find(|(name, _)| *name == field)
+                .and_then(|(_, value)| match value {
+                    MetaValue::Obj {
+                        handle: Some(target),
+                        ..
+                    } => Some(*target),
+                    _ => None,
+                })
+        })
+    })
+}
+
 // ---- G2 pyfunction wrappers ----
 
 /// Capture one tagged field value; returns the identity handle.
+///
+/// `num` carries the identity handle for kind `"obj"` (the node-valued
+/// serve fields) and is ignored by every other kind; `None` leaves the
+/// record marker-only.
 #[pyfunction]
 #[pyo3(signature = (obj, field, kind, text=None, num=None, items=None))]
 pub(crate) fn rust_node_mirror_capture_meta(
@@ -1039,7 +1087,10 @@ pub(crate) fn rust_node_mirror_capture_meta(
         "bool" => MetaValue::Bool(num.unwrap_or(0) != 0),
         "int" => MetaValue::Int(num.unwrap_or(0)),
         "str" => MetaValue::Text(text.unwrap_or_default()),
-        "obj" => MetaValue::Obj(text.unwrap_or_default()),
+        "obj" => MetaValue::Obj {
+            marker: text.unwrap_or_default(),
+            handle: num.and_then(|n| u64::try_from(n).ok()),
+        },
         "list" => MetaValue::List(items.unwrap_or_default()),
         other => {
             return Err(PyValueError::new_err(format!(
@@ -1053,6 +1104,11 @@ pub(crate) fn rust_node_mirror_capture_meta(
 /// Read the metadata record as `{field: (kind, text, num, items)}`; None
 /// when the object has no entry. Kind is one of `none`, `bool`, `int`,
 /// `str`, `obj`, `list`.
+///
+/// An `obj` record reports its marker in `text` and `None` in `num`; the
+/// captured identity handle is reported by
+/// `rust_node_mirror_meta_field_handle` instead, so the record shape every
+/// existing reader sees is unchanged.
 #[pyfunction]
 pub(crate) fn rust_node_mirror_meta(py: Python<'_>, handle: u64) -> PyResult<Option<PyObject>> {
     with_meta_store(|store| {
@@ -1067,7 +1123,7 @@ pub(crate) fn rust_node_mirror_meta(py: Python<'_>, handle: u64) -> PyResult<Opt
                         MetaValue::Bool(v) => ("bool", None, Some(i64::from(*v)), None),
                         MetaValue::Int(v) => ("int", None, Some(*v), None),
                         MetaValue::Text(v) => ("str", Some(v.as_str()), None, None),
-                        MetaValue::Obj(v) => ("obj", Some(v.as_str()), None, None),
+                        MetaValue::Obj { marker, .. } => ("obj", Some(marker.as_str()), None, None),
                         MetaValue::List(v) => ("list", None, None, Some(v.clone())),
                     };
                     dict.set_item(*field, item)?;
@@ -1076,6 +1132,17 @@ pub(crate) fn rust_node_mirror_meta(py: Python<'_>, handle: u64) -> PyResult<Opt
             })
             .transpose()
     })
+}
+
+/// The identity handle a node-valued field's `Obj` record captured; None
+/// when the object or field has no entry, the field is another shape, or
+/// the capture could not mint a pin.
+///
+/// Read-only: it mints no handle and pins nothing, so a caller can assert
+/// what the record holds without changing it.
+#[pyfunction]
+pub(crate) fn rust_node_mirror_meta_field_handle(handle: u64, field: &str) -> Option<u64> {
+    meta_field_node_handle(handle, field)
 }
 
 /// Capture counter for `handle`; None when the object has no entry.
@@ -1106,9 +1173,13 @@ pub(crate) fn rust_node_mirror_meta_entry_count() -> usize {
 // G2.1 (#1787 PR B): statement-family serving read flip
 // ===========================================================================
 
-// The serve set is the one registered statement field native code reads
-// live: `Block.is_unreachable`. A record serves only in the exact shape
-// the capture wrote (`Bool`); a shape-crossed write defers (#1785 class).
+// Two record shapes share this one channel: the `Bool` record of the one
+// registered statement scalar native code reads live, and a node record
+// (`AssertStmt`/`ReturnStmt`/`ExpressionStmt` `expr`) served from the pin.
+
+// A flag serves only in the exact shape the capture wrote, and a node only
+// when its handle still resolves through `object_of`; anything else defers
+// rather than answering wrongly (#1785 class).
 
 // Thread-local like the G1.1 read state: a mode set on one thread cannot
 // make another thread's empty store look authoritative, and the unit tests
@@ -1269,6 +1340,113 @@ pub(crate) fn rust_node_mirror_serve_stmt_flag(obj: &PyAny, field: &str) -> Opti
 #[pyfunction]
 pub(crate) fn rust_node_mirror_verify_stmt_flag(obj: &PyAny, field: &str) -> Option<bool> {
     verify_stmt_flag(obj, field)
+}
+
+// ---- node-valued fields: the same channel, a servable object ----
+
+/// Serve `obj.field` as the live object the record pinned, or `None` when
+/// the read must stay live: mode 0, no identity handle, no `Obj` record
+/// for the field, a record whose capture could not mint a pin, or a handle
+/// the pin layer can no longer resolve (a reset, or an identity-only reset
+/// that moved on). The fail direction is always the defer, never a wrong
+/// object.
+///
+/// The store borrow is released before the mode-2 compare, which reads
+/// live Python attributes and could re-enter the store.
+pub(crate) fn serve_stmt_node(py: Python<'_>, obj: &PyAny, field: &str) -> Option<Py<PyAny>> {
+    let served = read_stmt_node_record(py, obj, field)?;
+    if stmt_read_mode() >= 2 && !compare_stmt_node(py, obj, field, &served) {
+        bump_stmt(|state| state.mismatched += 1);
+    }
+    bump_stmt(|state| state.served += 1);
+    Some(served)
+}
+
+/// The differential entry point for a node-valued field: resolve the record
+/// and compare it against the live slot in any serving mode, counting one
+/// comparison. Usable in mode 1, where the production path does not compare
+/// by itself, so the negative control can drive it.
+pub(crate) fn verify_stmt_node(py: Python<'_>, obj: &PyAny, field: &str) -> Option<bool> {
+    let served = read_stmt_node_record(py, obj, field)?;
+    let matched = compare_stmt_node(py, obj, field, &served);
+    if !matched {
+        bump_stmt(|state| state.mismatched += 1);
+    }
+    bump_stmt(|state| state.served += 1);
+    Some(matched)
+}
+
+/// The live object `obj.field`'s record pinned, or `None` when the read
+/// must stay live. Counts provenance only: it neither compares nor counts a
+/// serve, so both read entry points above own those counters.
+fn read_stmt_node_record(py: Python<'_>, obj: &PyAny, field: &str) -> Option<Py<PyAny>> {
+    if stmt_read_mode() == 0 {
+        bump_stmt(|state| state.deferred_off += 1);
+        return None;
+    }
+    bump_stmt(|state| state.consulted += 1);
+    let handle = match identity::handle_of(obj) {
+        Some(handle) => handle,
+        None => {
+            bump_stmt(|state| state.deferred_unrecorded += 1);
+            return None;
+        }
+    };
+    // The store borrow is released here, before the pin layer runs and
+    // before any live attribute read.
+    let target = meta_field_node_handle(handle, field);
+    let served = target.and_then(|target| object_of(py, target));
+    if served.is_none() {
+        bump_stmt(|state| state.deferred_unrecorded += 1);
+    }
+    served
+}
+
+/// Mode-2 differential: the served object against the live slot, compared
+/// by identity. `object_of` answers the exact pinned object, so a
+/// value-equal imitation or a different node counts as a mismatch.
+///
+/// Additive-only (#1780): a live slot the probe cannot read counts as a
+/// compare error and *not* as a mismatch. The record can only exist where
+/// the capture read that slot successfully, so an unreadable slot is a
+/// probe limitation rather than a shown disagreement; a run where reads
+/// fail wholesale therefore stays visible in `compare_errors` instead of
+/// reporting a clean differential. `compare_stmt_flag`'s stricter rule is
+/// deliberately left as it is: a `Bool` record is exact by construction,
+/// so an unreadable live flag there can only mean an out-of-contract
+/// post-capture mutation.
+fn compare_stmt_node(py: Python<'_>, obj: &PyAny, field: &str, served: &Py<PyAny>) -> bool {
+    bump_stmt(|state| state.compared += 1);
+    match obj.getattr(field) {
+        Ok(live) => live.as_ptr() == served.as_ref(py).as_ptr(),
+        Err(_) => {
+            bump_stmt(|state| state.compare_errors += 1);
+            true
+        }
+    }
+}
+
+/// `Some(object)` served from the record for `obj.field`; `None` when the
+/// read must stay live (mode 0, unrecorded, marker-only, or an unresolvable
+/// handle).
+#[pyfunction]
+pub(crate) fn rust_node_mirror_serve_stmt_node(
+    py: Python<'_>,
+    obj: &PyAny,
+    field: &str,
+) -> Option<Py<PyAny>> {
+    serve_stmt_node(py, obj, field)
+}
+
+/// The differential entry point: `Some(matched)` when the record served the
+/// read, `None` when it stayed live. Counts one comparison either way.
+#[pyfunction]
+pub(crate) fn rust_node_mirror_verify_stmt_node(
+    py: Python<'_>,
+    obj: &PyAny,
+    field: &str,
+) -> Option<bool> {
+    verify_stmt_node(py, obj, field)
 }
 
 // ===========================================================================
@@ -1492,7 +1670,7 @@ mod g2_meta_tests {
                 h
             );
             assert_eq!(
-                capture_meta(obj, "info", MetaValue::Obj("TypeInfo:mod.C".into())).unwrap(),
+                capture_meta(obj, "info", MetaValue::obj("TypeInfo:mod.C")).unwrap(),
                 h
             );
             assert_eq!(
@@ -1514,7 +1692,7 @@ mod g2_meta_tests {
             );
             assert_eq!(
                 field_value(h, "info"),
-                Some(MetaValue::Obj("TypeInfo:mod.C".into()))
+                Some(MetaValue::obj("TypeInfo:mod.C"))
             );
             assert_eq!(
                 field_value(h, "items"),
@@ -1531,7 +1709,7 @@ mod g2_meta_tests {
             let obj = fresh_object(py);
             let h = capture_meta(obj, "type", MetaValue::NoneVal).unwrap();
             capture_meta(obj, "is_final_def", MetaValue::Bool(false)).unwrap();
-            capture_meta(obj, "type", MetaValue::Obj("InstanceType".into())).unwrap();
+            capture_meta(obj, "type", MetaValue::obj("InstanceType")).unwrap();
             let order: Vec<&str> = with_meta_store(|s| {
                 s.by_handle[&h]
                     .fields
@@ -1540,10 +1718,7 @@ mod g2_meta_tests {
                     .collect()
             });
             assert_eq!(order, vec!["type", "is_final_def"]);
-            assert_eq!(
-                field_value(h, "type"),
-                Some(MetaValue::Obj("InstanceType".into()))
-            );
+            assert_eq!(field_value(h, "type"), Some(MetaValue::obj("InstanceType")));
             assert_eq!(with_meta_store(|s| s.by_handle[&h].captures), 3);
         });
     }
@@ -2147,6 +2322,8 @@ pub(crate) fn register_registry(m: &PyModule) -> PyResult<()> {
 
     m.add_function(wrap_pyfunction!(rust_node_mirror_meta_entry_count, m)?)?;
 
+    m.add_function(wrap_pyfunction!(rust_node_mirror_meta_field_handle, m)?)?;
+
     // Phase G2.1 (#1787 PR B): statement-family serving read flip for
     // `Block.is_unreachable`. Mode 0 by default; mode 2 adds the
     // differential compare that makes a corpus run evidence.
@@ -2161,6 +2338,13 @@ pub(crate) fn register_registry(m: &PyModule) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(rust_node_mirror_serve_stmt_flag, m)?)?;
 
     m.add_function(wrap_pyfunction!(rust_node_mirror_verify_stmt_flag, m)?)?;
+
+    // Phase G2.3 (#1787): the same statement channel over the node-valued
+    // serve set (`AssertStmt`/`ReturnStmt`/`ExpressionStmt` `expr`), served
+    // as the live object the capture pinned.
+    m.add_function(wrap_pyfunction!(rust_node_mirror_serve_stmt_node, m)?)?;
+
+    m.add_function(wrap_pyfunction!(rust_node_mirror_verify_stmt_node, m)?)?;
 
     // Phase G2.2 (#1787): the `Var` binder-key handle translation. Mode 0
     // by default; mode 2 adds the per-key differential that makes a corpus
@@ -2661,6 +2845,252 @@ mod g2_serving_tests {
             let obj = fresh_block(py);
             capture_meta(obj, "is_unreachable", MetaValue::Bool(true)).unwrap();
             assert_eq!(verify_stmt_flag(obj, "is_unreachable"), None);
+            let (_, _, deferred_off, _, compared, _, _) = stmt_counters();
+            assert_eq!((deferred_off, compared), (1, 0));
+        });
+    }
+}
+
+#[cfg(test)]
+mod stmt_node_serving_tests {
+    use super::*;
+
+    /// Initialize the embedded interpreter, then run with the GIL.
+    fn with_py<T>(f: impl FnOnce(Python<'_>) -> T) -> T {
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(f)
+    }
+
+    /// A stand-in for a served statement node: one `expr` slot, which is the
+    /// only thing the read and the compare touch.
+    fn fresh_stmt(py: Python<'_>) -> &PyAny {
+        py.eval("type('S', (), {})()", None, None).unwrap()
+    }
+
+    /// Fresh pins, store and counters, then the serving mode.
+    fn start_node(mode: u8) {
+        reset_meta();
+        reset_pins();
+        reset_stmt_read_counters();
+        set_stmt_read_mode(mode).unwrap();
+    }
+
+    /// Capture `obj.expr` the way the Python capture does for a node-valued
+    /// serve field: marker plus the identity handle of the pinned value.
+    fn capture_node(obj: &PyAny, value: &PyAny) -> u64 {
+        let handle = capture_pin(value).unwrap();
+        capture_meta(
+            obj,
+            "expr",
+            MetaValue::Obj {
+                marker: "NameExpr".into(),
+                handle: Some(handle),
+            },
+        )
+        .unwrap();
+        handle
+    }
+
+    fn stmt_counters() -> (u64, u64, u64, u64, u64, u64, u64) {
+        stmt_read_counters()
+    }
+
+    #[test]
+    fn test_mode_zero_does_not_serve_a_node_and_counts_the_deferral() {
+        with_py(|py| {
+            start_node(0);
+            let obj = fresh_stmt(py);
+            let value = fresh_stmt(py);
+            obj.setattr("expr", value).unwrap();
+            capture_node(obj, value);
+            assert!(serve_stmt_node(py, obj, "expr").is_none());
+            assert_eq!(stmt_counters(), (0, 0, 1, 0, 0, 0, 0));
+        });
+    }
+
+    #[test]
+    fn test_a_pinned_record_serves_the_identical_object() {
+        with_py(|py| {
+            start_node(1);
+            let obj = fresh_stmt(py);
+            let value = fresh_stmt(py);
+            obj.setattr("expr", value).unwrap();
+            capture_node(obj, value);
+            let served = serve_stmt_node(py, obj, "expr").expect("a pinned record must serve");
+            assert_eq!(
+                served.as_ref(py).as_ptr(),
+                value.as_ptr(),
+                "the served object must be the pinned one, not a copy"
+            );
+            let (consulted, served_n, deferred_off, unrecorded, compared, mismatched, errors) =
+                stmt_counters();
+            assert_eq!(
+                (
+                    consulted,
+                    served_n,
+                    deferred_off,
+                    unrecorded,
+                    compared,
+                    mismatched,
+                    errors
+                ),
+                (1, 1, 0, 0, 0, 0, 0)
+            );
+        });
+    }
+
+    #[test]
+    fn test_a_marker_only_record_does_not_serve_a_node() {
+        with_py(|py| {
+            start_node(1);
+            let obj = fresh_stmt(py);
+            let value = fresh_stmt(py);
+            obj.setattr("expr", value).unwrap();
+            // The record exists with the right marker but no handle: the
+            // record cannot name an object, so the live read must stay in
+            // charge rather than the marker being trusted.
+            capture_meta(obj, "expr", MetaValue::obj("NameExpr")).unwrap();
+            assert!(serve_stmt_node(py, obj, "expr").is_none());
+            let (_, served_n, _, unrecorded, _, _, _) = stmt_counters();
+            assert_eq!((served_n, unrecorded), (0, 1));
+        });
+    }
+
+    #[test]
+    fn test_another_fields_handle_is_not_served_for_this_field() {
+        with_py(|py| {
+            start_node(1);
+            let obj = fresh_stmt(py);
+            let value = fresh_stmt(py);
+            obj.setattr("expr", value).unwrap();
+            let handle = capture_pin(value).unwrap();
+            capture_meta(
+                obj,
+                "other",
+                MetaValue::Obj {
+                    marker: "NameExpr".into(),
+                    handle: Some(handle),
+                },
+            )
+            .unwrap();
+            assert!(
+                serve_stmt_node(py, obj, "expr").is_none(),
+                "a handle recorded under another field must not answer this one"
+            );
+        });
+    }
+
+    #[test]
+    fn test_a_stale_handle_defers_rather_than_answering_wrongly() {
+        with_py(|py| {
+            start_node(1);
+            let obj = fresh_stmt(py);
+            let value = fresh_stmt(py);
+            obj.setattr("expr", value).unwrap();
+            let handle = capture_node(obj, value);
+            assert!(serve_stmt_node(py, obj, "expr").is_some());
+            // The per-build boundary drops the pins: the handle is stale,
+            // and the fail direction must be the defer, never a wrong object.
+            reset_pins();
+            assert!(serve_stmt_node(py, obj, "expr").is_none());
+            // The record itself is untouched - it still names the handle,
+            // which is exactly why the read had to defer instead of answer.
+            assert_eq!(
+                meta_field_node_handle(identity::handle_of(obj).unwrap(), "expr"),
+                Some(handle)
+            );
+        });
+    }
+
+    #[test]
+    fn test_the_handle_accessor_reports_what_the_record_holds() {
+        with_py(|py| {
+            start_node(0);
+            let obj = fresh_stmt(py);
+            let value = fresh_stmt(py);
+            let handle = capture_node(obj, value);
+            let owner = identity::handle_of(obj).unwrap();
+            assert_eq!(meta_field_node_handle(owner, "expr"), Some(handle));
+            assert_eq!(meta_field_node_handle(owner, "missing"), None);
+        });
+    }
+
+    #[test]
+    fn test_mode_two_compare_detects_a_desynced_node() {
+        with_py(|py| {
+            start_node(2);
+            let obj = fresh_stmt(py);
+            let value = fresh_stmt(py);
+            obj.setattr("expr", value).unwrap();
+            capture_node(obj, value);
+            assert_eq!(
+                serve_stmt_node(py, obj, "expr")
+                    .unwrap()
+                    .as_ref(py)
+                    .as_ptr(),
+                value.as_ptr()
+            );
+            // A live write the capture hook never saw, so the record still
+            // names the old object: the served read and the live slot must
+            // disagree here.
+            let other = fresh_stmt(py);
+            obj.setattr("expr", other).unwrap();
+            assert_eq!(
+                serve_stmt_node(py, obj, "expr")
+                    .unwrap()
+                    .as_ref(py)
+                    .as_ptr(),
+                value.as_ptr()
+            );
+            let (_, served_n, _, _, compared, mismatched, errors) = stmt_counters();
+            assert_eq!((served_n, compared, mismatched, errors), (2, 2, 1, 0));
+        });
+    }
+
+    #[test]
+    fn test_an_unreadable_live_slot_is_a_compare_error_not_a_mismatch() {
+        with_py(|py| {
+            start_node(2);
+            let obj = fresh_stmt(py);
+            let value = fresh_stmt(py);
+            obj.setattr("expr", value).unwrap();
+            capture_node(obj, value);
+            // Additive-only (#1780): the record can only exist where the
+            // capture read the slot, so an unreadable live slot is a probe
+            // limitation, counted as such instead of as a disagreement.
+            obj.delattr("expr").unwrap();
+            assert!(serve_stmt_node(py, obj, "expr").is_some());
+            let (_, _, _, _, compared, mismatched, errors) = stmt_counters();
+            assert_eq!((compared, mismatched, errors), (1, 0, 1));
+        });
+    }
+
+    #[test]
+    fn test_verify_serves_a_node_in_mode_one() {
+        with_py(|py| {
+            start_node(1);
+            let obj = fresh_stmt(py);
+            let value = fresh_stmt(py);
+            obj.setattr("expr", value).unwrap();
+            capture_node(obj, value);
+            assert_eq!(verify_stmt_node(py, obj, "expr"), Some(true));
+            let other = fresh_stmt(py);
+            obj.setattr("expr", other).unwrap();
+            assert_eq!(verify_stmt_node(py, obj, "expr"), Some(false));
+            let (_, served_n, _, _, compared, mismatched, _) = stmt_counters();
+            assert_eq!((served_n, compared, mismatched), (2, 2, 1));
+        });
+    }
+
+    #[test]
+    fn test_verify_requires_the_serving_mode() {
+        with_py(|py| {
+            start_node(0);
+            let obj = fresh_stmt(py);
+            let value = fresh_stmt(py);
+            obj.setattr("expr", value).unwrap();
+            capture_node(obj, value);
+            assert_eq!(verify_stmt_node(py, obj, "expr"), None);
             let (_, _, deferred_off, _, compared, _, _) = stmt_counters();
             assert_eq!((deferred_off, compared), (1, 0));
         });
