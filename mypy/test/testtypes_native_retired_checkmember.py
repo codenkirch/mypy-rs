@@ -153,7 +153,7 @@ class NativeCheckmemberRetiredSeamsSuite(Suite):
         plain = _make_var("plain", self.info, itype)
         classvar = _make_var("cv", self.info, itype, is_classvar=True)
         inferred = _make_var("inf", self.info, itype, is_inferred=True)
-        shadowed = _make_var("shadow", self.info, itype)
+        shadowed = _make_var("shadow", self.info, itype, register=False)
         self.info.names["shadow"] = SymbolTableNode(MDEF, Var("shadow"))
         unregistered = _make_var("absent", self.info, itype, register=False)
 

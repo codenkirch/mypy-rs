@@ -4670,13 +4670,7 @@ def _set_native_visitor_active(active: bool) -> None:
 
 
 def _set_native_visitor_resolver(resolver: Any) -> None:
-    """Install the `NativeTypeResolver` for the alias-aware flatten seam.
-
-    `flatten_nested_tuples` expands zero-argument alias items through
-    this resolver's alias snapshot, mirroring Python's union-shape
-    decision. With no resolver installed the seam defers on any alias
-    input, as before.
-    """
+    """Retired (#1763): kept as a no-op for build/test compatibility."""
     global _native_visitor_resolver
     _native_visitor_resolver = resolver
 
