@@ -114,6 +114,45 @@ from mypy.types import (
 _ABSENT = object()
 
 
+def _snapshot_types_module_bindings(names: tuple[str, ...]) -> dict[str, object]:
+    """Snapshot `mypy.types` bindings; a missing name reads as `_ABSENT`."""
+    import mypy.types as _types_mod
+
+    return {name: _types_mod.__dict__.get(name, _ABSENT) for name in names}
+
+
+def _restore_types_module_bindings(saved: dict[str, object]) -> None:
+    """Undo a `_snapshot_types_module_bindings` snapshot."""
+    import mypy.types as _types_mod
+
+    for name, prior in saved.items():
+        if prior is _ABSENT:
+            _types_mod.__dict__.pop(name, None)
+        else:
+            _types_mod.__dict__[name] = prior
+
+
+class _LeakyTypesBindingCase:
+    """Negative control for the binding-hygiene detector (#1786).
+
+    Injects one `mypy.types` seam name and never restores it, so the
+    hygiene test has a known leak it must flag. A plain class, not a
+    `Suite`, so pytest neither collects nor runs it.
+    """
+
+    def __init__(self, seam: str) -> None:
+        self._SEAM_BINDINGS = (seam,)
+
+    def setUp(self) -> None:
+        import mypy.types as _types_mod
+
+        for name in self._SEAM_BINDINGS:
+            _types_mod.__dict__[name] = object()
+
+    def tearDown(self) -> None:
+        pass
+
+
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeTypeWireSuite(Suite):
     """Parity tests for the Rust `Type` wire reader (Stage 3a).
@@ -413,6 +452,11 @@ class NativeRemoveDupsSuite(Suite):
     the seam preserves identity end-to-end.
     """
 
+    # The `mypy.types` seam names this suite injects. The binding-hygiene
+    # test derives its expectation from here, so a new injection cannot
+    # drift out of leak coverage (#1786).
+    _SEAM_BINDINGS: tuple[str, ...] = ("_VisitorWriteBuffer", "_ReadBuffer", "_rust_remove_dups")
+
     def setUp(self) -> None:
         from librt.internal import ReadBuffer, WriteBuffer
 
@@ -422,10 +466,7 @@ class NativeRemoveDupsSuite(Suite):
         # Bind the seam names the module-level try would have bound. Save
         # the prior bindings first (absent stays distinct from the
         # ImportError branch's `None`) and restore them in tearDown (#1778).
-        self._orig_module_bindings = {
-            name: _types_mod.__dict__.get(name, _ABSENT)
-            for name in ("_VisitorWriteBuffer", "_ReadBuffer", "_rust_remove_dups")
-        }
+        self._orig_module_bindings = _snapshot_types_module_bindings(self._SEAM_BINDINGS)
         _types_mod._VisitorWriteBuffer = WriteBuffer  # type: ignore[attr-defined]
         _types_mod._ReadBuffer = ReadBuffer  # type: ignore[attr-defined]
         _types_mod.__dict__.setdefault("_rust_remove_dups", _type_kernel.rust_remove_dups)
@@ -458,11 +499,7 @@ class NativeRemoveDupsSuite(Suite):
         _set_native_visitor_resolver(None)
         self._types_mod._VISITOR_HAS_TYPE_KERNEL = self._orig_kernel_flag
         self._set_gates(self._orig_visitor_gate, self._orig_types_gate)
-        for name, prior in self._orig_module_bindings.items():
-            if prior is _ABSENT:
-                self._types_mod.__dict__.pop(name, None)
-            else:
-                self._types_mod.__dict__[name] = prior
+        _restore_types_module_bindings(self._orig_module_bindings)
 
     def _set_gates(self, visitor: bool, types: bool) -> None:
         from mypy.types import _set_native_visitor_active, _set_native_visitor_types_active
@@ -551,6 +588,9 @@ class NativeHasRecursiveTypesFlattenSuite(Suite):
     pyfunctions are pinned by direct calls.
     """
 
+    # Same derivation as NativeRemoveDupsSuite (#1786).
+    _SEAM_BINDINGS: tuple[str, ...] = ("_VisitorWriteBuffer", "_ReadBuffer")
+
     def setUp(self) -> None:
         from librt.internal import ReadBuffer, WriteBuffer
 
@@ -560,10 +600,7 @@ class NativeHasRecursiveTypesFlattenSuite(Suite):
         # Same process-global hygiene as NativeRemoveDupsSuite (#1778):
         # save the prior bindings, absent distinct from `None`, and put
         # them back in tearDown.
-        self._orig_module_bindings = {
-            name: _types_mod.__dict__.get(name, _ABSENT)
-            for name in ("_VisitorWriteBuffer", "_ReadBuffer")
-        }
+        self._orig_module_bindings = _snapshot_types_module_bindings(self._SEAM_BINDINGS)
         _types_mod._VisitorWriteBuffer = WriteBuffer  # type: ignore[attr-defined]
         _types_mod._ReadBuffer = ReadBuffer  # type: ignore[attr-defined]
         self._orig_kernel_flag = _types_mod._VISITOR_HAS_TYPE_KERNEL
@@ -588,11 +625,7 @@ class NativeHasRecursiveTypesFlattenSuite(Suite):
         self._set_gates(self._orig_visitor_gate, self._orig_types_gate)
         _set_native_visitor_resolver(None)
         self._types_mod._VISITOR_HAS_TYPE_KERNEL = self._orig_kernel_flag
-        for name, prior in self._orig_module_bindings.items():
-            if prior is _ABSENT:
-                self._types_mod.__dict__.pop(name, None)
-            else:
-                self._types_mod.__dict__[name] = prior
+        _restore_types_module_bindings(self._orig_module_bindings)
 
     def _set_gates(self, visitor: bool, types: bool) -> None:
         from mypy.types import _set_native_visitor_active, _set_native_visitor_types_active
@@ -804,46 +837,44 @@ class NativeMirrorBindingHygieneSuite(Suite):
     """
 
     def test_the_binding_suites_restore_the_types_module_bindings(self) -> None:
-        import mypy.types as _types_mod
-
         cases = (
-            (
-                NativeRemoveDupsSuite,
-                "test_alias_rows_parity_and_identity",
-                ("_VisitorWriteBuffer", "_ReadBuffer", "_rust_remove_dups"),
-            ),
-            (
-                NativeHasRecursiveTypesFlattenSuite,
-                "test_hrt_parities",
-                ("_VisitorWriteBuffer", "_ReadBuffer"),
-            ),
+            (NativeRemoveDupsSuite, "test_alias_rows_parity_and_identity"),
+            (NativeHasRecursiveTypesFlattenSuite, "test_hrt_parities"),
         )
-        names = ("_VisitorWriteBuffer", "_ReadBuffer", "_rust_remove_dups")
-        prior = {name: _types_mod.__dict__.get(name, _ABSENT) for name in names}
+        # The checked names come from each suite's own declaration, so a
+        # new injection cannot drift out of leak coverage (#1786).
+        names = tuple(dict.fromkeys(n for cls, _ in cases for n in cls._SEAM_BINDINGS))
+        assert names, "no seam bindings declared: the hygiene check would be vacuous"
+        prior = _snapshot_types_module_bindings(names)
         try:
-            for suite_cls, test_name, suite_names in cases:
+            for suite_cls, test_name in cases:
                 # Both pristine shapes: the `None` the module's ImportError
                 # branch binds, and a name the module never bound at all.
                 for pristine in (None, _ABSENT):
-                    for name in suite_names:
-                        if pristine is _ABSENT:
-                            _types_mod.__dict__.pop(name, None)
-                        else:
-                            _types_mod.__dict__[name] = pristine
-                    case = suite_cls(test_name)
-                    case.setUp()
-                    case.tearDown()
-                    for name in suite_names:
-                        after = _types_mod.__dict__.get(name, _ABSENT)
-                        assert (
-                            after is pristine
-                        ), f"{suite_cls.__name__} leaked {name}: {after!r} != {pristine!r}"
+                    leaked = self._leaked_seam_names(suite_cls(test_name), pristine)
+                    assert not leaked, f"{suite_cls.__name__} leaked {leaked} at {pristine!r}"
+            # Negative control: a case that never restores must be flagged
+            # for every derived name, so a green run cannot be vacuous.
+            for name in names:
+                for pristine in (None, _ABSENT):
+                    leaked = self._leaked_seam_names(_LeakyTypesBindingCase(name), pristine)
+                    assert leaked == [name], f"detector missed {name}: {leaked}"
         finally:
-            for name, value in prior.items():
-                if value is _ABSENT:
-                    _types_mod.__dict__.pop(name, None)
-                else:
-                    _types_mod.__dict__[name] = value
+            _restore_types_module_bindings(prior)
+
+    def _leaked_seam_names(self, case: Any, pristine: object) -> list[str]:
+        """Run one setUp/tearDown cycle; return the seam names left behind."""
+        import mypy.types as _types_mod
+
+        names = case._SEAM_BINDINGS
+        for name in names:
+            if pristine is _ABSENT:
+                _types_mod.__dict__.pop(name, None)
+            else:
+                _types_mod.__dict__[name] = pristine
+        case.setUp()
+        case.tearDown()
+        return [n for n in names if _types_mod.__dict__.get(n, _ABSENT) is not pristine]
 
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
