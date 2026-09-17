@@ -144,20 +144,39 @@ discards the output the script exists to produce). A probe that can undercount i
 worse than no probe, because its numbers are treated as primary evidence.
 
 Pre-flight for T2/T3/T4: prove which source tree you are testing. A worktree
-`.venv` is a symlink to the main checkout's venv, and that venv's editable
-install points at the main checkout, so `import mypy` can silently resolve
-there. The symptom is `_pytest.pathlib.ImportPathMismatchError` naming the main
-checkout's `mypy/test/conftest.py` against yours, with 0 engagement on every
-seam while a probe reports thousands. Before trusting any count, suite result
-or engagement number:
+`.venv` is a symlink to the main checkout's venv, and that venv is a PEP 660
+editable install. Two channels can resolve `import mypy` to a foreign tree
+(#1789): the editable finder on `sys.meta_path` maps `mypy` to whatever tree
+last installed into the venv (possibly a deleted worktree), and the interpreter
+puts the current directory at `sys.path[0]`, shadowing every PYTHONPATH entry.
+The old `PYTHONPATH=... python -c "import mypy"` incantation therefore
+reports the tree you are standing in, not the tree you asked about. The symptom
+is `_pytest.pathlib.ImportPathMismatchError` naming the main checkout's
+`mypy/test/conftest.py` against yours, with 0 engagement on every seam while a
+probe reports thousands.
+
+`conftest.py` makes a hollow green impossible: before any suite code runs
+(in every xdist worker, since each worker imports the conftest fresh), it
+asserts that the imported `mypy` lives in the tree whose tests are collecting.
+Do not remove or weaken that assertion. Before trusting any count, suite
+result or engagement number, run the standalone check with the same venv
+interpreter and PYTHONPATH the real run will use:
 
 ```bash
-PYTHONPATH=<worktree>:<scratch .so dir>:$PYTHONPATH \
-  .venv/bin/python -c "import mypy; print(mypy.__file__)"
+.venv/bin/python scripts/assert_worktree_import.py <tree under test>
 ```
 
-It must print the worktree path. A probe harness that exits 0 while raising is
-worse than no probe: read its exit status before reading its numbers.
+Exit 0 plus the resolved path is the only acceptable result; the helper
+strips the editable finder and the cwd entry, so neither channel can fool it.
+A probe harness that exits 0 while raising is worse than no probe: read its
+exit status before reading its numbers.
+
+Worktree lanes: run pytest from inside the worktree, so the cwd entry is the
+tree under test and the conftest assertion holds. `pyproject.toml` sets
+`addopts = "-nauto"`; a fresh xdist worker re-creates the editable finder,
+and the conftest assertion is what holds workers honest. For quick
+single-suite runs override the fan-out with `-n0` on the command line or
+`PYTEST_ADDOPTS="-n0"` (both beat `addopts`).
 
 Heavy ops (cargo build/test, pytest, self-check) run through the weighted pool:
 `/private/tmp/mypy-rs-sem.sh run 1 <build>` for a build, `run 2 <corpus>` for a
