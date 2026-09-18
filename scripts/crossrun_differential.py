@@ -103,6 +103,7 @@ SUITE_OPT_GATES = {
     "native_ast_mirror": "TEST_NATIVE_AST_MIRROR",
     "native_symtable_mirror": "TEST_NATIVE_SYMTABLE_MIRROR",
     "native_ast_mirror_read": "TEST_NATIVE_AST_MIRROR_READ",
+    "native_ast_mirror_stmt_read": "TEST_NATIVE_AST_MIRROR_STMT_READ",
     "native_symtable_read_flip": "TEST_NATIVE_SYMTABLE_READ_FLIP",
     "native_symtable_read_flip_verify": "TEST_NATIVE_SYMTABLE_READ_FLIP_VERIFY",
 }
@@ -1343,10 +1344,11 @@ def worker_main(argv: list[str]) -> int:
 
         # Serving gates have two channels: the env var, and the production
         # default the build wiring serves when the env gate is unset (#1860).
-        # The node default is read back from `nodes_mirror` (#1863).
+        # The node and statement defaults are read back from `nodes_mirror`
+        # (#1863, #1869), never re-derived from kernel presence.
         production_defaults = {
             "MYPY_TK_NODE_READ_FLIP": 1 if nodes_mirror.production_read_flip() else 0,
-            "MYPY_TK_STMT_READ_FLIP": 0,
+            "MYPY_TK_STMT_READ_FLIP": 1 if nodes_mirror.production_stmt_flip() else 0,
             "MYPY_TK_VAR_KEY_FLIP": 0,
         }
         gates: dict[str, dict[str, Any]] = {}

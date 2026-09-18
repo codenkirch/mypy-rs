@@ -4,8 +4,11 @@
 statement field native code reads live - from the Rust metadata record
 when the stmt read flip is on, and the native dependency walk
 (`depswalk.rs`) plus the native semanal visitor read it through
-`serve_stmt_flag`. Mode 0 (the default) serves nothing; mode 1 serves;
-mode 2 serves and compares every served read against the live slot.
+`serve_stmt_flag`. Mode 0 serves nothing; mode 1 serves and is the
+production default (#1869: `build` sets it through
+`set_production_stmt_read_flip` when the capture and
+`native_ast_mirror_stmt_read` gates are on); mode 2 serves and compares
+every served read against the live slot, and is measurement-only.
 
 The suite has three jobs:
 
@@ -293,6 +296,116 @@ class StmtShadowServingSuite(Suite):
                 os.environ.pop(env_name, None)
             else:
                 os.environ[env_name] = saved_env
+
+    # -- the production default (#1869) --
+
+    def test_production_wiring_serves_only_when_told_to(self) -> None:
+        """`set_production_stmt_read_flip` is what `build` calls (#1869).
+
+        Without an env gate it sets the mode from the option (1 serves,
+        0 off). With one, the measurement arm keeps control of the
+        channel: `activate` parsed the env value before the wiring ran,
+        so the wiring defers to the mode in force instead of overriding
+        it. The compare mode (2) is never selected by the option alone,
+        so a production run cannot end up in a differential mode by
+        default.
+        """
+        env_name = self._m._STMT_READ_FLIP_ENV
+        saved_env = os.environ.get(env_name)
+        saved_decision = self._m._production_stmt_flip
+        try:
+            os.environ.pop(env_name, None)
+            assert self._m.set_production_stmt_read_flip(False) == 0
+            assert self._m.stmt_read_flip() == 0
+            assert self._m.set_production_stmt_read_flip(True) == 1
+            assert self._m.stmt_read_flip() == 1
+            os.environ[env_name] = "2"
+            # `activate` applies the env mode before the wiring runs; the
+            # stand-in call plays that role here, and neither option may
+            # override it.
+            assert self._m.set_stmt_read_flip(2) == 2
+            assert self._m.set_production_stmt_read_flip(False) == 2
+            assert self._m.set_production_stmt_read_flip(True) == 2
+            os.environ[env_name] = "0"
+            assert self._m.set_stmt_read_flip(0) == 0
+            assert self._m.set_production_stmt_read_flip(True) == 0
+        finally:
+            self._m.set_stmt_read_flip(0)
+            self._m._production_stmt_flip = saved_decision
+            if saved_env is None:
+                os.environ.pop(env_name, None)
+            else:
+                os.environ[env_name] = saved_env
+
+    def test_production_wiring_records_its_decision_for_the_runner(self) -> None:
+        """`production_stmt_flip` reports what the wiring last wired (#1869).
+
+        The cross-run runner consumes this instead of re-deriving the
+        production default from kernel presence and the raw options, so
+        the recorded decision must track the setter exactly: False
+        before any wiring, the last `serve` argument afterwards, and the
+        wiring's own decision even when an env gate holds the channel
+        (the env wins for the mode, not for what the wiring asked).
+        """
+        env_name = self._m._STMT_READ_FLIP_ENV
+        saved_env = os.environ.get(env_name)
+        saved_decision = self._m._production_stmt_flip
+        try:
+            os.environ.pop(env_name, None)
+            self._m.set_production_stmt_read_flip(False)
+            assert self._m.production_stmt_flip() is False
+            self._m.set_production_stmt_read_flip(True)
+            assert self._m.production_stmt_flip() is True
+            os.environ[env_name] = "2"
+            assert self._m.set_stmt_read_flip(2) == 2
+            assert self._m.set_production_stmt_read_flip(False) == 2
+            assert self._m.production_stmt_flip() is False
+        finally:
+            self._m._production_stmt_flip = saved_decision
+            self._m.set_stmt_read_flip(0)
+            if saved_env is None:
+                os.environ.pop(env_name, None)
+            else:
+                os.environ[env_name] = saved_env
+
+    def test_production_wiring_arms_the_statement_capture(self) -> None:
+        """Serving needs records the default `ref` scope never writes.
+
+        The production `serve=True` call widens the armed classes to the
+        four serving ones and installs the meta patch, so a statement
+        constructed afterwards is adopted and its record serves: the
+        wiring, not the scope env, is what makes a default production
+        run record at all.
+        """
+        scope_name = self._m._CAPTURE_SCOPE_ENV
+        stmt_env = self._m._STMT_READ_FLIP_ENV
+        var_env = self._m._VAR_KEY_FLIP_ENV
+        seed_env = self._m._DEF_SEED_ENV
+        saved = {name: os.environ.get(name) for name in (scope_name, stmt_env, var_env, seed_env)}
+        saved_decision = self._m._production_stmt_flip
+        saved_armed = self._m._meta_armed_classes
+        try:
+            for name in (stmt_env, var_env, seed_env, scope_name):
+                os.environ.pop(name, None)
+            assert self._m.activate(audit=True) is True
+            assert self._m._meta_armed_classes == frozenset(), "the ref scope arms no meta class"
+            self._m.reset(clear_counts=True)
+            assert self._m.set_production_stmt_read_flip(True) == 1
+            assert (
+                self._m._meta_armed_classes == self._m._META_STMT_CLASSES
+            ), "the wiring must widen the armed classes"
+            stmt = ExpressionStmt(NameExpr("x"))
+            assert id(stmt) in self._m._META_HANDLES, "the wiring must arm the capture"
+            assert self._k.rust_node_mirror_serve_stmt_node(stmt, "expr") is not None
+        finally:
+            self._m._production_stmt_flip = saved_decision
+            self._m._meta_armed_classes = saved_armed
+            for name, value in saved.items():
+                if value is None:
+                    os.environ.pop(name, None)
+                else:
+                    os.environ[name] = value
+            self._m.set_stmt_read_flip(0)
 
     # -- the real consumer, in every mode --
 

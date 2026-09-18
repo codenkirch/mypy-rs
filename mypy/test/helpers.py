@@ -392,6 +392,7 @@ _NATIVE_ENV_MODULE_PROBES = {
     "TEST_NATIVE_SYMTABLE_READ_FLIP": ("type_kernel", "rust_snapshot_symbol_table_shadow"),
     "TEST_NATIVE_SYMTABLE_READ_FLIP_VERIFY": ("type_kernel", "rust_snapshot_symbol_table_shadow"),
     "TEST_NATIVE_AST_MIRROR_READ": ("type_kernel", "rust_aststrip_process_lvalue"),
+    "TEST_NATIVE_AST_MIRROR_STMT_READ": ("type_kernel", "rust_node_mirror_stmt_read_mode"),
 }
 
 
@@ -488,6 +489,10 @@ def parse_options(
     # lvalue read and the production walker mode serve only when the
     # capture mirror is on.
     options.native_ast_mirror_read = _env_gate("TEST_NATIVE_AST_MIRROR_READ")
+    # Phase G2.1 (#1869) statement serving-read gate: same differential
+    # contract as the expression one (unset env = off; the self-check
+    # exercises the default-on path).
+    options.native_ast_mirror_stmt_read = _env_gate("TEST_NATIVE_AST_MIRROR_STMT_READ")
     # Phase G3.0a (#1581) namespace shadow is capture-only for the same
     # reason: the option installs the SymbolTable class hooks only.
     options.native_symtable_mirror = _env_gate("TEST_NATIVE_SYMTABLE_MIRROR")

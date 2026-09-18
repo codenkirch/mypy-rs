@@ -357,6 +357,7 @@ class NodeShadowServingSuite(Suite):
         """
         env_name = self._m._READ_FLIP_ENV
         saved_env = os.environ.get(env_name)
+        saved_decision = self._m._production_read_flip
         try:
             os.environ.pop(env_name, None)
             assert self._m.set_production_read_flip(False) == 0
@@ -375,6 +376,7 @@ class NodeShadowServingSuite(Suite):
             assert self._m.set_production_read_flip(True) == 0
         finally:
             self._m.set_read_flip(0)
+            self._m._production_read_flip = saved_decision
             if saved_env is None:
                 os.environ.pop(env_name, None)
             else:

@@ -430,6 +430,10 @@ class Options:
         # reads (aststrip lvalue, walker `RefExpr` scalars) serve from shadow
         # storage in production. Not in OPTIONS_AFFECTING_CACHE.
         self.native_ast_mirror_read = True
+        # Phase G2.1 (#1869): the statement family's serving reads
+        # (`Block.is_unreachable`, the three `expr` slots) serve from shadow
+        # storage in production. Not in OPTIONS_AFFECTING_CACHE.
+        self.native_ast_mirror_stmt_read = True
         # Phase G3.0a (#1581): opt-in dual-write namespace capture shadow
         # for symbol tables (semanal adding funnel via put_names_entry).
         # Capture-only, not in OPTIONS_AFFECTING_CACHE.

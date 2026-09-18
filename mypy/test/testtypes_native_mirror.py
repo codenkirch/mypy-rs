@@ -31,6 +31,7 @@ from mypy.nodes import (
     MDEF,
     ArgKind,
     Argument,
+    AssertStmt,
     AssignmentStmt,
     Block,
     CallExpr,
@@ -6206,14 +6207,15 @@ class NativeNodeShadowReadFlipSuite(Suite):
 
 
 class NodeMirrorCaptureScopeSuite(Suite):
-    """#1864: the default capture scope arms only the RefExpr family.
+    """#1864/#1869: the capture scope arms the surface per class.
 
     The narrow scope is the production default. These tests pin its
     runtime contract - the ref arms capture while the analyzed, field and
-    meta arms no-op with their own skip counters - plus the two arming
-    implications: `full` arms the whole surface, and a meta flip env arms
-    meta capture. `activate` re-reads the scope env on every call, so both
-    scopes are exercised in this one process.
+    meta arms no-op with their own skip counters - plus the arming
+    implications: `full` arms the whole surface, a meta flip env arms
+    meta capture, and `stmt` (#1869) arms exactly the four classes the
+    G2.1 serving channel reads. `activate` re-reads the scope env on
+    every call, so every scope is exercised in this one process.
     """
 
     def setUp(self) -> None:
@@ -6316,14 +6318,53 @@ class NodeMirrorCaptureScopeSuite(Suite):
         assert id(var) in self._m._META_HANDLES, "the flip env must arm meta capture"
         assert self._m.report().get("meta_capture", 0) >= 1
 
+    def test_stmt_scope_arms_exactly_the_four_serving_classes(self) -> None:
+        """#1869: `stmt` is the surface the production wiring arms.
+
+        The four classes the G2.1 channel serves (Block's `Bool` record
+        plus the node-valued serve set) capture; every other G2 class
+        skips with the meta counter, exactly like the default scope.
+        """
+        self._activate("stmt")
+        block = Block([])
+        block.is_unreachable = True
+        nodes = [
+            block,
+            AssertStmt(NameExpr("x")),
+            ExpressionStmt(NameExpr("y")),
+            ReturnStmt(NameExpr("z")),
+        ]
+        for node in nodes:
+            assert id(node) in self._m._META_HANDLES, "a serving class must capture"
+        assert self._m.report().get("meta_capture", 0) >= 1, self._m.report()
+        var = Var("x")
+        var.is_final = True
+        assert id(var) not in self._m._META_HANDLES, "a non-serving class must not capture"
+        assert self._m.report().get("scope_skip.meta", 0) >= 1, self._m.report()
+
+    def test_stmt_scope_keeps_the_ref_family_behavior(self) -> None:
+        # The expression surface is unaffected by the wider meta arm: a
+        # binding write adopts exactly as under the default scope, and
+        # no meta record appears for it.
+        self._activate("stmt")
+        ref = NameExpr("x")
+        ref.kind = GDEF
+        assert id(ref) in self._m._NODE_HANDLES, "the binding write must adopt"
+        counters = self._m.report()
+        assert counters.get("capture_ref") == 1, counters
+        assert counters.get("meta_capture", 0) == 0, counters
+        assert self._k.rust_node_mirror_meta_entry_count() == 0
+
     def test_the_scope_env_is_reread_on_every_activate(self) -> None:
         self._activate("full")
         assert self._m._capture_scope == "full"
-        full_armed = self._m._meta_armed
-        assert full_armed is True
+        assert self._m._meta_armed_classes == frozenset(self._m._G2_TRACKED)
+        self._activate("stmt")
+        assert self._m._capture_scope == "stmt"
+        assert self._m._meta_armed_classes == self._m._META_STMT_CLASSES
         self._activate(None)
         assert self._m._capture_scope == "ref"
-        assert self._m._meta_armed is False
+        assert self._m._meta_armed_classes == frozenset()
         var = Var("x")
         var.is_final = True
         assert id(var) not in self._m._META_HANDLES, "a re-read must narrow the runtime gate"
