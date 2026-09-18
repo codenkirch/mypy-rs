@@ -333,9 +333,7 @@ class NativeClassifyTypeobjGateRetiredSuite(Suite):
     def test_no_rust_name_in_co_names(self) -> None:
         # Not "no rust_ name at all": the head legitimately still loads
         # `_rust_solve_generic_call` and `_rust_calibrate_type_obj_return`.
-        # `co_names` is a static attribute of the code object and does not
-        # vary with `_set_native_checkexpr_active`, so this pins the source
-        # of the retirement, not the toggle (#1847).
+        # `co_names` is static, so this pins the source, not the toggle (#1847).
         from mypy.checkexpr import ExpressionChecker
 
         dead = ("_rust_classify_typeobj_gate",)
@@ -531,3 +529,45 @@ class NativeCheckArgClassifyRetiredSuite(Suite):
         ]
         live = [n for n in found if callable(getattr(checkexpr, n, None))]
         assert live, f"no live rust_* alias in check_argument_types: {found}"
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeCheckOverloadCallRetiredSuite(Suite):
+    """Pin the #1624 retirement of the `rust_check_overload_call` shim.
+
+    The seam pre-picked the first-match overload item across the FFI
+    (generic items via the constraint-solve kernel, plus a Python-side
+    per-target type-object gate-fact list) and only trusted the pick when
+    re-running `check_call` added no new errors. A load-robust
+    instruction-count A/B on the cold self-check (`/usr/bin/time -l`
+    instructions retired, single-process, 3+2 interleaved runs) measured
+    the crossing a net loss: wrapping the binding in a no-op left the
+    pure-Python resolution plus the Python-side gate and wire prep, and
+    still saved 2.3e9 of the 487.6e9 baseline instructions (-0.47%). The
+    unconditional Python trial resolution below the gate was already the
+    authoritative body, so the seam is now uncalled; the Rust pyfunction
+    stays registered for the direct-seam tests in `NativeOverloadCallSuite`.
+    """
+
+    def test_shim_helpers_and_source_removed(self) -> None:
+        import inspect
+
+        from mypy import checkexpr
+
+        assert not hasattr(checkexpr, "_rust_check_overload_call")
+        assert not hasattr(checkexpr, "_typeobj_gate_flag_for_roc")
+        src = inspect.getsource(checkexpr.ExpressionChecker.check_overload_call)
+        for dead in ("rust_", "native_idx"):
+            assert dead not in src, f"check_overload_call still carries {dead}"
+
+    def test_no_rust_name_loaded(self) -> None:
+        from mypy.checkexpr import ExpressionChecker
+
+        loaded = [
+            n for n in ExpressionChecker.check_overload_call.__code__.co_names if "rust_" in n
+        ]
+        assert loaded == [], f"check_overload_call still loads {loaded}"
+
+    def test_pyfunction_stays_registered(self) -> None:
+        assert _type_kernel is not None
+        assert hasattr(_type_kernel, "rust_check_overload_call")

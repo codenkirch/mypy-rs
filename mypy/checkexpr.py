@@ -256,7 +256,6 @@ try:
         rust_check_argument_types_plan as _rust_check_argument_types_plan,
         rust_check_callable_call as _rust_check_callable_call,
         rust_check_operator as _rust_check_operator,
-        rust_check_overload_call as _rust_check_overload_call,
         rust_classify_call as _rust_classify_call,
         rust_classify_check_arg as _rust_classify_check_arg,
         rust_classify_check_boolean_op as _rust_classify_check_boolean_op,
@@ -355,7 +354,6 @@ except ImportError:
     _rust_tuple_context_matches = None  # type: ignore[assignment]
     _rust_build_tuple_type = None  # type: ignore[assignment]
     _rust_calibrate_type_obj_return = None  # type: ignore[assignment]
-    _rust_check_overload_call = None  # type: ignore[assignment]
     _rust_dangerous_comparison = None  # type: ignore[assignment]
     _rust_callable_type = None  # type: ignore[assignment]
     _rust_check_argument_types_plan = None  # type: ignore[assignment]
@@ -1279,39 +1277,6 @@ def _try_native_normalize_callable(callee: ProperType) -> bool | None:
         return bytes(rust_bytes) == buf.getvalue()
     except (AssertionError, NotImplementedError, ValueError):
         return None
-
-
-def _typeobj_gate_flag_for_roc(t: CallableType) -> int:
-    """Per-target instantiation-gate flag for the roc overload seam.
-
-    Mirrors the pre-argument gate chain of `check_callable_call`
-    (checkexpr.py:2843-2871) as a scalar fact: a protocol class or an
-    abstract class without `fallback_to_any` emits a fail for the item
-    regardless of the arguments (`Type[...]` riders via `from_type_type`
-    are exempt), so that overload item can never match. Rust arbitrates
-    from these facts alone: 1 = the gates emit a fail (item never
-    matches), 0 = the gates are inapplicable or pass, -1 = a fact is
-    unreadable (the whole call defers, position-identical to the old
-    type-object whole-call defer). The decision-free reads here are the
-    same ones Python's own gate chain performs; nothing is re-decided
-    Rust-side, so a stale or partial type snapshot cannot invert a
-    first-match selection.
-    """
-    try:
-        if not t.is_type_obj():
-            return 0
-        info = t.type_object()
-        from_type_type = t.from_type_type
-        # Protocol and abstract gates pair up as an if/elif chain; either
-        # branch failing means the item is rejected, so one flag is enough
-        # for matching semantics (the message emission stays in Python).
-        if info.is_protocol and not from_type_type:
-            return 1
-        if info.is_abstract and not from_type_type and not info.fallback_to_any:
-            return 1
-        return 0
-    except (AttributeError, AssertionError, TypeError, ValueError):
-        return -1
 
 
 # Type of callback user for checking individual function arguments. See
@@ -4431,53 +4396,6 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
         plausible_targets = self.plausible_overload_call_targets(
             arg_types, arg_kinds, arg_names, callee
         )
-
-        # Native overload dispatch: Rust returns the first-match target index
-        # (generic targets via the constraint-solve kernel). Re-run check_call
-        # on the chosen target; trust only when it adds no new errors.
-        native_idx: int | None = None
-        if (
-            _CHECKEXPR_HAS_TYPE_KERNEL
-            and _native_checkcall_active
-            and _native_checkexpr_resolver is not None
-            and plausible_targets
-            and not any(map(has_any_type, arg_types))
-            and not any(self.real_union(arg) for arg in arg_types)
-        ):
-            try:
-                native_idx = _rust_check_overload_call(
-                    _native_checkexpr_resolver,
-                    [_serialize_type_for_checkexpr(t) for t in plausible_targets],
-                    [_serialize_type_for_checkexpr(t) for t in arg_types],
-                    [k.value for k in arg_kinds],
-                    self.chk.options.strict_optional,
-                    list(arg_names) if arg_names is not None else None,
-                    self.chk.in_checked_function(),
-                    type_state.infer_unions,
-                    [_typeobj_gate_flag_for_roc(t) for t in plausible_targets],
-                )
-            except (AssertionError, NotImplementedError, ValueError, TypeError, IndexError):
-                native_idx = None
-        if native_idx is not None:
-            typ = plausible_targets[native_idx]
-            with self.msg.filter_errors(filter_revealed_type=True) as w:
-                with self.chk.local_type_map as m:
-                    ret_type, infer_type = self.check_call(
-                        callee=typ,
-                        args=args,
-                        arg_kinds=arg_kinds,
-                        arg_names=arg_names,
-                        context=context,
-                        callable_name=callable_name,
-                        object_type=object_type,
-                    )
-            if not w.has_new_errors():
-                self.chk.store_types(m)
-                # Step 3's tail warns on the matched item's definition after
-                # infer_overload_return_type; this early return bypasses it.
-                if isinstance(c := get_proper_type(infer_type), CallableType):
-                    self.chk.warn_deprecated(c.definition, context)
-                return ret_type, infer_type
 
         # Step 2: If the arguments contain a union, we try performing union math first,
         #         instead of picking the first matching overload.

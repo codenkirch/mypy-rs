@@ -2771,6 +2771,11 @@ class NativeOverloadCallSuite(Suite):
     substituted form like a plain target. `None` always means defer;
     Rust never decides no-match or ambiguity.
 
+    The production crossing retired (#1624), so these pins drive the
+    pyfunction directly; the per-target gate facts (#1439) that the
+    retired shim computed Python-side are supplied explicitly as
+    `typeobj_gate_fails` here.
+
     Categories: first-match ordering, per-target rejects, deferral
     shapes (star / typeobj / ParamSpec), direct generic solves,
     per-target type-object instantiation-gate facts (#1439).
@@ -2860,8 +2865,8 @@ class NativeOverloadCallSuite(Suite):
 
     def test_typeobj_gate_fail_skips_to_next_target(self) -> None:
         # A type-object item whose pre-argument instantiation gates fail
-        # (flag 1, shim-side) can never match; first-match steps past it
-        # to the plain target, mirroring Python's rejection step.
+        # (flag 1) can never match; first-match steps past it to the plain
+        # target. The retired shim computed these facts; tests supply them.
         typeobj = self.fx.callable_type(self.fx.a, self.fx.a)
         take_b = self.fx.callable(self.fx.b, self.fx.str_type)
         assert self._call([typeobj, take_b], [self.fx.b], typeobj_gate_fails=[1, 0]) == 1

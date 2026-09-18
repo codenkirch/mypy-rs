@@ -28,6 +28,7 @@ spent effort on seams that were already retired here.
 | #1685, #1669 | `0046062a1`, `618c2b196` | residual scalar-only wire seams |
 | #1664 | `032caceee` | `is_literal_type_like` |
 | #1648 (#1640) | `ad8783e97` | hot short-call reads in `mypy/types.py`: `is_generic`, `has_recursive_types`, truthiness defaults, `is_var_arg`/`is_kw_arg`, min/max args, tuple/union length |
+| #1624 | (this lane) | `rust_expand_type`, `rust_check_overload_call` (defer-arm instruction A/B: -1.66% / -0.47% on the cold self-check) |
 | #1514, #1492 | `530919b65`, `83f0b6706` | wave-61A decidable leftovers; symtable find_member/unpack/apply-report defers |
 
 In flight when this log was written: `rust_fill_typevars` (#1744),
@@ -49,9 +50,16 @@ form is invisible to it.
 The decision rule behind these, measured as min-of-7 ns/call with both arms in
 one process and the FFI ticket spied for engagement: **the wire interface loses
 when the Python body is an O(1)/O(n) rebuild or scan, and wins when the body is
-a recursive visitor.** `rust_expand_type` (0.43-0.61x) is the standing example
-of a port that pays and keeps its interface. Per-seam numbers and the ranked
-remainder are in #1739; `rust_analyze_instance_member_dispatch` (1.10x) and
+a recursive visitor.** That rule was #1624's first casualty: `rust_expand_type`,
+its standing example (0.43-0.61x per call), retired anyway after a load-robust
+end-to-end instruction-count A/B on the cold self-check showed the whole
+crossing (gate + serialize + decode cache) cost 1.66% more retired instructions
+than the pure-Python visitor, microbenchmark notwithstanding. A per-call win
+can still be an end-to-end loss once the Python-side wire prep, the decode
+fixup and the cache rides are counted; #1624's method (defer-arm instruction
+A/B, single-process, interleaved runs) is the tiebreaker for keeps like this.
+Per-seam numbers and the ranked remainder are in #1739;
+`rust_analyze_instance_member_dispatch` (1.10x) and
 `rust_classify_special_unbound` (0.78x on its common shape) measured as
 keeps, not retirements.
 
@@ -61,8 +69,9 @@ reader-visible shapes — re-measured 0.40-0.62x on static, trivial-self and
 generic, all three a loss. The shape that produced 1.10x is unrecorded, so the
 keep is **unresolved rather than established**. Do not retire the seam on the
 different-shape number; the originating harness needs recording or the keep
-re-deriving. `rust_expand_type`'s keep is unaffected: it is documented here as
-a deliberate keep of a port that pays.
+re-deriving. `rust_expand_type`'s keep has since been overturned: it retired in
+#1624 (see the decision-rule paragraph above); the end-to-end measurement, not
+the per-call microbenchmark, is the arbiter.
 
 ### Native-parser parity
 

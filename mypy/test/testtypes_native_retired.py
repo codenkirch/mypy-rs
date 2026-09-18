@@ -659,8 +659,10 @@ class NativeWireRoundTripSeamsRetiredSuite(Suite):
     item swap, 16x for a callable return-type swap, and 26x/14x for
     flatten with nothing / one union row to flatten. Both now run pure
     Python; the Rust pyfunctions stay registered for direct-seam tests.
-    `rust_expand_type` is deliberately untouched: its Python body is a
-    full recursive visitor and the port measured 2.3x faster.
+    `rust_expand_type` has since been retired too (#1624): its microbenchmark
+    verdict (2.3x faster) did not survive the end-to-end instruction-count
+    A/B on the cold self-check, where deferring the seam saved 1.66% of
+    retired instructions.
 
     This suite fails if a wire crossing returns on either path.
     """

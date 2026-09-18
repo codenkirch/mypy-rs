@@ -7166,17 +7166,16 @@ class NativeExpandTypeDefinitionGateSuite(Suite):
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeExpandTypeEmptyEnvSuite(Suite):
-    """Parity for the Rust `expand_type` empty-env fast path.
+    """Direct-seam tests for the Rust `expand_type` empty-env fast path.
 
-    `expand_type(typ, {})` performs no substitution. The seam used to bail
-    on ANY empty env (expandtype.rs returned None inside rust_expand_type),
-    forcing a pure-Python rebuild even for typevar-free types. Now an empty
-    env is wire-portable: `expand_type_with_env` rebuilds the tree and
-    returns leftover TypeVars instead of deferring; the shim re-links the
-    decoded vars to the live originals (`resync_var_identities`), so the
-    caller keeps object identity. This suite locks the differential: a
-    typevar-free type must engage natively and gate-on == gate-off for
-    both typevar-free and typevar-bearing input.
+    `expand_type(typ, {})` performs no substitution. The Rust kernel used
+    to bail on ANY empty env (expandtype.rs returned None inside
+    rust_expand_type); an empty env is wire-portable, and
+    `expand_type_with_env` rebuilds the tree and returns leftover TypeVars
+    instead of deferring, with the decoded vars re-linkable to the live
+    originals (`resync_var_identities`). The production crossing retired
+    (#1624), so the value pins below run the pure-Python `expand_type`
+    both arms and the engagement pins drive the pyfunction directly.
     """
 
     def setUp(self) -> None:
@@ -7231,8 +7230,9 @@ class NativeExpandTypeEmptyEnvSuite(Suite):
         assert_equal(on, off, f"expand_type(empty env) parity {typ}")
 
     def test_seam_engages_typevar_free(self) -> None:
-        # G[A] with an empty env has no TypeVar to substitute; the seam must
-        # engage (return bytes) and produce a rebuilt G[A].
+        # G[A] with an empty env has no TypeVar to substitute; the Rust
+        # pyfunction must still answer (return bytes) with a rebuilt G[A]
+        # for the direct seam (production no longer calls it, #1624).
         from mypy.expandtype import _serialize_env, _serialize_type
 
         result = _type_kernel.rust_expand_type(
@@ -7241,13 +7241,14 @@ class NativeExpandTypeEmptyEnvSuite(Suite):
         assert result is not None, "empty-env typevar-free expand_type did not engage"
 
     def test_typevar_free_parity(self) -> None:
-        # G[A] (no typevars): native rebuild must equal Python rebuild.
+        # G[A] (no typevars): the pure-Python rebuild is the only path
+        # now; the toggle must not change the answer.
         self._assert_par(self.fx.ga)
 
     def test_typevar_result_relinks_identity(self) -> None:
-        # G[T] with an empty env leaves T unmatched. The seam returns the
-        # expansion with the leftover T; the shim re-links every decoded T
-        # occurrence to the live original (identity parity, gate-on == off).
+        # G[T] with an empty env leaves T unmatched. The direct seam
+        # proves the Rust result carries the leftover T; the pure-Python
+        # visitor keeps the live T by identity (gate-on == gate-off).
         from mypy.expandtype import _serialize_env, _serialize_type
 
         result = _type_kernel.rust_expand_type(
@@ -7266,15 +7267,16 @@ class NativeExpandTypeEmptyEnvSuite(Suite):
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeExpandTypeAliasSuite(Suite):
-    """Parity for the Rust `expand_type` alias-arg handling (#1195).
+    """Direct-seam tests for the Rust `expand_type` alias-arg handling (#1195).
 
-    The seam used to defer every alias-bearing input (the alias_entry
-    guard) and any result still carrying a TypeAliasType. Alias args now
-    expand natively (mirroring visit_type_alias_type) and the Python shim
-    re-links wire-decoded alias nodes to live TypeAlias nodes via
-    fixup_wire_type(resolve_aliases=True); a decoded alias missing from
-    the per-build alias map defers to the pure-Python body, and parity
-    holds either way.
+    The Rust kernel used to defer every alias-bearing input (the
+    alias_entry guard) and any result still carrying a TypeAliasType;
+    alias args now expand (mirroring visit_type_alias_type) and decoded
+    alias nodes re-link to live TypeAlias nodes via
+    fixup_wire_type(resolve_aliases=True). The production crossing
+    retired (#1624), so the differential below is the pure-Python
+    `expand_type` on both arms; the engagement pins drive the pyfunction
+    directly.
     """
 
     def setUp(self) -> None:
@@ -7382,9 +7384,9 @@ class NativeExpandTypeAliasSuite(Suite):
         self._assert_par(Instance(self.fx.gi, [alias_int]))
 
     def test_missing_alias_map_defers_to_python(self) -> None:
-        # Without a wire alias map the fixup cannot re-link the decoded
-        # alias; the shim must fall back to the pure-Python body and both
-        # gates still agree.
+        # Without a wire alias map the old fixup could not re-link the
+        # decoded alias, so the shim deferred to pure Python; with the
+        # crossing retired that body is the only path either way.
         from mypy.wirefixup import set_wire_alias_map
 
         alias_t = TypeAliasType(self.alias, [self.fx.t])
@@ -7454,17 +7456,19 @@ class NativeExpandTypeAliasSuite(Suite):
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeExpandParamSpecSpliceSuite(Suite):
-    """Parity for the Rust `expand_type` ParamSpec splice (wave29 #1343).
+    """Direct-seam tests for the Rust `expand_type` ParamSpec splice (wave29 #1343).
 
     `visit_callable_type`'s Concatenate splice (expandtype.py:1149-1195)
-    and `visit_param_spec` (:963-996) run natively when the env maps the
-    ParamSpec to a Parameters and no ParamSpecType occurs in the result.
-    Shapes the port defers (a fresh meta substitute keyed only at a
-    nonzero meta level, an unpack it cannot normalize, an ARGS/KWARGS
-    leaf with a Parameters replacement, and any splice or leaf result
-    that embeds a ParamSpecType -- the wire drops meta_level, so a
-    fresh origin would round-trip at meta level 0) fall back to the
-    pure Python body, so gate-on == gate-off everywhere.
+    and `visit_param_spec` (:963-996) splice natively in the kernel when
+    the env maps the ParamSpec to a Parameters and no ParamSpecType occurs
+    in the result. Shapes the port defers (a fresh meta substitute keyed
+    only at a nonzero meta level, an unpack it cannot normalize, an
+    ARGS/KWARGS leaf with a Parameters replacement, and any splice or
+    leaf result that embeds a ParamSpecType -- the wire drops meta_level,
+    so a fresh origin would round-trip at meta level 0) defer to the
+    pure-Python body. The production crossing retired (#1624), so the
+    `_assert_par` arms both run the pure-Python `expand_type`; engagement
+    is pinned through the direct `_engaged` seam helper.
     """
 
     def setUp(self) -> None:

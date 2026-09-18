@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import copy
 from collections.abc import Iterable, Mapping
 from typing import Any, Final, TypeVar, cast, overload
 
@@ -55,22 +54,16 @@ import mypy.type_visitor  # ruff: isort: skip
 # is_subtype(), meet_types(), join_types() etc.
 # TODO: add a static dependency test for this.
 
-# Stage 3c type-kernel seam: when type_kernel is importable and a resolver
-# is installed, expand_type routes through Rust. Rust returns None for any
-# type it does not handle, in which case we fall back to the pure-Python
+# Stage 3c type-kernel seams: expand_type_by_instance, the freshen pair and
+# remove_trivial route through Rust when a resolver is installed; Rust returns
+# None for what it cannot handle. `expand_type` itself is pure Python (#1624).
 
-# visitor. This is the strangler-fig per-call gate.
-
-
-# wire-bytes -> decoded+fixed Type cache for the expand_type seam
-# (74K calls, ~98% repeat). Copy-on-hit: callers apply per-call
-# line/column. Cleared per build + on real typeinfo map replacement.
-_expand_type_decode_cache: dict[bytes, Type] = {}
+# wire-bytes -> decoded Type list cache for the remove_trivial seam.
+# Cleared per build + on real typeinfo map replacement.
 _expand_remove_trivial_cache: dict[bytes, list[Type]] = {}
 
 
 def _clear_expand_decode_cache() -> None:
-    _expand_type_decode_cache.clear()
     _expand_remove_trivial_cache.clear()
 
 
@@ -81,8 +74,8 @@ def _needs_python(typ: Type, *, definition_gate: bool = True) -> bool:
     via ``_resync_definitions`` pass ``definition_gate=False``: the
     instance-args precheck of ``expand_type_by_instance`` and
     ``freshen_all_functions_type_vars``. The other expand-family gates
-    (``expand_type`` and ``expand_type_by_instance``'s top-level check)
-    keep the flag on: their decoded trees re-enter error reporting as
+    (``expand_type_by_instance``'s top-level check) keep the flag on: their
+    decoded trees re-enter error reporting as
     plugin contexts, where nested wire-decoded types carry no locations
     (functools partial, #1220 scope note). Callers without a re-stamp
     path (env values, remove_trivial) also keep the gate.
@@ -134,86 +127,6 @@ def _needs_python(typ: Type, *, definition_gate: bool = True) -> bool:
         elif isinstance(p, TypeType):
             stack.append(p.item)
     return False
-
-
-def _contains_alias_raw(t: Type) -> bool:
-    """True if any node in the raw type tree is a TypeAliasType.
-
-    Unlike ``_needs_python`` (which walks ``get_proper_type`` and so hides
-    non-recursive aliases behind their expansion), this walks the raw tree,
-    mirroring the Rust ``result_contains_typealias`` scan.
-    """
-    stack: list[Type] = [t]
-    visited: set[int] = set()
-    while stack:
-        typ = stack.pop()
-        if id(typ) in visited:
-            continue
-        visited.add(id(typ))
-        if isinstance(typ, TypeAliasType):
-            return True
-        # Deliberate raw-tree walk (no get_proper_type expansion): detect the
-        # literal alias nodes the substitution would round-trip through wire.
-        if isinstance(typ, Instance):  # type: ignore[misc]
-            stack.extend(typ.args)
-        elif isinstance(typ, CallableType):  # type: ignore[misc]
-            stack.append(typ.ret_type)
-            stack.extend(typ.arg_types)
-            for v in typ.variables:
-                stack.append(v.upper_bound)
-                stack.append(v.default)
-        elif isinstance(typ, UnionType):  # type: ignore[misc]
-            stack.extend(typ.items)
-        elif isinstance(typ, TupleType):  # type: ignore[misc]
-            stack.extend(typ.items)
-        elif isinstance(typ, TypeType):  # type: ignore[misc]
-            stack.append(typ.item)
-        elif isinstance(typ, UnpackType):
-            stack.append(typ.type)
-    return False
-
-
-def _env_substitutes_unsafe(typ: Type, env: Mapping[TypeVarId, Type]) -> bool:
-    """True if substituting `env` into `typ` would introduce an unsafe node.
-
-    Only the env entries for typevars actually referenced by `typ` are
-    substituted by expand_type, so only those values can lose a definition
-    or alias on a kernel round-trip. Walking just those bounds the cost to
-    the substituted subset, keeping large unrelated envs (e.g. big dict
-    literals) on the fast kernel path.
-    """
-    used: set[tuple[int, str]] = set()
-    stack: list[Type] = [typ]
-    visited: set[int] = set()
-    while stack:
-        t = stack.pop()
-        p = get_proper_type(t)
-        if id(p) in visited:
-            continue
-        visited.add(id(p))
-        if isinstance(p, TypeVarType):
-            used.add((p.id.raw_id, p.id.namespace))
-        elif isinstance(p, Instance):
-            stack.extend(p.args)
-        elif isinstance(p, CallableType):
-            for v in p.variables:
-                used.add((v.id.raw_id, v.id.namespace))
-            stack.append(p.ret_type)
-            stack.extend(p.arg_types)
-        elif isinstance(p, UnionType):
-            stack.extend(p.items)
-        elif isinstance(p, TupleType):
-            stack.extend(p.items)
-        elif isinstance(p, TypeType):
-            stack.append(p.item)
-    return any(
-        (v.raw_id, v.namespace) in used
-        # Env values carrying a TypeAliasType stay on the Python path: the
-        # substituted value would round-trip the wire as a decoded alias
-        # node; keeping the original live node by identity is safer.
-        and (_needs_python(t) or _contains_alias_raw(t))
-        for v, t in env.items()
-    )
 
 
 try:
@@ -314,6 +227,9 @@ def _serialize_env(env: Mapping[TypeVarId, Type]) -> bytes:
     Layout: count (bare int) + pairs of (TypeVarId raw_id bare int +
     TypeVarId meta_level bare int + TypeVarId namespace tagged str +
     Type blob). Mirrors the Rust `decode_env` reader in expandtype.rs.
+    Production no longer crosses (#1624); the direct-seam tests in
+    `testtypes_native_engagement_types.py` use it to drive the
+    `rust_expand_type` pyfunction.
     """
     buf = _WriteBuffer()
     _write_int_bare(buf, len(env))
@@ -341,100 +257,9 @@ def expand_type(typ: Type, env: Mapping[TypeVarId, Type]) -> Type:
     """Substitute any type variable references in a type given by a type
     environment.
     """
-    # Stage 3c type-kernel seam: try the Rust expand_type path. Rust
-    # returns None for unsupported cases (ParamSpec, TypeAliasType, etc.),
-    # so we then fall through to the pure-Python visitor (strangler-fig).
-    if (
-        _HAS_TYPE_KERNEL
-        and _native_expand_type_active
-        and _native_expand_type_resolver is not None
-        and not _needs_python(typ)
-        and not _env_substitutes_unsafe(typ, env)
-    ):
-        try:
-            result = _type_kernel.rust_expand_type(
-                _native_expand_type_resolver,
-                _serialize_type(typ),
-                _serialize_env(env),
-                state.strict_optional,
-            )
-            if result is not None:
-                raw = bytes(result)
-                cached = _expand_type_decode_cache.get(raw)
-                if cached is not None and isinstance(cached, ProperType):
-                    from mypy.wirefixup import resync_var_identities
-
-                    # Shallow copy: callers mutate top-level line/column;
-                    # identical blobs must not cross-contaminate sites
-                    # applying different locations.
-                    fixed = copy.copy(cached)
-                    fixed.line = typ.line
-                    fixed.column = typ.column
-                    if isinstance(fixed, CallableType):
-                        fixed.fallback.line = fixed.line
-                    relinked = resync_var_identities(typ, fixed, list(env.values()))
-                    if relinked is not None:
-                        fixed = _resync_definitions(typ, relinked)
-                        if fixed is not None:
-                            return fixed
-                else:
-                    decoded = read_type(_ReadBuffer(raw))
-                    from mypy.wirefixup import (
-                        canonicalize_fresh_vars_reported,
-                        fixup_wire_type,
-                        resync_var_identities,
-                    )
-
-                    # resolve_aliases=True re-links wire-decoded TypeAliasType
-                    # nodes to live TypeAlias nodes; an alias missing from the
-                    # per-build map defers (None) to the pure-Python body.
-                    fixed = fixup_wire_type(decoded, resolve_aliases=True)
-                    # The wire format does not carry line/column; decoded
-                    # types default to line -1. Preserve the input type's
-                    # location so derived contexts (e.g. plugin
-
-                    # default_return_type) report errors at the call site
-                    # instead of a phantom line 0/-1.
-                    if fixed is not None and isinstance(fixed, ProperType):
-                        fixed.line = typ.line
-                        fixed.column = typ.column
-                        if isinstance(fixed, CallableType):
-                            fixed.fallback.line = fixed.line
-                    # Clear the process-global primitive decode singletons after
-                    # a read so NOT_READY Instances cannot leak into later builds
-                    # (read_type lazily fills instance_cache with
-
-                    # Instance(NOT_READY, []) singletons for str/int/bool/etc).
-                    from mypy.types import instance_cache
-
-                    instance_cache.int_type = None
-                    instance_cache.str_type = None
-                    instance_cache.bool_type = None
-                    instance_cache.object_type = None
-                    instance_cache.function_type = None
-                    if fixed is not None:
-                        # The wire round-trip splits fresh meta-var occurrences
-                        # into distinct objects: re-unify them before a downstream
-                        # in-place freeze, and keep those trees out of the cache.
-                        fixed, has_fresh = canonicalize_fresh_vars_reported(fixed)
-                        if not has_fresh:
-                            # Cache the definition-less decoded shape; each
-                            # call re-stamps definitions from its own input
-                            # type (see the cached branch above).
-                            _expand_type_decode_cache[raw] = fixed
-                        # The wire round-trip also splits TypeVar identity:
-                        # re-link structurally-equal decoded vars to the
-                        # originals from typ/env values; unmatched defers.
-                        relinked = resync_var_identities(typ, fixed, list(env.values()))
-                        if relinked is not None:
-                            fixed = _resync_definitions(typ, relinked)
-                            if fixed is not None:
-                                return fixed
-        except (NotImplementedError, AssertionError):
-            # AssertionError: TypeInfo not yet fixed during semanal.
-            # NotImplementedError: unserializable variant.
-            # Both defer to Python.
-            pass
+    # The Rust seam retired in #1624: a load-robust instruction-count A/B on
+    # the cold self-check showed the wire crossing (gate + serialize + decode)
+    # cost 1.66% more instructions than this pure-Python visitor.
     return typ.accept(ExpandTypeVisitor(env))
 
 
@@ -758,7 +583,7 @@ def freshen_function_type_vars(callee: F) -> F:
                             fixed.fallback.line = fixed.line
                     # Clear the process-global primitive decode singletons
                     # after a read so NOT_READY Instances cannot leak into
-                    # later builds (see expand_type).
+                    # later builds (primitive singletons are process-global).
                     from mypy.types import instance_cache
 
                     instance_cache.int_type = None
@@ -865,7 +690,7 @@ def freshen_all_functions_type_vars(t: T) -> T:
                             if isinstance(fixed, CallableType):
                                 fixed.fallback.line = fixed.line
                         # Clear the process-global primitive decode
-                        # singletons after a read (see expand_type).
+                        # singletons after a read.
                         from mypy.types import instance_cache
 
                         instance_cache.int_type = None
@@ -1402,7 +1227,7 @@ def remove_trivial(types: Iterable[Type]) -> list[Type]:
                 decoded = read_type_list(_ReadBuffer(raw))
                 # Clear the process-global primitive decode singletons
                 # after a read so NOT_READY Instances cannot leak into
-                # later builds (see expand_type).
+                # later builds (primitive singletons are process-global).
                 from mypy.types import instance_cache
 
                 instance_cache.int_type = None

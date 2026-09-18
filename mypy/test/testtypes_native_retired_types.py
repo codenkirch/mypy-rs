@@ -24,10 +24,11 @@ import mypy.nodes as _nodes_mod
 import mypy.types as _types_mod
 from mypy.nodes import Block, FuncDef
 from mypy.test.helpers import Suite
-from mypy.test.testtypes import _NATIVE_WIRE_ENABLED
+from mypy.test.testtypes import _NATIVE_WIRE_ENABLED, _is_type_info
 from mypy.test.typefixture import TypeFixture
 from mypy.types import (
     CallableType,
+    Instance,
     TupleType,
     Type,
     UnpackType,
@@ -208,3 +209,115 @@ class NativeFuncItemIsDynamicRetiredSuite(Suite):
     def test_pyfunction_stays_registered(self) -> None:
         assert hasattr(_type_kernel, "rust_func_item_is_dynamic")
         assert hasattr(_type_kernel, "rust_decorator_is_dynamic")
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeExpandTypeRetiredSuite(Suite):
+    """Pin the #1624 retirement of the `rust_expand_type` shim.
+
+    The seam was the standing microbenchmark keep (the Rust port measured
+    2.3x the Python visitor per call), but a load-robust instruction-count
+    A/B on the cold self-check (`/usr/bin/time -l` instructions retired,
+    single-process, 3+2 interleaved runs) falsified that verdict end to
+    end: wrapping the seam's Python binding in a no-op (the pure-Python
+    path plus the Python-side gate and wire prep that still run) saved
+    8.1e9 of the 487.6e9 baseline instructions (-1.66%). A true retire
+    also drops the gate and serialization, so the retire gain is at least
+    the measured delta. `expand_type` now runs its pure-Python visitor;
+    the Rust pyfunction stays registered for the direct-seam tests in
+    `NativeExpandTypeEmptyEnvSuite` / `NativeExpandTypeAliasSuite` /
+    `NativeExpandParamSpecSpliceSuite`. The sibling
+    `rust_expand_type_by_instance` seam is untouched and stays live.
+    """
+
+    def setUp(self) -> None:
+        from mypy.expandtype import (
+            _set_native_expand_type_active,
+            _set_native_expand_type_resolver,
+            _set_native_expand_type_typeinfo_map,
+        )
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        self.fx = TypeFixture()
+        self._set_active = _set_native_expand_type_active
+        self._set_resolver = _set_native_expand_type_resolver
+        type_infos = [v for v in vars(self.fx).values() if _is_type_info(v)]
+        self._resolver = _type_kernel.build_native_resolver(type_infos, [])
+        self._set_resolver(self._resolver)
+        self._set_active(True)
+        _set_native_expand_type_typeinfo_map({i.fullname: i for i in type_infos})
+        set_wire_typeinfo_map({i.fullname: i for i in type_infos})
+
+    def tearDown(self) -> None:
+        from mypy.expandtype import _set_native_expand_type_typeinfo_map
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        self._set_active(False)
+        self._set_resolver(None)
+        _set_native_expand_type_typeinfo_map(None)
+        set_wire_typeinfo_map(None)
+
+    def _gate_shapes(self) -> list[tuple[str, Any, Any]]:
+        """(expected render, typ, env) for the shapes the retired gate served."""
+        return [
+            ("G[A]", self.fx.ga, {}),
+            ("G[T]", self.fx.gt, {}),
+            ("G[A]", self.fx.gt, {self.fx.t.id: self.fx.a}),
+            ("G[A]", Instance(self.fx.gi, [self.fx.a]), {self.fx.t.id: self.fx.b}),
+            ("def (B) -> A", self.fx.callable(self.fx.t, self.fx.a), {self.fx.t.id: self.fx.b}),
+        ]
+
+    def test_shim_helpers_and_source_removed(self) -> None:
+        import mypy.expandtype as expandtype
+
+        for gone in (
+            "_env_substitutes_unsafe",
+            "_contains_alias_raw",
+            "_expand_type_decode_cache",
+        ):
+            assert not hasattr(expandtype, gone), f"{gone} should be retired"
+        src = inspect.getsource(expandtype.expand_type)
+        assert "rust_" not in src, "expand_type should be pure Python"
+
+    def test_no_rust_name_loaded_with_gate_on(self) -> None:
+        from mypy.expandtype import expand_type
+
+        loaded = [n for n in expand_type.__code__.co_names if "rust_" in n]
+        assert loaded == [], f"expand_type still loads {loaded}"
+
+    def test_no_wire_serialization_on_the_gate_shapes(self) -> None:
+        import mypy.expandtype as expandtype
+        from mypy.expandtype import expand_type
+
+        calls: list[str] = []
+        orig_type = expandtype._serialize_type
+        orig_env = expandtype._serialize_env
+
+        def spy_type(t: Any) -> bytes:
+            calls.append("type")
+            return orig_type(t)
+
+        def spy_env(env: Any) -> bytes:
+            calls.append("env")
+            return orig_env(env)
+
+        expandtype._serialize_type = spy_type
+        expandtype._serialize_env = spy_env
+        try:
+            for _expected, typ, env in self._gate_shapes():
+                expand_type(typ, env)
+        finally:
+            expandtype._serialize_type = orig_type
+            expandtype._serialize_env = orig_env
+        assert calls == [], f"retired expand_type seam serialized: {calls}"
+
+    def test_values_on_the_gate_shapes(self) -> None:
+        from mypy.expandtype import expand_type
+
+        for expected, typ, env in self._gate_shapes():
+            got = str(expand_type(typ, env))
+            assert got == expected, f"expand_type({typ}) diverged: {got!r} != {expected!r}"
+
+    def test_pyfunction_stays_registered(self) -> None:
+        assert _type_kernel is not None
+        assert hasattr(_type_kernel, "rust_expand_type")

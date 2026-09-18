@@ -1151,7 +1151,8 @@ class InferFunctionTypeArgumentsParitySuite(Suite):
 
     def setUp(self) -> None:
         # Install a native resolver over the fixture type graph so the
-        # expand_type and solve_one leaves route through the Rust kernel.
+        # freshen and solve_one leaves route through the Rust kernel
+        # (`expand_type` itself is pure Python since #1624).
         import type_kernel
 
         from mypy.wirefixup import set_wire_typeinfo_map
