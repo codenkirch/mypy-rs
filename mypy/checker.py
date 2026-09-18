@@ -79,7 +79,14 @@ from typing import (
 )
 
 import mypy.checkexpr
-from mypy import errorcodes as codes, join, message_registry, nodes, operators
+from mypy import (
+    checker_driver as _checker_driver,
+    errorcodes as codes,
+    join,
+    message_registry,
+    nodes,
+    operators,
+)
 from mypy.binder import ConditionalTypeBinder, Frame, get_declaration
 from mypy.checker_shared import CheckerScope, TypeCheckerSharedApi, TypeRange
 from mypy.checker_state import checker_state
@@ -684,6 +691,11 @@ NATIVE_CA_BRANCH_SIMPLE = 3
 _native_checker_active: bool = False
 _native_checker_types_active: bool = False
 _native_checker_stmts_active: bool = False
+
+# Phase H1 (#1861): arm the Python-side driver counters only when
+# `MYPY_TK_H1_STATS` is set, so production pays one boolean test per
+# statement; the Rust driver counts the same events in checker_driver.rs.
+_H1_STATS: bool = _checker_driver.stats_enabled()
 
 
 def _set_native_checker_active(active: bool) -> None:
@@ -1622,6 +1634,8 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
 
     def accept(self, stmt: Statement) -> None:
         """Type check a node in the given type context."""
+        if _H1_STATS:
+            _checker_driver.record_statements_dispatched()
         try:
             stmt.accept(self)
         except Exception as err:
@@ -4668,6 +4682,8 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
             return
         marked_unreachable = False
         for s in b.body:
+            if _H1_STATS:
+                _checker_driver.record_visit_block_iterations()
             if self.binder.is_unreachable():
                 if self.scope.top_level_function() is None and not marked_unreachable:
                     self.mark_unreachable(b.body, after=s)

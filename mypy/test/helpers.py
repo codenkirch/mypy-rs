@@ -394,6 +394,7 @@ _NATIVE_ENV_MODULE_PROBES = {
     "TEST_NATIVE_AST_MIRROR_READ": ("type_kernel", "rust_aststrip_process_lvalue"),
     "TEST_NATIVE_AST_MIRROR_STMT_READ": ("type_kernel", "rust_node_mirror_stmt_read_mode"),
     "TEST_NATIVE_AST_MIRROR_VAR_KEY": ("type_kernel", "rust_node_mirror_var_key_mode"),
+    "TEST_NATIVE_CHECKER_TRAVERSAL": ("type_kernel", "rust_checker_driver_mode"),
 }
 
 
@@ -498,6 +499,9 @@ def parse_options(
     # contract (unset env = off; the self-check exercises the
     # default-on path).
     options.native_ast_mirror_var_key = _env_gate("TEST_NATIVE_AST_MIRROR_VAR_KEY")
+    # Phase H1 (#1861) checker-traversal driver gate: unset env = off (the
+    # Python loops stay in charge); the daemon path bails regardless.
+    options.native_checker_traversal = _env_gate("TEST_NATIVE_CHECKER_TRAVERSAL")
     # Phase G3.0a (#1581) namespace shadow is capture-only for the same
     # reason: the option installs the SymbolTable class hooks only.
     options.native_symtable_mirror = _env_gate("TEST_NATIVE_SYMTABLE_MIRROR")

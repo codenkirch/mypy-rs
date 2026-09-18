@@ -457,6 +457,10 @@ class Options:
         # Rust mirrors reachability flags for O(1) is_unreachable;
         # type-merging stays Python. Not in OPTIONS_AFFECTING_CACHE.
         self.native_binder = False
+        # Phase H1 (#1861): opt-in Rust checker-traversal driver and binder
+        # join; no per-call fallback, so default-off with a cross-run
+        # differential. Not in OPTIONS_AFFECTING_CACHE.
+        self.native_checker_traversal = False
         # Some behaviors are changed when using Bazel (https://bazel.build).
         self.bazel = False
         # If True, export inferred types for all expressions as BuildResult.types

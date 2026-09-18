@@ -56,6 +56,7 @@ mod cache;
 mod callable_compat;
 mod checkcall;
 mod checkcall_typeobj;
+mod checker_driver;
 mod checker_functions;
 mod checker_helpers;
 mod checker_stmts;
@@ -285,6 +286,7 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
     overload_never::register_registry(module)?;
     overlap_unsafe::register_registry(module)?;
     overload_override::register_registry(module)?;
+    checker_driver::register_registry(module)?;
     checker_functions::register_registry(module)?;
     type_range::register_registry(module)?;
     supported_self_type::register_registry(module)?;

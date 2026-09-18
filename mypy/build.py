@@ -485,6 +485,13 @@ def build(
             from mypy import nodes_mirror
 
             nodes_mirror.var_key_sessionfinish_dump()
+        # H1 (#1861): the checker-driver evidence of this session, same
+        # contract. Reports both the Python-side and Rust-side counters so
+        # the cross-run differential compares like with like.
+        if os.environ.get("MYPY_TK_H1_SESSIONFINISH_OUT"):
+            from mypy import checker_driver
+
+            checker_driver.sessionfinish_dump()
 
 
 def build_inner(
@@ -1435,6 +1442,12 @@ class BuildManager:
         nodes_mirror.set_production_var_key_flip(
             capture_active and self.options.native_ast_mirror_var_key
         )
+        # Phase H1 (#1861): the checker-traversal driver gate. Set on every
+        # manager, the off case included, so no later run inherits a stale
+        # mode. The driver is independent of the node shadow.
+        from mypy import checker_driver
+
+        checker_driver.set_production_checker_traversal(self.options.native_checker_traversal)
         # Phase G1.2 (#1674): the aststrip read flip is a differential gate on
         # the same shadow. Written on every manager, including the off
         # case, so no later run inherits a stale True.
