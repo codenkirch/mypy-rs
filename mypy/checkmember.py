@@ -83,6 +83,7 @@ from mypy.types import (
     _serialize_stats_on,
     _serialize_with_taint_check,
     _type_wire_cache,
+    _type_wire_cache_hit,
     _wire_cache_enabled,
     get_proper_type,
     instance_cache,
@@ -231,11 +232,11 @@ def _serialize_type_for_checkmember(t: Type) -> bytes:
         _serialize_stats["calls"] += 1
     key = id(t)
     if _wire_cache_enabled():
-        entry = _type_wire_cache.get(key)
-        if entry is not None and entry[0] is t:
+        cached = _type_wire_cache_hit(key, t)
+        if cached is not None:
             if _serialize_stats_on:
                 _serialize_stats["hits"] += 1
-            return entry[1]
+            return cached
     if type(t) is Instance:
         fn = t.type.fullname
         if (
@@ -253,7 +254,7 @@ def _serialize_type_for_checkmember(t: Type) -> bytes:
             if _serialize_stats_on:
                 _serialize_stats["writes"] += 1
                 _serialize_stats["bytes"] += len(fast)
-            _type_wire_cache[key] = (t, fast)
+            _type_wire_cache[key] = (t, fast, None)
         return fast
     # Phase F2 (#1393, slice 2): mirror-blob read on the expensive miss path,
     # same seam contract as the checkexpr funnel.
@@ -263,15 +264,15 @@ def _serialize_type_for_checkmember(t: Type) -> bytes:
             _serialize_stats["mirror"] += 1
         return blob
     buf = _CheckMemberWriteBuffer()
-    result, saw_tvar = _serialize_with_taint_check(t, buf)
-    if saw_tvar:
+    result, fp = _serialize_with_taint_check(t, buf)
+    if fp is not None:
         if _serialize_stats_on:
             _serialize_stats["tvar"] += 1
-    elif _wire_cache_enabled() and (not isinstance(t, Instance) or t.type_ref is None):  # type: ignore[misc]
+    if _wire_cache_enabled() and (not isinstance(t, Instance) or t.type_ref is None):  # type: ignore[misc]
         if _serialize_stats_on:
             _serialize_stats["writes"] += 1
             _serialize_stats["bytes"] += len(result)
-        _type_wire_cache[key] = (t, result)
+        _type_wire_cache[key] = (t, result, fp)
     return result
 
 

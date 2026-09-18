@@ -39,6 +39,7 @@ from mypy.types import (
     UnpackType,
     _serialize_with_taint_check,
     _type_wire_cache,
+    _type_wire_cache_hit,
     _wire_cache_enabled,
     flatten_nested_unions,
     get_proper_type,
@@ -202,9 +203,9 @@ def _serialize_type(t: Type) -> bytes:
     """Serialize a `Type` to its wire-format bytes for the Rust reader."""
     key = id(t)
     if _wire_cache_enabled():
-        entry = _type_wire_cache.get(key)
-        if entry is not None and entry[0] is t:
-            return entry[1]
+        cached = _type_wire_cache_hit(key, t)
+        if cached is not None:
+            return cached
     if type(t) is Instance:
         fn = t.type.fullname
         if (
@@ -215,9 +216,9 @@ def _serialize_type(t: Type) -> bytes:
         ):
             return _BUILTIN_INSTANCE_BYTES[fn]
     buf = _WriteBuffer()
-    result, saw_tvar = _serialize_with_taint_check(t, buf)
-    if not saw_tvar and _wire_cache_enabled() and (type(t) is not Instance or t.type_ref is None):
-        _type_wire_cache[key] = (t, result)
+    result, fp = _serialize_with_taint_check(t, buf)
+    if _wire_cache_enabled() and (type(t) is not Instance or t.type_ref is None):
+        _type_wire_cache[key] = (t, result, fp)
     return result
 
 

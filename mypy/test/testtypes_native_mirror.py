@@ -2188,6 +2188,145 @@ class NativeMirrorHiddenParentSuite(Suite):
 
 
 @skipUnless(_HAS_TYPE_KERNEL, "requires the type_kernel extension")
+class WireCacheTvarFingerprintSuite(Suite):
+    """Unit tests for the tvar meta-fingerprint of the wire-byte cache.
+
+    A tvar-containing type is stored with a fingerprint of every
+    (node, TypeVarId, meta_level) its serialization walk touched; every
+    hit re-validates the fingerprint, so in-place meta_level writes and
+    `.id` rebinds downgrade the entry to a miss and re-walk instead of
+    serving stale bytes. The write_type_map fix is load-bearing: without
+    it a tvar inside TypedDict items or ExtraAttrs attrs escapes the
+    fingerprint entirely.
+    """
+
+    def setUp(self) -> None:
+        from mypy.types import _clear_type_wire_cache, _set_type_wire_cache_enabled
+
+        _clear_type_wire_cache()
+        _set_type_wire_cache_enabled(True)
+        self.fx = TypeFixture()
+
+    def tearDown(self) -> None:
+        from mypy.types import _clear_type_wire_cache, _set_type_wire_cache_enabled
+
+        _set_type_wire_cache_enabled(False)
+        _clear_type_wire_cache()
+
+    def _tvar_callable(self) -> CallableType:
+        return CallableType([self.fx.t], [ARG_POS], [None], self.fx.o, self.fx.function, name="f")
+
+    def test_tvar_composite_stored_with_fingerprint_then_hit(self) -> None:
+        from mypy.checkexpr import _serialize_type_for_checkexpr
+        from mypy.types import _type_wire_cache
+
+        c = self._tvar_callable()
+        first = _serialize_type_for_checkexpr(c)
+        fp = _type_wire_cache[id(c)][2]
+        assert fp is not None, "tvar composite must store a fingerprint"
+        assert (self.fx.t, self.fx.t.id, 0) in fp, fp
+        second = _serialize_type_for_checkexpr(c)
+        assert second is first, "unchanged fingerprint must serve the cached blob"
+
+    def test_meta_level_mutation_rewalks_and_restores(self) -> None:
+        from mypy.checkexpr import _serialize_type_for_checkexpr
+        from mypy.types import _type_wire_cache
+
+        c = self._tvar_callable()
+        stale = _serialize_type_for_checkexpr(c)
+        self.fx.t.id.meta_level = 1
+        fresh = _serialize_type_for_checkexpr(c)
+        assert fresh != stale, "mutated meta_level must not serve stale bytes"
+        entry = _type_wire_cache[id(c)]
+        assert entry[1] is fresh
+        fp = entry[2]
+        assert fp is not None, "re-walk must re-store with a fingerprint"
+        assert (self.fx.t, self.fx.t.id, 1) in fp, fp
+
+    def test_id_rebind_rewalks(self) -> None:
+        from mypy.checkexpr import _serialize_type_for_checkexpr
+        from mypy.types import _type_wire_cache
+
+        c = self._tvar_callable()
+        stale = _serialize_type_for_checkexpr(c)
+        self.fx.t.id = TypeVarId(42, 0, namespace="mod.C")
+        fresh = _serialize_type_for_checkexpr(c)
+        assert fresh != stale, "a rebound .id must not serve stale bytes"
+        assert _type_wire_cache[id(c)][1] is fresh
+
+    def test_tvar_free_type_stores_none_fingerprint(self) -> None:
+        from mypy.checkexpr import _serialize_type_for_checkexpr
+        from mypy.types import _type_wire_cache
+
+        c = CallableType([self.fx.o], [ARG_POS], [None], self.fx.o, self.fx.function, name="g")
+        _serialize_type_for_checkexpr(c)
+        assert _type_wire_cache[id(c)][2] is None
+
+    def test_typeddict_tvar_in_items_is_fingerprinted(self) -> None:
+        from mypy.checkexpr import _serialize_type_for_checkexpr
+        from mypy.types import TypedDictType, _type_wire_cache
+
+        td = TypedDictType({"x": self.fx.t}, {"x"}, set(), self.fx.a)
+        _serialize_type_for_checkexpr(td)
+        fp = _type_wire_cache[id(td)][2]
+        assert fp is not None, "write_type_map must feed the fingerprint"
+        assert any(node is self.fx.t for node, _tvid, _lvl in fp), fp
+
+    def test_extra_attrs_tvar_is_fingerprinted(self) -> None:
+        from mypy.checkexpr import _serialize_type_for_checkexpr
+        from mypy.types import ExtraAttrs, Instance, _type_wire_cache
+
+        inst = Instance(self.fx.oi, [])
+        inst.extra_attrs = ExtraAttrs({"attr": self.fx.t}, set(), "mod")
+        _serialize_type_for_checkexpr(inst)
+        fp = _type_wire_cache[id(inst)][2]
+        assert fp is not None, "ExtraAttrs attrs must feed the fingerprint"
+        assert any(node is self.fx.t for node, _tvid, _lvl in fp), fp
+
+    def test_no_librt_fingerprint_stays_complete(self) -> None:
+        import mypy.types as types_mod
+        from mypy.checkexpr import _serialize_type_for_checkexpr
+        from mypy.types import _type_wire_cache
+
+        saved = types_mod.__dict__["write_raw_bytes"]
+        types_mod.__dict__["write_raw_bytes"] = None
+        try:
+            c = self._tvar_callable()
+            stale = _serialize_type_for_checkexpr(c)
+            fp = _type_wire_cache[id(c)][2]
+            assert fp is not None, "funnel stores still carry fingerprints"
+            assert (self.fx.t, self.fx.t.id, 0) in fp, fp
+            self.fx.t.id.meta_level = 1
+            fresh = _serialize_type_for_checkexpr(c)
+            assert fresh != stale, "no-librt stores must still reject mutations"
+        finally:
+            types_mod.__dict__["write_raw_bytes"] = saved
+
+    @skipUnless(_SPLICE_ACTIVE, "splice path needs librt write_raw_bytes")
+    def test_splice_path_rejects_mutated_fingerprint(self) -> None:
+        from librt.internal import WriteBuffer
+
+        from mypy.checkexpr import _serialize_type_for_checkexpr
+        from mypy.types import _set_type_wire_cache_enabled, _write_type_cached
+
+        c = self._tvar_callable()
+        _serialize_type_for_checkexpr(c)  # funnel store carries the fingerprint
+        b1 = WriteBuffer()
+        _write_type_cached(c, b1)  # splice hit
+        self.fx.t.id.meta_level = 1
+        b2 = WriteBuffer()
+        _write_type_cached(c, b2)  # fingerprint reject: full re-walk
+        assert b1.getvalue() != b2.getvalue()
+        _set_type_wire_cache_enabled(False)
+        try:
+            ref = WriteBuffer()
+            c.write(ref)
+        finally:
+            _set_type_wire_cache_enabled(True)
+        assert b2.getvalue() == ref.getvalue()
+
+
+@skipUnless(_HAS_TYPE_KERNEL, "requires the type_kernel extension")
 class NativeWriteFunnelSkipSuite(Suite):
     """Unit tests for the unprotected-write epoch protocol (slice 6, #1397).
 

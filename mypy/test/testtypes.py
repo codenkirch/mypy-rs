@@ -2074,7 +2074,7 @@ except ImportError:
 def _splice_funnel_active() -> bool:
     """write_raw_bytes is new in the librt fork; with PyPI librt the
     wire-cache splice path is inert and the splice-hit tests skip."""
-    from mypy.types import write_raw_bytes  # type: ignore[attr-defined]
+    from mypy.types import write_raw_bytes
 
     return _SPLICE_EXT_OK and bool(write_raw_bytes)
 
