@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import copy
-from typing import Any, cast
+from typing import Any, Final, cast
 
 from mypy.expandtype import expand_type_by_instance
 from mypy.nodes import TypeInfo
@@ -15,6 +15,12 @@ from mypy.types import (
     TypeOfAny,
     TypeType,
     UnionType,
+    _read_mirror_blob,
+    _serialize_stats,
+    _serialize_stats_on,
+    _serialize_with_taint_check,
+    _type_wire_cache,
+    _wire_cache_enabled,
     get_proper_type,
     has_type_vars,
     read_type,
@@ -75,11 +81,46 @@ def _set_native_map_resolver(resolver: Any) -> None:
     _native_map_resolver = resolver
 
 
+# Argless built-in instances serialize to fixed bytes; mirroring the
+# fast path in checker.py / checkexpr.py / subtypes.py.
+_BUILTIN_INSTANCE_BYTES: Final[dict[str, bytes]] = {
+    "builtins.str": b"\x50\x53",
+    "builtins.function": b"\x50\x54",
+    "builtins.int": b"\x50\x55",
+    "builtins.bool": b"\x50\x56",
+    "builtins.object": b"\x50\x57",
+}
+
+
 def _serialize_type(t: Type) -> bytes:
     """Serialize a `Type` to its wire-format bytes for the Rust reader."""
+    # Wire-cache probe and store, same phase-gated shape as the S-group
+    # funnels (subtypes.py, join.py, erasetype.py, typeops.py): the probe
+    # is a no-op miss while semantic analysis has the cache disabled.
+    key = id(t)
+    if _wire_cache_enabled():
+        entry = _type_wire_cache.get(key)
+        if entry is not None and entry[0] is t:
+            return entry[1]
+    if type(t) is Instance:
+        fn = t.type.fullname
+        if (
+            not t.args
+            and not t.last_known_value
+            and not t.extra_attrs
+            and fn in _BUILTIN_INSTANCE_BYTES
+        ):
+            return _BUILTIN_INSTANCE_BYTES[fn]
+    blob = _read_mirror_blob(t)
+    if blob is not None:
+        if _serialize_stats_on:
+            _serialize_stats["mirror"] += 1
+        return blob
     buf = _WriteBuffer()
-    t.write(buf)
-    return buf.getvalue()
+    result, saw_tvar = _serialize_with_taint_check(t, buf)
+    if not saw_tvar and _wire_cache_enabled() and (not isinstance(t, Instance) or t.type_ref is None):  # type: ignore[misc]
+        _type_wire_cache[key] = (t, result)
+    return result
 
 
 def _needs_python(typ: Type, allow_alias: bool = False) -> bool:

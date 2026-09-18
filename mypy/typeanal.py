@@ -114,6 +114,12 @@ from mypy.types import (
     UnpackType,
     _encode_no_arg_instance,
     _mirror_touch,
+    _read_mirror_blob,
+    _serialize_stats,
+    _serialize_stats_on,
+    _serialize_with_taint_check,
+    _type_wire_cache,
+    _wire_cache_enabled,
     callable_with_ellipsis,
     find_unpack_in_list,
     flatten_nested_tuples,
@@ -4105,12 +4111,29 @@ def native_analyze_type(
 
 
 def _serialize_typeanal_type(t: Type) -> bytes:
+    # Wire-cache probe and store, same phase-gated shape as the S-group
+    # funnels (subtypes.py, join.py, erasetype.py, typeops.py): the probe
+    # is a no-op miss while semantic analysis has the cache disabled.
+    key = id(t)
+    if _wire_cache_enabled():
+        entry = _type_wire_cache.get(key)
+        if entry is not None and entry[0] is t:
+            return entry[1]
     fast = _encode_no_arg_instance(t, _TypeanalWriteBuffer)
     if fast is not None:
+        if _wire_cache_enabled() and t.type_ref is None:  # type: ignore[attr-defined]
+            _type_wire_cache[key] = (t, fast)
         return fast
+    blob = _read_mirror_blob(t)
+    if blob is not None:
+        if _serialize_stats_on:
+            _serialize_stats["mirror"] += 1
+        return blob
     buf = _TypeanalWriteBuffer()
-    t.write(buf)
-    return buf.getvalue()
+    result, saw_tvar = _serialize_with_taint_check(t, buf)
+    if not saw_tvar and _wire_cache_enabled() and (not isinstance(t, Instance) or t.type_ref is None):  # type: ignore[misc]
+        _type_wire_cache[key] = (t, result)
+    return result
 
 
 class _WirePositionStamper(TrivialSyntheticTypeTranslator):
