@@ -759,7 +759,7 @@ Same pattern as Phase F for `mypy.nodes`, family by family:
   last, because semanal mutates them mid-pass.
 - **G4:** graduation: "the AST executes on Rust storage."
 
-**G4 status (updated 2026-09-18, #1864).** The G4 forks are ratified
+**G4 status (updated 2026-09-18, #1869).** The G4 forks are ratified
 (#1836, closed by #1858): read-serving suffices for G4, the claim is
 per family, and the landed order is expression → statement → def. The
 expression family's production flip (`Options.native_ast_mirror` and
@@ -781,9 +781,27 @@ through the `nodes_mirror` accessor). **The expression rung is
 claimed** under #1836's read-serving ratification, with its binding
 condition restated: the expression family's write path is still
 Python, and the cross-run differential is evidence of agreement, not
-proof of ownership. The G2.1 statement and G2.2 def serving flips stay
-held behind their own follow-up issues. Full record: the #1860 and
-#1864 ledger entries in
+proof of ownership. env wins (served 0) while the accessor still records the wiring's True
+decision. **The G2.1 statement serving flip (#1869) is the second
+family to graduate:** `Options.native_ast_mirror_stmt_read` default
+`True`, serving the four `stmt`-scope classes (`Block`,
+`AssertStmt`, `ReturnStmt`, `ExpressionStmt`) through the same
+widen-only production wiring topology as the expression channel. The
+first quiet-gate measurement of the flip was **NO-GO as implemented**
+(ratios 1.218/1.168/1.186): the runtime per-class armed gate — the
+"patch-all sixteen classes, narrow at run" design — paid an uncached
+MRO walk on ~1.05M rejected writes per build on the twelve un-armed
+classes, ~18% cold-path. The fix, in the same lane before any PR
+existed: the armed verdict is cached like its sibling helpers, keyed
+by (armed set, class) so no stale verdict is structurally possible.
+After the fix the quiet gate **passes** (three clean pairs at
+1.051/1.090/1.073 against the 10% gate) with every battery green in
+both gate states at exact baselines. **The statement rung is claimed**
+under #1836's read-serving ratification, with its binding condition
+restated: the statement family's write path is still Python, and the
+cross-run differential is evidence of agreement, not proof of
+ownership. The G2.2 def serving flip stays held behind #1870. Full
+record: the #1860, #1864 and #1869 ledger entries in
 `docs/plans/type-kernel-seam-ledger.md`.
 
 The same risk register applies, with one extra item: semanal visitor
@@ -826,6 +844,13 @@ if the bridge costs outweigh the standalone benefit.
   cross-run differential is evidence of agreement, not proof of ownership.
   Statement and def families follow; the "the AST executes in Rust" rung
   below is claimed only when all three graduate.
+- G4, statement family (2026-09-18, #1869): "the statement family's node
+  reads execute on Rust storage" — same per-family claim and binding
+  condition. The lane's first quiet gate was NO-GO (an uncached MRO walk
+  in the capture hot path, ~18% cold-path); the armed-verdict cache in
+  the same lane brought three clean pairs to 1.051/1.090/1.073, under
+  the 10% gate. The def family (#1870) is the last; the "the AST
+  executes in Rust" rung below is claimed only when all three graduate.
 - After G4: "the AST executes in Rust."
 - After H: "the type-checking pipeline executes in Rust."
 - After J: "full Rust port", with the Python plugin bridge optional.

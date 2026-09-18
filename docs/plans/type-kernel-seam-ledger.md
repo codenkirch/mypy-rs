@@ -5468,3 +5468,132 @@ behind their own issues. Full measurement logs:
 `/private/tmp/mypy-rs-1864-probe/` (`quiet_gate.log`, `times.txt`,
 `workshare.log`) and `/private/tmp/crossrun-1864/`. Refs: #1864,
 #1866, #1863, #1860, #1624, #1836, #1839.
+
+#### G4 statement-family production read-serving flip (#1869, recorded 2026-09-18)
+
+Issue #1869 flips `Options.native_ast_mirror_stmt_read` to default
+`True`, so a production run serves the statement family's shadow reads
+from Rust storage — the second of the three #1836-ratified per-family
+rungs (expression landed as #1864; the def family stays held behind
+#1870). The channel serves the four classes the `stmt` capture scope
+arms (`_META_STMT_CLASSES` = `Block` plus the node-valued serve set
+`AssertStmt`/`ReturnStmt`/`ExpressionStmt`, derived from
+`_META_NODE_FIELDS` so the armed set and the serve set cannot drift
+apart): a served read resolves the live node's `expr`/`Bool` record
+through the mirror. The wiring mirrors the expression topology:
+`set_production_stmt_read_flip(capture_active and
+Options.native_ast_mirror_stmt_read)` is called from
+`BuildManager.__init__` on every manager (off case included, so no
+later build inherits a stale mode), an explicit `MYPY_TK_STMT_READ_FLIP`
+always wins over the option, this entry point never selects the
+compare mode (2), and arming is widen-only (`_meta_armed_classes |=
+_META_STMT_CLASSES`, then `_activate_meta()`): the off case never
+narrows a surface an earlier manager widened — only `activate` re-reads
+the scope. `production_stmt_flip()` records the wiring's own decision
+for the cross-run runner's default model (the #1863 accessor pattern,
+extended to this channel), and the option is not in
+`OPTIONS_AFFECTING_CACHE`.
+
+Two #1867-pass advisory nits are fixed in the same lane (#1868): the
+node-read production wiring test now saves/restores
+`_production_read_flip` in its `finally` block, and the cross-run
+AGREE-path test asserts on the marker the runner actually emits
+(`"INERT"`, the uppercase armed-but-inert clause) instead of the
+lowercase `is inert` phrase that only the NOT_RUN message carries.
+
+The lane also repairs a counter-ordering defect the reversed-order
+isolation run exposed: `seed_loaded` diagnosed the armed-scope gate
+before the untracked-class check, so an untracked class (a
+`TypeAlias`, not a `_G2_TRACKED` key) under the narrow `stmt` scope
+was counted as `seed_loaded.scope_skip` instead of the refusal
+`meta_seed_rejected_untracked`. The untracked refusal is a property of
+the store, not of the armed scope, so it is diagnosed first; the pinned
+`seed_loaded.scope_skip` contract for a tracked class under a narrow
+scope is unchanged.
+
+Correctness evidence, all green in both gate states and matching the
+#1864 baseline: `testcheck` 8144 passed / 69 skipped / 7 xfailed each
+state; the fine-grained family 1296 passed / 256 skipped each state;
+the reversed-order isolation run (25 files, testcheck first, all five
+gates env-on) 12453 passed / 76 skipped / 7 xfailed, 0 failed (the
+#1864 baseline plus the tests this lane added); cold self-check
+`Success: no issues found in 378 source files` in each state with
+byte-identical logs; the cross-run differential agreeing on all five
+legs (kernel, errors, ast, typemap, deferral.build). One observation
+recorded with the differential: the flips-serve arm reports
+`ARMED BUT INERT (0 consulted)` for NODE_READ and STMT_READ on that
+corpus — its reads do not route through the native consumers — so the
+differential is agreement evidence only, and the engagement proof
+comes from the tree-pinned probe instead.
+
+Engagement probe (three legs, tree-pinned, exit 0): with production
+defaults the statement channel served 2763 of 5637 consulted reads
+with the `block`/`assert`/`return`/`expr` records adopted (`var`
+correctly not: the Var-key translation stays env-gated 0, #1870); with
+the option patched off, served 0 and `production_stmt_flip()` False;
+with `MYPY_TK_STMT_READ_FLIP=0` against the option-on default, the
+env wins (served 0) while the accessor still records the wiring's
+True decision.
+
+**The first quiet-gate measurement: NO-GO as first implemented.** A
+contaminated provisional pass (a sibling project's oracle run pushed
+load1 5.5 → 8.2 mid-measurement; ratios 1.178/1.108/1.200, marked
+PROVISIONAL by the driver) was re-measured in a watcher-confirmed quiet
+window (load1 3.65 at start): three clean interleaved pairs at on/off
+ratios **1.218 / 1.168 / 1.186** (on 19.0/18.1/17.9 s vs off
+15.6/15.5/15.1 s), all over the 10% gate, every pair's mid-round load
+drift under the 2-point discard threshold, and the ratio stable across
+both passes at every load level — a real, reproducible cold-path cost.
+The probe audit and a code read localize it: `_activate_meta` patches
+all 16 `_G2_TRACKED` classes and the runtime per-class gate narrows, so
+the twelve un-armed classes' ~1.05M rejected writes per build each
+paid an uncached MRO walk in `_meta_armed_for` — the only uncached
+walk left in the capture hot path, ~2.5-3 µs a write, the whole delta
+(the four armed classes contribute only ~12.5k captures). The fix, in
+the same lane before any PR existed: the armed verdict is cached like
+its sibling helpers (`_meta_tracked`, `_meta_ctor_fields`,
+`_meta_node_fields`), keyed by (armed set, class) so any arming change
+— including a test's direct reassignment of the global — is a
+different key and can never read a stale verdict; no invalidation
+sites to miss, no counter contract touched. First-pass logs:
+`quiet_gate_provisional.log`, `times_provisional.txt`,
+`workshare_provisional.log`; second-pass (pre-fix) logs:
+`quiet_gate_prefix.log` in the probe dir alongside the archived
+`prefix-logs/` battery set.
+
+**The quiet-gate measurement after the fix: PASS.** Window at 07:51
+(load1 4.14 at start, watcher-confirmed; the self-check legs themselves
+lift load1 to ~5.1-5.9, the same self-induced pattern as the #1864
+pass). Three interleaved cold self-check rounds, alternating start
+order, on-leg = production defaults, off-leg = the statement gate
+alone patched out (same tree, same built extensions):
+
+| round | leg | seconds | load1 at end | on/off ratio |
+|---|---|---|---|---|
+| r1 | on | 16.4 | 5.13 | 1.051 |
+| r1 | off | 15.6 | 5.28 | |
+| r2 | off | 15.5 | 5.53 | 1.090 |
+| r2 | on | 16.9 | 5.37 | |
+| r3 | on | 16.2 | 5.44 | 1.073 |
+| r3 | off | 15.1 | 5.86 | |
+
+No round had load1 rise more than two points mid-round (max drift
++1.14, in the first pair off the 4.14 window open). Work-share re-
+measured in the same window, whole-stack and kernel-dominated (#1624
+context, unchanged in character by this lane): parse +5.5 %, semanal
+−12.0 %, type_check −46.7 %, **total −25.4 %** (native slower).
+
+**Verdict and disposition.** The lane passes its own criteria after the
+in-lane overhead fix: quiet gate ≤10 % on three clean pairs
+(1.051/1.090/1.073), every correctness battery green in both gate
+states at exact baselines, work-share re-measured, and both #1868
+advisory nits fixed in the same diff. **The G4 statement-family rung
+is claimed** under #1836's read-serving ratification, with its binding
+condition restated: the statement family's write path is still Python,
+and the cross-run differential is evidence of agreement, not proof of
+ownership. The G2.2 def serving flip stays held behind #1870; the "the
+AST executes in Rust storage" rung is claimed only when all three
+families graduate. Full logs:
+`/private/tmp/mypy-rs-1869-probe/` (`quiet_gate.log`, `times.txt`,
+`workshare.log`). Refs: #1869, #1868, #1864, #1860, #1866, #1836,
+#1839, #1624, #1870.

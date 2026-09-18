@@ -95,6 +95,33 @@ PR #1862 closed unmerged, **branch preserved for the re-attempt**.
   mode**: with the env unset it always reads `mode0` because the production
   wiring patches the mode after `activate` ran. The effective mode is
   `read_mode` / `rust_node_mirror_read_mode()`.
+- **A background Bash task's default timeout is 600 s.** The quiet-gate
+  watcher (90-min provisional fallback) was launched detached with the
+  default and would have been killed mid-wait ten minutes in. Long
+  watchers must be launched with `disable_timeout` and bound themselves
+  in-script.
+- **`uv run <tool>` from inside a worktree repoints the shared venv's
+  editable install at that worktree** (observed with a subagent's
+  `uv run ruff`): every sibling worktree then resolves `import mypy`
+  to the wrong tree through the symlinked venv. Restore with `uv sync`
+  from the main checkout and re-verify with
+  `scripts/assert_worktree_import.py` before trusting any run.
+- **`seed_loaded`'s untracked-class refusal is a store property,
+  diagnosed before the armed-scope gate** (#1869): the reversed order
+  mislabels an untracked-class seed under a narrow scope as
+  `scope_skip`, and only the reversed-order isolation run catches it —
+  the ordered suites never put the two gates in that configuration.
+- **`ARMED BUT INERT (0 consulted)` in a cross-run arm is a corpus
+  property, not a flip failure**: the differential corpus routes no
+  reads through that channel's native consumers, so the engagement
+  proof for a serving flip comes from the tree-pinned probe, and the
+  differential remains agreement evidence only.
+- **A runtime gate is not free just because it "only narrows".** The
+  patch-all `_meta_setattr` leaned on a per-class armed gate whose
+  uncached MRO walk ran ~1.05M times per self-check build on un-armed
+  classes — ~18% cold-path, a quiet-gate NO-GO. Cache per-class
+  verdicts like the sibling helpers, and key the cache by the armed
+  set itself so a reassignment (tests do this) can never read stale.
 
 ## RESUME POINT — 2026-09-17, night (wave 11: 4 PRs merged; #1624's caching lever measured dead)
 
