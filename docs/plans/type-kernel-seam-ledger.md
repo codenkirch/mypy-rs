@@ -5292,3 +5292,110 @@ mode-2 differential will assert. Tests:
 `node_mirror_tests::test_object_of_defers_when_identity_forgets_the_handle`
 (Rust) and `NativeNodeMirrorSuite::test_identity_reset_defers_object_of`
 (Python, through `rust_mirror_reset(False)`). Refs: #1795, #1787 PR B.
+
+#### G4 expression-family graduation attempt: production read-serving default on (#1860, recorded 2026-09-18 — NO-GO, closed unmerged)
+
+The wave-12 T3 lane implemented the G4 expression-family graduation flip:
+`Options.native_ast_mirror` and `Options.native_ast_mirror_read` default
+`True` (neither in `OPTIONS_AFFECTING_CACHE`; no shadow state may enter the
+cache). The #1836 one-family-one-flip rule is carried by the capture/serving
+split, not by new options: **capture is family-agnostic** (the G1 expression
+records and the G2 statement/def metadata records ride the one
+`native_ast_mirror` gate), while **serving is per-channel**, and only the
+expression channels follow `native_ast_mirror_read`: the G1.1 `RefExpr`
+binding scalars (`depswalk.rs` through `RefView`) and the G1.2 aststrip
+MemberExpr lvalue read. The G2.1 statement channel
+(`MYPY_TK_STMT_READ_FLIP`) and the G2.2 Var-key translation
+(`MYPY_TK_VAR_KEY_FLIP`) stay env-only default 0; their flips are follow-up
+issues and are now **held until the capture-overhead fix lands**.
+
+The wiring is `BuildManager.__init__` calling
+`nodes_mirror.set_production_read_flip(capture_active and
+options.native_ast_mirror_read)`, on every manager including the off case
+(the aststrip rule: a later build in the process must not inherit a stale
+mode). Production serves mode 1 only; mode 2 (serve + differential compare)
+is a measurement mode this entry point never selects. `MYPY_TK_NODE_READ_FLIP`
+wins over the option: `activate()` parses the env before the wiring runs, and
+the wiring defers whenever the env var is present, so measurement arms keep
+control of the channel. The test harness stays a differential
+(`helpers.parse_options` forces both gates from env, unset = off), so
+default-on is exercised by the self-check, the CLI, and the tree-pinned probe.
+The #1839 cross-run kernel leg models the same resolution (`effective` = env
+value when present, else the production default), so an option-armed channel
+is compared rather than misread as inert. The #1859 del contract is restated
+unchanged and still in force on the branch: a `del` on a tracked G1 slot is
+out of contract, no production `del` on a tracked G1 slot exists, the pins
+stay in force, and the G1 write-flip work must flip them knowingly. The
+#1836 binding condition rides the claim on any future merge of this work:
+the expression family's **write path is still Python**, and the cross-run
+differential is **evidence of agreement, not proof of ownership**.
+
+Correctness evidence (all green, both gate states): `testcheck` 8144
+passed / 69 skipped / 7 xfailed in each state (404 s off, 515 s on); the
+fine-grained family (`testfinegrained` + `testfinegrainedcache`) 1296
+passed / 256 skipped in each state; the reversed-order isolation run
+(#336 shape, all five gates env-on) 12370 passed / 76 skipped / 7 xfailed;
+cold self-check `Success: no issues found in 378 source files` in each state
+with byte-identical output (the gate-off leg runs through a tree-pinned
+`Options.__init__` patch wrapper, since no CLI flag exists for the gates);
+the #1839 cross-run differential (mirror-on vs mirror-off, legs
+kernel/errors/ast/typemap/deferral.build) agreeing on all five legs, 49
+trees and 49 cache payloads byte-identical, typemap 6214/6214 entries; the
+tree-pinned dmypy probe on the corpus serving `4/4` consults gate-on
+(`capture_ref` 112529) vs 0 (deferred) on an unpatched-main control with
+identical error output; `testcrossrundifferential` 64 passed / 4 subtests
+with the three new option-default cases; `cargo fmt --check` and
+`cargo clippy -D warnings` clean (no Rust change).
+
+**The quiet-gate measurement: NO-GO.** The quiet window arrived at
+03:05:37 (load1 8.44 / load5 15.25, decaying). Three interleaved cold
+self-check rounds (`mypy_self_check.ini -p mypy -p mypyc --no-incremental`),
+alternating start order, on-leg = production defaults, off-leg = same tree
+with the flip patched out of `Options` (the wrapper's integrity pinned: same
+worktree, same built extensions, the delta attributable to the gate):
+
+| round | leg | seconds | load1 at end |
+|---|---|---|---|
+| r1 | on | 20.8 | 6.89 |
+| r1 | off | 13.2 | 6.53 |
+| r2 | off | 13.2 | 6.35 |
+| r2 | on | 20.5 | 6.41 |
+| r3 | on | 22.7 | 9.64 (contaminated, load rising) |
+| r3 | off | 19.4 | 11.13 (contaminated) |
+
+r3 is contaminated (load rose 9.6 -> 11.1 mid-round); the verdict rests on
+r1/r2: on/off ratios 1.58 and 1.56, **median-of-ratios ~+55% wall overhead
+against the 10% gate**; even the best individual pair is +17%. Two clean
+interleaved pairs is decisive. Phase work-share
+(`scripts/measure_work_share.py`, 2 accepted pairs; round 1 rejected by the
+20% parse-drift filter): parse +2.9%, semanal −8.7%, type_check −40.5%,
+**total −22.1%** (negative = native slower).
+
+**Diagnosis: capture-dominated, not serving-dominated.** Serving is armed
+and proven (the probe above), but in batch self-check the serving consumer
+is nearly inert — the fine-grained deps walk that consumes served reads
+does not run in plain `mypy_self_check.ini` mode (the cross-run kernel
+leg's `ARMED BUT INERT` note is the same observation) — while ~112k mirror
+refs are still dual-written on the Python side every run. The cold check
+pays full capture cost and exercises almost none of the serving benefit.
+Honest caveat: no engagement counter was sampled during the on-legs
+themselves; serving was proven separately, and the capture-inert conclusion
+rests on the batch-mode note plus the arithmetic. One review artifact from
+the lane: the `ocr review` pass produced 3 low findings, all fixed
+(`build.py` import hoist, `in_force` -> `effective` fallback,
+`consulted=3` fixture), and the independent reader pass filed #1863
+(advisory: `production_defaults` coupling in `testcrossrundifferential`).
+
+**Verdict and disposition.** The issue's acceptance text says: record the
+quiet-gate measurement and close unmerged if the flip fails its own
+criteria. It fails (~+55% vs the 10% gate). Issue #1860 is closed as NO-GO
+and PR #1862 closed unmerged, following #1663 and #1698. **The branch
+`feat/1860-g4-expression-serve-flip` (`7bece0d20`) is deliberately
+preserved**: the implementation is correct, only too slow. Follow-up
+#1864 (mirror capture overhead below the 10% flip gate) blocks the ladder:
+the G4 re-flip re-attempts from the preserved branch, and the G2.1/G2.2
+flip drafts are held until it lands. The per-flip G4 rung ("the expression
+family's node reads execute on Rust storage") is **not claimed** — a phase
+closed without graduating contributes no rung. Full measurement logs:
+`/private/tmp/mypy-rs-1860-probe/` (`quiet_gate.log`, `times.txt`,
+`workshare.log`). Refs: #1860, #1862, #1863, #1864, #1624, #1836, #1839.

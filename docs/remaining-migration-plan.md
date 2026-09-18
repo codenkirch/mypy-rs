@@ -759,6 +759,29 @@ Same pattern as Phase F for `mypy.nodes`, family by family:
   last, because semanal mutates them mid-pass.
 - **G4:** graduation: "the AST executes on Rust storage."
 
+**G4 status (updated 2026-09-18, #1860).** The G4 forks are ratified
+(#1836, closed by #1858): read-serving suffices for G4, the claim is
+per family, and the landed order is expression → statement → def. The
+expression family's production flip was implemented in wave 12
+(#1860, PR #1862): `Options.native_ast_mirror` and
+`Options.native_ast_mirror_read` default `True`, capture
+family-agnostic, serving per-channel (expression channels only).
+All correctness batteries passed in both gate states, but the
+quiet-gate wall-clock measurement returned **NO-GO**: ~+55% cold
+self-check overhead (20.8/20.5 s gate-on vs 13.2/13.2 s gate-off, two
+clean interleaved pairs) against the 10% gate, with work-share total
+−22.1% (native slower, type_check −40.5%). The overhead is
+capture-dominated: the serving consumer is nearly inert in batch mode
+(no fine-grained deps walk), while ~112k mirror refs are dual-written
+every run. The issue and PR are closed unmerged (precedent #1663,
+#1698); **the expression rung is not claimed** — a phase closed
+without graduating contributes no rung. The branch
+`feat/1860-g4-expression-serve-flip` is preserved for a re-attempt
+after #1864 (mirror capture overhead below the 10% flip gate) lands;
+the G2.1 statement and G2.2 def serving flips are held behind the
+same issue. Full record: the #1860 ledger entry in
+`docs/plans/type-kernel-seam-ledger.md`.
+
 The same risk register applies, with one extra item: semanal visitor
 mutation sites must migrate behind accessor methods on the views as their
 families flip; defer-compatible returns stay until Phase H.

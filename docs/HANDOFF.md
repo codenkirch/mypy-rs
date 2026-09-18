@@ -1,5 +1,89 @@
 # Handoff: strangler-fig Rust migration loop (seam-deferral reduction)
 
+## RESUME POINT — 2026-09-18, morning (wave 12 closed: 17 PRs merged; #1860 G4 flip NO-GO, unmerged)
+
+`main` = `47209c257` (#1859). Seventeen PRs merged this wave; the wave's one
+T3 lane (#1860) finished with a decisive NO-GO and closed unmerged.
+
+### Merged this wave
+
+| merge SHA | PR | what |
+|---|---|---|
+| `cb09a1dc7` | #1826 | feat(type_kernel): statement-family serve seed + handle encoding for stmt.expr (#1787) |
+| `a0b8a5350` | #1829 | fix(audit): name the remedy when type_kernel is not importable (#1821) |
+| `9601d2b9c` | #1830 | perf(type_kernel): retire the checkexpr call head and arg-context shims (#1739) |
+| `3546293d1` | #1832 | test(checkmember): pin values where a gate differential cannot fail |
+| `1b20d5d65` | #1839 | feat(parity): cross-run differential runner for gate-state comparison (#1770) |
+| `e0085dcf5` | #1840 | fix(audit): crashed-run refusal, extension identity, unconsumed cause split |
+| `655017555` | #1843 | perf(type_kernel): retire rust_classify_typeobj_gate (#1833) |
+| `19093d51d` | #1844 | feat(type_kernel): explicit load-time seed + provenance split for the def-family store (#1825) |
+| `40c64f541` | #1848 | test: pin values where the remaining gate comparisons cannot fail (#1834) |
+| `d4e59684c` | #1850 | fix(audit): shared-blob attribution, operator abort, type-misc green |
+| `dfa12ad20` | #1851 | test(type_kernel): repair two vacuous pins and a stale retirement claim |
+| `0a97f7f35` | #1852 | fix(type_kernel): def-family seed hygiene - dedupe, dead constants, zero counters |
+| `da333de00` | #1854 | test: pin values where the 22 gate comparisons cannot fail (#1845) |
+| `9393db907` | #1855 | fix(type_kernel): retract a deleted tracked slot's record |
+| `8fe6ef805` | #1857 | test: pin values where the 8 gate comparisons cannot fail (#1853) |
+| `42187f067` | #1858 | docs: ratify the G4 forks - read-serving, landed order, per-family claims (#1836) |
+| `47209c257` | #1859 | test(type_kernel): pin retraction counters and the G1 del gap (#1856) |
+
+### The #1860 G4 flip: NO-GO, closed unmerged (the wave's one T3 lane)
+
+The flip (`Options.native_ast_mirror` + `Options.native_ast_mirror_read`
+default `True`, expression-family serving) was fully implemented on
+`feat/1860-g4-expression-serve-flip` (`7bece0d20`, PR #1862) and every
+correctness battery was green in both gate states: `testcheck` 8144/69/7
+each state, fine-grained family 1296/256 each state, reversed-order
+isolation 12370/76/7, cold self-check 378 files byte-identical, the #1839
+cross-run differential 5/5 legs, tree-pinned probe 4/4 served gate-on vs
+0 on an unpatched-main control.
+
+The quiet-gate wall-clock measurement (quiet window 03:05:37, load1 8.44):
+3 interleaved cold self-check rounds; the two clean pairs both show
+**~+55% overhead** (on 20.8/20.5 s vs off 13.2/13.2 s) against the 10%
+gate; work-share total −22.1% (native slower). Diagnosis:
+**capture-dominated** — serving is armed but nearly inert in batch mode
+(the fine-grained deps walk does not run), while ~112k mirror refs are
+dual-written every run. #1860 closed as NO-GO (precedent #1663, #1698),
+PR #1862 closed unmerged, **branch preserved for the re-attempt**.
+
+### Next work (in order)
+
+1. **#1864** (self-assigned): reduce mirror capture overhead below the 10%
+   flip gate — lazy/selective capture, cheaper per-write encoding, or
+   batched capture. Acceptance: quiet-gate ≤10% on two clean interleaved
+   pairs, batteries green both states. Then re-open the G4 flip from the
+   preserved branch `feat/1860-g4-expression-serve-flip` (rebase first).
+2. **G2.1/G2.2 flip issues** (drafts on disk at
+   `/private/tmp/mypy-rs-1860-probe/issue-g21-stmt-flip-draft.md`,
+   `issue-g22-def-flip-draft.md`): file them only after #1864 lands and
+   the G4 re-flip passes its gate.
+3. **#1861 H1 slice** starts after the G4 flip lands.
+4. **#1745**: branch protection — blocked on the owner's ADMIN credential;
+   the decision and the ready command are posted on the issue.
+
+### Rules that bit this session
+
+- **Pin `cwd` on every Bash pool/pytest call.** Post-compaction, tool calls
+  lost the worktree `cwd` and the recorded command showed no `cd` prefix: the
+  run would have executed from the main checkout and silently tested
+  unpatched `main` (the #1789 wrong-tree hazard, conftest assertion and all).
+- **A helper script is not `-m`**: `python /private/tmp/.../script.py` puts the
+  script's own directory at `sys.path[0]`, so `import mypy` goes through the
+  venv's editable finder (the main checkout) while `-m`-spawned build workers
+  import the worktree — the parent/worker wire formats then disagree and the
+  self-check dies with `Cannot connect to build worker(s)`. Every helper that
+  imports mypy must pin the tree the way the probe does, or be run via `-m`
+  from the worktree.
+- **A loaded wall-clock number is never a gate verdict.** The 10% gate waited
+  out 60–90 load1 from foreign nightlies before the 03:05 quiet window; the
+  watcher interleave (alternating start order, pool `run 2` per leg, on-leg
+  plain `-m mypy` defaults, off-leg tree-pinned `Options` patch) is the
+  reusable recipe (`/private/tmp/mypy-rs-1860-probe/quiet_gate.sh`).
+- **r3-style contamination is detectable in-band**: log load1 at leg end and
+  discard pairs where the trend reverses (load rose 9.6 → 11.1 mid-r3); the
+  verdict rests on clean pairs only.
+
 ## RESUME POINT — 2026-09-17, night (wave 11: 4 PRs merged; #1624's caching lever measured dead)
 
 `main` = `476accf40` (#1819). Four PRs merged this wave; four lanes were still
