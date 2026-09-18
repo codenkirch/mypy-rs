@@ -380,6 +380,37 @@ class NodeShadowServingSuite(Suite):
             else:
                 os.environ[env_name] = saved_env
 
+    def test_production_wiring_records_its_decision_for_the_runner(self) -> None:
+        """`production_read_flip` reports what the wiring last wired (#1863).
+
+        The cross-run runner consumes this instead of re-deriving the
+        production default from kernel presence and the raw options, so the
+        recorded decision must track the setter exactly: False before any
+        wiring, the last `serve` argument afterwards, and the wiring's own
+        decision even when an env gate holds the channel (the env wins for
+        the mode, not for what the wiring asked).
+        """
+        env_name = self._m._READ_FLIP_ENV
+        saved_env = os.environ.get(env_name)
+        saved_decision = self._m._production_read_flip
+        try:
+            os.environ.pop(env_name, None)
+            self._m.set_production_read_flip(False)
+            assert self._m.production_read_flip() is False
+            self._m.set_production_read_flip(True)
+            assert self._m.production_read_flip() is True
+            os.environ[env_name] = "2"
+            assert self._m.set_read_flip(2) == 2
+            assert self._m.set_production_read_flip(False) == 2
+            assert self._m.production_read_flip() is False
+        finally:
+            self._m._production_read_flip = saved_decision
+            self._m.set_read_flip(0)
+            if saved_env is None:
+                os.environ.pop(env_name, None)
+            else:
+                os.environ[env_name] = saved_env
+
     # -- the real consumer, in every mode --
 
     def test_deps_walk_serves_the_scalars_and_agrees_with_python(self) -> None:

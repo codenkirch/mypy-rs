@@ -273,6 +273,9 @@ _in_capture = False
 # widen-only: a widened patch set stays, gated at runtime.
 _capture_scope: str = "ref"
 _meta_armed: bool = False
+# #1863: what `set_production_read_flip` last wired. The runner reads this
+# back instead of re-deriving the production default from raw signals.
+_production_read_flip: bool = False
 _ORIG_SETATTR: Any = object.__setattr__
 _ORIG_DELATTR: Any = object.__delattr__
 # id(node) -> native handle for every node the store holds a record for.
@@ -380,9 +383,22 @@ def set_production_read_flip(serve: bool) -> int:
     manager, so a later build cannot inherit a mode from an earlier one
     in the process (the aststrip flip's rule).
     """
+    global _production_read_flip
+    _production_read_flip = serve
     if os.environ.get(_READ_FLIP_ENV) is not None:
         return read_flip()
     return set_read_flip(1 if serve else 0)
+
+
+def production_read_flip() -> bool:
+    """Whether the production wiring last asked this channel to serve.
+
+    What `set_production_read_flip` recorded (#1863): the build wiring's own
+    decision, not a re-derivation from kernel presence and options, so a
+    consumer (the cross-run runner's default model) cannot disagree with
+    what was actually wired. False before any manager ran.
+    """
+    return _production_read_flip
 
 
 def read_counters() -> dict[str, int]:

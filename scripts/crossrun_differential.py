@@ -1343,14 +1343,9 @@ def worker_main(argv: list[str]) -> int:
 
         # Serving gates have two channels: the env var, and the production
         # default the build wiring serves when the env gate is unset (#1860).
-        # The node default mirrors build.py's wiring, kernel presence included.
-        kernel_present = nodes_mirror._kernel() is not None
+        # The node default is read back from `nodes_mirror` (#1863).
         production_defaults = {
-            "MYPY_TK_NODE_READ_FLIP": (
-                1
-                if kernel_present and options.native_ast_mirror and options.native_ast_mirror_read
-                else 0
-            ),
+            "MYPY_TK_NODE_READ_FLIP": 1 if nodes_mirror.production_read_flip() else 0,
             "MYPY_TK_STMT_READ_FLIP": 0,
             "MYPY_TK_VAR_KEY_FLIP": 0,
         }
@@ -1366,7 +1361,7 @@ def worker_main(argv: list[str]) -> int:
             strict=True,
         ):
             raw_env = os.environ.get(gate)
-            default = production_defaults[gate]
+            default = production_defaults.get(gate, 0)
             gates[gate] = {
                 "declared": gate_mode(declared_env.get(gate, "0"), gate, "the arm's tokens"),
                 "requested": gate_mode(raw_env or "0", gate, "the process environment"),
