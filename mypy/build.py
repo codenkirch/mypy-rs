@@ -1427,6 +1427,10 @@ class BuildManager:
             capture_active = nodes_mirror.activate(
                 audit=_os_ast_mirror.environ.get("MYPY_TK_AST_MIRROR_AUDIT") == "1"
             )
+        # #1875: the runtime capture gate, same every-manager rule. The
+        # off case installs the dormant state, so a process whose classes
+        # an earlier on-build patched stops minting unread records.
+        nodes_mirror.set_capture_enabled(capture_active)
         # G4 (#1860, #1869, #1870): production serves the expression and
         # statement family's shadow reads and the def family's Var-key
         # translation. Set on every manager, off case included.
@@ -2022,12 +2026,15 @@ class BuildManager:
             # never survive a recheck. Runs first (it leaves `identity`
             # alone), so the mirror sweep below sees its pins gone.
             typeview.reset()
-        if self.options.native_ast_mirror:
+        # #1875: activation is one-shot and `reset` keeps it, so an
+        # off-build in a process that ever ran an on-build must still drop
+        # the store the patched capture classes kept filling.
+        from mypy import nodes_mirror
+
+        if self.options.native_ast_mirror or nodes_mirror.ever_active():
             # Phase G1.0a (#1572): node-shadow entries pin AST nodes; a
             # stale graph must never survive a recheck. Reset before the
             # type mirror (it also leaves `identity` alone).
-            from mypy import nodes_mirror
-
             nodes_mirror.reset()
         if (
             self.options.native_symtable_mirror

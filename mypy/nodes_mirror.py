@@ -285,6 +285,9 @@ _FIELD_NAMES: Final[frozenset[str]] = (
 
 _kernel_mod: Any = None
 _active = False
+# #1875: sticky activation marker. Activation is one-shot and `reset`
+# deliberately keeps it, so this flips at most once per process.
+_ever_active = False
 _audit_mode = False
 # Re-entrancy guard: a capture reads live fields, never writes them, but
 # the guard keeps a future field-property hook from recursing.
@@ -297,6 +300,10 @@ _capture_scope: str = "ref"
 # four serving classes under `stmt`, all `_G2_TRACKED` keys under `full` (a meta
 # flip env implies `full`). `activate` re-reads per call; the wiring only widens.
 _meta_armed_classes: frozenset[type] = frozenset()
+# #1875: the runtime capture gate. Default True keeps direct `activate()`
+# callers capturing; the build wiring writes it on every manager, off case
+# included, so an off-build installs the dormant state.
+_capture_enabled: bool = True
 # #1863: what `set_production_read_flip` last wired. The runner reads this
 # back instead of re-deriving the production default from raw signals.
 _production_read_flip: bool = False
@@ -888,7 +895,7 @@ def _node_setattr(self: Any, name: str, value: Any) -> None:
     # any AttributeError from an unknown slot propagates exactly as the
     # unpatched object.__setattr__ would.
     _ORIG_SETATTR(self, name, value)
-    if not _active or _in_capture:
+    if not _active or not _capture_enabled or _in_capture:
         return
     if name in _REF_FIELDS:
         if _NODE_HANDLES.get(id(self)) is None and _is_baseline(name, value):
@@ -1337,12 +1344,13 @@ def cache_read_origin(origin: str) -> str | None:
     """Mark the capture origin while a cache reader materializes nodes.
 
     Returns the origin to hand back to `restore_origin`, or None when the
-    store is inactive: an off-gate reader pays one call and changes no
-    state. The pair is deliberately not a context manager, because the
-    readers are on mypy's hot cache path and this must cost one call.
+    store is inactive - never activated, or gated off by the build wiring
+    (#1875): an off-gate reader pays one call and changes no state. The
+    pair is deliberately not a context manager, because the readers are
+    on mypy's hot cache path and this must cost one call.
     """
     global _capture_origin
-    if not _active:
+    if not _active or not _capture_enabled:
         return None
     previous = _capture_origin
     _capture_origin = origin
@@ -1374,7 +1382,7 @@ def seed_loaded(node: Any) -> int:
     as a refusal rather than passing silently. Never raises into the
     reader's deserialization path.
     """
-    if not _active:
+    if not _active or not _capture_enabled:
         return 0
     tracked = _meta_tracked(type(node))
     if not tracked:
@@ -1438,7 +1446,7 @@ def _meta_setattr(self: Any, name: str, value: Any) -> None:
     # Apply the write first; the store records the post-write state and
     # an unknown-slot AttributeError propagates unchanged.
     _ORIG_SETATTR(self, name, value)
-    if not _active or _in_capture:
+    if not _active or not _capture_enabled or _in_capture:
         return
     if not _meta_armed_for(type(self)):
         # #1864/#1869: capture is armed per class (the full surface, the
@@ -1475,7 +1483,7 @@ def touch(node: Any, field: str) -> None:
     G1.0b's `ComparisonExpr.method_types` are the current callers.
     Off-gate calls return immediately; unknown fields are ignored.
     """
-    if not _active or _in_capture:
+    if not _active or not _capture_enabled or _in_capture:
         return
     if field in _FIELD_NAMES:
         # #1864: the G1.0b field arm is a no-op in the ref scope.
@@ -1499,7 +1507,7 @@ def _meta_delattr(self: Any, name: str) -> None:
     # as the unpatched object.__delattr__ would), then retract the slot's
     # record so absence keeps meaning "not recorded" (#1841).
     _ORIG_DELATTR(self, name)
-    if not _active or _in_capture:
+    if not _active or not _capture_enabled or _in_capture:
         return
     if not _meta_armed_for(type(self)):
         # #1864/#1869: same per-class scope rule as `_meta_setattr` - an
@@ -1586,9 +1594,11 @@ def activate(*, audit: bool = False) -> bool:
 
     Activation is one-shot (un-patching mid-run would desync live
     records), matching the type mirror. A later activate call may still
-    turn counters on. A malformed serving-mode env var raises before any
-    state change, so the failure cannot half-activate and a retry is not
-    swallowed by the one-shot guard.
+    turn counters on, and re-arms the runtime capture gate (#1875), so
+    capture resumes even after an off-build installed the dormant state.
+    A malformed serving-mode env var raises before any state change, so
+    the failure cannot half-activate and a retry is not swallowed by the
+    one-shot guard.
 
     The capture scope (#1864) is re-read on every call: the runtime gates
     (and so the counter keys) narrow and widen per call, while class
@@ -1601,6 +1611,7 @@ def activate(*, audit: bool = False) -> bool:
     enable it against a missing extension instead of trusting the option.
     """
     global _active, _audit_mode, _capture_scope, _meta_armed_classes
+    global _capture_enabled, _ever_active
     # #1864: parse the scope first, before the one-shot guard, so a bad
     # value fails loudly with the module untouched and every retry sees
     # the scope now in force.
@@ -1626,6 +1637,10 @@ def activate(*, audit: bool = False) -> bool:
     if _active:
         _capture_scope = scope
         _meta_armed_classes = armed
+        # #1875: a successful activate re-arms the capture gate, so a
+        # direct caller (or a later on-build) never inherits an
+        # off-build's dormant state.
+        _capture_enabled = True
         if audit:
             _audit_mode = True
         # Widen only: the classes a narrower earlier call left unpatched.
@@ -1686,6 +1701,9 @@ def activate(*, audit: bool = False) -> bool:
     if scope == "full" and not _patch_capture_classes(_WIDE_PATCH_CLASSES):
         return False
     _active = True
+    # #1875: sticky across `reset`, read by the build wiring's off arm.
+    _ever_active = True
+    _capture_enabled = True
     _count("activate")
     _count(f"capture_scope.{scope}")
     # G2.0 (#1577): patch the statement/def family (separate section),
@@ -1708,6 +1726,35 @@ def activate(*, audit: bool = False) -> bool:
         set_var_key_flip(env_var_key_mode)
         _count(f"var_key_flip.mode{var_key_flip()}")
     return True
+
+
+def ever_active() -> bool:
+    """Whether `activate` ever succeeded in this process (#1875).
+
+    Activation is one-shot and kept across `reset`, so this flips at most
+    once and never back. The build wiring reads it to run the node reset
+    for an off-build in a process whose capture classes stay patched.
+    """
+    return _ever_active
+
+
+def set_capture_enabled(enabled: bool) -> None:
+    """Set whether the capture entry points record (#1875).
+
+    The build wiring writes its `capture_active` on every manager, off
+    case included, so an off-build in a process whose classes an earlier
+    on-build patched installs the dormant state: no record lands and no
+    counter mints, exactly like a never-activated process. Default True,
+    and a successful `activate` re-arms it, so direct callers (the
+    mirror suites) keep capturing. Idempotent and cheap; runs per build.
+    """
+    global _capture_enabled
+    _capture_enabled = enabled
+
+
+def capture_enabled() -> bool:
+    """Whether the capture entry points currently record (#1875)."""
+    return _capture_enabled
 
 
 def reset(*, clear_counts: bool = False) -> None:

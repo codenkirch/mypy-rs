@@ -6406,3 +6406,151 @@ class NodeMirrorCaptureScopeSuite(Suite):
         assert handle is not None, "the pin must ride the default-scope ref capture"
         assert self._k.rust_node_mirror_object_of(handle) is var
         assert self._m.report().get("pin_target") == 1
+
+
+class NodeMirrorCaptureGateSuite(Suite):
+    """#1875: the off-build boundary of a process that already activated.
+
+    Activation is one-shot and `reset` keeps it, so an off-build in a
+    process that ever ran an on-build finds the capture classes still
+    patched. The build wiring must still reset the store (the #1572
+    stale-graph hazard) and gate every runtime capture entry point, or
+    the patched arms keep minting records no consumer reads. The gate
+    defaults to on, so direct `activate()` callers capture as before.
+    """
+
+    def setUp(self) -> None:
+        import type_kernel as kernel
+
+        from mypy import nodes_mirror
+
+        self._k = kernel
+        self._m = nodes_mirror
+        assert self._m.activate(audit=True) is True, "the scratch extension is present"
+        self._m.reset(clear_counts=True)
+
+    def tearDown(self) -> None:
+        # The gate is module state the build wiring writes per manager;
+        # restore the default so later suites capture as before.
+        self._m.set_capture_enabled(True)
+        self._m.reset(clear_counts=True)
+
+    def test_off_build_in_an_ever_active_process_still_resets_the_store(self) -> None:
+        # The build-level reset path (#1875's stale-graph arm): the daemon
+        # recheck calls `_clear_native_resolvers`, which must drop the
+        # store when the option is off in an ever-active process.
+        from types import SimpleNamespace
+
+        from mypy.build import BuildManager
+        from mypy.options import Options
+
+        ref = NameExpr("x")
+        ref.kind = GDEF
+        assert id(ref) in self._m._NODE_HANDLES, "the on-arm must capture first"
+        assert self._k.rust_node_mirror_entry_count() == 1
+        options = Options()
+        options.native_ast_mirror = False
+        options.native_symtable_mirror = False
+        options.native_symtable_read_flip = False
+        options.native_symtable_read_flip_verify = False
+        options.native_type_mirror = False
+        options.native_type_kernel = False
+        manager = cast(BuildManager, SimpleNamespace(options=options))
+        BuildManager._clear_native_resolvers(manager)
+        assert self._m._NODE_HANDLES == {}, "an off-build reset must drop the records"
+        assert self._m._META_HANDLES == {}, "an off-build reset must drop the meta records"
+        assert self._k.rust_node_mirror_entry_count() == 0, "no record may pin a node"
+
+    def test_a_second_build_with_the_gate_off_drops_the_shadow(self) -> None:
+        # The issue #1875 scenario end to end: the process activated
+        # capture once (setUp), then runs a build with the option off -
+        # the on->off order now normal for any first-on-arm process.
+        import tempfile
+
+        from mypy.dmypy_server import Server
+        from mypy.modulefinder import BuildSource
+        from mypy.options import Options
+
+        assert self._m.ever_active() is True
+        with tempfile.TemporaryDirectory() as td:
+            main_path = os.path.join(td, "main.py")
+            with open(main_path, "w", encoding="utf8") as f:
+                f.write("value = [3]\n")
+            options = Options()
+            options.use_builtins_fixtures = True
+            options.native_ast_mirror = False
+            server = Server(options, os.path.join(td, "status.json"))
+            sources = [BuildSource(main_path, "main", None)]
+
+            def check() -> None:
+                res = server.check(sources, export_types=False, is_tty=False, terminal_width=-1)
+                assert res["status"] == 0, res
+
+            check()
+            assert self._m._NODE_HANDLES == {}, "an off-build must mint no record"
+            assert self._k.rust_node_mirror_entry_count() == 0, self._m.report()
+            # The recheck runs the daemon boundary (`_clear_native_resolvers`)
+            # with the option still off: the ever-active arm must reset.
+            with open(main_path, "w", encoding="utf8") as f:
+                f.write("value = [4]\n")
+            check()
+            assert self._m._NODE_HANDLES == {}, "no record may survive the recheck"
+            assert self._k.rust_node_mirror_entry_count() == 0, self._m.report()
+
+    def test_the_off_arm_installs_the_dormant_state(self) -> None:
+        # The build wiring writes `set_capture_enabled(False)` once per
+        # manager; every capture entry point must then no-op exactly like
+        # a never-activated process (#1875's ungated-path family).
+        os.environ[self._m._CAPTURE_SCOPE_ENV] = "full"
+        self.addCleanup(os.environ.pop, self._m._CAPTURE_SCOPE_ENV, None)
+        assert self._m.activate(audit=True) is True
+        self._m.reset(clear_counts=True)
+        self._m.set_capture_enabled(False)
+        ref = NameExpr("x")
+        ref.kind = GDEF
+        call = CallExpr(NameExpr("f"), [], [], [])
+        call.analyzed = NameExpr("x")
+        member = MemberExpr(NameExpr("o"), "y")
+        member.kind = GDEF
+        member.def_var = Var("y")
+        self._m.touch(member, "method_types")
+        var = Var("x")
+        var.is_final = True
+        del var.is_final
+        assert self._m.seed_loaded(var) == 0
+        assert self._m.cache_read_origin(self._m.ORIGIN_CACHE_FIXED) is None
+        assert self._m.report() == {}, "a gated entry point must not even count"
+        assert self._m._NODE_HANDLES == {}
+        assert self._m._META_HANDLES == {}
+        assert self._k.rust_node_mirror_entry_count() == 0
+        assert self._k.rust_node_mirror_meta_entry_count() == 0
+        # The setter is idempotent and reversible: a repeated off write
+        # changes nothing, and re-enabling resumes capture for a later
+        # on-build (the on->off->on order).
+        self._m.set_capture_enabled(False)
+        self._m.set_capture_enabled(True)
+        resumed = NameExpr("y")
+        resumed.kind = GDEF
+        assert id(resumed) in self._m._NODE_HANDLES, "re-enabling must resume capture"
+        assert self._m.report().get("capture_ref") == 1, self._m.report()
+
+    def test_ever_active_flips_once_and_survives_reset(self) -> None:
+        # The sticky marker keys the reset arm on, so it must follow
+        # activation's own rule: kept across `reset`, never back. (Being
+        # already True on entry is process state other suites may set.)
+        assert self._m.ever_active() is True, "setUp's activate must flip it"
+        self._m.reset()
+        assert self._m.ever_active() is True, "reset must keep the marker"
+        assert self._m._active is True, "reset must keep activation (one-shot)"
+        self._m.reset(clear_counts=True)
+        assert self._m.ever_active() is True, "a clear-counts reset must keep it too"
+
+    def test_the_default_gate_keeps_direct_activation_capturing(self) -> None:
+        # Part 2's default contract: with no build-level call, direct
+        # activate() captures exactly as before #1875 - the other mirror
+        # suites rely on this.
+        assert self._m.capture_enabled() is True
+        ref = NameExpr("x")
+        ref.kind = GDEF
+        assert id(ref) in self._m._NODE_HANDLES, "the default state must capture"
+        assert self._m.report().get("capture_ref") == 1, self._m.report()
