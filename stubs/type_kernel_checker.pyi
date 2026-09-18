@@ -909,6 +909,15 @@ def rust_literal_int_expr(
     type_maps: list[dict[Expression, Type]], expr: Expression
 ) -> tuple[int, int | None] | None: ...
 
+# H1 (#1861): the checker-driver counter store. The nine-tuple order is the
+# contract with mypy.checker_driver.EVENT_NAMES; both sides list the same
+# events. set_mode accepts only 0, 1 and 2 and raises ValueError otherwise.
+def rust_checker_driver_mode() -> int: ...
+def rust_checker_driver_set_mode(mode: int) -> int: ...
+def rust_checker_driver_record(kind: int) -> None: ...
+def rust_checker_driver_counters() -> tuple[int, int, int, int, int, int, int, int, int]: ...
+def rust_checker_driver_reset() -> None: ...
+
 __all__ = [
     "PluginHookRegistry",
     "rust_is_protocol_implementation",
@@ -1157,4 +1166,9 @@ __all__ = [
     "rust_refers_to_different_scope",
     "rust_flatten_lvalues",
     "rust_literal_int_expr",
+    "rust_checker_driver_mode",
+    "rust_checker_driver_set_mode",
+    "rust_checker_driver_record",
+    "rust_checker_driver_counters",
+    "rust_checker_driver_reset",
 ]

@@ -25,6 +25,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+from collections.abc import Callable
 
 # Event names, in the same order as `DriverCounters9` in checker_driver.rs.
 EVENT_NAMES = (
@@ -51,6 +52,14 @@ _python_counts: dict[str, int] = {name: 0 for name in EVENT_NAMES}
 # decision, not a re-derivation from options.
 _production_traversal = False
 
+# Module-level Optional slots so the "extension present?" guards below are
+# meaningful to mypy whether or not the import succeeds.
+_rust_counters: Callable[[], tuple[int, ...]] | None = None
+_rust_mode: Callable[[], int] | None = None
+_rust_record: Callable[[int], None] | None = None
+_rust_reset: Callable[[], None] | None = None
+_rust_set_mode: Callable[[int], int] | None = None
+
 try:  # The extension may be absent in a pure-Python checkout.
     from type_kernel import (
         rust_checker_driver_counters as _rust_counters,
@@ -60,11 +69,7 @@ try:  # The extension may be absent in a pure-Python checkout.
         rust_checker_driver_set_mode as _rust_set_mode,
     )
 except ImportError:  # pragma: no cover - exercised by the gate-off lane
-    _rust_counters = None  # type: ignore[assignment]
-    _rust_mode = None  # type: ignore[assignment]
-    _rust_record = None  # type: ignore[assignment]
-    _rust_reset = None  # type: ignore[assignment]
-    _rust_set_mode = None  # type: ignore[assignment]
+    pass
 
 
 def stats_enabled() -> bool:
@@ -117,7 +122,9 @@ def python_counters() -> dict[str, int]:
 
 def driver_mode() -> int:
     """The Rust driver's serving mode (0 off, 1 drive, 2 drive + compare)."""
-    return _rust_mode() if _rust_mode is not None else 0
+    if _rust_mode is None:
+        return 0
+    return _rust_mode()
 
 
 def set_driver_mode(mode: int) -> int:
