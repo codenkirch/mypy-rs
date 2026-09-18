@@ -43,8 +43,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 60
     env:
-      # pyproject addopts is "-nauto"; cap it so a 4-core runner does not fan
-      # out 18 xdist workers (memory-cap rule, and see the -nauto issue).
+      # pyproject addopts already pins -n4 (the -nauto issue, #1877); keep
+      # the env cap as a belt so a runner sees 4 workers even if addopts
+      # changes again.
       PYTEST_XDIST_AUTO_NUM_WORKERS: "4"
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4

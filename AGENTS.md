@@ -173,7 +173,7 @@ exit status before reading its numbers.
 
 Worktree lanes: run pytest from inside the worktree, so the cwd entry is the
 tree under test and the conftest assertion holds. `pyproject.toml` sets
-`addopts = "-nauto"`; a fresh xdist worker re-creates the editable finder,
+`addopts = "-n4"`; a fresh xdist worker re-creates the editable finder,
 and the conftest assertion is what holds workers honest. For quick
 single-suite runs override the fan-out with `-n0` on the command line or
 `PYTEST_ADDOPTS="-n0"` (both beat `addopts`).
