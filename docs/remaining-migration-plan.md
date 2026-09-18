@@ -759,27 +759,31 @@ Same pattern as Phase F for `mypy.nodes`, family by family:
   last, because semanal mutates them mid-pass.
 - **G4:** graduation: "the AST executes on Rust storage."
 
-**G4 status (updated 2026-09-18, #1860).** The G4 forks are ratified
+**G4 status (updated 2026-09-18, #1864).** The G4 forks are ratified
 (#1836, closed by #1858): read-serving suffices for G4, the claim is
 per family, and the landed order is expression → statement → def. The
-expression family's production flip was implemented in wave 12
-(#1860, PR #1862): `Options.native_ast_mirror` and
+expression family's production flip (`Options.native_ast_mirror` and
 `Options.native_ast_mirror_read` default `True`, capture
-family-agnostic, serving per-channel (expression channels only).
-All correctness batteries passed in both gate states, but the
-quiet-gate wall-clock measurement returned **NO-GO**: ~+55% cold
-self-check overhead (20.8/20.5 s gate-on vs 13.2/13.2 s gate-off, two
-clean interleaved pairs) against the 10% gate, with work-share total
-−22.1% (native slower, type_check −40.5%). The overhead is
-capture-dominated: the serving consumer is nearly inert in batch mode
-(no fine-grained deps walk), while ~112k mirror refs are dual-written
-every run. The issue and PR are closed unmerged (precedent #1663,
-#1698); **the expression rung is not claimed** — a phase closed
-without graduating contributes no rung. The branch
-`feat/1860-g4-expression-serve-flip` is preserved for a re-attempt
-after #1864 (mirror capture overhead below the 10% flip gate) lands;
-the G2.1 statement and G2.2 def serving flips are held behind the
-same issue. Full record: the #1860 ledger entry in
+family-agnostic, serving per-channel on the expression channels) was
+first attempted in wave 12 (#1860, PR #1862): all correctness
+batteries passed in both gate states, but the quiet-gate wall-clock
+measurement returned **NO-GO** (~+55% cold self-check overhead
+against the 10% gate, capture-dominated) and the issue and PR were
+closed unmerged with the branch preserved. After #1866 (selective
+mirror-capture scope) landed, the re-flip lane (#1864) re-measured on
+the rebased branch: three clean interleaved cold self-check pairs at
+on/off ratios 1.087 / 1.088 / 1.066 (on 15.0/14.9/14.5 s vs off
+13.8/13.7/13.6 s, quiet window load1 3.89), passing the 10% gate,
+with all batteries green in both gate states and the cross-run
+differential agreeing on all five legs; the #1863 default-coupling
+finding is fixed in the same lane (production default read back
+through the `nodes_mirror` accessor). **The expression rung is
+claimed** under #1836's read-serving ratification, with its binding
+condition restated: the expression family's write path is still
+Python, and the cross-run differential is evidence of agreement, not
+proof of ownership. The G2.1 statement and G2.2 def serving flips stay
+held behind their own follow-up issues. Full record: the #1860 and
+#1864 ledger entries in
 `docs/plans/type-kernel-seam-ledger.md`.
 
 The same risk register applies, with one extra item: semanal visitor

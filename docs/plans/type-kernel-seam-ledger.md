@@ -5399,3 +5399,72 @@ family's node reads execute on Rust storage") is **not claimed** — a phase
 closed without graduating contributes no rung. Full measurement logs:
 `/private/tmp/mypy-rs-1860-probe/` (`quiet_gate.log`, `times.txt`,
 `workshare.log`). Refs: #1860, #1862, #1863, #1864, #1624, #1836, #1839.
+
+#### G4 expression-family re-flip after the capture-overhead fix (#1864, recorded 2026-09-18 — PASS)
+
+Issue #1864 re-attempted the flip from the preserved branch once #1866
+(selective mirror-capture scope, `821eb468e`) landed on main. The
+rebased branch (`feat/1864-g4-expression-reflip`, flip commit
+`3f9f0a8a2`) needed no scope changes: production serving uses the
+default `ref` capture scope, so #1866's scope machinery carries the
+flip unchanged. The same lane folds in the #1863 fix: the runner
+(`scripts/crossrun_differential.py`) reads the NODE_READ production
+default back through a `nodes_mirror.production_read_flip()` accessor
+set by the production wiring (`Closes #1863`), with a regression test
+asserting the wiring records its decision where the runner looks.
+
+Correctness evidence, all green in both gate states and matching the
+#1862 baseline: the six lane suites 500 passed / 5 skipped / 4 subtests
+each; `testcheck` 8144 / 69 / 7 each; the fine-grained family 1296
+passed / 256 skipped each; the reversed-order isolation run (#336
+shape, 25 files, testcheck first, all five gates env-on) 12445 passed /
+76 skipped / 7 xfailed, 0 failed — +75 passed over the 12370 baseline,
+consistent with tests #1866 added after that number was recorded, with
+skips/xfails exact; cold self-check `Success: no issues found in 378
+source files` in each state with byte-identical logs; the cross-run
+differential agreeing on all five legs (errors byte-identical, 49
+trees and 49 cache payloads byte-identical, typemap 6214/6214,
+deferral.build identical), kernel leg on-arm `NODE_READ=1
+STMT_READ=0 VAR_KEY=0` vs off-arm `0/0/0`, with provenance
+`{'requested': 0, 'default': 1, 'effective': 1, 'in_force': 1}` — the
+default now fed by the #1863 accessor.
+
+**The quiet-gate measurement: PASS.** Quiet window at 04:35
+(load1 3.89). Three interleaved cold self-check rounds
+(`mypy_self_check.ini -p mypy -p mypyc --no-incremental`),
+alternating start order, on-leg = production defaults, off-leg = same
+tree with the flip patched out of `Options` (wrapper integrity
+pinned: same worktree, same built extensions):
+
+| round | leg | seconds | load1 at end | on/off ratio |
+|---|---|---|---|---|
+| r1 | on | 15.0 | 4.30 | 1.087 |
+| r1 | off | 13.8 | 4.78 | |
+| r2 | off | 13.7 | 4.98 | 1.088 |
+| r2 | on | 14.9 | 5.11 | |
+| r3 | on | 14.5 | 5.63 | 1.066 |
+| r3 | off | 13.6 | 5.63 | |
+
+No round had load1 rise more than two points mid-round (max drift
+~0.5): three clean interleaved pairs, ratios 1.087 / 1.088 / 1.066,
+median ~+8% against the 10% gate. #1866 cut the on-leg from the #1860
+20.8/20.5 s to 14.5–15.0 s, which is the whole delta: the off-leg is
+unchanged (13.2–13.8 s across both lanes). Phase work-share
+(`scripts/measure_work_share.py --pairs 2`, both accepted): parse
++3.6%, semanal −14.9%, type_check −45.3%, **total −25.9%** — this is
+the whole-stack measurement (Python-only vs full native including the
+kernel), so it is kernel-dominated context, not the mirror gate; it
+is recorded on #1624 alongside the #1860 numbers.
+
+**Verdict and disposition.** The re-flip passes its own criteria:
+quiet-gate ≤10% on three clean pairs, batteries green in both states,
+work-share re-measured, and the #1863 finding fixed in the same lane.
+**The G4 expression-family rung is claimed** under #1836's
+read-serving ratification, with its binding condition restated: the
+expression family's write path is still Python, and the cross-run
+differential is evidence of agreement, not proof of ownership. The
+G2.1 statement and G2.2 def serving flips stay held as follow-ups
+behind their own issues. Full measurement logs:
+`/private/tmp/mypy-rs-1864-probe/` (`quiet_gate.log`, `times.txt`,
+`workshare.log`) and `/private/tmp/crossrun-1864/`. Refs: #1864,
+#1866, #1863, #1860, #1624, #1836, #1839.
