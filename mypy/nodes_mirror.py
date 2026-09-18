@@ -1078,6 +1078,9 @@ _META_CTOR_FIELDS: Final[dict[type, frozenset[str]]] = {
 _META_FIELDS: dict[type, frozenset[str]] = {}
 _META_CTOR_CACHE: dict[type, frozenset[str]] = {}
 _META_NODE_CACHE: dict[type, frozenset[str]] = {}
+# (armed set, class) -> armed verdict. Keyed by the set so rearming (and
+# tests that reassign the global directly) can never read a stale verdict.
+_META_ARMED_VERDICTS: dict[tuple[frozenset[type], type], bool] = {}
 # id(node) -> native handle for every node the metadata store holds.
 _META_HANDLES: dict[int, int] = {}
 
@@ -1130,11 +1133,22 @@ def _meta_armed_for(cls: type) -> bool:
     #1869: arming is per class, so a `stmt`-scope activation captures the
     four serving classes while the wider `full` surface stays off. The
     MRO walk matches `_meta_tracked`: a patched subclass resolves to its
-    armed base.
+    armed base. The verdict is cached keyed by the armed set itself: this
+    is the capture patch's hot path, where the un-armed classes' rejected
+    writes (about a million per self-check build under the statement
+    flip) each paid the uncached walk and cost the quiet gate ~18%
+    cold-path. Keying on the set means any later arming change - or a
+    test's direct reassignment of the global - can never read a stale
+    verdict; a different set is a different key.
     """
     if not _meta_armed_classes:
         return False
-    return any(base in _meta_armed_classes for base in cls.__mro__)
+    key = (_meta_armed_classes, cls)
+    verdict = _META_ARMED_VERDICTS.get(key)
+    if verdict is None:
+        verdict = any(base in _meta_armed_classes for base in cls.__mro__)
+        _META_ARMED_VERDICTS[key] = verdict
+    return verdict
 
 
 def _meta_ctor_adopts(cls: type) -> bool:
