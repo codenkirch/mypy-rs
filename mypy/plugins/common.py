@@ -466,7 +466,9 @@ def add_attribute_to_class(
         node._fullname = info.fullname + "." + name
 
     _put_names_entry(
-        info.names, name, SymbolTableNode(MDEF, node, plugin_generated=True, no_serialize=no_serialize)
+        info.names,
+        name,
+        SymbolTableNode(MDEF, node, plugin_generated=True, no_serialize=no_serialize),
     )
     return node
 

@@ -2421,9 +2421,7 @@ def _try_native_infer_directed_arg_constraints(
         if target is None:
             raise NotImplementedError("target unresolvable on wire")
         constraint = Constraint(origin, op, target)  # type: ignore[arg-type]
-        constraint.extra_tvars = _restore_extra_tvars(
-            _read_constraint_extras(data), left, right
-        )
+        constraint.extra_tvars = _restore_extra_tvars(_read_constraint_extras(data), left, right)
         constraints.append(constraint)
     return constraints
 

@@ -628,9 +628,7 @@ def _walk_indices_py(root: Type) -> tuple[list[TypeVarId], list[Any], list[Type]
     return tvids, aliases, embeds
 
 
-def _walk_registration(
-    root: Type,
-) -> tuple[list[TypeVarId], list[Any], list[Type], list[Type]]:
+def _walk_registration(root: Type) -> tuple[list[TypeVarId], list[Any], list[Type], list[Type]]:
     """Index walk plus the direct family children, in `_child_types` order.
 
     `_register_tree` needs both; the Rust walk collects them in one
@@ -645,9 +643,7 @@ def _walk_registration(
     return _walk_registration_py(root)
 
 
-def _walk_registration_py(
-    root: Type,
-) -> tuple[list[TypeVarId], list[Any], list[Type], list[Type]]:
+def _walk_registration_py(root: Type) -> tuple[list[TypeVarId], list[Any], list[Type], list[Type]]:
     """Pure-Python `_walk_registration` body (deferral and differential)."""
     tvids, aliases, embeds = _walk_indices_py(root)
     children = [child for _site, child in _child_types(root) if type(child) in FAMILY_NAME]

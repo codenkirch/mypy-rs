@@ -145,10 +145,7 @@ class TestHardExit(TestCase):
                         f.write("diagnostic\n")
 
                 atexit.register(handler)
-                with (
-                    mock.patch("os._exit") as fake_exit,
-                    mock.patch.object(sys, "stdout", f),
-                ):
+                with mock.patch("os._exit") as fake_exit, mock.patch.object(sys, "stdout", f):
                     hard_exit(0)
                 with open(path, "rb") as reader:
                     assert reader.read() == b"diagnostic\n"
@@ -197,23 +194,17 @@ class TestCollectionGuard(TestCase):
                             methods = [
                                 m.name
                                 for m in node.body
-                                if isinstance(m, ast.FunctionDef)
-                                and m.name.startswith("test")
+                                if isinstance(m, ast.FunctionDef) and m.name.startswith("test")
                             ]
                             if methods:
-                                offenders.append(
-                                    f"{path.name}:{node.lineno} {node.name}"
-                                )
+                                offenders.append(f"{path.name}:{node.lineno} {node.name}")
         assert not offenders, (
             "test-looking definitions that pytest will not collect "
-            "(convert to TestCase/DataSuite or remove): "
-            + ", ".join(offenders)
+            "(convert to TestCase/DataSuite or remove): " + ", ".join(offenders)
         )
 
     @staticmethod
-    def _collectable(
-        name: str, bases: list[str], names: dict[str, ast.ClassDef]
-    ) -> bool:
+    def _collectable(name: str, bases: list[str], names: dict[str, ast.ClassDef]) -> bool:
         """Whether a Test* class is picked up by a collector."""
         if any(
             b in ("TestCase", "DataSuite", "DataDrivenTestCase", "Suite", "MypycDataSuite")
@@ -221,7 +212,9 @@ class TestCollectionGuard(TestCase):
         ):
             return True
         return any(
-            TestCollectionGuard._collectable(base, TestCollectionGuard._bases(names.get(base)), names)
+            TestCollectionGuard._collectable(
+                base, TestCollectionGuard._bases(names.get(base)), names
+            )
             for base in bases
             if base in names
         )
@@ -230,7 +223,4 @@ class TestCollectionGuard(TestCase):
     def _bases(node: ast.ClassDef | None) -> list[str]:
         if node is None:
             return []
-        return [
-            b.id if isinstance(b, ast.Name) else getattr(b, "attr", "?")
-            for b in node.bases
-        ]
+        return [b.id if isinstance(b, ast.Name) else getattr(b, "attr", "?") for b in node.bases]

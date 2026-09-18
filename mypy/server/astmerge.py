@@ -399,6 +399,7 @@ class NodeReplaceVisitor(TraverserVisitor):
         # patch (list item assignment, not attribute write). Re-capture so the
         # shadow stays in sync with the post-fixup state.
         from mypy import symtables_mirror
+
         if symtables_mirror._active:
             symtables_mirror._capture_meta(info, "astmerge_fixup")
 

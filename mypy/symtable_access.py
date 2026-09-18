@@ -98,6 +98,7 @@ def set_bases_mro(info: Any, bases: Any, mro: Any) -> None:
     if symtables_mirror._active:
         symtables_mirror._capture_meta(info, "bases_mro")
     from mypy.typestate import type_state
+
     type_state.reset_subtype_caches_for(info)
 
 
@@ -107,6 +108,7 @@ def set_meta(info: Any, metaclass_type: Any) -> None:
     if symtables_mirror._active:
         symtables_mirror._capture_meta(info, "metaclass_type")
     from mypy.typestate import type_state
+
     type_state.reset_subtype_caches_for(info)
 
 

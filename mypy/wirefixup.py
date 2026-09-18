@@ -775,7 +775,9 @@ class _TypeRefFixer(TypeTranslator):
     """
 
     def __init__(
-        self, typeinfo_map: dict[str, Any], alias_map: dict[str, Any] | None = None,
+        self,
+        typeinfo_map: dict[str, Any],
+        alias_map: dict[str, Any] | None = None,
         symbol_map: dict[str, Any] | None = None,
     ) -> None:
         super().__init__()

@@ -4051,11 +4051,7 @@ def append_invariance_notes(
                     key_same_result = is_same_type(arg_args[0], exp_args[0])
                     val_subtype_result = is_subtype(arg_args[1], exp_args[1])
             result = _type_kernel.rust_append_invariance_notes_live(
-                arg_type,
-                expected_type,
-                arg_subtype_result,
-                key_same_result,
-                val_subtype_result,
+                arg_type, expected_type, arg_subtype_result, key_same_result, val_subtype_result
             )
             if result is not None:
                 return notes + result
@@ -4175,10 +4171,7 @@ def make_inferred_type_note(
                     for sub_arg, sup_arg in zip(subtype.args, supertype.args)
                 ]
                 if _type_kernel.rust_make_inferred_type_note_live(
-                    subtype,
-                    supertype,
-                    arg_results,
-                    context,
+                    subtype, supertype, arg_results, context
                 ):
                     assert isinstance(context, ReturnStmt)
                     assert isinstance(context.expr, NameExpr)

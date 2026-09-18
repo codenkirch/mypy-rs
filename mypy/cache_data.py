@@ -83,11 +83,7 @@ def _try_native_write_cache_data(tree: MypyFile) -> bytes | None:
         return None
     try:
         out: bytes | None = _ast_serialize.write_cache_data(
-            tree,
-            _capture_type_opt,
-            _capture_type_list,
-            _capture_literal,
-            _capture_json,
+            tree, _capture_type_opt, _capture_type_list, _capture_literal, _capture_json
         )
     except (AssertionError, NotImplementedError, ValueError, OverflowError):
         return None

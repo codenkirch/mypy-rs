@@ -54,7 +54,11 @@ class ProperTypePlugin(Plugin):
     def declare_hook_fullnames(self) -> dict[str, frozenset[str]] | None:
         return {
             "get_function_hook": frozenset(
-                {"builtins.isinstance", "mypy.types.get_proper_type", "mypy.types.get_proper_types"}
+                {
+                    "builtins.isinstance",
+                    "mypy.types.get_proper_type",
+                    "mypy.types.get_proper_types",
+                }
             )
         }
 

@@ -188,9 +188,7 @@ class NativeDaemonStableHandleSuite(unittest.TestCase):
             ]
 
             def check() -> None:
-                res = server.check(
-                    sources, export_types=False, is_tty=False, terminal_width=-1
-                )
+                res = server.check(sources, export_types=False, is_tty=False, terminal_width=-1)
                 assert res["status"] == 0, res
 
             check()
