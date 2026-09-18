@@ -13,6 +13,13 @@ import, so production pays one boolean test and nothing else. The
 ``record_*`` functions bump unconditionally; a caller that does not want
 the count simply does not call them.
 
+Slice 1 wires only the two events the gate-off path already owns
+(``statements_dispatched``, ``visit_block_iterations``): every other key
+of ``_python_counts`` is an honest zero until its gate-off call site
+exists, so a ``record_*`` helper is added together with its caller, never
+before (a helper without a caller is a structural zero, the failure
+family AGENTS.md names for measurement code).
+
 The counter names mirror the Rust ``DriverCounters9`` field order
 verbatim. No name may be removed or reinterpreted without updating both
 sides and the plan: a name mismatch silently undercounts, which is the
@@ -88,28 +95,12 @@ def reset_stats() -> None:
 # --- Python-side records (the gate-off path) -------------------------------
 
 
-def record_driver_entered() -> None:
-    _python_counts["driver_entered"] += 1
-
-
 def record_statements_dispatched() -> None:
     _python_counts["statements_dispatched"] += 1
 
 
 def record_visit_block_iterations() -> None:
     _python_counts["visit_block_iterations"] += 1
-
-
-def record_deferred_nodes_deferred() -> None:
-    _python_counts["deferred_nodes_deferred"] += 1
-
-
-def record_unreachable_marked() -> None:
-    _python_counts["unreachable_marked"] += 1
-
-
-def record_breaks_taken() -> None:
-    _python_counts["breaks_taken"] += 1
 
 
 def python_counters() -> dict[str, int]:

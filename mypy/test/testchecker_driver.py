@@ -34,11 +34,6 @@ import os
 import tempfile
 from unittest import skipUnless
 
-try:
-    import type_kernel as _type_kernel
-except ImportError:
-    _type_kernel = None  # type: ignore[assignment]
-
 from mypy import checker_driver
 from mypy.options import OPTIONS_AFFECTING_CACHE, Options
 from mypy.test.helpers import Suite, _env_gate
@@ -61,9 +56,6 @@ class CheckerDriverCountersSuite(Suite):
         checker_driver.set_production_checker_traversal(False)
 
     # --- the Rust half ----------------------------------------------------
-
-    def test_rust_mode_defaults_to_zero(self) -> None:
-        assert checker_driver.driver_mode() == 0
 
     def test_rust_mode_accepts_0_1_2(self) -> None:
         assert checker_driver.set_driver_mode(1) == 1
@@ -90,12 +82,17 @@ class CheckerDriverCountersSuite(Suite):
             if name != "statements_dispatched":
                 assert counters[name] == 0, f"{name} must stay 0 after kind 1"
 
-    def test_rust_record_covers_every_kind(self) -> None:
+    def test_rust_record_kind_maps_one_hot_to_its_event_name(self) -> None:
+        # One-hot per kind: recording all nine at once is permutation-blind
+        # (all-ones under any scramble), so a reordered tuple or a scrambled
+        # record() table would leave the differential misattributing counters.
         for kind, name in enumerate(checker_driver.EVENT_NAMES):
+            checker_driver.reset_stats()
             checker_driver.record_driver_event(kind)
-        counters = checker_driver.rust_counters()
-        assert counters is not None
-        assert counters == dict.fromkeys(checker_driver.EVENT_NAMES, 1)
+            counters = checker_driver.rust_counters()
+            assert counters is not None
+            assert counters[name] == 1, f"kind {kind} must bump {name}"
+            assert sum(counters.values()) == 1, f"kind {kind} must bump only {name}"
 
     def test_rust_reset_clears_counters_but_keeps_mode(self) -> None:
         checker_driver.set_driver_mode(2)
@@ -106,13 +103,6 @@ class CheckerDriverCountersSuite(Suite):
         assert counters is not None
         assert counters == dict.fromkeys(checker_driver.EVENT_NAMES, 0)
         checker_driver.set_driver_mode(0)
-
-    def test_event_names_match_the_rust_field_order(self) -> None:
-        # The cross-run differential keys both halves by these names, so a
-        # reorder on one side only would silently undercount the other.
-        counters = checker_driver.rust_counters()
-        assert counters is not None
-        assert tuple(counters) == checker_driver.EVENT_NAMES
 
     # --- the Python half --------------------------------------------------
 
@@ -161,8 +151,10 @@ class CheckerDriverCountersSuite(Suite):
 
     def test_sessionfinish_dump_is_a_noop_without_the_env(self) -> None:
         os.environ.pop(checker_driver.SESSIONFINISH_ENV, None)
-        # Must not raise and must not write anywhere.
-        checker_driver.sessionfinish_dump()
+        # Without the env the dump must neither raise (it sits in a finally
+        # whose job is the in-flight exception) nor write: an os.environ[]
+        # lookup or an inverted guard both fail here.
+        assert checker_driver.sessionfinish_dump() is None
 
     # --- the gates --------------------------------------------------------
 

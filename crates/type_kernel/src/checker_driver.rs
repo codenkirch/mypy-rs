@@ -66,17 +66,7 @@ struct DriverCounters {
 /// `(driver_entered, statements_dispatched, callbacks_emitted,
 /// callbacks_raised, bailouts_to_python_loop, deferred_nodes_deferred,
 /// unreachable_marked, breaks_taken, visit_block_iterations)`.
-pub(crate) type DriverCounters9 = (
-    u64,
-    u64,
-    u64,
-    u64,
-    u64,
-    u64,
-    u64,
-    u64,
-    u64,
-);
+pub(crate) type DriverCounters9 = (u64, u64, u64, u64, u64, u64, u64, u64, u64);
 
 thread_local! {
     static DRIVER_STATE: RefCell<DriverCounters> = RefCell::new(DriverCounters::default());
