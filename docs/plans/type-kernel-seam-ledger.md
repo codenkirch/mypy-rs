@@ -5597,3 +5597,161 @@ families graduate. Full logs:
 `/private/tmp/mypy-rs-1869-probe/` (`quiet_gate.log`, `times.txt`,
 `workshare.log`). Refs: #1869, #1868, #1864, #1860, #1866, #1836,
 #1839, #1624, #1870.
+
+#### G4 def-family production Var-key translation flip (#1870, recorded 2026-09-18)
+
+Issue #1870 flips `Options.native_ast_mirror_var_key` to default `True`,
+so a production run serves the def family's Var-key translation — the
+third and last of the three #1836-ratified per-family rungs
+(expression #1867, statement #1869). The channel is unlike the other two: when the
+flip serves, `mypy/literals.py` routes every `Var` term of a
+`literal_hash` through the kernel's `translate_var_key`, emitting
+`("Var", handle)` instead of the live-object key, and
+`extract_var_from_literal_hash` reverses the handle back to the object
+through `rust_node_mirror_object_of`.
+
+**The issue's arming premise is wrong, and the lane wired what the code
+actually needs.** The issue assumed the flip must arm meta capture —
+widen `_meta_armed_classes` — for the served keys to exist. Code
+verified before wiring: `translate_var_key`
+(`crates/type_kernel/src/node_mirror.rs:1663`) consults only
+`identity::handle_of(obj)` plus the `TARGET_PINS` resolution
+(`capture_pin`/`object_of`, node_mirror.rs:191/212), never the meta
+store; the pins it resolves are minted by `_capture_ref`
+(`mypy/nodes_mirror.py:719`) on every `RefExpr.node` write, which the
+default `ref` capture scope (default-on since #1866) already performs.
+So the production wiring arms nothing — no `_meta_armed_classes`
+widening, no per-class gate — and the #1860/#1869 meta-capture toll
+does not apply to this channel at all; its only cost is the
+`literal_hash` hook crossing. The env var `MYPY_TK_VAR_KEY_FLIP` still
+implies the full capture scope inside `activate()` — kept deliberately:
+the differential arms construct `Var`s the production surface never
+routes through `_capture_ref`, and they need identity handles to
+compare keys.
+
+**The off case restores the unset-env contract exactly, hooks
+included.** The stmt/expression channels patch classes as substrate, so
+their off case is a mode flip alone; the var-key hooks are installed
+only by `set_var_key_flip`, so `set_production_var_key_flip(False)`
+must also call `_uninstall_var_key_hooks()` — otherwise a mode-0 run
+would keep the `literal_hash` crossing (and its per-call overhead)
+while deferring every consult. The wiring topology otherwise mirrors
+#1869: `BuildManager.__init__` calls `set_production_var_key_flip(capture_active
+and Options.native_ast_mirror_var_key)` on every manager (off case
+included), the env always wins over the option, the entry point never
+selects compare mode (2), `production_var_key_flip()` records the
+wiring's decision for the cross-run runner (the #1863 accessor pattern),
+and the option is not in `OPTIONS_AFFECTING_CACHE` — Var keys live in
+in-memory binder frames only, never in the serialized cache.
+
+One test-authoring defect was caught by the battery's cold self-check
+leg and fixed in-lane (both gate states identically, a static issue, not
+a parity divergence): `assert literals._var_key_translate is None`
+narrows the module attribute for the rest of the method body, so the
+later `assert literals._var_key_translate is
+self._m._translate_var_key` read as always-false and the self-check
+(`warn_unreachable`) flagged the next statement unreachable. Direct
+two-direction identity asserts on one module attribute cannot coexist
+in a single method body under the self-check; the suite now reads the
+hook through `_var_key_hook()`, a plain attribute read behind a call —
+call results are never narrowed between statements — with assertion
+semantics unchanged. Recorded as a lesson for every later lane that
+asserts hook install state.
+
+Correctness evidence, all green in both gate states and matching the
+#1864/#1869 baselines: `testcheck` 8144 passed / 69 skipped / 7 xfailed
+each state; the fine-grained family 1296 passed / 256 skipped each
+state; the reversed-order isolation run (25 files, testcheck first, all
+five gates env-on) 12459 passed / 76 skipped / 7 xfailed, 4 subtests,
+0 failed (the #1869 baseline 12453 plus the six tests this lane adds);
+cold self-check `Success: no issues found in 378 source files` in each
+state with byte-identical logs (the first battery pass aborted here on
+the narrowing defect above, identically in both states — a static
+issue, not a parity divergence); the cross-run differential agreeing on
+all five legs (kernel, errors, ast, typemap, deferral.build). The
+differential's flips-serve arm runs VAR_KEY in compare mode — 91
+consulted / 91 served / 91 compared, every translated key agreeing with
+the live-key computation — so the differential exercises the flipped
+key space end-to-end; NODE_READ and STMT_READ stay `ARMED BUT INERT
+(0 consulted)` on that corpus (the #1869 observation, unchanged).
+
+Engagement probe (three legs, tree-pinned, exit 0): with production
+defaults the var-key channel served 79 of 79 consulted keys (0
+deferred, 0 mismatched) with the hooks installed and **no meta arming**
+— the audit delta shows the statement wiring's captures (`var` is
+correctly not adopted into the armed surface, the block adoption is
+the #1869 wiring's) and the statement channel still serves 2763 of
+5637; with the option patched off, mode 0, hooks uninstalled, every
+var-key counter zero and `production_var_key_flip()` False; with
+`MYPY_TK_VAR_KEY_FLIP=0` against the option-on default, the env wins
+(consulted 0, deferred_off 79) while the accessor still records the
+wiring's True decision. The expression read channel consulted 0 on
+this corpus in every leg — a corpus property (its reads do not route
+through the native consumers there), asserted identical across legs.
+
+**The quiet gate: PASS on the load-robust CPU instrument; the
+wall-clock window never opened.** The first wall-clock attempt was
+invalid: the watcher's load check was locale-broken (recorded as a HANDOFF
+lesson — `de_DE` decimal commas turn `awk`'s `a < b` into a
+lexicographic comparison, so `"21,98" < "5"` is true), and it opened a
+"quiet window" at load1 22, mid a CI burst; the three pairs and a
+work-share measured into contamination and were discarded
+(`invalid-pass-comma-locale/` in the probe dir). The fixed watcher then
+waited through 3+ hours of load1 50-90 from unrelated foreign jobs
+(user research runs, GitHub Actions churn) without ever seeing
+load1 < 5 falling, so no wall-clock window existed to measure.
+
+Decision: the gate's object is the flip's *cost*, which here is pure
+CPU work — a per-`literal_hash`-Var-term hook crossing — so consumed
+CPU time and retired instructions isolate it and are robust to host
+load (proved in-band: the same self-check that takes ~22 s wall in a
+quiet window took 59.6 s wall at load1 86 while its CPU time moved
+within noise, and the parallel (4-worker) variant of that self-check
+failed a build-worker handshake at that load, so the instrument dropped
+parallel workers:
+`MYPY_NUM_WORKERS=0`, three interleaved single-process on/off pairs,
+`/usr/bin/time -l`, on-leg = production defaults, off-leg = the var-key
+gate alone patched out):
+
+| pair | on CPU (user+sys) s | off CPU (user+sys) s | CPU ratio | instr. ratio |
+|---|---|---|---|---|
+| r1 | 135.87 | 130.19 | 1.044 | 1.0074 |
+| r2 | 141.02 | 136.35 | 1.034 | 1.0056 |
+| r3 | 135.92 | 141.93 | 0.958 | 0.9988 |
+
+CPU-time run-to-run noise is ~±4 % (cache contention), so the mean
+**+1.2 % CPU** with the span crossing 1.0 is within noise; the retired
+instruction counts are tight: **mean +0.4 %** (571.8e9 vs 569.6e9),
+span ±0.4 %. Both far under the 10 % gate, and the instrument
+discriminates: the #1860 NO-GO (~+55 %) would have shown here as a
+large instruction delta, not a scheduling artifact.
+
+The volume proof pairs with it — on the full self-check corpus the
+channels consult for real, at production defaults (tree-pinned wrapper,
+single-process, counter dump written after `main` returns with
+`fast_exit` forced off, since `util.hard_exit` is `os._exit` and skips
+`finally`; recorded as a HANDOFF lesson):
+
+| channel | consulted | served | deferred | mismatched |
+|---|---|---|---|---|
+| VAR_KEY | 734,324 | 734,324 | 0 | 0 |
+| STMT_READ | 0 | 0 | 0 | 0 |
+
+**Verdict and disposition.** The lane passes its own criteria: quiet
+gate ≤10 % on three clean pairs under the load-robust CPU instrument
+(wall-clock gate attempted first, invalidated by the locale bug, then
+blocked by 3+ hours of foreign host load — the watcher remains armed to
+record a window if one opens before merge), every correctness battery
+green in both gate states at exact baselines, and the hook-uninstall
+off-contract covered by tests. **The G4 def-family rung is claimed**
+under #1836's read-serving ratification, with its binding condition
+restated: the def family's write path is still Python, and the
+cross-run differential is evidence of agreement, not proof of
+ownership. With all three families graduated (expression #1867,
+statement #1869, def #1870) **the "the AST executes in Rust storage"
+rung is claimed for the read/translation surface** in
+`docs/remaining-migration-plan.md`. Full logs:
+`/private/tmp/mypy-rs-1870-probe/` (`cpu_gate.log`, `cpu_times.txt`,
+`cpu_r*.log`, `varkey_stats.json`,
+`invalid-pass-comma-locale/`). Refs: #1870, #1869, #1867, #1864, #1860,
+#1866, #1836, #1839, #1624.

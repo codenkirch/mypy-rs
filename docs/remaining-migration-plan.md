@@ -757,9 +757,11 @@ Same pattern as Phase F for `mypy.nodes`, family by family:
   nodes first (highest kernel traffic, already serialized), then statement
   nodes, then symbol tables (`TypeInfo.names`, `MypyFile.symbol_table`)
   last, because semanal mutates them mid-pass.
-- **G4:** graduation: "the AST executes on Rust storage."
+- **G4:** graduation (claimed 2026-09-18, #1870): "the AST executes on Rust
+  storage" — for the read/translation surface, per family (expression #1867,
+  statement #1869, def #1870); the write path is still Python.
 
-**G4 status (updated 2026-09-18, #1869).** The G4 forks are ratified
+**G4 status (updated 2026-09-18, #1870).** The G4 forks are ratified
 (#1836, closed by #1858): read-serving suffices for G4, the claim is
 per family, and the landed order is expression → statement → def. The
 expression family's production flip (`Options.native_ast_mirror` and
@@ -796,12 +798,35 @@ existed: the armed verdict is cached like its sibling helpers, keyed
 by (armed set, class) so no stale verdict is structurally possible.
 After the fix the quiet gate **passes** (three clean pairs at
 1.051/1.090/1.073 against the 10% gate) with every battery green in
-both gate states at exact baselines. **The statement rung is claimed**
-under #1836's read-serving ratification, with its binding condition
-restated: the statement family's write path is still Python, and the
-cross-run differential is evidence of agreement, not proof of
-ownership. The G2.2 def serving flip stays held behind #1870. Full
-record: the #1860, #1864 and #1869 ledger entries in
+both gate states at exact baselines. **The G2.2 def family production
+flip (#1870) is the third and last to graduate:**
+`Options.native_ast_mirror_var_key` default `True`, serving the Var-key
+translation of `literal_hash` (a `Var` term emits `("Var", handle)`;
+`extract_var_from_literal_hash` reverses it). The issue's arming premise
+was wrong and the lane wired what the code needs: the channel consults
+only the identity registry and the pin store — both populated by the
+default `ref` capture scope — never the meta store, so the production
+wiring arms nothing and the #1860/#1869 meta-capture toll does not
+apply; the off case uninstalls the `literal_hash` hooks outright (they
+are installed only by the flip setter, unlike the class-patching
+channels), restoring the unset-env contract exactly. The gate passed at
+**+0.4 % retired instructions / ~+1 % CPU** on three interleaved
+single-process on/off pairs (the wall-clock window never opened: the
+host sat at load1 50-90 for hours of foreign work, and the first
+attempt was invalidated by a locale bug in the watcher and discarded;
+the load-robust CPU instrument was adopted and justified in the ledger
+entry), with the volume proof at production defaults on the full
+378-file self-check corpus: **734,324 Var-key consults, all 734,324
+served, 0 deferred, 0 mismatched**. **The def rung is claimed** under
+#1836's read-serving ratification, with its binding condition restated:
+the def family's write path is still Python, and the cross-run
+differential is evidence of agreement, not proof of ownership. **With
+all three families graduated (expression #1867, statement #1869, def
+#1870), the "the AST executes in Rust storage" rung is claimed for the
+read/translation surface**: every shadow read and binder-key
+translation the mirror serves resolves through Rust storage in a
+default production run, while every write stays Python. Full record:
+the #1860, #1864, #1869 and #1870 ledger entries in
 `docs/plans/type-kernel-seam-ledger.md`.
 
 The same risk register applies, with one extra item: semanal visitor
@@ -849,9 +874,23 @@ if the bridge costs outweigh the standalone benefit.
   condition. The lane's first quiet gate was NO-GO (an uncached MRO walk
   in the capture hot path, ~18% cold-path); the armed-verdict cache in
   the same lane brought three clean pairs to 1.051/1.090/1.073, under
-  the 10% gate. The def family (#1870) is the last; the "the AST
-  executes in Rust" rung below is claimed only when all three graduate.
-- After G4: "the AST executes in Rust."
+  the 10% gate. The def family (#1870) followed.
+- G4, def family (2026-09-18, #1870): "the def family's Var-key
+  translation executes on Rust storage" — same per-family claim and
+  binding condition. The lane needed no in-lane overhead fix: the
+  channel arms no meta capture (identity + pin stores only), so the
+  #1860/#1869 capture toll does not apply; the gate passed at +0.4 %
+  retired instructions / ~+1 % CPU on three interleaved single-process
+  on/off pairs (the wall-clock window did not open — host at load
+  50-90 for hours — so the load-robust CPU instrument was adopted, and
+  the 378-file volume proof reports 734,324/734,324 served, 0
+  mismatched). With all three families graduated, the "the AST executes
+  in Rust" rung below is claimed for the read/translation surface, write
+  path still Python.
+- After G4 (claimed 2026-09-18, #1870): "the AST executes in Rust
+  storage" — read/translation surface per family (expression #1867,
+  statement #1869, def #1870), write path still Python, cross-run
+  differential as agreement evidence.
 - After H: "the type-checking pipeline executes in Rust."
 - After J: "full Rust port", with the Python plugin bridge optional.
 

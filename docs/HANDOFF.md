@@ -122,6 +122,57 @@ PR #1862 closed unmerged, **branch preserved for the re-attempt**.
   classes — ~18% cold-path, a quiet-gate NO-GO. Cache per-class
   verdicts like the sibling helpers, and key the cache by the armed
   set itself so a reassignment (tests do this) can never read stale.
+- **A flip issue's arming premise is a hypothesis, not a spec**
+  (#1870): the issue assumed the def flip must widen meta capture, but
+  the channel reads only the identity registry and the pin store
+  (populated by the default `ref` scope), so the production wiring arms
+  nothing. Read the kernel's actual consult path before wiring capture
+  scope; following the premise would have re-paid the #1860 toll for
+  nothing.
+- **Two-direction identity asserts on one module attribute cannot
+  coexist in one body under `warn_unreachable`** (#1870):
+  `assert mod._hook is None` narrows the attribute for the rest of the
+  body, so a later `assert mod._hook is <callable>` reads always-false
+  and the next statement is flagged unreachable — the battery's cold
+  self-check leg catches it, identically in both gate states. Read
+  hooks through a call (`_var_key_hook()`); call results are not carried
+  between statements.
+- **Hooks installed only by the flip setter need an explicit off
+  uninstall** (#1870): the class-patching channels leave their substrate
+  patched and gate at run time, but the var-key `literal_hash` hooks
+  would keep the crossing (and its cost) with mode 0 alone; the off case
+  must call `_uninstall_var_key_hooks()`.
+- **`bash -n` a sed-adapted driver before launching it** (#1870): the
+  adapted battery.sh carried a doubled paren on the isolation loop's
+  array append; the first run aborted at an earlier leg, and bash only
+  parses a command when it reaches it, so the error surfaced two runs
+  later. A syntax check costs one second.
+- **The quiet-gate watcher's load check was locale-broken** (#1870):
+  `sysctl vm.loadavg` prints decimal commas under `de_DE`, so
+  `awk -v a="21,98" -v b="5" 'a < b'` compares strings lexicographically
+  ("21,98" < "5" is true, "46,20" < "5" is true) and the first watcher
+  opened a "quiet window" at load1 22, mid a CI burst — three pairs and
+  a work-share measured into contamination and were discarded
+  (`invalid-pass-comma-locale/`). Fix: pipe the load through
+  `tr ',' '.'`, and treat a gate log with comma decimals as
+  window-unverifiable. The #1869 window was genuinely quiet (load1 4-6,
+  ratios matching #1864's independent pass) so its PASS stands, but its
+  watcher carried the same latent bug.
+- **A load-robust gate for a CPU-bound flip: CPU time + retired
+  instructions** (#1870). When no wall-clock window exists (host at
+  load 50-90 for hours from foreign jobs), `/usr/bin/time -l` on
+  single-process (`MYPY_NUM_WORKERS=0`) cold self-checks gives
+  load-insensitive on/off ratios: the same run measured 59.6 s wall at
+  load1 86 vs ~22 s quiet while its CPU time stayed in noise, and the
+  4-worker variant failed a build-worker handshake under that load.
+  Retired instructions are the tightest signal (mean +0.4 %, span
+  ±0.4 %); CPU-time noise is ~±4 % (cache contention), so read the
+  span, not a single pair.
+- **`util.hard_exit` is `os._exit`: an at-exit counter dump never
+  runs** (#1870). mypy's `fast_exit` (default) calls `util.hard_exit`,
+  skipping every `finally` and destructor, so a wrapper's post-`main`
+  dump silently produced nothing. Force `Options.fast_exit = False` in
+  the wrapper (or accept the dump must happen inside the build).
 
 ## RESUME POINT — 2026-09-17, night (wave 11: 4 PRs merged; #1624's caching lever measured dead)
 
