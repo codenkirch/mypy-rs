@@ -62,6 +62,7 @@ def rust_node_mirror_capture_ref(
     fullname: str,
     is_new_def: bool,
     is_inferred_def: bool,
+    target: Any = ...,
 ) -> int: ...
 def rust_node_mirror_capture_analyzed(obj: Any, analyzed_kind: str | None) -> int: ...
 def rust_node_mirror_ref(handle: int) -> tuple[int | None, str | None, str, bool, bool] | None: ...
@@ -133,8 +134,7 @@ def rust_node_mirror_meta_entry_count() -> int: ...
 # `fields` are `(field, kind, text, num, items)` records as
 # `capture_meta` takes one of; it answers (handle, preexisting, minted, replaced).
 def rust_node_mirror_seed_loaded(
-    obj: Any,
-    fields: list[tuple[str, str, str | None, int | None, list[str] | None]],
+    obj: Any, fields: list[tuple[str, str, str | None, int | None, list[str] | None]]
 ) -> tuple[int, bool, int, int]: ...
 
 # Phase G2.1 (#1787 PR B): statement-family serving read flip.

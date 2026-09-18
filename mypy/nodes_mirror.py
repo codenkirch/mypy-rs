@@ -95,6 +95,17 @@ slot for is counted as a refusal (`meta_seed_rejected_untracked`) rather
 than passing silently, so "the seed declined" and "the seed never ran" are
 never the same reading.
 
+Capture scope (#1864): the default surface is the RefExpr binding family
+alone (`ref`), which is what every current serving flip reads;
+`MYPY_TK_CAPTURE_SCOPE=full` arms the whole surface (the G1.0b field
+arms, `analyzed`, and the G2 meta capture). Arming a meta flip
+(`MYPY_TK_STMT_READ_FLIP`, `MYPY_TK_VAR_KEY_FLIP` or
+`MYPY_TK_DEF_SEED_CONTROL`) implies the full meta surface, because those
+channels serve from records the narrow scope never writes. `activate`
+re-reads the scope env on every call, so one process can exercise both
+scopes; the runtime gates narrow and widen per call, while class patching
+only ever widens and a narrowed patch set is held at runtime instead.
+
 Blind channels, audited against #1787 §1(b):
 - `replace_object_state` (`mypy/util.py`): its `setattr` leg re-registers
   the surviving identity through the same hook, pinned by
@@ -118,8 +129,11 @@ Blind channels, audited against #1787 §1(b):
   `NodeSlotDeletionOutOfContractSuite`.
 
 Design notes:
-- Capture is via class-level monkeypatching of ``__setattr__`` on
-  ``RefExpr``, ``CallExpr``, ``IndexExpr`` and ``OpExpr``. These classes
+- Capture is via class-level monkeypatching of ``__setattr__``. #1864:
+  the ``RefExpr`` patch is always installed (the default `ref` scope);
+  ``CallExpr``, ``IndexExpr``, ``OpExpr`` and the other G1.0b expression
+  classes are patched only under the full capture scope, and the G2 meta
+  classes only when the meta surface is armed. These classes
   use ``__slots__`` but define no ``__setattr__`` of their own, so the
   patch composes cleanly and ``type(x) is NameExpr`` keeps working. When
   the gate is off nothing is patched, so the cost in normal runs is one
@@ -248,6 +262,11 @@ _audit_mode = False
 # Re-entrancy guard: a capture reads live fields, never writes them, but
 # the guard keeps a future field-property hook from recursing.
 _in_capture = False
+# #1864: runtime capture-scope state. `activate` re-reads the scope env
+# per call (gates narrow AND widen), while class patching is monotonic
+# widen-only: a widened patch set stays, gated at runtime.
+_capture_scope: str = "ref"
+_meta_armed: bool = False
 _ORIG_SETATTR: Any = object.__setattr__
 _ORIG_DELATTR: Any = object.__delattr__
 # id(node) -> native handle for every node the store holds a record for.
@@ -268,6 +287,13 @@ _STMT_READ_FLIP_ENV: Final = "MYPY_TK_STMT_READ_FLIP"
 # other flips: an unset variable leaves the key path untouched rather than
 # wiring a PyO3 crossing into every `literal_hash`.
 _VAR_KEY_FLIP_ENV: Final = "MYPY_TK_VAR_KEY_FLIP"
+
+# #1864: the capture scope. `ref` (the default) arms only the RefExpr
+# binding family; `full` arms the whole surface. Arming a meta flip
+# implies arming meta capture: it serves records the narrow scope omits.
+_CAPTURE_SCOPE_ENV: Final = "MYPY_TK_CAPTURE_SCOPE"
+_CAPTURE_SCOPES: Final[frozenset[str]] = frozenset({"ref", "full"})
+_DEF_SEED_ENV: Final = "MYPY_TK_DEF_SEED_CONTROL"
 
 # G2.4 (#1825): capture origins. A field record is attributed to the path
 # that materialized the object; the marker is module state, not a per-call
@@ -615,18 +641,24 @@ def _capture_ref(node: RefExpr) -> None:
             if isinstance(fullname, str):
                 node_fullname = fullname
             # G2 (#1787): pin the binding target under its identity handle
-            # so `rust_node_mirror_object_of` can resolve the handle back
-            # to this exact object later (the Var key substrate).
-            _kernel_mod.rust_node_mirror_capture_pin(target)
+            # so `rust_node_mirror_object_of` resolves it back later. #1864:
+            # the pin rides the same crossing (one kernel call per capture).
             _count("pin_target")
         handle = _kernel_mod.rust_node_mirror_capture_ref(
-            node, node.kind, node_fullname, node._fullname, node.is_new_def, node.is_inferred_def
+            node,
+            node.kind,
+            node_fullname,
+            node._fullname,
+            node.is_new_def,
+            node.is_inferred_def,
+            target,
         )
         # Seed the parse-time `name` slot only on first adoption: later
         # writes to an adopted node re-issue the identical record (#1714),
         # while adopted-only `_TEXT_FIELDS` capture covers real renames.
-        newly_adopted = id(node) not in _NODE_HANDLES
-        _NODE_HANDLES[id(node)] = handle
+        node_id = id(node)
+        newly_adopted = node_id not in _NODE_HANDLES
+        _NODE_HANDLES[node_id] = handle
         _count("capture_ref")
         if newly_adopted:
             _seed_name(node)
@@ -721,19 +753,30 @@ def _node_setattr(self: Any, name: str, value: Any) -> None:
             _count("baseline_skip.ref")
             return
         _capture_ref(self)
-    elif name == "analyzed" and value is None and id(self) not in _NODE_HANDLES:
-        _count("baseline_skip.analyzed")
     elif name == "analyzed":
+        # #1864: a G1.0b-expression capture arm; a no-op in the ref scope.
+        if _capture_scope != "full":
+            _count("scope_skip.analyzed")
+            return
+        if value is None and id(self) not in _NODE_HANDLES:
+            _count("baseline_skip.analyzed")
+            return
         _capture_analyzed(self)
     elif name in _TEXT_FIELDS:
         # G1.2 (#1674): a parse-time slot, so the constructor write is not
         # a capture trigger; only an adopted node can hold a stale record
-        # for it (`mypy/renaming.py` renames NameExpr slots in place).
+        # (`mypy/renaming.py` renames). All scopes: the read flip serves it.
         if _NODE_HANDLES.get(id(self)) is None:
             _count("baseline_skip." + name)
             return
         _capture_field(self, name)
     elif name in _FIELD_NAMES:
+        # #1864: the G1.0b field arms are reached through RefExpr-family
+        # writes too (`type_guard`, `def_var`, ...), so the runtime scope
+        # gate - not just the class patch set - keeps them inert in `ref`.
+        if _capture_scope != "full":
+            _count("scope_skip.field")
+            return
         if _NODE_HANDLES.get(id(self)) is None and _is_field_baseline(name, value):
             _count("baseline_skip." + name)
             return
@@ -940,6 +983,7 @@ _META_CTOR_FIELDS: Final[dict[type, frozenset[str]]] = {
 
 _META_FIELDS: dict[type, frozenset[str]] = {}
 _META_CTOR_CACHE: dict[type, frozenset[str]] = {}
+_META_NODE_CACHE: dict[type, frozenset[str]] = {}
 # id(node) -> native handle for every node the metadata store holds.
 _META_HANDLES: dict[int, int] = {}
 
@@ -974,12 +1018,15 @@ def _meta_ctor_fields(cls: type) -> frozenset[str]:
 
 def _meta_node_fields(cls: type) -> frozenset[str]:
     """Node-valued serve slots for a patched class or its subclasses."""
-    fields: frozenset[str] = frozenset()
-    for base in cls.__mro__:
-        found = _META_NODE_FIELDS.get(base)
-        if found is not None:
-            fields = found
-            break
+    fields = _META_NODE_CACHE.get(cls)
+    if fields is None:
+        fields = frozenset()
+        for base in cls.__mro__:
+            found = _META_NODE_FIELDS.get(base)
+            if found is not None:
+                fields = found
+                break
+        _META_NODE_CACHE[cls] = fields
     return fields
 
 
@@ -1153,6 +1200,11 @@ def seed_loaded(node: Any) -> int:
     """
     if not _active:
         return 0
+    if not _meta_armed:
+        # #1864: the seed only writes meta records, so an unarmed meta
+        # surface declines the whole call.
+        _count("seed_loaded.scope_skip")
+        return 0
     tracked = _meta_tracked(type(node))
     if not tracked:
         # The store tracks nothing for this class, so the seed declined.
@@ -1210,6 +1262,11 @@ def _meta_setattr(self: Any, name: str, value: Any) -> None:
     _ORIG_SETATTR(self, name, value)
     if not _active or _in_capture:
         return
+    if not _meta_armed:
+        # #1864: meta capture is armed only under the full scope (or a
+        # meta flip); the patch may still be installed from a wider call.
+        _count("scope_skip.meta")
+        return
     if name not in _meta_tracked(type(self)):
         return
     if id(self) not in _META_HANDLES and name in _meta_ctor_fields(type(self)):
@@ -1242,10 +1299,18 @@ def touch(node: Any, field: str) -> None:
     if not _active or _in_capture:
         return
     if field in _FIELD_NAMES:
+        # #1864: the G1.0b field arm is a no-op in the ref scope.
+        if _capture_scope != "full":
+            _count("scope_skip.touch")
+            return
         if _is_field_baseline(field, getattr(node, field)):
             return
         _capture_field(node, field)
         _count("touch." + field)
+        return
+    if not _meta_armed:
+        # #1864: the meta arm follows the same scope rule as capture.
+        _count("scope_skip.meta")
         return
     _capture_meta(node, field)
 
@@ -1256,6 +1321,11 @@ def _meta_delattr(self: Any, name: str) -> None:
     # record so absence keeps meaning "not recorded" (#1841).
     _ORIG_DELATTR(self, name)
     if not _active or _in_capture:
+        return
+    if not _meta_armed:
+        # #1864: same scope rule as `_meta_setattr` - an unarmed meta
+        # surface has no record to retract.
+        _count("scope_skip.meta")
         return
     if name not in _meta_tracked(type(self)):
         return
@@ -1297,6 +1367,32 @@ def _activate_meta() -> None:
             _count("meta_activate_failed.patch")
 
 
+_REF_PATCH_CLASSES: Final[tuple[type, ...]] = (RefExpr,)
+_WIDE_PATCH_CLASSES: Final[tuple[type, ...]] = (
+    CallExpr,
+    IndexExpr,
+    OpExpr,
+    ComparisonExpr,
+    StrExpr,
+    UnaryExpr,
+)
+
+
+def _patch_capture_classes(classes: tuple[type, ...]) -> bool:
+    """Install the capture ``__setattr__`` patch on each class (#1864)."""
+    for cls in classes:
+        try:
+            # A plain `type` reports as an incompatible assignment (unlike
+            # the old concrete-class call sites).
+            cls.__setattr__ = _node_setattr  # type: ignore[assignment]
+        except Exception:
+            # A compiled (mypyc) class refuses class-level patching; a
+            # partial install stays inert because `_active` never flips.
+            _count("activate_failed.patch")
+            return False
+    return True
+
+
 def _reset_meta() -> None:
     if _kernel_mod is not None:
         _kernel_mod.rust_node_mirror_meta_reset()
@@ -1312,14 +1408,46 @@ def activate(*, audit: bool = False) -> bool:
     state change, so the failure cannot half-activate and a retry is not
     swallowed by the one-shot guard.
 
+    The capture scope (#1864) is re-read on every call: the runtime gates
+    (and so the counter keys) narrow and widen per call, while class
+    patching only ever widens - a class patched under `full` stays
+    patched, its capture arms then gated by the runtime scope. This is
+    what lets one pytest process exercise both scopes.
+
     Returns whether the store is active afterwards, so a caller that
     gates a consumer on the shadow (the G1.2 read flip) can refuse to
     enable it against a missing extension instead of trusting the option.
     """
-    global _active, _audit_mode
+    global _active, _audit_mode, _capture_scope, _meta_armed
+    # #1864: parse the scope first, before the one-shot guard, so a bad
+    # value fails loudly with the module untouched and every retry sees
+    # the scope now in force.
+    raw_scope = os.environ.get(_CAPTURE_SCOPE_ENV, "ref")
+    scope = raw_scope or "ref"
+    if scope not in _CAPTURE_SCOPES:
+        raise ValueError(f"{_CAPTURE_SCOPE_ENV} must be 'ref' or 'full', got {raw_scope!r}")
+    # A meta flip needs the records it serves from, so arming one arms
+    # meta capture. The def-seed gate is presence-armed here; its values
+    # are a test-harness contract, not activate()'s to parse.
+    meta_armed = (
+        scope == "full"
+        or _STMT_READ_FLIP_ENV in os.environ
+        or _VAR_KEY_FLIP_ENV in os.environ
+        or _DEF_SEED_ENV in os.environ
+    )
     if _active:
+        _capture_scope = scope
+        _meta_armed = meta_armed
         if audit:
             _audit_mode = True
+        # Widen only: the classes a narrower earlier call left unpatched.
+        # Re-patching is a no-op; a failure is counted, not fatal, because
+        # the store is already live with the narrower surface.
+        if scope == "full":
+            _patch_capture_classes(_WIDE_PATCH_CLASSES)
+        if meta_armed:
+            _activate_meta()
+        _count(f"capture_scope.{scope}")
         return True
     # G1.1: parse and validate the env gate before anything is patched, so
     # a bad value fails loudly with the module untouched.
@@ -1360,20 +1488,22 @@ def activate(*, audit: bool = False) -> bool:
         _count("activate_failed.no_type_kernel")
         return False
     _audit_mode = audit
+    _capture_scope = scope
+    _meta_armed = meta_armed
     # G1.0b adds ComparisonExpr / StrExpr / UnaryExpr; NameExpr and
-    # MemberExpr already route through the RefExpr patch.
-    for cls in (RefExpr, CallExpr, IndexExpr, OpExpr, ComparisonExpr, StrExpr, UnaryExpr):
-        try:
-            cls.__setattr__ = _node_setattr  # type: ignore[method-assign]
-        except Exception:
-            # A compiled (mypyc) class refuses class-level patching; a
-            # partial install stays inert because `_active` never flips.
-            _count("activate_failed.patch")
-            return False
+    # MemberExpr already route through the RefExpr patch. #1864: RefExpr
+    # is the default surface; the rest patch only under `full` (monotonic).
+    if not _patch_capture_classes(_REF_PATCH_CLASSES):
+        return False
+    if scope == "full" and not _patch_capture_classes(_WIDE_PATCH_CLASSES):
+        return False
     _active = True
     _count("activate")
-    # G2.0 (#1577): patch the statement/def family (separate section).
-    _activate_meta()
+    _count(f"capture_scope.{scope}")
+    # G2.0 (#1577): patch the statement/def family (separate section), only
+    # when the meta surface is armed for this activation.
+    if _meta_armed:
+        _activate_meta()
     # G1.1: the serving mode is set only once capture is live, so the
     # channel can never answer from an empty store. The env var is the
     # measurement gate (see `_READ_FLIP_ENV`).

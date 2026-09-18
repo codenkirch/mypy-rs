@@ -51,9 +51,9 @@ pub(crate) struct NodeShadow {
     pub(crate) ref_captures: u64,
     pub(crate) analyzed_captures: u64,
     // ---- G1.0b: remaining G1 expression fields (wave 71A, #1576) ----
-    /// Per-field records keyed by Python slot name; map presence is the
-    /// "captured at least once" marker.
-    pub(crate) fields: HashMap<String, FieldValue>,
+    /// Per-field records keyed by interned Python slot name; map presence
+    /// is the "captured at least once" marker.
+    pub(crate) fields: HashMap<&'static str, FieldValue>,
     pub(crate) field_captures: u64,
 }
 
@@ -87,6 +87,8 @@ fn handle_or_error(obj: &PyAny) -> PyResult<u64> {
 }
 
 /// Capture the five binding scalars for `obj`; returns the identity handle.
+/// A present `target` (the `node` slot's binding target) is pinned under its
+/// own identity handle in the same crossing (#1787, folded by #1864).
 pub(crate) fn capture_ref(
     obj: &PyAny,
     kind: Option<i64>,
@@ -94,8 +96,13 @@ pub(crate) fn capture_ref(
     fullname: String,
     is_new_def: bool,
     is_inferred_def: bool,
+    target: Option<&PyAny>,
 ) -> PyResult<u64> {
     let handle = handle_or_error(obj)?;
+    let target_pin = match target {
+        Some(target) => Some((handle_or_error(target)?, Py::from(target))),
+        None => None,
+    };
     with_store(|store| {
         let entry = store.by_handle.entry(handle).or_default();
         entry.kind = kind;
@@ -106,6 +113,9 @@ pub(crate) fn capture_ref(
         entry.ref_captures += 1;
         store.pins.insert(handle, Py::from(obj));
     });
+    if let Some((target_handle, pin)) = target_pin {
+        TARGET_PINS.with(|cell| cell.borrow_mut().insert(target_handle, pin));
+    }
     Ok(handle)
 }
 
@@ -225,8 +235,10 @@ pub(crate) fn pin_count() -> usize {
 // ---- pyfunction wrappers ----
 
 /// Capture the `RefExpr` binding scalars; returns the identity handle.
+/// `target` (the `node` slot's binding target) is pinned under its own
+/// identity handle in the same crossing when given.
 #[pyfunction]
-#[pyo3(signature = (obj, kind, node_fullname, fullname, is_new_def, is_inferred_def))]
+#[pyo3(signature = (obj, kind, node_fullname, fullname, is_new_def, is_inferred_def, target=None))]
 pub(crate) fn rust_node_mirror_capture_ref(
     obj: &PyAny,
     kind: Option<i64>,
@@ -234,6 +246,7 @@ pub(crate) fn rust_node_mirror_capture_ref(
     fullname: String,
     is_new_def: bool,
     is_inferred_def: bool,
+    target: Option<&PyAny>,
 ) -> PyResult<u64> {
     capture_ref(
         obj,
@@ -242,6 +255,7 @@ pub(crate) fn rust_node_mirror_capture_ref(
         fullname,
         is_new_def,
         is_inferred_def,
+        target,
     )
 }
 
@@ -373,7 +387,8 @@ pub(crate) enum FieldValue {
     },
 }
 
-fn capture_field_value(obj: &PyAny, field: String, value: FieldValue) -> PyResult<u64> {
+fn capture_field_value(obj: &PyAny, field: &str, value: FieldValue) -> PyResult<u64> {
+    let field = intern_field(field);
     let handle = handle_or_error(obj)?;
     with_store(|store| {
         let entry = store.by_handle.entry(handle).or_default();
@@ -416,9 +431,9 @@ fn capture_field_value(obj: &PyAny, field: String, value: FieldValue) -> PyResul
 // normal capture hook.
 
 /// Interned field names. Field names come from the finite Python-side
-/// `_META_PATCHED` table, leaked once, so records store `&'static str`
+/// tracked-field tables, leaked once, so both stores hold `&'static str`
 /// keys without a per-capture key allocation.
-fn intern_meta_field(field: &str) -> &'static str {
+fn intern_field(field: &str) -> &'static str {
     static INTERNED: std::sync::OnceLock<std::sync::Mutex<HashMap<String, &'static str>>> =
         std::sync::OnceLock::new();
     let map = INTERNED.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
@@ -501,7 +516,7 @@ fn with_meta_store<T>(f: impl FnOnce(&mut MetaStore) -> T) -> T {
 /// A repeated field write replaces the tagged value in place.
 pub(crate) fn capture_meta(obj: &PyAny, field: &str, value: MetaValue) -> PyResult<u64> {
     let handle = handle_or_error(obj)?;
-    let field = intern_meta_field(field);
+    let field = intern_field(field);
     with_meta_store(|store| {
         let entry = store.by_handle.entry(handle).or_default();
         if let Some(existing) = entry.fields.iter_mut().find(|(name, _)| *name == field) {
@@ -564,7 +579,7 @@ pub(crate) fn rust_node_mirror_seed_loaded(
     let mut encoded: Vec<(&'static str, MetaValue)> = Vec::with_capacity(fields.len());
     for (field, kind, text, num, items) in fields {
         let value = meta_value_for(&kind, text, num, items)?;
-        encoded.push((intern_meta_field(&field), value));
+        encoded.push((intern_field(&field), value));
     }
     // A duplicate name from Python must not double-count: the repeat would
     // match the record this loop just pushed, counting the slot in `minted`
@@ -636,7 +651,7 @@ fn meta_value_for(
 #[pyfunction]
 pub(crate) fn rust_node_mirror_capture_field_kind(
     obj: &PyAny,
-    field: String,
+    field: &str,
     kind: Option<String>,
 ) -> PyResult<u64> {
     capture_field_value(obj, field, FieldValue::Kind(kind))
@@ -650,7 +665,7 @@ pub(crate) fn rust_node_mirror_capture_field_kind(
 #[pyo3(signature = (obj, field, kind, wire))]
 pub(crate) fn rust_node_mirror_capture_field_wire(
     obj: &PyAny,
-    field: String,
+    field: &str,
     kind: Option<String>,
     wire: Vec<u8>,
 ) -> PyResult<u64> {
@@ -669,7 +684,7 @@ pub(crate) fn rust_node_mirror_capture_field_wire(
 #[pyfunction]
 pub(crate) fn rust_node_mirror_capture_flag(
     obj: &PyAny,
-    field: String,
+    field: &str,
     value: bool,
 ) -> PyResult<u64> {
     capture_field_value(obj, field, FieldValue::Flag(value))
@@ -679,7 +694,7 @@ pub(crate) fn rust_node_mirror_capture_flag(
 #[pyfunction]
 pub(crate) fn rust_node_mirror_capture_field_name(
     obj: &PyAny,
-    field: String,
+    field: &str,
     name: Option<String>,
 ) -> PyResult<u64> {
     capture_field_value(obj, field, FieldValue::Name(name))
@@ -689,7 +704,7 @@ pub(crate) fn rust_node_mirror_capture_field_name(
 #[pyfunction]
 pub(crate) fn rust_node_mirror_capture_field_text(
     obj: &PyAny,
-    field: String,
+    field: &str,
     value: String,
 ) -> PyResult<u64> {
     capture_field_value(obj, field, FieldValue::Text(value))
@@ -699,7 +714,7 @@ pub(crate) fn rust_node_mirror_capture_field_text(
 #[pyfunction]
 pub(crate) fn rust_node_mirror_capture_field_kinds(
     obj: &PyAny,
-    field: String,
+    field: &str,
     kinds: Vec<Option<String>>,
 ) -> PyResult<u64> {
     capture_field_value(obj, field, FieldValue::Kinds(kinds))
@@ -758,7 +773,7 @@ pub(crate) fn rust_node_mirror_field(py: Python<'_>, handle: u64, field: &str) -
 pub(crate) fn rust_node_mirror_fields(handle: u64) -> Option<Vec<String>> {
     with_store(|store| {
         store.by_handle.get(&handle).map(|entry| {
-            let mut names: Vec<String> = entry.fields.keys().cloned().collect();
+            let mut names: Vec<String> = entry.fields.keys().map(|k| k.to_string()).collect();
             names.sort();
             names
         })
@@ -1262,7 +1277,7 @@ pub(crate) fn rust_node_mirror_meta_drop(handle: u64) -> bool {
 /// absence mean "not recorded" again (#1841). Returns whether the entry held it.
 #[pyfunction]
 pub(crate) fn rust_node_mirror_meta_retire_field(handle: u64, field: &str) -> bool {
-    let field = intern_meta_field(field);
+    let field = intern_field(field);
     with_meta_store(|store| {
         store.by_handle.get_mut(&handle).is_some_and(|entry| {
             let before = entry.fields.len();
@@ -2046,6 +2061,7 @@ mod node_mirror_tests {
                 "x".to_string(),
                 true,
                 false,
+                None,
             )
             .unwrap();
             assert_eq!(entry_count(), 1);
@@ -2072,7 +2088,7 @@ mod node_mirror_tests {
         with_py(|py| {
             reset();
             let obj = fresh_object(py);
-            let h = capture_ref(obj, None, None, String::new(), false, false).unwrap();
+            let h = capture_ref(obj, None, None, String::new(), false, false, None).unwrap();
             let h2 = capture_analyzed(obj, Some("CastExpr".to_string())).unwrap();
             assert_eq!(h, h2);
             assert_eq!(entry_count(), 1);
@@ -2106,8 +2122,8 @@ mod node_mirror_tests {
         with_py(|py| {
             reset();
             let obj = fresh_object(py);
-            let h = capture_ref(obj, Some(2), None, "y".to_string(), false, true).unwrap();
-            capture_ref(obj, Some(2), None, "y".to_string(), false, true).unwrap();
+            let h = capture_ref(obj, Some(2), None, "y".to_string(), false, true, None).unwrap();
+            capture_ref(obj, Some(2), None, "y".to_string(), false, true, None).unwrap();
             capture_analyzed(obj, None).unwrap();
             let (refs, analyzed) = with_store(|s| {
                 let e = s.by_handle.get(&h).unwrap();
@@ -2123,7 +2139,7 @@ mod node_mirror_tests {
         with_py(|py| {
             reset();
             let obj = fresh_object(py);
-            let h = capture_ref(obj, None, None, String::new(), false, false).unwrap();
+            let h = capture_ref(obj, None, None, String::new(), false, false, None).unwrap();
             assert!(retire(h));
             assert_eq!(entry_count(), 0);
             assert!(!retire(h));
@@ -2136,8 +2152,8 @@ mod node_mirror_tests {
             reset();
             let a = fresh_object(py);
             let b = fresh_object(py);
-            capture_ref(a, None, None, String::new(), false, false).unwrap();
-            capture_ref(b, None, None, String::new(), false, false).unwrap();
+            capture_ref(a, None, None, String::new(), false, false, None).unwrap();
+            capture_ref(b, None, None, String::new(), false, false, None).unwrap();
             assert_eq!(entry_count(), 2);
             assert_eq!(reset(), 2);
             assert_eq!(entry_count(), 0);
@@ -2150,7 +2166,7 @@ mod node_mirror_tests {
         with_py(|py| {
             reset();
             let obj = fresh_object(py);
-            let h = capture_ref(obj, None, None, String::new(), false, false).unwrap();
+            let h = capture_ref(obj, None, None, String::new(), false, false, None).unwrap();
             reset();
             // `rust_mirror_reset` alone owns `identity::reset`; the node
             // shadow reset must leave the raw handle registry alive.
@@ -2171,6 +2187,7 @@ mod node_mirror_tests {
                 "n".to_string(),
                 false,
                 true,
+                None,
             )
             .unwrap();
             assert_eq!(
@@ -2292,7 +2309,7 @@ mod node_field_shadow_tests {
             let obj = fresh_object(py);
             let h = capture_field_value(
                 obj,
-                "method_type".to_string(),
+                "method_type",
                 FieldValue::Kind(Some("CallableType".to_string())),
             )
             .unwrap();
@@ -2309,8 +2326,7 @@ mod node_field_shadow_tests {
         with_py(|py| {
             reset();
             let obj = fresh_object(py);
-            let h =
-                capture_field_value(obj, "as_type".to_string(), FieldValue::Kind(None)).unwrap();
+            let h = capture_field_value(obj, "as_type", FieldValue::Kind(None)).unwrap();
             let (tag, kind) = obj_field(py, h, "as_type")
                 .unwrap()
                 .extract::<(String, Option<String>)>(py)
@@ -2329,19 +2345,14 @@ mod node_field_shadow_tests {
         with_py(|py| {
             reset();
             let obj = fresh_object(py);
-            let h = capture_field_value(obj, "right_always".to_string(), FieldValue::Flag(true))
-                .unwrap();
+            let h = capture_field_value(obj, "right_always", FieldValue::Flag(true)).unwrap();
             let (tag, flag) = obj_field(py, h, "right_always")
                 .unwrap()
                 .extract::<(String, bool)>(py)
                 .unwrap();
             assert_eq!((tag.as_str(), flag), ("flag", true));
-            capture_field_value(
-                obj,
-                "def_var".to_string(),
-                FieldValue::Name(Some("mod.v".to_string())),
-            )
-            .unwrap();
+            capture_field_value(obj, "def_var", FieldValue::Name(Some("mod.v".to_string())))
+                .unwrap();
             let (tag, name) = obj_field(py, h, "def_var")
                 .unwrap()
                 .extract::<(String, Option<String>)>(py)
@@ -2357,7 +2368,7 @@ mod node_field_shadow_tests {
             let obj = fresh_object(py);
             let h = capture_field_value(
                 obj,
-                "method_types".to_string(),
+                "method_types",
                 FieldValue::Kinds(vec![Some("Instance".to_string()), None]),
             )
             .unwrap();
@@ -2375,9 +2386,9 @@ mod node_field_shadow_tests {
         with_py(|py| {
             reset();
             let obj = fresh_object(py);
-            let h = capture_ref(obj, None, None, "x".to_string(), false, false).unwrap();
-            capture_field_value(obj, "type_guard".to_string(), FieldValue::Kind(None)).unwrap();
-            capture_field_value(obj, "right_always".to_string(), FieldValue::Flag(true)).unwrap();
+            let h = capture_ref(obj, None, None, "x".to_string(), false, false, None).unwrap();
+            capture_field_value(obj, "type_guard", FieldValue::Kind(None)).unwrap();
+            capture_field_value(obj, "right_always", FieldValue::Flag(true)).unwrap();
             assert_eq!(entry_count(), 1);
             // The field captures must not clobber the ref record.
             assert_eq!(
@@ -2396,9 +2407,8 @@ mod node_field_shadow_tests {
         with_py(|py| {
             reset();
             let obj = fresh_object(py);
-            let h = capture_field_value(obj, "method_type".to_string(), FieldValue::Kind(None))
-                .unwrap();
-            capture_field_value(obj, "method_type".to_string(), FieldValue::Kind(None)).unwrap();
+            let h = capture_field_value(obj, "method_type", FieldValue::Kind(None)).unwrap();
+            capture_field_value(obj, "method_type", FieldValue::Kind(None)).unwrap();
             assert_eq!(rust_node_mirror_field_captures(h), Some(2));
             assert_eq!(rust_node_mirror_fields(h + 1), None);
             assert_eq!(rust_node_mirror_field_captures(h + 1), None);
@@ -2411,7 +2421,7 @@ mod node_field_shadow_tests {
         with_py(|py| {
             reset();
             let obj = fresh_object(py);
-            capture_field_value(obj, "method_type".to_string(), FieldValue::Kind(None)).unwrap();
+            capture_field_value(obj, "method_type", FieldValue::Kind(None)).unwrap();
             assert_eq!(reset(), 1);
             assert_eq!(entry_count(), 0);
             assert_eq!(rust_node_mirror_field_captures(1), None);
@@ -2425,26 +2435,21 @@ mod node_field_shadow_tests {
             let obj = fresh_object(py);
             let h = rust_node_mirror_capture_field_kind(
                 obj,
-                "method_type".to_string(),
+                "method_type",
                 Some("AnyType".to_string()),
             )
             .unwrap();
             assert_eq!(
-                rust_node_mirror_capture_flag(obj, "right_always".to_string(), true).unwrap(),
+                rust_node_mirror_capture_flag(obj, "right_always", true).unwrap(),
                 h
             );
             assert_eq!(
-                rust_node_mirror_capture_field_name(
-                    obj,
-                    "def_var".to_string(),
-                    Some("m.v".to_string())
-                )
-                .unwrap(),
-                h
-            );
-            assert_eq!(
-                rust_node_mirror_capture_field_kinds(obj, "method_types".to_string(), vec![None])
+                rust_node_mirror_capture_field_name(obj, "def_var", Some("m.v".to_string()))
                     .unwrap(),
+                h
+            );
+            assert_eq!(
+                rust_node_mirror_capture_field_kinds(obj, "method_types", vec![None]).unwrap(),
                 h
             );
             assert_eq!(rust_node_mirror_field_captures(h), Some(4));
@@ -2465,8 +2470,7 @@ mod node_field_shadow_tests {
         with_py(|py| {
             reset();
             let obj = fresh_object(py);
-            let h = rust_node_mirror_capture_field_text(obj, "name".to_string(), "x".to_string())
-                .unwrap();
+            let h = rust_node_mirror_capture_field_text(obj, "name", "x".to_string()).unwrap();
             let (tag, text) = obj_field(py, h, "name")
                 .unwrap()
                 .extract::<(String, String)>(py)
@@ -2474,12 +2478,12 @@ mod node_field_shadow_tests {
             assert_eq!((tag.as_str(), text.as_str()), ("text", "x"));
             assert_eq!(shadow_field_text(h, "name").as_deref(), Some("x"));
             // A field written as another shape is not served as text.
-            rust_node_mirror_capture_flag(obj, "is_special_form".to_string(), true).unwrap();
+            rust_node_mirror_capture_flag(obj, "is_special_form", true).unwrap();
             assert_eq!(shadow_field_text(h, "is_special_form"), None);
             // `is_new_def` is the G1.0a record field (never a map entry):
             // its default is False until a binding capture writes it.
             assert_eq!(shadow_is_new_def(h), Some(false));
-            rust_node_mirror_capture_ref(obj, Some(1), None, "m.x".to_string(), true, false)
+            rust_node_mirror_capture_ref(obj, Some(1), None, "m.x".to_string(), true, false, None)
                 .unwrap();
             assert_eq!(shadow_is_new_def(h), Some(true));
             // An unknown handle serves nothing (the caller keeps live).
@@ -2665,6 +2669,7 @@ mod g1_serving_tests {
                 "mod.x".into(),
                 true,
                 false,
+                None,
             )
             .unwrap();
             assert_eq!(serve_ref_scalars(obj), None);
@@ -2700,6 +2705,7 @@ mod g1_serving_tests {
                 "mod.x".into(),
                 true,
                 false,
+                None,
             )
             .unwrap();
             let served = serve_ref_scalars(obj).expect("a recorded ref must serve");
@@ -2756,10 +2762,10 @@ mod g1_serving_tests {
         with_py(|py| {
             start(1);
             let obj = fresh_ref(py);
-            capture_ref(obj, None, None, "".into(), false, false).unwrap();
+            capture_ref(obj, None, None, "".into(), false, false, None).unwrap();
             assert!(!serve_ref_scalars(obj).unwrap().is_new_def);
             obj.setattr("is_new_def", true).unwrap();
-            capture_ref(obj, Some(2), None, "mod.x".into(), true, false).unwrap();
+            capture_ref(obj, Some(2), None, "mod.x".into(), true, false, None).unwrap();
             let served = serve_ref_scalars(obj).unwrap();
             assert!(
                 served.is_new_def,
@@ -2774,7 +2780,7 @@ mod g1_serving_tests {
         with_py(|py| {
             start(1);
             let obj = fresh_ref(py);
-            capture_ref(obj, None, None, "".into(), false, false).unwrap();
+            capture_ref(obj, None, None, "".into(), false, false, None).unwrap();
             for _ in 0..5 {
                 assert!(serve_ref_scalars(obj).is_some());
             }
@@ -2792,7 +2798,7 @@ mod g1_serving_tests {
             let obj = fresh_ref(py);
             obj.setattr("kind", 1i64).unwrap();
             obj.setattr("fullname", "mod.x").unwrap();
-            capture_ref(obj, Some(1), None, "mod.x".into(), false, false).unwrap();
+            capture_ref(obj, Some(1), None, "mod.x".into(), false, false, None).unwrap();
             assert_eq!(serve_ref_scalars(obj).is_some(), true);
             let (_, served, _, _, compared, mismatched, errors) = served_counters();
             assert_eq!((served, compared, mismatched, errors), (1, 1, 0, 0));
@@ -2805,7 +2811,7 @@ mod g1_serving_tests {
             start(2);
             let obj = fresh_ref(py);
             obj.setattr("fullname", "mod.x").unwrap();
-            capture_ref(obj, None, None, "mod.x".into(), false, false).unwrap();
+            capture_ref(obj, None, None, "mod.x".into(), false, false, None).unwrap();
             // A live write no ref capture saw: the record is now stale, and
             // the compare must say so instead of passing.
             obj.setattr("is_new_def", true).unwrap();
@@ -2831,7 +2837,7 @@ mod g1_serving_tests {
                     None,
                 )
                 .unwrap();
-            capture_ref(obj, Some(1), None, "".into(), false, false).unwrap();
+            capture_ref(obj, Some(1), None, "".into(), false, false, None).unwrap();
             assert_eq!(verify_ref_scalars(obj), Some(false));
             let (_, _, _, _, compared, mismatched, errors) = served_counters();
             assert_eq!((compared, mismatched, errors), (1, 1, 1));
@@ -2854,7 +2860,7 @@ mod g1_serving_tests {
                     None,
                 )
                 .unwrap();
-            capture_ref(obj, None, None, "".into(), false, false).unwrap();
+            capture_ref(obj, None, None, "".into(), false, false, None).unwrap();
             assert_eq!(verify_ref_scalars(obj), Some(true));
             let (_, served, _, _, compared, mismatched, errors) = served_counters();
             assert_eq!((served, compared, mismatched, errors), (1, 1, 0, 0));
@@ -2877,7 +2883,7 @@ mod g1_serving_tests {
                     None,
                 )
                 .unwrap();
-            capture_ref(obj, None, None, "".into(), false, false).unwrap();
+            capture_ref(obj, None, None, "".into(), false, false, None).unwrap();
             assert_eq!(verify_ref_scalars(obj), Some(false));
             let (_, served, _, _, compared, mismatched, errors) = served_counters();
             assert_eq!((served, compared, mismatched, errors), (1, 1, 1, 1));
@@ -2902,7 +2908,7 @@ mod g1_serving_tests {
         with_py(|py| {
             start(0);
             let obj = fresh_ref(py);
-            capture_ref(obj, None, None, "".into(), false, false).unwrap();
+            capture_ref(obj, None, None, "".into(), false, false, None).unwrap();
             assert_eq!(verify_ref_scalars(obj), None);
             let (_, _, deferred_off, _, compared, _, _) = served_counters();
             assert_eq!((deferred_off, compared), (1, 0));

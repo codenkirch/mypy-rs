@@ -11,6 +11,7 @@ except ImportError:
     _splice_kernel = None  # type: ignore[assignment]
     _type_kernel = None  # type: ignore[assignment]
 
+import os
 import sys
 from collections.abc import Callable, Iterator
 from typing import Any, cast
@@ -4339,6 +4340,9 @@ class NativeAstMirrorSuite(Suite):
 
         from mypy import nodes_mirror
 
+        # #1864: `analyzed` capture needs the full scope.
+        os.environ[nodes_mirror._CAPTURE_SCOPE_ENV] = "full"
+        self.addCleanup(os.environ.pop, nodes_mirror._CAPTURE_SCOPE_ENV, None)
         nodes_mirror.activate(audit=True)
         nodes_mirror.reset(clear_counts=True)
         self._k = kernel
@@ -4569,6 +4573,9 @@ class NativeAstMirrorFieldSuite(Suite):
 
         from mypy import nodes_mirror
 
+        # #1864: the G1.0b field arms need the full scope.
+        os.environ[nodes_mirror._CAPTURE_SCOPE_ENV] = "full"
+        self.addCleanup(os.environ.pop, nodes_mirror._CAPTURE_SCOPE_ENV, None)
         nodes_mirror.activate(audit=True)
         nodes_mirror.reset(clear_counts=True)
         self._k = kernel
@@ -4777,6 +4784,9 @@ class NativeAstMirrorWireSuite(Suite):
 
         from mypy import nodes_mirror
 
+        # #1864: the wire-field arms need the full scope.
+        os.environ[nodes_mirror._CAPTURE_SCOPE_ENV] = "full"
+        self.addCleanup(os.environ.pop, nodes_mirror._CAPTURE_SCOPE_ENV, None)
         nodes_mirror.activate(audit=True)
         nodes_mirror.reset(clear_counts=True)
         self._k = kernel
@@ -4924,6 +4934,9 @@ class NativeStmtDefMirrorSuite(Suite):
 
         from mypy import nodes_mirror
 
+        # #1864: the meta capture arms need the full scope.
+        os.environ[nodes_mirror._CAPTURE_SCOPE_ENV] = "full"
+        self.addCleanup(os.environ.pop, nodes_mirror._CAPTURE_SCOPE_ENV, None)
         nodes_mirror.activate(audit=True)
         # TypeFixture builds real Vars/TypeInfos, so it must come before
         # the reset that zeroes the store for each test.
@@ -5918,6 +5931,10 @@ class NativeNodeShadowReadFlipSuite(Suite):
 
         from mypy import nodes_mirror
 
+        # #1864: one seed pin adopts through a CallExpr `analyzed` write,
+        # so the suite needs the full scope.
+        os.environ[nodes_mirror._CAPTURE_SCOPE_ENV] = "full"
+        self.addCleanup(os.environ.pop, nodes_mirror._CAPTURE_SCOPE_ENV, None)
         nodes_mirror.activate(audit=True)
         nodes_mirror.reset(clear_counts=True)
         self._k = kernel
@@ -6180,3 +6197,165 @@ class NativeNodeShadowReadFlipSuite(Suite):
                 sys.modules["type_kernel"] = saved_module
             nodes_mirror._active = saved_active
             nodes_mirror._kernel_mod = saved_kernel
+
+
+class NodeMirrorCaptureScopeSuite(Suite):
+    """#1864: the default capture scope arms only the RefExpr family.
+
+    The narrow scope is the production default. These tests pin its
+    runtime contract - the ref arms capture while the analyzed, field and
+    meta arms no-op with their own skip counters - plus the two arming
+    implications: `full` arms the whole surface, and a meta flip env arms
+    meta capture. `activate` re-reads the scope env on every call, so both
+    scopes are exercised in this one process.
+    """
+
+    def setUp(self) -> None:
+        import type_kernel as kernel
+
+        from mypy import nodes_mirror
+
+        self._k = kernel
+        self._m = nodes_mirror
+
+    def tearDown(self) -> None:
+        os.environ.pop(self._m._CAPTURE_SCOPE_ENV, None)
+        self._m.reset(clear_counts=True)
+
+    def _activate(self, scope: str | None) -> None:
+        """Arm `scope` (None: env unset) and zero the store for one test."""
+        if scope is None:
+            os.environ.pop(self._m._CAPTURE_SCOPE_ENV, None)
+        else:
+            os.environ[self._m._CAPTURE_SCOPE_ENV] = scope
+        assert self._m.activate(audit=True) is True
+        self._m.reset(clear_counts=True)
+
+    def _narrow_to_default(self) -> None:
+        # Widen first, then narrow: the patches from the wider call stay
+        # installed, so the runtime gate is the only thing left to test.
+        self._activate("full")
+        self._activate(None)
+
+    def test_default_scope_captures_the_ref_family_only(self) -> None:
+        self._activate(None)
+        ref = NameExpr("x")
+        ref.kind = GDEF
+        assert id(ref) in self._m._NODE_HANDLES, "the binding write must adopt"
+        counters = self._m.report()
+        assert counters.get("capture_ref") == 1, counters
+        assert counters.get("meta_capture", 0) == 0, counters
+        assert self._k.rust_node_mirror_meta_entry_count() == 0
+
+    def test_the_field_arms_noop_in_the_default_scope(self) -> None:
+        self._narrow_to_default()
+        member = MemberExpr(NameExpr("o"), "y")
+        member.kind = GDEF
+        before = self._m.report()
+        member.def_var = Var("y")
+        self._m.touch(member, "method_types")
+        after = self._m.report()
+        assert after.get("scope_skip.field", 0) - before.get("scope_skip.field", 0) == 1
+        assert after.get("scope_skip.touch", 0) - before.get("scope_skip.touch", 0) == 1
+        fields = self._k.rust_node_mirror_fields(self._m._NODE_HANDLES[id(member)]) or []
+        assert "def_var" not in fields, "a skipped field arm must not record"
+
+    def test_analyzed_noops_in_the_default_scope(self) -> None:
+        self._narrow_to_default()
+        call = CallExpr(NameExpr("f"), [], [], [])
+        before = self._m.report()
+        call.analyzed = NameExpr("x")
+        after = self._m.report()
+        assert after.get("scope_skip.analyzed", 0) - before.get("scope_skip.analyzed", 0) == 1
+        assert id(call) not in self._m._NODE_HANDLES, "a skipped arm must not adopt"
+
+    def test_meta_capture_and_seed_noop_in_the_default_scope(self) -> None:
+        self._narrow_to_default()
+        var = Var("x")
+        var.is_final = True
+        assert id(var) not in self._m._META_HANDLES, "an unarmed meta surface must not adopt"
+        assert self._m.seed_loaded(var) == 0
+        counters = self._m.report()
+        assert counters.get("scope_skip.meta", 0) >= 1, counters
+        assert counters.get("seed_loaded.scope_skip") == 1, counters
+        assert self._k.rust_node_mirror_meta_entry_count() == 0
+
+    def test_full_scope_arms_the_whole_surface(self) -> None:
+        self._activate("full")
+        call = CallExpr(NameExpr("f"), [], [], [])
+        call.analyzed = NameExpr("x")
+        member = MemberExpr(NameExpr("o"), "y")
+        member.kind = GDEF
+        member.def_var = Var("y")
+        var = Var("x")
+        var.is_final = True
+        assert self._m.seed_loaded(var) >= 1
+        counters = self._m.report()
+        assert counters.get("capture_analyzed") == 1, counters
+        assert counters.get("capture_def_var") == 1, counters
+        assert counters.get("meta_capture", 0) >= 1, counters
+        assert self._k.rust_node_mirror_meta_entry_count() >= 1
+
+    def test_a_meta_flip_env_arms_meta_capture(self) -> None:
+        # The flip serves from records the narrow scope never writes, so
+        # arming it implies arming their capture (#1864's arming rule).
+        self._activate(None)
+        os.environ[self._m._STMT_READ_FLIP_ENV] = "1"
+        self.addCleanup(os.environ.pop, self._m._STMT_READ_FLIP_ENV, None)
+        self.addCleanup(self._m.set_stmt_read_flip, 0)
+        assert self._m.activate(audit=True) is True
+        self._m.reset(clear_counts=True)
+        var = Var("x")
+        var.is_final = True
+        assert id(var) in self._m._META_HANDLES, "the flip env must arm meta capture"
+        assert self._m.report().get("meta_capture", 0) >= 1
+
+    def test_the_scope_env_is_reread_on_every_activate(self) -> None:
+        self._activate("full")
+        assert self._m._capture_scope == "full"
+        full_armed = self._m._meta_armed
+        assert full_armed is True
+        self._activate(None)
+        assert self._m._capture_scope == "ref"
+        assert self._m._meta_armed is False
+        var = Var("x")
+        var.is_final = True
+        assert id(var) not in self._m._META_HANDLES, "a re-read must narrow the runtime gate"
+        assert self._m.report().get("scope_skip.meta", 0) >= 1
+
+    def test_a_malformed_scope_env_raises_with_no_state_change(self) -> None:
+        self._activate(None)
+        before = self._m.report()
+        os.environ[self._m._CAPTURE_SCOPE_ENV] = "bogus"
+        raised = False
+        try:
+            self._m.activate()
+        except ValueError:
+            raised = True
+        assert raised, "a malformed scope env must be refused"
+        assert self._m._capture_scope == "ref"
+        assert self._m.report() == before, "a refused activate must change no state"
+        # Empty behaves like unset: the default scope, not a refusal.
+        os.environ[self._m._CAPTURE_SCOPE_ENV] = ""
+        assert self._m.activate() is True
+
+    def test_the_default_scope_patches_only_the_ref_family(self) -> None:
+        # Patching is monotonic, so an earlier full-scope activation in
+        # this process leaves the wide classes patched and this pin has
+        # nothing left to observe; the runtime gate is what holds them.
+        if CallExpr.__setattr__ is self._m._node_setattr:
+            return
+        self._activate(None)
+        assert RefExpr.__setattr__ is self._m._node_setattr
+        assert CallExpr.__setattr__ is not self._m._node_setattr
+
+    def test_binding_targets_are_still_pinned_in_the_default_scope(self) -> None:
+        self._activate(None)
+        var = Var("y")
+        expr = NameExpr("y")
+        expr.kind = GDEF
+        expr.node = var
+        handle = self._k.rust_node_mirror_handle_of(var)
+        assert handle is not None, "the pin must ride the default-scope ref capture"
+        assert self._k.rust_node_mirror_object_of(handle) is var
+        assert self._m.report().get("pin_target") == 1

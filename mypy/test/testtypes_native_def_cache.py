@@ -90,6 +90,9 @@ class DefCacheSeedSuite(Suite):
 
         self._m = nodes_mirror
         self._k = _type_kernel
+        # #1864: the seed writes meta records, so it needs the full scope.
+        os.environ[nodes_mirror._CAPTURE_SCOPE_ENV] = "full"
+        self.addCleanup(os.environ.pop, nodes_mirror._CAPTURE_SCOPE_ENV, None)
         self._m.activate(audit=True)
         self._m.reset(clear_counts=True)
         # Captured before any control lands, so a test that needs the real
@@ -456,6 +459,9 @@ class MetaSlotDeletionSuite(Suite):
 
         self._m = nodes_mirror
         self._k = _type_kernel
+        # #1864: the meta retraction arms need the full scope.
+        os.environ[nodes_mirror._CAPTURE_SCOPE_ENV] = "full"
+        self.addCleanup(os.environ.pop, nodes_mirror._CAPTURE_SCOPE_ENV, None)
         self._m.activate(audit=True)
         self._m.reset(clear_counts=True)
 
