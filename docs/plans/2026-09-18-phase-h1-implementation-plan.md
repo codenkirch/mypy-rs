@@ -4,6 +4,11 @@ Date: 2026-09-18. Base: `main` @ `9606f9fba` (G2.2 def-family Var-key flip, #187
 Worktree `feat/1861-h1`. Design of record: the #1770 brief and the
 `docs/plans/2026-09-13-phase-h-readiness-brief.md` corrections.
 
+> **Amendment 2026-09-18 (read before §0):** slices 2–3 below were superseded
+> by measurement during slice-1 review. Sections 0 and 5 are retained as the
+> original reasoning; see §6 for the recon, the PyO3 crossing microbenchmark,
+> the cProfile run, and the resulting decision. The evidence lives on #1861.
+
 ## 0. What this slice is, and the honest economics
 
 H1 replaces the Python checker's **control-flow loops** with a Rust driver that
@@ -171,3 +176,37 @@ invariant preserved.
    F-phase-derived and load-affected).
 4. Whether the H1b binder rung has any measured ratio (the slice table's ratio
    column is `-`).
+
+## 6. Amendment 2026-09-18: measurement revises slices 2–3
+
+Slice 1 landed the instrument; the instant it existed, the lane used it (and a
+profiler) to check the plan's economics before building either heavier slice.
+Three results, all recorded on #1861:
+
+1. **The driver is not the seam that makes the binder reachable (recon).**
+   Every `Frame.types` operation lives in `mypy/binder.py` at method
+   granularity, triggered from `FrameContext.__enter__/__exit__`, `assign_type`,
+   `put`, `get`, `cleanse`, `allow_jump`. None comes from the statement/block
+   loops the driver would own, so the join is reachable from Python-driven loops
+   exactly as the H1b flag store already is. The driver also cannot amortize the
+   join: the binder crossings happen inside the Python `visit_*` bodies, which
+   run under the driver too.
+2. **The 0.33 µs crossing figure is ~10× too high (microbenchmark).** Measured
+   on this host: a no-arg PyO3 crossing is ~28 ns, one-arg ~48 ns, versus a
+   ~24 ns Python call and an ~18 ns Python dict store. The driver is one
+   crossing *plus* one Python callback per statement, so it is a small net loss,
+   not the wash §0 assumed.
+3. **The binder is ~1.4% of the run, not "the real ownership mass" (cProfile).**
+   Summed `tottime` of every `mypy/binder.py` seam is 1.42% of a 6-file corpus
+   run; the hot mass is `semanal.py` 11.4%, `types.py` 9.9%,
+   `nodes_mirror.py` 9.5%, `nodes.py` 6.1%. Slice 3's ceiling is ~1.4%, under
+   after crossing and callback costs.
+
+**Decision.** Slice 2 is parked (measured basis, not cancelled). Slice 3's
+premise is falsified: "the real ownership mass is the binder" is true as *state
+owned* and false as *time spent*, so it is not built as a perf rung. The next
+lane target comes from the measured mass (the existing kernel-mirror direction
+over `types.py`/`nodes.py`/`semanal.py`), not a new checker-driver/binder rung.
+The parked rung's notes and these numbers are the record if a later endgame
+phase makes a Rust-owned checker loop structurally necessary.
+

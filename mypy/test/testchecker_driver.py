@@ -150,11 +150,15 @@ class CheckerDriverCountersSuite(Suite):
         assert dumped["python"]["statements_dispatched"] == 1
 
     def test_sessionfinish_dump_is_a_noop_without_the_env(self) -> None:
-        os.environ.pop(checker_driver.SESSIONFINISH_ENV, None)
-        # Without the env the dump must neither raise (it sits in a finally
-        # whose job is the in-flight exception) nor write: an os.environ[]
-        # lookup or an inverted guard both fail here.
-        assert checker_driver.sessionfinish_dump() is None
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "h1-{pid}.json")
+            # A stale value must be ignored once the env is cleared, and the
+            # call must not raise (it sits in a finally whose job is the
+            # in-flight exception): a cached env read or a KeyError fails here.
+            os.environ[checker_driver.SESSIONFINISH_ENV] = out
+            os.environ.pop(checker_driver.SESSIONFINISH_ENV, None)
+            checker_driver.sessionfinish_dump()
+            assert not os.path.exists(out.replace("{pid}", str(os.getpid())))
 
     # --- the gates --------------------------------------------------------
 
