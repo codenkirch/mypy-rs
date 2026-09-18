@@ -1415,9 +1415,9 @@ class BuildManager:
                 read_route=_view_arm >= 2,
                 audit=_os_view.environ.get("MYPY_TYPE_VIEW_AUDIT") == "1",
             )
-        # Phase G1 (#1572, #1860): dual-write node shadow, default on and
-        # family-agnostic (serving is decided per channel below). Wraps
-        # live node classes, independent of the type-kernel gate.
+        # Phase G1 (#1572, #1860): dual-write node shadow. Default off
+        # (#1624); family-agnostic (serving is decided per channel below).
+        # Wraps live node classes, independent of the type-kernel gate.
         capture_active = False
         from mypy import nodes_mirror
 

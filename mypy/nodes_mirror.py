@@ -25,14 +25,16 @@ G1.1 adds the store's first *mode-gated* serving read channel:
 `set_read_flip` selects a mode (0 off, 1 serve, 2 serve + differential
 compare) that the native dependency walker obeys when it reads the
 `RefExpr` binding scalars, so those reads are answered from the record
-instead of crossing to the live slots. Mode 1 is the production default
-(#1860, G4 expression-family graduation): `build` calls
-`set_production_read_flip` with the capture and `native_ast_mirror_read`
-gates, so a default production run serves, while an explicit
-`MYPY_TK_NODE_READ_FLIP` still wins for the measurement arms and mode 2
-is never a production mode. `read_counters` reports the channel's
-provenance (served, deferred, compared, mismatched), which is what makes
-a run's evidence checkable rather than assumed.
+instead of crossing to the live slots. Serving mode 1 is selected
+whenever the capture is armed (#1860, G4 expression-family graduation):
+`build` calls `set_production_read_flip` with the capture and
+`native_ast_mirror_read` gates, so a run serves only with the capture
+armed - and the capture is default-off since #1624, so a default
+production run does not serve - while an explicit `MYPY_TK_NODE_READ_FLIP`
+still wins for the measurement arms and mode 2 is never a production
+mode. `read_counters` reports the channel's provenance (served,
+deferred, compared, mismatched), which is what makes a run's evidence
+checkable rather than assumed.
 
 G2 store extension (#1787 / PR A, record-only, no consumer): the
 statement/def metadata store registers the constructor-set payload
@@ -54,10 +56,11 @@ served only in the exact shape the capture wrote (`Bool`); a
 shape-crossed record defers to the live slot, so record-shape drift can
 never answer a read. `stmt_read_counters` reports the same provenance
 seven-tuple as the G1.1 channel, which is what makes a run's evidence
-checkable rather than assumed. Mode 1 is the production default (#1869,
-G4 statement-family graduation): `build` calls
+checkable rather than assumed. Serving mode 1 is selected whenever the
+capture is armed (#1869, G4 statement-family graduation): `build` calls
 `set_production_stmt_read_flip` with the capture and
-`native_ast_mirror_stmt_read` gates, and the same call arms the four
+`native_ast_mirror_stmt_read` gates (and the capture is default-off since
+#1624, so a default run does not serve), and the same call arms the four
 serving classes' capture (the `stmt` scope below), because the default
 `ref` scope records none of them; an explicit `MYPY_TK_STMT_READ_FLIP`
 still wins for the measurement arms and mode 2 is never a production
@@ -84,9 +87,10 @@ that `extract_var_from_literal_hash` reverses through
 to the exact pinned `Var`, so an unresolvable key defers to the live object
 instead of keying a lookup on the wrong node. The mode lives in Rust storage
 (`FlipState`); the env var (`MYPY_TK_VAR_KEY_FLIP`) is the measurement gate,
-and since #1870 production serves mode 1 by default through
-`set_production_var_key_flip` (the off case uninstalls the hooks, so an
-unset env and a wiring-off build are the same untouched key path). The
+and since #1870 `set_production_var_key_flip` selects mode 1 whenever the
+capture is armed (the off case uninstalls the hooks, so an unset env and a
+wiring-off build are the same untouched key path; the capture is default-off
+since #1624, so a default run does not serve). The
 counters report `deferred == 0` in mode 2 to prove the key space stayed
 homogeneous.
 
@@ -144,11 +148,12 @@ Blind channels, audited against #1787 §1(b):
   deleted slot. The G1 record is not per-field where it matters - the five
   binding scalars the serving channel reads are one snapshot gated by a
   single presence marker (`ref_captures`) - so the #1841-style per-field
-  retire cannot cover them without new record state. #1860 sent the G1
-  serving flip default-on with this gap still open, by owner contract:
+  retire cannot cover them without new record state. #1860 first sent the
+  G1 serving flip default-on with this gap still open, by owner contract:
   no production `del` on a tracked G1 slot exists, the pins stay in force
   (`NodeSlotDeletionOutOfContractSuite`), and the write-flip work must
-  flip them knowingly.
+  flip them knowingly. The serving flip is now parked behind the capture
+  (default off, #1624), so the contract only binds a lane that re-arms it.
 
 Design notes:
 - Capture is via class-level monkeypatching of ``__setattr__``. #1864:
@@ -623,10 +628,10 @@ def set_production_var_key_flip(serve: bool) -> int:
 
     Serving arms nothing: the channel's substrate is the ref capture,
     which pins every binding target under its identity handle and is
-    default-on production surface already. `translate_var_key` consults
-    the identity registry and the pin store, never the meta store, so
-    widening `_meta_armed_classes` would add capture cost for records
-    this channel cannot read.
+    inert while the capture is off (default, #1624) and re-armed when it
+    is on. `translate_var_key` consults the identity registry and the pin
+    store, never the meta store, so widening `_meta_armed_classes` would
+    add capture cost for records this channel cannot read.
     """
     global _production_var_key_flip
     _production_var_key_flip = serve

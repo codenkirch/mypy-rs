@@ -426,11 +426,13 @@ class Options:
         # capture costs +23% instructions vs Python (issue #1624) and
         # the read surface re-arms from this flag alone.
         self.native_ast_mirror = False
-        # Phase G1.2/G1.1 (#1674, #1860): the expression serving reads serve
-        # from shadow storage when the capture is on. Not cache-affecting.
+        # Phase G1.2/G1.1 (#1674, #1860): the expression serving reads
+        # (aststrip lvalue, walker `RefExpr` scalars) serve when the capture
+        # is on. Not cache-affecting.
         self.native_ast_mirror_read = True
-        # Phase G2.1 (#1869): the statement serving reads serve from shadow
-        # storage when the capture is on. Not cache-affecting.
+        # Phase G2.1 (#1869): the statement serving reads (`Block.is_unreachable`,
+        # the three `expr` slots) serve when the capture is on. Not
+        # cache-affecting.
         self.native_ast_mirror_stmt_read = True
         # Phase G2.2 (#1870): the def family's `Var` binder-key translation
         # serves store handles when the capture is on. Not cache-affecting.
