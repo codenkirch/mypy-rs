@@ -20,8 +20,6 @@ jobs:
   full-battery:
     runs-on: ubuntu-latest
     timeout-minutes: 300
-    env:
-      PYTEST_XDIST_AUTO_NUM_WORKERS: "4"
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
