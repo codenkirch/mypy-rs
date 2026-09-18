@@ -121,6 +121,7 @@ from mypy.types import (
     _type_wire_cache,
     _type_wire_cache_hit,
     _wire_cache_enabled,
+    _wire_cache_storable,
     callable_with_ellipsis,
     find_unpack_in_list,
     flatten_nested_tuples,
@@ -4132,7 +4133,11 @@ def _serialize_typeanal_type(t: Type) -> bytes:
         return blob
     buf = _TypeanalWriteBuffer()
     result, fp = _serialize_with_taint_check(t, buf)
-    if _wire_cache_enabled() and (not isinstance(t, Instance) or t.type_ref is None):  # type: ignore[misc]
+    if (
+        _wire_cache_enabled()
+        and _wire_cache_storable(t)
+        and (not isinstance(t, Instance) or t.type_ref is None)  # type: ignore[misc]
+    ):
         _type_wire_cache[key] = (t, result, fp)
     return result
 

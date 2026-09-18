@@ -2228,7 +2228,7 @@ class WireCacheTvarFingerprintSuite(Suite):
         second = _serialize_type_for_checkexpr(c)
         assert second is first, "unchanged fingerprint must serve the cached blob"
 
-    def test_meta_level_mutation_rewalks_and_restores(self) -> None:
+    def test_meta_level_mutation_rewalks(self) -> None:
         from mypy.checkexpr import _serialize_type_for_checkexpr
         from mypy.types import _type_wire_cache
 
@@ -2324,6 +2324,36 @@ class WireCacheTvarFingerprintSuite(Suite):
         finally:
             _set_type_wire_cache_enabled(True)
         assert b2.getvalue() == ref.getvalue()
+
+    @skipUnless(_SPLICE_ACTIVE, "splice path needs librt write_raw_bytes")
+    def test_precached_child_splice_merges_fingerprint(self) -> None:
+        from mypy.checkexpr import _serialize_type_for_checkexpr
+        from mypy.types import UnionType, _type_wire_cache
+
+        child = self._tvar_callable()
+        _serialize_type_for_checkexpr(child)  # child gets its own entry
+        parent = UnionType([child])
+        stale = _serialize_type_for_checkexpr(parent)  # nested splice hit
+        fp = _type_wire_cache[id(parent)][2]
+        assert fp is not None, "a spliced child must merge its triples"
+        assert (self.fx.t, self.fx.t.id, 0) in fp, fp
+        self.fx.t.id.meta_level = 1
+        fresh = _serialize_type_for_checkexpr(parent)
+        assert fresh != stale, "a merged fingerprint must reject the stale parent"
+        assert _type_wire_cache[id(parent)][1] is fresh
+
+    def test_bare_tvar_is_never_a_cache_root(self) -> None:
+        from mypy.checkexpr import _serialize_type_for_checkexpr
+        from mypy.types import _type_wire_cache
+
+        _serialize_type_for_checkexpr(self.fx.t)
+        assert id(self.fx.t) not in _type_wire_cache, "bare tvars must not be roots"
+        c = self._tvar_callable()
+        stale = _serialize_type_for_checkexpr(c)
+        fp = _type_wire_cache[id(c)][2]
+        assert fp is not None and (self.fx.t, self.fx.t.id, 0) in fp, fp
+        self.fx.t.id.meta_level = 1
+        assert _serialize_type_for_checkexpr(c) != stale
 
 
 @skipUnless(_HAS_TYPE_KERNEL, "requires the type_kernel extension")

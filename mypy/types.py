@@ -143,7 +143,6 @@ _type_wire_cache_enabled: bool = False
 # Tvar safety: meta_level is mutated in place and `.id` can be rebound,
 # so tvar bytes can go stale. Each outermost session records touched
 # nodes here; the fingerprint gates reuse (_type_wire_cache_hit).
-_type_wire_cache_saw_tvar: int = 0
 _type_wire_cache_session_depth: int = 0
 _type_wire_cache_tvars: dict[int, tuple[TypeVarLikeType, TypeVarId, int]] = {}
 
@@ -155,6 +154,11 @@ _type_mirror_splice_check: Callable[[Type, bytes], None] | None = None
 
 def _clear_type_wire_cache() -> None:
     _type_wire_cache.clear()
+    # The accumulator pins the last session's tvar nodes and their bounds;
+    # drop them with the entries. Never clear mid-session: the in-flight
+    # fingerprint depends on it.
+    if _type_wire_cache_session_depth == 0:
+        _type_wire_cache_tvars.clear()
 
 
 def _set_type_wire_cache_enabled(on: bool) -> None:
@@ -164,6 +168,17 @@ def _set_type_wire_cache_enabled(on: bool) -> None:
 
 def _wire_cache_enabled() -> bool:
     return _type_wire_cache_enabled
+
+
+def _wire_cache_storable(t: Type) -> bool:
+    """Whether `t` may be stored as a wire-cache root entry.
+
+    False for bare tvar roots: a stored bare tvar would hit in
+    `_write_type_cached` before the recording branch fires, and the
+    splice would skip the walk that records it, starving the enclosing
+    fingerprint. Re-walking a bare tvar costs a few dozen bytes.
+    """
+    return not isinstance(t, TypeVarLikeType)
 
 
 def _record_tvar_fingerprint(t: TypeVarLikeType) -> None:
@@ -4766,7 +4781,9 @@ def _serialize_type_for_visitor(t: Type) -> bytes:
     if fp is not None:
         if _serialize_stats_on:
             _serialize_stats["tvar"] += 1
-    if _wire_cache_enabled() and (not isinstance(t, Instance) or t.type_ref is None):  # type: ignore[misc]
+    # Bare tvars are never cache roots (they would shadow the recording
+    # branch in _write_type_cached for every enclosing serialization).
+    if _wire_cache_enabled() and not isinstance(t, TypeVarLikeType) and (not isinstance(t, Instance) or t.type_ref is None):  # type: ignore[misc]
         if _serialize_stats_on:
             _serialize_stats["writes"] += 1
             _serialize_stats["bytes"] += len(result)
@@ -5610,13 +5627,17 @@ def _write_type_cached(t: Type, data: WriteBuffer) -> None:
     of every (node, TypeVarId, meta_level) the serialization walk touched:
     inference mutates meta_level in place (applytype.py, typeops.py) and
     can rebind `.id`, so a fingerprint mismatch downgrades the entry to
-    a miss and the type is re-walked (never stale bytes).
+    a miss and the type is re-walked (never stale bytes). A nested cache
+    hit merges its recorded triples into the enclosing session's
+    fingerprint, so a spliced child keeps the parent's fingerprint
+    complete. Bare tvars are never stored as cache roots, here or in the
+    serialize funnels.
 
     No-op (plain t.write) while _type_wire_cache_enabled is False,
     which covers semanal/typeanal where Type objects are still mutable.
     Also falls back to plain t.write when librt predates write_raw_bytes.
     """
-    global _type_wire_cache_saw_tvar, _type_wire_cache_session_depth
+    global _type_wire_cache_session_depth
     if not _type_wire_cache_enabled or write_raw_bytes is None:
         if write_raw_bytes is None and _type_wire_cache_session_depth > 0:
             # No-librt fallback: funnels still store at session exit, so
@@ -5635,14 +5656,22 @@ def _write_type_cached(t: Type, data: WriteBuffer) -> None:
                 _serialize_stats["tvar_hits"] += 1
             if _type_mirror_splice_check is not None:
                 _type_mirror_splice_check(t, entry[1])
+            if fp is not None and _type_wire_cache_session_depth > 0:
+                # A nested hit splices without re-walking, so nothing else
+                # records the child's tvars; merge them or the outermost
+                # store can keep a fingerprint that never rejects a mutant.
+                for node, tvid, level in fp:
+                    node_key = id(node)
+                    if node_key not in _type_wire_cache_tvars:
+                        _type_wire_cache_tvars[node_key] = (node, tvid, level)
             write_raw_bytes(data, entry[1])
             return
         if _serialize_stats_on:
             _serialize_stats["tvar_reject"] += 1
     if isinstance(t, (TypeVarType, ParamSpecType, TypeVarTupleType)):
         # Bare tvar: never stored as a cache root (its own bytes change
-        # with meta_level), but recorded for the enclosing session.
-        _type_wire_cache_saw_tvar += 1
+        # with meta_level; funnels exclude them too), but recorded for the
+        # enclosing session.
         _record_tvar_fingerprint(t)
         t.write(data)
         return
@@ -5654,7 +5683,6 @@ def _write_type_cached(t: Type, data: WriteBuffer) -> None:
     # Outermost: isolate bytes via temp buffer, record tvars, store with
     # the session fingerprint.
     _type_wire_cache_session_depth += 1
-    _type_wire_cache_saw_tvar = 0
     _type_wire_cache_tvars.clear()
     tmp = WriteBuffer()
     try:
@@ -5683,9 +5711,8 @@ def _serialize_with_taint_check(
     entry is served only while every recorded (node, TypeVarId,
     meta_level) triple still holds.
     """
-    global _type_wire_cache_saw_tvar, _type_wire_cache_session_depth
+    global _type_wire_cache_session_depth
     _type_wire_cache_session_depth += 1
-    _type_wire_cache_saw_tvar = 0
     _type_wire_cache_tvars.clear()
     try:
         t.write(buf)

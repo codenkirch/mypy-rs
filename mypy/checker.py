@@ -311,6 +311,7 @@ from mypy.types import (
     _type_wire_cache,
     _type_wire_cache_hit,
     _wire_cache_enabled,
+    _wire_cache_storable,
     find_unpack_in_list,
     flatten_nested_unions,
     get_proper_type,
@@ -1111,7 +1112,11 @@ def _serialize_type_for_checker(t: Type) -> bytes:
     if fp is not None:
         if _serialize_stats_on:
             _serialize_stats["tvar"] += 1
-    if _wire_cache_enabled() and (not isinstance(t, Instance) or t.type_ref is None):  # type: ignore[misc]
+    if (
+        _wire_cache_enabled()
+        and _wire_cache_storable(t)
+        and (not isinstance(t, Instance) or t.type_ref is None)  # type: ignore[misc]
+    ):
         if _serialize_stats_on:
             _serialize_stats["writes"] += 1
             _serialize_stats["bytes"] += len(result)

@@ -41,6 +41,7 @@ from mypy.types import (
     _type_wire_cache,
     _type_wire_cache_hit,
     _wire_cache_enabled,
+    _wire_cache_storable,
     flatten_nested_unions,
     get_proper_type,
     read_type,
@@ -217,7 +218,11 @@ def _serialize_type(t: Type) -> bytes:
             return _BUILTIN_INSTANCE_BYTES[fn]
     buf = _WriteBuffer()
     result, fp = _serialize_with_taint_check(t, buf)
-    if _wire_cache_enabled() and (type(t) is not Instance or t.type_ref is None):
+    if (
+        _wire_cache_enabled()
+        and _wire_cache_storable(t)
+        and (type(t) is not Instance or t.type_ref is None)
+    ):
         _type_wire_cache[key] = (t, result, fp)
     return result
 
