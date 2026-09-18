@@ -2551,11 +2551,17 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
             # otherwise (user plugins, registry absent, or a real match).
             if not plugin_call_hook_known_absent(callable_name):
                 if object_type is not None:
-                    method_sig_hook = self._try_native_plugin_hook(
-                        callable_name, "get_method_signature_hook"
-                    )
-                    if method_sig_hook is None:
-                        method_sig_hook = self.plugin.get_method_signature_hook(callable_name)
+                    # Per-kind pre-gate: a registry-proven absent kind
+                    # makes both the seam and the Python chain return
+                    # None, so skip both without the Rust round trip.
+                    if not plugin_hook_known_absent("get_method_signature_hook", callable_name):
+                        method_sig_hook = self._try_native_plugin_hook(
+                            callable_name, "get_method_signature_hook"
+                        )
+                        if method_sig_hook is None:
+                            method_sig_hook = self.plugin.get_method_signature_hook(callable_name)
+                    else:
+                        method_sig_hook = None
                     if method_sig_hook:
                         return self.apply_method_signature_hook(
                             callee,
@@ -2567,11 +2573,18 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
                             method_sig_hook,
                         )
                 else:
-                    function_sig_hook = self._try_native_plugin_hook(
-                        callable_name, "get_function_signature_hook"
-                    )
-                    if function_sig_hook is None:
-                        function_sig_hook = self.plugin.get_function_signature_hook(callable_name)
+                    # Per-kind pre-gate, same contract as the method
+                    # branch above.
+                    if not plugin_hook_known_absent("get_function_signature_hook", callable_name):
+                        function_sig_hook = self._try_native_plugin_hook(
+                            callable_name, "get_function_signature_hook"
+                        )
+                        if function_sig_hook is None:
+                            function_sig_hook = self.plugin.get_function_signature_hook(
+                                callable_name
+                            )
+                    else:
+                        function_sig_hook = None
                     if function_sig_hook:
                         return self.apply_function_signature_hook(
                             callee, args, arg_kinds, context, arg_names, function_sig_hook
@@ -3283,6 +3296,9 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
             and (
                 (
                     object_type is None
+                    # Per-kind pre-gate: provable absence means the seam
+                    # declines and the Python chain returns None.
+                    and not plugin_hook_known_absent("get_function_hook", callable_name)
                     and (
                         self._try_native_plugin_hook(callable_name, "get_function_hook")
                         or self.plugin.get_function_hook(callable_name)
@@ -3290,6 +3306,7 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
                 )
                 or (
                     object_type is not None
+                    and not plugin_hook_known_absent("get_method_hook", callable_name)
                     and (
                         self._try_native_plugin_hook(callable_name, "get_method_hook")
                         or self.plugin.get_method_hook(callable_name)

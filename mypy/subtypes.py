@@ -936,8 +936,10 @@ def _is_subtype(
         # buffer did not include this pair).
         try:
             result = _type_kernel.rust_is_subtype(
-                _serialize_type(left),
-                _serialize_type(right),
+                # Reuse the batch attempt's wire bytes when it produced
+                # them; re-serialize only if that attempt declined.
+                left_bytes if left_bytes is not None else _serialize_type(left),
+                right_bytes if right_bytes is not None else _serialize_type(right),
                 subtype_context.ignore_type_params,
                 subtype_context.ignore_declared_variance,
                 subtype_context.always_covariant,
