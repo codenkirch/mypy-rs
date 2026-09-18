@@ -83,9 +83,12 @@ that `extract_var_from_literal_hash` reverses through
 `rust_node_mirror_object_of`. A handle only translates when it resolves back
 to the exact pinned `Var`, so an unresolvable key defers to the live object
 instead of keying a lookup on the wrong node. The mode lives in Rust storage
-(`FlipState`), the gate is opt-in (`MYPY_TK_VAR_KEY_FLIP`, an unset
-variable wires no hook into `literal_hash`), and the counters report
-`deferred == 0` in mode 2 to prove the key space stayed homogeneous.
+(`FlipState`); the env var (`MYPY_TK_VAR_KEY_FLIP`) is the measurement gate,
+and since #1870 production serves mode 1 by default through
+`set_production_var_key_flip` (the off case uninstalls the hooks, so an
+unset env and a wiring-off build are the same untouched key path). The
+counters report `deferred == 0` in mode 2 to prove the key space stayed
+homogeneous.
 
 G2.4 (#1825) makes the store's cache-loaded coverage a contract rather
 than a by-product of the reader. The fixed-format and JSON cache readers
@@ -112,10 +115,13 @@ classes the G2.1 channel serves (`Block`, `AssertStmt`, `ReturnStmt`,
 `ExpressionStmt`) beside it; `full` arms the whole surface (the G1.0b
 field arms, `analyzed`, and the G2 meta capture). Production arms `stmt`
 through the wiring (#1869): `set_production_stmt_read_flip` widens the
-armed classes and never narrows them. Arming a meta flip
-(`MYPY_TK_STMT_READ_FLIP`, `MYPY_TK_VAR_KEY_FLIP` or
-`MYPY_TK_DEF_SEED_CONTROL`) implies the full meta surface, because those
-channels serve from records the narrow scope never writes. `activate`
+armed classes and never narrows them. Production var-key serving (#1870)
+arms nothing: it serves from the ref capture's pins, never the meta
+store. Arming a meta flip env (`MYPY_TK_STMT_READ_FLIP`,
+`MYPY_TK_VAR_KEY_FLIP` or `MYPY_TK_DEF_SEED_CONTROL`) still implies the
+full meta surface: the statement and seed channels serve from records
+the narrow scope never writes, and the var-key differential wants every
+constructed `Var` to hold an identity handle. `activate`
 re-reads the scope env on every call, so one process can exercise every
 scope; the runtime gates narrow and widen per call, while class patching
 only ever widens and a narrowed patch set is held at runtime instead.
@@ -291,6 +297,8 @@ _meta_armed_classes: frozenset[type] = frozenset()
 _production_read_flip: bool = False
 # #1869: what `set_production_stmt_read_flip` last wired, same contract.
 _production_stmt_flip: bool = False
+# #1870: what `set_production_var_key_flip` last wired, same contract.
+_production_var_key_flip: bool = False
 _ORIG_SETATTR: Any = object.__setattr__
 _ORIG_DELATTR: Any = object.__delattr__
 # id(node) -> native handle for every node the store holds a record for.
@@ -598,6 +606,48 @@ def var_key_counters() -> dict[str, int]:
         "mismatched": int(mismatched),
         "compare_errors": int(compare_errors),
     }
+
+
+def set_production_var_key_flip(serve: bool) -> int:
+    """Set the G2.2 mode a production build runs (#1870).
+
+    `serve` is `capture_active and Options.native_ast_mirror_var_key`. With
+    both on, the `Var` binder-key translation serves store handles (mode 1).
+    The off case restores the unset-env contract exactly: mode 0 with the
+    hooks uninstalled, so `literal_hash` never crosses into Rust per Var
+    key element. An explicit `MYPY_TK_VAR_KEY_FLIP` always wins, so the
+    differential arms keep control of the channel, and the compare mode
+    (2) stays a measurement mode this entry point never selects. Called
+    on every manager, so a later build cannot inherit a mode from an
+    earlier one in the process (the aststrip flip's rule).
+
+    Serving arms nothing: the channel's substrate is the ref capture,
+    which pins every binding target under its identity handle and is
+    default-on production surface already. `translate_var_key` consults
+    the identity registry and the pin store, never the meta store, so
+    widening `_meta_armed_classes` would add capture cost for records
+    this channel cannot read.
+    """
+    global _production_var_key_flip
+    _production_var_key_flip = serve
+    if os.environ.get(_VAR_KEY_FLIP_ENV) is not None:
+        return var_key_flip()
+    if serve:
+        return set_var_key_flip(1)
+    mode = set_var_key_flip(0)
+    _uninstall_var_key_hooks()
+    return mode
+
+
+def production_var_key_flip() -> bool:
+    """Whether the production wiring last asked this channel to serve.
+
+    What `set_production_var_key_flip` recorded (#1870): the build
+    wiring's own decision, not a re-derivation from kernel presence and
+    options, so a consumer (the cross-run runner's default model) cannot
+    disagree with what was actually wired. False before any manager ran.
+    """
+    return _production_var_key_flip
 
 
 def _translate_var_key(var: Var) -> Any:

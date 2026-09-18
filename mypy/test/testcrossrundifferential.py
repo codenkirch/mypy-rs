@@ -490,6 +490,39 @@ class KernelLegSuite(unittest.TestCase):
         self.assertEqual(comparison.verdict, runner.VERDICT_AGREE)
         self.assertNotIn("is inert", comparison.detail)
 
+    def test_the_var_key_option_default_in_force_agrees(self) -> None:
+        """The var-key gate's production default (#1870) is not inert.
+
+        An arm carrying no env token serves mode 1 through the wiring's
+        recorded decision, so the leg must compare it, not call it inert.
+        """
+        left = _provenance("a")
+        left["gates"]["MYPY_TK_VAR_KEY_FLIP"] = _gate(
+            requested=0, default=1, effective=1, in_force=1, served=2, consulted=2
+        )
+        comparison = runner.compare_kernel_leg(self._runs(left, _provenance("b")), ("a", "b"))
+        self.assertEqual(comparison.verdict, runner.VERDICT_AGREE)
+        self.assertNotIn("INERT", comparison.detail)
+
+    def test_an_inert_var_key_option_default_gate_is_not_run(self) -> None:
+        left = _provenance("a")
+        left["gates"]["MYPY_TK_VAR_KEY_FLIP"] = _gate(
+            requested=0, default=1, effective=1, in_force=0
+        )
+        comparison = runner.compare_kernel_leg(self._runs(left, _provenance("b")), ("a", "b"))
+        self.assertEqual(comparison.verdict, runner.VERDICT_NOT_RUN)
+        self.assertIn("is inert", comparison.detail)
+        self.assertIn("option default 1", comparison.detail)
+
+    def test_a_declared_env_zero_beats_the_var_key_option_default(self) -> None:
+        left = _provenance("a")
+        left["gates"]["MYPY_TK_VAR_KEY_FLIP"] = _gate(
+            requested=0, default=1, effective=0, in_force=0
+        )
+        comparison = runner.compare_kernel_leg(self._runs(left, _provenance("b")), ("a", "b"))
+        self.assertEqual(comparison.verdict, runner.VERDICT_AGREE)
+        self.assertNotIn("is inert", comparison.detail)
+
     def test_an_undeclared_channel_is_not_run(self) -> None:
         """Regression for the env leak: a served mode nothing declared fails.
 
@@ -723,6 +756,7 @@ class SuitesLegSuite(unittest.TestCase):
             [
                 "opt:native_ast_mirror=1",
                 "opt:native_ast_mirror_stmt_read=1",
+                "opt:native_ast_mirror_var_key=1",
                 "flag:--no-native-type-kernel",
             ],
         )
@@ -730,6 +764,7 @@ class SuitesLegSuite(unittest.TestCase):
         self.assertEqual(unmappable, [])
         self.assertEqual(translated["TEST_NATIVE_AST_MIRROR"], "1")
         self.assertEqual(translated["TEST_NATIVE_AST_MIRROR_STMT_READ"], "1")
+        self.assertEqual(translated["TEST_NATIVE_AST_MIRROR_VAR_KEY"], "1")
         self.assertEqual(translated["TEST_NATIVE_TYPE_KERNEL"], "0")
 
 

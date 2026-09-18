@@ -1420,14 +1420,20 @@ class BuildManager:
             capture_active = nodes_mirror.activate(
                 audit=_os_ast_mirror.environ.get("MYPY_TK_AST_MIRROR_AUDIT") == "1"
             )
-        # G4 (#1860, #1869): production serves the expression and the
-        # statement family's shadow reads; the Var-key translation stays
-        # env-gated 0. Set on every manager, off case included.
+        # G4 (#1860, #1869, #1870): production serves the expression and
+        # statement family's shadow reads and the def family's Var-key
+        # translation. Set on every manager, off case included.
         nodes_mirror.set_production_read_flip(
             capture_active and self.options.native_ast_mirror_read
         )
         nodes_mirror.set_production_stmt_read_flip(
             capture_active and self.options.native_ast_mirror_stmt_read
+        )
+        # G2.2 (#1870): the Var-key translation serves from the ref
+        # capture's pins, so this arms nothing; the off case uninstalls
+        # the hooks so `literal_hash` never crosses into Rust.
+        nodes_mirror.set_production_var_key_flip(
+            capture_active and self.options.native_ast_mirror_var_key
         )
         # Phase G1.2 (#1674): the aststrip read flip is a differential gate on
         # the same shadow. Written on every manager, including the off

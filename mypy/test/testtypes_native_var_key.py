@@ -4,9 +4,10 @@
 (`_capture_ref` pins the target), and `mypy/literals.py` emits that handle in
 the narrowing key (`("Var", handle)`) when the var-key flip serves, keeping
 the live object key when it defers. `extract_var_from_literal_hash` reverses
-the handle through `rust_node_mirror_object_of`. Mode 0 (the default) keeps
-the live object key, mode 1 emits the handle, mode 2 emits it and compares
-every translated key against the live-key computation.
+the handle through `rust_node_mirror_object_of`. Mode 0 keeps the live
+object key (the pre-#1870 default), mode 1 emits the handle, mode 2 emits
+it and compares every translated key against the live-key computation;
+since #1870 the production default serves mode 1.
 
 The suite has four jobs:
 
@@ -26,6 +27,7 @@ The suite has four jobs:
 from __future__ import annotations
 
 import os
+from collections.abc import Callable
 from typing import Any
 
 try:
@@ -343,6 +345,135 @@ class VarKeyTranslationSuite(Suite):
                 os.environ.pop(env_name, None)
             else:
                 os.environ[env_name] = saved_env
+
+    # -- the production default (#1870) --
+
+    def _var_key_hook(self) -> Callable[[Var], Any] | None:
+        """The translate hook `literals` currently routes through.
+
+        Read fresh on every call: direct `literals._var_key_translate`
+        references in one method body are narrowed by the checker (an
+        `is None` assert makes a later `is <callable>` assert read as
+        unreachable under the self-check), while a call result is never
+        carried between statements. The value is the plain attribute.
+        """
+        from mypy import literals
+
+        return literals._var_key_translate
+
+    def test_production_wiring_serves_only_when_told_to(self) -> None:
+        """`set_production_var_key_flip` is what `build` calls (#1870).
+
+        Without an env gate it sets the mode from the option (1 serves,
+        0 off), and the off case also uninstalls the hooks so the unset
+        contract holds: `literal_hash` never crosses into Rust. With an
+        env gate the measurement arm keeps control of the channel:
+        neither option may override it, and the compare mode (2) is
+        never selected by the option alone.
+        """
+        env_name = self._m._VAR_KEY_FLIP_ENV
+        saved_env = os.environ.get(env_name)
+        saved_decision = self._m._production_var_key_flip
+        try:
+            os.environ.pop(env_name, None)
+            assert self._m.set_production_var_key_flip(False) == 0
+            assert self._m.var_key_flip() == 0
+            assert self._var_key_hook() is None, "off must keep the key path untouched"
+            assert self._m.set_production_var_key_flip(True) == 1
+            assert self._m.var_key_flip() == 1
+            assert (
+                self._var_key_hook() is self._m._translate_var_key
+            ), "serve must install the translation hook"
+            os.environ[env_name] = "2"
+            assert self._m.set_var_key_flip(2) == 2
+            assert self._m.set_production_var_key_flip(False) == 2
+            assert self._m.set_production_var_key_flip(True) == 2
+            os.environ[env_name] = "0"
+            assert self._m.set_var_key_flip(0) == 0
+            assert self._m.set_production_var_key_flip(True) == 0
+        finally:
+            self._m.set_var_key_flip(0)
+            self._m._uninstall_var_key_hooks()
+            self._m._production_var_key_flip = saved_decision
+            if saved_env is None:
+                os.environ.pop(env_name, None)
+            else:
+                os.environ[env_name] = saved_env
+
+    def test_production_wiring_records_its_decision_for_the_runner(self) -> None:
+        """`production_var_key_flip` reports what the wiring last wired (#1870).
+
+        The cross-run runner consumes this instead of re-deriving the
+        production default from kernel presence and the raw options, so
+        the recorded decision must track the setter exactly: False
+        before any wiring, the last `serve` argument afterwards, and the
+        wiring's own decision even when an env gate holds the channel
+        (the env wins for the mode, not for what the wiring asked).
+        """
+        env_name = self._m._VAR_KEY_FLIP_ENV
+        saved_env = os.environ.get(env_name)
+        saved_decision = self._m._production_var_key_flip
+        try:
+            os.environ.pop(env_name, None)
+            self._m.set_production_var_key_flip(False)
+            assert self._m.production_var_key_flip() is False
+            self._m.set_production_var_key_flip(True)
+            assert self._m.production_var_key_flip() is True
+            os.environ[env_name] = "2"
+            assert self._m.set_var_key_flip(2) == 2
+            assert self._m.set_production_var_key_flip(False) == 2
+            assert self._m.production_var_key_flip() is False
+        finally:
+            self._m._production_var_key_flip = saved_decision
+            self._m.set_var_key_flip(0)
+            self._m._uninstall_var_key_hooks()
+            if saved_env is None:
+                os.environ.pop(env_name, None)
+            else:
+                os.environ[env_name] = saved_env
+
+    def test_production_wiring_serves_from_the_ref_pins_and_arms_nothing(self) -> None:
+        """Serving needs no meta arming: the substrate is the ref capture.
+
+        The channel consults the identity registry and the pin store,
+        never the meta store, so the production wiring widens no armed
+        class. The `ref` scope every default production run activates
+        already pins each binding target, and that pin is what serves.
+        """
+        scope_name = self._m._CAPTURE_SCOPE_ENV
+        var_env = self._m._VAR_KEY_FLIP_ENV
+        seed_env = self._m._DEF_SEED_ENV
+        stmt_env = self._m._STMT_READ_FLIP_ENV
+        saved = {name: os.environ.get(name) for name in (scope_name, var_env, seed_env, stmt_env)}
+        saved_decision = self._m._production_var_key_flip
+        saved_armed = self._m._meta_armed_classes
+        try:
+            for name in (var_env, seed_env, stmt_env, scope_name):
+                os.environ.pop(name, None)
+            assert self._m.activate(audit=True) is True
+            assert self._m._meta_armed_classes == frozenset(), "the ref scope arms no meta class"
+            self._m.reset(clear_counts=True)
+            assert self._m.set_production_var_key_flip(True) == 1
+            assert (
+                self._m._meta_armed_classes == frozenset()
+            ), "the var-key wiring must arm nothing"
+            var = Var("x")
+            self._pin(var)
+            handle = self._k.rust_node_mirror_handle_of(var)
+            assert handle is not None, "the ref capture must mint the identity"
+            assert self._k.rust_node_mirror_serve_var_key(var) == handle
+            counters = self._m.var_key_counters()
+            assert counters["served"] == 1
+        finally:
+            self._m._production_var_key_flip = saved_decision
+            self._m._meta_armed_classes = saved_armed
+            for name, value in saved.items():
+                if value is None:
+                    os.environ.pop(name, None)
+                else:
+                    os.environ[name] = value
+            self._m.set_var_key_flip(0)
+            self._m._uninstall_var_key_hooks()
 
     # -- the invariant the control drives red --
 

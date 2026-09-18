@@ -434,6 +434,10 @@ class Options:
         # (`Block.is_unreachable`, the three `expr` slots) serve from shadow
         # storage in production. Not in OPTIONS_AFFECTING_CACHE.
         self.native_ast_mirror_stmt_read = True
+        # Phase G2.2 (#1870): the def family's `Var` binder-key translation
+        # serves store handles in production. The keys live in in-memory
+        # binder frames only, so this is not in OPTIONS_AFFECTING_CACHE.
+        self.native_ast_mirror_var_key = True
         # Phase G3.0a (#1581): opt-in dual-write namespace capture shadow
         # for symbol tables (semanal adding funnel via put_names_entry).
         # Capture-only, not in OPTIONS_AFFECTING_CACHE.
