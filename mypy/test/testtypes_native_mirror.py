@@ -2201,16 +2201,21 @@ class WireCacheTvarFingerprintSuite(Suite):
     """
 
     def setUp(self) -> None:
-        from mypy.types import _clear_type_wire_cache, _set_type_wire_cache_enabled
+        from mypy.types import (
+            _clear_type_wire_cache,
+            _set_type_wire_cache_enabled,
+            _wire_cache_enabled,
+        )
 
         _clear_type_wire_cache()
+        self._prev_wire_cache_enabled = _wire_cache_enabled()
         _set_type_wire_cache_enabled(True)
         self.fx = TypeFixture()
 
     def tearDown(self) -> None:
         from mypy.types import _clear_type_wire_cache, _set_type_wire_cache_enabled
 
-        _set_type_wire_cache_enabled(False)
+        _set_type_wire_cache_enabled(self._prev_wire_cache_enabled)
         _clear_type_wire_cache()
 
     def _tvar_callable(self) -> CallableType:
