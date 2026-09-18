@@ -757,9 +757,12 @@ Same pattern as Phase F for `mypy.nodes`, family by family:
   nodes first (highest kernel traffic, already serialized), then statement
   nodes, then symbol tables (`TypeInfo.names`, `MypyFile.symbol_table`)
   last, because semanal mutates them mid-pass.
-- **G4:** graduation (claimed 2026-09-18, #1870): "the AST executes on Rust
+- **G4:** graduation (first claimed 2026-09-18, #1870; **parked
+  2026-09-18 by the #1624 correction below**): "the AST executes on Rust
   storage" — for the read/translation surface, per family (expression #1867,
-  statement #1869, def #1870); the write path is still Python.
+  statement #1869, def #1870); the write path is still Python. The
+  default-on flip was withdrawn when the capture was measured at +23%
+  instructions against Python; the surface stays one flag away.
 
 **G4 status (updated 2026-09-18, #1870).** The G4 forks are ratified
 (#1836, closed by #1858): read-serving suffices for G4, the claim is
@@ -829,6 +832,40 @@ default production run, while every write stays Python. Full record:
 the #1860, #1864, #1869 and #1870 ledger entries in
 `docs/plans/type-kernel-seam-ledger.md`.
 
+**#1624 correction (2026-09-18): the G4 default-on flip is parked, the
+rung withdrawn pending a capture design.** Every per-family gate above
+measured a marginal cost with the capture already on in *both* arms
+(expression/stmt: mirror-on vs mirror-on-with-that-channel-off; def:
+var-key-on vs var-key-off), so the capture toll itself was never
+charged. A load-robust four-arm CPU gate on the cold self-check (single
+process, `/usr/bin/time -l`, three interleaved pairs per arm,
+instruction spread <0.3%) measures it for the first time. All arms are
+`mypy_self_check.ini -n0 --no-incremental -p mypy -p mypyc`; production
+defaults vs `--no-native-type-kernel` vs a `native_ast_mirror=False`
+wrapper vs both off (instructions retired, mean of three):
+
+| arm | instr. retired | vs Python |
+|---|---:|---:|
+| production (mirror on, kernel on) | 568.0e9 | +55% |
+| kernel off (mirror on) | 450.2e9 | |
+| mirror off (kernel on) | 483.7e9 | |
+| both off (Python baseline) | 366.3e9 | 0 |
+
+The node mirror alone is **+84.3e9 instructions (+17.4% of the
+on-arm, +23% over Python)**; the type kernel alone is **+117.8e9
+(+26% / +32%)**; the default-on native stack together is **+201.7e9
+instructions / ~+85% CPU**. The mirror's only live serving channel is
+the Var-key translation (734,705 of the 3.04M mirror crossings; the
+expression and statement channels consult 0 on this corpus), and that
+channel's own gate was +0.4% instructions (inside noise): the mirror
+pays the capture for reads that mostly do not happen. `Options.native_ast_mirror`
+therefore defaults **off** again, matching its sibling mirrors
+(`native_type_mirror`, `native_symtable_mirror`); the three serving
+options keep their defaults and re-arm automatically if the capture is
+turned back on, so the whole G4 surface is one flag away. The rung is
+not deleted, it is parked: read-serving does not clear #1624's bar
+until the capture stops paying a crossing per tracked write.
+
 The same risk register applies, with one extra item: semanal visitor
 mutation sites must migrate behind accessor methods on the views as their
 families flip; defer-compatible returns stay until Phase H.
@@ -884,13 +921,18 @@ if the bridge costs outweigh the standalone benefit.
   on/off pairs (the wall-clock window did not open — host at load
   50-90 for hours — so the load-robust CPU instrument was adopted, and
   the 378-file volume proof reports 734,324/734,324 served, 0
-  mismatched). With all three families graduated, the "the AST executes
-  in Rust" rung below is claimed for the read/translation surface, write
-  path still Python.
-- After G4 (claimed 2026-09-18, #1870): "the AST executes in Rust
+  mismatched). **Withdrawn the same day:** the #1624 four-arm gate
+  below shows the three per-family gates each measured only the
+  *marginal* cost with the capture on in both arms, and the capture
+  itself costs +23% instructions over Python, so the whole G4
+  read-surface (all three families) is parked behind
+  `Options.native_ast_mirror`, default off.
+- G4 (claimed and withdrawn 2026-09-18): "the AST executes in Rust
   storage" — read/translation surface per family (expression #1867,
-  statement #1869, def #1870), write path still Python, cross-run
-  differential as agreement evidence.
+  statement #1869, def #1870). **Parked by the #1624 correction**
+  (node-mirror capture +23% instructions vs Python, no measured serving
+  benefit); the default is one flag from the claimed state, write path
+  still Python, cross-run differential as agreement evidence.
 - After H: "the type-checking pipeline executes in Rust."
 - After J: "full Rust port", with the Python plugin bridge optional.
 

@@ -4551,13 +4551,13 @@ class NativeAstMirrorSuite(Suite):
         finally:
             self._k.rust_node_mirror_capture_ref = original
 
-    def test_option_default_on_and_not_cache_affecting(self) -> None:
+    def test_option_default_off_and_not_cache_affecting(self) -> None:
         from mypy.options import OPTIONS_AFFECTING_CACHE, Options
 
-        # #1860: capture is the default-on G4 flip. Family-agnostic (the
-        # G2 statement/def records ride the same gate) but never in the
-        # cache: no shadow state may enter it.
-        assert Options().native_ast_mirror is True
+        # #1624: capture is default-off. The G4 flip (true) measured at
+        # +23% instructions vs Python with no serving benefit; the shadow
+        # is parked behind the option until a crossing-free capture exists.
+        assert Options().native_ast_mirror is False
         assert "native_ast_mirror" not in OPTIONS_AFFECTING_CACHE
 
 
@@ -6148,9 +6148,9 @@ class NativeNodeShadowReadFlipSuite(Suite):
     def test_option_default_on_and_not_cache_affecting(self) -> None:
         from mypy.options import OPTIONS_AFFECTING_CACHE, Options
 
-        # #1860: the expression family's serving reads are default-on in
-        # production (G4), while the statement/def serving modes stay
-        # env-gated default 0. The option never touches the cache.
+        # #1624: the serving mode still defaults on, but the build sets
+        # every serving flip to `capture_active and option` and the capture
+        # is default-off, so it is inert. The option never touches the cache.
         assert Options().native_ast_mirror_read is True
         assert "native_ast_mirror_read" not in OPTIONS_AFFECTING_CACHE
 

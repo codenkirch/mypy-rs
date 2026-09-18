@@ -422,21 +422,18 @@ class Options:
         # write is pushed into the stored blob by the Rust splice op instead
         # of a full Python re-serialize. Default off until parity.
         self.native_type_instance_write = False
-        # Phase G1 (#1860, G4 graduation): dual-write node shadow, default
-        # on, family-agnostic capture; only the expression serving channels
-        # follow `native_ast_mirror_read`. Not in OPTIONS_AFFECTING_CACHE.
-        self.native_ast_mirror = True
-        # Phase G1.2/G1.1 (#1674, #1860): the expression family's serving
-        # reads (aststrip lvalue, walker `RefExpr` scalars) serve from shadow
-        # storage in production. Not in OPTIONS_AFFECTING_CACHE.
+        # Phase G1 (#1860): dual-write node shadow. Default off: the
+        # capture costs +23% instructions vs Python (issue #1624) and
+        # the read surface re-arms from this flag alone.
+        self.native_ast_mirror = False
+        # Phase G1.2/G1.1 (#1674, #1860): the expression serving reads serve
+        # from shadow storage when the capture is on. Not cache-affecting.
         self.native_ast_mirror_read = True
-        # Phase G2.1 (#1869): the statement family's serving reads
-        # (`Block.is_unreachable`, the three `expr` slots) serve from shadow
-        # storage in production. Not in OPTIONS_AFFECTING_CACHE.
+        # Phase G2.1 (#1869): the statement serving reads serve from shadow
+        # storage when the capture is on. Not cache-affecting.
         self.native_ast_mirror_stmt_read = True
         # Phase G2.2 (#1870): the def family's `Var` binder-key translation
-        # serves store handles in production. The keys live in in-memory
-        # binder frames only, so this is not in OPTIONS_AFFECTING_CACHE.
+        # serves store handles when the capture is on. Not cache-affecting.
         self.native_ast_mirror_var_key = True
         # Phase G3.0a (#1581): opt-in dual-write namespace capture shadow
         # for symbol tables (semanal adding funnel via put_names_entry).

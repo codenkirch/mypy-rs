@@ -5755,3 +5755,40 @@ rung is claimed for the read/translation surface** in
 `cpu_r*.log`, `varkey_stats.json`,
 `invalid-pass-comma-locale/`). Refs: #1870, #1869, #1867, #1864, #1860,
 #1866, #1836, #1839, #1624.
+
+- **#1624 four-arm CPU gate and the G4 park (2026-09-18, PR on
+  `fix/1624-mirror-default-off`).** The per-family G4 gates above each
+  measured a *marginal* cost with the node capture already on in both
+  arms, so the capture toll was never charged. This lane measures it
+  directly with the load-robust CPU instrument (`MYPY_NUM_WORKERS=0`,
+  cold self-check `-n0 --no-incremental -p mypy -p mypyc`,
+  `/usr/bin/time -l`, three interleaved on/off pairs per arm, LC_ALL=C
+  so the decimal point parses; instruction spread <0.3% across all
+  arms). Four arms, instructions retired (mean of three):
+
+  | arm | instr. retired | vs Python |
+  |---|---:|---:|
+  | production (mirror on, kernel on) | 568.0e9 | +55% |
+  | kernel off (mirror on) | 450.2e9 | |
+  | mirror off (kernel on) | 483.7e9 | |
+  | both off (Python) | 366.3e9 | 0 |
+
+  Node mirror alone **+84.3e9 (+17.4% of the on-arm, +23% over
+  Python)**; type kernel alone **+117.8e9 (+26% / +32%)**; the default
+  stack **+201.7e9 instr / ~+85% CPU**. The count audit (same tree,
+  `MYPY_SERIALIZE_STATS`-style id-keyed harness) confirms the mirror is
+  **3.04M of 5.62M seam calls** (`capture_ref` 1.46M, `serve_var_key`
+  734,705, `capture_field_text` 404,840, `object_of` 175,543,
+  `capture_meta` 130,595, `capture_pin` 125,472); of the three serving
+  channels only VAR_KEY consults (its own gate was +0.4% instr, inside
+  noise), the expression and statement channels consult 0 on this
+  corpus. Disposition: `Options.native_ast_mirror` defaults **off**
+  again (matching `native_type_mirror` / `native_symtable_mirror`); the
+  three serving options keep their defaults and re-arm when the capture
+  is turned on, so the G4 read-surface is one flag away. The
+  "the AST executes in Rust storage" rung is **withdrawn/parked** in
+  `docs/remaining-migration-plan.md`; the type kernel's own +32% keeps
+  #1624 open. Full logs: `/private/tmp/mypy-rs-1624-probe/`
+  (`cpu_gate.log`, `cpu_gate_mirror.log`, `cpu_gate_prod.log`,
+  `audit_2026-09-18.txt`). Refs: #1624, #1860, #1864, #1867, #1869,
+  #1870, #1861.
